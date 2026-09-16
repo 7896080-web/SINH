@@ -1,0 +1,21 @@
+{% if log_entries %}
+<table>
+    <tbody>
+        {% for entry in log_entries %}
+        <tr>
+            <td class="mono help-text" style="white-space:nowrap; width:1%;">{{ entry.created_at.strftime('%H:%M:%S') }}</td>
+            <td style="width:1%; white-space:nowrap;">
+                {% if entry.level.value == 'good' %}<span class="badge badge--good">{{ entry.action }}</span>
+                {% elif entry.level.value == 'warn' %}<span class="badge badge--warn">{{ entry.action }}</span>
+                {% elif entry.level.value == 'error' %}<span class="badge badge--bad">{{ entry.action }}</span>
+                {% else %}<span class="badge" style="background:var(--line-soft);">{{ entry.action }}</span>
+                {% endif %}
+            </td>
+            <td class="mono" style="font-size:12.5px;">{{ entry.message }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% else %}
+<div class="empty-state">Журнал пуст — выполните любое действие выше.</div>
+{% endif %}

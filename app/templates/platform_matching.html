@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% block title %}Сопоставление площадок{% endblock %}
+{% block content %}
+
+<div class="page-header">
+    <div>
+        <h1>Сопоставление площадок</h1>
+        <p>Размер-цвет SKU, собранные по общему пулу баркодов через WB / Ozon / Kit</p>
+    </div>
+    <div class="toolbar">
+        <a id="export-link"
+           href="/platform-matching/export?q={{ q }}&coverage={{ coverage }}&mapped={{ mapped }}"
+           class="btn">Экспорт в Excel</a>
+    </div>
+</div>
+
+<p class="help-text" style="margin: -8px 0 14px;">
+    Единица — размер-цвет SKU; у него может быть несколько баркодов (пул, напр.
+    внутренний и производителя, или свой на каждой площадке). Два SKU считаются
+    одним товаром, если их пулы пересекаются хотя бы одним общим баркодом — так
+    один размер-цвет склеивается между площадками и с 1С. «Частично» означает:
+    SKU сопоставлен, но не все его баркоды привязаны к 1С по отдельности (для
+    резолвинга заказов нужен каждый). Чтобы привязать: экспортируйте, заполните
+    «ID_1С» и загрузите файл на «Мэппинге» (Импорт из Excel).
+</p>
+
+<form class="filters"
+      hx-get="/platform-matching/rows"
+      hx-target="#pm-table"
+      hx-trigger="keyup changed delay:400ms from:input, change from:select"
+      hx-include="this">
+
+    <div class="field">
+        <label for="q">Поиск</label>
+        <input type="search" id="q" name="q" value="{{ q }}" placeholder="баркод, артикул, название">
+    </div>
+
+    <div class="field">
+        <label for="coverage">Охват</label>
+        <select id="coverage" name="coverage">
+            <option value="" {% if not coverage %}selected{% endif %}>Все</option>
+            <option value="multi" {% if coverage == 'multi' %}selected{% endif %}>Только на нескольких площадках</option>
+        </select>
+    </div>
+
+    <div class="field">
+        <label for="mapped">Привязка к 1С</label>
+        <select id="mapped" name="mapped">
+            <option value="" {% if not mapped %}selected{% endif %}>Все</option>
+            <option value="unmapped" {% if mapped == 'unmapped' %}selected{% endif %}>Не привязанные</option>
+            <option value="mapped" {% if mapped == 'mapped' %}selected{% endif %}>Привязанные</option>
+        </select>
+    </div>
+</form>
+
+<div class="card" style="padding:0;">
+    <div id="pm-table">
+        {% include "platform_matching_rows.html" %}
+    </div>
+</div>
+
+<script>
+    // Держим ссылку "Экспорт" в актуальном состоянии при живой фильтрации.
+    document.querySelector('.filters').addEventListener('input', function () {
+        var q = document.getElementById('q').value;
+        var coverage = document.getElementById('coverage').value;
+        var mapped = document.getElementById('mapped').value;
+        document.getElementById('export-link').href =
+            '/platform-matching/export?q=' + encodeURIComponent(q) +
+            '&coverage=' + encodeURIComponent(coverage) +
+            '&mapped=' + encodeURIComponent(mapped);
+    });
+</script>
+
+{% endblock %}

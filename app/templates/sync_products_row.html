@@ -1,0 +1,67 @@
+<tr id="row-{{ row.uid_1c }}">
+    <td class="mono">{{ row.article or '—' }}</td>
+    <td>{{ row.size or '' }}</td>
+    <td>{{ row.color or '' }}</td>
+    <td>
+        {{ row.name or '—' }}
+        {% if not row.has_barcode %}
+            <span class="badge badge--bad" title="Нет ни одного баркода для этого товара">нет баркода</span>
+        {% endif %}
+    </td>
+    <td class="mono" style="text-align:right;">{{ row.stock_on_hand }}</td>
+    <td style="text-align:right;">
+        <input type="number" min="0" value="{{ row.reserve }}"
+               style="width:56px; padding:3px 5px; font-size:12px; text-align:right;"
+               hx-post="/sync-products/{{ row.uid_1c }}/reserve"
+               hx-trigger="change"
+               hx-vals="js:{reserve: event.target.value}"
+               hx-target="#row-{{ row.uid_1c }}" hx-swap="outerHTML"
+               title="Резерв: столько штук держим у себя и не отдаём на площадки. На каждую площадку уходит max(0, остаток − резерв). Общий на все каналы.">
+        {% if row.reserve and row.reserve >= row.stock_on_hand %}
+            <div class="help-text" style="color:var(--warn);">→ 0 на площадки</div>
+        {% endif %}
+    </td>
+
+    <td style="text-align:center;">
+        <input type="date" value="{{ row.active_since.isoformat() if row.active_since else '' }}"
+               style="padding:3px 5px; font-size:12px;"
+               hx-post="/sync-products/{{ row.uid_1c }}/active-since"
+               hx-trigger="change"
+               hx-vals="js:{value: event.target.value}"
+               hx-target="#row-{{ row.uid_1c }}" hx-swap="outerHTML"
+               title="Дата старта задним числом (общая для всех площадок; от неё стартует бэкфилл на «Тестировании»).">
+    </td>
+
+    {% for account in accounts %}
+    {% set state = row.accounts[account.id] %}
+    <td>
+        <div class="platform-check">
+        {% if state.enabled %}
+            <input type="checkbox" checked
+                   hx-post="/sync-products/{{ row.uid_1c }}/{{ account.id }}/toggle"
+                   hx-vals="js:{enabled: event.target.checked}"
+                   hx-target="#row-{{ row.uid_1c }}" hx-swap="outerHTML"
+                   title="{% if not row.has_barcode %}Включено, но нет баркода — синхронизация не сработает{% endif %}">
+        {% elif state.has_proposal %}
+            <button type="button" class="proposal-flag"
+                    hx-post="/sync-products/{{ row.uid_1c }}/{{ account.id }}/toggle"
+                    hx-vals='{"enabled": "true"}'
+                    hx-target="#row-{{ row.uid_1c }}" hx-swap="outerHTML"
+                    title="Карточка найдена в кабинете {{ account.name }}{% if state.proposal_date %} {{ state.proposal_date.strftime('%d.%m.%Y') }}{% endif %} — включить синхронизацию?">⚡</button>
+        {% else %}
+            <input type="checkbox"
+                   hx-post="/sync-products/{{ row.uid_1c }}/{{ account.id }}/toggle"
+                   hx-vals="js:{enabled: event.target.checked}"
+                   hx-target="#row-{{ row.uid_1c }}" hx-swap="outerHTML">
+        {% endif %}
+        </div>
+        <input type="number" min="0" value="{{ state.min_threshold }}"
+               style="width:56px; margin-top:4px; padding:3px 5px; font-size:12px;"
+               hx-post="/sync-products/{{ row.uid_1c }}/{{ account.id }}/threshold"
+               hx-trigger="change"
+               hx-vals="js:{min_threshold: event.target.value}"
+               hx-target="#row-{{ row.uid_1c }}" hx-swap="outerHTML"
+               title="Минимальный порог: ниже этого остатка на площадку уходит 0, а не фактическое количество. 0 — порог выключен.">
+    </td>
+    {% endfor %}
+</tr>

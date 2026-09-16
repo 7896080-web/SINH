@@ -1,0 +1,45 @@
+{% if rows %}
+<table>
+    <thead>
+        <tr>
+            <th>Товар</th>
+            <th>Артикул</th>
+            <th>Площадки</th>
+            <th>Баркодов</th>
+            <th>Привязка к 1С</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for row in rows %}
+        <tr>
+            <td>
+                {{ row.name or '—' }}
+                <div class="help-text mono">{{ row.rep_barcode }}{% if row.barcode_count > 1 %} +{{ row.barcode_count - 1 }}{% endif %}</div>
+            </td>
+            <td class="mono">{{ row.article or '—' }}</td>
+            <td>
+                {% for p in row.platforms %}<span class="badge">{{ p|upper }}</span> {% endfor %}
+                {% if row.platform_count >= 2 %}<span class="help-text">×{{ row.platform_count }}</span>{% endif %}
+            </td>
+            <td class="mono">{{ row.barcode_count }}</td>
+            <td>
+                {% if row.status == 'mapped' %}
+                    <span class="badge badge--good">привязан</span>
+                    {% if row.uid_1cs|length == 1 %}<span class="help-text mono">{{ row.uid_1cs[0] }}</span>{% endif %}
+                {% elif row.status == 'partial' %}
+                    <span class="badge badge--warn">частично</span>
+                    <span class="help-text">SKU сопоставлен, не все размеры привязаны</span>
+                {% else %}
+                    <span class="help-text">не привязан</span>
+                {% endif %}
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% if total > limit %}
+<div class="help-text" style="padding:10px 14px;">Показаны первые {{ limit }} из {{ total }} — уточните фильтр.</div>
+{% endif %}
+{% else %}
+<div class="empty-state">По заданным фильтрам ничего не найдено.</div>
+{% endif %}

@@ -1,0 +1,27 @@
+[Unit]
+Description=Sync Admin - фоновый планировщик воркеров (опрос заказов, рассылка, FTP-канал, сверка)
+After=network.target postgresql.service sync-admin-web.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=syncadmin
+Group=syncadmin
+WorkingDirectory=/opt/sync_admin
+EnvironmentFile=/opt/sync_admin/.env
+ExecStart=/opt/sync_admin/venv/bin/python -m app.workers.scheduler
+
+# Раздел 13 спецификации: новый кабинет получает задания только после
+# перезапуска процесса (ограничение APScheduler в blocking-режиме) — при
+# добавлении/отключении кабинета в админке нужно вручную перезапустить:
+#   systemctl restart sync-admin-scheduler
+Restart=always
+RestartSec=10
+
+StandardOutput=append:/var/log/sync_admin/scheduler.log
+StandardError=append:/var/log/sync_admin/scheduler.log
+
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

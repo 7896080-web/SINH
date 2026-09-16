@@ -1,0 +1,30 @@
+# Секреты — никогда не коммитить
+.env
+*.pem
+*.key
+
+# Виртуальное окружение
+venv/
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Локальные базы данных для разработки/тестов
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# IDE
+.vscode/
+.idea/
+
+# ОС
+.DS_Store
+
+# Бэкапы (создаются deploy/backup.sh на сервере, не в репозитории)
+/backups/

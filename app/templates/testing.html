@@ -1,0 +1,252 @@
+{% extends "base.html" %}
+{% block title %}Тестирование{% endblock %}
+{% block content %}
+
+<style>
+  .search-results { position:absolute; z-index:20; left:0; right:0; top:100%;
+    background:var(--surface, #fff); border:1px solid var(--border, #d0d0d0);
+    border-radius:6px; margin-top:2px; max-height:320px; overflow-y:auto;
+    box-shadow:0 6px 20px rgba(0,0,0,.12); }
+  .search-results:empty { display:none; }
+  .search-results a { display:block; padding:8px 10px; text-decoration:none;
+    color:inherit; border-bottom:1px solid var(--border, #eee); }
+  .search-results a:last-child { border-bottom:0; }
+  .search-results a:hover { background:var(--surface-hover, #f0f4ff); }
+  .search-results .muted { color:#888; font-size:.85em; }
+  .search-results .empty { padding:8px 10px; color:#888; }
+</style>
+
+<div class="page-header">
+    <div>
+        <h1>Тестирование перед запуском</h1>
+        <p>Выберите один товар и один кабинет — прогоните через них весь цикл (баркод → остаток → заказ → отмена),
+        прежде чем включать синхронизацию на весь каталог.</p>
+    </div>
+</div>
+
+<div class="card">
+    <form method="get" action="/testing" style="display:flex; gap:12px; align-items:flex-end; flex-wrap:wrap;">
+        <div class="field" style="flex:1; min-width:260px; position:relative;">
+            <label for="q_product">Товар (поиск по сопоставленным)</label>
+            <input type="text" id="q_product" name="q" autocomplete="off"
+                   placeholder="артикул или название…"
+                   value="{% if product %}{{ product.article }} — {{ product.name }}{% endif %}"
+                   hx-get="/testing/search-products"
+                   hx-trigger="keyup changed delay:300ms"
+                   hx-target="#product-results" hx-swap="innerHTML"
+                   hx-include="[name='account_id'],[name='start_date']">
+            <input type="hidden" id="uid_1c" name="uid_1c" value="{{ selected_uid or '' }}">
+            <div id="product-results" class="search-results"></div>
+        </div>
+        <div class="field" style="flex:1; min-width:220px;">
+            <label for="account_id">Кабинет</label>
+            <select id="account_id" name="account_id" required>
+                <option value="">— выберите —</option>
+                <option value="all" {% if selected_account_id == 'all' %}selected{% endif %}>Все площадки</option>
+                {% for a in accounts %}
+                <option value="{{ a.id }}" {% if selected_account_id == a.id|string %}selected{% endif %}>
+                    {{ a.name }} ({{ a.platform.value|upper }})
+                </option>
+                {% endfor %}
+            </select>
+        </div>
+        <div class="field" style="min-width:190px;">
+            <label for="start_date" title="Единая дата старта задним числом (broadcast_active_since). Сохраняется у товара и общая для всех площадок и страниц («Синхронизируемые товары», «Управление остатками»).">Дата старта задним числом</label>
+            <input type="date" id="start_date" name="start_date" value="{{ start_date or '' }}">
+        </div>
+        <button type="submit" class="btn-primary">Открыть</button>
+    </form>
+</div>
+
+{% if product and (account or all_mode) %}
+
+<div class="card">
+    <h3 style="margin-top:0">Старт задним числом — реальные заказы с площадки{% if all_mode %} (все площадки){% endif %}</h3>
+    <p class="help-text">Тянет с площадки настоящие FBS-заказы по этому товару начиная с «Даты начала» (задаётся в форме выбора вверху) и проводит по ним перемещения в 1С их реальной датой. Нужно, когда в 1С с этой даты не отражены отгрузки на маркетплейсы. Сначала загрузите список и проверьте, затем проведите — проведение реальное (не тест).</p>
+    {% if not start_date %}
+    <div class="empty-state">Укажите «Дату начала» в форме выбора вверху и нажмите «Открыть».</div>
+    {% else %}
+    <form method="post" action="/testing/load-real-orders" style="display:inline;">
+        <input type="hidden" name="uid_1c" value="{{ product.uid_1c }}">
+        <input type="hidden" name="account_id" value="{{ selected_account_id }}">
+        <input type="hidden" name="start_date" value="{{ start_date }}">
+        <button type="submit" class="btn" {% if not barcode %}disabled{% endif %}>Загрузить заказы с площадки (с {{ start_date }})</button>
+    </form>
+    {% if real_orders_error %}
+    <div class="badge badge--bad" style="margin-top:12px; display:inline-block;">{{ real_orders_error }}</div>
+    {% endif %}
+    {% if real_orders is defined and real_orders %}
+    {% set new_count = real_orders | selectattr('already', 'equalto', false) | list | length %}
+    <table style="margin-top:12px;">
+        <thead><tr>{% if all_mode %}<th>Кабинет</th>{% endif %}<th>Дата заказа</th><th>ID заказа</th><th>Баркод</th><th>Кол-во</th><th>Статус</th><th>В 1С</th></tr></thead>
+        <tbody>
+        {% for o in real_orders %}
+            <tr>
+                {% if all_mode %}<td>{{ o.account_name }}</td>{% endif %}
+                <td class="mono">{{ o.order_date or '—' }}</td>
+                <td class="mono">{{ o.order_id }}</td>
+                <td class="mono">{{ o.barcode }}</td>
+                <td class="mono">{{ o.quantity }}</td>
+                <td>{{ o.raw_status }}</td>
+                <td>{% if o.already %}<span class="badge badge--good">уже проведён</span>{% else %}<span class="badge badge--warn">новый</span>{% endif %}</td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    <form method="post" action="/testing/backfill" style="margin-top:12px;"
+          onsubmit="return confirm('Провести {{ new_count }} перемещений в 1С задним числом? Действие реальное — списываются остатки и создаются документы в 1С.');">
+        <input type="hidden" name="uid_1c" value="{{ product.uid_1c }}">
+        <input type="hidden" name="account_id" value="{{ selected_account_id }}">
+        <input type="hidden" name="start_date" value="{{ start_date }}">
+        <button type="submit" class="btn-primary" {% if new_count == 0 %}disabled{% endif %}>Провести перемещения задним числом ({{ new_count }} новых)</button>
+    </form>
+    {% elif real_orders is defined %}
+    <div class="empty-state" style="margin-top:12px;">Заказов по этому товару с {{ start_date }} не найдено.</div>
+    {% endif %}
+    {% endif %}
+</div>
+
+<div class="card">
+    <h3 style="margin-top:0">Порог трансляции</h3>
+    <p class="help-text">Задайте зависимость: «доступно на дату» и «остаток ЦС на дату» — порог = ЦС на дату − доступно (может быть и отрицательным). Дальше на площадки уходит <b>max(0, текущий ЦС − порог)</b>. Порог фиксирован и сам отслеживает все движения склада (приход, расход, списание, пересортица, перемещение) через текущий остаток ЦС — не накапливается и не дрейфует. «Сбросить» — вернуть автоматический расчёт от остатка. Значение общее для всех кабинетов.</p>
+    <p>Сейчас передаётся на площадки: <b>{{ current_send }}</b>
+        {% if product.broadcast_offset is not none %}(текущий ЦС {{ product.stock_on_hand }} − порог {{ product.broadcast_offset }}){% elif product.transmit_override is not none %}(ручной {{ product.transmit_override }}){% else %}(авто — от остатка ЦС {{ product.stock_on_hand }}){% endif %}
+    </p>
+    <form method="post" action="/testing/set-override" style="display:flex; gap:12px; align-items:flex-end; flex-wrap:wrap;">
+        <input type="hidden" name="uid_1c" value="{{ product.uid_1c }}">
+        <input type="hidden" name="account_id" value="{{ selected_account_id }}">
+        <div class="field">
+            <label for="available">Доступно на дату</label>
+            <input type="number" id="available" name="available" style="width:130px;">
+        </div>
+        <div class="field">
+            <label for="stock_at_date">Остаток ЦС на дату</label>
+            <input type="number" id="stock_at_date" name="stock_at_date" style="width:150px;">
+        </div>
+        <button type="submit" class="btn-primary">Установить порог</button>
+        <button type="submit" name="clear" value="1" class="btn">Сбросить (авто)</button>
+    </form>
+    {% if product.broadcast_offset is not none %}<p class="help-text">Текущий порог: <b>{{ product.broadcast_offset }}</b>.</p>{% endif %}
+</div>
+
+{% if account %}
+<div class="card">
+    <h3 style="margin-top:0">Текущее состояние</h3>
+    <table>
+        <tr><td>Товар</td><td>{{ product.article }} — {{ product.name }}</td></tr>
+        <tr><td>Физический остаток (ЦС)</td><td class="mono">{{ product.stock_on_hand }}</td></tr>
+        <tr>
+            <td>Баркод</td>
+            <td>
+                {% if barcode %}<span class="mono">{{ barcode }}</span>
+                {% else %}<span class="badge badge--bad">не сопоставлен — сначала «Мэппинг»</span>{% endif %}
+            </td>
+        </tr>
+        <tr>
+            <td>Синхронизация в «{{ account.name }}»</td>
+            <td>
+                {% if setting and setting.enabled %}<span class="badge badge--good">включена</span>
+                {% else %}<span class="badge badge--warn">выключена</span>{% endif %}
+                {% if setting and setting.min_threshold %} · порог: {{ setting.min_threshold }}{% endif %}
+            </td>
+        </tr>
+    </table>
+</div>
+
+<div class="card">
+    <h3 style="margin-top:0">Шаг 1 — проверить отправку остатка</h3>
+    <p class="help-text">Реальный запрос к площадке с текущим фактическим остатком — безопасно, повторяет то же значение, что уже должно там стоять.</p>
+    <form method="post" action="/testing/push-stock">
+        <input type="hidden" name="uid_1c" value="{{ product.uid_1c }}">
+        <input type="hidden" name="account_id" value="{{ account.id }}">
+        <button type="submit" class="btn-primary" {% if not barcode %}disabled{% endif %}>Отправить текущий остаток</button>
+    </form>
+</div>
+
+<div class="card">
+    <h3 style="margin-top:0">Шаг 2 — симулировать заказ</h3>
+    <p class="help-text">Не требует настоящей покупки — прогоняет синтетический заказ через тот же код, что и живой опрос: сопоставление баркода, списание, рассылка на остальные кабинеты, задание в 1С.</p>
+    <form method="post" action="/testing/simulate-order" style="display:flex; gap:12px; align-items:flex-end;">
+        <input type="hidden" name="uid_1c" value="{{ product.uid_1c }}">
+        <input type="hidden" name="account_id" value="{{ account.id }}">
+        <div class="field">
+            <label for="quantity">Количество</label>
+            <input type="number" id="quantity" name="quantity" value="1" min="1" style="width:80px;">
+        </div>
+        <div class="field">
+            <label for="order_date">Дата документа (синтетический тест)</label>
+            <input type="date" id="order_date" name="order_date">
+        </div>
+        <button type="submit" class="btn-primary" {% if not barcode %}disabled{% endif %}>Симулировать поступление заказа</button>
+    </form>
+</div>
+
+<div class="card">
+    <h3 style="margin-top:0">Тестовые заказы по этой паре товар/кабинет</h3>
+    {% if test_orders %}
+    <table>
+        <thead><tr><th>ID заказа</th><th>Количество</th><th>Статус</th><th>Создан</th><th></th></tr></thead>
+        <tbody>
+        {% for o in test_orders %}
+            <tr>
+                <td class="mono">{{ o.order_id }}</td>
+                <td class="mono">{{ o.quantity }}</td>
+                <td>
+                    {% if o.status.value == 'processed' %}<span class="badge badge--warn">открыт</span>
+                    {% elif o.status.value == 'confirmed' %}<span class="badge badge--good">подтверждён</span>
+                    {% else %}<span class="badge">отменён</span>{% endif %}
+                </td>
+                <td>{{ o.processed_at.strftime('%d.%m.%Y %H:%M:%S') }}</td>
+                <td>
+                    {% if o.status.value == 'processed' %}
+                    <form method="post" action="/testing/simulate-confirm" style="display:inline;">
+                        <input type="hidden" name="uid_1c" value="{{ product.uid_1c }}">
+                        <input type="hidden" name="account_id" value="{{ account.id }}">
+                        <input type="hidden" name="order_id" value="{{ o.order_id }}">
+                        <button type="submit" class="btn">Симулировать подтверждение</button>
+                    </form>
+                    <form method="post" action="/testing/simulate-cancel" style="display:inline;">
+                        <input type="hidden" name="uid_1c" value="{{ product.uid_1c }}">
+                        <input type="hidden" name="account_id" value="{{ account.id }}">
+                        <input type="hidden" name="order_id" value="{{ o.order_id }}">
+                        <button type="submit" class="btn">Симулировать отмену</button>
+                    </form>
+                    {% endif %}
+                </td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <div class="empty-state">Тестовых заказов ещё не было.</div>
+    {% endif %}
+</div>
+
+<div class="card">
+    <h3 style="margin-top:0">Шаг 3 — очистить тестовые данные</h3>
+    <p class="help-text">
+        Возвращает физический остаток к исходному значению (если есть незакрытые тестовые заказы),
+        рассылает исправленный остаток по всем кабинетам с включённой синхронизацией и удаляет
+        тестовые записи (заказы, задания в 1С, аномалии) — они больше нигде не будут мешать реальной работе.
+    </p>
+    <form method="post" action="/testing/cleanup">
+        <input type="hidden" name="uid_1c" value="{{ product.uid_1c }}">
+        <input type="hidden" name="account_id" value="{{ account.id }}">
+        <button type="submit" class="btn" {% if not test_orders %}disabled{% endif %}>Очистить тестовые данные</button>
+    </form>
+</div>
+
+<div class="card">
+    <h3 style="margin-top:0">Живой журнал</h3>
+    <p class="help-text">Обновляется автоматически каждые 2 секунды — держите страницу открытой при отладке.</p>
+    <div id="test-log" style="max-height: 360px; overflow-y: auto;"
+         hx-get="/testing/log-rows?uid_1c={{ product.uid_1c }}&account_id={{ account.id }}"
+         hx-trigger="every 2s" hx-swap="innerHTML">
+        {% include "testing_log_rows.html" %}
+    </div>
+</div>
+{% endif %}
+
+{% endif %}
+
+{% endblock %}

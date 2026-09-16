@@ -1,0 +1,111 @@
+{% extends "base.html" %}
+{% block title %}API-ключи{% endblock %}
+{% block content %}
+
+<div class="page-header">
+    <div>
+        <h1>API-ключи и кабинеты</h1>
+        <p>Доступы для подключения к Wildberries, Ozon и Яндекс KIT. На одной площадке может быть несколько кабинетов (например, разные ИП на WB).</p>
+    </div>
+</div>
+
+<div class="card">
+    <h3 style="margin-top:0">Склады, которые нужны в 1С</h3>
+    <p class="help-text">
+        Заведите в старой базе 1С склады <b>ровно с такими названиями</b> (или переименуйте существующие) —
+        код ищет их по точному совпадению имени. Список меняется автоматически: склад «Ожидает» появляется здесь,
+        как только для соответствующей площадки добавлен хотя бы один активный кабинет.
+    </p>
+    {% if required_warehouses %}
+    <table>
+        <thead><tr><th>Название склада</th><th>Назначение</th><th>Использует</th></tr></thead>
+        <tbody>
+            {% for w in required_warehouses %}
+            <tr>
+                <td class="mono">{{ w.name }}</td>
+                <td>{{ w.purpose }}</td>
+                <td>{{ w.used_by }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <div class="empty-state">Кабинетов ещё нет — список складов появится после добавления первого.</div>
+    {% endif %}
+</div>
+
+<div class="card">
+    <h3 style="margin-top:0">Добавить кабинет</h3>
+    <form method="post" action="/api-keys/accounts/create" style="display:flex; align-items:flex-end; gap:12px;">
+        <div class="field">
+            <label for="new-platform">Площадка</label>
+            <select id="new-platform" name="platform" required>
+                {% for p in platforms %}
+                <option value="{{ p.value }}">{{ platform_labels[p] }}</option>
+                {% endfor %}
+            </select>
+        </div>
+        <div class="field" style="flex:1">
+            <label for="new-name">Название кабинета</label>
+            <input type="text" id="new-name" name="name" placeholder="например, ИП Яворская" required>
+        </div>
+        <button type="submit" class="btn-primary">Добавить</button>
+    </form>
+</div>
+
+{% for account in accounts %}
+<div class="card" style="{% if not account.is_active %}opacity: 0.55;{% endif %}">
+    <div style="display:flex; justify-content:space-between; align-items:baseline;">
+        <h3 style="margin-top:0">
+            {{ account.name }}
+            <span class="badge badge--good" style="margin-left:6px;">{{ account.platform_label }}</span>
+            {% if not account.is_active %}<span class="badge badge--bad" style="margin-left:6px;">отключён</span>{% endif %}
+        </h3>
+        {% if account.is_active %}
+        <form method="post" action="/api-keys/accounts/{{ account.id }}/deactivate">
+            <button type="submit" class="btn">Отключить кабинет</button>
+        </form>
+        {% else %}
+        <form method="post" action="/api-keys/accounts/{{ account.id }}/activate">
+            <button type="submit" class="btn-primary">Включить кабинет</button>
+        </form>
+        {% endif %}
+    </div>
+
+    <form method="post" action="/api-keys/accounts/{{ account.id }}/warehouse"
+          style="display:flex; align-items:flex-end; gap:12px; margin-bottom: 12px;">
+        <div class="field" style="flex:1">
+            <label>ID склада на площадке (для отправки остатков)</label>
+            <input type="text" name="warehouse_id" value="{{ account.warehouse_id }}" autocomplete="off">
+        </div>
+        <button type="submit" class="btn-primary">Сохранить</button>
+    </form>
+
+    {% for field in account.fields %}
+    <form method="post" action="/api-keys/accounts/{{ account.id }}/{{ field.field_name }}"
+          style="display:flex; align-items:flex-end; gap:12px; margin-bottom: 12px;">
+        <div class="field" style="flex:1">
+            <label>{{ field.field_label }}</label>
+            <input type="text" name="value"
+                   placeholder="{% if field.is_set %}{{ field.masked }}{% else %}не задано{% endif %}"
+                   autocomplete="off">
+            {% if field.is_set %}
+                <div class="help-text">
+                    Текущее значение: {{ field.masked }} · обновлено
+                    {{ field.updated_at.strftime('%d.%m.%Y %H:%M') if field.updated_at else '' }}
+                </div>
+            {% else %}
+                <div class="help-text">Ключ не задан</div>
+            {% endif %}
+        </div>
+        <button type="submit" class="btn-primary">Сохранить</button>
+    </form>
+    {% endfor %}
+</div>
+{% endfor %}
+
+{% if not accounts %}
+<div class="empty-state">Кабинетов ещё нет — добавьте первый через форму выше.</div>
+{% endif %}
+
+{% endblock %}
