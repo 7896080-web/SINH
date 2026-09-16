@@ -1,0 +1,101 @@
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from datetime import date
+
+
+@dataclass
+class PlatformOrder:
+    """Единый формат заказа независимо от площадки — то, с чем работает
+    order_poller.py, не зная деталей конкретного API."""
+    order_id: str
+    barcode: str
+    quantity: int
+    raw_status: str
+    is_cancellation: bool = False
+    is_partial_refund: bool = False
+    refused_quantity: int = 0  # заполняется только для partial_refund (Kit)
+    order_date: date | None = None  # реальная дата заказа — только для бэкфилла (get_orders_since)
+
+
+@dataclass
+class StockPushItem:
+    barcode: str
+    quantity: int
+    # Идентификаторы товара на площадке для отправки остатка (заполняет
+    # dispatch из каталога). У каждой площадки свой ключ остатка:
+    #   WB   — sku = barcode;
+    #   Ozon — offer_id = article (артикул продавца);
+    #   Kit  — variant_id = external_id (UUID варианта).
+    # Пусты, если каталог кабинета не загружен — тогда клиент падает обратно
+    # на barcode (корректно только для WB).
+    external_id: str = ""
+    article: str = ""
+
+
+@dataclass
+class CatalogItem:
+    """Строка каталога площадки — для страницы «Мэппинг»."""
+    external_id: str
+    barcode: str
+    article: str
+    name: str
+
+
+class PlatformClient(ABC):
+    """Общий контракт. Конкретные реализации — wb.py / ozon.py / kit.py.
+
+    ВАЖНО: ни один из трёх клиентов не тестировался против реальных
+    рабочих API-ключей (их ещё нет в системе) — код написан строго по
+    документации, собранной на этапе проектирования (раздел 12
+    спецификации), но живого end-to-end прогона не было. Первое
+    реальное подключение может вскрыть неточности в формате заголовков
+    или структуре ответа — это стоит проверить в первую очередь."""
+
+    name: str
+
+    @abstractmethod
+    def get_orders_awaiting_confirmation(self) -> list[PlatformOrder]:
+        """Заказы в статусе 'ожидает подтверждения' — наш триггер списания."""
+
+    @abstractmethod
+    def get_cancelled_orders(self, order_ids: list[str]) -> list[PlatformOrder]:
+        """Из списка ранее обработанных ID — те, что оказались отменены."""
+
+    def get_orders_since(self, date_from: date) -> list[PlatformOrder]:
+        """Историческая выборка FBS-заказов с даты date_from — для бэкфилла
+        «старта задним числом» (страница тестирования). Каждый PlatformOrder
+        несёт order_date — реальную дату заказа на площадке, которой будет
+        датирован документ перемещения в 1С. По умолчанию не реализовано
+        (пустой список); переопределяется в конкретных клиентах."""
+        return []
+
+    def get_confirmed_orders(self, order_ids: list[str]) -> list[PlatformOrder]:
+        """Из ранее принятых заказов — те, что площадка перевела в
+        «подтверждён/отгружен». Это триггер перемещения в 1С
+        «<Площадка>.Ожидает» → «Склад <Площадка>» (process_confirmation).
+
+        ВНИМАНИЕ: детект статуса подтверждения по каждой площадке ещё НЕ
+        реализован — нужны реальные статусы живого API (WB supplierStatus,
+        Ozon posting status, Kit статус), которых пока нет в системе. По
+        умолчанию возвращает [] (ничего не подтверждается, движение не
+        создаётся). Переопределить в конкретном клиенте, когда статусы
+        подтвердятся на живых ключах. Сама 1С-механика подтверждения
+        (перемещение, статус заказа) уже реализована и покрыта тестами."""
+        return []
+
+    @abstractmethod
+    def push_stock(self, warehouse_id: str, items: list[StockPushItem]) -> dict:
+        """Отправка батча остатков. Возвращает {'ok': [...], 'errors': [...]}."""
+
+    @abstractmethod
+    def get_catalog_items(self) -> list[CatalogItem]:
+        """Полная спецификация карточек площадки — баркод, артикул, название.
+        Используется страницей «Мэппинг» (кнопка «Загрузить спецификацию»)
+        для обогащения конфликтов сопоставления контекстом с площадки, и
+        воркером catalog_poller.py для индикатора-предложения ⚡."""
+
+    @abstractmethod
+    def test_connection(self) -> tuple[bool, str]:
+        """Лёгкий, безопасный (read-only) запрос — проверить, что ключи
+        валидны и площадка отвечает, не затрагивая никакие данные.
+        Возвращает (успех, человекочитаемое сообщение)."""

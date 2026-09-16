@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% block title %}Аномалии синхронизации{% endblock %}
+{% block content %}
+
+<div class="page-header">
+    <div>
+        <h1>Аномалии синхронизации</h1>
+        <p>Заказы на товары без синхронизации и включённые кабинеты без баркода</p>
+    </div>
+    <div class="toolbar">
+        <a id="export-link" href="/anomalies/export?status={{ status }}&q={{ q }}&account_id={{ account_id }}" class="btn">Экспорт в Excel</a>
+        <form method="post" action="/anomalies/import" enctype="multipart/form-data" style="display:inline;">
+            <label class="btn file-upload-btn">
+                Импорт из Excel
+                <input type="file" name="file" accept=".xlsx" onchange="this.form.submit()">
+            </label>
+        </form>
+    </div>
+</div>
+
+<div style="margin-bottom: 14px;">
+    <a href="/anomalies?status=new" class="btn {% if status == 'new' %}btn-primary{% endif %}">
+        Необработанные{% if new_count %} ({{ new_count }}){% endif %}
+    </a>
+    <a href="/anomalies?status=resolved" class="btn {% if status == 'resolved' %}btn-primary{% endif %}">Обработанные</a>
+</div>
+
+<form class="filters"
+      hx-get="/anomalies/rows"
+      hx-target="#anomalies-table"
+      hx-trigger="keyup changed delay:400ms from:input, change from:select"
+      hx-include="this">
+    <input type="hidden" name="status" value="{{ status }}">
+
+    <div class="field">
+        <label for="q">Поиск</label>
+        <input type="search" id="q" name="q" value="{{ q }}" placeholder="артикул, наименование">
+    </div>
+
+    <div class="field">
+        <label for="account_id">Кабинет</label>
+        <select id="account_id" name="account_id">
+            <option value="">Все</option>
+            {% for a in accounts %}
+            <option value="{{ a.id }}" {% if account_id == a.id|string %}selected{% endif %}>{{ a.name }} ({{ a.platform.value|upper }})</option>
+            {% endfor %}
+        </select>
+    </div>
+
+    <div class="field">
+        <label for="reason">Причина</label>
+        <select id="reason" name="reason">
+            <option value="">Все</option>
+            {% for r in reasons %}
+            <option value="{{ r.value }}" {% if reason == r.value %}selected{% endif %}>{{ reason_labels[r] }}</option>
+            {% endfor %}
+        </select>
+    </div>
+</form>
+
+<div class="card" style="padding:0;">
+    <div id="anomalies-table">
+        {% include "anomalies_rows.html" %}
+    </div>
+</div>
+
+<script>
+    document.querySelector('.filters').addEventListener('input', function () {
+        var q = document.getElementById('q').value;
+        var accountId = document.getElementById('account_id').value;
+        var status = document.querySelector('input[name=status]').value;
+        var reason = document.getElementById('reason').value;
+        document.getElementById('export-link').href =
+            '/anomalies/export?status=' + encodeURIComponent(status) +
+            '&q=' + encodeURIComponent(q) +
+            '&account_id=' + encodeURIComponent(accountId) +
+            '&reason=' + encodeURIComponent(reason);
+    });
+</script>
+
+{% endblock %}

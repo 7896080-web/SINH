@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}Синхронизируемые товары{% endblock %}
+{% block content %}
+
+<div class="page-header">
+    <div>
+        <h1>Синхронизируемые товары</h1>
+        <p>Галочка — товар передаётся в кабинет. ⚡ — карточка найдена в кабинете, предлагается включить.
+        Число под галочкой — минимальный порог: ниже него на площадку уходит 0, а не фактический остаток.</p>
+    </div>
+    <div class="toolbar">
+        <a id="export-link" href="/sync-products/export?q={{ q }}&only_proposals={{ only_proposals|lower }}" class="btn">Экспорт в Excel</a>
+        <form method="post" action="/sync-products/import" enctype="multipart/form-data" style="display:inline;">
+            <label class="btn file-upload-btn">
+                Импорт из Excel
+                <input type="file" name="file" accept=".xlsx" onchange="this.form.submit()">
+            </label>
+        </form>
+    </div>
+</div>
+
+<form class="filters"
+      hx-get="/sync-products/rows"
+      hx-target="#sync-table"
+      hx-trigger="keyup changed delay:400ms from:input, change from:input[type=checkbox]"
+      hx-include="this">
+
+    <div class="field">
+        <label for="q">Поиск</label>
+        <input type="search" id="q" name="q" value="{{ q }}" placeholder="артикул, наименование">
+    </div>
+
+    <label class="checkbox-inline" style="padding-bottom:8px;">
+        <input type="checkbox" name="only_proposals" value="true" {% if only_proposals %}checked{% endif %}>
+        Только с предложениями ⚡
+    </label>
+</form>
+
+<div class="card" style="padding:0;">
+    <div id="sync-table">
+        {% include "sync_products_rows.html" %}
+    </div>
+</div>
+
+<script>
+    document.querySelector('.filters').addEventListener('input', function () {
+        var q = document.getElementById('q').value;
+        var onlyProposals = document.querySelector('input[name=only_proposals]').checked;
+        document.getElementById('export-link').href =
+            '/sync-products/export?q=' + encodeURIComponent(q) +
+            '&only_proposals=' + onlyProposals;
+    });
+</script>
+
+{% endblock %}

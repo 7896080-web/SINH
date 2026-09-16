@@ -1,0 +1,55 @@
+{% if rows %}
+<table>
+    <thead>
+        <tr>
+            <th>Товар</th>
+            <th>Кабинет</th>
+            <th>Причина</th>
+            <th style="text-align:right;">Заказов поймано</th>
+            <th>Последний раз</th>
+            <th></th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for row in rows %}
+        <tr id="anomaly-{{ row.uid_1c }}-{{ row.account_id }}-{{ row.reason.value }}">
+            <td>
+                <div>{{ row.name or '—' }}</div>
+                <div class="mono help-text">{{ row.article or '—' }}</div>
+                <div class="help-text">{{ row.size or '' }}{% if row.color %} · {{ row.color }}{% endif %}</div>
+            </td>
+            <td>{{ row.account_name }} <span class="help-text">{{ row.account_platform.value|upper }}</span></td>
+            <td>
+                {% if row.reason.value == 'order_on_disabled' %}
+                    <span class="badge badge--bad">{{ reason_labels[row.reason] }}</span>
+                {% else %}
+                    <span class="badge badge--warn">{{ reason_labels[row.reason] }}</span>
+                {% endif %}
+            </td>
+            <td class="mono" style="text-align:right;">{{ row.occurrences }}</td>
+            <td>{{ row.last_detected.strftime('%d.%m.%Y %H:%M') }}</td>
+            <td>
+                {% if status == 'new' %}
+                <label class="checkbox-inline">
+                    <input type="checkbox"
+                           hx-post="/anomalies/{{ row.uid_1c }}/{{ row.account_id }}/resolve"
+                           hx-target="#anomaly-{{ row.uid_1c }}-{{ row.account_id }}-{{ row.reason.value }}"
+                           hx-swap="outerHTML"
+                           hx-confirm="Включить синхронизацию для «{{ row.name }}» в кабинете {{ row.account_name }}?">
+                    Синхронизировать
+                </label>
+                {% endif %}
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% else %}
+<div class="empty-state">
+    {% if status == 'new' %}
+        Необработанных аномалий нет.
+    {% else %}
+        Обработанных записей по заданным фильтрам не найдено.
+    {% endif %}
+</div>
+{% endif %}

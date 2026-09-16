@@ -1,0 +1,27 @@
+[Unit]
+Description=Sync Admin - веб-интерфейс (FastAPI/Uvicorn)
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=syncadmin
+Group=syncadmin
+WorkingDirectory=/opt/sync_admin
+EnvironmentFile=/opt/sync_admin/.env
+ExecStart=/opt/sync_admin/venv/bin/gunicorn app.main:app \
+    --workers 2 \
+    --worker-class uvicorn.workers.UvicornWorker \
+    --bind 127.0.0.1:8000 \
+    --access-logfile /var/log/sync_admin/web-access.log \
+    --error-logfile /var/log/sync_admin/web-error.log
+
+Restart=always
+RestartSec=5
+
+# Отдельный системный пользователь, не root — приложение не должно
+# работать с полными правами на сервере
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

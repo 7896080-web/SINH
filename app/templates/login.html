@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Вход — Синхронизация площадок</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="login-shell">
+        <div class="login-card">
+            <h1>Синхронизация площадок</h1>
+            <p>Войдите, чтобы продолжить</p>
+            <form method="post" action="/login">
+                {% if error %}
+                    <div class="error-text">{{ error }}</div>
+                {% endif %}
+                <div class="field">
+                    <label for="username">Логин</label>
+                    <input type="text" id="username" name="username" value="{{ username or '' }}" autofocus required>
+                </div>
+                <div class="field">
+                    <label for="password">Пароль</label>
+                    <input type="password" id="password" name="password" required>
+                </div>
+                <button type="submit" class="btn-primary">Войти</button>
+            </form>
+        </div>
+    </div>
+</body>
+</html>

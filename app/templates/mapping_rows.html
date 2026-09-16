@@ -1,0 +1,63 @@
+{% if view == 'conflicts' %}
+    {% if rows %}
+    <table>
+        <thead>
+            <tr>
+                <th>Баркод</th>
+                <th>Кабинет</th>
+                <th>Название на площадке</th>
+                <th>Артикул на площадке</th>
+                <th>Попыток</th>
+                <th>Впервые увиден</th>
+                <th>Последний раз</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for row in rows %}
+            <tr>
+                <td class="mono">{{ row.barcode }}</td>
+                <td>{{ row.account_name }} <span class="help-text">{{ row.account_platform.value|upper }}</span></td>
+                <td>{{ row.platform_name or '—' }}</td>
+                <td class="mono">{{ row.platform_article or '—' }}</td>
+                <td class="mono">{{ row.attempts }}</td>
+                <td>{{ row.first_seen.strftime('%d.%m.%Y %H:%M') }}</td>
+                <td>{{ row.last_seen.strftime('%d.%m.%Y %H:%M') }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <div class="empty-state">Конфликтов сопоставления не найдено — все баркоды с площадок распознаны.</div>
+    {% endif %}
+{% else %}
+    {% if rows %}
+    <table>
+        <thead>
+            <tr>
+                <th>Баркод</th>
+                <th>Артикул</th>
+                <th>Размер</th>
+                <th>Цвет</th>
+                <th>Наименование</th>
+                <th>Источник</th>
+                <th>Добавлен</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for row in rows %}
+            <tr>
+                <td class="mono">{{ row.barcode }}</td>
+                <td class="mono">{{ row.product.article or '—' }}</td>
+                <td>{{ row.product.size or '' }}</td>
+                <td>{{ row.product.color or '' }}</td>
+                <td>{{ row.product.name or '—' }}</td>
+                <td>{{ row.source_platform or 'выгрузка из 1С' }}</td>
+                <td>{{ row.created_at.strftime('%d.%m.%Y %H:%M') }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <div class="empty-state">По заданным фильтрам ничего не найдено.</div>
+    {% endif %}
+{% endif %}

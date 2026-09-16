@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+{% block title %}Мэппинг{% endblock %}
+{% block content %}
+
+<div class="page-header">
+    <div>
+        <h1>Мэппинг</h1>
+        <p>Сопоставление баркодов с номенклатурой 1С</p>
+    </div>
+    <div class="toolbar">
+        <a id="export-link" href="/mapping/export?view={{ view }}&q={{ q }}&source_platform={{ source_platform }}&account_id={{ account_id }}" class="btn">Экспорт в Excel</a>
+        <form method="post" action="/mapping/import" enctype="multipart/form-data" style="display:inline;">
+            <label class="btn file-upload-btn">
+                Импорт из Excel
+                <input type="file" name="file" accept=".xlsx" onchange="this.form.submit()">
+            </label>
+        </form>
+    </div>
+</div>
+
+<div style="margin-bottom: 14px;">
+    <a href="/mapping?view=mapped" class="btn {% if view == 'mapped' %}btn-primary{% endif %}">Сопоставленные</a>
+    <a href="/mapping?view=conflicts" class="btn {% if view == 'conflicts' %}btn-primary{% endif %}">
+        Конфликты{% if conflicts_count %} ({{ conflicts_count }}){% endif %}
+    </a>
+</div>
+
+{% if view == 'conflicts' %}
+<p class="help-text" style="margin: -8px 0 14px;">
+    Чтобы разрешить конфликт: экспортируйте список, заполните колонку «ID_1С» (посмотреть ID можно на
+    вкладке «Сопоставленные» — экспортируйте её, там ID проставлены у существующих товаров), загрузите файл обратно.
+    Колонки «Название/Артикул на площадке» помогают понять, что это за товар — заполнятся, если загрузить
+    спецификацию соответствующего кабинета.
+</p>
+<div class="toolbar" style="margin-bottom: 14px; flex-wrap: wrap;">
+    {% for a in accounts %}
+    <form method="post" action="/mapping/load-catalog/{{ a.id }}" style="display:inline;">
+        <button type="submit" class="btn">Загрузить спецификацию: {{ a.name }} ({{ a.platform.value|upper }})</button>
+    </form>
+    {% endfor %}
+</div>
+{% endif %}
+
+<form class="filters"
+      hx-get="/mapping/rows"
+      hx-target="#mapping-table"
+      hx-trigger="keyup changed delay:400ms from:input, change from:select"
+      hx-include="this">
+    <input type="hidden" name="view" value="{{ view }}">
+
+    <div class="field">
+        <label for="q">Поиск</label>
+        <input type="search" id="q" name="q" value="{{ q }}"
+               placeholder="{% if view == 'conflicts' %}баркод, название{% else %}баркод, артикул, наименование{% endif %}">
+    </div>
+
+    {% if view == 'conflicts' %}
+    <div class="field">
+        <label for="account_id">Кабинет</label>
+        <select id="account_id" name="account_id">
+            <option value="">Все</option>
+            {% for a in accounts %}
+            <option value="{{ a.id }}" {% if account_id == a.id|string %}selected{% endif %}>{{ a.name }} ({{ a.platform.value|upper }})</option>
+            {% endfor %}
+        </select>
+    </div>
+    {% else %}
+    <div class="field">
+        <label for="source_platform">Площадка</label>
+        <select id="source_platform" name="source_platform">
+            <option value="">Все</option>
+            {% for p in platforms %}
+            <option value="{{ p.value }}" {% if source_platform == p.value %}selected{% endif %}>{{ p.value|upper }}</option>
+            {% endfor %}
+        </select>
+    </div>
+    {% endif %}
+</form>
+
+<div class="card" style="padding:0;">
+    <div id="mapping-table">
+        {% include "mapping_rows.html" %}
+    </div>
+</div>
+
+<script>
+    // Держим ссылку "Экспорт" в актуальном состоянии, если фильтры меняются
+    // без перезагрузки страницы (живая фильтрация через HTMX).
+    document.querySelector('.filters').addEventListener('input', function () {
+        var q = document.getElementById('q').value;
+        var view = document.querySelector('input[name=view]').value;
+        var platformEl = document.getElementById('source_platform');
+        var accountEl = document.getElementById('account_id');
+        var platform = platformEl ? platformEl.value : '';
+        var account = accountEl ? accountEl.value : '';
+        document.getElementById('export-link').href =
+            '/mapping/export?view=' + encodeURIComponent(view) +
+            '&q=' + encodeURIComponent(q) +
+            '&source_platform=' + encodeURIComponent(platform) +
+            '&account_id=' + encodeURIComponent(account);
+    });
+</script>
+
+{% endblock %}

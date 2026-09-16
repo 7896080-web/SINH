@@ -1,0 +1,134 @@
+{% extends "base.html" %}
+{% block title %}Диагностика{% endblock %}
+{% block content %}
+
+<div class="page-header">
+    <div>
+        <h1>Диагностика и стабильность</h1>
+        <p>Проверка подключения, ручной запуск синхронизации, состояние очередей и фоновых процессов.</p>
+    </div>
+</div>
+
+<div class="card">
+    <h3 style="margin-top:0">Общая картина</h3>
+    <table>
+        <tr><td>Конфликтов сопоставления</td><td class="mono" style="text-align:right">{{ global_stats.conflicts }}</td></tr>
+        <tr><td>Необработанных аномалий</td><td class="mono" style="text-align:right">{{ global_stats.anomalies_new }}</td></tr>
+        <tr><td>Ошибок в очереди рассылки</td><td class="mono" style="text-align:right">{{ global_stats.dispatch_errors_total }}</td></tr>
+    </table>
+</div>
+
+<div class="card">
+    <h3 style="margin-top:0">Общие фоновые процессы</h3>
+    <table>
+        <thead><tr><th>Процесс</th><th>Последний запуск</th><th>Статус</th></tr></thead>
+        <tbody>
+        {% for item in shared_heartbeats %}
+            <tr>
+                <td>{{ item.name }}</td>
+                {% if item.hb %}
+                <td>{{ item.hb.last_run_at.strftime('%d.%m.%Y %H:%M:%S') }}</td>
+                <td>
+                    {% if item.hb.last_success %}
+                        <span class="badge badge--good">ок</span>
+                    {% else %}
+                        <span class="badge badge--bad" title="{{ item.hb.last_error }}">ошибка</span>
+                    {% endif %}
+                </td>
+                {% else %}
+                <td colspan="2" class="help-text">ещё не запускался</td>
+                {% endif %}
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+{% for row in account_rows %}
+{% set account = row.account %}
+<div class="card" style="{% if not account.is_active %}opacity:0.6;{% endif %}">
+    <div style="display:flex; justify-content:space-between; align-items:baseline; flex-wrap:wrap; gap:8px;">
+        <h3 style="margin-top:0">
+            {{ account.name }}
+            <span class="badge badge--good">{{ account.platform.value|upper }}</span>
+            {% if not account.is_active %}<span class="badge badge--bad">отключён</span>{% endif %}
+            {% if account.consecutive_failures > 0 %}
+                <span class="badge badge--warn" title="{{ account.last_error or '' }}">
+                    сбоев подряд: {{ account.consecutive_failures }}
+                </span>
+            {% endif %}
+        </h3>
+        <div class="toolbar">
+            <form method="post" action="/diagnostics/accounts/{{ account.id }}/test-connection" style="display:inline;">
+                <button type="submit" class="btn">Проверить подключение</button>
+            </form>
+            <form method="post" action="/diagnostics/accounts/{{ account.id }}/poll-now" style="display:inline;">
+                <button type="submit" class="btn" {% if not account.is_active %}disabled{% endif %}>Опросить заказы сейчас</button>
+            </form>
+            <form method="post" action="/diagnostics/accounts/{{ account.id }}/catalog-now" style="display:inline;">
+                <button type="submit" class="btn" {% if not account.is_active %}disabled{% endif %}>Обновить каталог сейчас</button>
+            </form>
+            {% if account.consecutive_failures > 0 %}
+            <form method="post" action="/diagnostics/accounts/{{ account.id }}/reset-failures" style="display:inline;">
+                <button type="submit" class="btn">Сбросить счётчик сбоев</button>
+            </form>
+            {% endif %}
+        </div>
+    </div>
+
+    {% if account.last_connection_check_at %}
+    <p class="help-text">
+        Последняя проверка подключения: {{ account.last_connection_check_at.strftime('%d.%m.%Y %H:%M:%S') }} —
+        {% if account.last_connection_ok %}
+            <span style="color:var(--good)">{{ account.last_connection_message }}</span>
+        {% else %}
+            <span style="color:var(--bad)">{{ account.last_connection_message }}</span>
+        {% endif %}
+    </p>
+    {% endif %}
+
+    <table>
+        <tbody>
+            <tr>
+                <td>Опрос заказов — последний запуск</td>
+                <td>
+                    {% if row.heartbeat %}
+                        {{ row.heartbeat.last_run_at.strftime('%d.%m.%Y %H:%M:%S') }}
+                        {% if row.heartbeat.last_success %}
+                            <span class="badge badge--good">ок</span>
+                        {% else %}
+                            <span class="badge badge--bad" title="{{ row.heartbeat.last_error }}">ошибка</span>
+                        {% endif %}
+                    {% else %}
+                        <span class="help-text">ещё не запускался</span>
+                    {% endif %}
+                </td>
+            </tr>
+            <tr>
+                <td>Очередь рассылки</td>
+                <td>
+                    ожидает: <span class="mono">{{ row.queue.dispatch_pending }}</span>
+                    {% if row.queue.dispatch_errors %}
+                    · <span class="badge badge--bad">ошибок: {{ row.queue.dispatch_errors }}</span>
+                    {% endif %}
+                </td>
+            </tr>
+            <tr>
+                <td>Задания в 1С (FTP)</td>
+                <td>
+                    в пути: <span class="mono">{{ row.queue.ftp_pending }}</span>
+                    {% if row.queue.ftp_timeout %}
+                    · <span class="badge badge--bad">просрочено: {{ row.queue.ftp_timeout }}</span>
+                    {% endif %}
+                </td>
+            </tr>
+        </tbody>
+    </table>
+</div>
+{% endfor %}
+
+{% if not account_rows %}
+<div class="empty-state">Кабинетов ещё нет — добавьте их на странице «API-ключи».</div>
+{% endif %}
+
+{% endblock %}

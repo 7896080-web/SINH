@@ -1,0 +1,10 @@
+{% if results %}
+{% for p in results %}
+<a href="/testing?uid_1c={{ p.uid_1c }}&account_id={{ account_id }}&start_date={{ start_date }}">
+    <strong>{{ p.article }}</strong> — {{ p.name }}{% if p.size or p.color %} · {{ p.size or '' }}{% if p.color %}/{{ p.color }}{% endif %}{% endif %}
+    <span class="muted">(остаток {{ p.stock_on_hand }})</span>
+</a>
+{% endfor %}
+{% elif q %}
+<div class="empty">Ничего не найдено среди сопоставленных товаров.</div>
+{% endif %}
