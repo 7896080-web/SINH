@@ -362,3 +362,85 @@ def test_simulate_confirm_moves_to_platform_warehouse(logged_in_client, web_db):
     # только фиксируется статус confirmed (см. process_confirmation).
     task = web_db.query(FtpTask).filter(FtpTask.command == "CONFIRM_MOVEMENT").first()
     assert task is None
+
+
+def _seed_backfill_history(web_db, a1, a2):
+    """Реальный след прошлого бэкфилла по u1 + чужой товар u2 + синтетический TEST-."""
+    from app.models import (Product, Barcode, ProcessedOrder, FtpTask, FtpTaskStatus,
+                            DispatchQueueItem, TestLogEntry, TestLogLevel, SyncAnomaly, AnomalyReason)
+    web_db.add(Product(broadcast_enabled=True, uid_1c="u2", article="ART-2", name="Чужой", stock_on_hand=4))
+    web_db.add(Barcode(barcode="222", uid_1c="u2"))
+    web_db.add_all([
+        ProcessedOrder(account_id=a1.id, order_id="WB-1", uid_1c="u1", quantity=1),
+        ProcessedOrder(account_id=a2.id, order_id="OZ-1", uid_1c="u1", quantity=2),
+        ProcessedOrder(account_id=a1.id, order_id="TEST-keep", uid_1c="u1", quantity=1),
+        ProcessedOrder(account_id=a1.id, order_id="WB-other", uid_1c="u2", quantity=1),
+        FtpTask(command="CREATE_MOVEMENT", barcode="111", quantity=1, order_id="WB-1", account_id=a1.id,
+                status=FtpTaskStatus.done),
+        FtpTask(command="CREATE_MOVEMENT", barcode="111", quantity=2, order_id="OZ-1", account_id=a2.id,
+                status=FtpTaskStatus.done),
+        FtpTask(command="CREATE_MOVEMENT", barcode="222", quantity=1, order_id="WB-other", account_id=a1.id,
+                status=FtpTaskStatus.done),
+        DispatchQueueItem(uid_1c="u1", account_id=a1.id, quantity=9, reason="order"),
+        DispatchQueueItem(uid_1c="u2", account_id=a1.id, quantity=4, reason="order"),
+        TestLogEntry(uid_1c="u1", account_id=a1.id, level=TestLogLevel.info, action="backfill", message="x"),
+        SyncAnomaly(uid_1c="u1", account_id=a1.id, reason=AnomalyReason.order_on_disabled, order_id="WB-1"),
+    ])
+    web_db.commit()
+
+
+def test_reset_backfill_removes_real_history_keeps_stock_and_others(logged_in_client, web_db):
+    a1, a2 = _seed(web_db)
+    _seed_backfill_history(web_db, a1, a2)
+    from app.models import Product, ProcessedOrder, FtpTask, DispatchQueueItem, TestLogEntry, SyncAnomaly, AuditLog
+
+    r = logged_in_client.post("/testing/reset-backfill",
+                              data={"uid_1c": "u1", "account_id": a1.id, "confirm_deleted_in_1c": "1"},
+                              follow_redirects=False)
+    assert r.status_code == 303
+
+    left = {o.order_id for o in web_db.query(ProcessedOrder).all()}
+    assert left == {"TEST-keep", "WB-other"}  # реальные u1 сняты, синтетический и чужой остались
+    assert {t.order_id for t in web_db.query(FtpTask).all()} == {"WB-other"}
+    assert web_db.query(SyncAnomaly).count() == 0
+    assert web_db.query(TestLogEntry).filter(TestLogEntry.action == "backfill").count() == 0
+    assert web_db.query(DispatchQueueItem).filter(DispatchQueueItem.uid_1c == "u2").count() == 1
+
+    product = web_db.query(Product).filter(Product.uid_1c == "u1").first()
+    assert product.stock_on_hand == 10  # остаток не трогаем — его выравнивает сверка
+
+    fresh = web_db.query(DispatchQueueItem).filter(
+        DispatchQueueItem.uid_1c == "u1", DispatchQueueItem.reason == "backfill_reset").all()
+    assert {i.account_id for i in fresh} == {a1.id, a2.id}
+    assert web_db.query(AuditLog).filter(AuditLog.action == "test_reset_backfill").count() == 1
+
+
+def test_reset_backfill_requires_confirmation_checkbox(logged_in_client, web_db):
+    a1, a2 = _seed(web_db)
+    _seed_backfill_history(web_db, a1, a2)
+    from app.models import ProcessedOrder
+
+    logged_in_client.post("/testing/reset-backfill", data={"uid_1c": "u1", "account_id": a1.id})
+    assert web_db.query(ProcessedOrder).count() == 4
+
+
+def test_reset_backfill_refuses_while_1c_task_open(logged_in_client, web_db):
+    a1, a2 = _seed(web_db)
+    _seed_backfill_history(web_db, a1, a2)
+    from app.models import ProcessedOrder, FtpTask, FtpTaskStatus
+    task = web_db.query(FtpTask).filter(FtpTask.order_id == "WB-1").first()
+    task.status = FtpTaskStatus.sent
+    web_db.commit()
+
+    r = logged_in_client.post("/testing/reset-backfill",
+                              data={"uid_1c": "u1", "account_id": a1.id, "confirm_deleted_in_1c": "1"})
+    assert web_db.query(ProcessedOrder).count() == 4
+    assert "незавершённых заданий 1С" in r.text
+
+
+def test_testing_page_shows_backfill_reset_card(logged_in_client, web_db):
+    a1, a2 = _seed(web_db)
+    _seed_backfill_history(web_db, a1, a2)
+    r = logged_in_client.get(f"/testing?uid_1c=u1&account_id={a1.id}")
+    assert "Сброс истории бэкфилла" in r.text
+    assert "Записей прошлого прогона: <b>2</b>" in r.text

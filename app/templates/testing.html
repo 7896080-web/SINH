@@ -107,6 +107,19 @@
 </div>
 
 <div class="card">
+    <h3 style="margin-top:0">Сброс истории бэкфилла (все кабинеты)</h3>
+    <p class="help-text">Чтобы провести «старт задним числом» заново после удаления документов перемещения в 1С. Удаляет по этому товару реальные записи прошлого прогона: обработанные заказы (кроме синтетических TEST-), задания 1С и аномалии по ним, очередь рассылки и живой журнал. Остаток ЦС <b>не меняет</b> — его выравнивает сверка с 1С. Пока по заказам есть незавершённые задания 1С, сброс невозможен.</p>
+    <p>Записей прошлого прогона: <b>{{ backfill.orders }}</b>{% if backfill.open_tasks %} · незавершённых заданий 1С: <b class="badge badge--warn">{{ backfill.open_tasks }}</b>{% endif %}</p>
+    <form method="post" action="/testing/reset-backfill"
+          onsubmit="return confirm('Сбросить историю бэкфилла по товару ({{ backfill.orders }} заказов)? Записи будут удалены без возврата.');">
+        <input type="hidden" name="uid_1c" value="{{ product.uid_1c }}">
+        <input type="hidden" name="account_id" value="{{ selected_account_id }}">
+        <label style="display:block; margin-bottom:8px;"><input type="checkbox" name="confirm_deleted_in_1c" value="1" required> Документы перемещения по этим заказам в 1С удалены</label>
+        <button type="submit" class="btn" {% if backfill.orders == 0 or backfill.open_tasks %}disabled{% endif %}>Сбросить историю бэкфилла</button>
+    </form>
+</div>
+
+<div class="card">
     <h3 style="margin-top:0">Порог трансляции</h3>
     <p class="help-text">Задайте зависимость: «доступно на дату» и «остаток ЦС на дату» — порог = ЦС на дату − доступно (может быть и отрицательным). Дальше на площадки уходит <b>max(0, текущий ЦС − порог)</b>. Порог фиксирован и сам отслеживает все движения склада (приход, расход, списание, пересортица, перемещение) через текущий остаток ЦС — не накапливается и не дрейфует. «Сбросить» — вернуть автоматический расчёт от остатка. Значение общее для всех кабинетов.</p>
     <p>Сейчас передаётся на площадки: <b>{{ current_send }}</b>

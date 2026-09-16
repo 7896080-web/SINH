@@ -10,7 +10,7 @@ from app.database import get_db
 from app.dependencies import get_current_user
 from app.models import (
     Product, Barcode, SyncSetting, PlatformAccount, ProcessedOrder, OrderProcessStatus,
-    DispatchQueueItem, FtpTask, SyncAnomaly, TestLogEntry, TestLogLevel, User,
+    DispatchQueueItem, FtpTask, FtpTaskStatus, SyncAnomaly, TestLogEntry, TestLogLevel, User,
 )
 from app.workers.client_factory import build_client
 from app.workers.credentials import CredentialsMissing
@@ -54,6 +54,34 @@ def _sku_send(product) -> int:
     if product.transmit_override is not None:
         return max(0, product.transmit_override)
     return max(0, (product.stock_on_hand or 0) - (product.reserve or 0))
+
+
+def _real_processed_orders(db: Session, uid_1c: str) -> list:
+    """Реальные (не синтетические TEST-) обработанные заказы товара по всем кабинетам —
+    след прошлого бэкфилла/живого опроса. Именно их снимает «Сброс истории бэкфилла»."""
+    return db.query(ProcessedOrder).filter(
+        ProcessedOrder.uid_1c == uid_1c, ProcessedOrder.order_id.notlike(f"{TEST_ORDER_PREFIX}%"),
+    ).order_by(ProcessedOrder.processed_at.asc()).all()
+
+
+def _open_1c_tasks(db: Session, orders: list) -> int:
+    """Сколько заданий 1С по этим заказам ещё не завершены (pending/sent): пока 1С
+    может их обработать, сбрасывать историю нельзя — в 1С появится документ без
+    записи у нас."""
+    n = 0
+    for o in orders:
+        n += db.query(FtpTask).filter(
+            FtpTask.order_id == o.order_id, FtpTask.account_id == o.account_id,
+            FtpTask.status.in_([FtpTaskStatus.pending, FtpTaskStatus.sent]), FtpTask.is_test.is_(False),
+        ).count()
+    return n
+
+
+def _backfill_summary(db: Session, product) -> dict:
+    if product is None:
+        return {"orders": 0, "open_tasks": 0}
+    orders = _real_processed_orders(db, product.uid_1c)
+    return {"orders": len(orders), "open_tasks": _open_1c_tasks(db, orders)}
 
 
 def _load_context(db: Session, uid_1c: str | None, account_id: int | None):
@@ -212,6 +240,7 @@ def testing_page(
         "product": product, "account": account, "barcode": barcode, "setting": setting,
         "test_orders": test_orders, "log_entries": log_entries,
         "current_send": _sku_send(product),
+        "backfill": _backfill_summary(db, product),
         "flash": pop_flash(request),
     })
 
@@ -552,6 +581,7 @@ def load_real_orders(
         "test_orders": test_orders, "log_entries": log_entries,
         "real_orders": real_orders, "real_orders_error": error,
         "current_send": _sku_send(product),
+        "backfill": _backfill_summary(db, product),
         "flash": pop_flash(request),
     })
 
@@ -680,4 +710,73 @@ def set_override(
     log_action(db, user.username, "test_set_override", f"{uid_1c}: {msg} targets={targets}")
     db.commit()
     set_flash(request, f"{msg} Поставлено в рассылку на {len(targets)} вкл. кабинет(ов).", "good")
+    return redirect
+
+
+@router.post("/testing/reset-backfill")
+def reset_backfill(
+    request: Request, uid_1c: str = Form(...), account_id: str = Form(""),
+    confirm_deleted_in_1c: str = Form(""),
+    db: Session = Depends(get_db), user: User = Depends(get_current_user),
+):
+    """Сброс истории бэкфилла по товару (все кабинеты): удаляет реальные записи
+    прошлого прогона — ProcessedOrder (кроме синтетических TEST-, их снимает
+    «Очистить тестовые данные»), задания 1С и аномалии по этим заказам, всю очередь
+    рассылки и живой журнал товара. Нужен, чтобы провести «старт задним числом»
+    заново после того, как оператор удалил документы перемещения в 1С: без сброса
+    идемпотентность по ProcessedOrder пометит все заказы «уже проведён».
+
+    Остаток stock_on_hand НЕ трогаем: он подтянется сверкой с 1С (раз в час) —
+    восстанавливать вручную нельзя, т.к. сверка могла уже учесть удаление
+    документов, и получилось бы задвоение. Отказываемся, пока по этим заказам есть
+    незавершённые задания 1С (pending/sent): 1С ещё может их провести."""
+    redirect = RedirectResponse(f"/testing?uid_1c={uid_1c}&account_id={account_id}", status_code=303)
+    product = db.query(Product).filter(Product.uid_1c == uid_1c).first()
+    if product is None:
+        set_flash(request, "Товар не найден.", "warn")
+        return redirect
+    if not confirm_deleted_in_1c:
+        set_flash(request, "Сброс не выполнен: подтвердите галочкой, что документы перемещения в 1С удалены.", "warn")
+        return redirect
+
+    orders = _real_processed_orders(db, uid_1c)
+    if not orders:
+        set_flash(request, "Истории бэкфилла по этому товару нет — сбрасывать нечего.", "warn")
+        return redirect
+    open_tasks = _open_1c_tasks(db, orders)
+    if open_tasks:
+        set_flash(request, f"Сброс не выполнен: по этим заказам ещё {open_tasks} незавершённых заданий 1С "
+                           f"(pending/sent). Дождитесь их обработки (1–2 цикла обмена) и повторите.", "warn")
+        return redirect
+
+    deleted_ftp = deleted_anomaly = 0
+    for o in orders:
+        deleted_ftp += db.query(FtpTask).filter(
+            FtpTask.order_id == o.order_id, FtpTask.account_id == o.account_id, FtpTask.is_test.is_(False),
+        ).delete(synchronize_session=False)
+        deleted_anomaly += db.query(SyncAnomaly).filter(
+            SyncAnomaly.order_id == o.order_id, SyncAnomaly.account_id == o.account_id,
+        ).delete(synchronize_session=False)
+    order_pks = [o.id for o in orders]
+    deleted_orders = db.query(ProcessedOrder).filter(ProcessedOrder.id.in_(order_pks)).delete(synchronize_session=False)
+    deleted_dispatch = db.query(DispatchQueueItem).filter(DispatchQueueItem.uid_1c == uid_1c).delete(synchronize_session=False)
+    deleted_log = db.query(TestLogEntry).filter(TestLogEntry.uid_1c == uid_1c).delete(synchronize_session=False)
+
+    # Площадкам — актуальное значение заново (dispatch пересчитает от текущего
+    # остатка/порога в момент отправки).
+    targets = []
+    for s in db.query(SyncSetting).filter(SyncSetting.uid_1c == uid_1c, SyncSetting.enabled.is_(True)).all():
+        db.add(DispatchQueueItem(uid_1c=uid_1c, account_id=s.account_id,
+                                 quantity=product.stock_on_hand, reason="backfill_reset"))
+        targets.append(s.account_id)
+
+    msg = (f"История бэкфилла сброшена: заказов {deleted_orders}, заданий 1С {deleted_ftp}, аномалий {deleted_anomaly}, "
+           f"записей рассылки {deleted_dispatch}, записей журнала {deleted_log}. Остаток ЦС не менялся "
+           f"({product.stock_on_hand}) — сверьте его с 1С или дождитесь сверки перед новым прогоном.")
+    acc_int = _acc_int(account_id)
+    if acc_int is not None:
+        _log(db, uid_1c, acc_int, TestLogLevel.good, "reset_backfill", f"{msg} Рассылка на кабинеты: {targets}.")
+    log_action(db, user.username, "test_reset_backfill", f"{uid_1c}: {msg} targets={targets}")
+    db.commit()
+    set_flash(request, msg, "good")
     return redirect
