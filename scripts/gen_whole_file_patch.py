@@ -24,6 +24,7 @@ APPLY_TEMPLATE = r'''import base64, hashlib, io, os, shutil
 ROOT = r"C:\sync_admin"
 TAG = {tag!r}
 FILES = {files!r}
+DELETE = {delete!r}
 
 def sha(b):
     return hashlib.sha256(b).hexdigest()
@@ -49,6 +50,25 @@ for rel, expect, b64 in FILES:
     with io.open(path, "rb") as f:
         assert sha(f.read()) == expect, "write verify failed: " + rel
     print(status, rel)
+    written += 1
+
+# Удаление файлов, которых больше нет в релизе (переименование/слияние страниц).
+# Сам файл уносим в бэкап, .pyc рядом — просто удаляем, иначе Python может
+# импортировать устаревший байт-код, а pytest — подобрать удалённые тесты.
+for rel in DELETE:
+    path = os.path.join(ROOT, rel.replace("/", os.sep))
+    if not os.path.exists(path):
+        print("gone", rel)
+        continue
+    shutil.move(path, path + ".bak_" + TAG)
+    base = os.path.basename(path)
+    if base.endswith(".py"):
+        cache = os.path.join(os.path.dirname(path), "__pycache__")
+        if os.path.isdir(cache):
+            for f in os.listdir(cache):
+                if f.startswith(base[:-3] + "."):
+                    os.remove(os.path.join(cache, f))
+    print("del", rel)
     written += 1
 print("DONE", written)
 '''
@@ -84,13 +104,14 @@ $py = "C:\sync_admin\.venv\Scripts\python.exe"
 '''
 
 
-def build(root: str, files: list[str], tag: str, parts: int, width: int) -> tuple[str, dict]:
+def build(root: str, files: list[str], tag: str, parts: int, width: int,
+          delete: list[str] | None = None) -> tuple[str, dict]:
     entries = []
     for rel in files:
         with open(os.path.join(root, rel), "rb") as f:
             data = f.read()
         entries.append((rel, hashlib.sha256(data).hexdigest(), base64.b64encode(data).decode("ascii")))
-    apply_src = APPLY_TEMPLATE.format(tag=tag, files=entries).encode("utf-8")
+    apply_src = APPLY_TEMPLATE.format(tag=tag, files=entries, delete=list(delete or [])).encode("utf-8")
     b64 = base64.b64encode(zlib.compress(apply_src, 9)).decode("ascii")
     full_sha = hashlib.sha256(b64.encode("ascii")).hexdigest()
 
@@ -103,7 +124,8 @@ def build(root: str, files: list[str], tag: str, parts: int, width: int) -> tupl
                                   sha=hashlib.sha256(piece.encode("ascii")).hexdigest()))
     concat = " + ".join(f"$p{i}" for i in range(1, len(pieces) + 1))
     out.append(PS_APPLY.format(concat=concat, full_sha=full_sha, tag=tag))
-    info = {"files": len(entries), "raw_bytes": len(apply_src), "b64_len": len(b64),
+    info = {"files": len(entries), "deleted": len(delete or []),
+            "raw_bytes": len(apply_src), "b64_len": len(b64),
             "parts": len(pieces), "full_sha": full_sha}
     return "".join(out), info
 
@@ -115,9 +137,11 @@ def main() -> int:
     ap.add_argument("--tag", required=True, help="метка патча, напр. pm12 (суффикс бэкапов .bak_<tag>)")
     ap.add_argument("--parts", type=int, default=2)
     ap.add_argument("--width", type=int, default=80)
+    ap.add_argument("--delete", nargs="*", default=[],
+                    help="пути, которые нужно УДАЛИТЬ на сервере (уносятся в .bak_<tag>)")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
-    text, info = build(a.root, a.files, a.tag, a.parts, a.width)
+    text, info = build(a.root, a.files, a.tag, a.parts, a.width, a.delete)
     with open(a.out, "w", encoding="utf-8", newline="\r\n") as f:
         f.write(text)
     print(info)
