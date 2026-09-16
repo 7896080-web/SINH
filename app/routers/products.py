@@ -15,7 +15,7 @@ from datetime import date, datetime
 from fastapi import APIRouter, Request, Depends, Form, Query, UploadFile, File
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
@@ -97,27 +97,77 @@ def _row(product: Product, accounts: list[PlatformAccount]) -> dict:
     }
 
 
-def _load_products(db: Session, q: str, only_proposals: bool, only_blocked: bool,
-                   accounts: list[PlatformAccount]) -> list[Product]:
+PAGE_LIMIT = 300          # строк на странице; больше браузеру показывать бессмысленно
+EXPORT_LIMIT = 50000      # потолок выгрузки: защита от попытки собрать .xlsx на весь каталог
+
+
+def _base_query(db: Session, q: str, only_proposals: bool, only_blocked: bool,
+                hide_size_u: bool = False):
+    """Отбор в SQL — ДО ограничения по количеству строк.
+
+    Раньше сначала брались первые 300 товаров по алфавиту, и лишь потом
+    применялись фильтры: при каталоге в 152 тысячи SKU «Только с предложениями»
+    и «Только те, где уходит 0» показывали пусто, потому что в первых 300 по
+    алфавиту таких товаров не было."""
     query = db.query(Product).options(joinedload(Product.sync_settings), joinedload(Product.barcodes))
     if q:
         like = f"%{q}%"
         query = query.filter(or_(Product.article.ilike(like), Product.name.ilike(like)))
-    products = query.order_by(Product.name).limit(300).all()
-
     if only_proposals:
-        products = [p for p in products if any(s.has_proposal for s in p.sync_settings)]
+        query = query.filter(Product.sync_settings.any(SyncSetting.has_proposal.is_(True)))
     if only_blocked:
-        # «Ничего не уходит»: ни один отмеченный кабинет не получает положительное число.
-        # Товары, не отмеченные нигде, сюда не попадают — это не проблема, а выбор оператора.
-        kept = []
-        for p in products:
-            settings_map = {s.account_id: s for s in p.sync_settings}
-            marked = [a for a in accounts if (settings_map.get(a.id) and settings_map[a.id].enabled)]
-            if marked and all(explain(p, settings_map.get(a.id), a).quantity == 0 for a in marked):
-                kept.append(p)
-        products = kept
-    return products
+        # Предварительный отбор: «ничего не уходит» имеет смысл только для товаров,
+        # отмеченных хотя бы в одном кабинете. Точный расчёт — ниже, по лестнице.
+        query = query.filter(Product.sync_settings.any(SyncSetting.enabled.is_(True)))
+    if hide_size_u:
+        # Безразмерные позиции (характеристика «U» — универсальный размер) оператору
+        # в этом списке не нужны. Сравнение без учёта регистра и пробелов; товары
+        # без размера не прячем — у них характеристики просто нет.
+        query = query.filter(or_(Product.size.is_(None),
+                                 func.upper(func.trim(Product.size)) != "U"))
+    return query.order_by(Product.name)
+
+
+def _blocked_everywhere(product: Product, accounts: list[PlatformAccount]) -> bool:
+    """Ни один отмеченный кабинет не получает положительное число."""
+    settings_map = {s.account_id: s for s in product.sync_settings}
+    marked = [a for a in accounts if (settings_map.get(a.id) and settings_map[a.id].enabled)]
+    return bool(marked) and all(explain(product, settings_map.get(a.id), a).quantity == 0 for a in marked)
+
+
+def _load_products(db: Session, q: str, only_proposals: bool, only_blocked: bool,
+                   accounts: list[PlatformAccount], limit: int = PAGE_LIMIT,
+                   hide_size_u: bool = False) -> tuple[list[Product], int]:
+    """Возвращает (строки, сколько всего подходит под фильтр). Второе число нужно,
+    чтобы честно написать оператору «показано 300 из N», а не делать вид, что это всё.
+    Отрицательное значение = счёт оборван на пределе сканирования, в интерфейсе
+    показывается как «N+»."""
+    query = _base_query(db, q, only_proposals, only_blocked, hide_size_u)
+
+    if not only_blocked:
+        total = query.order_by(None).count()
+        return query.limit(limit).all(), total
+
+    # «Уходит 0» точно считается только лестницей: идём порциями и останавливаемся,
+    # набрав limit, чтобы не тянуть весь каталог в память. Счёт «всего» тоже
+    # ограничен: на каталоге в сотни тысяч SKU точный пересчёт стоил бы секунд.
+    kept, total, offset = [], 0, 0
+    CHUNK, SCAN_CAP = 1000, 20000
+    partial = False
+    while True:
+        chunk = query.offset(offset).limit(CHUNK).all()
+        if not chunk:
+            break
+        for p in chunk:
+            if _blocked_everywhere(p, accounts):
+                total += 1
+                if len(kept) < limit:
+                    kept.append(p)
+        offset += CHUNK
+        if len(kept) >= limit and offset >= SCAN_CAP:
+            partial = True          # «из N+»: дальше не считали
+            break
+    return kept, (-total if partial else total)
 
 
 def _dispatch_summary(db: Session) -> dict:
@@ -136,12 +186,16 @@ def _dispatch_summary(db: Session) -> dict:
 
 
 def _render(request: Request, db: Session, user: User, q: str, only_proposals: bool,
-            only_blocked: bool, template: str):
+            only_blocked: bool, hide_size_u: bool, template: str):
     accounts = _active_accounts(db)
-    rows = [_row(p, accounts) for p in _load_products(db, q, only_proposals, only_blocked, accounts)]
+    products, total = _load_products(db, q, only_proposals, only_blocked, accounts,
+                                     hide_size_u=hide_size_u)
+    rows = [_row(p, accounts) for p in products]
     return templates.TemplateResponse(request, template, {
         "request": request, "current_user": user, "active_page": "products",
-        "rows": rows, "q": q, "only_proposals": only_proposals, "only_blocked": only_blocked,
+        "rows": rows, "total": total, "page_limit": PAGE_LIMIT,
+        "q": q, "only_proposals": only_proposals, "only_blocked": only_blocked,
+        "hide_size_u": hide_size_u,
         "accounts": accounts, "account_label": _account_label,
         "dispatch": _dispatch_summary(db),
         "flash": pop_flash(request) if template == "products.html" else None,
@@ -168,21 +222,21 @@ def _back(q: str) -> RedirectResponse:
 @router.get("/products", response_class=HTMLResponse)
 def products_page(
     request: Request, q: str = Query(""), only_proposals: bool = Query(False),
-    only_blocked: bool = Query(False),
+    only_blocked: bool = Query(False), hide_size_u: bool = Query(False),
     db: Session = Depends(get_db), user: User = Depends(get_current_user),
 ):
     if not _active_accounts(db):
         set_flash(request, "Пока нет ни одного активного кабинета — добавьте его на странице «API-ключи».", "warn")
-    return _render(request, db, user, q, only_proposals, only_blocked, "products.html")
+    return _render(request, db, user, q, only_proposals, only_blocked, hide_size_u, "products.html")
 
 
 @router.get("/products/rows", response_class=HTMLResponse)
 def products_rows(
     request: Request, q: str = Query(""), only_proposals: bool = Query(False),
-    only_blocked: bool = Query(False),
+    only_blocked: bool = Query(False), hide_size_u: bool = Query(False),
     db: Session = Depends(get_db), user: User = Depends(get_current_user),
 ):
-    return _render(request, db, user, q, only_proposals, only_blocked, "products_rows.html")
+    return _render(request, db, user, q, only_proposals, only_blocked, hide_size_u, "products_rows.html")
 
 
 # Старые адреса — на новую страницу (в закладках и в переписке они ещё живут).
@@ -447,10 +501,13 @@ def dispatch_toggle(
 @router.get("/products/export")
 def products_export(
     q: str = Query(""), only_proposals: bool = Query(False), only_blocked: bool = Query(False),
+    hide_size_u: bool = Query(False),
     db: Session = Depends(get_db), user: User = Depends(get_current_user),
 ):
     accounts = _active_accounts(db)
-    products = _load_products(db, q, only_proposals, only_blocked, accounts)
+    products, total = _load_products(db, q, only_proposals, only_blocked, accounts,
+                                     limit=EXPORT_LIMIT, hide_size_u=hide_size_u)
+    total = abs(total)          # для файла знак «счёт оборван» роли не играет
 
     headers = ["ID_1С", "Артикул", "Размер", "Цвет", "Наименование", "Остаток ЦС",
                "Резерв", "Порог трансляции", "Трансляция", "Уходит на площадки"]
@@ -471,6 +528,11 @@ def products_export(
             row.append("Да" if setting and setting.enabled else "Нет")
             row.append(setting.min_threshold if setting else 0)
         data.append(row)
+
+    if total > len(data):
+        # Молчаливо обрезанная выгрузка — худший вариант: оператор правит её в Excel
+        # и импортирует обратно, считая, что охватил весь каталог.
+        data.append([f"⚠ показаны первые {len(data)} строк из {total} — уточните поиск или фильтр"])
 
     return build_xlsx_response(headers, data, "товары_и_остатки.xlsx")
 

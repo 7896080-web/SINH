@@ -35,7 +35,7 @@
         рядом написана причина.</p>
     </div>
     <div class="toolbar">
-        <a href="/products/export?q={{ q }}&only_proposals={{ only_proposals|lower }}&only_blocked={{ only_blocked|lower }}" class="btn">Экспорт в Excel</a>
+        <a href="/products/export?q={{ q }}&only_proposals={{ only_proposals|lower }}&only_blocked={{ only_blocked|lower }}&hide_size_u={{ hide_size_u|lower }}" class="btn">Экспорт в Excel</a>
         <form method="post" action="/products/import" enctype="multipart/form-data" style="display:inline;">
             <label class="btn file-upload-btn">
                 Импорт из Excel
@@ -95,6 +95,11 @@
     <label class="checkbox-inline" style="padding-bottom:8px;">
         <input type="checkbox" name="only_blocked" value="true" {% if only_blocked %}checked{% endif %}>
         Только те, где уходит 0
+    </label>
+    <label class="checkbox-inline" style="padding-bottom:8px;"
+           title="Прячет позиции с универсальным размером «U». Товары без размера остаются.">
+        <input type="checkbox" name="hide_size_u" value="true" {% if hide_size_u %}checked{% endif %}>
+        Скрыть размер U
     </label>
 </form>
 

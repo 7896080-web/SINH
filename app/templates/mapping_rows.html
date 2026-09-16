@@ -52,7 +52,7 @@
                 <td>{{ row.product.color or '' }}</td>
                 <td>{{ row.product.name or '—' }}</td>
                 <td>{{ row.source_platform or 'выгрузка из 1С' }}</td>
-                <td>{{ row.created_at.strftime('%d.%m.%Y %H:%M') }}</td>
+                <td>{{ row.created_at.strftime('%d.%m.%Y %H:%M') if row.created_at else '—' }}</td>
             </tr>
             {% endfor %}
         </tbody>
