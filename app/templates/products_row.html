@@ -9,7 +9,7 @@
         {% if not row.has_barcode %}
             <span class="badge badge--bad" title="Нет ни одного баркода — сопоставление и отправка не сработают">нет баркода</span>
         {% endif %}
-        {% for p in row.proposals %}
+        {% for p in row.proposals if not p.shown %}
             <button type="button" class="pr-flag pr-flag--inline"
                     hx-post="/products/{{ row.uid_1c }}/{{ p.account_id }}/toggle"
                     hx-vals='{"enabled": "true"}'
@@ -86,16 +86,16 @@
                title="Дата старта задним числом: от неё стартует бэкфилл на странице «Тестирование».">
     </td>
 
-    {% for account in accounts %}
-    {% set state = row.accounts[account.id] %}
-    <td class="pr-acc">
-        <div class="pr-acc__top">
+    <td class="pr-cabs">
+        {% for account in accounts %}
+        {% set state = row.accounts[account.id] %}
+        <div class="pr-cab">
             {% if state.has_proposal and not state.enabled %}
                 <button type="button" class="pr-flag"
                         hx-post="/products/{{ row.uid_1c }}/{{ account.id }}/toggle"
                         hx-vals='{"enabled": "true"}'
                         hx-target="#row-{{ row.uid_1c }}" hx-swap="outerHTML"
-                        title="Карточка найдена в кабинете {{ account.name }}{% if state.proposal_date %} {{ state.proposal_date.strftime('%d.%m.%Y') }}{% endif %} — включить?">⚡</button>
+                        title="Карточка найдена в кабинете «{{ account.name }}»{% if state.proposal_date %} {{ state.proposal_date.strftime('%d.%m.%Y') }}{% endif %} — включить передачу?">⚡</button>
             {% else %}
                 <input type="checkbox" {% if state.enabled %}checked{% endif %}
                        hx-post="/products/{{ row.uid_1c }}/{{ account.id }}/toggle"
@@ -103,21 +103,20 @@
                        hx-target="#row-{{ row.uid_1c }}" hx-swap="outerHTML"
                        title="Передавать этот товар в кабинет «{{ account.name }}».">
             {% endif %}
+            <span class="pr-cab__name">{{ account.name }}</span>
             <input type="number" value="{{ state.min_threshold }}" min="0" class="pr-input pr-input--tiny"
                    hx-post="/products/{{ row.uid_1c }}/{{ account.id }}/threshold" hx-trigger="change"
                    hx-vals="js:{min_threshold: event.target.value}"
                    hx-target="#row-{{ row.uid_1c }}" hx-swap="outerHTML"
                    title="Порог кабинета: если доступно не больше этого числа — уходит 0. 0 — выключен. Не применяется, когда задан порог трансляции.">
-        </div>
-        {% if state.enabled %}
-            {% if state.blocked %}
-                <div class="pr-hint pr-hint--warn" title="{{ state.fix_hint }}">→ 0: {{ state.reason }}</div>
+            {% if not state.enabled %}
+                <span class="pr-hint">не передаётся</span>
+            {% elif state.blocked %}
+                <span class="pr-hint pr-hint--warn" title="{{ state.fix_hint }}">→ 0: {{ state.reason }}</span>
             {% else %}
-                <div class="pr-hint pr-hint--good">→ {{ state.quantity }}</div>
+                <span class="pr-hint pr-hint--good">→ {{ state.quantity }}</span>
             {% endif %}
-        {% else %}
-            <div class="pr-hint">не передаётся</div>
-        {% endif %}
+        </div>
+        {% endfor %}
     </td>
-    {% endfor %}
 </tr>
