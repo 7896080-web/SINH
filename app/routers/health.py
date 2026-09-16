@@ -21,6 +21,11 @@ EXPECTED_INTERVAL_SECONDS = {
     "ftp_send_export_request": 3600 * 3,
     "reconciliation": 3600 * 3,
     "reconcile_accounts": 300 * 3,
+    "import_barcodes": 900 * 3,
+    # Метка недельного ПОЛНОГО импорта справочника 1С (scheduler.job_import_barcodes):
+    # пишется раз в 7 дней, без своей записи здесь протухала бы через 10 минут и
+    # держала /health в 503 всю неделю.
+    "import_barcodes_full": 7 * 86400 * 3,
 }
 # Per-account воркеры пишут heartbeat с ДИНАМИЧЕСКИМ именем
 # (`poll_orders_account_<id>`, `catalog_poll_account_<id>`) — сопоставляем по
