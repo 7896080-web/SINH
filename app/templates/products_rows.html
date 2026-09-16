@@ -18,7 +18,12 @@
         {% for row in rows %}
             {% include "products_row.html" %}
         {% else %}
-        <tr><td colspan="{{ 10 + accounts|length }}"><div class="empty-state">Ничего не найдено.</div></td></tr>
+        <tr><td colspan="{{ 11 + accounts|length }}"><div class="empty-state">Ничего не найдено.</div></td></tr>
         {% endfor %}
+        {% if total is defined and (total > rows|length or total < 0) %}
+        <tr><td colspan="{{ 11 + accounts|length }}">
+            <div class="pr-hint pr-hint--warn">Показано {{ rows|length }} из {% if total < 0 %}{{ -total }}+{% else %}{{ total }}{% endif %} — уточните поиск. Экспорт в Excel отдаёт всё, что подходит под фильтр.</div>
+        </td></tr>
+        {% endif %}
     </tbody>
 </table>

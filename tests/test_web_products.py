@@ -330,3 +330,105 @@ def test_import_updates_offset_broadcast_and_cabinets(logged_in_client, web_db):
     assert p.broadcast_offset == 11
     assert p.broadcast_enabled is True
     assert web_db.query(SyncSetting).first().enabled is True
+
+
+# --------------------------------------------------------------- фильтры до ограничения строк
+
+def _many(web_db, n, with_proposal_from=None, blocked_from=None):
+    """n товаров по алфавиту; предложения и «уходит 0» — только у ХВОСТА списка,
+    чтобы поймать старую ошибку: ограничение в 300 строк применялось до фильтра."""
+    from app.routers.products import PAGE_LIMIT
+    a1, = _accounts(web_db, (Platform.wb, "WB-1"))
+    for i in range(n):
+        uid = f"p{i:05d}"
+        web_db.add(Product(uid_1c=uid, article=f"A{i:05d}", name=f"Товар {i:05d}",
+                           stock_on_hand=10,
+                           broadcast_enabled=not (blocked_from is not None and i >= blocked_from)))
+        web_db.add(Barcode(barcode=f"bc{i:05d}", uid_1c=uid))
+        web_db.add(SyncSetting(uid_1c=uid, account_id=a1.id, enabled=True,
+                               has_proposal=(with_proposal_from is not None and i >= with_proposal_from)))
+    web_db.commit()
+    return a1, PAGE_LIMIT
+
+
+def test_proposal_filter_finds_rows_beyond_the_page_limit(logged_in_client, web_db):
+    """Товары с предложениями лежат за пределами первых 300 по алфавиту."""
+    _many(web_db, 350, with_proposal_from=340)
+
+    r = logged_in_client.get("/products/rows?only_proposals=true")
+
+    assert r.text.count('<tr id="row-') == 10
+    assert "Товар 00345" in r.text
+
+
+def test_blocked_filter_finds_rows_beyond_the_page_limit(logged_in_client, web_db):
+    """То же для фильтра «уходит 0»: раньше он показывал пусто на большом каталоге."""
+    _many(web_db, 350, blocked_from=340)
+
+    r = logged_in_client.get("/products/rows?only_blocked=true")
+
+    assert r.text.count('<tr id="row-') == 10
+    assert "Товар 00345" in r.text
+
+
+def test_page_says_how_many_rows_were_hidden(logged_in_client, web_db):
+    _many(web_db, 400)
+
+    r = logged_in_client.get("/products/rows")
+
+    assert "Показано 300 из 400" in r.text
+
+
+def test_export_is_not_silently_truncated(logged_in_client, web_db):
+    """Обрезанная выгрузка помечается прямо в файле: оператор правит её в Excel и
+    импортирует обратно, считая, что охватил весь каталог."""
+    import io
+    from openpyxl import load_workbook
+    from app.routers import products as products_router
+
+    _many(web_db, 50)
+    products_router.EXPORT_LIMIT = 10          # искусственно занижаем потолок
+    try:
+        r = logged_in_client.get("/products/export")
+    finally:
+        products_router.EXPORT_LIMIT = 50000
+
+    ws = load_workbook(io.BytesIO(r.content)).active
+    last = [c.value for c in ws[ws.max_row]]
+    assert "показаны первые 10 строк из 50" in str(last[0])
+
+
+# --------------------------------------------------------------- фильтр размера U
+
+def test_hide_size_u_filter(logged_in_client, web_db):
+    """«Скрыть размер U» убирает безразмерные позиции и не трогает остальные."""
+    for uid, size in [("a", "XL"), ("b", "U"), ("c", "u"), ("d", " U "), ("e", None)]:
+        web_db.add(Product(uid_1c=uid, article=f"ART-{uid}", name=f"Товар {uid}",
+                           size=size, stock_on_hand=5, broadcast_enabled=True))
+        web_db.add(Barcode(barcode=f"bc-{uid}", uid_1c=uid))
+    web_db.commit()
+
+    full = logged_in_client.get("/products/rows")
+    assert full.text.count('<tr id="row-') == 5
+
+    filtered = logged_in_client.get("/products/rows?hide_size_u=true")
+    assert filtered.text.count('<tr id="row-') == 2      # XL и товар без размера
+    assert "Товар a" in filtered.text
+    assert "Товар e" in filtered.text                     # размера нет — не прячем
+    for hidden in ("Товар b", "Товар c", "Товар d"):      # U, u и « U » — регистр и пробелы
+        assert hidden not in filtered.text
+
+
+def test_hide_size_u_applies_to_export(logged_in_client, web_db):
+    import io
+    from openpyxl import load_workbook
+    for uid, size in [("a", "XL"), ("b", "U")]:
+        web_db.add(Product(uid_1c=uid, article=f"ART-{uid}", name=f"Товар {uid}",
+                           size=size, stock_on_hand=5, broadcast_enabled=True))
+        web_db.add(Barcode(barcode=f"bc-{uid}", uid_1c=uid))
+    web_db.commit()
+
+    r = logged_in_client.get("/products/export?hide_size_u=true")
+    ws = load_workbook(io.BytesIO(r.content)).active
+    sizes = [row[2] for row in ws.iter_rows(min_row=2, values_only=True)]
+    assert sizes == ["XL"]
