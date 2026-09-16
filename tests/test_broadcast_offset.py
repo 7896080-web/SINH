@@ -77,3 +77,15 @@ def test_clear_threshold_route(logged_in_client, web_db):
     logged_in_client.post("/testing/set-override", data={"uid_1c": "uZ", "clear": "1"})
     web_db.expire_all()
     assert web_db.query(Product).filter(Product.uid_1c == "uZ").first().broadcast_offset is None
+
+
+def test_set_threshold_warns_when_broadcast_disabled(logged_in_client, web_db):
+    """Порог задан, но трансляция SKU выключена → сообщение обязано сказать, что уходит 0."""
+    from app.models import Product
+    web_db.add(Product(uid_1c="u9", stock_on_hand=29, broadcast_enabled=False))
+    web_db.commit()
+    r = logged_in_client.post("/testing/set-override",
+                              data={"uid_1c": "u9", "account_id": "", "available": "32", "stock_at_date": "43"})
+    assert "ВЫКЛЮЧЕНА" in r.text and "уходит 0" in r.text
+    web_db.refresh(web_db.query(Product).filter(Product.uid_1c == "u9").first())
+    assert web_db.query(Product).filter(Product.uid_1c == "u9").first().broadcast_offset == 11

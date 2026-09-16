@@ -52,7 +52,11 @@ class LocalExchange:
     def download_and_archive_result(self, filename: str) -> str:
         self._ensure_dirs()
         src = self.dir_results / filename
-        content = src.read_text(encoding="utf-8")
+        # utf-8-sig: обработка 1С пишет файлы через ЗаписьТекста(…, КодировкаТекста.UTF8),
+        # то есть С BOM. При чтении как чистого utf-8 три байта BOM прилипали к первому
+        # полю первой строки — первая строка result_*.txt не сопоставлялась с заданием
+        # (задание вечно "sent"), а первый uid в stock_*.txt/barcodes_*.txt искажался.
+        content = src.read_text(encoding="utf-8-sig")
         os.replace(src, self.dir_archive / filename)
         return content
 
