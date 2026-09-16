@@ -194,12 +194,38 @@ def test_apply_result_batch_closes_timed_out_task_on_late_result(db):
 
 
 def test_scheduler_hourly_jobs_fire_right_after_start(web_db):
-    """Запрос выгрузки остатков и сверка стартуют в первую минуту после запуска воркера,
-    а не через час (иначе каждый деплой откладывает актуализацию остатка ЦС)."""
+    """Часовые задания стартуют сразу после запуска воркера (раньше каждый деплой
+    откладывал их на час), и СВЕРКА ИДЁТ ПОСЛЕ ЗАПРОСА ВЫГРУЗКИ с запасом на ответ
+    1С: обработка запускается по своему расписанию, и читать результат через десять
+    секунд означало читать снимок прошлого цикла."""
+    from datetime import timezone
     from app.workers.scheduler import build_scheduler
+
     sched = build_scheduler()  # не запускаем — только состав заданий и их первый запуск
-    for job_id in ("ftp_send_export_request", "reconciliation"):
-        job = sched.get_job(job_id)
-        assert job is not None
-        from datetime import timezone
-        assert (job.next_run_time - datetime.now(timezone.utc)).total_seconds() < 60  # APScheduler хранит aware
+    now = datetime.now(timezone.utc)
+
+    request = sched.get_job("ftp_send_export_request")
+    reconciliation = sched.get_job("reconciliation")
+    assert request is not None and reconciliation is not None
+
+    # запрос выгрузки — в первую минуту после старта
+    assert (request.next_run_time - now).total_seconds() < 60
+    # сверка — позже запроса, но в пределах разумного окна
+    gap = (reconciliation.next_run_time - request.next_run_time).total_seconds()
+    assert 60 <= gap <= 900, f"сверка должна идти через несколько минут после запроса, а не через {gap} с"
+
+
+def test_scheduler_ftp_jobs_have_separate_heartbeats():
+    """Три расписания зовут один job_ftp_send. Если бы они писали heartbeat под общим
+    именем, минутный прогон затирал бы остальные и остановка часового запроса выгрузки
+    (то есть остановка сверки) была бы не видна в /health."""
+    import inspect
+    from app.workers import scheduler
+
+    src = inspect.getsource(scheduler.build_scheduler)
+    assert 'heartbeat_name="ftp_send_export_request"' in src
+    assert 'heartbeat_name="ftp_send_barcode_request"' in src
+
+    from app.routers.health import EXPECTED_INTERVAL_SECONDS
+    assert "ftp_send_export_request" in EXPECTED_INTERVAL_SECONDS
+    assert "ftp_send_barcode_request" in EXPECTED_INTERVAL_SECONDS

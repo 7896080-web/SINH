@@ -129,7 +129,16 @@ def job_dispatch():
         db.close()
 
 
-def job_ftp_send(request_stock_export: bool = False, request_barcode_export: bool = False):
+def job_ftp_send(request_stock_export: bool = False, request_barcode_export: bool = False,
+                 heartbeat_name: str = "ftp_send"):
+    """Отправка накопленных заданий в 1С. Три расписания зовут эту же функцию:
+    минутное (только задания), часовое (плюс запрос выгрузки остатков) и суточное
+    (плюс запрос справочника баркодов). Каждое пишет СВОЙ heartbeat: под общим
+    именем минутный прогон затирал бы остальные, и остановка часового запроса
+    выгрузки — то есть фактическая остановка сверки — была бы не видна в /health.
+
+    Время heartbeat часового запроса дополнительно служит отметкой «когда мы в
+    последний раз попросили выгрузку»: сверка применяет только снимок новее её."""
     db = SessionLocal()
     try:
         exchange = _build_ftp_exchange()
@@ -139,10 +148,10 @@ def job_ftp_send(request_stock_export: bool = False, request_barcode_export: boo
             filename, content = batch
             exchange.upload_task_file(filename, content)
             logger.info("ftp_send: %s (%d строк)", filename, content.count("\n") + 1)
-        _heartbeat(db, "ftp_send", True)
+        _heartbeat(db, heartbeat_name, True)
     except Exception as e:
         logger.exception("ftp_send failed")
-        _heartbeat(db, "ftp_send", False, str(e))
+        _heartbeat(db, heartbeat_name, False, str(e))
     finally:
         db.close()
 
@@ -172,7 +181,11 @@ def job_reconciliation():
     db = SessionLocal()
     try:
         exchange = _build_ftp_exchange()
-        rows = fetch_stock_export_rows(exchange)
+        # Снимок старше последнего запроса выгрузки — ответ на ПРОШЛЫЙ цикл: он
+        # отражает склад часовой давности и вернул бы проданное за час обратно.
+        marker = db.query(WorkerHeartbeat).filter(
+            WorkerHeartbeat.worker_name == "ftp_send_export_request").first()
+        rows = fetch_stock_export_rows(exchange, not_older_than=marker.last_run_at if marker else None)
         if rows:
             # 1С — хозяин ассортимента: сначала заводим/обновляем товары
             # (новые SKU, размер/цвет), затем сверяем остатки.
@@ -182,7 +195,9 @@ def job_reconciliation():
             for r in rows:
                 for bc in r["barcodes"]:
                     stock[bc] = r["quantity"]
-            stats = run_reconciliation(db, stock)
+            # Выгрузка 1С — полный снимок склада ЦС (публикуется атомарно), поэтому
+            # отсутствующий в ней товар распродан в ноль.
+            stats = run_reconciliation(db, stock, missing_means_zero=True)
             logger.info("reconciliation: %s", stats)
         else:
             logger.info("reconciliation: нет свежего файла выгрузки остатков — пропуск")
@@ -326,13 +341,19 @@ def build_scheduler() -> BlockingScheduler:
     # рестарт воркера (деплой) сдвигает запрос выгрузки и сверку на час, и остаток ЦС
     # в приложении отстаёт от 1С до часа дольше, чем должен.
     start = now_utc()
-    sched.add_job(lambda: job_ftp_send(request_stock_export=True), "interval",
+    sched.add_job(lambda: job_ftp_send(request_stock_export=True,
+                                       heartbeat_name="ftp_send_export_request"), "interval",
                   hours=1, id="ftp_send_export_request", max_instances=1,
                   next_run_time=start + timedelta(seconds=20))
+    # Сверка — через 5 минут после запроса выгрузки, чтобы 1С успела ответить:
+    # обработка запускается по своему расписанию, и читать результат через 10 секунд
+    # означало читать файл прошлого цикла.
     sched.add_job(job_reconciliation, "interval", hours=1, id="reconciliation", max_instances=1,
-                  next_run_time=start + timedelta(seconds=30))
-    sched.add_job(lambda: job_ftp_send(request_barcode_export=True), "interval",
-                  hours=24, id="ftp_send_barcode_request", max_instances=1)
+                  next_run_time=start + timedelta(minutes=5))
+    sched.add_job(lambda: job_ftp_send(request_barcode_export=True,
+                                       heartbeat_name="ftp_send_barcode_request"), "interval",
+                  hours=24, id="ftp_send_barcode_request", max_instances=1,
+                  next_run_time=start + timedelta(seconds=40))
     sched.add_job(job_import_barcodes, "interval", minutes=15, id="import_barcodes", max_instances=1)
 
     # Per-account задания: первичная простановка + периодическая сверка.
