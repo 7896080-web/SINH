@@ -16,7 +16,7 @@ from app.workers.catalog_sync import load_platform_catalog
 from app.workers.catalog_poller import poll_catalog
 from app.workers.ftp_channel import (
     LocalExchange, build_task_batch, apply_result_batch, detect_timed_out_tasks,
-    fetch_stock_export_files, fetch_stock_export_rows, fetch_barcode_dict_files,
+    fetch_stock_export_files, fetch_stock_export_snapshot, fetch_barcode_dict_files,
 )
 from app.workers.reconciliation import run_reconciliation, import_product_master, import_barcode_dict
 
@@ -185,7 +185,8 @@ def job_reconciliation():
         # отражает склад часовой давности и вернул бы проданное за час обратно.
         marker = db.query(WorkerHeartbeat).filter(
             WorkerHeartbeat.worker_name == "ftp_send_export_request").first()
-        rows = fetch_stock_export_rows(exchange, not_older_than=marker.last_run_at if marker else None)
+        rows, snapshot_at = fetch_stock_export_snapshot(
+            exchange, not_older_than=marker.last_run_at if marker else None)
         if rows:
             # 1С — хозяин ассортимента: сначала заводим/обновляем товары
             # (новые SKU, размер/цвет), затем сверяем остатки.
@@ -197,7 +198,8 @@ def job_reconciliation():
                     stock[bc] = r["quantity"]
             # Выгрузка 1С — полный снимок склада ЦС (публикуется атомарно), поэтому
             # отсутствующий в ней товар распродан в ноль.
-            stats = run_reconciliation(db, stock, missing_means_zero=True)
+            stats = run_reconciliation(db, stock, missing_means_zero=True,
+                                       snapshot_at=snapshot_at)
             logger.info("reconciliation: %s", stats)
         else:
             logger.info("reconciliation: нет свежего файла выгрузки остатков — пропуск")
