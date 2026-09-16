@@ -144,3 +144,35 @@ def test_fetch_stock_export_files_combines_and_archives(tmp_path):
 
     assert combined == {"111": 5, "112": 5}
     assert (tmp_path / "archive" / "stock_1.txt").exists()
+
+
+def test_local_exchange_strips_bom_written_by_1c(tmp_path):
+    """1С пишет result_/stock_/barcodes_ через ЗаписьТекста(UTF8) — с BOM. Первая строка
+    должна разбираться так же, как остальные (раньше BOM прилипал к order_id первой
+    строки, и первое задание каждого файла оставалось 'sent' навсегда)."""
+    from app.workers.ftp_channel import LocalExchange
+    ex = LocalExchange(tmp_path / "tasks", tmp_path / "results", tmp_path / "archive")
+    ex._ensure_dirs()
+    (tmp_path / "results" / "result_1.txt").write_bytes("﻿o1|OK|ЦБ1\no2|OK|ЦБ2".encode("utf-8"))
+    content = ex.download_and_archive_result("result_1.txt")
+    assert content.splitlines()[0] == "o1|OK|ЦБ1"
+
+
+def test_apply_result_batch_first_line_with_bom_closes_task(db):
+    """Сквозная проверка: файл с BOM, прочитанный через LocalExchange, закрывает
+    задание из ПЕРВОЙ строки."""
+    from app.workers.ftp_channel import LocalExchange, apply_result_batch
+    import tempfile, pathlib
+    account = make_account(db, Platform.wb)
+    task = FtpTask(command="CREATE_MOVEMENT", barcode="111", quantity=1, order_id="first",
+                   account_id=account.id, status=FtpTaskStatus.sent, sent_at=now_utc())
+    db.add(task)
+    db.commit()
+    root = pathlib.Path(tempfile.mkdtemp())
+    ex = LocalExchange(root / "t", root / "r", root / "a")
+    ex._ensure_dirs()
+    (root / "r" / "result_x.txt").write_bytes("﻿first|OK|ЦБ000000186".encode("utf-8"))
+    stats = apply_result_batch(db, ex.download_and_archive_result("result_x.txt"))
+    assert stats == {"ok": 1, "error": 0, "unmatched": 0}
+    db.refresh(task)
+    assert task.status == FtpTaskStatus.done and task.result_detail == "ЦБ000000186"

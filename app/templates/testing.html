@@ -123,7 +123,8 @@
     <h3 style="margin-top:0">Порог трансляции</h3>
     <p class="help-text">Задайте зависимость: «доступно на дату» и «остаток ЦС на дату» — порог = ЦС на дату − доступно (может быть и отрицательным). Дальше на площадки уходит <b>max(0, текущий ЦС − порог)</b>. Порог фиксирован и сам отслеживает все движения склада (приход, расход, списание, пересортица, перемещение) через текущий остаток ЦС — не накапливается и не дрейфует. «Сбросить» — вернуть автоматический расчёт от остатка. Значение общее для всех кабинетов.</p>
     <p>Сейчас передаётся на площадки: <b>{{ current_send }}</b>
-        {% if product.broadcast_offset is not none %}(текущий ЦС {{ product.stock_on_hand }} − порог {{ product.broadcast_offset }}){% elif product.transmit_override is not none %}(ручной {{ product.transmit_override }}){% else %}(авто — от остатка ЦС {{ product.stock_on_hand }}){% endif %}
+        {% if not product.broadcast_enabled %}<span class="badge badge--bad">трансляция SKU выключена → 0; включить на «Управлении остатками»</span>
+        {% elif product.broadcast_offset is not none %}(текущий ЦС {{ product.stock_on_hand }} − порог {{ product.broadcast_offset }}){% elif product.transmit_override is not none %}(ручной {{ product.transmit_override }}){% else %}(авто — от остатка ЦС {{ product.stock_on_hand }}){% endif %}
     </p>
     <form method="post" action="/testing/set-override" style="display:flex; gap:12px; align-items:flex-end; flex-wrap:wrap;">
         <input type="hidden" name="uid_1c" value="{{ product.uid_1c }}">
