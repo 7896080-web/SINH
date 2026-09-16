@@ -219,8 +219,12 @@ def apply_result_batch(db: Session, content: str) -> dict:
             continue
         order_id, result_status, detail = parts[0], parts[1], "|".join(parts[2:])
 
+        # Принимаем результат и для просроченного (timeout) задания: опоздавший ответ 1С —
+        # это ровно тот случай, ради которого timeout и существует; иначе задание, по
+        # которому 1С документ создала, навсегда остаётся «без результата».
         task = db.query(FtpTask).filter(
-            FtpTask.order_id == order_id, FtpTask.status == FtpTaskStatus.sent,
+            FtpTask.order_id == order_id,
+            FtpTask.status.in_([FtpTaskStatus.sent, FtpTaskStatus.timeout]),
         ).order_by(FtpTask.sent_at.desc()).first()
 
         if task is None:
