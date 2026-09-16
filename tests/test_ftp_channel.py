@@ -176,3 +176,29 @@ def test_apply_result_batch_first_line_with_bom_closes_task(db):
     assert stats == {"ok": 1, "error": 0, "unmatched": 0}
     db.refresh(task)
     assert task.status == FtpTaskStatus.done and task.result_detail == "ЦБ000000186"
+
+
+def test_apply_result_batch_closes_timed_out_task_on_late_result(db):
+    """Опоздавший ответ 1С по просроченному (timeout) заданию закрывает его как done."""
+    from app.workers.ftp_channel import apply_result_batch
+    account = make_account(db, Platform.wb)
+    task = FtpTask(command="CREATE_MOVEMENT", barcode="111", quantity=1, order_id="late",
+                   account_id=account.id, status=FtpTaskStatus.timeout,
+                   sent_at=now_utc() - timedelta(hours=2))
+    db.add(task)
+    db.commit()
+    stats = apply_result_batch(db, "late|OK|ЦБ000000186")
+    assert stats["ok"] == 1
+    db.refresh(task)
+    assert task.status == FtpTaskStatus.done and task.result_detail == "ЦБ000000186"
+
+
+def test_scheduler_hourly_jobs_fire_right_after_start(web_db):
+    """Запрос выгрузки остатков и сверка стартуют в первую минуту после запуска воркера,
+    а не через час (иначе каждый деплой откладывает актуализацию остатка ЦС)."""
+    from app.workers.scheduler import build_scheduler
+    sched = build_scheduler()  # не запускаем — только состав заданий и их первый запуск
+    for job_id in ("ftp_send_export_request", "reconciliation"):
+        job = sched.get_job(job_id)
+        assert job is not None
+        assert (job.next_run_time - now_utc()).total_seconds() < 60

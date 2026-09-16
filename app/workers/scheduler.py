@@ -322,9 +322,15 @@ def build_scheduler() -> BlockingScheduler:
     sched.add_job(job_dispatch, "interval", seconds=45, id="dispatch", max_instances=1)
     sched.add_job(job_ftp_send, "interval", minutes=1, id="ftp_send", max_instances=1)
     sched.add_job(job_ftp_receive, "interval", minutes=1, id="ftp_receive", max_instances=1)
+    # Часовые задания: первый прогон сразу после старта, а не через час. Иначе каждый
+    # рестарт воркера (деплой) сдвигает запрос выгрузки и сверку на час, и остаток ЦС
+    # в приложении отстаёт от 1С до часа дольше, чем должен.
+    start = now_utc()
     sched.add_job(lambda: job_ftp_send(request_stock_export=True), "interval",
-                  hours=1, id="ftp_send_export_request", max_instances=1)
-    sched.add_job(job_reconciliation, "interval", hours=1, id="reconciliation", max_instances=1)
+                  hours=1, id="ftp_send_export_request", max_instances=1,
+                  next_run_time=start + timedelta(seconds=20))
+    sched.add_job(job_reconciliation, "interval", hours=1, id="reconciliation", max_instances=1,
+                  next_run_time=start + timedelta(seconds=30))
     sched.add_job(lambda: job_ftp_send(request_barcode_export=True), "interval",
                   hours=24, id="ftp_send_barcode_request", max_instances=1)
     sched.add_job(job_import_barcodes, "interval", minutes=15, id="import_barcodes", max_instances=1)
