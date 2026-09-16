@@ -9,6 +9,13 @@
         {% if not row.has_barcode %}
             <span class="badge badge--bad" title="Нет ни одного баркода — сопоставление и отправка не сработают">нет баркода</span>
         {% endif %}
+        {% for p in row.proposals %}
+            <button type="button" class="pr-flag pr-flag--inline"
+                    hx-post="/products/{{ row.uid_1c }}/{{ p.account_id }}/toggle"
+                    hx-vals='{"enabled": "true"}'
+                    hx-target="#row-{{ row.uid_1c }}" hx-swap="outerHTML"
+                    title="Карточка найдена в кабинете «{{ p.name }}»{% if p.date %} {{ p.date.strftime('%d.%m.%Y') }}{% endif %}{% if not p.shown %} (кабинет сейчас неактивен){% endif %} — включить передачу в него?">⚡ {{ p.name }}</button>
+        {% endfor %}
         {% if row.transmit_override is not none %}
             <div class="pr-hint pr-hint--warn">
                 ручной остаток {{ row.transmit_override }} (устаревший режим, перекрыт порогом)

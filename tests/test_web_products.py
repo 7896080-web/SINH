@@ -432,3 +432,49 @@ def test_hide_size_u_applies_to_export(logged_in_client, web_db):
     ws = load_workbook(io.BytesIO(r.content)).active
     sizes = [row[2] for row in ws.iter_rows(min_row=2, values_only=True)]
     assert sizes == ["XL"]
+
+
+def test_proposal_marker_is_visible_in_the_product_row(logged_in_client, web_db):
+    """Колонки кабинетов уезжают за правый край экрана, поэтому ⚡ должна быть видна
+    рядом с наименованием — иначе фильтр «только с предложениями» показывает строки,
+    в которых оператор не находит ни одной молнии."""
+    a1, a2 = _accounts(web_db, (Platform.wb, "ИП ЯВОРСКАЯ"), (Platform.kit, "КИТ"))
+    _product(web_db, stock=5)
+    _sync(web_db, "u1", a1, enabled=False)
+    _sync(web_db, "u1", a2, enabled=False)
+    web_db.query(SyncSetting).filter(SyncSetting.account_id == a1.id).first().has_proposal = True
+    web_db.commit()
+
+    r = logged_in_client.get("/products/rows?only_proposals=true")
+
+    assert "⚡ ИП ЯВОРСКАЯ" in r.text
+    assert "⚡ КИТ" not in r.text          # у этого кабинета предложения нет
+
+
+def test_proposal_marker_shows_inactive_cabinet_too(logged_in_client, web_db):
+    """Предложение по кабинету, который сейчас неактивен: колонки у него нет,
+    и без этой пометки молния была бы не видна нигде."""
+    a1, a2 = _accounts(web_db, (Platform.wb, "ИП ЯВОРСКАЯ"), (Platform.kit, "КИТ"))
+    _product(web_db, stock=5)
+    _sync(web_db, "u1", a2, enabled=False)
+    web_db.query(SyncSetting).filter(SyncSetting.account_id == a2.id).first().has_proposal = True
+    a2.is_active = False
+    web_db.commit()
+
+    r = logged_in_client.get("/products/rows?only_proposals=true")
+
+    assert "⚡ КИТ" in r.text
+    assert "кабинет сейчас неактивен" in r.text
+
+
+def test_enabled_cabinet_has_no_proposal_marker(logged_in_client, web_db):
+    """Товар уже передаётся в кабинет — предлагать нечего."""
+    a1, = _accounts(web_db, (Platform.wb, "ИП ЯВОРСКАЯ"))
+    _product(web_db, stock=5)
+    _sync(web_db, "u1", a1, enabled=True)
+    web_db.query(SyncSetting).first().has_proposal = True
+    web_db.commit()
+
+    r = logged_in_client.get("/products/rows")
+
+    assert "⚡ ИП ЯВОРСКАЯ" not in r.text

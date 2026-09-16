@@ -61,9 +61,11 @@ def _parse_date(raw: str) -> date | None:
     return datetime.strptime(raw, "%Y-%m-%d").date()
 
 
-def _row(product: Product, accounts: list[PlatformAccount]) -> dict:
+def _row(product: Product, accounts: list[PlatformAccount],
+         all_accounts: dict[int, PlatformAccount] | None = None) -> dict:
     """Строка таблицы. По каждому кабинету — реальное число и причина нуля."""
     settings_map = {s.account_id: s for s in product.sync_settings}
+    all_accounts = all_accounts or {a.id: a for a in accounts}
 
     sku = explain(product, None, None)          # уровень SKU: только выключатель трансляции
     per_account = {}
@@ -81,8 +83,26 @@ def _row(product: Product, accounts: list[PlatformAccount]) -> dict:
             "fix_hint": result.fix_hint,
         }
 
+    # Предложения ⚡ рядом с наименованием: колонки кабинетов уезжают вправо за край
+    # экрана, и оператор, включив фильтр «только с предложениями», не понимал, где
+    # молния. Заодно видно предложение по кабинету, который сейчас неактивен и
+    # колонки на странице не имеет.
+    proposals = []
+    for setting in product.sync_settings:
+        if not setting.has_proposal or setting.enabled:
+            continue
+        account = all_accounts.get(setting.account_id)
+        proposals.append({
+            "account_id": setting.account_id,
+            "name": account.name if account else f"кабинет #{setting.account_id}",
+            "shown": any(a.id == setting.account_id for a in accounts),
+            "date": setting.proposal_date,
+        })
+    proposals.sort(key=lambda p: p["name"])
+
     return {
         "uid_1c": product.uid_1c, "article": product.article, "name": product.name,
+        "proposals": proposals,
         "size": product.size, "color": product.color,
         "stock_on_hand": product.stock_on_hand or 0, "reserve": product.reserve or 0,
         "broadcast_offset": product.broadcast_offset,
@@ -188,9 +208,10 @@ def _dispatch_summary(db: Session) -> dict:
 def _render(request: Request, db: Session, user: User, q: str, only_proposals: bool,
             only_blocked: bool, hide_size_u: bool, template: str):
     accounts = _active_accounts(db)
+    all_accounts = {a.id: a for a in db.query(PlatformAccount).all()}
     products, total = _load_products(db, q, only_proposals, only_blocked, accounts,
                                      hide_size_u=hide_size_u)
-    rows = [_row(p, accounts) for p in products]
+    rows = [_row(p, accounts, all_accounts) for p in products]
     return templates.TemplateResponse(request, template, {
         "request": request, "current_user": user, "active_page": "products",
         "rows": rows, "total": total, "page_limit": PAGE_LIMIT,
@@ -208,8 +229,9 @@ def _row_response(request: Request, db: Session, uid_1c: str):
     product = _get_product(db, uid_1c)
     if product is None:
         return HTMLResponse("", status_code=404)
+    all_accounts = {a.id: a for a in db.query(PlatformAccount).all()}
     return templates.TemplateResponse(request, "products_row.html", {
-        "request": request, "row": _row(product, accounts), "accounts": accounts,
+        "request": request, "row": _row(product, accounts, all_accounts), "accounts": accounts,
     })
 
 
