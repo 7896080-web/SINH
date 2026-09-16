@@ -434,10 +434,19 @@ def test_hide_size_u_applies_to_export(logged_in_client, web_db):
     assert sizes == ["XL"]
 
 
+def _cab_block(html: str, account_name: str) -> str:
+    """Кусок строки товара, относящийся к одному кабинету (одна строка внутри
+    единственной колонки «Кабинеты»)."""
+    blocks = html.split('<div class="pr-cab">')[1:]
+    matching = [b for b in blocks if account_name in b]
+    assert matching, f"в строке товара нет блока кабинета «{account_name}»"
+    return matching[0]
+
+
 def test_proposal_marker_is_visible_in_the_product_row(logged_in_client, web_db):
-    """Колонки кабинетов уезжают за правый край экрана, поэтому ⚡ должна быть видна
-    рядом с наименованием — иначе фильтр «только с предложениями» показывает строки,
-    в которых оператор не находит ни одной молнии."""
+    """Кабинеты собраны в одну колонку, каждый своей строкой: молния должна стоять
+    в строке того кабинета, где нашлась карточка, и только там — иначе фильтр
+    «только с предложениями» показывает строки без единой молнии."""
     a1, a2 = _accounts(web_db, (Platform.wb, "ИП ЯВОРСКАЯ"), (Platform.kit, "КИТ"))
     _product(web_db, stock=5)
     _sync(web_db, "u1", a1, enabled=False)
@@ -447,8 +456,13 @@ def test_proposal_marker_is_visible_in_the_product_row(logged_in_client, web_db)
 
     r = logged_in_client.get("/products/rows?only_proposals=true")
 
-    assert "⚡ ИП ЯВОРСКАЯ" in r.text
-    assert "⚡ КИТ" not in r.text          # у этого кабинета предложения нет
+    with_proposal = _cab_block(r.text, "ИП ЯВОРСКАЯ")
+    assert "⚡" in with_proposal
+    assert f"/products/u1/{a1.id}/toggle" in with_proposal
+    assert "Карточка найдена в кабинете «ИП ЯВОРСКАЯ»" in with_proposal
+
+    assert "⚡" not in _cab_block(r.text, "КИТ")   # у этого кабинета предложения нет
+    assert "⚡ КИТ" not in r.text
 
 
 def test_proposal_marker_shows_inactive_cabinet_too(logged_in_client, web_db):
@@ -477,4 +491,5 @@ def test_enabled_cabinet_has_no_proposal_marker(logged_in_client, web_db):
 
     r = logged_in_client.get("/products/rows")
 
+    assert "⚡" not in _cab_block(r.text, "ИП ЯВОРСКАЯ")
     assert "⚡ ИП ЯВОРСКАЯ" not in r.text
