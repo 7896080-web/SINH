@@ -7,7 +7,14 @@
 import ast, hashlib, io, os, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DIRS = ["app", "alembic/versions"]
+
+# Сверяем ВСЁ дерево, а не только app/: расхождение в tests/ (серверные файлы отстали
+# от кода на несколько фич) всплыло только при прогоне и выглядело как поломка патча.
+SKIP_DIRS = {".git", "venv", ".venv", "__pycache__", ".pytest_cache", "backups",
+             ".vscode", ".idea", "logs", "node_modules"}
+SUFFIXES = (".py", ".html", ".txt", ".md", ".ini", ".sh", ".ps1", ".bsl", ".xml", ".conf", ".service")
+# .env и бэкапы патчей сравнивать нельзя/незачем: секреты и следы деплоя.
+SKIP_NAMES = {".env", ".env.example"}
 
 
 def _strip_docstrings(tree):
@@ -33,13 +40,13 @@ def norm_hash(path):
 
 def collect(root):
     out = {}
-    for d in DIRS:
-        for dp, dn, fn in os.walk(os.path.join(root, d)):
-            dn[:] = [x for x in dn if x != "__pycache__"]
-            for f in fn:
-                if f.endswith((".py", ".html")):
-                    p = os.path.join(dp, f)
-                    out[os.path.relpath(p, root).replace(os.sep, "/")] = norm_hash(p)
+    for dp, dn, fn in os.walk(root):
+        dn[:] = [x for x in dn if x not in SKIP_DIRS]
+        for f in fn:
+            if not f.endswith(SUFFIXES) or f in SKIP_NAMES or ".bak_" in f:
+                continue
+            p = os.path.join(dp, f)
+            out[os.path.relpath(p, root).replace(os.sep, "/")] = norm_hash(p)
     return out
 
 
