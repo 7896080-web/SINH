@@ -201,4 +201,5 @@ def test_scheduler_hourly_jobs_fire_right_after_start(web_db):
     for job_id in ("ftp_send_export_request", "reconciliation"):
         job = sched.get_job(job_id)
         assert job is not None
-        assert (job.next_run_time - now_utc()).total_seconds() < 60
+        from datetime import timezone
+        assert (job.next_run_time - datetime.now(timezone.utc)).total_seconds() < 60  # APScheduler хранит aware
