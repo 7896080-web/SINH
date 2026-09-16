@@ -1,7 +1,7 @@
 import logging
 import os
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from app.timeutils import now_utc
 
 from sqlalchemy.orm import Session
@@ -54,7 +54,10 @@ class LocalExchange:
         p = self.dir_results / filename
         if not p.exists():
             return None
-        return datetime.utcfromtimestamp(p.stat().st_mtime)
+        # Явная конвертация эпохи в naive UTC. utcfromtimestamp устарел, а
+        # fromtimestamp без пояса вернул бы ЛОКАЛЬНОЕ время: на сервере UTC+3 это
+        # сдвинуло бы сравнение со временем запроса на три часа.
+        return datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc).replace(tzinfo=None)
 
     def list_barcode_files(self) -> list[str]:
         if not self.dir_results.exists():
