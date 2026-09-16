@@ -209,8 +209,15 @@ def parse_stock_export_rows(content: str) -> list[dict]:
     return rows
 
 
-def fetch_stock_export_rows(exchange: "LocalExchange", not_older_than: datetime | None = None) -> list[dict]:
-    """Полные строки выгрузки остатков (uid/артикул/имя/кол-во/баркоды/размер/цвет).
+def fetch_stock_export_snapshot(exchange: "LocalExchange",
+                                not_older_than: datetime | None = None) -> tuple[list[dict], datetime | None]:
+    """То же, что `fetch_stock_export_rows`, но вместе со ВРЕМЕНЕМ снимка.
+
+    Время нужно сверке: задание, закрытое уже после выгрузки, в самой выгрузке
+    ещё не проведено, и без этой поправки сверка считает его приходом на склад
+    (см. `reconciliation._in_flight_adjustment`). Может быть None, если файловая
+    система не отдала время модификации, — тогда сверка считает «в пути» только
+    по заданиям, открытым прямо сейчас (прежнее поведение).
 
     `not_older_than` — момент, когда мы в последний раз ПОПРОСИЛИ у 1С выгрузку.
     Файл старше этого момента — ответ на прошлый запрос: он отражает склад часовой
@@ -222,7 +229,7 @@ def fetch_stock_export_rows(exchange: "LocalExchange", not_older_than: datetime 
     из нового файла и «воскрес» бы из старого)."""
     files = exchange.list_stock_files()          # имена вида stock_ГГГГММДДЧЧММСС.txt, отсортированы
     if not files:
-        return []
+        return [], None
 
     fresh = []
     for filename in files:
@@ -235,14 +242,22 @@ def fetch_stock_export_rows(exchange: "LocalExchange", not_older_than: datetime 
         fresh.append(filename)
 
     if not fresh:
-        return []
+        return [], None
 
     newest = fresh[-1]
     for filename in fresh[:-1]:
         exchange.download_and_archive_result(filename)
         logger.info("stock: %s заменён более свежим снимком %s", filename, newest)
 
-    return parse_stock_export_rows(exchange.download_and_archive_result(newest))
+    taken_at = exchange.file_mtime_utc(newest)   # до архивации: после неё файла уже нет
+    return parse_stock_export_rows(exchange.download_and_archive_result(newest)), taken_at
+
+
+def fetch_stock_export_rows(exchange: "LocalExchange", not_older_than: datetime | None = None) -> list[dict]:
+    """Только строки выгрузки, без времени снимка — для вызовов, которым время
+    не нужно (разовые скрипты, тесты разбора)."""
+    rows, _ = fetch_stock_export_snapshot(exchange, not_older_than=not_older_than)
+    return rows
 
 
 def apply_result_batch(db: Session, content: str) -> dict:

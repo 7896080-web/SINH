@@ -1,5 +1,6 @@
 from datetime import datetime
 
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from app.models import (
@@ -29,19 +30,36 @@ def classify_delta(delta: int, python_stock: int) -> ReconciliationClassificatio
     return ReconciliationClassification.auto_plus if delta > 0 else ReconciliationClassification.auto_minus
 
 
-def _in_flight_adjustment(db: Session, uid_1c: str) -> int:
-    """Сколько 'в пути' на FTP-канале для этого товара прямо сейчас:
-    незавершённые CREATE_MOVEMENT увеличивают ожидаемый остаток в 1С
-    (мы уже списали у себя, 1С ещё нет), незавершённые CANCEL_MOVEMENT —
-    уменьшают (мы уже вернули, 1С ещё нет)."""
+def _in_flight_adjustment(db: Session, uid_1c: str, snapshot_at: datetime | None = None) -> int:
+    """Сколько «в пути» по этому товару НА МОМЕНТ СНИМКА 1С.
+
+    Приём заказа списывает остаток у нас сразу (подтверждение площадки не ждём —
+    заказ уходит в перемещение ЦС → склад площадки), а документ в 1С появляется
+    только когда 1С обработает задание и пришлёт результат. В промежутке 1С
+    показывает единицы, которых у нас уже нет: незавершённые CREATE_MOVEMENT
+    увеличивают ожидаемый остаток в 1С, незавершённые CANCEL_MOVEMENT (возврат на
+    ЦС — только по нашей отмене) уменьшают.
+
+    `snapshot_at` — время выгрузки, по которой идёт сверка. Задание, закрытое
+    ПОСЛЕ снимка, в самом снимке ещё не проведено, значит на момент снимка оно
+    тоже было «в пути». Без этой оговорки задание, закрывшееся в промежутке между
+    выгрузкой и сверкой (а это 5 минут штатного расписания), выглядело бы как
+    приход на склад и вернуло бы уже отгруженные единицы на площадки."""
 
     barcodes = {b.barcode for b in db.query(Barcode).filter(Barcode.uid_1c == uid_1c).all()}
     if not barcodes:
         return 0
 
+    still_open = FtpTask.status.in_([FtpTaskStatus.pending, FtpTaskStatus.sent])
+    if snapshot_at is None:
+        was_open = still_open
+    else:
+        was_open = or_(still_open, and_(FtpTask.completed_at.isnot(None),
+                                        FtpTask.completed_at >= snapshot_at))
+
     open_tasks = db.query(FtpTask).filter(
         FtpTask.barcode.in_(barcodes),
-        FtpTask.status.in_([FtpTaskStatus.pending, FtpTaskStatus.sent]),
+        was_open,
         FtpTask.is_test.is_(False),  # тестовые задания не должны искажать сверку
     ).all()
 
@@ -159,7 +177,8 @@ MIN_SNAPSHOT_COVERAGE = 0.5
 
 
 def run_reconciliation(db: Session, stock_from_1c: dict[str, int],
-                       missing_means_zero: bool = False) -> dict:
+                       missing_means_zero: bool = False,
+                       snapshot_at: datetime | None = None) -> dict:
     """stock_from_1c: {баркод: количество на ЦС} — результат периодической
     выгрузки из старой базы (раздел 8). Раз в час, согласно спецификации.
 
@@ -167,7 +186,12 @@ def run_reconciliation(db: Session, stock_from_1c: dict[str, int],
     которого в снимке нет, физически распродан в ноль: виртуальная таблица
     «ТоварыНаСкладах.Остатки» нулевые позиции не возвращает, и без этого флага такой
     товар не сверялся бы никогда — приложение вечно транслировало бы на площадки
-    последнее ненулевое число (прямой оверселл)."""
+    последнее ненулевое число (прямой оверселл).
+
+    `snapshot_at` — время файла выгрузки. Нужно, чтобы правильно посчитать «в пути»:
+    задание, закрытое уже после снимка, в снимке ещё не проведено (см.
+    `_in_flight_adjustment`). Без него сверка занижает «в пути» и возвращает на
+    склад единицы, которые площадка уже продала."""
 
     stats = {"normal": 0, "auto_plus": 0, "auto_minus": 0, "needs_review": 0,
              "unmatched_barcodes": 0, "zeroed_missing": 0}
@@ -202,7 +226,7 @@ def run_reconciliation(db: Session, stock_from_1c: dict[str, int],
         if product is None:
             continue
 
-        in_flight = _in_flight_adjustment(db, uid_1c)
+        in_flight = _in_flight_adjustment(db, uid_1c, snapshot_at)
         expected_1c = product.stock_on_hand + in_flight
         delta = actual_1c - expected_1c
 
@@ -221,7 +245,22 @@ def run_reconciliation(db: Session, stock_from_1c: dict[str, int],
             # автоматически, независимо от величины. classify_delta оставлен для
             # журнала (крупные по-прежнему видно как needs_review), но остаток и
             # ручную цифру двигаем всегда.
-            product.stock_on_hand = actual_1c
+            #
+            # Применяем НЕ сырое actual_1c, а actual_1c − «в пути». 1С показывает
+            # склад ЦС до проведения наших незакрытых заданий: заказ списывает
+            # остаток у нас сразу, документ в 1С появляется позже. Сырое
+            # присваивание вернуло бы уже отгруженные единицы обратно на склад и
+            # отправило бы их на площадки — ошибка ровно на сумму незакрытых
+            # заданий по товару, то есть максимальная в часы пиковых продаж.
+            #
+            # Тождество: actual − in_flight = (expected + delta) − in_flight
+            #                               = stock + delta,
+            # то есть остаток двигается ровно на дельту склада — так же, как
+            # ниже двигается transmit_override. Отрицательный результат (склад
+            # распродан в магазине глубже, чем мы успели отгрузить) сохраняем:
+            # это честная пересортица, на площадки при этом уходит 0.
+            new_stock = actual_1c - in_flight
+            product.stock_on_hand = new_stock
 
             # Ручная цифра трансляции (transmit_override) «дышит» вместе со складом:
             # приход прибавляет, расход убавляет — ровно на delta. Заказы в delta НЕ
@@ -240,7 +279,7 @@ def run_reconciliation(db: Session, stock_from_1c: dict[str, int],
             ).all()
             for setting in enabled_platforms:
                 db.add(DispatchQueueItem(
-                    uid_1c=uid_1c, account_id=setting.account_id, quantity=actual_1c,
+                    uid_1c=uid_1c, account_id=setting.account_id, quantity=new_stock,
                     reason="reconciliation",
                 ))
 
