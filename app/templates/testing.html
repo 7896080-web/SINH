@@ -120,27 +120,16 @@
 </div>
 
 <div class="card">
-    <h3 style="margin-top:0">Порог трансляции</h3>
-    <p class="help-text">Задайте зависимость: «доступно на дату» и «остаток ЦС на дату» — порог = ЦС на дату − доступно (может быть и отрицательным). Дальше на площадки уходит <b>max(0, текущий ЦС − порог)</b>. Порог фиксирован и сам отслеживает все движения склада (приход, расход, списание, пересортица, перемещение) через текущий остаток ЦС — не накапливается и не дрейфует. «Сбросить» — вернуть автоматический расчёт от остатка. Значение общее для всех кабинетов.</p>
-    <p>Сейчас передаётся на площадки: <b>{{ current_send }}</b>
-        {% if not product.broadcast_enabled %}<span class="badge badge--bad">трансляция SKU выключена → 0; включить на «Управлении остатками»</span>
-        {% elif product.broadcast_offset is not none %}(текущий ЦС {{ product.stock_on_hand }} − порог {{ product.broadcast_offset }}){% elif product.transmit_override is not none %}(ручной {{ product.transmit_override }}){% else %}(авто — от остатка ЦС {{ product.stock_on_hand }}){% endif %}
+    <h3 style="margin-top:0">Сколько сейчас уходит на площадки</h3>
+    <p>Итог по товару: <b>{{ current_send }}</b>
+        {% if not product.broadcast_enabled %}<span class="badge badge--bad">трансляция товара выключена → 0</span>
+        {% elif product.broadcast_offset is not none %}(остаток ЦС {{ product.stock_on_hand }} − порог {{ product.broadcast_offset }})
+        {% elif product.transmit_override is not none %}(устаревший ручной остаток {{ product.transmit_override }})
+        {% else %}(остаток ЦС {{ product.stock_on_hand }} − резерв {{ product.reserve }}){% endif %}
     </p>
-    <form method="post" action="/testing/set-override" style="display:flex; gap:12px; align-items:flex-end; flex-wrap:wrap;">
-        <input type="hidden" name="uid_1c" value="{{ product.uid_1c }}">
-        <input type="hidden" name="account_id" value="{{ selected_account_id }}">
-        <div class="field">
-            <label for="available">Доступно на дату</label>
-            <input type="number" id="available" name="available" style="width:130px;">
-        </div>
-        <div class="field">
-            <label for="stock_at_date">Остаток ЦС на дату</label>
-            <input type="number" id="stock_at_date" name="stock_at_date" style="width:150px;">
-        </div>
-        <button type="submit" class="btn-primary">Установить порог</button>
-        <button type="submit" name="clear" value="1" class="btn">Сбросить (авто)</button>
-    </form>
-    {% if product.broadcast_offset is not none %}<p class="help-text">Текущий порог: <b>{{ product.broadcast_offset }}</b>.</p>{% endif %}
+    <p class="help-text">Порог трансляции, резерв, выключатель трансляции и пороги кабинетов
+    задаются на странице <a href="/products?q={{ product.article or '' }}">«Товары и остатки»</a> — там же
+    по каждому кабинету видно число, которое реально уйдёт, и причина, если это ноль.</p>
 </div>
 
 {% if account %}

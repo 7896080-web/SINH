@@ -1,0 +1,24 @@
+<table class="pr-table">
+    <thead>
+        <tr>
+            <th></th>
+            <th>Артикул</th><th>Размер</th><th>Цвет</th><th>Наименование</th>
+            <th title="Из 1С, вручную не меняется">Остаток ЦС</th>
+            <th title="Держим у себя; только в автоматическом режиме">Резерв</th>
+            <th title="Постоянное расхождение учёта 1С и реального склада">Порог трансляции</th>
+            <th title="Главный выключатель товара">Трансляция</th>
+            <th title="Итог уровня товара, до порогов кабинетов">Уходит</th>
+            <th title="От неё стартует бэкфилл на «Тестировании»">Активно с</th>
+            {% for account in accounts %}
+            <th title="{{ account.platform.value|upper }}">{{ account.name }}<div class="pr-hint">галочка · порог</div></th>
+            {% endfor %}
+        </tr>
+    </thead>
+    <tbody>
+        {% for row in rows %}
+            {% include "products_row.html" %}
+        {% else %}
+        <tr><td colspan="{{ 10 + accounts|length }}"><div class="empty-state">Ничего не найдено.</div></td></tr>
+        {% endfor %}
+    </tbody>
+</table>

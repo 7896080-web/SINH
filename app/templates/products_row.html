@@ -1,0 +1,116 @@
+<tr id="row-{{ row.uid_1c }}">
+    <td><input type="checkbox" name="uids" value="{{ row.uid_1c }}" form="bulk-form"></td>
+
+    <td class="mono">{{ row.article or '—' }}</td>
+    <td>{{ row.size or '' }}</td>
+    <td>{{ row.color or '' }}</td>
+    <td>
+        {{ row.name or '—' }}
+        {% if not row.has_barcode %}
+            <span class="badge badge--bad" title="Нет ни одного баркода — сопоставление и отправка не сработают">нет баркода</span>
+        {% endif %}
+        {% if row.transmit_override is not none %}
+            <div class="pr-hint pr-hint--warn">
+                ручной остаток {{ row.transmit_override }} (устаревший режим, перекрыт порогом)
+                <button type="button" class="pr-mini"
+                        hx-post="/products/{{ row.uid_1c }}/clear-override"
+                        hx-target="#row-{{ row.uid_1c }}" hx-swap="outerHTML">сбросить</button>
+            </div>
+        {% endif %}
+    </td>
+
+    <td class="mono pr-num" title="Физический остаток склада ЦС, приходит из 1С сверкой. Вручную не меняется.">{{ row.stock_on_hand }}</td>
+
+    <td>
+        <input type="number" value="{{ row.reserve }}" min="0" class="pr-input"
+               hx-post="/products/{{ row.uid_1c }}/reserve" hx-trigger="change"
+               hx-vals="js:{reserve: event.target.value}"
+               hx-target="#row-{{ row.uid_1c }}" hx-swap="outerHTML"
+               title="Сколько штук держим у себя. Применяется только в автоматическом режиме — если задан порог трансляции, резерв не участвует.">
+    </td>
+
+    <td>
+        <input type="number" value="{% if row.broadcast_offset is not none %}{{ row.broadcast_offset }}{% endif %}"
+               placeholder="—" class="pr-input"
+               hx-post="/products/{{ row.uid_1c }}/offset" hx-trigger="change"
+               hx-vals="js:{value: event.target.value}"
+               hx-target="#row-{{ row.uid_1c }}" hx-swap="outerHTML"
+               title="Постоянное расхождение между учётом 1С и реальным складом. Уходит max(0, остаток ЦС − порог). Пусто — порог не задан. Может быть отрицательным.">
+        <details class="pr-calc">
+            <summary>посчитать</summary>
+            <form hx-post="/products/{{ row.uid_1c }}/offset"
+                  hx-target="#row-{{ row.uid_1c }}" hx-swap="outerHTML">
+                <label>учёт 1С на дату <input type="number" name="stock_at_date" class="pr-input"></label>
+                <label>реально на дату <input type="number" name="available" class="pr-input"></label>
+                <button type="submit" class="pr-mini">ОК</button>
+            </form>
+        </details>
+    </td>
+
+    <td>
+        <button type="button" class="{{ 'pr-on' if row.broadcast_enabled else 'pr-off' }}"
+                hx-post="/products/{{ row.uid_1c }}/broadcast"
+                hx-vals='{"enabled": "{{ 'false' if row.broadcast_enabled else 'true' }}"}'
+                hx-target="#row-{{ row.uid_1c }}" hx-swap="outerHTML"
+                title="Главный выключатель товара. Выключено — на все площадки уходит 0, какими бы ни были порог и остаток.">
+            {{ 'Вкл' if row.broadcast_enabled else 'Выкл' }}
+        </button>
+    </td>
+
+    <td class="pr-num">
+        {% if row.sku_blocked %}
+            <span class="badge badge--bad">0</span>
+            <div class="pr-hint pr-hint--warn">{{ row.sku_reason }}</div>
+        {% else %}
+            <b>{{ row.sku_quantity }}</b>
+            <div class="pr-hint">
+                {% if row.broadcast_offset is not none %}{{ row.stock_on_hand }} − порог {{ row.broadcast_offset }}
+                {% elif row.transmit_override is not none %}ручной остаток
+                {% else %}{{ row.stock_on_hand }} − резерв {{ row.reserve }}{% endif %}
+            </div>
+        {% endif %}
+    </td>
+
+    <td>
+        <input type="date" value="{{ row.active_since.isoformat() if row.active_since else '' }}" class="pr-date"
+               hx-post="/products/{{ row.uid_1c }}/active-since" hx-trigger="change"
+               hx-vals="js:{value: event.target.value}"
+               hx-target="#row-{{ row.uid_1c }}" hx-swap="outerHTML"
+               title="Дата старта задним числом: от неё стартует бэкфилл на странице «Тестирование».">
+    </td>
+
+    {% for account in accounts %}
+    {% set state = row.accounts[account.id] %}
+    <td class="pr-acc">
+        <div class="pr-acc__top">
+            {% if state.has_proposal and not state.enabled %}
+                <button type="button" class="pr-flag"
+                        hx-post="/products/{{ row.uid_1c }}/{{ account.id }}/toggle"
+                        hx-vals='{"enabled": "true"}'
+                        hx-target="#row-{{ row.uid_1c }}" hx-swap="outerHTML"
+                        title="Карточка найдена в кабинете {{ account.name }}{% if state.proposal_date %} {{ state.proposal_date.strftime('%d.%m.%Y') }}{% endif %} — включить?">⚡</button>
+            {% else %}
+                <input type="checkbox" {% if state.enabled %}checked{% endif %}
+                       hx-post="/products/{{ row.uid_1c }}/{{ account.id }}/toggle"
+                       hx-vals="js:{enabled: event.target.checked}"
+                       hx-target="#row-{{ row.uid_1c }}" hx-swap="outerHTML"
+                       title="Передавать этот товар в кабинет «{{ account.name }}».">
+            {% endif %}
+            <input type="number" value="{{ state.min_threshold }}" min="0" class="pr-input pr-input--tiny"
+                   hx-post="/products/{{ row.uid_1c }}/{{ account.id }}/threshold" hx-trigger="change"
+                   hx-vals="js:{min_threshold: event.target.value}"
+                   hx-target="#row-{{ row.uid_1c }}" hx-swap="outerHTML"
+                   title="Порог кабинета: если доступно не больше этого числа — уходит 0. 0 — выключен. Не применяется, когда задан порог трансляции.">
+        </div>
+        {% if state.enabled %}
+            {% if state.blocked %}
+                <div class="pr-hint pr-hint--warn" title="{{ state.fix_hint }}">→ 0: {{ state.reason }}</div>
+            {% else %}
+                <div class="pr-hint pr-hint--good">→ {{ state.quantity }}</div>
+            {% endif %}
+        {% else %}
+            <div class="pr-hint">не передаётся</div>
+        {% endif %}
+    </td>
+    {% endfor %}
+</tr>

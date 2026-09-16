@@ -48,44 +48,6 @@ def test_disabled_zero(db):
     assert _quantity_to_send(db, "u1", 1, 29) == 0
 
 
-# --- роут /testing/set-override: ввод «доступно» + «остаток ЦС на дату» → порог ---
-
-def test_set_threshold_route_computes_offset(logged_in_client, web_db):
-    web_db.add(Product(uid_1c="uX", stock_on_hand=29, broadcast_enabled=True,
-                       transmit_override=7))
-    web_db.commit()
-    logged_in_client.post("/testing/set-override",
-                          data={"uid_1c": "uX", "available": "32", "stock_at_date": "43"})
-    web_db.expire_all()
-    p = web_db.query(Product).filter(Product.uid_1c == "uX").first()
-    assert p.broadcast_offset == 11          # 43 − 32
-    assert p.transmit_override is None        # старую ручную цифру гасим
-
-
-def test_set_threshold_route_negative(logged_in_client, web_db):
-    web_db.add(Product(uid_1c="uY", stock_on_hand=10, broadcast_enabled=True))
-    web_db.commit()
-    logged_in_client.post("/testing/set-override",
-                          data={"uid_1c": "uY", "available": "15", "stock_at_date": "10"})
-    web_db.expire_all()
-    assert web_db.query(Product).filter(Product.uid_1c == "uY").first().broadcast_offset == -5
-
-
-def test_clear_threshold_route(logged_in_client, web_db):
-    web_db.add(Product(uid_1c="uZ", stock_on_hand=10, broadcast_enabled=True, broadcast_offset=3))
-    web_db.commit()
-    logged_in_client.post("/testing/set-override", data={"uid_1c": "uZ", "clear": "1"})
-    web_db.expire_all()
-    assert web_db.query(Product).filter(Product.uid_1c == "uZ").first().broadcast_offset is None
-
-
-def test_set_threshold_warns_when_broadcast_disabled(logged_in_client, web_db):
-    """Порог задан, но трансляция SKU выключена → сообщение обязано сказать, что уходит 0."""
-    from app.models import Product
-    web_db.add(Product(uid_1c="u9", stock_on_hand=29, broadcast_enabled=False))
-    web_db.commit()
-    r = logged_in_client.post("/testing/set-override",
-                              data={"uid_1c": "u9", "account_id": "", "available": "32", "stock_at_date": "43"})
-    assert "ВЫКЛЮЧЕНА" in r.text and "уходит 0" in r.text
-    web_db.refresh(web_db.query(Product).filter(Product.uid_1c == "u9").first())
-    assert web_db.query(Product).filter(Product.uid_1c == "u9").first().broadcast_offset == 11
+# Роуты установки порога переехали на /products — их тесты в tests/test_web_products.py
+# (test_offset_direct_value, test_offset_computed_from_recount, test_offset_can_be_negative,
+# test_offset_cleared_by_empty_value, test_clear_legacy_override).

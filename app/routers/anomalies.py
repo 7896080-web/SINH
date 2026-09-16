@@ -10,7 +10,7 @@ from sqlalchemy import func, or_
 from app.database import get_db
 from app.dependencies import get_current_user
 from app.models import SyncAnomaly, SyncSetting, Product, PlatformAccount, AnomalyReason, AnomalyStatus, User
-from app.routers.sync_products import enqueue_full_resend
+from app.transmit import enqueue_full_resend
 from app.excel_utils import build_xlsx_response, read_xlsx_rows, parse_bool_ru, format_dt
 from app.flash import set_flash, pop_flash
 from app.audit import log_action

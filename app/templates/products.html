@@ -1,0 +1,119 @@
+{% extends "base.html" %}
+{% block title %}Товары и остатки{% endblock %}
+{% block content %}
+<style>
+  .pr-table{width:100%;border-collapse:collapse;font-size:13px}
+  .pr-table th,.pr-table td{border-bottom:1px solid #eef0f4;padding:6px 8px;vertical-align:top}
+  .pr-table th{text-align:left;font-size:12px;color:#556;white-space:nowrap}
+  .pr-num{text-align:right}
+  .pr-input{width:68px;padding:3px 5px;font-size:12px;text-align:right}
+  .pr-input--tiny{width:46px}
+  .pr-date{padding:3px 5px;font-size:12px}
+  .pr-hint{font-size:11px;color:#667;margin-top:2px;white-space:normal}
+  .pr-hint--warn{color:#9a1c1c}
+  .pr-hint--good{color:#16794a;font-weight:600}
+  .pr-mini{font-size:11px;padding:1px 6px}
+  .pr-calc summary{font-size:11px;color:#567;cursor:pointer;margin-top:2px}
+  .pr-calc label{display:block;font-size:11px;color:#556;margin-top:3px}
+  .pr-on{background:#16794a;color:#fff}
+  .pr-off{background:#9a1c1c;color:#fff}
+  .pr-flag{background:#fde68a;border:none;border-radius:4px;cursor:pointer}
+  .pr-acc__top{display:flex;gap:4px;align-items:center}
+  .pr-masters{display:flex;flex-wrap:wrap;gap:10px;margin:8px 0 14px}
+  .pr-masters form{display:flex;align-items:center;gap:6px;border:1px solid #dfe3ea;border-radius:8px;padding:6px 10px;background:#fafbfc}
+  .pr-bulk{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:10px 0;padding:8px 10px;border:1px dashed #c7cdd6;border-radius:8px;background:#fbfcfe}
+  .pr-bulk input{width:auto}
+  .pr-ladder{font-size:13px;line-height:1.7;margin:6px 0 0}
+  .pr-ladder li{margin-bottom:2px}
+</style>
+
+<div class="page-header">
+    <div>
+        <h1>Товары и остатки</h1>
+        <p>Одна строка на размер-цвет SKU: что уходит на площадки и почему именно столько.
+        В колонке каждого кабинета показано число, которое реально уйдёт, — если там ноль,
+        рядом написана причина.</p>
+    </div>
+    <div class="toolbar">
+        <a href="/products/export?q={{ q }}&only_proposals={{ only_proposals|lower }}&only_blocked={{ only_blocked|lower }}" class="btn">Экспорт в Excel</a>
+        <form method="post" action="/products/import" enctype="multipart/form-data" style="display:inline;">
+            <label class="btn file-upload-btn">
+                Импорт из Excel
+                <input type="file" name="file" accept=".xlsx" onchange="this.form.submit()">
+            </label>
+        </form>
+    </div>
+</div>
+
+<details class="card" style="padding:10px 14px;">
+    <summary><b>Как считается количество для площадки</b></summary>
+    <ol class="pr-ladder">
+        <li><b>Трансляция товара</b> выключена → <b>0</b>. Колонка «Трансляция» в строке. По умолчанию выключена у всех товаров.</li>
+        <li><b>Кабинет не отмечен</b> галочкой → <b>0</b> в этот кабинет. Живой опрос заказов тоже берёт только отмеченные пары.</li>
+        <li><b>Рассылка на площадку на паузе</b> → <b>0</b>. Переключатели ниже.</li>
+        <li>Задан <b>порог трансляции</b> → уходит <b>остаток ЦС − порог</b>. Порог фиксирован: заказы и сверка двигают остаток, а он стоит на месте, поэтому цифра не дрейфует.</li>
+        <li>Иначе → <b>остаток ЦС − резерв</b>, и если результат не больше <b>порога кабинета</b>, уходит 0.</li>
+    </ol>
+    <p class="help-text">Порог трансляции — это постоянное расхождение между учётом 1С и реальным складом.
+    Считается один раз по пересчёту: учёт 1С на дату минус реально найденное количество. Кнопка «посчитать» в колонке порога сделает вычитание сама.</p>
+</details>
+
+<h3>Рассылка по площадкам (пауза)</h3>
+<div class="pr-masters">
+  {% for p in dispatch.platforms %}
+  <form method="post" action="/products/dispatch-toggle">
+    <input type="hidden" name="q" value="{{ q }}">
+    <input type="hidden" name="scope" value="{{ p.platform }}">
+    <strong>{{ p.platform|upper }}</strong>
+    <span class="muted">{{ p.on }}/{{ p.total }} вкл</span>
+    <button name="enabled" value="true" class="pr-on">Вкл</button>
+    <button name="enabled" value="false" class="pr-off">Пауза</button>
+  </form>
+  {% endfor %}
+  <form method="post" action="/products/dispatch-toggle">
+    <input type="hidden" name="q" value="{{ q }}">
+    <input type="hidden" name="scope" value="all">
+    <strong>ВСЕ</strong>
+    <span class="muted">{{ dispatch.all_on }}/{{ dispatch.all_total }} вкл</span>
+    <button name="enabled" value="true" class="pr-on">Вкл</button>
+    <button name="enabled" value="false" class="pr-off">Пауза</button>
+  </form>
+</div>
+
+<form class="filters"
+      hx-get="/products/rows" hx-target="#pr-table"
+      hx-trigger="keyup changed delay:400ms from:input, change from:input[type=checkbox]"
+      hx-include="this">
+    <div class="field">
+        <label for="q">Поиск</label>
+        <input type="search" id="q" name="q" value="{{ q }}" placeholder="артикул, наименование">
+    </div>
+    <label class="checkbox-inline" style="padding-bottom:8px;">
+        <input type="checkbox" name="only_proposals" value="true" {% if only_proposals %}checked{% endif %}>
+        Только с предложениями ⚡
+    </label>
+    <label class="checkbox-inline" style="padding-bottom:8px;">
+        <input type="checkbox" name="only_blocked" value="true" {% if only_blocked %}checked{% endif %}>
+        Только те, где уходит 0
+    </label>
+</form>
+
+<form id="bulk-form" method="post" action="/products/bulk" class="pr-bulk">
+  <input type="hidden" name="q" value="{{ q }}">
+  <span class="muted">С отмеченными:</span>
+  <input type="number" name="int_value" placeholder="число" style="width:80px;">
+  <button name="action" value="set_reserve">Резерв =</button>
+  <button name="action" value="set_offset">Порог трансляции =</button>
+  <button name="action" value="clear_offset">Сбросить порог</button>
+  <button name="action" value="broadcast_on" class="pr-on">Трансляция вкл</button>
+  <button name="action" value="broadcast_off" class="pr-off">Трансляция выкл</button>
+  <input type="date" name="date_value">
+  <button name="action" value="set_active_since">Активно с =</button>
+</form>
+
+<div class="card" style="padding:0; overflow-x:auto;">
+    <div id="pr-table">
+        {% include "products_rows.html" %}
+    </div>
+</div>
+{% endblock %}
