@@ -8,7 +8,7 @@
    и через пять циклов предохранитель гасил боевой кабинет.
 """
 import os
-from datetime import timedelta
+from datetime import timedelta, timezone
 
 from app.models import (Product, Barcode, ProcessedOrder, OrderProcessStatus, FtpTask,
                         FtpTaskStatus, Platform, SyncSetting, DispatchQueueItem)
@@ -26,11 +26,13 @@ def _exchange(tmp_path):
 
 
 def _write_stock(ex, name, body, mtime=None):
+    """`mtime` — naive UTC, как его отдаёт now_utc(). Перевод в эпоху ОБЯЗАН быть
+    явным: `.timestamp()` у naive-даты трактует её как локальное время, и на сервере
+    в UTC+3 файл «постарел» бы на три часа (этот тест так и падал на сервере)."""
     p = ex.dir_results / name
     p.write_text(body, encoding="utf-8")
     if mtime is not None:
-        ts = mtime.replace(tzinfo=None).timestamp() + (
-            now_utc().timestamp() - now_utc().replace(tzinfo=None).timestamp())
+        ts = mtime.replace(tzinfo=timezone.utc).timestamp()
         os.utime(p, (ts, ts))
     return p
 
@@ -200,3 +202,17 @@ def test_wb_client_would_have_crashed_on_synthetic_id():
 
     with pytest.raises(ValueError):
         WbClient(token="x", warehouse_id="w").get_cancelled_orders([f"{TEST_ORDER_PREFIX}abc"])
+
+
+def test_file_mtime_is_timezone_independent(tmp_path):
+    """Свежесть снимка не должна зависеть от пояса сервера: время файла и время
+    запроса сравниваются в одной шкале (naive UTC). На сервере UTC+3 наивный
+    перевод давал сдвиг на три часа, и свежий снимок отбрасывался как устаревший."""
+    ex = _exchange(tmp_path)
+    moment = now_utc()
+    _write_stock(ex, "stock_x.txt", "u1|A|Т|5|111", mtime=moment)
+
+    got = ex.file_mtime_utc("stock_x.txt")
+
+    assert abs((got - moment).total_seconds()) < 2, (
+        f"время файла {got} разошлось с now_utc() {moment} — проверьте пояс")
