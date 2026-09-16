@@ -11,6 +11,24 @@ from app.workers.matching import resolve_barcode
 from app.workers.platform_clients.base import PlatformClient, PlatformOrder
 
 
+# Префикс синтетических заказов со страницы «Тестирование». У ProcessedOrder нет
+# флага is_test — симулированный заказ отличается только этим префиксом, и живой
+# опрос ОБЯЗАН исключать такие заказы: их идентификаторы не существуют на площадке
+# (клиент WB приводит номер к целому и падает, после пяти падений предохранитель
+# гасит боевой кабинет).
+TEST_ORDER_PREFIX = "TEST-"
+
+
+def _real_open_orders(db: Session, account: PlatformAccount) -> list[ProcessedOrder]:
+    """Принятые, но ещё не закрытые заказы кабинета — только НАСТОЯЩИЕ.
+    Их идентификаторы уходят прямо в API площадки, поэтому синтетика исключается."""
+    return db.query(ProcessedOrder).filter(
+        ProcessedOrder.account_id == account.id,
+        ProcessedOrder.status == OrderProcessStatus.processed,
+        ProcessedOrder.order_id.notlike(f"{TEST_ORDER_PREFIX}%"),
+    ).all()
+
+
 def _representative_barcode(db: Session, uid_1c: str) -> str | None:
     """Для FTP-задания в 1С нужен любой настоящий физический баркод товара —
     после того как подтвердилось, что Kit тоже отдаёт реальный баркод
@@ -271,13 +289,10 @@ def poll_cancellations(db: Session, client: PlatformClient, account: PlatformAcc
     """Обратный ход: заказ, который мы уже списали, оказался отменён —
     возвращаем количество и рассылаем заново (раздел 5 спецификации)."""
 
-    open_orders = db.query(ProcessedOrder).filter(
-        ProcessedOrder.account_id == account.id,
-        # Только НЕподтверждённые заказы (в статусе «Ожидает»): отмена = возврат
-        # «<Площадка>.Ожидает» → ЦС. Подтверждённый заказ терминален — продажу и
-        # возврат ПОСЛЕ продажи в нашем потоке не обрабатываем (по требованию).
-        ProcessedOrder.status == OrderProcessStatus.processed,
-    ).all()
+    # Только НЕподтверждённые заказы (в статусе «Ожидает»): отмена = возврат
+    # «<Площадка>.Ожидает» → ЦС. Подтверждённый заказ терминален — продажу и
+    # возврат ПОСЛЕ продажи в нашем потоке не обрабатываем (по требованию).
+    open_orders = _real_open_orders(db, account)
     order_ids = [o.order_id for o in open_orders]
     orders_by_id = {o.order_id: o for o in open_orders}
 
@@ -303,10 +318,7 @@ def poll_confirmations(db: Session, client: PlatformClient, account: PlatformAcc
     """Подтверждённые/отгруженные заказы: те, что мы приняли (processed) и
     которые площадка перевела в статус «подтверждён/отгружен». По каждому —
     перемещение в 1С «<Площадка>.Ожидает» → «Склад <Площадка>»."""
-    open_orders = db.query(ProcessedOrder).filter(
-        ProcessedOrder.account_id == account.id,
-        ProcessedOrder.status == OrderProcessStatus.processed,
-    ).all()
+    open_orders = _real_open_orders(db, account)
     order_ids = [o.order_id for o in open_orders]
     orders_by_id = {o.order_id: o for o in open_orders}
 

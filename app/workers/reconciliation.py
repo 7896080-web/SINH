@@ -152,11 +152,25 @@ def import_barcode_dict(db: Session, rows: list[dict], full: bool = False) -> di
     return stats
 
 
-def run_reconciliation(db: Session, stock_from_1c: dict[str, int]) -> dict:
-    """stock_from_1c: {баркод: количество на ЦС} — результат периодической
-    выгрузки из старой базы (раздел 8). Раз в час, согласно спецификации."""
+# Доля прошлых ненулевых товаров, ниже которой снимок считается подозрительным и
+# обнуление по отсутствию НЕ применяется: лучше не тронуть остаток, чем обнулить
+# весь ассортимент из-за обрезанного или подсунутого вручную файла.
+MIN_SNAPSHOT_COVERAGE = 0.5
 
-    stats = {"normal": 0, "auto_plus": 0, "auto_minus": 0, "needs_review": 0, "unmatched_barcodes": 0}
+
+def run_reconciliation(db: Session, stock_from_1c: dict[str, int],
+                       missing_means_zero: bool = False) -> dict:
+    """stock_from_1c: {баркод: количество на ЦС} — результат периодической
+    выгрузки из старой базы (раздел 8). Раз в час, согласно спецификации.
+
+    `missing_means_zero` — выгрузка является ПОЛНЫМ снимком склада ЦС. Тогда товар,
+    которого в снимке нет, физически распродан в ноль: виртуальная таблица
+    «ТоварыНаСкладах.Остатки» нулевые позиции не возвращает, и без этого флага такой
+    товар не сверялся бы никогда — приложение вечно транслировало бы на площадки
+    последнее ненулевое число (прямой оверселл)."""
+
+    stats = {"normal": 0, "auto_plus": 0, "auto_minus": 0, "needs_review": 0,
+             "unmatched_barcodes": 0, "zeroed_missing": 0}
 
     # Группируем полученные из 1С количества по uid_1c (может быть несколько
     # баркодов на один товар — считаем максимум, т.к. это один физический остаток)
@@ -167,6 +181,21 @@ def run_reconciliation(db: Session, stock_from_1c: dict[str, int]) -> dict:
             stats["unmatched_barcodes"] += 1
             continue
         uid_to_actual[row.uid_1c] = max(uid_to_actual.get(row.uid_1c, 0), qty)
+
+    if missing_means_zero and uid_to_actual:
+        # Товары с баркодами и ненулевым остатком, которых в снимке нет.
+        known = {uid for (uid,) in db.query(Product.uid_1c)
+                 .filter(Product.stock_on_hand != 0)
+                 .join(Barcode, Barcode.uid_1c == Product.uid_1c).distinct()}
+        missing = known - set(uid_to_actual)
+        if known and len(uid_to_actual) < len(known) * MIN_SNAPSHOT_COVERAGE:
+            # Снимок покрывает меньше половины прежних ненулевых товаров — похоже на
+            # обрезанную или подложенную вручную выгрузку. Ничего не обнуляем.
+            stats["snapshot_suspicious"] = len(uid_to_actual)
+        else:
+            for uid in missing:
+                uid_to_actual[uid] = 0
+            stats["zeroed_missing"] = len(missing)
 
     for uid_1c, actual_1c in uid_to_actual.items():
         product = db.query(Product).filter(Product.uid_1c == uid_1c).first()

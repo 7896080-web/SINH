@@ -1,3 +1,4 @@
+import logging
 import os
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -6,6 +7,8 @@ from app.timeutils import now_utc
 from sqlalchemy.orm import Session
 
 from app.models import FtpTask, FtpTaskStatus, Platform
+
+logger = logging.getLogger("sync_worker")
 
 TASK_TIMEOUT_MINUTES = 15
 
@@ -43,6 +46,15 @@ class LocalExchange:
         if not self.dir_results.exists():
             return []
         return sorted(p.name for p in self.dir_results.glob("stock_*.txt"))
+
+    def file_mtime_utc(self, filename: str) -> datetime | None:
+        """Время последней записи файла результата в naive UTC — тем же масштабом,
+        что и now_utc(). Нужно, чтобы отличить свежую выгрузку 1С от той, что
+        лежит с прошлого цикла."""
+        p = self.dir_results / filename
+        if not p.exists():
+            return None
+        return datetime.utcfromtimestamp(p.stat().st_mtime)
 
     def list_barcode_files(self) -> list[str]:
         if not self.dir_results.exists():
@@ -194,16 +206,40 @@ def parse_stock_export_rows(content: str) -> list[dict]:
     return rows
 
 
-def fetch_stock_export_rows(exchange: "LocalExchange") -> list[dict]:
-    """Как fetch_stock_export_files, но отдаёт полные строки (uid/артикул/имя/
-    кол-во/баркоды/размер/цвет). Читает все stock_*.txt из results и архивирует.
-    Дубли uid схлопываются — берём последнюю встреченную строку."""
-    combined = {}
-    for filename in exchange.list_stock_files():
-        content = exchange.download_and_archive_result(filename)
-        for r in parse_stock_export_rows(content):
-            combined[r["uid_1c"]] = r
-    return list(combined.values())
+def fetch_stock_export_rows(exchange: "LocalExchange", not_older_than: datetime | None = None) -> list[dict]:
+    """Полные строки выгрузки остатков (uid/артикул/имя/кол-во/баркоды/размер/цвет).
+
+    `not_older_than` — момент, когда мы в последний раз ПОПРОСИЛИ у 1С выгрузку.
+    Файл старше этого момента — ответ на прошлый запрос: он отражает склад часовой
+    давности, и применять его нельзя (продажи за этот час вернутся «обратно», и
+    завышенный остаток уедет на площадки). Такие файлы архивируются без разбора.
+
+    Из оставшихся берётся ТОЛЬКО САМЫЙ СВЕЖИЙ: выгрузка 1С — это снимок склада
+    целиком, и склеивать два снимка нельзя (товар, распроданный в ноль, исчезает
+    из нового файла и «воскрес» бы из старого)."""
+    files = exchange.list_stock_files()          # имена вида stock_ГГГГММДДЧЧММСС.txt, отсортированы
+    if not files:
+        return []
+
+    fresh = []
+    for filename in files:
+        mtime = exchange.file_mtime_utc(filename)
+        if not_older_than is not None and mtime is not None and mtime < not_older_than:
+            exchange.download_and_archive_result(filename)
+            logger.warning("stock: %s старше последнего запроса выгрузки (%s < %s) — пропущен",
+                           filename, mtime, not_older_than)
+            continue
+        fresh.append(filename)
+
+    if not fresh:
+        return []
+
+    newest = fresh[-1]
+    for filename in fresh[:-1]:
+        exchange.download_and_archive_result(filename)
+        logger.info("stock: %s заменён более свежим снимком %s", filename, newest)
+
+    return parse_stock_export_rows(exchange.download_and_archive_result(newest))
 
 
 def apply_result_batch(db: Session, content: str) -> dict:

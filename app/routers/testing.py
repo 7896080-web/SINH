@@ -14,7 +14,8 @@ from app.models import (
 )
 from app.workers.client_factory import build_client
 from app.workers.credentials import CredentialsMissing
-from app.workers.order_poller import process_new_order, process_cancellation, process_confirmation
+from app.workers.order_poller import (process_new_order, process_cancellation, process_confirmation,
+                                      TEST_ORDER_PREFIX)
 from app.workers.scheduler import PENDING_WAREHOUSE_NAME, SOLD_WAREHOUSE_NAME
 from app.workers.dispatch import _resolve_push_target, _quantity_to_send
 from app.transmit import explain
@@ -25,7 +26,6 @@ from app.flash import set_flash, pop_flash
 router = APIRouter()
 templates = Jinja2Templates(directory="app/templates")
 
-TEST_ORDER_PREFIX = "TEST-"
 
 
 def _new_test_order_id() -> str:

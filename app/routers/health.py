@@ -19,6 +19,7 @@ EXPECTED_INTERVAL_SECONDS = {
     "ftp_send": 60 * 3,
     "ftp_receive": 60 * 3,
     "ftp_send_export_request": 3600 * 3,
+    "ftp_send_barcode_request": 86400 * 3,
     "reconciliation": 3600 * 3,
     "reconcile_accounts": 300 * 3,
     "import_barcodes": 900 * 3,
