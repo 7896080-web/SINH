@@ -1,0 +1,332 @@
+"""Единая страница «Товары и остатки» (/products) — заменила «Синхронизируемые
+товары» и «Управление остатками». Здесь же проверяется главное свойство новой
+страницы: по каждому кабинету показано число, которое РЕАЛЬНО уйдёт, и причина нуля.
+"""
+from datetime import date
+
+from app.models import (Product, Barcode, PlatformAccount, Platform, SyncSetting,
+                        DispatchQueueItem)
+
+
+def _accounts(web_db, *specs):
+    made = []
+    for platform, name in specs:
+        a = PlatformAccount(platform=platform, name=name, warehouse_id="wh")
+        web_db.add(a)
+        made.append(a)
+    web_db.commit()
+    for a in made:
+        web_db.refresh(a)
+    return made
+
+
+def _product(web_db, uid="u1", stock=10, reserve=0, offset=None, override=None,
+             broadcast=True, barcode="111"):
+    p = Product(uid_1c=uid, article="A-" + uid, name="Товар " + uid, stock_on_hand=stock,
+                reserve=reserve, broadcast_offset=offset, transmit_override=override,
+                broadcast_enabled=broadcast)
+    web_db.add(p)
+    if barcode:
+        web_db.add(Barcode(barcode=barcode + uid, uid_1c=uid))
+    web_db.commit()
+    return p
+
+
+def _sync(web_db, uid, account, enabled=True, threshold=0):
+    s = SyncSetting(uid_1c=uid, account_id=account.id, enabled=enabled, min_threshold=threshold)
+    web_db.add(s)
+    web_db.commit()
+    return s
+
+
+# --------------------------------------------------------------- страница и объяснения
+
+def test_page_renders_with_product_and_ladder(logged_in_client, web_db):
+    _product(web_db)
+    r = logged_in_client.get("/products")
+    assert r.status_code == 200
+    assert "Товары и остатки" in r.text
+    assert "Товар u1" in r.text
+    assert "Как считается количество для площадки" in r.text
+
+
+def test_old_page_urls_redirect_to_merged_page(logged_in_client, web_db):
+    for old in ("/sync-products", "/stock-control"):
+        r = logged_in_client.get(old, follow_redirects=False)
+        assert r.status_code == 301, old
+        assert r.headers["location"] == "/products"
+
+
+def test_each_cabinet_shows_real_quantity(logged_in_client, web_db):
+    a1, a2 = _accounts(web_db, (Platform.wb, "WB-1"), (Platform.ozon, "OZ-1"))
+    _product(web_db, stock=29, offset=11)
+    _sync(web_db, "u1", a1, enabled=True)
+    _sync(web_db, "u1", a2, enabled=False)
+
+    r = logged_in_client.get("/products")
+    assert "→ 18" in r.text          # 29 − 11 в отмеченный кабинет
+    assert "не передаётся" in r.text  # неотмеченный кабинет
+
+
+def test_disabled_broadcast_shows_zero_and_reason(logged_in_client, web_db):
+    a1, = _accounts(web_db, (Platform.wb, "WB-1"))
+    _product(web_db, stock=29, offset=11, broadcast=False)
+    _sync(web_db, "u1", a1, enabled=True)
+
+    r = logged_in_client.get("/products")
+    assert "трансляция товара выключена" in r.text
+
+
+def test_cabinet_threshold_reason_is_shown(logged_in_client, web_db):
+    a1, = _accounts(web_db, (Platform.wb, "WB-1"))
+    _product(web_db, stock=10)                    # авторежим: 10 − 0 = 10
+    _sync(web_db, "u1", a1, enabled=True, threshold=32)
+
+    r = logged_in_client.get("/products")
+    assert "порог кабинета 32" in r.text
+
+
+def test_paused_platform_reason_is_shown(logged_in_client, web_db):
+    a1, = _accounts(web_db, (Platform.wb, "WB-1"))
+    a1.dispatch_enabled = False
+    _product(web_db, stock=29, offset=11)
+    _sync(web_db, "u1", a1, enabled=True)
+
+    r = logged_in_client.get("/products")
+    assert "на паузе" in r.text
+
+
+def test_only_blocked_filter_keeps_problem_rows(logged_in_client, web_db):
+    a1, = _accounts(web_db, (Platform.wb, "WB-1"))
+    _product(web_db, uid="ok", stock=29, offset=11)
+    _product(web_db, uid="bad", stock=29, offset=11, broadcast=False)
+    _sync(web_db, "ok", a1, enabled=True)
+    _sync(web_db, "bad", a1, enabled=True)
+
+    r = logged_in_client.get("/products/rows?only_blocked=true")
+    assert "Товар bad" in r.text
+    assert "Товар ok" not in r.text
+
+
+# --------------------------------------------------------------- правки строки
+
+def test_reserve_update_and_resend(logged_in_client, web_db):
+    a1, = _accounts(web_db, (Platform.wb, "WB-1"))
+    _product(web_db, stock=10)
+    _sync(web_db, "u1", a1, enabled=True)
+
+    logged_in_client.post("/products/u1/reserve", data={"reserve": "2"})
+    web_db.expire_all()
+    assert web_db.query(Product).first().reserve == 2
+    assert web_db.query(DispatchQueueItem).filter(DispatchQueueItem.uid_1c == "u1").count() >= 1
+
+
+def test_reserve_negative_clamped(logged_in_client, web_db):
+    _product(web_db, stock=10, reserve=3)
+    logged_in_client.post("/products/u1/reserve", data={"reserve": "-5"})
+    web_db.expire_all()
+    assert web_db.query(Product).first().reserve == 0
+
+
+def test_offset_direct_value(logged_in_client, web_db):
+    _product(web_db, stock=29, override=7)
+    logged_in_client.post("/products/u1/offset", data={"value": "11"})
+    web_db.expire_all()
+    p = web_db.query(Product).first()
+    assert p.broadcast_offset == 11
+    assert p.transmit_override is None       # порог гасит устаревшую ручную цифру
+
+
+def test_offset_computed_from_recount(logged_in_client, web_db):
+    _product(web_db, stock=29)
+    logged_in_client.post("/products/u1/offset", data={"stock_at_date": "43", "available": "32"})
+    web_db.expire_all()
+    assert web_db.query(Product).first().broadcast_offset == 11
+
+
+def test_offset_can_be_negative(logged_in_client, web_db):
+    _product(web_db, stock=10)
+    logged_in_client.post("/products/u1/offset", data={"stock_at_date": "10", "available": "15"})
+    web_db.expire_all()
+    assert web_db.query(Product).first().broadcast_offset == -5
+
+
+def test_offset_cleared_by_empty_value(logged_in_client, web_db):
+    _product(web_db, stock=10, offset=3)
+    logged_in_client.post("/products/u1/offset", data={"value": ""})
+    web_db.expire_all()
+    assert web_db.query(Product).first().broadcast_offset is None
+
+
+def test_offset_rejects_non_number(logged_in_client, web_db):
+    _product(web_db, stock=10, offset=3)
+    logged_in_client.post("/products/u1/offset", data={"value": "abc"})
+    web_db.expire_all()
+    assert web_db.query(Product).first().broadcast_offset == 3
+
+
+def test_clear_legacy_override(logged_in_client, web_db):
+    _product(web_db, stock=10, override=44)
+    logged_in_client.post("/products/u1/clear-override")
+    web_db.expire_all()
+    assert web_db.query(Product).first().transmit_override is None
+
+
+def test_broadcast_toggle(logged_in_client, web_db):
+    _product(web_db, broadcast=False)
+    logged_in_client.post("/products/u1/broadcast", data={"enabled": "true"})
+    web_db.expire_all()
+    assert web_db.query(Product).first().broadcast_enabled is True
+
+    logged_in_client.post("/products/u1/broadcast", data={"enabled": "false"})
+    web_db.expire_all()
+    assert web_db.query(Product).first().broadcast_enabled is False
+
+
+def test_active_since_set_and_clear(logged_in_client, web_db):
+    _product(web_db)
+    logged_in_client.post("/products/u1/active-since", data={"value": "2026-09-01"})
+    web_db.expire_all()
+    assert web_db.query(Product).first().broadcast_active_since == date(2026, 9, 1)
+
+    logged_in_client.post("/products/u1/active-since", data={"value": ""})
+    web_db.expire_all()
+    assert web_db.query(Product).first().broadcast_active_since is None
+
+
+def test_toggle_cabinet_enables_and_enqueues_resend(logged_in_client, web_db):
+    a1, = _accounts(web_db, (Platform.wb, "WB-1"))
+    _product(web_db, stock=10)
+
+    logged_in_client.post(f"/products/u1/{a1.id}/toggle", data={"enabled": "true"})
+    web_db.expire_all()
+    setting = web_db.query(SyncSetting).filter(SyncSetting.account_id == a1.id).first()
+    assert setting.enabled is True
+    items = web_db.query(DispatchQueueItem).filter(DispatchQueueItem.reason == "manual_enable").all()
+    assert [i.quantity for i in items] == [10]
+
+
+def test_toggle_off_does_not_enqueue(logged_in_client, web_db):
+    a1, = _accounts(web_db, (Platform.wb, "WB-1"))
+    _product(web_db, stock=10)
+    _sync(web_db, "u1", a1, enabled=True)
+
+    logged_in_client.post(f"/products/u1/{a1.id}/toggle", data={"enabled": "false"})
+    web_db.expire_all()
+    assert web_db.query(SyncSetting).first().enabled is False
+    assert web_db.query(DispatchQueueItem).filter(DispatchQueueItem.reason == "manual_enable").count() == 0
+
+
+def test_cabinet_threshold_update_and_clamp(logged_in_client, web_db):
+    a1, = _accounts(web_db, (Platform.wb, "WB-1"))
+    _product(web_db, stock=10)
+
+    logged_in_client.post(f"/products/u1/{a1.id}/threshold", data={"min_threshold": "3"})
+    web_db.expire_all()
+    assert web_db.query(SyncSetting).first().min_threshold == 3
+
+    logged_in_client.post(f"/products/u1/{a1.id}/threshold", data={"min_threshold": "-5"})
+    web_db.expire_all()
+    assert web_db.query(SyncSetting).first().min_threshold == 0
+
+
+def test_three_wb_cabinets_are_separate_columns(logged_in_client, web_db):
+    _accounts(web_db, (Platform.wb, "ИП Первый"), (Platform.wb, "ИП Второй"), (Platform.wb, "ИП Третий"))
+    _product(web_db)
+    r = logged_in_client.get("/products")
+    for name in ("ИП Первый", "ИП Второй", "ИП Третий"):
+        assert name in r.text
+
+
+# --------------------------------------------------------------- массовые действия
+
+def test_bulk_reserve_offset_broadcast(logged_in_client, web_db):
+    _product(web_db, uid="a", stock=10)
+    _product(web_db, uid="b", stock=10)
+
+    logged_in_client.post("/products/bulk", data={
+        "action": "set_reserve", "uids": ["a", "b"], "int_value": "4", "q": ""})
+    web_db.expire_all()
+    assert [p.reserve for p in web_db.query(Product).order_by(Product.uid_1c)] == [4, 4]
+
+    logged_in_client.post("/products/bulk", data={
+        "action": "set_offset", "uids": ["a"], "int_value": "-3", "q": ""})
+    web_db.expire_all()
+    assert web_db.query(Product).filter(Product.uid_1c == "a").first().broadcast_offset == -3
+
+    logged_in_client.post("/products/bulk", data={
+        "action": "clear_offset", "uids": ["a"], "q": ""})
+    web_db.expire_all()
+    assert web_db.query(Product).filter(Product.uid_1c == "a").first().broadcast_offset is None
+
+    logged_in_client.post("/products/bulk", data={
+        "action": "broadcast_off", "uids": ["a", "b"], "q": ""})
+    web_db.expire_all()
+    assert not any(p.broadcast_enabled for p in web_db.query(Product))
+
+
+def test_bulk_without_selection_is_noop(logged_in_client, web_db):
+    _product(web_db, stock=10, reserve=1)
+    logged_in_client.post("/products/bulk", data={"action": "set_reserve", "int_value": "5", "q": ""})
+    web_db.expire_all()
+    assert web_db.query(Product).first().reserve == 1
+
+
+def test_dispatch_toggle_per_platform_and_all(logged_in_client, web_db):
+    wb, oz = _accounts(web_db, (Platform.wb, "WB-1"), (Platform.ozon, "OZ-1"))
+
+    logged_in_client.post("/products/dispatch-toggle", data={"scope": "wb", "enabled": "false", "q": ""})
+    web_db.expire_all()
+    assert web_db.query(PlatformAccount).filter(PlatformAccount.id == wb.id).first().dispatch_enabled is False
+    assert web_db.query(PlatformAccount).filter(PlatformAccount.id == oz.id).first().dispatch_enabled is True
+
+    logged_in_client.post("/products/dispatch-toggle", data={"scope": "all", "enabled": "true", "q": ""})
+    web_db.expire_all()
+    assert all(a.dispatch_enabled for a in web_db.query(PlatformAccount))
+
+
+# --------------------------------------------------------------- Excel
+
+def test_export_contains_new_columns(logged_in_client, web_db):
+    a1, = _accounts(web_db, (Platform.wb, "WB-1"))
+    _product(web_db, stock=29, offset=11)
+    _sync(web_db, "u1", a1, enabled=True)
+
+    r = logged_in_client.get("/products/export")
+    assert r.status_code == 200
+    assert "spreadsheet" in r.headers["content-type"]
+
+    import io
+    from openpyxl import load_workbook
+    ws = load_workbook(io.BytesIO(r.content)).active
+    headers = [c.value for c in ws[1]]
+    assert "Порог трансляции" in headers
+    assert "Трансляция" in headers
+    assert "Уходит на площадки" in headers
+    assert "WB-1 (WB) — Синхронизировать" in headers
+    values = dict(zip(headers, [c.value for c in ws[2]]))
+    assert values["Порог трансляции"] == 11
+    assert values["Уходит на площадки"] == 18
+
+
+def test_import_updates_offset_broadcast_and_cabinets(logged_in_client, web_db):
+    a1, = _accounts(web_db, (Platform.wb, "WB-1"))
+    _product(web_db, stock=29, broadcast=False)
+
+    import io
+    from openpyxl import Workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["ID_1С", "Резерв", "Порог трансляции", "Трансляция", "WB-1 (WB) — Синхронизировать", "WB-1 (WB) — Порог"])
+    ws.append(["u1", 0, 11, "Да", "Да", 0])
+    buf = io.BytesIO()
+    wb.save(buf)
+
+    logged_in_client.post("/products/import",
+                          files={"file": ("p.xlsx", buf.getvalue(),
+                                          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
+    web_db.expire_all()
+    p = web_db.query(Product).first()
+    assert p.broadcast_offset == 11
+    assert p.broadcast_enabled is True
+    assert web_db.query(SyncSetting).first().enabled is True

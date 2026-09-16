@@ -3,6 +3,7 @@ from app.timeutils import now_utc
 
 from sqlalchemy.orm import Session
 
+from app.transmit import quantity_for_account
 from app.models import (
     DispatchQueueItem, DispatchStatus, SyncSetting, PlatformAccount, Barcode, PlatformCatalogItem, Product,
 )
@@ -36,45 +37,11 @@ def _resolve_push_target(db: Session, uid_1c: str, account_id: int) -> tuple[str
 
 
 def _quantity_to_send(db: Session, uid_1c: str, account_id: int, quantity: int) -> int:
-    """Итоговое количество для отправки на площадку из сырого остатка.
-
-    Приоритет (всё применяется в момент отправки, не при постановке в очередь —
-    чтобы учесть самые свежие значения):
-
-    0. Трансляция SKU выключена (`broadcast_enabled = False`) → 0 (товар
-       снимается с продажи на площадках).
-    1. Ручной «передаваемый остаток» (`transmit_override` задан) → ровно это
-       значение (не ниже 0). Резерв и порог не применяются — оператор задал
-       число явно. Заказы вычитаются из override, отмена возвращает (order_poller);
-       фоновое обновление остатка из 1С его не трогает.
-    2. Иначе — расчёт: резерв (на товар) + минимальный порог (на кабинет):
-       на площадку доступно max(0, остаток − резерв); если доступное не
-       превышает порог — уходит 0 (не продать последние штуки во всех каналах)."""
-    product = db.query(Product).filter(Product.uid_1c == uid_1c).first()
-
-    if product is not None and not product.broadcast_enabled:
-        return 0
-    # Порог трансляции (broadcast_offset): фиксированная зависимость «текущий ЦС −
-    # порог» (порог может быть ±). На площадку уходит max(0, остаток ЦС − порог).
-    # Не накапливается и не дрейфует — на любое движение ЦС меняется stock_on_hand,
-    # а порог фиксирован. Приоритетнее устаревшего transmit_override.
-    if product is not None and product.broadcast_offset is not None:
-        return max(0, (product.stock_on_hand or 0) - product.broadcast_offset)
-    if product is not None and product.transmit_override is not None:
-        return max(0, product.transmit_override)
-
-    reserve = product.reserve if product else 0
-    # max(0, ...) заодно корректно отрабатывает ОТРИЦАТЕЛЬНЫЙ остаток из 1С
-    # (пересортица, ещё не исправленная — это не баг): на площадку уходит 0,
-    # а не отрицательное значение и не оверселл.
-    available = max(0, quantity - reserve)
-
-    setting = db.query(SyncSetting).filter(
-        SyncSetting.uid_1c == uid_1c, SyncSetting.account_id == account_id,
-    ).first()
-    if setting and setting.min_threshold and available <= setting.min_threshold:
-        return 0
-    return available
+    """Сколько уйдёт на площадку. Лестница приоритетов — в app/transmit.py, один
+    модуль на рассылку и на интерфейс (раньше копии разошлись, и страница показывала
+    не то, что реально уходило). Считается в момент отправки, а не при постановке в
+    очередь, чтобы взять самые свежие значения."""
+    return quantity_for_account(db, uid_1c, account_id, quantity)
 
 
 def run_dispatch_cycle(db: Session, clients: dict, active_accounts: list[PlatformAccount] | None = None) -> dict:

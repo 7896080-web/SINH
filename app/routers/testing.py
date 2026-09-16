@@ -17,6 +17,7 @@ from app.workers.credentials import CredentialsMissing
 from app.workers.order_poller import process_new_order, process_cancellation, process_confirmation
 from app.workers.scheduler import PENDING_WAREHOUSE_NAME, SOLD_WAREHOUSE_NAME
 from app.workers.dispatch import _resolve_push_target, _quantity_to_send
+from app.transmit import explain
 from app.workers.platform_clients.base import PlatformOrder, StockPushItem
 from app.audit import log_action
 from app.flash import set_flash, pop_flash
@@ -45,15 +46,9 @@ def _load_log(db: Session, uid_1c: str, account_id: int, limit: int = 100):
 
 
 def _sku_send(product) -> int:
-    """Итоговая цифра «сейчас передаётся на площадки» на уровне SKU (порог кабинета
-    применяется отдельно). Порог трансляции приоритетнее override."""
-    if product is None or not product.broadcast_enabled:
-        return 0
-    if product.broadcast_offset is not None:
-        return max(0, (product.stock_on_hand or 0) - product.broadcast_offset)
-    if product.transmit_override is not None:
-        return max(0, product.transmit_override)
-    return max(0, (product.stock_on_hand or 0) - (product.reserve or 0))
+    """«Сейчас передаётся» на уровне SKU. Лестница — в app/transmit.py, один модуль
+    на рассылку и интерфейс (пороги кабинетов применяются отдельно, по кабинету)."""
+    return explain(product, None, None).quantity
 
 
 def _real_processed_orders(db: Session, uid_1c: str) -> list:
@@ -654,69 +649,6 @@ def backfill_real_orders(
     if error:
         msg += f" ⚠ {error}"
     set_flash(request, msg, "good" if failed == 0 else "warn")
-    return redirect
-
-
-@router.post("/testing/set-override")
-def set_override(
-    request: Request, uid_1c: str = Form(...), account_id: str = Form(""),
-    available: str = Form(""), stock_at_date: str = Form(""), clear: str = Form(""),
-    db: Session = Depends(get_db), user: User = Depends(get_current_user),
-):
-    """Порог трансляции (Product.broadcast_offset): фиксированная зависимость
-    «текущий ЦС − порог». Оператор вводит «доступно на дату» и «остаток ЦС на дату»,
-    порог = (ЦС на дату) − (доступно на дату) — может быть ОТРИЦАТЕЛЬНЫМ. Дальше на
-    площадки уходит max(0, текущий_ЦС − порог), и это само отслеживает все движения
-    склада (приход/расход/списание/пересортица/перемещение) через текущий остаток,
-    НЕ накапливаясь и не дрейфуя. «Сбросить» — убрать порог (автоматический расчёт).
-    Значение — на уровне товара (общее для всех кабинетов)."""
-    product = db.query(Product).filter(Product.uid_1c == uid_1c).first()
-    redirect = RedirectResponse(f"/testing?uid_1c={uid_1c}&account_id={account_id}", status_code=303)
-    if product is None:
-        set_flash(request, "Товар не найден.", "warn")
-        return redirect
-
-    if clear:
-        product.broadcast_offset = None
-        product.transmit_override = None
-        send_qty = product.stock_on_hand
-        msg = "Порог трансляции сброшен — вернулся автоматический расчёт от остатка ЦС."
-    else:
-        try:
-            avail = int((available or "").strip())
-            stock_d = int((stock_at_date or "").strip())
-        except ValueError:
-            set_flash(request, "Введите оба числа: «доступно на дату» и «остаток ЦС на дату».", "warn")
-            db.commit()
-            return redirect
-        offset = stock_d - avail  # порог может быть ± (доступно больше/меньше учёта ЦС)
-        product.broadcast_offset = offset
-        product.transmit_override = None  # переходим на порог, старую ручную цифру гасим
-        send_qty = max(0, (product.stock_on_hand or 0) - offset)
-        msg = (f"Порог трансляции установлен: {offset} (ЦС на дату {stock_d} − доступно {avail}). "
-               f"Сейчас передаётся: max(0, {product.stock_on_hand} − {offset}) = {send_qty}.")
-    if not product.broadcast_enabled:
-        # Порог/override считаются ПОСЛЕ гейта трансляции SKU: пока она выключена, на
-        # площадки уходит 0, что бы тут ни насчитали. Говорим об этом прямо, иначе
-        # оператор видит «18» в сообщении и «0» в карточке и не понимает, что не так.
-        send_qty = 0
-        msg += (" ⚠ Трансляция SKU ВЫКЛЮЧЕНА — на площадки уходит 0. Включить: «Управление остатками» → "
-                "кнопка «Вкл» в строке товара.")
-
-    # Рассылаем на включённые кабинеты (боевой путь): dispatch применит
-    # transmit_override (если задан) или пересчитает от остатка (после сброса).
-    targets = []
-    for s in db.query(SyncSetting).filter(SyncSetting.uid_1c == uid_1c, SyncSetting.enabled.is_(True)).all():
-        db.add(DispatchQueueItem(uid_1c=uid_1c, account_id=s.account_id, quantity=send_qty, reason="test_override"))
-        targets.append(s.account_id)
-
-    acc_int = _acc_int(account_id)
-    if acc_int is not None:
-        _log(db, uid_1c, acc_int, TestLogLevel.info, "set_override",
-             f"{msg} Поставлено в рассылку на кабинеты: {targets}.")
-    log_action(db, user.username, "test_set_override", f"{uid_1c}: {msg} targets={targets}")
-    db.commit()
-    set_flash(request, f"{msg} Поставлено в рассылку на {len(targets)} вкл. кабинет(ов).", "good")
     return redirect
 
 
