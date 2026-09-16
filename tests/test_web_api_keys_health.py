@@ -263,3 +263,29 @@ def test_health_per_account_order_poller_stale_after_its_interval(logged_in_clie
     r = logged_in_client.get("/health")
     assert r.status_code == 503
     assert r.json()["workers"][0]["stale"] is True
+
+
+def test_health_import_barcodes_15min_job_not_stale_between_runs(client, web_db):
+    """import_barcodes идёт раз в 15 мин — через 20 минут после прогона это ещё не протухание."""
+    from app.models import WorkerHeartbeat
+
+    web_db.add(WorkerHeartbeat(worker_name="import_barcodes",
+                               last_run_at=now_utc() - timedelta(minutes=20), last_success=True))
+    web_db.commit()
+
+    r = client.get("/health")
+    assert r.status_code == 200, r.text
+    assert r.json()["workers"][0]["stale"] is False
+
+
+def test_health_weekly_full_barcode_import_marker_not_stale_for_days(client, web_db):
+    """Метка import_barcodes_full пишется раз в неделю: 5 дней назад — норма, а не 503."""
+    from app.models import WorkerHeartbeat
+
+    web_db.add(WorkerHeartbeat(worker_name="import_barcodes_full",
+                               last_run_at=now_utc() - timedelta(days=5), last_success=True))
+    web_db.commit()
+
+    r = client.get("/health")
+    assert r.status_code == 200, r.text
+    assert r.json()["workers"][0]["stale"] is False
