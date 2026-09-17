@@ -263,16 +263,35 @@ def job_ftp_receive():
 RECONCILIATION_APPLIED = "reconciliation_applied"
 
 
+def _heartbeat_at(db, worker_name: str):
+    hb = db.query(WorkerHeartbeat).filter(WorkerHeartbeat.worker_name == worker_name).first()
+    return hb.last_run_at if hb else None
+
+
+def _export_request_answered(db) -> bool:
+    """Ответ 1С на последний запрос выгрузки уже применён?
+
+    Сравниваются две отметки: когда в последний раз ПОПРОСИЛИ выгрузку и когда в
+    последний раз её ПРИМЕНИЛИ. Применили позже, чем попросили — цикл закрыт,
+    ждать нечего. Нет хотя бы одной отметки (первый запуск на чистой базе) —
+    считаем, что ответа ещё нет: сказать про ожидание лишний раз безопаснее, чем
+    промолчать о том, что сверка стоит.
+    """
+    requested = _heartbeat_at(db, "ftp_send_export_request")
+    applied = _heartbeat_at(db, RECONCILIATION_APPLIED)
+    if requested is None or applied is None:
+        return False
+    return applied >= requested
+
+
 def job_reconciliation():
     db = SessionLocal()
     try:
         exchange = _build_ftp_exchange()
         # Снимок старше последнего запроса выгрузки — ответ на ПРОШЛЫЙ цикл: он
         # отражает склад часовой давности и вернул бы проданное за час обратно.
-        marker = db.query(WorkerHeartbeat).filter(
-            WorkerHeartbeat.worker_name == "ftp_send_export_request").first()
-        rows, snapshot_at = fetch_stock_export_snapshot(
-            exchange, not_older_than=marker.last_run_at if marker else None)
+        requested_at = _heartbeat_at(db, "ftp_send_export_request")
+        rows, snapshot_at = fetch_stock_export_snapshot(exchange, not_older_than=requested_at)
         if rows:
             # 1С — хозяин ассортимента: сначала заводим/обновляем товары
             # (новые SKU, размер/цвет), затем сверяем остатки.
@@ -290,8 +309,14 @@ def job_reconciliation():
             # Отдельная метка: сверка не просто отработала, а ФАКТИЧЕСКИ применила
             # снимок 1С. Ниже, в ветке пропуска, её намеренно нет — см. RECONCILIATION_APPLIED.
             _heartbeat(db, RECONCILIATION_APPLIED, True)
-        else:
-            logger.info("reconciliation: нет свежего файла выгрузки остатков — пропуск")
+        elif not _export_request_answered(db):
+            # Проверок теперь двенадцать в час, а ответ 1С — один. Писать строку на
+            # каждый холостой заход значит вернуть в лог тот самый шум, ради которого
+            # глушили apscheduler. Пишем только пока ОЖИДАЕМ ответа на последний
+            # запрос: это 1-2 строки в час и ровно та информация, ради которой лог
+            # читают — «попросили, ответа пока нет». После применения снимка ждать
+            # нечего, и до следующего запроса сверка молчит.
+            logger.info("reconciliation: ответа 1С на запрос выгрузки ещё нет — ждём")
         _heartbeat(db, "reconciliation", True)
     except Exception as e:
         logger.exception("reconciliation failed")
@@ -457,11 +482,23 @@ def build_scheduler() -> BlockingScheduler:
                                        heartbeat_name="ftp_send_export_request"), "interval",
                   hours=1, id="ftp_send_export_request", max_instances=1,
                   next_run_time=start + timedelta(seconds=20))
-    # Сверка — через 5 минут после запроса выгрузки, чтобы 1С успела ответить:
-    # обработка запускается по своему расписанию, и читать результат через 10 секунд
-    # означало читать файл прошлого цикла.
-    sched.add_job(job_reconciliation, "interval", hours=1, id="reconciliation", max_instances=1,
-                  next_run_time=start + timedelta(minutes=5))
+    # Сверка смотрит папку ответов КАЖДЫЕ 5 МИНУТ, хотя выгрузку просим раз в час.
+    # Раньше она была часовой и шла через 5 минут после запроса — «чтобы 1С успела
+    # ответить». Это молчаливо предполагало, что 1С отвечает быстрее пяти минут, а на
+    # боевом обработка запускается по СВОЕМУ расписанию, раз в 10 минут. Ответ приходил
+    # в среднем через 7 минут, то есть всегда ПОСЛЕ того, как сверка уже посмотрела и
+    # ушла, а на следующем цикле тот же файл отбраковывался как более старый, чем новый
+    # запрос. И это не разовое невезение: оба расписания периодические, поэтому фаза,
+    # выпавшая при старте воркера, держится до его перезапуска — сверка, промахнувшись один раз,
+    # не срабатывала уже никогда. Именно так она простояла 17.09.2026.
+    # Разделяем два разных вопроса: «как часто просить у 1С выгрузку» (дорого — раз в час,
+    # это полный снимок 152 тыс. товаров) и «как часто проверять, не пришёл ли ответ»
+    # (дёшево — это чтение каталога). Ни на какое расписание 1С мы больше не закладываемся.
+    # Правило свежести при этом НЕ ослаблено: применяется по-прежнему только снимок новее
+    # последнего запроса — учащение проверок не даёт применить ни одного файла, который
+    # старая схема сочла бы устаревшим.
+    sched.add_job(job_reconciliation, "interval", minutes=5, id="reconciliation",
+                  max_instances=1, next_run_time=start + timedelta(minutes=1))
     sched.add_job(lambda: job_ftp_send(request_barcode_export=True,
                                        heartbeat_name="ftp_send_barcode_request"), "interval",
                   hours=24, id="ftp_send_barcode_request", max_instances=1,
