@@ -34,6 +34,13 @@ def _queue_counts(db: Session, account_id: int) -> dict:
         DispatchQueueItem.account_id == account_id, DispatchQueueItem.status == DispatchStatus.error,
         DispatchQueueItem.is_test.is_(False),
     ).count()
+    # Записи, которые уже сорвались и ждут следующей попытки: сама по себе это не
+    # ошибка (площадка отвечает не всегда), но растущее число — повод посмотреть
+    # в last_error, пока попытки не исчерпались и запись не стала ошибкой.
+    dispatch_retry = db.query(DispatchQueueItem).filter(
+        DispatchQueueItem.account_id == account_id, DispatchQueueItem.status == DispatchStatus.pending,
+        DispatchQueueItem.attempts > 0, DispatchQueueItem.is_test.is_(False),
+    ).count()
     ftp_pending = db.query(FtpTask).filter(
         FtpTask.account_id == account_id, FtpTask.status.in_([FtpTaskStatus.pending, FtpTaskStatus.sent]),
         FtpTask.is_test.is_(False),
@@ -44,6 +51,7 @@ def _queue_counts(db: Session, account_id: int) -> dict:
     ).count()
     return {
         "dispatch_pending": dispatch_pending, "dispatch_errors": dispatch_errors,
+        "dispatch_retry": dispatch_retry,
         "ftp_pending": ftp_pending, "ftp_timeout": ftp_timeout,
     }
 

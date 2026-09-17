@@ -108,8 +108,11 @@
                 <td>Очередь рассылки</td>
                 <td>
                     ожидает: <span class="mono">{{ row.queue.dispatch_pending }}</span>
+                    {% if row.queue.dispatch_retry %}
+                    · <span class="badge" title="Отправка сорвалась, запись ждёт следующей попытки. Ошибкой станет, только если не пройдёт все попытки.">повтор: {{ row.queue.dispatch_retry }}</span>
+                    {% endif %}
                     {% if row.queue.dispatch_errors %}
-                    · <span class="badge badge--bad">ошибок: {{ row.queue.dispatch_errors }}</span>
+                    · <span class="badge badge--bad" title="Попытки исчерпаны: на площадку это значение так и не ушло.">ошибок: {{ row.queue.dispatch_errors }}</span>
                     {% endif %}
                 </td>
             </tr>
