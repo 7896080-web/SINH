@@ -223,8 +223,18 @@ def _render(request: Request, db: Session, user: User, q: str, only_proposals: b
     })
 
 
-def _row_response(request: Request, db: Session, uid_1c: str):
-    """Ответ HTMX: перерисованная строка (все числа пересчитываются заново)."""
+def _row_response(request: Request, db: Session, uid_1c: str,
+                  error: str = "", error_field: str = ""):
+    """Ответ HTMX: перерисованная строка (все числа пересчитываются заново).
+
+    `error` — текст ошибки ввода, `error_field` — у какого поля его показать
+    (`reserve`, `offset`, `active_since`, `threshold:<id кабинета>`; пусто —
+    рядом с наименованием).
+
+    Ошибку показываем ПРЯМО В СТРОКЕ, а не через флеш-сообщение. Флеш снимается
+    только при полной перезагрузке страницы, а здесь ответ — фрагмент: строка
+    молча перерисовывалась прежним значением, и оператор считал, что ввод принят,
+    а плашка всплывала позже и уже без контекста."""
     accounts = _active_accounts(db)
     product = _get_product(db, uid_1c)
     if product is None:
@@ -232,7 +242,23 @@ def _row_response(request: Request, db: Session, uid_1c: str):
     all_accounts = {a.id: a for a in db.query(PlatformAccount).all()}
     return templates.TemplateResponse(request, "products_row.html", {
         "request": request, "row": _row(product, accounts, all_accounts), "accounts": accounts,
+        "error": error, "error_field": error_field,
     })
+
+
+def _as_int(raw: str) -> int | None:
+    """Целое из поля формы или None. Браузер в <input type="number"> отдаёт пустую
+    строку, если введено что-то нечисловое («12,5» с запятой — самый частый
+    случай), поэтому поля принимаем строкой и разбираем сами: с `int = Form(...)`
+    FastAPI отвечал 422, htmx при таком ответе строку не подменяет вовсе, и
+    оператор не видел ни нового значения, ни ошибки."""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
 
 
 def _back(q: str) -> RedirectResponse:
@@ -272,7 +298,7 @@ def legacy_redirect(q: str = Query("")):
 
 @router.post("/products/{uid_1c}/reserve", response_class=HTMLResponse)
 def set_reserve(
-    request: Request, uid_1c: str, reserve: int = Form(0),
+    request: Request, uid_1c: str, reserve: str = Form(""),
     db: Session = Depends(get_db), user: User = Depends(get_current_user),
 ):
     """Резерв: столько штук держим у себя. Применяется только в автоматическом
@@ -280,7 +306,12 @@ def set_reserve(
     product = _get_product(db, uid_1c)
     if product is None:
         return HTMLResponse("", status_code=404)
-    reserve = max(0, reserve)
+    parsed = _as_int(reserve)
+    if parsed is None:
+        return _row_response(request, db, uid_1c,
+                             error="Резерв: введите целое число (без запятой).",
+                             error_field="reserve")
+    reserve = max(0, parsed)
     if product.reserve != reserve:
         product.reserve = reserve
         log_action(db, user.username, "reserve_changed", f"{uid_1c} -> {reserve}")
@@ -316,8 +347,10 @@ def set_offset(
             else:
                 offset = int(stock_at_date.strip()) - int(available.strip())
         except ValueError:
-            set_flash(request, "Порог: введите целое число либо оба числа пересчёта.", "warn")
-            return _row_response(request, db, uid_1c)
+            return _row_response(
+                request, db, uid_1c,
+                error="Порог: введите целое число (без запятой) либо оба числа пересчёта.",
+                error_field="offset")
         product.broadcast_offset = offset
         product.transmit_override = None  # порог заменяет устаревшую ручную цифру
         detail = f"{offset}"
@@ -376,8 +409,9 @@ def set_active_since(
     try:
         product.broadcast_active_since = _parse_date(value)
     except ValueError:
-        set_flash(request, "Дата должна быть в формате ГГГГ-ММ-ДД.", "warn")
-        return _row_response(request, db, uid_1c)
+        return _row_response(request, db, uid_1c,
+                             error="Дата должна быть в формате ГГГГ-ММ-ДД.",
+                             error_field="active_since")
     log_action(db, user.username, "active_since_changed", f"{uid_1c} -> {product.broadcast_active_since}")
     db.commit()
     return _row_response(request, db, uid_1c)
@@ -418,13 +452,18 @@ def toggle_sync(
 
 @router.post("/products/{uid_1c}/{account_id}/threshold", response_class=HTMLResponse)
 def set_threshold(
-    request: Request, uid_1c: str, account_id: int, min_threshold: int = Form(0),
+    request: Request, uid_1c: str, account_id: int, min_threshold: str = Form(""),
     db: Session = Depends(get_db), user: User = Depends(get_current_user),
 ):
     """Порог кабинета — страховой буфер: если доступное количество не больше него,
     на эту площадку уходит 0. 0 = выключен. Не применяется, когда задан порог
     трансляции или ручной остаток: их оператор задал явно."""
-    min_threshold = max(0, min_threshold)
+    parsed = _as_int(min_threshold)
+    if parsed is None:
+        return _row_response(request, db, uid_1c,
+                             error="Порог кабинета: введите целое число (без запятой).",
+                             error_field=f"threshold:{account_id}")
+    min_threshold = max(0, parsed)
     setting = db.query(SyncSetting).filter(
         SyncSetting.uid_1c == uid_1c, SyncSetting.account_id == account_id,
     ).first()
