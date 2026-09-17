@@ -17,7 +17,8 @@ import sys
 import requests
 
 
-PAGES_TO_CHECK = ["/mapping", "/products", "/anomalies", "/diagnostics", "/testing", "/api-keys"]
+PAGES_TO_CHECK = ["/mapping", "/products", "/anomalies", "/stock-on-date", "/diagnostics",
+                  "/testing", "/api-keys"]
 
 
 def main():

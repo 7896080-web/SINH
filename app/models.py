@@ -435,3 +435,62 @@ class WorkerHeartbeat(Base):
     last_run_at = Column(DateTime, nullable=False)
     last_success = Column(Boolean, default=True, nullable=False)
     last_error = Column(Text, nullable=True)
+
+
+# ---------------------------------------------------------------------------
+# Выгрузка остатков 1С НА ЗАДАННОЕ ЧИСЛО (команда EXPORT_STOCK_ON_DATE).
+#
+# Это СПРАВКА, а не источник остатка. Обычная выгрузка (stock_*.txt) отражает
+# склад «сейчас» и через сверку управляет тем, что уходит на площадки; выгрузка
+# на дату отражает склад в прошлом. Применить её как текущий остаток означало бы
+# разослать на площадки цифры недельной давности, поэтому она живёт в отдельных
+# таблицах, приходит в файлах с другим префиксом (ondate_*.txt) и НИКОГДА не
+# трогает Product.stock_on_hand и очередь рассылки.
+# ---------------------------------------------------------------------------
+
+class StockDateStatus(str, enum.Enum):
+    pending = "pending"   # запрос создан, ещё не ушёл в 1С
+    sent = "sent"         # строка ушла в task_*.txt, ждём ondate_*.txt
+    done = "done"         # файл получен и разобран
+    timeout = "timeout"   # ответа нет дольше окна ожидания — обработка 1С не запускалась?
+
+
+class StockDateSnapshot(Base):
+    """Один запрос остатков ЦС на дату и его результат."""
+    __tablename__ = "stock_date_snapshots"
+
+    id = Column(Integer, primary_key=True)
+    snapshot_date = Column(Date, nullable=False, index=True)
+    status = Column(Enum(StockDateStatus), default=StockDateStatus.pending, nullable=False)
+    requested_by = Column(String(64), nullable=True)      # логин оператора
+    created_at = Column(DateTime, default=now_utc)
+    sent_at = Column(DateTime, nullable=True)
+    batch_filename = Column(String(128), nullable=True)   # какой task_*.txt унёс запрос
+    received_at = Column(DateTime, nullable=True)
+    result_filename = Column(String(128), nullable=True)  # какой ondate_*.txt принёс ответ
+    rows_count = Column(Integer, default=0, nullable=False)
+    note = Column(String(255), nullable=True)
+
+    rows = relationship("StockDateRow", back_populates="snapshot",
+                        cascade="all, delete-orphan", passive_deletes=True)
+
+
+class StockDateRow(Base):
+    """Строка выгрузки на дату — ровно то, что прислала 1С, без сопоставления с
+    нашим каталогом. Внешнего ключа на products нет намеренно: в выгрузке за
+    прошлое число встречаются товары, которых у нас в каталоге уже (или ещё) нет,
+    и ссылка молча выкидывала бы их из справки."""
+    __tablename__ = "stock_date_rows"
+
+    id = Column(Integer, primary_key=True)
+    snapshot_id = Column(Integer, ForeignKey("stock_date_snapshots.id", ondelete="CASCADE"),
+                         nullable=False, index=True)
+    uid_1c = Column(String(36), nullable=False, index=True)
+    article = Column(String(128), nullable=True)
+    name = Column(String(255), nullable=True)
+    size = Column(String(64), nullable=True)
+    color = Column(String(64), nullable=True)
+    barcodes = Column(Text, nullable=True)                # через запятую, как в файле
+    quantity = Column(Integer, nullable=False, default=0)
+
+    snapshot = relationship("StockDateSnapshot", back_populates="rows")

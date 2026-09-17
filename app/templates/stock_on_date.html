@@ -1,0 +1,123 @@
+{% extends "base.html" %}
+{% block title %}Остатки 1С на дату{% endblock %}
+{% block content %}
+
+<div class="page-header">
+    <div>
+        <h1>Остатки 1С на дату</h1>
+        <p>Сколько лежало на складе «ЦС Склад» на конец выбранного числа — по данным самой 1С</p>
+    </div>
+</div>
+
+<div class="card">
+    <form method="post" action="/stock-on-date/request" class="filters">
+        <div class="field">
+            <label for="value">Дата среза</label>
+            <input type="date" id="value" name="value" max="{{ today }}" value="{{ today }}" required>
+        </div>
+        <div class="field">
+            <label>&nbsp;</label>
+            <button type="submit" class="btn btn-primary">Запросить у 1С</button>
+        </div>
+    </form>
+    <p class="help-text">
+        Запрос уходит в 1С вместе с обычными заданиями (раз в минуту), ответ появляется здесь,
+        когда отработает обработка «ОбменССайтом». Это справка: цифры отсюда не меняют остаток
+        товара и никуда не транслируются.
+    </p>
+</div>
+
+{% if snapshots %}
+<div class="card">
+    <h2>Запросы</h2>
+    <table>
+        <thead>
+            <tr>
+                <th>Дата среза</th>
+                <th>Состояние</th>
+                <th style="text-align:right;">Позиций</th>
+                <th>Запросил</th>
+                <th>Получено</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for s in snapshots %}
+            <tr {% if snapshot and s.id == snapshot.id %}class="row--active"{% endif %}>
+                <td class="mono">{{ s.snapshot_date.strftime('%d.%m.%Y') }}</td>
+                <td>
+                    {% if s.status.value == 'done' %}
+                        <span class="badge badge--good">{{ status_labels[s.status] }}</span>
+                    {% elif s.status.value == 'timeout' %}
+                        <span class="badge badge--bad">{{ status_labels[s.status] }}</span>
+                    {% else %}
+                        <span class="badge badge--warn">{{ status_labels[s.status] }}</span>
+                    {% endif %}
+                    {% if s.note %}<div class="help-text">{{ s.note }}</div>{% endif %}
+                </td>
+                <td class="mono" style="text-align:right;">{{ s.rows_count }}</td>
+                <td>{{ s.requested_by or '—' }}</td>
+                <td>{{ s.received_at.strftime('%d.%m.%Y %H:%M') if s.received_at else '—' }}</td>
+                <td>
+                    {% if s.status.value == 'done' %}
+                    <a class="btn" href="/stock-on-date?snapshot_id={{ s.id }}">Показать</a>
+                    {% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}
+
+{% if snapshot %}
+<div class="page-header">
+    <div>
+        <h2>Остатки на {{ snapshot.snapshot_date.strftime('%d.%m.%Y') }}</h2>
+    </div>
+    <div class="toolbar">
+        <a id="export-link" class="btn"
+           href="/stock-on-date/{{ snapshot.id }}/export?q={{ q }}&nonzero={{ 'true' if nonzero else 'false' }}">
+            Экспорт в Excel
+        </a>
+    </div>
+</div>
+
+<form class="filters"
+      hx-get="/stock-on-date/rows"
+      hx-target="#stock-on-date-table"
+      hx-trigger="keyup changed delay:400ms from:input[type=search], change from:input[type=checkbox]"
+      hx-include="this">
+    <input type="hidden" name="snapshot_id" value="{{ snapshot.id }}">
+    <div class="field">
+        <label for="q">Поиск</label>
+        <input type="search" id="q" name="q" value="{{ q }}" placeholder="артикул, наименование, баркод">
+    </div>
+    <div class="field">
+        <label>&nbsp;</label>
+        <label class="checkbox-inline">
+            <input type="checkbox" id="nonzero" name="nonzero" value="true" {% if nonzero %}checked{% endif %}>
+            Только с остатком
+        </label>
+    </div>
+</form>
+
+<div class="card" style="padding:0;">
+    <div id="stock-on-date-table">
+        {% include "stock_on_date_rows.html" %}
+    </div>
+</div>
+
+<script>
+    document.querySelector('.filters[hx-get]').addEventListener('input', function () {
+        var link = document.getElementById('export-link');
+        if (!link) { return; }
+        var q = document.getElementById('q').value;
+        var nonzero = document.getElementById('nonzero').checked;
+        link.href = '/stock-on-date/{{ snapshot.id }}/export?q=' + encodeURIComponent(q) +
+                    '&nonzero=' + (nonzero ? 'true' : 'false');
+    });
+</script>
+{% endif %}
+
+{% endblock %}

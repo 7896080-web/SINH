@@ -280,3 +280,8 @@ tr:hover td { background: var(--bg); }
     opacity: 0;
     cursor: pointer;
 }
+
+/* Выбранная выгрузка в списке запросов на странице «Остатки на дату» */
+.row--active {
+    background: var(--accent-soft);
+}

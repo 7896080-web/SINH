@@ -1,0 +1,40 @@
+{% if rows %}
+<table>
+    <thead>
+        <tr>
+            <th>Товар</th>
+            <th>Размер / цвет</th>
+            <th>Баркоды</th>
+            <th style="text-align:right;">Остаток</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for row in rows %}
+        <tr>
+            <td>
+                <div>{{ row.name or '—' }}</div>
+                <div class="mono help-text">{{ row.article or '—' }}</div>
+            </td>
+            <td>{{ row.size or '' }}{% if row.color %} · {{ row.color }}{% endif %}</td>
+            <td class="mono help-text">{{ row.barcodes or '—' }}</td>
+            <td class="mono" style="text-align:right;">{{ row.quantity }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+<div class="help-text" style="padding:10px 14px;">
+    {% if total > shown %}
+        Показаны первые {{ shown }} из {{ total }} позиций — полный список выгружается в Excel.
+    {% else %}
+        Позиций: {{ total }}, суммарный остаток: {{ quantity_total }}.
+    {% endif %}
+</div>
+{% else %}
+<div class="empty-state">
+    {% if snapshot and snapshot.rows_count == 0 %}
+        1С вернула пустую выгрузку на это число.
+    {% else %}
+        По заданному отбору ничего не найдено.
+    {% endif %}
+</div>
+{% endif %}
