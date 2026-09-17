@@ -11,7 +11,38 @@ os.environ.setdefault("SECRETS_ENCRYPTION_KEY", "EfYA4-I-29JUEh7MiU9I4odQtKEB87p
 # (anyio.to_thread), а SQLite ":memory:" при подключении из разных потоков
 # каждый раз видит новую пустую базу. Файл на диске от этой проблемы избавлен.
 _web_db_path = os.path.join(tempfile.gettempdir(), "sync_admin_web_tests.db")
-os.environ.setdefault("DATABASE_URL", f"sqlite:///{_web_db_path}")
+_default_url = f"sqlite:///{_web_db_path}"
+
+
+def looks_like_test_database(url: str) -> bool:
+    """Можно ли безопасно гонять по этому адресу тесты.
+
+    Фикстура `web_db` после КАЖДОГО веб-теста делает `drop_all` — то есть сносит
+    все таблицы. Пока DATABASE_URL не задан в окружении, это временный файл в
+    %TEMP% и всё хорошо. Но тесты запускаются в том числе на боевом сервере (блок
+    FINISH каждого патча), и одна случайная строка `$env:DATABASE_URL=...` в той
+    же сессии PowerShell означала бы снос боевой базы. Поэтому принимаем только
+    файловый SQLite, у которого в пути явно видно, что он тестовый."""
+    if not url.startswith("sqlite:///"):
+        return False                      # PostgreSQL и прочее — точно не тест
+    path = url[len("sqlite:///"):].replace("\\", "/").lower()
+    if path in ("", ":memory:"):
+        return True
+    if path == _web_db_path.replace("\\", "/").lower():
+        return True
+    return "test" in os.path.basename(path)
+
+
+if "DATABASE_URL" not in os.environ:
+    os.environ["DATABASE_URL"] = _default_url
+elif not looks_like_test_database(os.environ["DATABASE_URL"]):
+    raise RuntimeError(
+        "DATABASE_URL в окружении указывает на НЕ тестовую базу: "
+        f"{os.environ['DATABASE_URL']}\n"
+        "Тесты сносят все таблицы после каждого веб-теста — запуск по этому "
+        "адресу уничтожил бы данные. Уберите переменную из окружения "
+        "(в PowerShell: Remove-Item Env:DATABASE_URL) и запустите заново."
+    )
 
 import pytest
 from sqlalchemy import create_engine
