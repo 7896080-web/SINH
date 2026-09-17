@@ -187,6 +187,11 @@ def mapping_import(
         deleted = db.query(MappingConflict).filter(MappingConflict.barcode == barcode).delete()
         resolved_conflicts += deleted
 
+    # Массовый импорт меняет ключ сопоставления для многих товаров сразу —
+    # соседние операции пишутся в журнал, эта не писалась.
+    log_action(db, user.username, "mapping_import",
+               f"добавлено {added}, уже были {already_mapped}, "
+               f"разрешено конфликтов {resolved_conflicts}, ошибок {len(errors)}")
     db.commit()
 
     message = f"Добавлено баркодов: {added}. Уже были сопоставлены: {already_mapped}."

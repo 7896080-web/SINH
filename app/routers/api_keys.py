@@ -184,7 +184,13 @@ def update_warehouse(
     if account is None:
         return RedirectResponse("/api-keys", status_code=303)
 
+    was = account.warehouse_id
     account.warehouse_id = warehouse_id.strip() or None
+    if account.warehouse_id != was:
+        # Склад кабинета определяет, куда уходит остаток и какое перемещение
+        # создаётся в 1С, — менять его молча нельзя.
+        log_action(db, user.username, "warehouse_changed",
+                   f"{account.name}: «{was or '—'}» -> «{account.warehouse_id or '—'}»")
     db.commit()
 
     set_flash(request, f"Склад для «{account.name}» обновлён.", "good")
@@ -213,7 +219,13 @@ def update_credential(
         cred = ApiCredential(account_id=account_id, field_name=field_name, field_label=field_label)
         db.add(cred)
 
+    had_value = cred.encrypted_value is not None
     cred.encrypted_value = encrypt_value(value) if value else None
+    # В журнал — только ФАКТ и имя поля. Само значение (боевой токен площадки) в
+    # журнале действий не место: он открыт любому пользователю админки.
+    log_action(db, user.username,
+               "credential_changed" if value else "credential_cleared",
+               f"{account.name} / {cred.field_label}" + ("" if value or had_value else " (было пусто)"))
     db.commit()
 
     return RedirectResponse("/api-keys", status_code=303)
