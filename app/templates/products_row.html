@@ -1,3 +1,4 @@
+{% macro field_error(field) %}{% if error and error_field == field %}<div class="pr-error" role="alert">⚠ {{ error }}</div>{% endif %}{% endmacro %}
 <tr id="row-{{ row.uid_1c }}">
     <td><input type="checkbox" name="uids" value="{{ row.uid_1c }}" form="bulk-form"></td>
 
@@ -6,6 +7,9 @@
     <td>{{ row.color or '' }}</td>
     <td>
         {{ row.name or '—' }}
+        {% if error and error_field not in ('reserve', 'offset', 'active_since') and not error_field.startswith('threshold:') %}
+            <div class="pr-error" role="alert">⚠ {{ error }}</div>
+        {% endif %}
         {% if not row.has_barcode %}
             <span class="badge badge--bad" title="Нет ни одного баркода — сопоставление и отправка не сработают">нет баркода</span>
         {% endif %}
@@ -34,6 +38,7 @@
                hx-vals="js:{reserve: event.target.value}"
                hx-target="#row-{{ row.uid_1c }}" hx-swap="outerHTML"
                title="Сколько штук держим у себя. Применяется только в автоматическом режиме — если задан порог трансляции, резерв не участвует.">
+        {{ field_error('reserve') }}
     </td>
 
     <td>
@@ -43,6 +48,7 @@
                hx-vals="js:{value: event.target.value}"
                hx-target="#row-{{ row.uid_1c }}" hx-swap="outerHTML"
                title="Постоянное расхождение между учётом 1С и реальным складом. Уходит max(0, остаток ЦС − порог). Пусто — порог не задан. Может быть отрицательным.">
+        {{ field_error('offset') }}
         <details class="pr-calc">
             <summary>посчитать</summary>
             <form hx-post="/products/{{ row.uid_1c }}/offset"
@@ -84,6 +90,7 @@
                hx-vals="js:{value: event.target.value}"
                hx-target="#row-{{ row.uid_1c }}" hx-swap="outerHTML"
                title="Дата старта задним числом: от неё стартует бэкфилл на странице «Тестирование».">
+        {{ field_error('active_since') }}
     </td>
 
     <td class="pr-cabs">
@@ -109,6 +116,7 @@
                    hx-vals="js:{min_threshold: event.target.value}"
                    hx-target="#row-{{ row.uid_1c }}" hx-swap="outerHTML"
                    title="Порог кабинета: если доступно не больше этого числа — уходит 0. 0 — выключен. Не применяется, когда задан порог трансляции.">
+            {{ field_error('threshold:' ~ account.id) }}
             {% if not state.enabled %}
                 <span class="pr-hint">не передаётся</span>
             {% elif state.blocked %}
