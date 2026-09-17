@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime
 from app.timeutils import now_utc
 
@@ -9,6 +10,8 @@ from app.models import (
 )
 from app.workers.matching import resolve_barcode
 from app.workers.platform_clients.base import PlatformClient, PlatformOrder
+
+logger = logging.getLogger("sync_worker")
 
 
 # Префикс синтетических заказов со страницы «Тестирование». У ProcessedOrder нет
@@ -204,17 +207,66 @@ def process_new_order(db: Session, order: PlatformOrder, account: PlatformAccoun
     return result
 
 
+def existing_cancel_task(db: Session, order_id: str, account_id: int, is_test: bool = False):
+    """Уже созданное задание отмены по этому заказу и кабинету, если оно есть.
+
+    Отмена в 1С НЕ идемпотентна: обработка ищет движения заказа по шаблону, а
+    обратный документ сам под этот шаблон подходит — повторная отмена создаёт
+    ФАНТОМНЫЙ ПРИХОД товара, которого не было. Исправить это в обработке нельзя:
+    база 1С только боевая, тестовой нет. Поэтому гарантируем со своей стороны,
+    что второе задание отмены по одному заказу не уедет никогда.
+
+    Смотрим задания в ЛЮБОМ статусе, а не только незакрытые:
+    - `done` — 1С отмену уже провела, повтор и есть тот самый фантом;
+    - `pending`/`sent` — задание ещё в работе, второе просто лишнее;
+    - `timeout` — ответа нет, провела 1С отмену или нет, неизвестно; послать
+      второе значит рискнуть фантомом ради предположения;
+    - `failed` — 1С ответила отказом, нужен разбор человеком, а не повтор вслепую.
+
+    `is_test` разделяет миры: симуляция не видит боевых заданий и наоборот."""
+    return db.query(FtpTask).filter(
+        FtpTask.command == "CANCEL_MOVEMENT",
+        FtpTask.order_id == order_id,
+        FtpTask.account_id == account_id,
+        FtpTask.is_test.is_(is_test),
+    ).order_by(FtpTask.id.asc()).first()
+
+
 def process_cancellation(db: Session, cancelled_order: PlatformOrder, record: ProcessedOrder,
                           account: PlatformAccount, is_test: bool = False) -> dict:
     """Обрабатывает ОДИН реверс — та же логика переиспользования, что и
     process_new_order выше. record — существующая строка ProcessedOrder,
     которую нужно откатить (или частично откатить для PARTIAL_REFUND)."""
 
-    result = {"status": None, "return_quantity": 0, "new_stock": None, "dispatched_to": [], "ftp_task_id": None}
+    result = {"status": None, "return_quantity": 0, "new_stock": None, "dispatched_to": [],
+              "ftp_task_id": None, "duplicate_cancel": False}
 
     return_quantity = cancelled_order.refused_quantity if cancelled_order.is_partial_refund else record.quantity
     if return_quantity <= 0:
         result["status"] = "skipped"
+        return result
+
+    already = existing_cancel_task(db, cancelled_order.order_id, account.id, is_test)
+    if already is not None:
+        # Отмена по этому заказу уже уходила в 1С — второй раз НИЧЕГО не делаем:
+        # ни задания (повтор дал бы фантомный приход, см. existing_cancel_task),
+        # ни возврата остатка. Возврат тоже нельзя повторять: он уже сделан
+        # первой отменой, а второй прибавил бы товар, которого нет, — то есть
+        # защита от фантома в 1С обернулась бы оверселлом у нас.
+        result["status"] = "duplicate"
+        result["duplicate_cancel"] = True
+        result["ftp_task_id"] = already.id
+        if not cancelled_order.is_partial_refund and record.status != OrderProcessStatus.cancelled:
+            # Заказ всё-таки закрываем: иначе опрос будет приносить его каждые
+            # две минуты и каждый раз упираться в эту же проверку.
+            record.status = OrderProcessStatus.cancelled
+            record.cancelled_at = now_utc()
+            db.commit()
+        logger.warning(
+            "отмена заказа %s (кабинет %s): задание отмены уже есть (#%s, %s) — "
+            "повтор пропущен целиком, иначе в 1С появился бы фантомный приход",
+            cancelled_order.order_id, account.id, already.id, already.status.value,
+        )
         return result
 
     product = db.query(Product).filter(Product.uid_1c == record.uid_1c).first()
