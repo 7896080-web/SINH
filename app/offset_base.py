@@ -35,6 +35,35 @@ def done_snapshot(db: Session, snapshot_date: date) -> StockDateSnapshot | None:
     ).order_by(StockDateSnapshot.id.desc()).first()
 
 
+def open_request(db: Session, snapshot_date: date) -> StockDateSnapshot | None:
+    """Незакрытая заявка на эту дату.
+
+    Вторую заводить нельзя: 1С называет файл ответа по дате, один ответ закрыл
+    бы только одну заявку, а вторая висела бы до таймаута и выглядела бы как
+    сбой канала.
+    """
+    return db.query(StockDateSnapshot).filter(
+        StockDateSnapshot.snapshot_date == snapshot_date,
+        StockDateSnapshot.status.in_([StockDateStatus.pending, StockDateStatus.sent]),
+    ).order_by(StockDateSnapshot.id.asc()).first()
+
+
+def ensure_snapshot_requested(db: Session, snapshot_date: date, username: str) -> bool:
+    """Заказать у 1С выгрузку на дату, если её ещё не заказывали. True — заказали.
+
+    Без этого связка получалась дырявой: оператор задаёт дату на странице
+    товаров, а выгрузку на неё должен не забыть попросить руками на другой
+    странице. Забудет — строка навсегда останется в «ждём выгрузку 1С», и
+    виноватым будет выглядеть расчёт.
+    """
+    if done_snapshot(db, snapshot_date) is not None:
+        return False                       # ответ уже есть, спрашивать нечего
+    if open_request(db, snapshot_date) is not None:
+        return False                       # уже спросили, ждём
+    db.add(StockDateSnapshot(snapshot_date=snapshot_date, requested_by=username))
+    return True
+
+
 def stock_at_date(db: Session, uid_1c: str, snapshot_date: date) -> int | None:
     """Сколько 1С показала по этому товару на дату.
 

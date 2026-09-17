@@ -29,6 +29,7 @@ from app.dependencies import get_current_user
 from app.excel_utils import build_xlsx_response
 from app.flash import set_flash, pop_flash
 from app.models import StockDateRow, StockDateSnapshot, StockDateStatus, User
+from app.offset_base import open_request
 from app.timeutils import now_utc
 
 router = APIRouter()
@@ -46,14 +47,10 @@ STATUS_LABELS = {
 }
 
 
-def _open_request(db: Session, snapshot_date: date) -> StockDateSnapshot | None:
-    """Незакрытая заявка на ту же дату. Вторую заводить нельзя: 1С назовёт файл
-    по дате, один ответ закрыл бы только одну заявку, а вторая висела бы до
-    таймаута."""
-    return db.query(StockDateSnapshot).filter(
-        StockDateSnapshot.snapshot_date == snapshot_date,
-        StockDateSnapshot.status.in_([StockDateStatus.pending, StockDateStatus.sent]),
-    ).order_by(StockDateSnapshot.id.asc()).first()
+# Правило «одна открытая заявка на дату» живёт в app/offset_base: оттуда же его
+# применяет страница товаров, задавая дату расчёта порога. Двух копий быть не
+# должно — разойдутся, и на одну дату уедет две заявки.
+_open_request = open_request
 
 
 def _snapshots(db: Session) -> list[StockDateSnapshot]:

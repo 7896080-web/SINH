@@ -18,7 +18,8 @@ from app.workers.order_poller import (process_new_order, process_cancellation, p
                                       TEST_ORDER_PREFIX, open_test_out)
 from app.workers.scheduler import PENDING_WAREHOUSE_NAME, SOLD_WAREHOUSE_NAME
 from app.workers.dispatch import _resolve_push_target, _quantity_to_send
-from app.transmit import explain
+from app.transmit import explain, offset_from_base, recompute_offset, sku_quantity
+from app.offset_base import ensure_snapshot_requested, set_base_date
 from app.workers.platform_clients.base import PlatformOrder, StockPushItem
 from app.audit import log_action
 from app.flash import set_flash, pop_flash
@@ -73,6 +74,33 @@ def _open_1c_tasks(db: Session, orders: list) -> int:
             FtpTask.is_test.is_(False),
         ).count()
     return n
+
+
+def _offset_calc(db: Session, product) -> dict | None:
+    """Расчёт порога для карточки на «Тестировании» — тот же, что на странице товаров.
+
+    Здесь он нужен, чтобы проверить старт задним числом ЧИСЛАМИ, а не на глаз:
+    оператор видит, сколько уходило бы на дату старта, и сколько уходит сейчас,
+    после всех проведённых бэкфиллом заказов и движений склада. Если бэкфилл
+    отработал правильно, второе число объясняется первым и разницей остатка.
+    """
+    if product is None:
+        return None
+    fact = product.fact_at_date
+    base = product.offset_base_stock
+    offset = offset_from_base(product)
+    return {
+        "date": product.offset_base_date,
+        "base_stock": base,
+        "fact": fact,
+        "reserve": product.reserve or 0,
+        "offset": product.broadcast_offset,
+        "computed": offset,
+        "waiting": product.offset_base_date is not None and base is None,
+        # Сколько уходило бы на саму дату расчёта — точка отсчёта для проверки.
+        "send_at_date": (max(0, base - offset) if (base is not None and offset is not None) else None),
+        "send_now": sku_quantity(product),
+    }
 
 
 def _backfill_summary(db: Session, product) -> dict:
@@ -248,6 +276,7 @@ def testing_page(
         # иначе оператор видит в журнале одно, а в карточке другое.
         "simulated_stock": (product.stock_on_hand - open_test_out(db, product.uid_1c)) if product else None,
         "backfill": _backfill_summary(db, product),
+        "calc": _offset_calc(db, product),
         "flash": pop_flash(request),
     })
 
@@ -673,6 +702,69 @@ def backfill_real_orders(
     if error:
         msg += f" ⚠ {error}"
     set_flash(request, msg, "good" if failed == 0 else "warn")
+    return redirect
+
+
+@router.post("/testing/offset-calc")
+def testing_offset_calc(
+    request: Request, uid_1c: str = Form(...), account_id: str = Form(""),
+    base_date: str = Form(""), fact: str = Form(""),
+    db: Session = Depends(get_db), user: User = Depends(get_current_user),
+):
+    """Расчёт порога с этой страницы: та же формула и те же поля, что на «Товарах».
+
+    Отдельный эндпоинт, а не переиспользование products-роутов, потому что те
+    отвечают фрагментом строки таблицы для htmx, а здесь страница целиком.
+    Считает и пишет всё равно один и тот же `recompute_offset` — двух реализаций
+    формулы быть не должно.
+    """
+    redirect = RedirectResponse(f"/testing?uid_1c={uid_1c}&account_id={account_id}",
+                                status_code=303)
+    product = db.query(Product).filter(Product.uid_1c == uid_1c).first()
+    if product is None:
+        set_flash(request, "Товар не найден.", "warn")
+        return redirect
+
+    raw_date = (base_date or "").strip()
+    if raw_date:
+        try:
+            day = datetime.strptime(raw_date, "%Y-%m-%d").date()
+        except ValueError:
+            set_flash(request, "Дата расчёта: формат ГГГГ-ММ-ДД.", "warn")
+            return redirect
+        if day > date.today():
+            set_flash(request, "Остатков на будущую дату в 1С нет.", "warn")
+            return redirect
+    else:
+        day = None
+
+    raw_fact = (fact or "").strip()
+    if raw_fact:
+        try:
+            product.fact_at_date = max(0, int(raw_fact))
+        except ValueError:
+            set_flash(request, "Факт на дату: введите целое число (без запятой).", "warn")
+            return redirect
+    else:
+        product.fact_at_date = None
+
+    if day != product.offset_base_date:
+        set_base_date(db, product, day)
+    if day is not None:
+        asked = ensure_snapshot_requested(db, day, user.username)
+    else:
+        asked = False
+    recompute_offset(product)
+
+    log_action(db, user.username, "offset_calc_from_testing",
+               f"{uid_1c} -> дата {raw_date or 'снята'}, факт {raw_fact or 'сброшен'}")
+    db.commit()
+
+    if asked:
+        set_flash(request, f"Запрос остатков ЦС на {day:%d.%m.%Y} поставлен в очередь — "
+                           f"порог посчитается, как ответит 1С.", "info")
+    elif product.broadcast_offset is not None:
+        set_flash(request, f"Порог: {product.broadcast_offset}.", "good")
     return redirect
 
 
