@@ -1,5 +1,6 @@
 import os
 import logging
+import sys
 import time
 from datetime import datetime, timedelta
 from app.timeutils import now_utc
@@ -38,7 +39,39 @@ def _log_time_offset() -> str:
     return time.strftime("%z")
 
 
+def use_utf8(stream) -> bool:
+    """Заставляет поток лога писать в UTF-8 вне зависимости от локали системы.
+
+    NSSM перенаправляет stderr процесса в `worker.err.log`, а Python кодирует
+    его в кодировку локали — на русской Windows это cp1251. Кириллица в логе
+    оказывалась в однобайтовой кодировке, и любой инструмент, читающий файл как
+    UTF-8, показывал вместо неё мусор: строка
+    `reconciliation: нет свежего файла выгрузки остатков — пропуск`
+    читалась как `��� ������� ����� ... � �������`. Это не косметика: именно по
+    этой строке видно, что сверка не сверяет, а найти её поиском по слову было
+    нельзя. Наша же инструкция (`deploy/README_WINDOWS.md`) велела читать лог
+    как UTF-8 — то есть гарантированно показывала мусор.
+
+    `errors="replace"` — чтобы неожиданный символ (например, имя файла, которое
+    файловая система отдала суррогатом) портил одну букву в строке, а не ронял
+    саму запись в лог.
+
+    Возвращает False, если поток переключить нельзя (его подменили на объект без
+    `reconfigure` — так делает перехват вывода в тестах): лог тогда остаётся в
+    прежней кодировке, но воркер из-за этого не падает.
+    """
+    reconfigure = getattr(stream, "reconfigure", None)
+    if reconfigure is None:
+        return False
+    try:
+        reconfigure(encoding="utf-8", errors="replace")
+    except (ValueError, OSError):
+        return False
+    return True
+
+
 def configure_logging(level: int = logging.INFO):
+    use_utf8(sys.stderr)
     logging.basicConfig(level=level, format=LOG_FORMAT.format(offset=_log_time_offset()))
     # APScheduler на КАЖДЫЙ цикл пишет «Running job» и «executed successfully».
     # При задании раз в 45 секунд плюс по заданию на кабинет это сотни строк в час
@@ -218,6 +251,18 @@ def job_ftp_receive():
         db.close()
 
 
+# Метка фактически применённой сверки. Само задание `reconciliation` отчитывается
+# об успехе и когда сверять было нечем: свежего файла выгрузки 1С нет — задание
+# честно отработало, ошибки не случилось. Но для системы про остатки «сверка
+# запускалась» и «остатки сверены» — разные вещи: пока 1С не отдаёт выгрузку,
+# остаток в приложении живёт сам по себе, расходится со складом и уезжает на
+# площадки как есть, то есть это прямая дорога к оверселлу. Такое молчание уже
+# ловили дважды (находки 14 и 15), здесь тот же случай: heartbeat зелёный,
+# мониторинг доволен, а сверки нет. По этой метке /health видит именно её
+# отсутствие.
+RECONCILIATION_APPLIED = "reconciliation_applied"
+
+
 def job_reconciliation():
     db = SessionLocal()
     try:
@@ -242,6 +287,9 @@ def job_reconciliation():
             stats = run_reconciliation(db, stock, missing_means_zero=True,
                                        snapshot_at=snapshot_at)
             logger.info("reconciliation: %s", stats)
+            # Отдельная метка: сверка не просто отработала, а ФАКТИЧЕСКИ применила
+            # снимок 1С. Ниже, в ветке пропуска, её намеренно нет — см. RECONCILIATION_APPLIED.
+            _heartbeat(db, RECONCILIATION_APPLIED, True)
         else:
             logger.info("reconciliation: нет свежего файла выгрузки остатков — пропуск")
         _heartbeat(db, "reconciliation", True)
