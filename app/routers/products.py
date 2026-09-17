@@ -217,7 +217,7 @@ def _render(request: Request, db: Session, user: User, q: str, only_proposals: b
         "rows": rows, "total": total, "page_limit": PAGE_LIMIT,
         "q": q, "only_proposals": only_proposals, "only_blocked": only_blocked,
         "hide_size_u": hide_size_u,
-        "accounts": accounts, "account_label": _account_label,
+        "accounts": accounts,
         "dispatch": _dispatch_summary(db),
         "flash": pop_flash(request) if template == "products.html" else None,
     })

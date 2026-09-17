@@ -27,9 +27,12 @@
    сверка) — реализованы, см. раздел «Фоновые воркеры (app/workers/)» ниже.
    Наполнение `products`/`barcodes`/`sync_settings` идёт из них и из канала
    обмена с 1С (локальная папка `C:\sync`).
-2. **`enqueue_full_resend()`** в `app/routers/sync_products.py` — реализована:
-   кладёт запись в очередь рассылки (`DispatchQueueItem`, `reason="manual_enable"`),
-   которую разбирает воркер `app/workers/dispatch.py`.
+2. **`enqueue_full_resend()`** — реализована и живёт в `app/transmit.py`
+   (страницы «Синхронизируемые товары» и «Управление остатками» слиты в одну,
+   `app/routers/products.py`): кладёт запись в очередь рассылки
+   (`DispatchQueueItem`, `reason="manual_enable"`), которую разбирает воркер
+   `app/workers/dispatch.py`. Снятие галочки кабинета кладёт туда же ноль
+   (`enqueue_withdrawal`) — остаток отзывается с площадки.
 3. **Alembic-миграции** — первая миграция сгенерирована
    (`alembic/versions/`), `alembic upgrade head` поднимает полную схему.
    `Base.metadata.create_all()` в `main.py` оставлен только для быстрого
@@ -384,12 +387,19 @@ app/
   security.py        — хэширование паролей
   crypto.py          — шифрование API-ключей
   dependencies.py    — get_current_user, редирект неавторизованных
+  transmit.py        — сколько уходит на площадку и почему (единый расчёт)
   routers/
     auth.py          — вход/выход
     api_keys.py      — страница API-ключей
-    mapping.py        — страница мэппинга
-    sync_products.py — страница синхронизируемых товаров
-  templates/         — Jinja2-шаблоны (base + 4 страницы + HTMX-фрагменты)
+    mapping.py       — страница мэппинга
+    platform_matching.py — сопоставление площадок между собой
+    products.py      — «Товары и остатки» (заменила «Синхронизируемые товары»
+                       и «Управление остатками»)
+    anomalies.py     — аномалии
+    diagnostics.py   — диагностика
+    testing.py       — страница тестирования и бэкфилла
+    health.py        — /health для мониторинга
+  templates/         — Jinja2-шаблоны (base + страницы + HTMX-фрагменты)
   static/style.css   — стили, без сторонних UI-фреймворков
 create_admin_user.py — разовый скрипт создания первого пользователя
 ```
