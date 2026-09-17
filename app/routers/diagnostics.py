@@ -79,7 +79,12 @@ def diagnostics_page(request: Request, db: Session = Depends(get_db), user: User
             "heartbeat": hb,
         })
 
-    shared_workers = ["dispatch", "ftp_send", "ftp_receive", "reconciliation"]
+    # `reconciliation_applied` — рядом с `reconciliation` намеренно: первое говорит,
+    # когда сверка ЗАПУСКАЛАСЬ, второе — когда она в последний раз реально применила
+    # выгрузку 1С. Разъехавшиеся времена в этих двух строках означают, что 1С не
+    # отдаёт выгрузку, и остаток в приложении больше не сверяется со складом.
+    shared_workers = ["dispatch", "ftp_send", "ftp_receive", "reconciliation",
+                      "reconciliation_applied"]
     shared_heartbeats = [{"name": w, "hb": _heartbeat_for(db, w)} for w in shared_workers]
 
     global_stats = {

@@ -21,6 +21,14 @@ EXPECTED_INTERVAL_SECONDS = {
     "ftp_send_export_request": 3600 * 3,
     "ftp_send_barcode_request": 86400 * 3,
     "reconciliation": 3600 * 3,
+    # Не задание, а метка ФАКТА: сверка применила выгрузку 1С (scheduler.job_reconciliation).
+    # Задание `reconciliation` выше отчитывается об успехе и тогда, когда сверять было
+    # нечем — свежей выгрузки нет, ошибки не произошло. Разошлись эти два смысла на
+    # боевом 17.09.2026: воркер два часа подряд писал «нет свежего файла выгрузки
+    # остатков — пропуск», heartbeat при этом оставался зелёным, и /health показывал
+    # 200 при фактически остановленной сверке. Три пропущенных часовых цикла подряд —
+    # тот же порог, что и у самого задания.
+    "reconciliation_applied": 3600 * 3,
     "reconcile_accounts": 300 * 3,
     "import_barcodes": 900 * 3,
     # Метка недельного ПОЛНОГО импорта справочника 1С (scheduler.job_import_barcodes):
@@ -56,6 +64,9 @@ REQUIRED_WORKERS = {
     "ftp_send_export_request": 600,
     "ftp_send_barcode_request": 600,
     "reconciliation": 900,
+    # Первый снимок ждём три часовых цикла: сверка идёт через 5 минут после запроса
+    # выгрузки, и если 1С в это окно не уложилась, следующая попытка будет через час.
+    "reconciliation_applied": 3 * 3600,
     "reconcile_accounts": 900,
     "import_barcodes": 1800,
 }
