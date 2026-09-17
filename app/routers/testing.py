@@ -193,17 +193,22 @@ def _fetch_real_orders(db: Session, uid_1c: str, account_id, start_date: str):
     return rows, error
 
 
-def _resolve_start(db: Session, uid_1c: str, start_date: str) -> str:
-    """Единая дата старта задним числом = Product.broadcast_active_since. Если
-    оператор ввёл дату — сохраняем её в поле (общее для всех площадок и страниц:
-    /testing, «Синхронизируемые товары», «Управление остатками»). Если поле пустое —
-    берём сохранённую. Возвращает строку ГГГГ-ММ-ДД (или пустую)."""
+def _resolve_start(db: Session, uid_1c: str, start_date: str, persist: bool = False) -> str:
+    """Единая дата старта задним числом = Product.broadcast_active_since.
+    Введённая оператором дата побеждает, пустое поле — берём сохранённую.
+    Возвращает строку ГГГГ-ММ-ДД (или пустую).
+
+    `persist=False` (по умолчанию) — ТОЛЬКО ЧТЕНИЕ. Просмотр заказов с площадки
+    обещает кнопкой и докстрингом, что ничего не меняет, а на деле молча
+    сохранял дату старта товара — без сообщения и без записи в аудит. Сохраняем
+    только там, где оператор явно что-то проводит (бэкфилл), и пишем об этом в
+    журнал действий."""
     product = db.query(Product).filter(Product.uid_1c == uid_1c).first()
     eff = (start_date or "").strip()
     if eff:
         try:
             d = datetime.strptime(eff, "%Y-%m-%d").date()
-            if product is not None:
+            if persist and product is not None:
                 product.broadcast_active_since = d
         except ValueError:
             pass  # некорректный формат отловит _fetch_real_orders ниже
@@ -330,6 +335,9 @@ def test_push_stock(
         _log(db, uid_1c, account_id, TestLogLevel.error, "push_stock", f"Нет ключей: {e}")
         set_flash(request, str(e), "warn")
     except Exception as e:
+        # Откат по той же причине, что и в бэкфилле: на сломанной сессии
+        # следующий же db.commit() ниже вылетел бы 500 вместо понятного сообщения.
+        db.rollback()
         _log(db, uid_1c, account_id, TestLogLevel.error, "push_stock", f"Исключение: {type(e).__name__}: {e}")
         set_flash(request, f"Ошибка отправки: {e}", "warn")
 
@@ -596,7 +604,12 @@ def backfill_real_orders(
     ещё не проведены, бэкфилл их и создаёт. Идемпотентность по ProcessedOrder
     (кабинет+order_id) не даёт провести заказ дважды. Каждый заказ проводится
     под своим кабинетом, дата документа = реальная дата заказа."""
-    start_date = _resolve_start(db, uid_1c, start_date)
+    product_before = db.query(Product).filter(Product.uid_1c == uid_1c).first()
+    saved_before = product_before.broadcast_active_since if product_before else None
+    start_date = _resolve_start(db, uid_1c, start_date, persist=True)
+    if product_before is not None and product_before.broadcast_active_since != saved_before:
+        log_action(db, user.username, "active_since_changed",
+                   f"{uid_1c} -> {product_before.broadcast_active_since} (бэкфилл)")
     redirect = RedirectResponse(
         f"/testing?uid_1c={uid_1c}&account_id={account_id}&start_date={start_date}", status_code=303,
     )
@@ -640,10 +653,18 @@ def backfill_real_orders(
             _log(db, uid_1c, r["account_id"], TestLogLevel.info, "backfill",
                  f"Заказ {r['order_id']} ({r['order_date']}, {r['account_name']}): {result['status']}. "
                  f"FtpTask={result['ftp_task_id']}, новый остаток={result['new_stock']}.")
+            db.commit()      # строка журнала должна пережить сбой на следующем заказе
         except Exception as e:
+            # Без отката сессия остаётся сломанной после неудачного commit внутри
+            # process_new_order, и СЛЕДУЮЩЕЕ же обращение к базе (хоть запись в
+            # журнал) вылетает наружу: часть заказов проведена, оператор видит 500
+            # и, скорее всего, повторяет прогон — уже по частично проведённым
+            # данным. Откатываем и продолжаем с остальными заказами.
+            db.rollback()
             failed += 1
             _log(db, uid_1c, r["account_id"], TestLogLevel.error, "backfill",
                  f"Заказ {r['order_id']} ({r['account_name']}): {type(e).__name__}: {e}")
+            db.commit()
 
     db.commit()
     log_action(db, user.username, "test_backfill",

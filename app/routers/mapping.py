@@ -7,7 +7,7 @@ from sqlalchemy import or_
 from app.database import get_db
 from app.dependencies import get_current_user
 from app.models import Barcode, Product, MappingConflict, Platform, PlatformAccount, PlatformCatalogItem, User
-from app.excel_utils import build_xlsx_response, read_xlsx_rows, format_dt
+from app.excel_utils import build_xlsx_response, read_xlsx_rows, format_dt, ExcelReadError
 from app.flash import set_flash, pop_flash
 from app.audit import log_action
 from app.workers.client_factory import build_client
@@ -147,7 +147,11 @@ def mapping_import(
     Колонка ID_1С — обязательна, это ключ сопоставления, редактировать её
     в Excel не нужно (это внутренний идентификатор товара, не артикул)."""
 
-    rows = read_xlsx_rows(file.file.read())
+    try:
+        rows = read_xlsx_rows(file.file.read())
+    except ExcelReadError as e:
+        set_flash(request, str(e), "warn")
+        return RedirectResponse("/mapping", status_code=303)
 
     added, already_mapped, errors = 0, 0, []
     resolved_conflicts = 0

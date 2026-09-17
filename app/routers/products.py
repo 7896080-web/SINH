@@ -24,7 +24,7 @@ from app.models import Product, PlatformAccount, Platform, SyncSetting, User
 from app.flash import set_flash, pop_flash
 from app.audit import log_action
 from app.timeutils import now_utc
-from app.excel_utils import build_xlsx_response, read_xlsx_rows, parse_bool_ru
+from app.excel_utils import build_xlsx_response, read_xlsx_rows, parse_bool_ru, ExcelReadError
 from app.transmit import explain, sku_quantity, enqueue_full_resend, enqueue_withdrawal
 
 router = APIRouter()
@@ -575,7 +575,11 @@ def products_import(
     Колонка «Уходит на площадки» справочная, при импорте игнорируется."""
     accounts = _active_accounts(db)
     label_to_account = {_account_label(a): a for a in accounts}
-    rows = read_xlsx_rows(file.file.read())
+    try:
+        rows = read_xlsx_rows(file.file.read())
+    except ExcelReadError as e:
+        set_flash(request, str(e), "warn")
+        return RedirectResponse("/products", status_code=303)
 
     updated, unchanged, errors = 0, 0, []
 

@@ -11,7 +11,7 @@ from app.database import get_db
 from app.dependencies import get_current_user
 from app.models import SyncAnomaly, SyncSetting, Product, PlatformAccount, AnomalyReason, AnomalyStatus, User
 from app.transmit import enqueue_full_resend
-from app.excel_utils import build_xlsx_response, read_xlsx_rows, parse_bool_ru, format_dt
+from app.excel_utils import build_xlsx_response, read_xlsx_rows, parse_bool_ru, format_dt, ExcelReadError
 from app.flash import set_flash, pop_flash
 from app.audit import log_action
 
@@ -168,7 +168,11 @@ def anomalies_import(
     ID_1С и Кабинет — ключ сопоставления (по имени кабинета, регистр важен)."""
 
     accounts_by_name = {a.name: a for a in db.query(PlatformAccount).all()}
-    rows = read_xlsx_rows(file.file.read())
+    try:
+        rows = read_xlsx_rows(file.file.read())
+    except ExcelReadError as e:
+        set_flash(request, str(e), "warn")
+        return RedirectResponse("/anomalies", status_code=303)
 
     resolved, skipped, errors = 0, 0, []
 
