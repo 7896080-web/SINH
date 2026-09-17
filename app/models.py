@@ -254,6 +254,10 @@ class DispatchQueueItem(Base):
     status = Column(Enum(DispatchStatus), default=DispatchStatus.pending, nullable=False)
     attempts = Column(Integer, default=0)
     last_error = Column(Text, nullable=True)
+    # Не раньше этого момента можно пробовать снова (пауза между попытками после
+    # сбоя площадки). NULL — можно прямо сейчас. Статус `error` терминален: он
+    # ставится, только когда попытки исчерпаны, см. app/workers/dispatch.py.
+    next_attempt_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=now_utc)
     sent_at = Column(DateTime, nullable=True)
     # Раздел про страницу тестирования: запись от симулированного заказа —
