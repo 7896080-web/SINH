@@ -211,7 +211,13 @@ def run_reconciliation(db: Session, stock_from_1c: dict[str, int],
         if row is None:
             stats["unmatched_barcodes"] += 1
             continue
-        uid_to_actual[row.uid_1c] = max(uid_to_actual.get(row.uid_1c, 0), qty)
+        # Максимум по баркодам одного товара — это один физический остаток. Но
+        # начинать максимум с нуля нельзя: отрицательный остаток (пересортица)
+        # превращался бы в 0 и в журнале сверки тоже. Весь остальной код
+        # специально хранит минус как есть (приём заказа, сверка), на площадку
+        # всё равно уходит max(0, …). Поэтому первое значение берём как есть.
+        previous = uid_to_actual.get(row.uid_1c)
+        uid_to_actual[row.uid_1c] = qty if previous is None else max(previous, qty)
 
     if missing_means_zero and uid_to_actual:
         # Товары с баркодами и ненулевым остатком, которых в снимке нет.

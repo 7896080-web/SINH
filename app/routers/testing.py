@@ -15,7 +15,7 @@ from app.models import (
 from app.workers.client_factory import build_client
 from app.workers.credentials import CredentialsMissing
 from app.workers.order_poller import (process_new_order, process_cancellation, process_confirmation,
-                                      TEST_ORDER_PREFIX)
+                                      TEST_ORDER_PREFIX, open_test_out)
 from app.workers.scheduler import PENDING_WAREHOUSE_NAME, SOLD_WAREHOUSE_NAME
 from app.workers.dispatch import _resolve_push_target, _quantity_to_send
 from app.transmit import explain
@@ -238,6 +238,10 @@ def testing_page(
         "product": product, "account": account, "barcode": barcode, "setting": setting,
         "test_orders": test_orders, "log_entries": log_entries,
         "current_send": _sku_send(product),
+        # Остаток «глазами симуляции»: боевой минус открытые тестовые заказы.
+        # Сам боевой остаток тест не трогает, поэтому показываем оба числа —
+        # иначе оператор видит в журнале одно, а в карточке другое.
+        "simulated_stock": (product.stock_on_hand - open_test_out(db, product.uid_1c)) if product else None,
         "backfill": _backfill_summary(db, product),
         "flash": pop_flash(request),
     })
@@ -501,17 +505,10 @@ def cleanup_test_data(
     _log(db, uid_1c, account_id, TestLogLevel.info, "cleanup",
          f"Очистка запущена. Найдено тестовых заказов по этому кабинету: {len(test_orders)}.")
 
-    restored = 0
-    for order in test_orders:
-        # processed И confirmed: остаток всё ещё занижен на order.quantity
-        # (подтверждение остаток не меняет), возвращаем его перед удалением.
-        # cancelled уже вернул остаток при симуляции отмены — его не трогаем.
-        if order.status in (OrderProcessStatus.processed, OrderProcessStatus.confirmed) and product is not None:
-            product.stock_on_hand += order.quantity
-            # Симметрично приёму заказа возвращаем ручной override (если задан).
-            if product.transmit_override is not None:
-                product.transmit_override = max(0, product.transmit_override + order.quantity)
-            restored += order.quantity
+    # Восстанавливать остаток больше НЕ НУЖНО и нельзя: симуляция его не трогает
+    # (см. order_poller.process_new_order). Раньше тест списывал боевой остаток, а
+    # очистка возвращала его обратно — если оставить только возврат, каждая очистка
+    # молча ДОБАВЛЯЛА бы товар на склад.
 
     # Тестовые записи в очереди рассылки никогда не уходили на площадку
     # по-настоящему (is_test исключает их в dispatch.py) — удаляем точно
@@ -520,10 +517,10 @@ def cleanup_test_data(
         DispatchQueueItem.uid_1c == uid_1c, DispatchQueueItem.is_test.is_(True),
     ).delete(synchronize_session=False)
 
-    if restored and product is not None:
-        # Реальным кабинетам с включённой синхронизацией на всякий случай
-        # шлём подтверждённый верный остаток — не обязательно (они и так не
-        # видели тестовых значений), но не мешает.
+    if test_orders and product is not None:
+        # Реальным кабинетам с включённой синхронизацией шлём текущий боевой
+        # остаток: тестовые значения до них не доходили (is_test исключает записи
+        # в dispatch.py), но лишняя сверка с реальностью после теста не мешает.
         enabled_settings = db.query(SyncSetting).filter(
             SyncSetting.uid_1c == uid_1c, SyncSetting.enabled.is_(True),
         ).all()
@@ -541,13 +538,16 @@ def cleanup_test_data(
         db.query(ProcessedOrder).filter(ProcessedOrder.order_id.in_(order_ids)).delete(synchronize_session=False)
 
     _log(db, uid_1c, account_id, TestLogLevel.good, "cleanup",
-         f"Готово. Остаток восстановлен на +{restored} шт. Удалено: заказов {len(order_ids)}, "
+         f"Готово. Боевой остаток симуляция не меняла, восстанавливать нечего "
+         f"({product.stock_on_hand if product is not None else '—'} шт). Удалено: заказов {len(order_ids)}, "
          f"записей в очереди рассылки {deleted_dispatch}, заданий 1С {deleted_ftp}, аномалий {deleted_anomaly}.")
 
-    log_action(db, user.username, "test_cleanup", f"{uid_1c} / кабинет #{account_id}: восстановлено {restored} шт.")
+    log_action(db, user.username, "test_cleanup",
+               f"{uid_1c} / кабинет #{account_id}: удалено тестовых заказов {len(order_ids)}")
     db.commit()
 
-    set_flash(request, f"Тестовые данные очищены. Остаток скорректирован на +{restored} шт. (если требовалось).", "good")
+    set_flash(request, f"Тестовые данные очищены: заказов {len(order_ids)}. "
+                       f"Боевой остаток симуляция не меняла.", "good")
     return RedirectResponse(f"/testing?uid_1c={uid_1c}&account_id={account_id}", status_code=303)
 
 
