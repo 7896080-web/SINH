@@ -433,6 +433,19 @@ def apply_stock_on_date_files(db: Session, exchange: "LocalExchange") -> dict:
         stats["files"] += 1
         stats["rows"] += len(rows)
 
+        # Товары, которым оператор задал эту дату для расчёта порога, ждали
+        # именно этого файла. Подставляем им остаток на дату и пересчитываем
+        # порог здесь же: между «задал дату» и «1С ответила» проходит до десяти
+        # минут, и если не доделать сейчас, расчёт застрянет до тех пор, пока
+        # оператор не тронет строку руками.
+        from app.offset_base import fill_waiting_products   # локально: цикл импортов
+        filled = fill_waiting_products(db, snapshot)
+        if filled["filled"]:
+            stats["offset_base_filled"] = stats.get("offset_base_filled", 0) + filled["filled"]
+            logger.info("stock_on_date: порог посчитан для %d товаров (изменился у %d, "
+                        "в очередь рассылки %d)", filled["filled"],
+                        filled["offsets_changed"], filled["queued"])
+
     db.commit()
     return stats
 

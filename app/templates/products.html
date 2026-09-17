@@ -14,8 +14,11 @@
         .pr-error{color:#b3261e;background:#fdecea;border:1px solid #f3b8b2;border-radius:4px;padding:2px 6px;margin-top:4px;font-size:12px;line-height:1.35}
   .pr-hint--good{color:#16794a;font-weight:600}
   .pr-mini{font-size:11px;padding:1px 6px}
-  .pr-calc summary{font-size:11px;color:#567;cursor:pointer;margin-top:2px}
-  .pr-calc label{display:block;font-size:11px;color:#556;margin-top:3px}
+  .pr-calcbox{min-width:190px}
+  .pr-calcrow{display:flex;align-items:center;gap:6px;margin-bottom:3px}
+  .pr-calcrow label{font-size:11px;color:#556;min-width:66px}
+  .pr-ro{font-size:12px;color:#334;background:#f2f4f7;border-radius:4px;padding:2px 7px}
+  .pr-calcres{border-top:1px dashed #dfe3ea;margin-top:4px;padding-top:4px;font-size:12px}
   .pr-on{background:#16794a;color:#fff}
   .pr-off{background:#9a1c1c;color:#fff}
   .pr-flag{background:#fde68a;border:none;border-radius:4px;cursor:pointer}
@@ -41,7 +44,7 @@
         рядом написана причина.</p>
     </div>
     <div class="toolbar">
-        <a href="/products/export?q={{ q }}&only_proposals={{ only_proposals|lower }}&only_blocked={{ only_blocked|lower }}&hide_size_u={{ hide_size_u|lower }}" class="btn">Экспорт в Excel</a>
+        <a href="/products/export?q={{ q }}&only_proposals={{ only_proposals|lower }}&only_blocked={{ only_blocked|lower }}&hide_size_u={{ hide_size_u|lower }}&only_unfinished={{ only_unfinished|lower }}" class="btn">Экспорт в Excel</a>
         <form method="post" action="/products/import" enctype="multipart/form-data" style="display:inline;">
             <label class="btn file-upload-btn">
                 Импорт из Excel
@@ -61,7 +64,12 @@
         <li>Иначе → <b>остаток ЦС − резерв</b>, и если результат не больше <b>порога кабинета</b>, уходит 0.</li>
     </ol>
     <p class="help-text">Порог трансляции — это постоянное расхождение между учётом 1С и реальным складом.
-    Считается один раз по пересчёту: учёт 1С на дату минус реально найденное количество. Кнопка «посчитать» в колонке порога сделает вычитание сама.</p>
+    Он не вводится руками, а выводится из трёх чисел на выбранную дату:
+    <b>порог = остаток ЦС на дату − (факт на дату − бронь)</b>. Остаток ЦС на дату приходит
+    из 1С (ответ идёт до десяти минут — до него строка пишет «ждём выгрузку»), факт вводит
+    оператор, бронь — сколько держим у себя. Дальше на площадки всегда уходит
+    <b>остаток ЦС сейчас − порог</b>: заказы, приходы, списания и пересортица двигают остаток,
+    а порог стоит на месте.</p>
 </details>
 
 <h3>Рассылка по площадкам (пауза)</h3>
@@ -107,18 +115,25 @@
         <input type="checkbox" name="hide_size_u" value="true" {% if hide_size_u %}checked{% endif %}>
         Скрыть размер U
     </label>
+    <label class="checkbox-inline" style="padding-bottom:8px;"
+           title="Дата расчёта задана, но 1С ещё не ответила либо факт не введён.">
+        <input type="checkbox" name="only_unfinished" value="true" {% if only_unfinished %}checked{% endif %}>
+        Только незавершённый расчёт
+    </label>
 </form>
 
 <form id="bulk-form" method="post" action="/products/bulk" class="pr-bulk">
   <input type="hidden" name="q" value="{{ q }}">
   <span class="muted">С отмеченными:</span>
   <input type="number" name="int_value" placeholder="число" style="width:80px;">
-  <button name="action" value="set_reserve">Резерв =</button>
-  <button name="action" value="set_offset">Порог трансляции =</button>
+  <button name="action" value="set_reserve">Резерв (бронь) =</button>
+  <button name="action" value="set_fact">Факт на дату =</button>
+  <button name="action" value="fact_from_stock" title="Там, где факт не введён, подставить остаток ЦС на дату">Факт = остаток ЦС</button>
   <button name="action" value="clear_offset">Сбросить порог</button>
   <button name="action" value="broadcast_on" class="pr-on">Трансляция вкл</button>
   <button name="action" value="broadcast_off" class="pr-off">Трансляция выкл</button>
   <input type="date" name="date_value">
+  <button name="action" value="set_base_date">Дата расчёта =</button>
   <button name="action" value="set_active_since">Активно с =</button>
 </form>
 

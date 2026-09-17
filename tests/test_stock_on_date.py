@@ -411,3 +411,52 @@ def test_export_gives_an_xlsx(logged_in_client, web_db):
 
 def test_unknown_snapshot_id_does_not_crash_the_page(logged_in_client, web_db):
     assert logged_in_client.get("/stock-on-date", params={"snapshot_id": "мусор"}).status_code == 200
+
+
+# --------------------------------------------------- порог считается при приёме файла
+
+def test_arriving_file_computes_the_threshold_for_waiting_products(db, tmp_path):
+    """Сквозная проверка связки: оператор задал дату заранее, 1С ответила файлом —
+    порог обязан посчитаться прямо здесь.
+
+    Без этого массовая простановка даты не работала бы вовсе: ответ 1С идёт до
+    десяти минут, и расчёт застревал бы до тех пор, пока каждую из 152 тысяч
+    строк не тронут руками.
+    """
+    from app.offset_base import set_base_date
+
+    exchange = _exchange(tmp_path)
+    snapshot = _request(db, status=StockDateStatus.sent)
+    product = Product(uid_1c="u1", article="A-1", name="Джинсы", stock_on_hand=9,
+                      reserve=2, fact_at_date=5, broadcast_enabled=True)
+    db.add(product)
+    db.commit()
+    set_base_date(db, product, date(2026, 8, 7))
+    assert product.broadcast_offset is None        # ответа ещё нет — считать не из чего
+
+    _result_file(exchange, "ondate_20260807_20260908121314.txt", ROW)   # u1 -> 7
+    apply_stock_on_date_files(db, exchange)
+
+    db.refresh(product)
+    assert product.offset_base_stock == 7
+    assert product.broadcast_offset == 4           # 7 − (5 − 2)
+
+
+def test_arriving_file_does_not_touch_the_current_stock(db, tmp_path):
+    """Граница, ради которой выгрузка на дату живёт отдельно, от нового расчёта
+    не сдвигается: остаток товара — по-прежнему «сейчас», а не «на дату»."""
+    from app.offset_base import set_base_date
+
+    exchange = _exchange(tmp_path)
+    _request(db, status=StockDateStatus.sent)
+    product = Product(uid_1c="u1", article="A-1", name="Джинсы", stock_on_hand=9,
+                      reserve=0, broadcast_enabled=True)
+    db.add(product)
+    db.commit()
+    set_base_date(db, product, date(2026, 8, 7))
+
+    _result_file(exchange, "ondate_20260807_20260908121314.txt", ROW)   # u1 -> 7
+    apply_stock_on_date_files(db, exchange)
+
+    db.refresh(product)
+    assert product.stock_on_hand == 9              # НЕ 7
