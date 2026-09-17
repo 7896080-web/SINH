@@ -1,5 +1,6 @@
 import os
 import logging
+import time
 from datetime import datetime, timedelta
 from app.timeutils import now_utc
 
@@ -23,7 +24,32 @@ from app.workers.ftp_channel import (
 )
 from app.workers.reconciliation import run_reconciliation, import_product_master, import_barcode_dict
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+# Время в строке лога — МЕСТНОЕ (так его ставит logging, так же 1С называет свои
+# файлы обмена), а в базе и в интерфейсе — UTC. На боевом сервере это разница в три
+# часа, и на ней уже один раз построили ложный вывод «1С обработала задание дважды»:
+# заявка была закрыта «в 13:00», а файл ответа лежал «от 15:59» — одно и то же
+# событие в двух шкалах. Поэтому к времени приписывается явное смещение:
+# `2026-09-17 16:00:20,561+0300`.
+LOG_FORMAT = "%(asctime)s{offset} %(levelname)s %(name)s: %(message)s"
+
+
+def _log_time_offset() -> str:
+    """Смещение часового пояса машины в виде `+0300`."""
+    return time.strftime("%z")
+
+
+def configure_logging(level: int = logging.INFO):
+    logging.basicConfig(level=level, format=LOG_FORMAT.format(offset=_log_time_offset()))
+    # APScheduler на КАЖДЫЙ цикл пишет «Running job» и «executed successfully».
+    # При задании раз в 45 секунд плюс по заданию на кабинет это сотни строк в час
+    # и мегабайты в неделю, в которых тонут наши собственные строки: на боевом
+    # сервере лог воркера дорос до 13 МБ, и разбирать по нему сбой уже нечем.
+    # WARNING оставляет ровно то, ради чего этот лог читают: пропущенные запуски
+    # (`Run time of job ... was missed`) и исключения внутри заданий.
+    logging.getLogger("apscheduler").setLevel(logging.WARNING)
+
+
+configure_logging()
 logger = logging.getLogger("sync_worker")
 
 # РЕАЛЬНЫЕ имена складов в базе «Магазин одежды и обуви» (справочник Склады).
