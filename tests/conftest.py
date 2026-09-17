@@ -57,7 +57,13 @@ def db():
     не связан с app.database.engine, который используют веб-тесты ниже)."""
     engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
     Base.metadata.create_all(bind=engine)
-    Session = sessionmaker(bind=engine)
+    # autoflush=False — КАК В БОЮ (app/database.py). Раньше фикстура брала
+    # умолчание SQLAlchemy (autoflush=True), и тестовая сессия вела себя иначе,
+    # чем боевая: незаписанные изменения были видны запросам. На этом проехал
+    # настоящий дефект — расчёт порога читал строки ответа 1С, ещё не ушедшие в
+    # базу, в тестах видел их, а на боевом получал пустой снимок и считал порог
+    # всему каталогу по нулям.
+    Session = sessionmaker(bind=engine, autoflush=False)
     session = Session()
     try:
         yield session
@@ -72,7 +78,7 @@ def web_db():
     app.database.get_db, а не через фикстуру выше."""
     from app.database import engine as app_engine
     Base.metadata.create_all(bind=app_engine)
-    Session = sessionmaker(bind=app_engine)
+    Session = sessionmaker(bind=app_engine, autoflush=False)   # как в бою
     session = Session()
     try:
         yield session
