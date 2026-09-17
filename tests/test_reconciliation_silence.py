@@ -170,3 +170,88 @@ def test_diagnostics_shows_when_the_snapshot_was_last_applied(logged_in_client, 
     body = logged_in_client.get("/diagnostics").text
 
     assert RECONCILIATION_APPLIED in body
+
+
+# ------------------------------------------------ фазовая ловушка расписания
+
+def test_reconciliation_does_not_wait_a_whole_hour_between_looks():
+    """Суть находки 17.09.2026.
+
+    Сверка была часовой и шла через 5 минут после запроса выгрузки — то есть
+    молча закладывалась на то, что 1С отвечает быстрее пяти минут. На боевом
+    обработка 1С запускается по своему расписанию, раз в 10 минут, и отвечала в
+    среднем через семь: файл приходил всегда ПОСЛЕ того, как сверка посмотрела и
+    ушла, а на следующем часовом цикле отбраковывался как более старый, чем новый
+    запрос.
+
+    Хуже всего, что это не разовое невезение. Оба расписания периодические,
+    поэтому фаза, выпавшая при старте воркера, держится до перезапуска: сверка,
+    промахнувшись один раз, не срабатывала уже НИКОГДА. Значит, интервал между
+    взглядами в папку обязан быть короче, чем интервал запуска обработки 1С.
+    """
+    from apscheduler.schedulers.background import BackgroundScheduler
+    from unittest.mock import patch
+
+    with patch.object(scheduler, "SessionLocal"), \
+         patch.object(scheduler, "reconcile_account_jobs", lambda *a, **kw: None), \
+         patch.object(scheduler, "BlockingScheduler", BackgroundScheduler):
+        sched = scheduler.build_scheduler()
+
+    look = sched.get_job("reconciliation").trigger.interval.total_seconds()
+    ask = sched.get_job("ftp_send_export_request").trigger.interval.total_seconds()
+
+    assert look <= 300, "смотреть в папку ответов надо чаще, чем 1С успевает ответить"
+    assert ask == 3600, "просить выгрузку чаще нельзя: это полный снимок 152 тыс. товаров"
+    assert look < ask, "взгляд в папку и запрос выгрузки — разные по цене вещи"
+
+
+# ------------------------------------------------ частые проверки не шумят в логе
+
+def test_waiting_for_an_answer_is_logged(monkeypatch, db, caplog):
+    """Пока ответа на последний запрос нет — строка в логе нужна: именно по ней
+    видно, что выгрузку попросили, а 1С молчит."""
+    import logging
+
+    db.add(WorkerHeartbeat(worker_name="ftp_send_export_request", last_success=True,
+                           last_run_at=now_utc() - timedelta(minutes=3)))
+    db.commit()
+
+    with caplog.at_level(logging.INFO, logger="sync_worker"):
+        _run_reconciliation(monkeypatch, db, [])
+
+    assert any("ждём" in r.getMessage() for r in caplog.records)
+
+
+def test_an_answered_cycle_stays_silent(monkeypatch, db, caplog):
+    """А после применения снимка ждать нечего. Проверок теперь двенадцать в час:
+    строка на каждый холостой заход вернула бы в лог тот самый шум, ради которого
+    глушили apscheduler."""
+    import logging
+
+    db.add(WorkerHeartbeat(worker_name="ftp_send_export_request", last_success=True,
+                           last_run_at=now_utc() - timedelta(minutes=30)))
+    db.add(WorkerHeartbeat(worker_name=RECONCILIATION_APPLIED, last_success=True,
+                           last_run_at=now_utc() - timedelta(minutes=20)))
+    db.commit()
+
+    with caplog.at_level(logging.INFO, logger="sync_worker"):
+        _run_reconciliation(monkeypatch, db, [])
+
+    assert not any("ждём" in r.getMessage() for r in caplog.records)
+
+
+def test_a_new_request_reopens_the_wait(monkeypatch, db, caplog):
+    """Следующий час — новый запрос, и ожидание начинается заново, хотя прошлый
+    снимок был успешно применён."""
+    import logging
+
+    db.add(WorkerHeartbeat(worker_name=RECONCILIATION_APPLIED, last_success=True,
+                           last_run_at=now_utc() - timedelta(minutes=55)))
+    db.add(WorkerHeartbeat(worker_name="ftp_send_export_request", last_success=True,
+                           last_run_at=now_utc() - timedelta(minutes=2)))
+    db.commit()
+
+    with caplog.at_level(logging.INFO, logger="sync_worker"):
+        _run_reconciliation(monkeypatch, db, [])
+
+    assert any("ждём" in r.getMessage() for r in caplog.records)
