@@ -27,7 +27,7 @@ from app.timeutils import now_utc
 from app.excel_utils import build_xlsx_response, read_xlsx_rows, parse_bool_ru, ExcelReadError
 from app.transmit import (explain, sku_quantity, enqueue_full_resend, enqueue_withdrawal,
                           offset_from_base, recompute_offset)
-from app.offset_base import set_base_date, stock_at_date
+from app.offset_base import ensure_snapshot_requested, set_base_date, stock_at_date
 
 router = APIRouter()
 templates = Jinja2Templates(directory="app/templates")
@@ -376,6 +376,11 @@ def set_base_date_route(
                              error="Остатков на будущую дату в 1С нет.", error_field="base_date")
 
     set_base_date(db, product, day)
+    if day is not None:
+        # Выгрузку на эту дату спрашиваем сами. Иначе связка дырявая: оператор
+        # задал дату, а попросить у 1С срез должен не забыть руками на другой
+        # странице — забудет, и строка навсегда останется в «ждём выгрузку».
+        ensure_snapshot_requested(db, day, user.username)
     log_action(db, user.username, "offset_base_date_changed", f"{uid_1c} -> {value or 'снята'}")
     _repropagate(db, product, reason="offset_base_date")
     db.commit()
@@ -635,6 +640,8 @@ def bulk_edit(
             # Снимок на дату уже есть — порог посчитается сразу; нет — строка
             # встанет в ожидание и доделается при приёме файла от 1С.
             set_base_date(db, p, d)
+            if d is not None:
+                ensure_snapshot_requested(db, d, user.username)
         elif action == "set_fact":
             p.fact_at_date = n
             recompute_offset(p)
@@ -798,6 +805,8 @@ def products_import(
                 errors.append(f"строка {i}: остатков на будущую дату в 1С нет")
             elif desired_day != product.offset_base_date:
                 set_base_date(db, product, desired_day)
+                if desired_day is not None:
+                    ensure_snapshot_requested(db, desired_day, user.username)
                 touched = True
 
         if "Факт на дату" in row:
