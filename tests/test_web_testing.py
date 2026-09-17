@@ -30,7 +30,9 @@ def test_testing_page_shows_product_state(logged_in_client, web_db):
     assert "включена" in r.text
 
 
-def test_simulate_order_decrements_stock_and_creates_test_order(logged_in_client, web_db):
+def test_simulate_order_does_not_touch_real_stock(logged_in_client, web_db):
+    """Симуляция не должна менять боевой остаток: раньше меняла, и следующая
+    РЕАЛЬНАЯ рассылка отправляла на площадку заниженное тестом число."""
     a1, a2 = _seed(web_db)
 
     r = logged_in_client.post(
@@ -41,12 +43,36 @@ def test_simulate_order_decrements_stock_and_creates_test_order(logged_in_client
 
     from app.models import Product, ProcessedOrder
     product = web_db.query(Product).filter(Product.uid_1c == "u1").first()
-    assert product.stock_on_hand == 7
+    assert product.stock_on_hand == 10          # боевой остаток не тронут
 
     order = web_db.query(ProcessedOrder).filter(ProcessedOrder.uid_1c == "u1").first()
     assert order is not None
     assert order.order_id.startswith("TEST-")
     assert order.quantity == 3
+
+
+def test_simulated_stock_is_shown_to_the_operator(logged_in_client, web_db):
+    """Но число, каким остаток выглядел бы при настоящем заказе, показать надо —
+    иначе в журнале одно, в карточке другое."""
+    a1, a2 = _seed(web_db)
+    logged_in_client.post("/testing/simulate-order",
+                          data={"uid_1c": "u1", "account_id": a1.id, "quantity": 3})
+
+    r = logged_in_client.get(f"/testing?uid_1c=u1&account_id={a1.id}")
+
+    assert "в симуляции: 7" in r.text
+
+
+def test_test_dispatch_items_use_the_simulated_value(logged_in_client, web_db):
+    """Тестовые записи в очереди должны нести симулированное число: иначе
+    проверка «что уйдёт на другие кабинеты» показывала бы неизменный остаток."""
+    a1, a2 = _seed(web_db)
+    logged_in_client.post("/testing/simulate-order",
+                          data={"uid_1c": "u1", "account_id": a1.id, "quantity": 3})
+
+    from app.models import DispatchQueueItem
+    item = web_db.query(DispatchQueueItem).filter(DispatchQueueItem.account_id == a2.id).first()
+    assert (item.quantity, item.is_test) == (7, True)
 
 
 def test_simulate_order_dispatches_to_other_account(logged_in_client, web_db):
@@ -92,16 +118,20 @@ def test_testing_page_lists_test_orders_and_allows_cancel(logged_in_client, web_
     assert "Симулировать отмену" in r.text
 
 
-def test_simulate_cancel_reverses_stock(logged_in_client, web_db):
+def test_simulate_cancel_reverses_the_simulation_not_the_real_stock(logged_in_client, web_db):
+    """Отмена симулированного заказа возвращает симулированное число к исходному,
+    а боевой остаток как не менялся, так и не меняется."""
     a1, a2 = _seed(web_db)
     logged_in_client.post("/testing/simulate-order", data={"uid_1c": "u1", "account_id": a1.id, "quantity": 4})
 
     from app.models import Product, ProcessedOrder
     product = web_db.query(Product).filter(Product.uid_1c == "u1").first()
-    assert product.stock_on_hand == 6
+    assert product.stock_on_hand == 10
+
+    r = logged_in_client.get(f"/testing?uid_1c=u1&account_id={a1.id}")
+    assert "в симуляции: 6" in r.text
 
     order = web_db.query(ProcessedOrder).filter(ProcessedOrder.uid_1c == "u1").first()
-
     r = logged_in_client.post(
         "/testing/simulate-cancel",
         data={"uid_1c": "u1", "account_id": a1.id, "order_id": order.order_id},
@@ -110,25 +140,30 @@ def test_simulate_cancel_reverses_stock(logged_in_client, web_db):
     assert r.status_code == 303
 
     web_db.refresh(product)
-    assert product.stock_on_hand == 10  # вернулось к исходному
+    assert product.stock_on_hand == 10
 
     web_db.refresh(order)
     assert order.status.value == "cancelled"
 
+    r = logged_in_client.get(f"/testing?uid_1c=u1&account_id={a1.id}")
+    assert "в симуляции" not in r.text      # симуляция вернулась к боевому числу
 
-def test_cleanup_restores_stock_for_open_test_order(logged_in_client, web_db):
+
+def test_cleanup_does_not_add_stock_back(logged_in_client, web_db):
+    """Раньше очистка ВОЗВРАЩАЛА списанное симуляцией. Теперь списывать нечего, и
+    возврат стал бы молчаливым приходом товара на склад — его быть не должно."""
     a1, a2 = _seed(web_db)
     logged_in_client.post("/testing/simulate-order", data={"uid_1c": "u1", "account_id": a1.id, "quantity": 5})
 
     from app.models import Product
     product = web_db.query(Product).filter(Product.uid_1c == "u1").first()
-    assert product.stock_on_hand == 5
+    assert product.stock_on_hand == 10
 
     r = logged_in_client.post("/testing/cleanup", data={"uid_1c": "u1", "account_id": a1.id}, follow_redirects=False)
     assert r.status_code == 303
 
     web_db.refresh(product)
-    assert product.stock_on_hand == 10  # восстановлено
+    assert product.stock_on_hand == 10      # ни меньше, ни БОЛЬШЕ
 
 
 def test_cleanup_removes_test_records(logged_in_client, web_db):

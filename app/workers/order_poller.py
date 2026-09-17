@@ -64,6 +64,19 @@ def _enqueue_dispatch_to_others(db: Session, uid_1c: str, source_account_id: int
     return targets
 
 
+def open_test_out(db: Session, uid_1c: str) -> int:
+    """Сколько единиц «забрали» симулированные заказы, которые ещё не отменены и
+    не очищены. Нужно, чтобы показать в тесте правдоподобный остаток, НЕ трогая
+    боевой `stock_on_hand`: симуляция не должна менять то, что уходит на реальные
+    площадки (см. process_new_order)."""
+    rows = db.query(ProcessedOrder).filter(
+        ProcessedOrder.uid_1c == uid_1c,
+        ProcessedOrder.order_id.like(f"{TEST_ORDER_PREFIX}%"),
+        ProcessedOrder.status.in_([OrderProcessStatus.processed, OrderProcessStatus.confirmed]),
+    ).all()
+    return sum(r.quantity or 0 for r in rows)
+
+
 def process_new_order(db: Session, order: PlatformOrder, account: PlatformAccount, warehouse_pending: str,
                        is_test: bool = False, order_date=None, respect_enabled: bool = True) -> dict:
     """Обрабатывает ОДИН заказ — сердце приёма заказов (раздел 4/5
@@ -122,19 +135,30 @@ def process_new_order(db: Session, order: PlatformOrder, account: PlatformAccoun
         result["detail"] = "Синхронизация выключена — заказ пропущен (нет в отборе)."
         return result
 
-    # Не клампим в 0: отрицательный остаток легитимен (пересортица) и так же
-    # ведёт себя reconciliation (пишет actual_1c из 1С как есть). На площадку
-    # всё равно уйдёт max(0, …) — клампит dispatch. Клампить здесь означало бы
-    # молча терять величину пересортицы до следующей сверки.
-    product.stock_on_hand = product.stock_on_hand - order.quantity
-    # Ручной «передаваемый остаток» (override): заказ вычитается ИЗ НЕГО (не ниже 0).
-    # Оператор задал стартовое число — продажи его уменьшают. В автоматическом
-    # сценарии (override не задан) заказ учитывается через сам остаток, здесь
-    # трогать нечего.
-    if product.transmit_override is not None:
-        product.transmit_override = max(0, product.transmit_override - order.quantity)
+    if is_test:
+        # Симуляция со страницы «Тестирование» НЕ трогает боевые поля товара.
+        # Раньше трогала: остаток 100, симуляция заказа на 7 → в базе 93, и
+        # следующая РЕАЛЬНАЯ рассылка отправляла на площадку 93 вместо 100.
+        # Направление безопасное (недоотправка), но это всё равно значит, что
+        # тест управляет боем. Считаем правдоподобное число для показа и для
+        # тестовых записей очереди — от него же вычитаем прошлые открытые тесты,
+        # чтобы цепочка симуляций выглядела как настоящая последовательность.
+        new_stock = product.stock_on_hand - open_test_out(db, uid_1c) - order.quantity
+    else:
+        # Не клампим в 0: отрицательный остаток легитимен (пересортица) и так же
+        # ведёт себя reconciliation (пишет actual_1c из 1С как есть). На площадку
+        # всё равно уйдёт max(0, …) — клампит dispatch. Клампить здесь означало бы
+        # молча терять величину пересортицы до следующей сверки.
+        product.stock_on_hand = product.stock_on_hand - order.quantity
+        # Ручной «передаваемый остаток» (override): заказ вычитается ИЗ НЕГО (не ниже 0).
+        # Оператор задал стартовое число — продажи его уменьшают. В автоматическом
+        # сценарии (override не задан) заказ учитывается через сам остаток, здесь
+        # трогать нечего.
+        if product.transmit_override is not None:
+            product.transmit_override = max(0, product.transmit_override - order.quantity)
+        new_stock = product.stock_on_hand
     result["uid_1c"] = uid_1c
-    result["new_stock"] = product.stock_on_hand
+    result["new_stock"] = new_stock
 
     # Синтетический тест по выключенному товару — оставляем аномалию-предупреждение
     # (оператор видит, что прогоняет выключенный SKU); реальных движений is_test не
@@ -153,7 +177,7 @@ def process_new_order(db: Session, order: PlatformOrder, account: PlatformAccoun
     ))
 
     result["dispatched_to"] = _enqueue_dispatch_to_others(
-        db, uid_1c, account.id, product.stock_on_hand, reason="order", is_test=is_test,
+        db, uid_1c, account.id, new_stock, reason="order", is_test=is_test,
     )
 
     barcode_for_1c = _representative_barcode(db, uid_1c)
@@ -192,14 +216,20 @@ def process_cancellation(db: Session, cancelled_order: PlatformOrder, record: Pr
         result["status"] = "skipped"
         return result
 
-    product.stock_on_hand += return_quantity
-    # Симметрично приёму заказа: если у товара задан ручной override, отмена
-    # возвращает вычтенное обратно в него (не ниже 0) — иначе отменённые заказы
-    # навсегда «съедали» бы ручную цифру.
-    if product.transmit_override is not None:
-        product.transmit_override = max(0, product.transmit_override + return_quantity)
+    if is_test:
+        # Как и приём: симуляция не трогает боевые поля. Отменяемая запись сейчас
+        # ещё числится открытой, поэтому её вклад прибавляем обратно вручную.
+        new_stock = product.stock_on_hand - open_test_out(db, record.uid_1c) + return_quantity
+    else:
+        product.stock_on_hand += return_quantity
+        # Симметрично приёму заказа: если у товара задан ручной override, отмена
+        # возвращает вычтенное обратно в него (не ниже 0) — иначе отменённые заказы
+        # навсегда «съедали» бы ручную цифру.
+        if product.transmit_override is not None:
+            product.transmit_override = max(0, product.transmit_override + return_quantity)
+        new_stock = product.stock_on_hand
     result["return_quantity"] = return_quantity
-    result["new_stock"] = product.stock_on_hand
+    result["new_stock"] = new_stock
 
     if cancelled_order.is_partial_refund:
         result["status"] = "partial"
@@ -209,7 +239,7 @@ def process_cancellation(db: Session, cancelled_order: PlatformOrder, record: Pr
         result["status"] = "reversed"
 
     result["dispatched_to"] = _enqueue_dispatch_to_others(
-        db, record.uid_1c, account.id, product.stock_on_hand, reason="cancel", is_test=is_test,
+        db, record.uid_1c, account.id, new_stock, reason="cancel", is_test=is_test,
     )
 
     barcode_for_1c = _representative_barcode(db, record.uid_1c)

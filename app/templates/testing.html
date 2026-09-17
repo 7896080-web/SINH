@@ -137,7 +137,14 @@
     <h3 style="margin-top:0">Текущее состояние</h3>
     <table>
         <tr><td>Товар</td><td>{{ product.article }} — {{ product.name }}</td></tr>
-        <tr><td>Физический остаток (ЦС)</td><td class="mono">{{ product.stock_on_hand }}</td></tr>
+        <tr>
+            <td>Физический остаток (ЦС)</td>
+            <td class="mono">{{ product.stock_on_hand }}
+                {% if simulated_stock is not none and simulated_stock != product.stock_on_hand %}
+                <span class="badge" title="Симуляция боевой остаток не меняет. Это то, каким он выглядел бы, если бы открытые тестовые заказы были настоящими.">в симуляции: {{ simulated_stock }}</span>
+                {% endif %}
+            </td>
+        </tr>
         <tr>
             <td>Баркод</td>
             <td>

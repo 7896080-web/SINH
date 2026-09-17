@@ -84,14 +84,43 @@ class LocalExchange:
         return content
 
 
+# Полей в строке справочника баркодов: uid|артикул|наименование|баркод|размер|цвет.
+BARCODE_DICT_FIELDS = 6
+# Полей в строке выгрузки остатков: uid|артикул|наименование|кол-во|баркоды|размер|цвет.
+STOCK_EXPORT_FIELDS = 7
+
+
+def _split_from_the_right(line: str, fields: int) -> list[str] | None:
+    """Разбор строки, устойчивый к разделителю ВНУТРИ наименования.
+
+    Обработка 1С чистит `|` в размере, цвете и баркодах, но не в артикуле и
+    наименовании: товар «Джинсы|36» сдвигал все поля вправо, и количество
+    читалось из соседней колонки, а баркод — из следующей. Хвост строки
+    (количество, баркоды, размер, цвет) имеет фиксированную длину, поэтому
+    режем его СПРАВА, а всё лишнее отдаём наименованию — оно и так текст.
+
+    Возвращает ровно `fields` кусков или None, если полей меньше минимума."""
+    parts = line.split("|")
+    if len(parts) < fields:
+        return None
+    if len(parts) == fields:
+        return parts
+    tail = fields - 3                       # сколько полей справа от наименования
+    return [parts[0], parts[1], "|".join(parts[2:-tail])] + parts[-tail:]
+
+
 def parse_barcode_dict(content: str) -> list[dict]:
     """Разбор barcodes_*.txt (полный справочник из .epf):
     'uid|артикул|наименование|баркод|размер|цвет' — одна строка на баркод."""
     rows = []
     for line in content.splitlines():
-        p = line.rstrip("\n").split("|")
-        if len(p) < 4:
-            continue
+        line = line.rstrip("\n")
+        p = _split_from_the_right(line, BARCODE_DICT_FIELDS)
+        if p is None:
+            # Старый формат без размера и цвета — режем как раньше, слева.
+            p = line.split("|")
+            if len(p) < 4:
+                continue
         rows.append({
             "uid_1c": p[0].strip(), "article": p[1].strip(), "name": p[2].strip(),
             "barcode": p[3].strip(),
@@ -189,8 +218,11 @@ def parse_stock_export_file(content: str) -> dict[str, int]:
         line = line.strip()
         if not line:
             continue
-        parts = line.split("|")
+        parts = _split_from_the_right(line, STOCK_EXPORT_FIELDS) or line.split("|")
         if len(parts) < 5:
+            continue
+        digits = parts[3].strip().lstrip("-")
+        if not digits.isdigit():
             continue
         quantity = int(parts[3])
         barcodes = [b for b in parts[4].split(",") if b]
@@ -218,9 +250,12 @@ def parse_stock_export_rows(content: str) -> list[dict]:
         line = line.strip()
         if not line:
             continue
-        parts = line.split("|")
-        if len(parts) < 5:
-            continue
+        parts = _split_from_the_right(line, STOCK_EXPORT_FIELDS)
+        if parts is None:
+            # Старый формат (без размера и цвета) — как раньше, слева.
+            parts = line.split("|")
+            if len(parts) < 5:
+                continue
         digits = parts[3].strip().lstrip("-")
         if not digits.isdigit():
             continue
