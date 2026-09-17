@@ -14,6 +14,7 @@ from datetime import date
 from app.models import (DispatchQueueItem, Platform, Product, StockDateRow, StockDateSnapshot,
                         StockDateStatus, SyncSetting)
 from app.offset_base import fill_waiting_products, set_base_date, stock_at_date
+from app.transmit import recompute_offset
 from tests.factories import make_account
 
 DAY = date(2026, 8, 7)
@@ -28,6 +29,20 @@ def _snapshot(db, day=DAY, status=StockDateStatus.done, rows=()):
         db.add(StockDateRow(snapshot_id=snap.id, uid_1c=uid, quantity=qty))
     db.commit()
     return snap
+
+
+def _with_calc(db, product, day=DAY, fact=None):
+    """Расчёт в ПРАВИЛЬНОМ порядке: сначала дата, потом факт.
+
+    Наоборот нельзя: смена даты стирает факт — он всегда «факт на дату», и
+    количество, пересчитанное 07.08, ничего не говорит о складе на другое число.
+    """
+    set_base_date(db, product, day)
+    if fact is not None:
+        product.fact_at_date = fact
+        recompute_offset(product)
+    db.commit()
+    return product
 
 
 def _product(db, uid="u1", **kw):
@@ -87,20 +102,36 @@ def test_setting_a_date_before_the_answer_leaves_the_product_waiting(db):
 
 def test_setting_a_date_after_the_answer_computes_at_once(db):
     _snapshot(db, rows=[("u1", 10)])
-    p = _product(db, reserve=2, fact_at_date=8)
+    p = _product(db, reserve=2)
 
-    set_base_date(db, p, DAY)
+    _with_calc(db, p, fact=8)
 
     assert p.offset_base_stock == 10
     assert p.broadcast_offset == 4
+
+
+def test_changing_the_date_drops_the_fact(db):
+    """Факт всегда «на дату»: посчитанное 07.08 количество ничего не говорит о
+    складе на 01.09. Оставить его значило бы посчитать порог по данным с другого
+    числа и молча отправить на площадки неверный остаток."""
+    _snapshot(db, rows=[("u1", 10)])
+    _snapshot(db, rows=[("u1", 12)], day=date(2026, 9, 1))
+    p = _product(db, reserve=2)
+    _with_calc(db, p, fact=8)
+    assert p.broadcast_offset == 4
+
+    set_base_date(db, p, date(2026, 9, 1))
+
+    assert p.fact_at_date is None
+    assert p.broadcast_offset == 2      # порог сводится к брони, пока факт не введён
 
 
 def test_clearing_the_date_drops_the_fact_but_keeps_the_threshold(db):
     """Факт привязан к конкретной дате — без неё он бессмыслен. А порог стирать
     нельзя: это молча вернуло бы на площадки полный остаток."""
     _snapshot(db, rows=[("u1", 10)])
-    p = _product(db, reserve=2, fact_at_date=8)
-    set_base_date(db, p, DAY)
+    p = _product(db, reserve=2)
+    _with_calc(db, p, fact=8)
 
     set_base_date(db, p, None)
 
@@ -112,8 +143,8 @@ def test_clearing_the_date_drops_the_fact_but_keeps_the_threshold(db):
 # ------------------------------------------------ ответ пришёл — доделываем
 
 def test_arriving_answer_fills_everyone_who_waited(db):
-    waiting = _product(db, uid="u1", reserve=2, fact_at_date=8)
-    set_base_date(db, waiting, DAY)
+    waiting = _product(db, uid="u1", reserve=2)
+    _with_calc(db, waiting, fact=8)     # дата задана до ответа 1С, факт — сразу
     snap = _snapshot(db, rows=[("u1", 10)])
 
     stats = fill_waiting_products(db, snap)
@@ -149,8 +180,8 @@ def test_an_already_filled_product_is_not_overwritten(db):
     """У кого остаток уже подставлен — тот получил своё число раньше. Переписать
     его свежим снимком значит поменять порог под оператором без его ведома."""
     _snapshot(db, rows=[("u1", 10)])
-    p = _product(db, uid="u1", reserve=2, fact_at_date=8)
-    set_base_date(db, p, DAY)
+    p = _product(db, uid="u1", reserve=2)
+    _with_calc(db, p, fact=8)
     assert p.broadcast_offset == 4
 
     later = _snapshot(db, rows=[("u1", 99)])
@@ -167,10 +198,10 @@ def test_changed_threshold_goes_into_the_dispatch_queue(db):
     """Иначе новый порог остался бы только на экране, а на площадке висело бы
     старое число — то есть расчёт был бы косметикой."""
     account = make_account(db, Platform.wb)
-    p = _product(db, uid="u1", reserve=2, fact_at_date=8)
+    p = _product(db, uid="u1", reserve=2)
     db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
     db.commit()
-    set_base_date(db, p, DAY)
+    _with_calc(db, p, fact=8)
     snap = _snapshot(db, rows=[("u1", 10)])
 
     stats = fill_waiting_products(db, snap)
@@ -184,10 +215,10 @@ def test_changed_threshold_goes_into_the_dispatch_queue(db):
 
 def test_unchecked_account_gets_nothing(db):
     account = make_account(db, Platform.wb)
-    p = _product(db, uid="u1", reserve=2, fact_at_date=8)
+    p = _product(db, uid="u1", reserve=2)
     db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=False))
     db.commit()
-    set_base_date(db, p, DAY)
+    _with_calc(db, p, fact=8)
     snap = _snapshot(db, rows=[("u1", 10)])
 
     stats = fill_waiting_products(db, snap)

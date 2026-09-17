@@ -27,7 +27,8 @@ from app.timeutils import now_utc
 from app.excel_utils import build_xlsx_response, read_xlsx_rows, parse_bool_ru, ExcelReadError
 from app.transmit import (explain, sku_quantity, enqueue_full_resend, enqueue_withdrawal,
                           offset_from_base, recompute_offset)
-from app.offset_base import ensure_snapshot_requested, set_base_date, stock_at_date
+from app.offset_base import (ensure_snapshot_requested, set_base_date, stock_at_date,
+                              stock_lookup)
 
 router = APIRouter()
 templates = Jinja2Templates(directory="app/templates")
@@ -618,6 +619,16 @@ def bulk_edit(
     products = db.query(Product).options(joinedload(Product.sync_settings)) \
         .filter(Product.uid_1c.in_(uids)).all()
 
+    # Снимок на дату читаем ОДИН раз на всю пачку, а не по товару: иначе
+    # простановка даты трёмстам отмеченным строкам — это шестьсот запросов.
+    lookup = None
+    if action == "set_base_date" and d is not None:
+        lookup = stock_lookup(db, d)
+        # Заявка на выгрузку — ОДНА на всю пачку, а не по товару: дата у всех
+        # одна, и вторая заявка на неё всё равно не создаётся. Внутри цикла это
+        # были бы лишние два запроса на каждую строку.
+        ensure_snapshot_requested(db, d, user.username)
+
     changed = 0
     for p in products:
         if action == "set_reserve":
@@ -639,9 +650,7 @@ def bulk_edit(
         elif action == "set_base_date":
             # Снимок на дату уже есть — порог посчитается сразу; нет — строка
             # встанет в ожидание и доделается при приёме файла от 1С.
-            set_base_date(db, p, d)
-            if d is not None:
-                ensure_snapshot_requested(db, d, user.username)
+            set_base_date(db, p, d, lookup=lookup)
         elif action == "set_fact":
             p.fact_at_date = n
             recompute_offset(p)
@@ -766,6 +775,10 @@ def products_import(
         return RedirectResponse("/products", status_code=303)
 
     updated, unchanged, errors = 0, 0, []
+    # Кэш поиска остатка по датам, встретившимся в файле. Обычно дата одна на
+    # весь файл, но полагаться на это нельзя. Без кэша импорт пятидесяти тысяч
+    # строк — это сто тысяч запросов к базе.
+    lookups: dict = {}
 
     for i, row in enumerate(rows, start=2):
         uid_1c = str(row.get("ID_1С") or "").strip()
@@ -804,9 +817,12 @@ def products_import(
             if desired_day is not None and desired_day > now_utc().date():
                 errors.append(f"строка {i}: остатков на будущую дату в 1С нет")
             elif desired_day != product.offset_base_date:
-                set_base_date(db, product, desired_day)
-                if desired_day is not None:
+                if desired_day is not None and desired_day not in lookups:
+                    lookups[desired_day] = stock_lookup(db, desired_day)
+                    # Заявка на эту дату — один раз, вместе с построением кэша.
                     ensure_snapshot_requested(db, desired_day, user.username)
+                set_base_date(db, product, desired_day,
+                              lookup=lookups.get(desired_day))
                 touched = True
 
         if "Факт на дату" in row:

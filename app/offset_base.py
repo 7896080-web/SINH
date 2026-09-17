@@ -84,23 +84,57 @@ def stock_at_date(db: Session, uid_1c: str, snapshot_date: date) -> int | None:
     return row.quantity if row is not None else 0
 
 
-def set_base_date(db: Session, product: Product, snapshot_date: date | None) -> bool:
+def stock_lookup(db: Session, snapshot_date: date):
+    """Готовая функция «uid → остаток на дату», со снимком, прочитанным ОДИН раз.
+
+    Для массовых путей: простановка даты сотне отмеченных строк и импорт Excel,
+    где строк бывает до пятидесяти тысяч. `stock_at_date` ходит в базу дважды на
+    каждый товар — на таком объёме это сто тысяч запросов и минуты ожидания.
+
+    Возвращает функцию, отдающую `None`, если готового снимка на дату нет вовсе.
+    """
+    snapshot = done_snapshot(db, snapshot_date)
+    if snapshot is None:
+        return lambda uid: None
+    by_uid: dict[str, int] = {}
+    for uid, quantity in db.query(StockDateRow.uid_1c, StockDateRow.quantity).filter(
+            StockDateRow.snapshot_id == snapshot.id).all():
+        by_uid[uid] = quantity        # повтор — последняя строка, как и в stock_at_date
+    return lambda uid: by_uid.get(uid, 0)
+
+
+def set_base_date(db: Session, product: Product, snapshot_date: date | None,
+                  lookup=None) -> bool:
     """Задать дату расчёта товару. True — порог изменился.
 
     Снимок на дату уже есть — подставляем остаток сразу. Нет — оставляем пустым,
     товар попадёт в ожидание, и `fill_waiting_products` доделает за нас, когда
     придёт ответ 1С.
 
-    Пустая дата снимает расчёт целиком: уходит и факт, потому что он привязан
-    именно к этой дате, а порог остаётся последним посчитанным. Стирать порог
-    здесь нельзя — это молча вернуло бы на площадки полный остаток.
+    **Факт при смене даты стирается.** Он всегда «факт НА ДАТУ»: пересчитанное
+    07.08 количество ничего не говорит о складе на 01.09. Оставить его значило бы
+    посчитать порог по данным с другого числа и отправить на площадки заведомо
+    неверный остаток — причём молча. Пусть лучше порог временно сведётся к брони
+    (это поведение сегодняшнего автоматического режима), а оператор впишет факт
+    заново.
+
+    Пустая дата снимает расчёт целиком. Порог при этом остаётся последним
+    посчитанным: стирать его здесь нельзя — это молча вернуло бы на площадки
+    полный остаток.
+
+    `lookup` — готовая функция поиска остатка (см. `stock_lookup`) для массовых
+    путей; без неё каждый товар идёт в базу сам.
     """
+    changed_day = snapshot_date != product.offset_base_date
     product.offset_base_date = snapshot_date
+    if changed_day:
+        product.fact_at_date = None
     if snapshot_date is None:
         product.offset_base_stock = None
         product.fact_at_date = None
         return False
-    product.offset_base_stock = stock_at_date(db, product.uid_1c, snapshot_date)
+    product.offset_base_stock = (lookup(product.uid_1c) if lookup is not None
+                                 else stock_at_date(db, product.uid_1c, snapshot_date))
     return recompute_offset(product)
 
 
@@ -116,29 +150,34 @@ def fill_waiting_products(db: Session, snapshot: StockDateSnapshot) -> dict:
     """
     stats = {"filled": 0, "offsets_changed": 0, "queued": 0}
 
-    waiting = db.query(Product).options(joinedload(Product.sync_settings)).filter(
-        Product.offset_base_date == snapshot.snapshot_date,
-        Product.offset_base_stock.is_(None),
-    ).all()
-    if not waiting:
-        return stats
+    lookup = stock_lookup(db, snapshot.snapshot_date)
 
-    # Одним запросом, а не по товару: в снимке бывают все 152 тысячи позиций,
-    # и отдельный SELECT на каждую превратил бы приём файла в часовую работу.
-    by_uid: dict[str, int] = {}
-    for uid, quantity in db.query(StockDateRow.uid_1c, StockDateRow.quantity).filter(
-            StockDateRow.snapshot_id == snapshot.id).all():
-        by_uid[uid] = quantity        # повтор — последняя строка, как и в stock_at_date
+    # ПАЧКАМИ, а не всё сразу. Оператор вправе проставить дату всему каталогу —
+    # это 152 тысячи товаров, и каждый тянет за собой свои настройки кабинетов.
+    # Загрузить их одним списком значило бы держать под миллион объектов в памяти
+    # воркера, который в это же время обслуживает опрос заказов и рассылку.
+    CHUNK = 1000
+    while True:
+        waiting = db.query(Product).options(joinedload(Product.sync_settings)).filter(
+            Product.offset_base_date == snapshot.snapshot_date,
+            Product.offset_base_stock.is_(None),
+        ).limit(CHUNK).all()
+        # Смещения нет намеренно: каждый обработанный товар получает непустой
+        # offset_base_stock и из выборки выпадает сам. Со смещением пачка
+        # «перепрыгивала» бы через необработанные строки.
+        if not waiting:
+            break
 
-    for product in waiting:
-        product.offset_base_stock = by_uid.get(product.uid_1c, 0)
-        stats["filled"] += 1
-        if recompute_offset(product):
-            stats["offsets_changed"] += 1
-            for setting in product.sync_settings:
-                if setting.enabled:
-                    enqueue_full_resend(db, product.uid_1c, setting.account_id,
-                                        reason="offset_base_filled")
-                    stats["queued"] += 1
+        for product in waiting:
+            product.offset_base_stock = lookup(product.uid_1c) or 0
+            stats["filled"] += 1
+            if recompute_offset(product):
+                stats["offsets_changed"] += 1
+                for setting in product.sync_settings:
+                    if setting.enabled:
+                        enqueue_full_resend(db, product.uid_1c, setting.account_id,
+                                            reason="offset_base_filled")
+                        stats["queued"] += 1
+        db.commit()
 
     return stats

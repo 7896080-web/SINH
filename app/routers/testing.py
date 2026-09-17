@@ -741,19 +741,20 @@ def testing_offset_calc(
     raw_fact = (fact or "").strip()
     if raw_fact:
         try:
-            product.fact_at_date = max(0, int(raw_fact))
+            parsed_fact = max(0, int(raw_fact))
         except ValueError:
             set_flash(request, "Факт на дату: введите целое число (без запятой).", "warn")
             return redirect
     else:
-        product.fact_at_date = None
+        parsed_fact = None
 
+    # Порядок важен: СНАЧАЛА дата, потом факт. Смена даты стирает факт (он всегда
+    # «факт на дату»), и если поставить факт первым, он тут же обнулится — форма
+    # молча теряла бы введённое число.
     if day != product.offset_base_date:
         set_base_date(db, product, day)
-    if day is not None:
-        asked = ensure_snapshot_requested(db, day, user.username)
-    else:
-        asked = False
+    product.fact_at_date = parsed_fact
+    asked = ensure_snapshot_requested(db, day, user.username) if day is not None else False
     recompute_offset(product)
 
     log_action(db, user.username, "offset_calc_from_testing",
