@@ -49,10 +49,16 @@ def _queue_counts(db: Session, account_id: int) -> dict:
         FtpTask.account_id == account_id, FtpTask.status == FtpTaskStatus.timeout,
         FtpTask.is_test.is_(False),
     ).count()
+    # 1С ответила ERROR: документа в её базе НЕТ, хотя товар мы уже списали.
+    # Раньше такое задание закрывалось как успешное и не попадало никуда.
+    ftp_failed = db.query(FtpTask).filter(
+        FtpTask.account_id == account_id, FtpTask.status == FtpTaskStatus.failed,
+        FtpTask.is_test.is_(False),
+    ).count()
     return {
         "dispatch_pending": dispatch_pending, "dispatch_errors": dispatch_errors,
         "dispatch_retry": dispatch_retry,
-        "ftp_pending": ftp_pending, "ftp_timeout": ftp_timeout,
+        "ftp_pending": ftp_pending, "ftp_timeout": ftp_timeout, "ftp_failed": ftp_failed,
     }
 
 

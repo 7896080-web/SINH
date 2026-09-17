@@ -301,7 +301,8 @@ class ProcessedOrder(Base):
 class FtpTaskStatus(str, enum.Enum):
     pending = "pending"
     sent = "sent"       # файл выложен на FTP, ждём результата
-    done = "done"        # результат получен и обработан
+    done = "done"        # 1С ответила OK: документ создан
+    failed = "failed"     # 1С ответила ERROR: документа НЕТ, нужен разбор
     timeout = "timeout"   # результата нет дольше окна ожидания — алерт
 
 
