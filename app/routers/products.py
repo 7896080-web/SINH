@@ -25,7 +25,9 @@ from app.flash import set_flash, pop_flash
 from app.audit import log_action
 from app.timeutils import now_utc
 from app.excel_utils import build_xlsx_response, read_xlsx_rows, parse_bool_ru, ExcelReadError
-from app.transmit import explain, sku_quantity, enqueue_full_resend, enqueue_withdrawal
+from app.transmit import (explain, sku_quantity, enqueue_full_resend, enqueue_withdrawal,
+                          offset_from_base, recompute_offset)
+from app.offset_base import set_base_date, stock_at_date
 
 router = APIRouter()
 templates = Jinja2Templates(directory="app/templates")
@@ -106,6 +108,15 @@ def _row(product: Product, accounts: list[PlatformAccount],
         "size": product.size, "color": product.color,
         "stock_on_hand": product.stock_on_hand or 0, "reserve": product.reserve or 0,
         "broadcast_offset": product.broadcast_offset,
+        # Расчёт порога от даты. `waiting_for_1c` — дата задана, а ответа ещё нет:
+        # строка не сломана, она просто ждёт файл, и оператору надо видеть именно
+        # это, а не пустой порог без объяснения.
+        "base_date": product.offset_base_date,
+        "base_stock": product.offset_base_stock,
+        "fact_at_date": product.fact_at_date,
+        "computed_offset": offset_from_base(product),
+        "waiting_for_1c": (product.offset_base_date is not None
+                           and product.offset_base_stock is None),
         "transmit_override": product.transmit_override,   # legacy: только предупреждение
         "broadcast_enabled": product.broadcast_enabled,
         "active_since": product.broadcast_active_since,
@@ -122,7 +133,7 @@ EXPORT_LIMIT = 50000      # потолок выгрузки: защита от �
 
 
 def _base_query(db: Session, q: str, only_proposals: bool, only_blocked: bool,
-                hide_size_u: bool = False):
+                hide_size_u: bool = False, only_unfinished: bool = False):
     """Отбор в SQL — ДО ограничения по количеству строк.
 
     Раньше сначала брались первые 300 товаров по алфавиту, и лишь потом
@@ -145,6 +156,14 @@ def _base_query(db: Session, q: str, only_proposals: bool, only_blocked: bool,
         # без размера не прячем — у них характеристики просто нет.
         query = query.filter(or_(Product.size.is_(None),
                                  func.upper(func.trim(Product.size)) != "U"))
+    if only_unfinished:
+        # Незавершённый расчёт порога: дата задана, но либо 1С ещё не ответила,
+        # либо факт не введён. На каталоге в 152 тысячи SKU без этого фильтра
+        # недоделанные строки просто не найти — а именно их и надо доделать.
+        query = query.filter(
+            Product.offset_base_date.isnot(None),
+            or_(Product.offset_base_stock.is_(None), Product.fact_at_date.is_(None)),
+        )
     return query.order_by(Product.name)
 
 
@@ -157,12 +176,13 @@ def _blocked_everywhere(product: Product, accounts: list[PlatformAccount]) -> bo
 
 def _load_products(db: Session, q: str, only_proposals: bool, only_blocked: bool,
                    accounts: list[PlatformAccount], limit: int = PAGE_LIMIT,
-                   hide_size_u: bool = False) -> tuple[list[Product], int]:
+                   hide_size_u: bool = False,
+                   only_unfinished: bool = False) -> tuple[list[Product], int]:
     """Возвращает (строки, сколько всего подходит под фильтр). Второе число нужно,
     чтобы честно написать оператору «показано 300 из N», а не делать вид, что это всё.
     Отрицательное значение = счёт оборван на пределе сканирования, в интерфейсе
     показывается как «N+»."""
-    query = _base_query(db, q, only_proposals, only_blocked, hide_size_u)
+    query = _base_query(db, q, only_proposals, only_blocked, hide_size_u, only_unfinished)
 
     if not only_blocked:
         total = query.order_by(None).count()
@@ -206,17 +226,20 @@ def _dispatch_summary(db: Session) -> dict:
 
 
 def _render(request: Request, db: Session, user: User, q: str, only_proposals: bool,
-            only_blocked: bool, hide_size_u: bool, template: str):
+            only_blocked: bool, hide_size_u: bool, template: str,
+            only_unfinished: bool = False):
     accounts = _active_accounts(db)
     all_accounts = {a.id: a for a in db.query(PlatformAccount).all()}
     products, total = _load_products(db, q, only_proposals, only_blocked, accounts,
-                                     hide_size_u=hide_size_u)
+                                     hide_size_u=hide_size_u,
+                                     only_unfinished=only_unfinished)
     rows = [_row(p, accounts, all_accounts) for p in products]
     return templates.TemplateResponse(request, template, {
         "request": request, "current_user": user, "active_page": "products",
         "rows": rows, "total": total, "page_limit": PAGE_LIMIT,
         "q": q, "only_proposals": only_proposals, "only_blocked": only_blocked,
         "hide_size_u": hide_size_u,
+        "only_unfinished": only_unfinished,
         "accounts": accounts,
         "dispatch": _dispatch_summary(db),
         "flash": pop_flash(request) if template == "products.html" else None,
@@ -271,20 +294,24 @@ def _back(q: str) -> RedirectResponse:
 def products_page(
     request: Request, q: str = Query(""), only_proposals: bool = Query(False),
     only_blocked: bool = Query(False), hide_size_u: bool = Query(False),
+    only_unfinished: bool = Query(False),
     db: Session = Depends(get_db), user: User = Depends(get_current_user),
 ):
     if not _active_accounts(db):
         set_flash(request, "Пока нет ни одного активного кабинета — добавьте его на странице «API-ключи».", "warn")
-    return _render(request, db, user, q, only_proposals, only_blocked, hide_size_u, "products.html")
+    return _render(request, db, user, q, only_proposals, only_blocked, hide_size_u,
+                   "products.html", only_unfinished=only_unfinished)
 
 
 @router.get("/products/rows", response_class=HTMLResponse)
 def products_rows(
     request: Request, q: str = Query(""), only_proposals: bool = Query(False),
     only_blocked: bool = Query(False), hide_size_u: bool = Query(False),
+    only_unfinished: bool = Query(False),
     db: Session = Depends(get_db), user: User = Depends(get_current_user),
 ):
-    return _render(request, db, user, q, only_proposals, only_blocked, hide_size_u, "products_rows.html")
+    return _render(request, db, user, q, only_proposals, only_blocked, hide_size_u,
+                   "products_rows.html", only_unfinished=only_unfinished)
 
 
 # Старые адреса — на новую страницу (в закладках и в переписке они ещё живут).
@@ -314,9 +341,76 @@ def set_reserve(
     reserve = max(0, parsed)
     if product.reserve != reserve:
         product.reserve = reserve
+        # Бронь входит в формулу порога, поэтому её смена обязана пересчитать
+        # порог. Без этого новое значение брони осталось бы словами: в пороге
+        # продолжала бы сидеть старая.
+        recompute_offset(product)
         log_action(db, user.username, "reserve_changed", f"{uid_1c} -> {reserve}")
         _repropagate(db, product, reason="reserve_changed")
         db.commit()
+    return _row_response(request, db, uid_1c)
+
+
+@router.post("/products/{uid_1c}/base-date", response_class=HTMLResponse)
+def set_base_date_route(
+    request: Request, uid_1c: str, value: str = Form(""),
+    db: Session = Depends(get_db), user: User = Depends(get_current_user),
+):
+    """Дата, на которую считается порог.
+
+    Снимок 1С на эту дату уже есть — остаток подставится сразу. Нет — строка
+    встанет в ожидание, и расчёт доделается сам, когда придёт файл ответа
+    (`offset_base.fill_waiting_products`). Пустая дата снимает расчёт, но НЕ
+    стирает порог: обнулить его здесь значило бы молча вернуть на площадки
+    полный остаток."""
+    product = _get_product(db, uid_1c)
+    if product is None:
+        return HTMLResponse("", status_code=404)
+    try:
+        day = _parse_date(value)
+    except ValueError:
+        return _row_response(request, db, uid_1c,
+                             error="Дата: формат ГГГГ-ММ-ДД.", error_field="base_date")
+    if day is not None and day > now_utc().date():
+        return _row_response(request, db, uid_1c,
+                             error="Остатков на будущую дату в 1С нет.", error_field="base_date")
+
+    set_base_date(db, product, day)
+    log_action(db, user.username, "offset_base_date_changed", f"{uid_1c} -> {value or 'снята'}")
+    _repropagate(db, product, reason="offset_base_date")
+    db.commit()
+    return _row_response(request, db, uid_1c)
+
+
+@router.post("/products/{uid_1c}/fact", response_class=HTMLResponse)
+def set_fact(
+    request: Request, uid_1c: str, value: str = Form(""),
+    db: Session = Depends(get_db), user: User = Depends(get_current_user),
+):
+    """Факт на дату: сколько лежало на складе НА САМОМ ДЕЛЕ.
+
+    Пусто — оператор не вводил, берём остаток ЦС на дату, и порог сводится к
+    брони. Ноль — утверждение «на складе пусто», это другое: тогда весь учётный
+    остаток 1С считается расхождением. Отрицательным не бывает."""
+    product = _get_product(db, uid_1c)
+    if product is None:
+        return HTMLResponse("", status_code=404)
+
+    raw = (value or "").strip()
+    if raw:
+        parsed = _as_int(raw)
+        if parsed is None:
+            return _row_response(request, db, uid_1c,
+                                 error="Факт на дату: введите целое число (без запятой).",
+                                 error_field="fact")
+        product.fact_at_date = max(0, parsed)
+    else:
+        product.fact_at_date = None
+
+    recompute_offset(product)
+    log_action(db, user.username, "fact_at_date_changed", f"{uid_1c} -> {raw or 'сброшен'}")
+    _repropagate(db, product, reason="fact_changed")
+    db.commit()
     return _row_response(request, db, uid_1c)
 
 
@@ -339,6 +433,12 @@ def set_offset(
 
     if clear or (not value.strip() and not available.strip() and not stock_at_date.strip()):
         product.broadcast_offset = None
+        # Снимаем и исходные три величины. Иначе «сброшен» было бы неправдой:
+        # дата осталась бы на месте, и первая же правка брони вернула бы порог
+        # обратно — оператор решил бы, что кнопка не работает.
+        product.offset_base_date = None
+        product.offset_base_stock = None
+        product.fact_at_date = None
         detail = "сброшен (автоматический расчёт от остатка и резерва)"
     else:
         try:
@@ -485,25 +585,29 @@ def bulk_edit(
     db: Session = Depends(get_db), user: User = Depends(get_current_user),
 ):
     """Массовая правка отмеченных строк: set_reserve | set_offset | clear_offset |
-    broadcast_on | broadcast_off | set_active_since."""
+    broadcast_on | broadcast_off | set_active_since | set_base_date | set_fact |
+    fact_from_stock."""
     if not uids:
         set_flash(request, "Не выбрано ни одной строки.", "warn")
         return _back(q)
 
     n = d = None
-    if action in ("set_reserve", "set_offset"):
+    if action in ("set_reserve", "set_offset", "set_fact"):
         try:
             n = int((int_value or "").strip())
         except ValueError:
             set_flash(request, "Введите число для массовой правки.", "warn")
             return _back(q)
-        if action == "set_reserve":
-            n = max(0, n)          # резерв отрицательным не бывает, порог — бывает
-    if action == "set_active_since":
+        if action in ("set_reserve", "set_fact"):
+            n = max(0, n)          # бронь и факт отрицательными не бывают, порог — бывает
+    if action in ("set_active_since", "set_base_date"):
         try:
             d = _parse_date(date_value)
         except ValueError:
             set_flash(request, "Дата должна быть в формате ГГГГ-ММ-ДД.", "warn")
+            return _back(q)
+        if action == "set_base_date" and d is not None and d > now_utc().date():
+            set_flash(request, "Остатков на будущую дату в 1С нет.", "warn")
             return _back(q)
 
     products = db.query(Product).options(joinedload(Product.sync_settings)) \
@@ -518,12 +622,28 @@ def bulk_edit(
             p.transmit_override = None
         elif action == "clear_offset":
             p.broadcast_offset = None
+            p.offset_base_date = None       # см. set_offset: сброс снимает расчёт целиком
+            p.offset_base_stock = None
+            p.fact_at_date = None
         elif action == "broadcast_on":
             p.broadcast_enabled = True
         elif action == "broadcast_off":
             p.broadcast_enabled = False
         elif action == "set_active_since":
             p.broadcast_active_since = d
+        elif action == "set_base_date":
+            # Снимок на дату уже есть — порог посчитается сразу; нет — строка
+            # встанет в ожидание и доделается при приёме файла от 1С.
+            set_base_date(db, p, d)
+        elif action == "set_fact":
+            p.fact_at_date = n
+            recompute_offset(p)
+        elif action == "fact_from_stock":
+            # «Факт = остаток ЦС» — только там, где оператор ничего не вводил:
+            # затирать введённые руками цифры массовой кнопкой нельзя.
+            if p.fact_at_date is None and p.offset_base_stock is not None:
+                p.fact_at_date = p.offset_base_stock
+                recompute_offset(p)
         else:
             set_flash(request, "Неизвестное действие.", "warn")
             return _back(q)
@@ -576,8 +696,12 @@ def products_export(
                                      limit=EXPORT_LIMIT, hide_size_u=hide_size_u)
     total = abs(total)          # для файла знак «счёт оборван» роли не играет
 
+    # Порядок колонок расчёта — тот же, что в строке на странице: дата, что
+    # показала 1С, резерв, факт, и уже из них порог. Оператор правит файл,
+    # сверяясь глазами со страницей, и разный порядок стоил бы ему ошибок.
     headers = ["ID_1С", "Артикул", "Размер", "Цвет", "Наименование", "Остаток ЦС",
-               "Резерв", "Порог трансляции", "Трансляция", "Уходит на площадки"]
+               "Дата расчёта", "Остаток ЦС на дату", "Резерв", "Факт на дату",
+               "Порог трансляции", "Трансляция", "Уходит на площадки"]
     for account in accounts:
         headers.append(f"{_account_label(account)} — Синхронизировать")
         headers.append(f"{_account_label(account)} — Порог")
@@ -586,7 +710,11 @@ def products_export(
     for product in products:
         settings_map = {s.account_id: s for s in product.sync_settings}
         row = [product.uid_1c, product.article, product.size, product.color, product.name,
-               product.stock_on_hand, product.reserve,
+               product.stock_on_hand,
+               product.offset_base_date.isoformat() if product.offset_base_date else "",
+               product.offset_base_stock if product.offset_base_stock is not None else "",
+               product.reserve,
+               product.fact_at_date if product.fact_at_date is not None else "",
                product.broadcast_offset if product.broadcast_offset is not None else "",
                "Да" if product.broadcast_enabled else "Нет",
                explain(product, None, None).quantity]
@@ -611,7 +739,17 @@ def products_import(
 ):
     """Массовая правка по отредактированному файлу экспорта. Ключ — колонка ID_1С.
     Заголовки колонок кабинетов менять нельзя: по ним определяется кабинет.
-    Колонка «Уходит на площадки» справочная, при импорте игнорируется."""
+
+    Справочные колонки, которые импорт НЕ читает:
+    «Уходит на площадки» — итог расчёта;
+    «Остаток ЦС на дату» — приходит из 1С, руками не задаётся;
+    «Порог трансляции» — у товара с датой расчёта он выводится из даты, факта и
+    брони. Принимать его ещё и из файла значило бы завести второй источник
+    правды: залитый порог и посчитанный разошлись бы, и никто не сказал бы,
+    какой верный. Менять порог надо через «Факт на дату». Если в файле порог всё
+    же изменён, строка попадёт в ошибки — молча проигнорировать правку нельзя,
+    оператор решил бы, что она применилась. У товара БЕЗ даты расчёта колонка
+    работает по-прежнему: там порог живёт как введённое руками число."""
     accounts = _active_accounts(db)
     label_to_account = {_account_label(a): a for a in accounts}
     try:
@@ -643,6 +781,37 @@ def products_import(
                     product.reserve = desired
                     touched = True
 
+        if "Дата расчёта" in row:
+            raw = row.get("Дата расчёта")
+            raw = "" if raw is None else str(raw).strip()
+            if isinstance(row.get("Дата расчёта"), datetime):
+                desired_day = row["Дата расчёта"].date()
+            elif isinstance(row.get("Дата расчёта"), date):
+                desired_day = row["Дата расчёта"]
+            else:
+                try:
+                    desired_day = _parse_date(raw[:10]) if raw else None
+                except ValueError:
+                    errors.append(f"строка {i}: дата расчёта — формат ГГГГ-ММ-ДД")
+                    desired_day = product.offset_base_date
+            if desired_day is not None and desired_day > now_utc().date():
+                errors.append(f"строка {i}: остатков на будущую дату в 1С нет")
+            elif desired_day != product.offset_base_date:
+                set_base_date(db, product, desired_day)
+                touched = True
+
+        if "Факт на дату" in row:
+            raw = row.get("Факт на дату")
+            raw = "" if raw is None else str(raw).strip()
+            try:
+                desired_fact = max(0, int(float(raw))) if raw else None
+            except ValueError:
+                errors.append(f"строка {i}: некорректный факт на дату")
+            else:
+                if product.fact_at_date != desired_fact:
+                    product.fact_at_date = desired_fact
+                    touched = True
+
         if "Порог трансляции" in row:
             raw = row.get("Порог трансляции")
             raw = "" if raw is None else str(raw).strip()
@@ -651,7 +820,14 @@ def products_import(
             except ValueError:
                 errors.append(f"строка {i}: некорректный порог трансляции")
             else:
-                if product.broadcast_offset != desired_offset:
+                if product.offset_base_date is not None:
+                    # Порог у такого товара расчётный. Сверяем с тем, что выйдет
+                    # из даты и факта, и расхождение показываем ошибкой.
+                    if desired_offset != offset_from_base(product):
+                        errors.append(
+                            f"строка {i}: порог считается из даты и факта — "
+                            f"правьте «Факт на дату», а не «Порог трансляции»")
+                elif product.broadcast_offset != desired_offset:
                     product.broadcast_offset = desired_offset
                     if desired_offset is not None:
                         product.transmit_override = None
@@ -697,6 +873,10 @@ def products_import(
             touched = True
 
         if touched:
+            # Один пересчёт на строку, уже после того как применены и дата, и
+            # факт, и бронь: считать после каждой по отдельности значило бы
+            # считать по половине данных.
+            recompute_offset(product)
             updated += 1
             _repropagate(db, product, reason="excel_import")
         else:

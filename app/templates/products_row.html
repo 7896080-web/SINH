@@ -7,7 +7,7 @@
     <td>{{ row.color or '' }}</td>
     <td>
         {{ row.name or '—' }}
-        {% if error and error_field not in ('reserve', 'offset', 'active_since') and not error_field.startswith('threshold:') %}
+        {% if error and error_field not in ('reserve', 'offset', 'active_since', 'base_date', 'fact') and not error_field.startswith('threshold:') %}
             <div class="pr-error" role="alert">⚠ {{ error }}</div>
         {% endif %}
         {% if not row.has_barcode %}
@@ -41,23 +41,54 @@
         {{ field_error('reserve') }}
     </td>
 
-    <td>
-        <input type="number" value="{% if row.broadcast_offset is not none %}{{ row.broadcast_offset }}{% endif %}"
-               placeholder="—" class="pr-input"
-               hx-post="/products/{{ row.uid_1c }}/offset" hx-trigger="change"
-               hx-vals="js:{value: event.target.value}"
-               hx-target="#row-{{ row.uid_1c }}" hx-swap="outerHTML"
-               title="Постоянное расхождение между учётом 1С и реальным складом. Уходит max(0, остаток ЦС − порог). Пусто — порог не задан. Может быть отрицательным.">
+    <td class="pr-calcbox">
+        <div class="pr-calcrow">
+            <label>на дату</label>
+            <input type="date" value="{{ row.base_date.isoformat() if row.base_date else '' }}" class="pr-date"
+                   hx-post="/products/{{ row.uid_1c }}/base-date" hx-trigger="change"
+                   hx-vals="js:{value: event.target.value}"
+                   hx-target="#row-{{ row.uid_1c }}" hx-swap="outerHTML"
+                   title="Дата, на которую считается порог. Остаток ЦС на неё берётся из выгрузки 1С.">
+        </div>
+        {{ field_error('base_date') }}
+
+        {% if row.waiting_for_1c %}
+            <div class="pr-hint pr-hint--warn">ждём выгрузку 1С на {{ row.base_date.strftime('%d.%m.%Y') }}</div>
+            <div class="pr-hint">факт можно ввести сейчас — порог посчитается, как придёт ответ</div>
+        {% elif row.base_date %}
+            <div class="pr-calcrow">
+                <label>остаток ЦС</label>
+                <span class="mono pr-ro" title="Что 1С показала на эту дату. Товара не было в выгрузке — 0.">{{ row.base_stock }}</span>
+            </div>
+        {% endif %}
+
+        {% if row.base_date %}
+        <div class="pr-calcrow">
+            <label>факт</label>
+            <input type="number" min="0" class="pr-input"
+                   value="{% if row.fact_at_date is not none %}{{ row.fact_at_date }}{% endif %}"
+                   placeholder="{{ row.base_stock if row.base_stock is not none else '—' }}"
+                   hx-post="/products/{{ row.uid_1c }}/fact" hx-trigger="change"
+                   hx-vals="js:{value: event.target.value}"
+                   hx-target="#row-{{ row.uid_1c }}" hx-swap="outerHTML"
+                   title="Сколько лежало на складе НА САМОМ ДЕЛЕ. Пусто — берём остаток ЦС на дату. Ноль — утверждение «на складе пусто», это другое.">
+        </div>
+        {{ field_error('fact') }}
+        {% endif %}
+
         {{ field_error('offset') }}
-        <details class="pr-calc">
-            <summary>посчитать</summary>
-            <form hx-post="/products/{{ row.uid_1c }}/offset"
-                  hx-target="#row-{{ row.uid_1c }}" hx-swap="outerHTML">
-                <label>учёт 1С на дату <input type="number" name="stock_at_date" class="pr-input"></label>
-                <label>реально на дату <input type="number" name="available" class="pr-input"></label>
-                <button type="submit" class="pr-mini">ОК</button>
-            </form>
-        </details>
+        <div class="pr-calcres">
+            {% if row.broadcast_offset is not none %}
+                порог <b>{{ row.broadcast_offset }}</b>
+                {% if row.base_date and not row.waiting_for_1c %}
+                    <div class="pr-hint">{{ row.base_stock }} − ({{ row.fact_at_date if row.fact_at_date is not none else row.base_stock }} − бронь {{ row.reserve }})</div>
+                {% else %}
+                    <div class="pr-hint">задан вручную</div>
+                {% endif %}
+            {% else %}
+                <span class="pr-hint">порог не задан</span>
+            {% endif %}
+        </div>
     </td>
 
     <td>
