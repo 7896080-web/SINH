@@ -30,9 +30,17 @@ class LocalExchange:
         for d in (self.dir_tasks, self.dir_results, self.dir_archive):
             d.mkdir(parents=True, exist_ok=True)
 
+    def task_file_exists(self, filename: str) -> bool:
+        return (self.dir_tasks / filename).exists() or (self.dir_archive / filename).exists()
+
     def upload_task_file(self, filename: str, content: str):
+        """Публикация задания. Перезапись существующего файла — ОШИБКА, а не
+        обычный ход: задания внутри него уже помечены отправленными, и затирание
+        означало бы, что в 1С они не попадут никогда и молча."""
         self._ensure_dirs()
         final = self.dir_tasks / filename
+        if self.task_file_exists(filename):
+            raise FileExistsError(f"задание {filename} уже существует — перезапись затёрла бы отправленные строки")
         tmp = self.dir_tasks / (filename + ".part")
         tmp.write_text(content, encoding="utf-8")
         os.replace(tmp, final)
@@ -102,13 +110,32 @@ def fetch_barcode_dict_files(exchange: "LocalExchange") -> list[dict]:
     return rows
 
 
+def _unique_task_filename(exchange: "LocalExchange | None" = None) -> str:
+    """Имя файла задания. Секунды не хватало: минутная отправка и суточный запрос
+    справочника попадали в одну и ту же секунду, второй файл затирал первый через
+    replace — а строки затёртого уже были помечены отправленными и в 1С не
+    попадали никогда. Теперь в имени микросекунды, и если имя всё же занято
+    (архив тоже проверяем), берём следующее свободное."""
+    base = now_utc()
+    for bump in range(1000):
+        stamp = base + timedelta(microseconds=bump)
+        name = f"task_{stamp:%Y%m%d%H%M%S%f}.txt"
+        if exchange is None or not exchange.task_file_exists(name):
+            return name
+    raise RuntimeError("не удалось подобрать свободное имя файла задания")
+
+
 def build_task_batch(db: Session, max_lines: int = 500, request_stock_export: bool = False,
-                     request_barcode_export: bool = False) -> tuple[str, str] | None:
+                     request_barcode_export: bool = False,
+                     exchange: "LocalExchange | None" = None) -> tuple[str, str] | None:
     """Собирает файл-задание из накопившихся FtpTask со статусом pending.
     Возвращает (имя_файла, содержимое) или None, если отправлять нечего.
     request_stock_export=True добавляет строку EXPORT_STOCK_ON_HAND — сигнал
     .epf сделать полную выгрузку остатков ЦС (раздел 8), используется
-    реже, чем обычные задания (например, раз в час перед сверкой)."""
+    реже, чем обычные задания (например, раз в час перед сверкой).
+
+    `exchange` нужен, чтобы проверить, что имя файла свободно, ДО того как строки
+    помечены отправленными: иначе занятое имя означало бы потерю целого батча."""
 
     tasks = db.query(FtpTask).filter(
         FtpTask.status == FtpTaskStatus.pending,
@@ -117,7 +144,7 @@ def build_task_batch(db: Session, max_lines: int = 500, request_stock_export: bo
     if not tasks and not request_stock_export and not request_barcode_export:
         return None
 
-    filename = f"task_{now_utc():%Y%m%d%H%M%S}.txt"
+    filename = _unique_task_filename(exchange)
     lines = []
     if request_stock_export:
         lines.append("EXPORT_STOCK_ON_HAND")
@@ -260,37 +287,83 @@ def fetch_stock_export_rows(exchange: "LocalExchange", not_older_than: datetime 
     return rows
 
 
+KNOWN_COMMANDS = ("CREATE_MOVEMENT", "CONFIRM_MOVEMENT", "CANCEL_MOVEMENT")
+
+
+def parse_result_line(line: str) -> tuple[str, str, str, str] | None:
+    """Разбор строки result_*.txt → (order_id, статус, подробность, команда).
+
+    Базовый формат `order_id|СТАТУС|подробность` — его пишет обработка 1С сейчас.
+    Необязательное ПОСЛЕДНЕЕ поле с именем команды (`…|CREATE_MOVEMENT`) делает
+    сопоставление точным: по одному номеру заказа у нас бывает и создание, и
+    отмена. Поле распознаётся только если это в точности одна из известных
+    команд, поэтому обычная подробность с символом `|` за команду не сойдёт.
+    Команда пустая — сопоставляем по номеру заказа, как раньше."""
+    parts = line.split("|")
+    if len(parts) < 3:
+        return None
+    command = ""
+    if len(parts) >= 4 and parts[-1].strip() in KNOWN_COMMANDS:
+        command = parts[-1].strip()
+        parts = parts[:-1]
+    return parts[0].strip(), parts[1].strip(), "|".join(parts[2:]), command
+
+
 def apply_result_batch(db: Session, content: str) -> dict:
-    """Разбирает файл result_*.txt и закрывает соответствующие FtpTask."""
+    """Разбирает файл result_*.txt и закрывает соответствующие FtpTask.
+
+    Две вещи, из-за которых этот разбор раньше врал:
+
+    1. Ответ `ERROR` закрывал задание как успешное (`done`). Документа в 1С при
+       этом не существует, а система считала заказ проведённым. Теперь такое
+       задание получает статус `failed` — оно видно в диагностике и продолжает
+       считаться «в пути» при сверке, то есть остаток не задирается обратно.
+    2. Задание искалось по одному номеру заказа, среди всех кабинетов и команд,
+       и бралось САМОЕ СВЕЖЕЕ. Ответ мог закрыть чужое задание. Теперь берём
+       самое СТАРОЕ незакрытое (1С отвечает в том же порядке, в каком получила
+       строки), в пределах одного файла одно задание закрывается только один раз,
+       а если 1С прислала имя команды — совпадение по команде обязательно."""
     stats = {"ok": 0, "error": 0, "unmatched": 0}
+    closed_ids: set[int] = set()
 
     for line in content.splitlines():
         line = line.strip()
         if not line:
             continue
-        parts = line.split("|")
-        if len(parts) < 3:
+        parsed = parse_result_line(line)
+        if parsed is None:
             continue
-        order_id, result_status, detail = parts[0], parts[1], "|".join(parts[2:])
+        order_id, result_status, detail, command = parsed
 
         # Принимаем результат и для просроченного (timeout) задания: опоздавший ответ 1С —
         # это ровно тот случай, ради которого timeout и существует; иначе задание, по
         # которому 1С документ создала, навсегда остаётся «без результата».
-        task = db.query(FtpTask).filter(
+        query = db.query(FtpTask).filter(
             FtpTask.order_id == order_id,
             FtpTask.status.in_([FtpTaskStatus.sent, FtpTaskStatus.timeout]),
-        ).order_by(FtpTask.sent_at.desc()).first()
+        )
+        if command:
+            query = query.filter(FtpTask.command == command)
+        if closed_ids:
+            query = query.filter(FtpTask.id.notin_(closed_ids))
+        task = query.order_by(FtpTask.sent_at.asc(), FtpTask.id.asc()).first()
 
         if task is None:
             stats["unmatched"] += 1
+            logger.warning("ftp_receive: ответ по заказу %s (%s) не сопоставлен ни с одним заданием",
+                           order_id, result_status)
             continue
 
-        task.status = FtpTaskStatus.done
+        ok = result_status == "OK"
+        task.status = FtpTaskStatus.done if ok else FtpTaskStatus.failed
         task.result_status = result_status
         task.result_detail = detail[:255]
         task.completed_at = now_utc()
+        closed_ids.add(task.id)
 
-        stats["ok" if result_status == "OK" else "error"] += 1
+        if not ok:
+            logger.error("1С отказала по заданию %s %s: %s", task.command, order_id, detail[:255])
+        stats["ok" if ok else "error"] += 1
 
     db.commit()
     return stats

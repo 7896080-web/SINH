@@ -143,7 +143,8 @@ def job_ftp_send(request_stock_export: bool = False, request_barcode_export: boo
     try:
         exchange = _build_ftp_exchange()
         batch = build_task_batch(db, request_stock_export=request_stock_export,
-                                 request_barcode_export=request_barcode_export)
+                                 request_barcode_export=request_barcode_export,
+                                 exchange=exchange)
         if batch:
             filename, content = batch
             exchange.upload_task_file(filename, content)

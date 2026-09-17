@@ -50,7 +50,14 @@ def _in_flight_adjustment(db: Session, uid_1c: str, snapshot_at: datetime | None
     if not barcodes:
         return 0
 
-    still_open = FtpTask.status.in_([FtpTaskStatus.pending, FtpTaskStatus.sent])
+    # pending/sent — задание ещё в работе. timeout — ответа нет, проведён документ
+    # или нет, неизвестно. failed — 1С ответила ERROR, документа заведомо НЕТ.
+    # Все три считаем «в пути»: 1С показывает эти единицы у себя, а у нас их уже
+    # списали. Не считать их — значит вернуть на склад уже проданное и отправить
+    # его на площадки второй раз. Ошибка в другую сторону (если документ всё же
+    # проведён) даёт недоотправку и лечится сама, как только задание закроется.
+    still_open = FtpTask.status.in_([FtpTaskStatus.pending, FtpTaskStatus.sent,
+                                     FtpTaskStatus.timeout, FtpTaskStatus.failed])
     if snapshot_at is None:
         was_open = still_open
     else:

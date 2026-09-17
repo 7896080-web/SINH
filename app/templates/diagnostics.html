@@ -121,7 +121,10 @@
                 <td>
                     в пути: <span class="mono">{{ row.queue.ftp_pending }}</span>
                     {% if row.queue.ftp_timeout %}
-                    · <span class="badge badge--bad">просрочено: {{ row.queue.ftp_timeout }}</span>
+                    · <span class="badge badge--bad" title="Ответа от 1С нет дольше окна ожидания: создан документ или нет — неизвестно.">просрочено: {{ row.queue.ftp_timeout }}</span>
+                    {% endif %}
+                    {% if row.queue.ftp_failed %}
+                    · <span class="badge badge--bad" title="1С ответила ERROR: документа в её базе НЕТ, хотя товар у нас уже списан. Нужен разбор вручную.">отказов 1С: {{ row.queue.ftp_failed }}</span>
                     {% endif %}
                 </td>
             </tr>

@@ -60,14 +60,17 @@ def _real_processed_orders(db: Session, uid_1c: str) -> list:
 
 
 def _open_1c_tasks(db: Session, orders: list) -> int:
-    """Сколько заданий 1С по этим заказам ещё не завершены (pending/sent): пока 1С
-    может их обработать, сбрасывать историю нельзя — в 1С появится документ без
-    записи у нас."""
+    """Сколько заданий 1С по этим заказам не завершены благополучно: пока 1С может
+    их обработать (pending/sent) или пока непонятно, что с ними стало (timeout —
+    ответа нет, failed — 1С ответила отказом), сбрасывать историю нельзя: в 1С
+    появится документ без записи у нас либо останется неразобранный отказ."""
     n = 0
     for o in orders:
         n += db.query(FtpTask).filter(
             FtpTask.order_id == o.order_id, FtpTask.account_id == o.account_id,
-            FtpTask.status.in_([FtpTaskStatus.pending, FtpTaskStatus.sent]), FtpTask.is_test.is_(False),
+            FtpTask.status.in_([FtpTaskStatus.pending, FtpTaskStatus.sent,
+                                FtpTaskStatus.timeout, FtpTaskStatus.failed]),
+            FtpTask.is_test.is_(False),
         ).count()
     return n
 
