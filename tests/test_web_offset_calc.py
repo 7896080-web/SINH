@@ -49,8 +49,8 @@ def test_setting_a_date_pulls_the_stock_and_computes(logged_in_client, web_db):
     _snapshot(web_db, [("u1", 10)])
     product = _product(web_db, reserve=2)
 
-    logged_in_client.post("/products/u1/fact", data={"value": "8"})
     logged_in_client.post("/products/u1/base-date", data={"value": "2026-08-07"})
+    logged_in_client.post("/products/u1/fact", data={"value": "8"})
 
     web_db.refresh(product)
     assert product.offset_base_stock == 10
@@ -62,9 +62,9 @@ def test_the_row_shows_the_arithmetic(logged_in_client, web_db):
     порог выглядит как магия и ему нечем верить."""
     _snapshot(web_db, [("u1", 10)])
     _product(web_db, reserve=2)
-    logged_in_client.post("/products/u1/fact", data={"value": "8"})
+    logged_in_client.post("/products/u1/base-date", data={"value": "2026-08-07"})
 
-    r = logged_in_client.post("/products/u1/base-date", data={"value": "2026-08-07"})
+    r = logged_in_client.post("/products/u1/fact", data={"value": "8"})
 
     assert "10 − (8 − бронь 2)" in r.text
 
@@ -94,8 +94,8 @@ def test_changing_the_reserve_moves_the_threshold(logged_in_client, web_db):
     """Ради этого три величины и хранятся."""
     _snapshot(web_db, [("u1", 10)])
     product = _product(web_db, reserve=2)
-    logged_in_client.post("/products/u1/fact", data={"value": "8"})
     logged_in_client.post("/products/u1/base-date", data={"value": "2026-08-07"})
+    logged_in_client.post("/products/u1/fact", data={"value": "8"})
 
     logged_in_client.post("/products/u1/reserve", data={"reserve": "5"})
 
@@ -368,3 +368,51 @@ def test_import_recomputes_once_after_all_three_values(logged_in_client, web_db)
     product = web_db.query(Product).first()
     assert product.reserve == 5
     assert product.broadcast_offset == 7        # 10 − (8 − 5), а не 10 − 8
+
+
+def test_moving_the_date_clears_the_fact_on_the_page(logged_in_client, web_db):
+    """Со стороны страницы то же правило: факт всегда «на дату». Перенесли дату —
+    старое пересчитанное количество к новому числу отношения не имеет, и молча
+    считать порог по нему нельзя."""
+    _snapshot(web_db, [("u1", 10)])
+    _snapshot(web_db, [("u1", 12)], day=date(2026, 9, 1))
+    product = _product(web_db, reserve=2)
+    logged_in_client.post("/products/u1/base-date", data={"value": "2026-08-07"})
+    logged_in_client.post("/products/u1/fact", data={"value": "8"})
+
+    logged_in_client.post("/products/u1/base-date", data={"value": "2026-09-01"})
+
+    web_db.refresh(product)
+    assert product.fact_at_date is None
+    assert product.offset_base_stock == 12
+    assert product.broadcast_offset == 2        # сводится к брони, пока факт не введён
+
+
+def test_bulk_date_reads_the_snapshot_once(logged_in_client, web_db):
+    """Массовая простановка даты не должна ходить в базу за каждым товаром: на
+    каталоге в 152 тысячи SKU это минуты ожидания и лишняя нагрузка на боевую
+    базу. Считаем запросы — они не должны расти вместе с числом строк."""
+    from sqlalchemy import event
+    from app.database import engine
+
+    rows = [(f"u{i:03d}", 10 + i) for i in range(20)]
+    _snapshot(web_db, rows)
+    for uid, _ in rows:
+        _product(web_db, uid=uid, reserve=1)
+
+    seen = []
+    listener = lambda conn, cur, stmt, *a: seen.append(stmt)
+    event.listen(engine, "before_cursor_execute", listener)
+    try:
+        logged_in_client.post("/products/bulk", data={
+            "action": "set_base_date", "uids": [uid for uid, _ in rows],
+            "date_value": "2026-08-07"})
+    finally:
+        event.remove(engine, "before_cursor_execute", listener)
+
+    selects = [q for q in seen if q.lstrip().upper().startswith("SELECT")
+               and "stock_date" in q.lower()]
+    assert len(selects) <= 4, f"чтений снимка {len(selects)} на 20 товаров — растёт со строками"
+    web_db.expire_all()
+    p = web_db.query(Product).filter(Product.uid_1c == "u005").first()
+    assert p.offset_base_stock == 15 and p.broadcast_offset == 1

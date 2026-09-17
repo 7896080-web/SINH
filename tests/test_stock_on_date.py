@@ -428,10 +428,14 @@ def test_arriving_file_computes_the_threshold_for_waiting_products(db, tmp_path)
     exchange = _exchange(tmp_path)
     snapshot = _request(db, status=StockDateStatus.sent)
     product = Product(uid_1c="u1", article="A-1", name="Джинсы", stock_on_hand=9,
-                      reserve=2, fact_at_date=5, broadcast_enabled=True)
+                      reserve=2, broadcast_enabled=True)
     db.add(product)
     db.commit()
+    # Порядок: сначала дата, потом факт. Смена даты стирает факт — он всегда
+    # «факт на дату», и число, пересчитанное на другое число, к делу не относится.
     set_base_date(db, product, date(2026, 8, 7))
+    product.fact_at_date = 5
+    db.commit()
     assert product.broadcast_offset is None        # ответа ещё нет — считать не из чего
 
     _result_file(exchange, "ondate_20260807_20260908121314.txt", ROW)   # u1 -> 7
