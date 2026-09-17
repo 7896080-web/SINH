@@ -18,6 +18,8 @@ from app.workers.catalog_poller import poll_catalog
 from app.workers.ftp_channel import (
     LocalExchange, build_task_batch, apply_result_batch, detect_timed_out_tasks,
     fetch_stock_export_files, fetch_stock_export_snapshot, fetch_barcode_dict_files,
+    apply_stock_on_date_files, detect_timed_out_stock_date_requests,
+    prune_stock_date_snapshots,
 )
 from app.workers.reconciliation import run_reconciliation, import_product_master, import_barcode_dict
 
@@ -167,9 +169,20 @@ def job_ftp_receive():
             stats = apply_result_batch(db, content)
             logger.info("ftp_receive: %s -> %s", filename, stats)
 
+        # Выгрузки остатков на дату — отдельный префикс файлов и отдельная
+        # таблица: в остаток товара и в сверку они не попадают никогда.
+        on_date = apply_stock_on_date_files(db, exchange)
+        if on_date["files"] or on_date["unmatched"]:
+            logger.info("ftp_receive: остатки на дату -> %s", on_date)
+        prune_stock_date_snapshots(db)
+
         timed_out = detect_timed_out_tasks(db)
         if timed_out:
             logger.warning("ftp_receive: %d заданий просрочены без ответа", len(timed_out))
+
+        stale_dates = detect_timed_out_stock_date_requests(db)
+        if stale_dates:
+            logger.warning("ftp_receive: %d заявок на остатки на дату без ответа", len(stale_dates))
 
         _heartbeat(db, "ftp_receive", True)
     except Exception as e:

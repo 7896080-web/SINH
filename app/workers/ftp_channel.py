@@ -1,16 +1,32 @@
 import logging
 import os
+import re
 from pathlib import Path
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from app.timeutils import now_utc
 
 from sqlalchemy.orm import Session
 
-from app.models import FtpTask, FtpTaskStatus, Platform
+from app.models import (FtpTask, FtpTaskStatus, Platform, StockDateRow, StockDateSnapshot,
+                        StockDateStatus)
 
 logger = logging.getLogger("sync_worker")
 
 TASK_TIMEOUT_MINUTES = 15
+
+# Выгрузка остатков на заданное число: команда в task_*.txt и ответ ondate_*.txt.
+STOCK_ON_DATE_COMMAND = "EXPORT_STOCK_ON_DATE"
+# Имя файла ответа: ondate_<дата среза ГГГГММДД>_<метка обработки ГГГГММДДЧЧММСС>.txt
+STOCK_ON_DATE_FILE_RE = re.compile(r"^ondate_(\d{8})_\d+\.txt$", re.IGNORECASE)
+# За раз просим не больше нескольких дат: каждая — отдельный запрос по регистру
+# остатков на боевой базе, и десяток сразу заметно её нагрузил бы.
+MAX_DATE_REQUESTS_PER_BATCH = 3
+# Обработка 1С запускается по своему расписанию, поэтому ждём ответа заметно
+# дольше, чем по обычному заданию (TASK_TIMEOUT_MINUTES).
+STOCK_ON_DATE_TIMEOUT_MINUTES = 180
+# Сколько выгрузок храним: это справка, а не данные системы, и полный снимок
+# склада за каждое число быстро раздул бы базу.
+STOCK_ON_DATE_KEEP = 10
 
 
 class LocalExchange:
@@ -54,6 +70,15 @@ class LocalExchange:
         if not self.dir_results.exists():
             return []
         return sorted(p.name for p in self.dir_results.glob("stock_*.txt"))
+
+    def list_stock_on_date_files(self) -> list[str]:
+        """Выгрузка остатков НА ДАТУ. Префикс намеренно другой (`ondate_`, а не
+        `stock_`): файл со складом за прошлое число не должен попасть ни в
+        сверку, ни в остаток товара — иначе на площадки уехали бы цифры той
+        давности, которую запросил оператор для справки."""
+        if not self.dir_results.exists():
+            return []
+        return sorted(p.name for p in self.dir_results.glob("ondate_*.txt"))
 
     def file_mtime_utc(self, filename: str) -> datetime | None:
         """Время последней записи файла результата в naive UTC — тем же масштабом,
@@ -163,6 +188,9 @@ def build_task_batch(db: Session, max_lines: int = 500, request_stock_export: bo
     .epf сделать полную выгрузку остатков ЦС (раздел 8), используется
     реже, чем обычные задания (например, раз в час перед сверкой).
 
+    Накопившиеся заявки на остатки НА ДАТУ (`StockDateSnapshot` в состоянии
+    pending) уходят той же машиной, строкой `EXPORT_STOCK_ON_DATE|ГГГГММДД`.
+
     `exchange` нужен, чтобы проверить, что имя файла свободно, ДО того как строки
     помечены отправленными: иначе занятое имя означало бы потерю целого батча."""
 
@@ -170,7 +198,15 @@ def build_task_batch(db: Session, max_lines: int = 500, request_stock_export: bo
         FtpTask.status == FtpTaskStatus.pending,
         FtpTask.is_test.is_(False),  # тестовые задания со страницы тестирования — никогда не уходят в реальный файл для 1С
     ).limit(max_lines).all()
-    if not tasks and not request_stock_export and not request_barcode_export:
+    # Запросы остатков на дату (страница «Остатки на дату»). Флага is_test у них
+    # нет и не нужно: команда только ЧИТАЕТ регистр остатков и ничего в 1С не
+    # создаёт и не меняет — побочного эффекта, от которого защищает is_test, у
+    # неё не существует.
+    date_requests = db.query(StockDateSnapshot).filter(
+        StockDateSnapshot.status == StockDateStatus.pending,
+    ).order_by(StockDateSnapshot.id.asc()).limit(MAX_DATE_REQUESTS_PER_BATCH).all()
+
+    if not tasks and not date_requests and not request_stock_export and not request_barcode_export:
         return None
 
     filename = _unique_task_filename(exchange)
@@ -179,6 +215,17 @@ def build_task_batch(db: Session, max_lines: int = 500, request_stock_export: bo
         lines.append("EXPORT_STOCK_ON_HAND")
     if request_barcode_export:
         lines.append("EXPORT_BARCODES")
+
+    sent_dates = set()
+    for snapshot in date_requests:
+        # Две заявки на одну дату дают ОДНУ строку: 1С назовёт файл по дате, и
+        # второй ответ просто затёр бы первый.
+        if snapshot.snapshot_date not in sent_dates:
+            lines.append(f"{STOCK_ON_DATE_COMMAND}|{snapshot.snapshot_date:%Y%m%d}")
+            sent_dates.add(snapshot.snapshot_date)
+        snapshot.status = StockDateStatus.sent
+        snapshot.sent_at = now_utc()
+        snapshot.batch_filename = filename
 
     for t in tasks:
         # Строка в файле для 1С по-прежнему содержит площадку (не кабинет) —
@@ -320,6 +367,107 @@ def fetch_stock_export_rows(exchange: "LocalExchange", not_older_than: datetime 
     не нужно (разовые скрипты, тесты разбора)."""
     rows, _ = fetch_stock_export_snapshot(exchange, not_older_than=not_older_than)
     return rows
+
+
+def parse_stock_on_date_filename(filename: str) -> "date | None":
+    """Дата среза из имени ondate_ГГГГММДД_ГГГГММДДЧЧММСС.txt."""
+    match = STOCK_ON_DATE_FILE_RE.match(filename)
+    if match is None:
+        return None
+    try:
+        return datetime.strptime(match.group(1), "%Y%m%d").date()
+    except ValueError:
+        return None
+
+
+def apply_stock_on_date_files(db: Session, exchange: "LocalExchange") -> dict:
+    """Забирает ondate_*.txt и раскладывает по заявкам «остатки на дату».
+
+    Сознательно НЕ трогает ни `Product.stock_on_hand`, ни очередь рассылки, ни
+    сверку: это снимок склада за прошлое число, и применение его как текущего
+    остатка означало бы рассылку на площадки цифр той давности, которую оператор
+    запросил всего лишь для справки. Всё, что делает функция, — складывает
+    строки файла в отдельную таблицу и закрывает заявку."""
+    stats = {"files": 0, "rows": 0, "unmatched": 0}
+
+    for filename in exchange.list_stock_on_date_files():
+        snapshot_date = parse_stock_on_date_filename(filename)
+        if snapshot_date is None:
+            exchange.download_and_archive_result(filename)
+            stats["unmatched"] += 1
+            logger.warning("stock_on_date: имя %s не разобрано — файл убран в архив", filename)
+            continue
+
+        snapshot = db.query(StockDateSnapshot).filter(
+            StockDateSnapshot.snapshot_date == snapshot_date,
+            StockDateSnapshot.status != StockDateStatus.done,
+        ).order_by(StockDateSnapshot.id.asc()).first()
+
+        content = exchange.download_and_archive_result(filename)
+        if snapshot is None:
+            stats["unmatched"] += 1
+            logger.warning("stock_on_date: выгрузка за %s не сопоставлена ни с одной заявкой "
+                           "(файл %s лежит в архиве)", snapshot_date, filename)
+            continue
+
+        rows = parse_stock_export_rows(content)
+        # Повторный ответ на ту же заявку (например, обработку запустили дважды)
+        # не должен задвоить строки.
+        db.query(StockDateRow).filter(
+            StockDateRow.snapshot_id == snapshot.id).delete(synchronize_session=False)
+        for row in rows:
+            db.add(StockDateRow(
+                snapshot_id=snapshot.id, uid_1c=row["uid_1c"], article=row["article"],
+                name=row["name"], size=row["size"], color=row["color"],
+                barcodes=",".join(row["barcodes"]), quantity=row["quantity"],
+            ))
+
+        snapshot.status = StockDateStatus.done
+        snapshot.received_at = now_utc()
+        snapshot.result_filename = filename
+        snapshot.rows_count = len(rows)
+        # Пустой ответ — не ошибка канала, а нормальный результат для даты, на
+        # которую остатков не было; но оператор должен видеть разницу между
+        # «пусто» и «ещё не пришло».
+        snapshot.note = "" if rows else "1С вернула пустую выгрузку"
+        stats["files"] += 1
+        stats["rows"] += len(rows)
+
+    db.commit()
+    return stats
+
+
+def detect_timed_out_stock_date_requests(db: Session) -> list:
+    """Заявка на остатки на дату без ответа дольше окна ожидания. Отдельное окно
+    (часы, а не минуты): обработка 1С запускается по своему расписанию, и первые
+    минуты молчания — норма."""
+    cutoff = now_utc() - timedelta(minutes=STOCK_ON_DATE_TIMEOUT_MINUTES)
+    stale = db.query(StockDateSnapshot).filter(
+        StockDateSnapshot.status == StockDateStatus.sent,
+        StockDateSnapshot.sent_at < cutoff,
+    ).all()
+    for snapshot in stale:
+        snapshot.status = StockDateStatus.timeout
+        snapshot.note = "1С не ответила — проверьте, что обработка «ОбменССайтом» запускается"
+    if stale:
+        db.commit()
+    return stale
+
+
+def prune_stock_date_snapshots(db: Session, keep: int = STOCK_ON_DATE_KEEP) -> int:
+    """Оставляет последние `keep` заявок, остальные удаляет вместе со строками.
+    Каждая выгрузка — полный снимок склада (тысячи строк), а нужна она обычно
+    один раз; без уборки база росла бы от справок."""
+    ids = [row.id for row in db.query(StockDateSnapshot.id)
+           .order_by(StockDateSnapshot.id.desc()).offset(keep).all()]
+    if not ids:
+        return 0
+    db.query(StockDateRow).filter(
+        StockDateRow.snapshot_id.in_(ids)).delete(synchronize_session=False)
+    db.query(StockDateSnapshot).filter(
+        StockDateSnapshot.id.in_(ids)).delete(synchronize_session=False)
+    db.commit()
+    return len(ids)
 
 
 KNOWN_COMMANDS = ("CREATE_MOVEMENT", "CONFIRM_MOVEMENT", "CANCEL_MOVEMENT")
