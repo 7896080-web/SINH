@@ -243,10 +243,23 @@ def test_health_expected_seconds_matches_dynamic_worker_names():
     assert _expected_seconds("что-то-неизвестное") == 600
 
 
+def _live_account(web_db):
+    """Кабинет должен существовать и быть активным: heartbeat снятого кабинета
+    /health теперь игнорирует (находка 14)."""
+    from app.models import PlatformAccount, Platform
+
+    account = PlatformAccount(platform=Platform.wb, name="Кабинет", warehouse_id="wh")
+    web_db.add(account)
+    web_db.commit()
+    web_db.refresh(account)
+    return account
+
+
 def test_health_daily_catalog_poller_not_falsely_stale(logged_in_client, web_db):
     from app.models import WorkerHeartbeat
+    account = _live_account(web_db)
     # catalog_poll суточный: heartbeat час назад — НЕ протух (ожидается 3 суток)
-    web_db.add(WorkerHeartbeat(worker_name="catalog_poll_account_7",
+    web_db.add(WorkerHeartbeat(worker_name=f"catalog_poll_account_{account.id}",
                                last_run_at=now_utc() - timedelta(hours=1), last_success=True))
     web_db.commit()
     r = logged_in_client.get("/health")
@@ -256,8 +269,9 @@ def test_health_daily_catalog_poller_not_falsely_stale(logged_in_client, web_db)
 
 def test_health_per_account_order_poller_stale_after_its_interval(logged_in_client, web_db):
     from app.models import WorkerHeartbeat
+    account = _live_account(web_db)
     # poll_orders интервал 120*3=360с; heartbeat 20 минут назад — протух
-    web_db.add(WorkerHeartbeat(worker_name="poll_orders_account_7",
+    web_db.add(WorkerHeartbeat(worker_name=f"poll_orders_account_{account.id}",
                                last_run_at=now_utc() - timedelta(minutes=20), last_success=True))
     web_db.commit()
     r = logged_in_client.get("/health")

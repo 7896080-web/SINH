@@ -7,6 +7,7 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 
 from app.database import SessionLocal
 from app.models import Platform, PlatformAccount, WorkerHeartbeat
+from app.routers.health import SCHEDULER_START_MARKER
 from app.workers.credentials import CredentialsMissing
 from app.workers.client_factory import build_client
 from app.workers.circuit_breaker import record_success, record_failure
@@ -308,11 +309,24 @@ def reconcile_account_jobs(sched, db) -> dict:
                           id=catalog_id, max_instances=1)
             added += 1
 
+    dropped_heartbeats = 0
     for stale_id in (existing_poll - desired_poll) | (existing_catalog - desired_catalog):
         sched.remove_job(stale_id)
         removed += 1
+        # Вместе с заданием убираем и его heartbeat. Иначе строка остаётся
+        # навсегда, протухает — и /health бессрочно отдаёт 503 из-за кабинета,
+        # который отключён штатно (руками или предохранителем). Мониторинг,
+        # который всегда красный, никто не читает.
+        # id задания и имя heartbeat — одна и та же строка
+        # (`poll_orders_account_<id>` / `catalog_poll_account_<id>`); это
+        # закреплено тестом, чтобы переименование не сломало уборку молча.
+        dropped_heartbeats += db.query(WorkerHeartbeat).filter(
+            WorkerHeartbeat.worker_name == stale_id,
+        ).delete(synchronize_session=False)
+    if dropped_heartbeats:
+        db.commit()
 
-    return {"added": added, "removed": removed}
+    return {"added": added, "removed": removed, "heartbeats_dropped": dropped_heartbeats}
 
 
 def job_reconcile_accounts(sched):
@@ -336,6 +350,14 @@ def build_scheduler() -> BlockingScheduler:
     подхватывается автоматически в пределах этого интервала — перезапуск
     процесса больше не требуется."""
     sched = BlockingScheduler(timezone="UTC")
+
+    # Отметка старта: по ней /health понимает, сколько планировщик работает, и не
+    # объявляет пропавшим воркер, который просто ещё не отработал первый раз.
+    db = SessionLocal()
+    try:
+        _heartbeat(db, SCHEDULER_START_MARKER, True)
+    finally:
+        db.close()
 
     sched.add_job(job_dispatch, "interval", seconds=45, id="dispatch", max_instances=1)
     sched.add_job(job_ftp_send, "interval", minutes=1, id="ftp_send", max_instances=1)
