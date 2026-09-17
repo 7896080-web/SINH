@@ -25,7 +25,7 @@ def test_reconcile_adds_jobs_for_active_accounts(db):
 
     stats = reconcile_account_jobs(sched, db)
 
-    assert stats == {"added": 2, "removed": 0}
+    assert stats == {"added": 2, "removed": 0, "heartbeats_dropped": 0}
     ids = _job_ids(sched)
     assert f"{POLL_ORDERS_JOB_PREFIX}{a.id}" in ids
     assert f"{CATALOG_POLL_JOB_PREFIX}{a.id}" in ids
@@ -38,7 +38,7 @@ def test_reconcile_is_idempotent(db):
     reconcile_account_jobs(sched, db)
     stats2 = reconcile_account_jobs(sched, db)  # второй прогон — ничего не меняет
 
-    assert stats2 == {"added": 0, "removed": 0}
+    assert stats2 == {"added": 0, "removed": 0, "heartbeats_dropped": 0}
 
 
 def test_reconcile_picks_up_new_account_without_restart(db):
