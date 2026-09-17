@@ -68,3 +68,40 @@ def test_our_own_lines_are_not_silenced(caplog):
         logging.getLogger("sync_worker").info("ftp_receive: остатки на дату -> %s", {"files": 1})
 
     assert any("остатки на дату" in r.getMessage() for r in caplog.records)
+
+
+# ------------------------------------------------ остановка службы — не авария
+
+def test_stopping_the_service_logs_one_line(monkeypatch, caplog):
+    """NSSM останавливает планировщик через Ctrl+C. Раньше Python печатал в лог
+    трассировку KeyboardInterrupt, и штатный рестарт (любой деплой) выглядел там
+    как падение."""
+    from app.workers import scheduler
+
+    class Stopped:
+        def start(self):
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(scheduler, "build_scheduler", lambda: Stopped())
+
+    with caplog.at_level(logging.INFO, logger="sync_worker"):
+        scheduler.main()                       # наружу ничего не летит
+
+    assert any("остановлен" in r.getMessage() for r in caplog.records)
+
+
+def test_a_real_failure_still_surfaces(monkeypatch):
+    """Обратная сторона: глушим ТОЛЬКО остановку. Упавший планировщик обязан
+    оставить в логе стек, иначе о его смерти никто не узнает."""
+    import pytest
+
+    from app.workers import scheduler
+
+    class Broken:
+        def start(self):
+            raise RuntimeError("база недоступна")
+
+    monkeypatch.setattr(scheduler, "build_scheduler", lambda: Broken())
+
+    with pytest.raises(RuntimeError):
+        scheduler.main()

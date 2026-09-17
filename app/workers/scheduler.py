@@ -432,6 +432,20 @@ def build_scheduler() -> BlockingScheduler:
     return sched
 
 
-if __name__ == "__main__":
+def main():
+    """Точка входа службы sync_admin_worker."""
     logger.info("Запуск планировщика воркеров синхронизации")
-    build_scheduler().start()
+    try:
+        build_scheduler().start()
+    except KeyboardInterrupt:
+        # NSSM останавливает службу, посылая процессу Ctrl+C. Без этой ветки
+        # Python валил в лог трассировку KeyboardInterrupt, и штатный рестарт —
+        # то есть каждый деплой — выглядел в журнале как авария. При разборе
+        # настоящего сбоя это лишний ложный след.
+        # Ловим ТОЛЬКО остановку: любое другое исключение обязано долететь до
+        # лога со стеком, иначе упавший планировщик будет молчать.
+        logger.info("Планировщик остановлен")
+
+
+if __name__ == "__main__":
+    main()
