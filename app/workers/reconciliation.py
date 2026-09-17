@@ -278,9 +278,10 @@ def run_reconciliation(db: Session, stock_from_1c: dict[str, int],
             # Ручная цифра трансляции (transmit_override) «дышит» вместе со складом:
             # приход прибавляет, расход убавляет — ровно на delta. Заказы в delta НЕ
             # входят (учтены через in_flight и уже двигают override в момент заказа),
-            # поэтому задвоения нет. max(0, …) не даёт уйти в минус.
+            # поэтому задвоения нет. Клампа в ноль нет намеренно: он делал движения
+            # необратимыми и цифра дрейфовала вверх. На площадку уходит max(0, …).
             if product.transmit_override is not None:
-                product.transmit_override = max(0, product.transmit_override + delta)
+                product.transmit_override = product.transmit_override + delta
 
             log.resolved = True
 

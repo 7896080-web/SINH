@@ -3,6 +3,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
+from app.audit import log_action
 from app.database import get_db
 from app.models import User
 from app.security import verify_password
@@ -48,6 +49,11 @@ def login_submit(
         error = "Неверный логин или пароль"
         if user:
             just_locked = record_login_failure(db, user)
+            # Вход в журнале действий: система работает с боевыми токенами
+            # площадок и остатками, и «кто и когда заходил» — такая же часть
+            # аудита, как смена склада или токена. Пароль, разумеется, не пишем.
+            log_action(db, username, "login_locked" if just_locked else "login_failed",
+                       f"неудачная попытка входа ({user.failed_login_attempts})")
             db.commit()
             if just_locked:
                 error = "Слишком много неудачных попыток. Аккаунт заблокирован на 30 минут."
@@ -61,6 +67,7 @@ def login_submit(
         )
 
     record_login_success(db, user)
+    log_action(db, user.username, "login_ok", "вход выполнен")
     db.commit()
 
     request.session["user_id"] = user.id

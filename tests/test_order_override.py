@@ -43,13 +43,58 @@ def test_order_leaves_automatic_scenario_untouched(db):
     assert p.transmit_override is None
 
 
-def test_order_override_clamped_at_zero(db):
+def test_order_override_goes_below_zero_instead_of_losing_the_difference(db):
+    """Находка 22: раньше здесь стоял кламп в ноль, и приём с отменой переставали
+    быть обратными — ручная цифра дрейфовала вверх. Теперь «долг» хранится как
+    минус; на площадку он всё равно превращается в 0."""
     acc = _seed(db, stock=5, override=2)
     order = PlatformOrder(order_id="o1", barcode="111", quantity=3, raw_status="new")
 
     process_new_order(db, order, acc, "WB.Ожидает")
 
-    assert db.query(Product).first().transmit_override == 0  # не уходит в минус
+    assert db.query(Product).first().transmit_override == -1
+
+
+def test_negative_override_still_sends_zero_to_the_platform(db):
+    """Граница: минус живёт только в учёте. Наружу уходит ноль, а не минус."""
+    from app.transmit import quantity_for_account, sku_quantity
+
+    acc = _seed(db, stock=5, override=2)
+    process_new_order(db, PlatformOrder(order_id="o1", barcode="111", quantity=3, raw_status="new"),
+                      acc, "WB.Ожидает")
+
+    product = db.query(Product).first()
+    assert sku_quantity(product) == 0
+    assert quantity_for_account(db, "u1", acc.id, product.stock_on_hand) == 0
+
+
+def test_order_and_cancellation_are_exactly_inverse(db):
+    """Сценарий из аудита дословно: было 2, заказ на 3, затем отмена — ручная
+    цифра обязана вернуться к 2, а не стать 3."""
+    acc = _seed(db, stock=5, override=2)
+    order = PlatformOrder(order_id="o1", barcode="111", quantity=3, raw_status="new")
+    process_new_order(db, order, acc, "WB.Ожидает")
+
+    record = db.query(ProcessedOrder).filter(ProcessedOrder.order_id == "o1").first()
+    cancelled = PlatformOrder(order_id="o1", barcode="111", quantity=3, raw_status="cancelled")
+    process_cancellation(db, cancelled, record, acc)
+
+    p = db.query(Product).first()
+    assert p.transmit_override == 2     # ровно столько, сколько было
+    assert p.stock_on_hand == 5
+
+
+def test_reconciliation_moves_override_without_clamping(db):
+    """Сверка двигает ручную цифру на складскую дельту — тоже без клампа, иначе
+    дрейф вернулся бы с другой стороны."""
+    from app.workers.reconciliation import run_reconciliation
+
+    _seed(db, stock=5, override=1)
+
+    run_reconciliation(db, {"111": 2})          # дельта склада −3
+
+    p = db.query(Product).first()
+    assert (p.stock_on_hand, p.transmit_override) == (2, -2)
 
 
 def test_cancellation_restores_override(db):

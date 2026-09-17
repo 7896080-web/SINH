@@ -150,12 +150,18 @@ def process_new_order(db: Session, order: PlatformOrder, account: PlatformAccoun
         # всё равно уйдёт max(0, …) — клампит dispatch. Клампить здесь означало бы
         # молча терять величину пересортицы до следующей сверки.
         product.stock_on_hand = product.stock_on_hand - order.quantity
-        # Ручной «передаваемый остаток» (override): заказ вычитается ИЗ НЕГО (не ниже 0).
+        # Ручной «передаваемый остаток» (override): заказ вычитается ИЗ НЕГО.
         # Оператор задал стартовое число — продажи его уменьшают. В автоматическом
         # сценарии (override не задан) заказ учитывается через сам остаток, здесь
         # трогать нечего.
+        #
+        # БЕЗ клампа в ноль: иначе приём и отмена перестают быть обратными и цифра
+        # дрейфует вверх. Было 2, заказ на 3 → 0 (единица потеряна), отмена вернула
+        # бы 3 — товар, которого нет. Минус здесь — это «долг», он честно вычитается
+        # из будущих возвратов; на площадку всё равно уходит max(0, …) — клампит
+        # transmit.sku_quantity, как и для самого остатка.
         if product.transmit_override is not None:
-            product.transmit_override = max(0, product.transmit_override - order.quantity)
+            product.transmit_override = product.transmit_override - order.quantity
         new_stock = product.stock_on_hand
     result["uid_1c"] = uid_1c
     result["new_stock"] = new_stock
@@ -223,10 +229,10 @@ def process_cancellation(db: Session, cancelled_order: PlatformOrder, record: Pr
     else:
         product.stock_on_hand += return_quantity
         # Симметрично приёму заказа: если у товара задан ручной override, отмена
-        # возвращает вычтенное обратно в него (не ниже 0) — иначе отменённые заказы
-        # навсегда «съедали» бы ручную цифру.
+        # возвращает вычтенное обратно в него. Тоже без клампа — приём и отмена
+        # обязаны быть в точности обратны друг другу.
         if product.transmit_override is not None:
-            product.transmit_override = max(0, product.transmit_override + return_quantity)
+            product.transmit_override = product.transmit_override + return_quantity
         new_stock = product.stock_on_hand
     result["return_quantity"] = return_quantity
     result["new_stock"] = new_stock
