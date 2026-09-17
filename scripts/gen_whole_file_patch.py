@@ -94,6 +94,11 @@ $p{i} = $p{i} -replace "\s",""
 
 PS_APPLY = r'''
 # ---- БЛОК APPLY ----
+# Сначала сверяем КАЖДУЮ часть по отдельности. Если какой-то блок не вставили,
+# в переменной остаётся кусок ПРОШЛОГО патча — полный хэш тогда не сойдётся, но
+# без этой проверки непонятно, какой именно блок виноват (так и случилось с pm31:
+# $p2 остался от pm30).
+{part_checks}
 $b = {concat}
 "full got    " + (Hx $b)
 "full expect {full_sha}"
@@ -123,7 +128,14 @@ def build(root: str, files: list[str], tag: str, parts: int, width: int,
         out.append(PS_PART.format(i=i, n=len(pieces), body=body,
                                   sha=hashlib.sha256(piece.encode("ascii")).hexdigest()))
     concat = " + ".join(f"$p{i}" for i in range(1, len(pieces) + 1))
-    out.append(PS_APPLY.format(concat=concat, full_sha=full_sha, tag=tag))
+    part_checks = "\n".join(
+        # Фигурные скобки здесь одинарные: строка подставляется в шаблон через
+        # format() уже готовой, повторного форматирования не будет.
+        f'if ((Hx $p{i}) -eq "{hashlib.sha256(piece.encode("ascii")).hexdigest()}") '
+        f'{{ "p{i} OK" }} else {{ "p{i} НЕ ТОТ — вставьте блок {i} заново" }}'
+        for i, piece in enumerate(pieces, 1)
+    )
+    out.append(PS_APPLY.format(concat=concat, full_sha=full_sha, tag=tag, part_checks=part_checks))
     info = {"files": len(entries), "deleted": len(delete or []),
             "raw_bytes": len(apply_src), "b64_len": len(b64),
             "parts": len(pieces), "full_sha": full_sha}
