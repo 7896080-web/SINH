@@ -292,13 +292,16 @@ def test_push_stock_applies_reserve_and_resolves_identifiers(logged_in_client, w
     """/testing идёт тем же путём, что рассылка: вычитает резерв и берёт
     offer_id (article) из каталога, а не баркод."""
     import app.routers.testing as testing_router
-    from app.models import Product, Barcode, PlatformAccount, PlatformCatalogItem
+    from app.models import Product, Barcode, PlatformAccount, PlatformCatalogItem, SyncSetting
 
     oz = PlatformAccount(platform="ozon", name="ОЗОН", warehouse_id="wh")
     web_db.add(oz); web_db.commit(); web_db.refresh(oz)
     web_db.add(Product(broadcast_enabled=True, uid_1c="u1", article="A", name="Т", stock_on_hand=5, reserve=2))
     web_db.add(Barcode(barcode="111", uid_1c="u1"))
     web_db.add(PlatformCatalogItem(account_id=oz.id, external_id="pid-9", barcode="111", article="OFR-9", name="Т"))
+    # Кабинет отмечен для товара: без отметки расчёт даёт 0 — на неотмеченный
+    # кабинет остаток не уходит ни из рассылки, ни отсюда (находки 6 и 7).
+    web_db.add(SyncSetting(uid_1c="u1", account_id=oz.id, enabled=True))
     web_db.commit()
 
     captured = {}

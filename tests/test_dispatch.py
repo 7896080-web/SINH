@@ -18,6 +18,9 @@ def test_dispatch_sends_only_latest_value_per_product(db):
     account = make_account(db, warehouse_id="wh-1")
     db.add(Product(broadcast_enabled=True, uid_1c="u1", article="A1", name="Товар", stock_on_hand=1))
     db.add(Barcode(barcode="111", uid_1c="u1"))
+    # Отметка кабинета обязательна: рассылка проверяет её так же, как интерфейс
+    # (находка 7 — без этого запись уходила на кабинет со снятой галочкой).
+    db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
     db.commit()
 
     for qty in (8, 6, 5):
@@ -171,6 +174,7 @@ def test_dispatch_reserve_subtracts_from_quantity(db):
     account = make_account(db, warehouse_id="wh-1")
     db.add(Product(broadcast_enabled=True, uid_1c="u1", article="A1", name="Т", stock_on_hand=5, reserve=2))
     db.add(Barcode(barcode="111", uid_1c="u1"))
+    db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
     db.add(DispatchQueueItem(uid_1c="u1", account_id=account.id, quantity=5, reason="order"))
     db.commit()
 
@@ -251,6 +255,7 @@ def test_quantity_reserve_applies_when_no_override(db):
     from app.workers.dispatch import _quantity_to_send
     account = make_account(db)
     db.add(Product(broadcast_enabled=True, uid_1c="u1", article="A", name="N", stock_on_hand=5, reserve=2))
+    db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
     db.commit()
     assert _quantity_to_send(db, "u1", account.id, 5) == 3  # override не задан → расчёт
 

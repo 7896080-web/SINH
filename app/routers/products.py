@@ -25,7 +25,7 @@ from app.flash import set_flash, pop_flash
 from app.audit import log_action
 from app.timeutils import now_utc
 from app.excel_utils import build_xlsx_response, read_xlsx_rows, parse_bool_ru
-from app.transmit import explain, sku_quantity, enqueue_full_resend
+from app.transmit import explain, sku_quantity, enqueue_full_resend, enqueue_withdrawal
 
 router = APIRouter()
 templates = Jinja2Templates(directory="app/templates")
@@ -389,7 +389,12 @@ def toggle_sync(
     db: Session = Depends(get_db), user: User = Depends(get_current_user),
 ):
     """Отметка кабинета: передавать ли этот товар в этот кабинет. Живой опрос
-    заказов работает только по отмеченным парам товар+кабинет."""
+    заказов работает только по отмеченным парам товар+кабинет.
+
+    Снятие галочки ОТЗЫВАЕТ остаток с площадки (ставит в очередь ноль). Иначе на
+    площадке остаётся последнее отправленное число, она продолжает продавать, а
+    заказы по снятой паре гейт отбора уже пропускает: ни списания у нас, ни
+    документа в 1С. Главный выключатель товара всегда вёл себя именно так."""
     setting = db.query(SyncSetting).filter(
         SyncSetting.uid_1c == uid_1c, SyncSetting.account_id == account_id,
     ).first()
@@ -405,7 +410,8 @@ def toggle_sync(
         enqueue_full_resend(db, uid_1c, account_id)
         log_action(db, user.username, "sync_enabled", f"{uid_1c} / кабинет #{account_id}")
     elif not enabled and was_enabled:
-        log_action(db, user.username, "sync_disabled", f"{uid_1c} / кабинет #{account_id}")
+        enqueue_withdrawal(db, uid_1c, account_id)
+        log_action(db, user.username, "sync_disabled", f"{uid_1c} / кабинет #{account_id} (в очередь 0)")
     db.commit()
     return _row_response(request, db, uid_1c)
 

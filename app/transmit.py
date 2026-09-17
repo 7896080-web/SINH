@@ -106,8 +106,15 @@ def explain(product: Product | None, setting, account) -> Transmit:
 
 
 def quantity_for_account(db: Session, uid_1c: str, account_id: int, raw_stock: int) -> int:
-    """То, что реально уходит на площадку. Используется рассылкой в момент отправки."""
-    from app.models import SyncSetting  # локально: избегаем цикла импортов
+    """То, что реально уходит на площадку. Используется рассылкой в момент отправки.
+
+    Проверяет ВСЮ лестницу, включая выключатели 1–2. Раньше считалось, что
+    отметку кабинета и паузу рассылка отсекает раньше («очередь копится только по
+    отмеченным кабинетам»), и здесь их не дублировали. Это неверно: запись,
+    попавшая в очередь до снятия галочки, переживает снятие — цикл рассылки брал
+    её из очереди и отправлял на уже отключённый кабинет полный остаток. Теперь
+    интерфейс (`explain`) и рассылка считают ровно одно и то же."""
+    from app.models import PlatformAccount, SyncSetting  # локально: избегаем цикла импортов
 
     product = db.query(Product).filter(Product.uid_1c == uid_1c).first()
     if product is None:
@@ -117,17 +124,19 @@ def quantity_for_account(db: Session, uid_1c: str, account_id: int, raw_stock: i
     setting = db.query(SyncSetting).filter(
         SyncSetting.uid_1c == uid_1c, SyncSetting.account_id == account_id,
     ).first()
+    if setting is None or not setting.enabled:
+        return 0
+    account = db.query(PlatformAccount).filter(PlatformAccount.id == account_id).first()
+    if account is not None and not account.dispatch_enabled:
+        return 0
 
     # Рассылка считает от значения, попавшего в очередь (raw_stock), — оно могло
     # быть посчитано чуть раньше текущего stock_on_hand.
     base = sku_quantity(product, raw_stock=raw_stock)
     mode = sku_mode(product)
-    threshold = (setting.min_threshold or 0) if setting else 0
+    threshold = setting.min_threshold or 0
     if mode == MODE_AUTO and threshold and base <= threshold:
         return 0
-    # Отметку кабинета и паузу площадки рассылка проверяет раньше (очередь копится
-    # только по отмеченным кабинетам, пауза отсекает кабинет целиком), поэтому
-    # здесь их не дублируем — иначе поведение изменится молча.
     return base
 
 
@@ -137,3 +146,14 @@ def enqueue_full_resend(db: Session, uid_1c: str, account_id: int, reason: str =
     product = db.query(Product).filter(Product.uid_1c == uid_1c).first()
     quantity = product.stock_on_hand if product else 0
     db.add(DispatchQueueItem(uid_1c=uid_1c, account_id=account_id, quantity=quantity, reason=reason))
+
+
+def enqueue_withdrawal(db: Session, uid_1c: str, account_id: int, reason: str = "manual_disable"):
+    """Отзыв остатка с площадки: ставит в очередь ноль.
+
+    Нужен, когда товар перестаёт передаваться в кабинет (снята галочка). Без
+    этого на площадке остаётся последнее отправленное число, она продолжает
+    продавать — а заказы по этой паре гейт отбора уже пропускает, то есть ни
+    списания у нас, ни документа в 1С не будет. Ровно так же ведёт себя главный
+    выключатель товара: он тоже отправляет ноль, а не «забывает» площадку."""
+    db.add(DispatchQueueItem(uid_1c=uid_1c, account_id=account_id, quantity=0, reason=reason))
