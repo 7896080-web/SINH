@@ -1,6 +1,6 @@
 {% if view == 'conflicts' %}
     {% if rows %}
-    <table>
+    <div class="table-scroll"><table>
         <thead>
             <tr>
                 <th>Баркод</th>
@@ -25,13 +25,13 @@
             </tr>
             {% endfor %}
         </tbody>
-    </table>
+    </table></div>
     {% else %}
     <div class="empty-state">Конфликтов сопоставления не найдено — все баркоды с площадок распознаны.</div>
     {% endif %}
 {% else %}
     {% if rows %}
-    <table>
+    <div class="table-scroll"><table>
         <thead>
             <tr>
                 <th>Баркод</th>
@@ -56,7 +56,7 @@
             </tr>
             {% endfor %}
         </tbody>
-    </table>
+    </table></div>
     {% else %}
     <div class="empty-state">По заданным фильтрам ничего не найдено.</div>
     {% endif %}

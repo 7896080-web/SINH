@@ -11,16 +11,16 @@
 
 <div class="card">
     <h3 style="margin-top:0">Общая картина</h3>
-    <table>
+    <div class="table-scroll"><table>
         <tr><td>Конфликтов сопоставления</td><td class="mono" style="text-align:right">{{ global_stats.conflicts }}</td></tr>
         <tr><td>Необработанных аномалий</td><td class="mono" style="text-align:right">{{ global_stats.anomalies_new }}</td></tr>
         <tr><td>Ошибок в очереди рассылки</td><td class="mono" style="text-align:right">{{ global_stats.dispatch_errors_total }}</td></tr>
-    </table>
+    </table></div>
 </div>
 
 <div class="card">
     <h3 style="margin-top:0">Общие фоновые процессы</h3>
-    <table>
+    <div class="table-scroll"><table>
         <thead><tr><th>Процесс</th><th>Последний запуск</th><th>Статус</th></tr></thead>
         <tbody>
         {% for item in shared_heartbeats %}
@@ -41,7 +41,7 @@
             </tr>
         {% endfor %}
         </tbody>
-    </table>
+    </table></div>
 </div>
 
 {% for row in account_rows %}
@@ -87,7 +87,7 @@
     </p>
     {% endif %}
 
-    <table>
+    <div class="table-scroll"><table>
         <tbody>
             <tr>
                 <td>Опрос заказов — последний запуск</td>
@@ -129,7 +129,7 @@
                 </td>
             </tr>
         </tbody>
-    </table>
+    </table></div>
 </div>
 {% endfor %}
 
