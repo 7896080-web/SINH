@@ -1,5 +1,5 @@
 {% if rows %}
-<table>
+<div class="table-scroll"><table>
     <thead>
         <tr>
             <th>Товар</th>
@@ -21,7 +21,7 @@
         </tr>
         {% endfor %}
     </tbody>
-</table>
+</table></div>
 <div class="help-text" style="padding:10px 14px;">
     {% if total > shown %}
         Показаны первые {{ shown }} из {{ total }} позиций — полный список выгружается в Excel.

@@ -88,7 +88,7 @@
         Порог посчитается сам, как придёт файл. Обработка 1С запускается по своему расписанию,
         это до десяти минут.</div>
     {% elif calc and calc.date %}
-        <table>
+        <div class="table-scroll"><table>
             <tr><td>Остаток ЦС на {{ calc.date.strftime('%d.%m.%Y') }}</td>
                 <td class="mono" style="text-align:right"><b>{{ calc.base_stock }}</b></td></tr>
             <tr><td>Бронь (резерв)</td><td class="mono" style="text-align:right">{{ calc.reserve }}</td></tr>
@@ -100,7 +100,7 @@
                 <td class="mono" style="text-align:right">{{ calc.send_at_date }}</td></tr>
             <tr style="background:#f3f8f4"><td><b>Уходит сейчас</b> ({{ product.stock_on_hand }} − порог {{ calc.offset }})</td>
                 <td class="mono" style="text-align:right"><b>{{ calc.send_now }}</b></td></tr>
-        </table>
+        </table></div>
         <p class="help-text">Если бэкфилл отработал правильно, «уходит сейчас» объясняется первым
         числом и движением остатка ЦС за период: заказы, приходы, списания и пересортица двигают
         остаток, а порог всё это время стоит на месте.</p>
@@ -129,7 +129,7 @@
     {% endif %}
     {% if real_orders is defined and real_orders %}
     {% set new_count = real_orders | selectattr('already', 'equalto', false) | list | length %}
-    <table style="margin-top:12px;">
+    <div class="table-scroll"><table style="margin-top:12px;">
         <thead><tr>{% if all_mode %}<th>Кабинет</th>{% endif %}<th>Дата заказа</th><th>ID заказа</th><th>Баркод</th><th>Кол-во</th><th>Статус</th><th>В 1С</th></tr></thead>
         <tbody>
         {% for o in real_orders %}
@@ -144,7 +144,7 @@
             </tr>
         {% endfor %}
         </tbody>
-    </table>
+    </table></div>
     <form method="post" action="/testing/backfill" style="margin-top:12px;"
           onsubmit="return confirm('Провести {{ new_count }} перемещений в 1С задним числом? Действие реальное — списываются остатки и создаются документы в 1С.');">
         <input type="hidden" name="uid_1c" value="{{ product.uid_1c }}">
@@ -187,7 +187,7 @@
 {% if account %}
 <div class="card">
     <h3 style="margin-top:0">Текущее состояние</h3>
-    <table>
+    <div class="table-scroll"><table>
         <tr><td>Товар</td><td>{{ product.article }} — {{ product.name }}</td></tr>
         <tr>
             <td>Физический остаток (ЦС)</td>
@@ -212,7 +212,7 @@
                 {% if setting and setting.min_threshold %} · порог: {{ setting.min_threshold }}{% endif %}
             </td>
         </tr>
-    </table>
+    </table></div>
 </div>
 
 <div class="card">
@@ -246,7 +246,7 @@
 <div class="card">
     <h3 style="margin-top:0">Тестовые заказы по этой паре товар/кабинет</h3>
     {% if test_orders %}
-    <table>
+    <div class="table-scroll"><table>
         <thead><tr><th>ID заказа</th><th>Количество</th><th>Статус</th><th>Создан</th><th></th></tr></thead>
         <tbody>
         {% for o in test_orders %}
@@ -278,7 +278,7 @@
             </tr>
         {% endfor %}
         </tbody>
-    </table>
+    </table></div>
     {% else %}
     <div class="empty-state">Тестовых заказов ещё не было.</div>
     {% endif %}

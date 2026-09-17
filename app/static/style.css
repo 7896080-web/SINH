@@ -79,7 +79,34 @@ a:hover { text-decoration: underline; }
 .main {
     flex: 1;
     padding: 28px 36px;
-    max-width: 1180px;
+    /* min-width: 0 — ключевое. По умолчанию у flex-элемента min-width: auto, то
+       есть он НЕ МОЖЕТ стать уже своего содержимого: широкая таблица распирала
+       .main, следом .shell, и горизонтально ехала вся страница вместе с меню —
+       оно уползало за левый край и «терялось». С нулевым минимумом .main
+       остаётся в пределах экрана, а прокручивается сама таблица внутри карточки
+       (.table-scroll ниже). */
+    min-width: 0;
+    /* Потолок был 1180px — на широком мониторе таблица товаров (13 колонок плюс
+       кабинеты) сжималась в эту рамку и пряталась под прокрутку, хотя место на
+       экране было. Ограничение оставлено, но шире: текст на сверхшироком
+       мониторе всё ещё не растягивается в нечитаемую строку. */
+    max-width: 1600px;
+}
+
+/* Прокрутка живёт ВНУТРИ карточки, а не у страницы: шапка, меню и остальные
+   карточки остаются на месте, уезжает только таблица. */
+.table-scroll {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+}
+
+/* Шапка таблицы не уезжает при вертикальной прокрутке: на 300 строках без неё
+   непонятно, какая колонка какая. */
+.table-scroll thead th {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    background: var(--surface);
 }
 
 .page-header {
@@ -284,4 +311,36 @@ tr:hover td { background: var(--bg); }
 /* Выбранная выгрузка в списке запросов на странице «Остатки на дату» */
 .row--active {
     background: var(--accent-soft);
+}
+
+
+/* --------------------------------------------------------------------------
+   Узкий экран. Меню в 220px и боковая раскладка на ноутбуке 13" съедали треть
+   ширины у таблиц; на планшете страница просто не помещалась.
+   -------------------------------------------------------------------------- */
+@media (max-width: 1100px) {
+    .shell { flex-direction: column; }
+    .nav {
+        width: 100%;
+        border-right: none;
+        border-bottom: 1px solid var(--line);
+        padding: 12px 0;
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 4px;
+    }
+    .nav__brand { border: none; margin: 0; padding: 0 16px; }
+    .nav__item { border-left: none; border-bottom: 3px solid transparent; padding: 8px 14px; }
+    .nav__item.active { border-left: none; border-bottom-color: var(--accent); }
+    .nav__footer { margin: 0 0 0 auto; border: none; padding: 0 16px; }
+    .main { padding: 20px 16px; max-width: none; }
+    .page-header { flex-direction: column; align-items: flex-start; gap: 10px; }
+    .filters { gap: 10px; }
+}
+
+@media (max-width: 640px) {
+    .main { padding: 16px 12px; }
+    input[type="text"], input[type="search"], input[type="password"], select { min-width: 0; }
+    .field { flex: 1 1 140px; }
 }

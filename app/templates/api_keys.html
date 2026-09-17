@@ -17,7 +17,7 @@
         как только для соответствующей площадки добавлен хотя бы один активный кабинет.
     </p>
     {% if required_warehouses %}
-    <table>
+    <div class="table-scroll"><table>
         <thead><tr><th>Название склада</th><th>Назначение</th><th>Использует</th></tr></thead>
         <tbody>
             {% for w in required_warehouses %}
@@ -28,7 +28,7 @@
             </tr>
             {% endfor %}
         </tbody>
-    </table>
+    </table></div>
     {% else %}
     <div class="empty-state">Кабинетов ещё нет — список складов появится после добавления первого.</div>
     {% endif %}
