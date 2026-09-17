@@ -47,31 +47,55 @@ def build_xlsx_response(headers: list[str], rows: list[list], filename: str) -> 
     )
 
 
+class ExcelReadError(Exception):
+    """Файл не читается как .xlsx. Отдельный тип, чтобы роутеры импорта могли
+    показать оператору человеческую причину.
+
+    Раньше любая проблема с самим файлом (не тот формат, обрезанная загрузка,
+    .xls или .csv, переименованные в .xlsx) вылетала наружу как BadZipFile и
+    превращалась в 500: все три импорта аккуратно собирают ошибки по строкам, но
+    падали на открытии файла, ещё до первой строки."""
+
+
 def read_xlsx_rows(file_bytes: bytes) -> list[dict]:
     """Читает .xlsx, первая строка — заголовки. Возвращает список словарей
-    {заголовок: значение}, пустые строки в конце файла пропускаются."""
-    wb = load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
-    ws = wb.active
+    {заголовок: значение}, пустые строки в конце файла пропускаются.
 
-    rows_iter = ws.iter_rows(values_only=True)
+    Бросает ExcelReadError, если файл не удалось прочитать как .xlsx."""
+    if not file_bytes:
+        raise ExcelReadError("Файл пустой — выберите .xlsx, выгруженный этой же страницей.")
+
     try:
-        headers = next(rows_iter)
-    except StopIteration:
-        return []
+        wb = load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
+        ws = wb.active
 
-    headers = [str(h).strip() if h is not None else "" for h in headers]
+        rows_iter = ws.iter_rows(values_only=True)
+        try:
+            headers = next(rows_iter)
+        except StopIteration:
+            return []
 
-    result = []
-    for raw_row in rows_iter:
-        if raw_row is None or all(v is None for v in raw_row):
-            continue
-        row_dict = {}
-        for idx, header in enumerate(headers):
-            value = raw_row[idx] if idx < len(raw_row) else None
-            row_dict[header] = value
-        result.append(row_dict)
+        headers = [str(h).strip() if h is not None else "" for h in headers]
 
-    return result
+        result = []
+        for raw_row in rows_iter:
+            if raw_row is None or all(v is None for v in raw_row):
+                continue
+            row_dict = {}
+            for idx, header in enumerate(headers):
+                value = raw_row[idx] if idx < len(raw_row) else None
+                row_dict[header] = value
+            result.append(row_dict)
+
+        return result
+    except ExcelReadError:
+        raise
+    except Exception as e:
+        raise ExcelReadError(
+            "Файл не читается как .xlsx "
+            f"({type(e).__name__}). Проверьте, что это именно .xlsx (не .xls и не .csv, "
+            "переименованные в .xlsx) и что он докачался целиком."
+        ) from e
 
 
 def parse_bool_ru(value) -> bool:
