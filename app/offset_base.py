@@ -150,7 +150,21 @@ def fill_waiting_products(db: Session, snapshot: StockDateSnapshot) -> dict:
     """
     stats = {"filled": 0, "offsets_changed": 0, "queued": 0}
 
-    lookup = stock_lookup(db, snapshot.snapshot_date)
+    # ОБЯЗАТЕЛЬНЫЙ flush. Приложение работает с `autoflush=False`
+    # (`app/database.py`), а вызывают нас сразу после того, как строки ответа
+    # добавлены в сессию и снимку проставлен статус `done`, — но ещё НЕ
+    # отправлены в базу. Без flush запрос ниже не увидит ни строк, ни статуса:
+    # снимок «не найден», остаток на дату у всех выходит нулём, и порог у всего
+    # каталога считается по несуществующим данным. Поймано только живым прогоном:
+    # в тестах сессия фикстуры флашится сама и дефект не проявлялся.
+    db.flush()
+
+    # Строки берём ПО ЭТОМУ снимку, а не ищем свежий по дате: мы его уже держим
+    # в руках, лишний поиск только добавляет способ ошибиться.
+    by_uid: dict[str, int] = {}
+    for uid, quantity in db.query(StockDateRow.uid_1c, StockDateRow.quantity).filter(
+            StockDateRow.snapshot_id == snapshot.id).all():
+        by_uid[uid] = quantity        # повтор — последняя строка, как в stock_at_date
 
     # ПАЧКАМИ, а не всё сразу. Оператор вправе проставить дату всему каталогу —
     # это 152 тысячи товаров, и каждый тянет за собой свои настройки кабинетов.
@@ -169,7 +183,8 @@ def fill_waiting_products(db: Session, snapshot: StockDateSnapshot) -> dict:
             break
 
         for product in waiting:
-            product.offset_base_stock = lookup(product.uid_1c) or 0
+            # Товара нет в ответе — значит на эту дату его на складе не было.
+            product.offset_base_stock = by_uid.get(product.uid_1c, 0)
             stats["filled"] += 1
             if recompute_offset(product):
                 stats["offsets_changed"] += 1

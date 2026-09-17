@@ -5,7 +5,28 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{% block title %}Синхронизация площадок{% endblock %}</title>
     <link rel="stylesheet" href="/static/style.css">
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/htmx/1.9.12/htmx.min.js"></script>
+    <!-- htmx лежит РЯДОМ, а не тянется из интернета. Раньше он грузился с
+         cdnjs.cloudflare.com, и вся интерактивность админки зависела от того,
+         доступен ли Cloudflare из браузера оператора. Если нет — страница
+         открывалась как ни в чём не бывало, но переставала работать МОЛЧА:
+         галочки кабинетов не сохранялись, поля не отправлялись, строки не
+         перерисовывались, и никакой ошибки оператор не видел. Для системы,
+         которая управляет остатками на площадках, «тихо не сработало» —
+         худший из возможных отказов. -->
+    <script src="/static/htmx.min.js"></script>
+    <script>
+        // Если файл всё же не загрузился (потеряли при обновлении, не тот путь),
+        // об этом надо СКАЗАТЬ, а не оставлять мёртвую страницу.
+        window.addEventListener("DOMContentLoaded", function () {
+            if (typeof window.htmx !== "undefined") return;
+            var warn = document.createElement("div");
+            warn.className = "flash flash--warn";
+            warn.textContent = "htmx не загрузился (/static/htmx.min.js) — галочки, " +
+                "поля и кнопки на странице работать не будут. Данные при этом целы; " +
+                "сообщите администратору.";
+            document.body.prepend(warn);
+        });
+    </script>
 </head>
 <body>
     <div class="shell">
