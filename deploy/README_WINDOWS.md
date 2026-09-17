@@ -46,7 +46,11 @@ powershell -ExecutionPolicy Bypass -File deploy\install_windows.ps1
 
 - Веб-админка: `http://127.0.0.1:8000/login` (логин/пароль из вывода скрипта).
 - Здоровье воркеров: `http://127.0.0.1:8000/health`.
-- Логи служб: `logs\sync_admin_web.log`, `logs\sync_admin_worker.err.log`.
+- Логи служб: `logs\<имя службы>.log` (stdout) и `logs\<имя службы>.err.log` (stderr).
+  Имена задаются при установке, и на сервере, развёрнутом не этим скриптом, они
+  другие — на боевом это `logs\web.err.log` и `logs\worker.err.log`. Точный путь
+  всегда можно спросить у самой службы: `nssm get sync_admin_worker AppStderr`.
+  Всё содержательное (Python logging) идёт в **err**-файл; `.log` обычно пустой.
 
 Дальнейшие шаги в самой админке:
 1. Ввести API-ключи площадок (страница «API-ключи»).
@@ -61,7 +65,28 @@ powershell -ExecutionPolicy Bypass -File deploy\install_windows.ps1
 nssm restart sync_admin_worker      # перечитать .env после правок
 nssm stop sync_admin_web
 nssm status sync_admin_worker
-Get-Content logs\sync_admin_worker.err.log -Tail 50
+Get-Content (nssm get sync_admin_worker AppStderr) -Tail 50
+```
+
+Размер и время файла в `Get-ChildItem` у работающей службы **отстают**: пока NSSM
+держит файл открытым, Windows обновляет эти поля лениво. Судить о том, пишется ли
+лог, по ним нельзя — читайте хвост самого файла.
+
+### Ротация лога
+
+NSSM по умолчанию пишет в один файл без ограничения размера — за месяцы это
+десятки мегабайт, и открыть их в редакторе уже нечем. Включается так (раз и
+навсегда, служба переживает обновления):
+
+```powershell
+nssm set sync_admin_worker AppRotateFiles 1
+nssm set sync_admin_worker AppRotateOnline 1
+nssm set sync_admin_worker AppRotateBytes 10485760   # 10 МБ
+nssm set sync_admin_web    AppRotateFiles 1
+nssm set sync_admin_web    AppRotateOnline 1
+nssm set sync_admin_web    AppRotateBytes 10485760
+nssm restart sync_admin_worker
+nssm restart sync_admin_web
 ```
 
 ## Доступ снаружи (если нужен)
