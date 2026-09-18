@@ -14,6 +14,36 @@ logger = logging.getLogger("sync_worker")
 
 TASK_TIMEOUT_MINUTES = 15
 
+# --- Перепроведение зависших перемещений -----------------------------------
+# 1С иногда забирает файл задания и не отвечает по нему НИ ОДНОЙ строкой — ни OK,
+# ни ERROR. 19.09 так пропали два файла из пятидесяти трёх (12 строк): остаток по
+# 11 товарам навсегда занижен, потому что незакрытое задание вечно считается «в
+# пути». Разобрать его было нечем: `timeout` означает «неизвестно, создан
+# документ или нет», а повторная отправка вслепую завела бы ВТОРОЙ документ
+# перемещения на тот же заказ.
+#
+# Механизм опирается на идемпотентность 1С по номеру заказа: обработка перед
+# созданием ищет документ с этим номером и, если он есть, возвращает OK, ничего
+# не создавая. Тогда повтор безопасен и одновременно служит проверкой — ответ OK
+# значит «документ есть», независимо от того, был он раньше или создан сейчас.
+#
+# ВЫКЛЮЧЕНО ПО УМОЛЧАНИЮ. Пока идемпотентности в 1С нет, включать нельзя: каждый
+# повтор задвоит документ. Включается переменной окружения на боевом сервере,
+# осознанно и после подтверждения со стороны 1С.
+MOVEMENT_REPOST_ENV = "MOVEMENT_REPOST_ENABLED"
+# Сколько ждём после отметки `timeout`, прежде чем повторять. Ответ 1С штатно
+# приходит за 4–7 минут, `timeout` ставится через 15 — к этому сроку опоздавший
+# ответ уже закрыл бы задание сам (`apply_result_batch` принимает и поздние).
+REPOST_AFTER_MINUTES = 30
+# Больше трёх раз не долбим: если и после них тишина, дело не в случайности —
+# задание остаётся `timeout` и ждёт человека, а не молотит вечно.
+MAX_REPOSTS = 3
+# Повторы уходят ОТДЕЛЬНЫМ маленьким файлом, а не подмешиваются к свежим
+# заданиям. Причина та же, из-за которой они и зависли: 1С роняет файл ЦЕЛИКОМ,
+# и строка, на которой она спотыкается, утащила бы за собой ни в чём не повинные
+# свежие перемещения.
+REPOST_BATCH_LINES = 3
+
 # Выгрузка остатков на заданное число: команда в task_*.txt и ответ ondate_*.txt.
 STOCK_ON_DATE_COMMAND = "EXPORT_STOCK_ON_DATE"
 # Имя файла ответа: ondate_<дата среза ГГГГММДД>_<метка обработки ГГГГММДДЧЧММСС>.txt
@@ -198,13 +228,32 @@ def build_task_batch(db: Session, max_lines: int = 500, request_stock_export: bo
         FtpTask.status == FtpTaskStatus.pending,
         FtpTask.is_test.is_(False),  # тестовые задания со страницы тестирования — никогда не уходят в реальный файл для 1С
     ).limit(max_lines).all()
+
+    # ИНВАРИАНТ: повтор зависшего перемещения никогда не едет в одном файле ни с
+    # чем другим. 1С роняет файл ЦЕЛИКОМ — именно так и зависли 12 строк, — значит
+    # строка, на которой она спотыкается, утащила бы за собой и свежие
+    # перемещения, и запрос выгрузки. Поэтому либо файл целиком из повторов, либо
+    # повторов в нём нет вовсе.
+    #
+    # Файл с запросом выгрузки (часовой/суточный) повторы не забирает никогда:
+    # иначе запрос остатков оказался бы проглочен, сверка встала бы на час, и мы
+    # починили бы одно, сломав другое. Повторы уедут следующим минутным файлом.
+    reposts = [t for t in tasks if (t.repost_count or 0) > 0]
+    asking_export = request_stock_export or request_barcode_export
+    if reposts and not asking_export:
+        tasks = reposts[:REPOST_BATCH_LINES]
+        date_requests_allowed = False
+    else:
+        tasks = [t for t in tasks if (t.repost_count or 0) == 0]
+        date_requests_allowed = True
     # Запросы остатков на дату (страница «Остатки на дату»). Флага is_test у них
     # нет и не нужно: команда только ЧИТАЕТ регистр остатков и ничего в 1С не
     # создаёт и не меняет — побочного эффекта, от которого защищает is_test, у
     # неё не существует.
     date_requests = db.query(StockDateSnapshot).filter(
         StockDateSnapshot.status == StockDateStatus.pending,
-    ).order_by(StockDateSnapshot.id.asc()).limit(MAX_DATE_REQUESTS_PER_BATCH).all()
+    ).order_by(StockDateSnapshot.id.asc()).limit(MAX_DATE_REQUESTS_PER_BATCH).all() \
+        if date_requests_allowed else []
 
     if not tasks and not date_requests and not request_stock_export and not request_barcode_export:
         return None
@@ -562,6 +611,66 @@ def apply_result_batch(db: Session, content: str) -> dict:
         stats["ok" if ok else "error"] += 1
 
     db.commit()
+    return stats
+
+
+def repost_enabled() -> bool:
+    """Включено ли перепроведение зависших перемещений.
+
+    Читаем окружение В МОМЕНТ ВЫЗОВА, а не при импорте: так состояние видно в
+    тестах и меняется рестартом службы, без пересборки образа.
+    """
+    return os.environ.get(MOVEMENT_REPOST_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def repost_stuck_movements(db: Session) -> dict:
+    """Возвращает зависшие перемещения в очередь на отправку.
+
+    Берём только `timeout`: `failed` — это внятный отказ 1С, там документа
+    заведомо нет и повтор ничего не проверяет, такое разбирает человек. `sent`
+    ещё в работе. Отменам (`CANCEL_MOVEMENT`) повтор тоже не делаем: идемпотентность
+    обещана по созданию, про отмену такой договорённости нет, а угадывать в
+    сторону 1С нельзя.
+
+    Само задание не пересоздаём, а возвращаем в `pending` — тогда у него
+    сохраняется вся история (когда создано, сколько раз повторяли), и «в пути»
+    оно как считалось, так и считается: остаток не дёргается туда-сюда, пока
+    ответа нет.
+    """
+    stats = {"reposted": 0, "exhausted": 0, "skipped_disabled": 0}
+
+    stuck = db.query(FtpTask).filter(
+        FtpTask.status == FtpTaskStatus.timeout,
+        FtpTask.command == "CREATE_MOVEMENT",
+        FtpTask.is_test.is_(False),
+    ).order_by(FtpTask.id).all()
+    if not stuck:
+        return stats
+
+    cutoff = now_utc() - timedelta(minutes=REPOST_AFTER_MINUTES)
+    ready = [t for t in stuck
+             if t.sent_at is not None and t.sent_at < cutoff]
+
+    stats["exhausted"] = len([t for t in ready if (t.repost_count or 0) >= MAX_REPOSTS])
+    ready = [t for t in ready if (t.repost_count or 0) < MAX_REPOSTS]
+
+    if not repost_enabled():
+        # Молча ничего не делаем, но СЧИТАЕМ: иначе выключенный механизм выглядел
+        # бы как отсутствие проблемы, а зависшие задания никуда не делись.
+        stats["skipped_disabled"] = len(ready)
+        return stats
+
+    for t in ready[:REPOST_BATCH_LINES]:
+        t.status = FtpTaskStatus.pending
+        t.repost_count = (t.repost_count or 0) + 1
+        t.batch_filename = None
+        t.sent_at = None
+        stats["reposted"] += 1
+
+    if stats["reposted"]:
+        db.commit()
+        logger.info("repost_stuck_movements: вернули в очередь %d зависших перемещений",
+                    stats["reposted"])
     return stats
 
 
