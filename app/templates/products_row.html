@@ -3,8 +3,8 @@
     <td><input type="checkbox" name="uids" value="{{ row.uid_1c }}" form="bulk-form"></td>
 
     <td class="mono">{{ row.article or '—' }}</td>
-    <td>{{ row.size or '' }}</td>
-    <td>{{ row.color or '' }}</td>
+    <td class="pr-th-narrow">{{ row.size or '' }}</td>
+    <td class="pr-th-narrow">{{ row.color or '' }}</td>
     <td>
         {{ row.name or '—' }}
         {% if error and error_field not in ('reserve', 'offset', 'active_since', 'base_date', 'fact', 'broadcast') and not error_field.startswith('threshold:') %}
@@ -43,12 +43,14 @@
 
     <td class="pr-calcbox">
         <div class="pr-status pr-status--{{ row.calc_status }}">
-            {% if row.calc_status == 'ready' %}
-                ✓ {{ row.calc_status_label }}{% if not row.broadcast_enabled %} — перемещения в 1С созданы, можно включать трансляцию{% endif %}
-            {% else %}
-                {{ row.calc_status_label }}
-            {% endif %}
+            {% if row.calc_status == 'ready' %}✓ {% endif %}{{ row.calc_status_label }}
         </div>
+        {% if row.calc_status == 'ready' and not row.broadcast_enabled %}
+            {# Отдельной строкой, а не внутри значка: значок не переносится, и эта
+               подсказка растягивала колонку на всю ширину, выдавливая «Размер» и
+               «Цвет» за край таблицы. #}
+            <div class="pr-hint">перемещения в 1С созданы — можно включать трансляцию</div>
+        {% endif %}
         <div class="pr-calcrow">
             <label>на дату</label>
             <input type="date" value="{{ row.base_date.isoformat() if row.base_date else '' }}" class="pr-date"
