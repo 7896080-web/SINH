@@ -275,3 +275,33 @@ def test_only_one_job_runs_at_a_time(db):
     db.commit()
 
     assert active_job(db) is not None
+
+
+def test_a_product_without_cabinets_is_not_called_up_to_date(db):
+    """Не отмечен ни один кабинет — спрашивать заказы негде, и мы никуда не
+    заглядывали. Назвать такой товар актуализированным значило бы дать оператору
+    включить трансляцию, считая остаток проверенным.
+
+    Найдено на живом прогоне: задание отчиталось «1 из 1, заказов проведено 0» и
+    поставило отметку, хотя не обратилось ни к одной площадке.
+    """
+    product = _product(db)          # кабинетов не отмечено
+
+    stats = catch_up_product(db, product, lambda d, aid: FakeClient(), _wh)
+
+    assert product.recalc_done_at is None
+    assert "кабинет" in "; ".join(stats["problems"])
+
+
+def test_zero_orders_from_a_real_cabinet_still_counts_as_up_to_date(db):
+    """Обратная сторона: кабинет отмечен, площадку спросили, заказов за период
+    действительно не было — остаток актуален, отметку ставим."""
+    account = make_account(db, Platform.wb)
+    product = _product(db)
+    db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
+    db.commit()
+
+    stats = catch_up_product(db, product, lambda d, aid: FakeClient([]), _wh)
+
+    assert stats["problems"] == []
+    assert product.recalc_done_at is not None

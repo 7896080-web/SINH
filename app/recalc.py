@@ -97,8 +97,15 @@ def collect_orders(db: Session, product: Product, since: date, build_client) -> 
     if not barcodes:
         return [], ["нет баркодов — товар не сопоставлен"]
 
+    accounts = _enabled_accounts(db, product.uid_1c)
+    if not accounts:
+        # Спрашивать заказы негде. Молча вернуть «ничего не нашлось» нельзя: тогда
+        # товар получил бы отметку «актуализирован», хотя мы никуда не заглядывали,
+        # и оператор включил бы трансляцию, считая остаток проверенным.
+        return [], ["не отмечен ни один кабинет — заказы спрашивать негде"]
+
     rows, problems = [], []
-    for account in _enabled_accounts(db, product.uid_1c):
+    for account in accounts:
         try:
             client = build_client(db, account.id)
         except CredentialsMissing as e:
