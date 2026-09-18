@@ -206,3 +206,69 @@ def test_ui_and_dispatch_agree(web_db, broadcast, enabled, dispatch_enabled, thr
     from_dispatch = quantity_for_account(web_db, "u1", account.id, 12)
 
     assert from_ui == from_dispatch == expected
+
+
+# --------------------------------------------- тишина до включения трансляции
+
+def test_editing_a_silent_product_queues_nothing(db):
+    """Правка брони, факта или порога у товара, который ещё не транслируется, не
+    должна ничего отправлять на площадку.
+
+    Это и есть требование «до момента полного расчёта не транслируем ни ноль, ни
+    какой-либо остаток»: оператор настраивает товар, а карточка на площадке живёт
+    своей жизнью, пока он не нажмёт «Вкл»."""
+    from app.models import DispatchQueueItem, Platform, Product, SyncSetting
+    from app.transmit import enqueue_full_resend
+    from tests.factories import make_account
+
+    account = make_account(db, Platform.wb)
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=10,
+                   broadcast_enabled=False))
+    db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
+    db.commit()
+
+    enqueue_full_resend(db, "u1", account.id, reason="reserve_changed")
+    db.commit()
+
+    assert db.query(DispatchQueueItem).count() == 0
+
+
+def test_a_transmitting_product_still_gets_its_update(db):
+    """Обратная сторона: у включённого товара правка по-прежнему доезжает."""
+    from app.models import DispatchQueueItem, Platform, Product, SyncSetting
+    from app.transmit import enqueue_full_resend
+    from tests.factories import make_account
+
+    account = make_account(db, Platform.wb)
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=10,
+                   broadcast_enabled=True))
+    db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
+    db.commit()
+
+    enqueue_full_resend(db, "u1", account.id, reason="reserve_changed")
+    db.commit()
+
+    assert db.query(DispatchQueueItem).count() == 1
+
+
+def test_switching_a_product_off_still_withdraws_the_stock(web_db, logged_in_client):
+    """Граница, которую легко снести этим же правилом: снятие с трансляции —
+    ОСОЗНАННЫЙ отзыв. На площадку обязан уйти ноль, иначе она продолжит продавать
+    по последнему присланному числу. Раньше это работало побочным эффектом
+    (в очередь ставилась обычная доотправка, а рассылка считала по ней ноль);
+    теперь отзыв делается явно."""
+    from app.models import DispatchQueueItem, Platform, PlatformAccount, Product, SyncSetting
+
+    account = PlatformAccount(platform=Platform.wb, name="WB-1", warehouse_id="wh")
+    web_db.add(account)
+    web_db.commit()
+    web_db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=10,
+                       broadcast_enabled=True))
+    web_db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
+    web_db.commit()
+
+    logged_in_client.post("/products/u1/broadcast", data={"enabled": "false"})
+
+    queued = web_db.query(DispatchQueueItem).all()
+    assert len(queued) == 1
+    assert queued[0].quantity == 0

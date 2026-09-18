@@ -557,7 +557,18 @@ def toggle_broadcast(
     if product.broadcast_enabled != enabled:
         product.broadcast_enabled = enabled
         log_action(db, user.username, "broadcast_toggled", f"{uid_1c} -> {enabled}")
-        _repropagate(db, product, reason="broadcast_toggled")
+        if enabled:
+            _repropagate(db, product, reason="broadcast_toggled")
+        else:
+            # Снятие с трансляции — ОСОЗНАННЫЙ отзыв: на площадку надо отправить
+            # ноль, иначе она продолжит продавать по последнему присланному
+            # числу. Раньше это работало побочным эффектом (ставили в очередь
+            # обычную доотправку, а та считала ноль); теперь автоматические пути
+            # такой товар вообще не ставят в очередь, поэтому отзыв делается явно.
+            for setting in product.sync_settings:
+                if setting.enabled:
+                    enqueue_withdrawal(db, uid_1c, setting.account_id,
+                                       reason="broadcast_off")
         db.commit()
     return _row_response(request, db, uid_1c)
 

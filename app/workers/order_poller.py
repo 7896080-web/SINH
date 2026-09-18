@@ -51,6 +51,16 @@ def _enqueue_dispatch_to_others(db: Session, uid_1c: str, source_account_id: int
 
     is_test=True (со страницы тестирования) помечает запись так, что
     dispatch.py заведомо её не отправит — см. комментарий у DispatchQueueItem."""
+    # Трансляция товара выключена — не ставим в очередь НИЧЕГО. Иначе рассылка
+    # посчитает по нему ноль и отправит этот ноль на площадку: для товара, по
+    # которому мы ещё не транслировали, это обнуление живой карточки, а не отзыв
+    # остатка. Особенно важно при актуализации задним числом: там заказы
+    # проводятся до включения трансляции, и каждый проведённый заказ отправлял бы
+    # ноль. Осознанный отзыв идёт отдельной функцией enqueue_withdrawal.
+    product = db.query(Product).filter(Product.uid_1c == uid_1c).first()
+    if product is not None and not product.broadcast_enabled:
+        return []
+
     settings = db.query(SyncSetting).filter(
         SyncSetting.uid_1c == uid_1c, SyncSetting.enabled.is_(True),
     ).all()

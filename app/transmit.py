@@ -199,8 +199,23 @@ def quantity_for_account(db: Session, uid_1c: str, account_id: int, raw_stock: i
 
 def enqueue_full_resend(db: Session, uid_1c: str, account_id: int, reason: str = "manual_enable"):
     """Разовая доотправка полного текущего остатка (раздел 10 спецификации).
-    Кладёт запись в очередь — реальную отправку делает воркер dispatch.py."""
+    Кладёт запись в очередь — реальную отправку делает воркер dispatch.py.
+
+    **Товар с выключенной трансляцией в очередь не ставится вовсе.** Раньше
+    ставился, а рассылка считала по нему ноль и этот ноль отправляла на площадку.
+    Для товара, который ещё ни разу не транслировался, это не «отзыв остатка», а
+    обнуление чужой карточки, по которой идут продажи: мы туда ничего не
+    отправляли и отзывать нам нечего.
+
+    Разница принципиальная и она в намерении. Осознанный отзыв — это
+    `enqueue_withdrawal`, отдельная функция, которую интерфейс зовёт явно, когда
+    оператор снимает галочку кабинета или выключает трансляцию. Здесь же путь
+    автоматический: доотправка после правки брони, факта, порога. Пока расчёт не
+    закончен и трансляция не включена, наружу не должно уходить ничего.
+    """
     product = db.query(Product).filter(Product.uid_1c == uid_1c).first()
+    if product is not None and not product.broadcast_enabled:
+        return
     quantity = product.stock_on_hand if product else 0
     db.add(DispatchQueueItem(uid_1c=uid_1c, account_id=account_id, quantity=quantity, reason=reason))
 
