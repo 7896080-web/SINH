@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Request, Depends, Query, UploadFile, File
+from fastapi import APIRouter, Request, Depends, Query, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session, joinedload
@@ -127,9 +127,15 @@ def mapping_export(
         filename = "конфликты_сопоставления.xlsx"
     else:
         rows = _query_mapped(db, q, source_platform)
-        headers = ["ID_1С", "Баркод", "Артикул", "Наименование", "Источник", "Добавлен"]
+        # Размер и цвет — не украшение: файл этой выгрузки правят руками, чтобы
+        # переподвязать баркод, и без них строки различаются только двумя
+        # непрозрачными идентификаторами. Перепутать размеры в таком файле проще,
+        # чем исправить то, ради чего его открыли.
+        headers = ["ID_1С", "Баркод", "Артикул", "Наименование", "Размер", "Цвет",
+                   "Источник", "Добавлен"]
         data = [
             [r.uid_1c, r.barcode, r.product.article, r.product.name,
+             r.product.size, r.product.color,
              r.source_platform or "выгрузка из 1С", format_dt(r.created_at)]
             for r in rows
         ]
@@ -140,12 +146,29 @@ def mapping_export(
 
 @router.post("/mapping/import")
 def mapping_import(
-    request: Request, file: UploadFile = File(...),
+    request: Request, file: UploadFile = File(...), repoint: bool = Form(False),
     db: Session = Depends(get_db), user: User = Depends(get_current_user),
 ):
     """Добавляет новые баркоды из выгруженного и отредактированного файла.
-    Колонка ID_1С — обязательна, это ключ сопоставления, редактировать её
-    в Excel не нужно (это внутренний идентификатор товара, не артикул)."""
+    Колонка ID_1С — ключ сопоставления, это внутренний идентификатор товара,
+    а не артикул.
+
+    `repoint` — разрешить ПЕРЕПОДВЯЗКУ: баркод уже есть, но в файле указан
+    другой товар. По умолчанию выключено, и такая строка остаётся ошибкой.
+
+    Зачем это вообще нужно. В карточках 1С встречается перепутанный баркод:
+    номер размера M на самом деле принадлежит L и наоборот. В 1С это
+    исправляют, а до нас исправление не доезжает никак — приём справочника
+    (`reconciliation.import_barcode_dict`) заводит только ОТСУТСТВУЮЩИЕ
+    баркоды, а этот импорт до сих пор отвечал «уже привязан к другому товару»
+    и строку пропускал. Другого способа переставить привязку в приложении нет,
+    а пока она неверна, заказ на один размер списывает другой.
+
+    Почему под галочкой, а не всегда. Переподвязка меняет, НА КАКОЙ товар
+    спишется заказ по этому баркоду. Случайно загруженный старый файл молча
+    переразнёс бы весь каталог, и продажи пошли бы с чужих размеров — такое
+    действие должно быть заявлено явно.
+    """
 
     try:
         rows = read_xlsx_rows(file.file.read())
@@ -155,6 +178,8 @@ def mapping_import(
 
     added, already_mapped, errors = 0, 0, []
     resolved_conflicts = 0
+    repointed = 0
+    conflicting = 0          # строки, где нужна переподвязка, а её не разрешили
 
     for i, row in enumerate(rows, start=2):  # +2: строка 1 — заголовок, Excel считает с 1
         uid_1c = str(row.get("ID_1С") or "").strip()
@@ -173,10 +198,32 @@ def mapping_import(
 
         existing = db.query(Barcode).filter(Barcode.barcode == barcode).first()
         if existing is not None:
-            if existing.uid_1c != uid_1c:
-                errors.append(f"строка {i}: баркод {barcode} уже привязан к другому товару")
-            else:
+            if existing.uid_1c == uid_1c:
                 already_mapped += 1
+                continue
+            if not repoint:
+                conflicting += 1
+                errors.append(f"строка {i}: баркод {barcode} привязан к другому товару "
+                              f"({existing.uid_1c}) — нужна галочка «разрешить переподвязку»")
+                continue
+
+            was_uid = existing.uid_1c
+            existing.uid_1c = uid_1c
+            existing.source_platform = "excel_repoint"
+            # Отметку «актуализирован» снимаем у ОБОИХ товаров. Расчёт поднимает
+            # заказы площадок по баркодам товара (`recalc.collect_orders`), и оба
+            # набора только что изменились: прежний вывод сделан по чужим
+            # баркодам и к новому составу не относится. Оставить отметку значило
+            # бы разрешить трансляцию остатка, сверенного не по тем продажам.
+            for affected_uid in (was_uid, uid_1c):
+                p = db.query(Product).filter(Product.uid_1c == affected_uid).first()
+                if p is not None:
+                    p.recalc_done_at = None
+                    p.recalc_account_ids = None
+            log_action(db, user.username, "barcode_repointed",
+                       f"{barcode}: {was_uid} -> {uid_1c}")
+            repointed += 1
+            db.query(MappingConflict).filter(MappingConflict.barcode == barcode).delete()
             continue
 
         db.add(Barcode(barcode=barcode, uid_1c=uid_1c, source_platform="excel_import"))
@@ -190,11 +237,17 @@ def mapping_import(
     # Массовый импорт меняет ключ сопоставления для многих товаров сразу —
     # соседние операции пишутся в журнал, эта не писалась.
     log_action(db, user.username, "mapping_import",
-               f"добавлено {added}, уже были {already_mapped}, "
+               f"добавлено {added}, уже были {already_mapped}, переподвязано {repointed}, "
                f"разрешено конфликтов {resolved_conflicts}, ошибок {len(errors)}")
     db.commit()
 
     message = f"Добавлено баркодов: {added}. Уже были сопоставлены: {already_mapped}."
+    if repointed:
+        message += (f" Переподвязано: {repointed} — по этим товарам снята отметка "
+                    f"«актуализирован», нужен новый расчёт.")
+    if conflicting and not repoint:
+        message += (f" Требуют переподвязки: {conflicting}. Включите галочку "
+                    f"«разрешить переподвязку» и загрузите файл ещё раз.")
     if resolved_conflicts:
         message += f" Разрешено конфликтов сопоставления: {resolved_conflicts}."
     if errors:
