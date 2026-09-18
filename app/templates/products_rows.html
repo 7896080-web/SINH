@@ -1,7 +1,9 @@
 <table class="pr-table">
     <thead>
         <tr>
-            <th></th>
+            <th><input type="checkbox" id="pr-all" name="all_filtered" value="true"
+                       form="bulk-form"
+                       title="Выбрать ВСЕ товары текущего отбора — не только показанные строки"></th>
             <th>Артикул</th><th>Размер</th><th>Цвет</th><th>Наименование</th>
             <th title="Из 1С, вручную не меняется">Остаток ЦС</th>
             <th title="Бронь: держим у себя и не отдаём площадкам. Входит в расчёт порога.">Резерв (бронь)</th>
@@ -27,3 +29,23 @@
         {% endif %}
     </tbody>
 </table>
+
+{# Фильтры уезжают в форму массовой правки ОТСЮДА, а не из шапки страницы: этот
+   фрагмент перерисовывается при каждом изменении фильтра, значит значения всегда
+   те, что оператор видит на экране. В шапке они оставались бы от прошлой полной
+   загрузки — и правка «по всему фильтру» применилась бы не к тому отбору. #}
+<input type="hidden" name="q" value="{{ q }}" form="bulk-form">
+{% if only_proposals %}<input type="hidden" name="only_proposals" value="true" form="bulk-form">{% endif %}
+{% if only_blocked %}<input type="hidden" name="only_blocked" value="true" form="bulk-form">{% endif %}
+{% if hide_size_u %}<input type="hidden" name="hide_size_u" value="true" form="bulk-form">{% endif %}
+{% if only_unfinished %}<input type="hidden" name="only_unfinished" value="true" form="bulk-form">{% endif %}
+
+<div class="pr-allfilter">
+    Галочка в шапке таблицы выбирает <b>весь текущий отбор</b>
+    {% if total is defined %}— {% if total < 0 %}{{ -total }}+{% else %}{{ total }}{% endif %} товаров{% endif %},
+    а не только показанные строки. Массовая правка применится ко всем им.
+    {% if total is defined and (total > rows|length or total < 0) %}
+    <div class="pr-hint pr-hint--warn">Показано {{ rows|length }} — остальные под отбор
+        тоже попадают и тоже будут изменены, хотя их не видно.</div>
+    {% endif %}
+</div>

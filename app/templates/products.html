@@ -43,6 +43,12 @@
   .pr-bulk input{width:auto}
   .pr-ladder{font-size:13px;line-height:1.7;margin:6px 0 0}
   .pr-ladder li{margin-bottom:2px}
+  .pr-status{display:inline-block;font-size:11px;padding:1px 7px;border-radius:999px;margin-bottom:4px;white-space:nowrap}
+  .pr-status--none{background:#eef0f4;color:#667}
+  .pr-status--waiting{background:#fbf1de;color:#b5750f}
+  .pr-status--need_fact{background:#fbf1de;color:#b5750f}
+  .pr-status--ready{background:#e7f3ec;color:#2f7d4f;font-weight:600}
+  .pr-allfilter{margin:8px 0 0;padding:8px 10px;border:1px solid #f0d9a8;background:#fdf6e6;border-radius:6px;font-size:13px}
 </style>
 
 <div class="page-header">
@@ -53,7 +59,6 @@
         рядом написана причина.</p>
     </div>
     <div class="toolbar">
-        <a href="/products/export?q={{ q }}&only_proposals={{ only_proposals|lower }}&only_blocked={{ only_blocked|lower }}&hide_size_u={{ hide_size_u|lower }}&only_unfinished={{ only_unfinished|lower }}" class="btn">Экспорт в Excel</a>
         <form method="post" action="/products/import" enctype="multipart/form-data" style="display:inline;">
             <label class="btn file-upload-btn">
                 Импорт из Excel
@@ -129,15 +134,30 @@
         <input type="checkbox" name="only_unfinished" value="true" {% if only_unfinished %}checked{% endif %}>
         Только незавершённый расчёт
     </label>
+    {# Экспорт — кнопка ЭТОЙ ЖЕ формы. Была отдельная ссылка, и её параметры
+       ставились при загрузке страницы: фильтры применяются живьём (htmx меняет
+       только таблицу), поэтому оператор менял отбор, видел новые строки, жал
+       «Экспорт» и получал файл по ПРЕЖНЕМУ фильтру. Кнопка формы собирает
+       значения полей в момент нажатия, разойтись им теперь не с чем.
+       htmx submit не перехватывает: в hx-trigger только keyup и change. #}
+    <button type="submit" formaction="/products/export" formmethod="get" class="btn"
+            style="margin-left:auto;"
+            title="Выгружает всё, что подходит под фильтры выше — ровно то, что сейчас в таблице">
+        Экспорт в Excel
+    </button>
 </form>
 
+{# Фильтры для этой формы приходят из фрагмента таблицы (products_rows.html):
+   он перерисовывается при каждом изменении отбора, а шапка страницы — нет. #}
 <form id="bulk-form" method="post" action="/products/bulk" class="pr-bulk">
-  <input type="hidden" name="q" value="{{ q }}">
   <span class="muted">С отмеченными:</span>
   <input type="number" name="int_value" placeholder="число" style="width:80px;">
   <button name="action" value="set_reserve">Резерв (бронь) =</button>
   <button name="action" value="set_fact">Факт на дату =</button>
   <button name="action" value="fact_from_stock" title="Там, где факт не введён, подставить остаток ЦС на дату">Факт = остаток ЦС</button>
+  <button name="action" value="stock_to_fact" class="pr-on"
+          title="Весь расчёт одним нажатием: поставить дату (из поля справа или уже заданную), подтянуть остаток ЦС на неё и записать его как факт. Строка станет «готово».">
+      Записать остаток ЦС на дату</button>
   <button name="action" value="clear_offset">Сбросить порог</button>
   <button name="action" value="broadcast_on" class="pr-on">Трансляция вкл</button>
   <button name="action" value="broadcast_off" class="pr-off">Трансляция выкл</button>
@@ -145,6 +165,21 @@
   <button name="action" value="set_base_date">Дата расчёта =</button>
   <button name="action" value="set_active_since">Активно с =</button>
 </form>
+
+<script>
+// Чекбокс в шапке — это «весь отбор»: он сам уходит в форму как all_filtered,
+// и сервер применяет правку ко всем подходящим товарам, а не к показанным
+// строкам. Здесь только визуальная часть: отмечаем видимые строки, чтобы было
+// видно, что выбор сделан. Обработчик делегированный — htmx подменяет таблицу
+// целиком при каждом изменении фильтра, и обработчик, повешенный прямо на
+// чекбокс, не пережил бы первую же перерисовку.
+document.addEventListener("change", function (e) {
+    if (e.target.id !== "pr-all") return;
+    document.querySelectorAll('input[name="uids"]').forEach(function (cb) {
+        cb.checked = e.target.checked;
+    });
+});
+</script>
 
 <div class="card table-scroll" style="padding:0;">
     <div id="pr-table">
