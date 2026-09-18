@@ -110,6 +110,26 @@ def _calc_status(product: Product, has_cabinet: bool = True,
     return ("ready", "актуализирован")
 
 
+def _blocks_broadcast_on(product: Product) -> str | None:
+    """Почему этот товар нельзя включать в трансляцию. None — можно.
+
+    Правило заказчика с самого начала одно: сначала расчёт, потом трансляция.
+    Ступень 2 лестницы закрывает случай «расчёт был, но кабинет отметили позже»,
+    а случай «расчёта не было вовсе» оставался открытым: у такого товара
+    `recalc_done_at` пуст, ступень не срабатывает, и включение отправляет на
+    площадки остаток, не сверенный ни с чем. Именно так выглядела строка
+    ZJYM269002 XL — «ждём 1С», а рядом «→ 21 после включения».
+
+    Проверяем на ВКЛЮЧЕНИИ. Выключение не трогаем никогда: снять с трансляции
+    должно быть можно в любой момент и без условий.
+    """
+    enabled_ids = {s.account_id for s in product.sync_settings if s.enabled}
+    code, label = _calc_status(product, bool(enabled_ids), enabled_ids)
+    if code == "ready":
+        return None
+    return label
+
+
 def _row(product: Product, accounts: list[PlatformAccount],
          all_accounts: dict[int, PlatformAccount] | None = None) -> dict:
     """Строка таблицы. По каждому кабинету — реальное число и причина нуля."""
@@ -591,6 +611,13 @@ def toggle_broadcast(
     if product is None:
         return HTMLResponse("", status_code=404)
     if product.broadcast_enabled != enabled:
+        if enabled:
+            blocked = _blocks_broadcast_on(product)
+            if blocked is not None:
+                return _row_response(
+                    request, db, uid_1c, error_field="broadcast",
+                    error=f"Включать трансляцию рано: {blocked}. Сначала расчёт — "
+                          f"иначе на площадки уйдёт остаток, не сверенный с их продажами.")
         product.broadcast_enabled = enabled
         log_action(db, user.username, "broadcast_toggled", f"{uid_1c} -> {enabled}")
         if enabled:
@@ -822,8 +849,13 @@ def bulk_edit(
         set_flash(request, message, "good")
         return back()
 
-    changed = skipped = 0
+    changed = skipped = refused = 0
     for p in products:
+        if action == "broadcast_on" and _blocks_broadcast_on(p) is not None:
+            # Молча пропустить нельзя: оператор решил бы, что включил всё
+            # отобранное. Считаем и называем в отчёте.
+            refused += 1
+            continue
         if action == "set_reserve":
             p.reserve = n
         elif action == "set_offset":
@@ -884,7 +916,11 @@ def bulk_edit(
     if skipped:
         message += (f" Пропущено {skipped}: 1С ещё не прислала выгрузку на эту дату — "
                     f"порог у них посчитается сам, когда придёт ответ.")
-    set_flash(request, message, "good" if not skipped else "warn")
+    if refused:
+        message += (f" Не включено {refused}: расчёт по ним не закончен. Трансляция "
+                    f"включается только после него — иначе на площадки уйдёт остаток, "
+                    f"не сверенный с их продажами.")
+    set_flash(request, message, "good" if not (skipped or refused) else "warn")
     return back()
 
 

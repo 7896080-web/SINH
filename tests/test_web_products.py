@@ -172,13 +172,68 @@ def test_clear_legacy_override(logged_in_client, web_db):
     assert web_db.query(Product).first().transmit_override is None
 
 
+def _ready_for_broadcast(web_db, uid="u1", account=None):
+    """Строка, доведённая до «актуализирован»: кабинет отмечен, дата задана, 1С
+    ответила, факт подтверждён, расчёт прошёл и покрыл этот кабинет.
+
+    Трансляция включается только с этого состояния — правило «сначала расчёт,
+    потом трансляция». Раньше включить можно было что угодно и когда угодно, и
+    строка ZJYM269002 XL показала, чем это кончается: «ждём 1С», а рядом
+    «→ 21 после включения» от порога, оставшегося с другой даты.
+    """
+    from datetime import date as _date
+
+    from app.timeutils import now_utc
+
+    account = account or _accounts(web_db, (Platform.wb, "WB-1"))[0]
+    _sync(web_db, uid, account)
+    product = web_db.query(Product).filter(Product.uid_1c == uid).one()
+    product.offset_base_date = _date(2026, 8, 7)
+    product.offset_base_stock = 10
+    product.fact_at_date = 10
+    product.recalc_done_at = now_utc()
+    product.recalc_account_ids = str(account.id)
+    web_db.commit()
+    return account
+
+
 def test_broadcast_toggle(logged_in_client, web_db):
     _product(web_db, broadcast=False)
+    _ready_for_broadcast(web_db)
+
     logged_in_client.post("/products/u1/broadcast", data={"enabled": "true"})
     web_db.expire_all()
     assert web_db.query(Product).first().broadcast_enabled is True
 
     logged_in_client.post("/products/u1/broadcast", data={"enabled": "false"})
+    web_db.expire_all()
+    assert web_db.query(Product).first().broadcast_enabled is False
+
+
+def test_broadcast_cannot_be_switched_on_before_the_catch_up(logged_in_client, web_db):
+    """Ровно случай ZJYM269002 XL: расчёта не было, 1С на новую дату не ответила,
+    а порог остался с прошлой — включение отправило бы на площадки остаток,
+    не сверенный ни с чем."""
+    _product(web_db, broadcast=False, offset=0)
+    account = _accounts(web_db, (Platform.wb, "WB-1"))[0]
+    _sync(web_db, "u1", account)
+
+    r = logged_in_client.post("/products/u1/broadcast", data={"enabled": "true"})
+
+    web_db.expire_all()
+    assert web_db.query(Product).first().broadcast_enabled is False
+    assert "Включать трансляцию рано" in r.text
+
+
+def test_switching_broadcast_off_is_never_blocked(logged_in_client, web_db):
+    """Снять с трансляции должно быть можно всегда: товар мог начать
+    транслироваться до того, как появилось это правило."""
+    _product(web_db, broadcast=True)
+    account = _accounts(web_db, (Platform.wb, "WB-1"))[0]
+    _sync(web_db, "u1", account)
+
+    logged_in_client.post("/products/u1/broadcast", data={"enabled": "false"})
+
     web_db.expire_all()
     assert web_db.query(Product).first().broadcast_enabled is False
 

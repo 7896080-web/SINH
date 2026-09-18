@@ -7,7 +7,7 @@
     <td>{{ row.color or '' }}</td>
     <td>
         {{ row.name or '—' }}
-        {% if error and error_field not in ('reserve', 'offset', 'active_since', 'base_date', 'fact') and not error_field.startswith('threshold:') %}
+        {% if error and error_field not in ('reserve', 'offset', 'active_since', 'base_date', 'fact', 'broadcast') and not error_field.startswith('threshold:') %}
             <div class="pr-error" role="alert">⚠ {{ error }}</div>
         {% endif %}
         {% if not row.has_barcode %}
@@ -89,6 +89,12 @@
                 порог <b>{{ row.broadcast_offset }}</b>
                 {% if row.base_date and not row.waiting_for_1c %}
                     <div class="pr-hint">{{ row.base_stock }} − ({{ row.fact_at_date if row.fact_at_date is not none else row.base_stock }} − бронь {{ row.reserve }})</div>
+                {% elif row.waiting_for_1c %}
+                    {# Дату сменили, 1С по новой ещё не ответила, а порог остался
+                       от прошлого расчёта: стирать его нельзя — это молча вернуло
+                       бы на площадки полный остаток. Но и называть его «заданным
+                       вручную» неправда: считали его мы, и на другую дату. #}
+                    <div class="pr-hint pr-hint--warn">от прошлого расчёта — ждём новый</div>
                 {% else %}
                     <div class="pr-hint">задан вручную</div>
                 {% endif %}
@@ -99,6 +105,7 @@
     </td>
 
     <td>
+        {{ field_error('broadcast') }}
         <button type="button" class="{{ 'pr-on' if row.broadcast_enabled else 'pr-off' }}"
                 hx-post="/products/{{ row.uid_1c }}/broadcast"
                 hx-vals='{"enabled": "{{ 'false' if row.broadcast_enabled else 'true' }}"}'
@@ -167,12 +174,18 @@
             {{ field_error('threshold:' ~ account.id) }}
             {% if not state.enabled %}
                 <span class="pr-hint">не передаётся</span>
-            {% elif state.blocked and state.potential %}
+            {% elif state.blocked and state.potential and row.calc_status == 'ready' %}
                 {# Прогноз вместо нуля: оператор смотрит сюда перед включением,
                    и «0, потому что выключено» не отвечает на его вопрос — ему
-                   нужно знать, какое число уйдёт, если нажать «Вкл». #}
+                   нужно знать, какое число уйдёт, если нажать «Вкл».
+                   Только у ГОТОВОЙ строки: пока расчёт не закончен, это число
+                   считается от порога, оставшегося с другой даты, и обещает то,
+                   чего включать ещё нельзя. #}
                 <span class="pr-hint pr-hint--pending" title="{{ state.reason }}. {{ state.fix_hint }}">
                     → <b>{{ state.potential }}</b> после включения</span>
+            {% elif state.blocked and not row.broadcast_enabled and row.calc_status != 'ready' %}
+                <span class="pr-hint" title="{{ row.calc_status_label }} — трансляцию включать рано">
+                    → после расчёта</span>
             {% elif state.blocked %}
                 <span class="pr-hint pr-hint--warn" title="{{ state.fix_hint }}">→ 0: {{ state.reason }}</span>
             {% else %}
