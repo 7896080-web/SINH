@@ -25,6 +25,9 @@ class OzonClient(PlatformClient):
             "Api-Key": api_key,
             "Content-Type": "application/json",
         })
+        # Выдачу оборвал защитный предел страниц, а не конец данных — картина
+        # неполная, и вызывающий обязан это знать (см. recalc.collect_orders).
+        self.last_truncated = False
 
     def _post(self, path: str, json_body=None):
         def call():
@@ -126,9 +129,18 @@ class OzonClient(PlatformClient):
                         barcode=barcode, quantity=int(product.get("quantity", 1)),
                         raw_status=str(posting.get("status") or ""), order_date=order_date,
                     ))
-            if len(postings) < 1000:
+            # Конец данных определяет сам Озон полем has_next, а не длина
+            # страницы: короткая страница при has_next=true у него бывает, и
+            # ранний стоп молча съедал бы хвост ленты. Ровно на этом у WB
+            # терялись заказы целыми неделями (см. wb.ORDERS_WINDOW_DAYS).
+            has_next = data.get("result", {}).get("has_next")
+            if has_next is None:
+                has_next = len(postings) >= 1000
+            if not has_next:
                 break
             offset += len(postings)
+        else:
+            self.last_truncated = True
         return result
 
     def get_cancelled_orders(self, order_ids: list[str]) -> list[PlatformOrder]:
