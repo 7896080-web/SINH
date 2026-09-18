@@ -9,10 +9,16 @@ from app.timeutils import now_utc
 
 
 def _run_reset(env, *args):
+    # Кодировку задаём с ОБЕИХ сторон и одинаковую. Раньше её не задавали вовсе:
+    # дочерний процесс печатал в своей, родитель декодировал в локальной, и на
+    # Windows это совпадало только пока никто не трогал PYTHONIOENCODING. Стоило
+    # выставить его в консоли перед прогоном (например, разбирая логи), как все
+    # три теста падали на кириллице — при полностью исправном скрипте.
     return subprocess.run(
         [sys.executable, "reset_password.py", *args],
         cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         env=env, capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
     )
 
 
@@ -21,6 +27,9 @@ def _base_env():
     env["DATABASE_URL"] = os.environ["DATABASE_URL"]
     env["SESSION_SECRET"] = os.environ.get("SESSION_SECRET", "x")
     env["SECRETS_ENCRYPTION_KEY"] = os.environ["SECRETS_ENCRYPTION_KEY"]
+    # Не наследуем то, что оператор выставил в консоли: тест должен зависеть от
+    # самого скрипта, а не от окружения, в котором его случайно запустили.
+    env["PYTHONIOENCODING"] = "utf-8"
     return env
 
 
