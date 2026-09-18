@@ -224,3 +224,55 @@ def test_error_text_is_still_available_to_the_operator(logged_in_client, web_db)
     r = logged_in_client.get("/diagnostics")
 
     assert "wildberries.ru" in r.text
+
+
+# ------------------- 15б. per-account задание, не отработавшее НИ РАЗУ
+
+def test_a_never_run_account_job_is_missing_not_invisible(client, web_db):
+    """Находка 19.09: суточная выгрузка каталога не запускалась вовсе — первый
+    прогон откладывался на сутки, а процесс столько не живёт. Строки heartbeat не
+    было, проверялись только существующие строки, и /health был зелёный при
+    снимке каталога пятидневной давности."""
+    account = _account(web_db)
+    _all_required(web_db)
+    _hb(web_db, f"poll_orders_account_{account.id}")
+    # catalog_poll_account_<id> не писали вовсе — задание не отработало ни разу
+
+    r = client.get("/health")
+
+    assert r.status_code == 503
+    assert r.json()["missing_workers"] == [f"catalog_poll_account_{account.id}"]
+
+
+def test_account_jobs_that_did_run_keep_health_green(client, web_db):
+    account = _account(web_db)
+    _all_required(web_db)
+    _hb(web_db, f"poll_orders_account_{account.id}")
+    _hb(web_db, f"catalog_poll_account_{account.id}")
+
+    r = client.get("/health")
+
+    assert r.status_code == 200
+    assert r.json()["missing_workers"] == []
+
+
+def test_account_jobs_are_forgiven_right_after_restart(client, web_db):
+    """Сразу после рестарта выгрузка каталога ещё не отработала — это не тревога."""
+    _account(web_db)
+    _all_required(web_db, uptime_seconds=60)
+
+    r = client.get("/health")
+
+    assert r.status_code == 200
+    assert r.json()["missing_workers"] == []
+
+
+def test_a_disabled_account_does_not_demand_its_jobs(client, web_db):
+    """Снятый кабинет заданий не имеет — требовать их отчёта нельзя."""
+    _account(web_db, active=False)
+    _all_required(web_db)
+
+    r = client.get("/health")
+
+    assert r.status_code == 200
+    assert r.json()["missing_workers"] == []
