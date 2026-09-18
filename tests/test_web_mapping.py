@@ -50,7 +50,8 @@ def test_mapping_export_mapped_view(logged_in_client, web_db):
 
     wb = load_workbook(io.BytesIO(r.content))
     ws = wb.active
-    assert [c.value for c in ws[1]] == ["ID_1С", "Баркод", "Артикул", "Наименование", "Источник", "Добавлен"]
+    assert [c.value for c in ws[1]] == ["ID_1С", "Баркод", "Артикул", "Наименование",
+                                        "Размер", "Цвет", "Источник", "Добавлен"]
     assert ws.cell(row=2, column=2).value == "4600000000001"
 
 
@@ -190,3 +191,128 @@ def test_mapping_conflict_resolution_full_cycle_via_excel(logged_in_client, web_
 
     r3 = logged_in_client.get("/mapping")
     assert "555" in r3.text
+
+
+# ------------------------------------------------ переподвязка перепутанных баркодов
+
+def _seed_two_sizes(web_db):
+    """Ровно случай с боя: баркоды размеров перепутаны местами.
+
+    В карточках 1С баркод размера M принадлежал L и наоборот. В 1С это
+    исправили, а к нам исправление не доезжает: приём справочника заводит
+    только отсутствующие баркоды, а импорт из Excel до этой правки отвечал
+    «уже привязан к другому товару» и строку пропускал. Пока привязка неверна,
+    заказ на M списывает L.
+    """
+    from app.models import Barcode, Product
+    from app.timeutils import now_utc
+
+    for uid, size in (("u-l", "L"), ("u-m", "M")):
+        web_db.add(Product(uid_1c=uid, article="ZJYM269002", name="Джемпер",
+                           size=size, color="011/коричневый", stock_on_hand=10,
+                           recalc_done_at=now_utc(), recalc_account_ids="1"))
+    web_db.add(Barcode(barcode="bc-L", uid_1c="u-m"))     # перепутано
+    web_db.add(Barcode(barcode="bc-M", uid_1c="u-l"))     # перепутано
+    web_db.commit()
+
+
+def _repoint_file(rows):
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["ID_1С", "Баркод", "Артикул", "Наименование", "Размер", "Цвет",
+               "Источник", "Добавлен"])
+    for uid, barcode in rows:
+        ws.append([uid, barcode, "ZJYM269002", "Джемпер", "", "", "", ""])
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _post_import(client, payload, repoint=False):
+    return client.post(
+        "/mapping/import",
+        files={"file": ("import.xlsx", payload,
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+        data={"repoint": "true"} if repoint else {},
+        follow_redirects=False,
+    )
+
+
+def test_import_refuses_to_repoint_without_the_checkbox(logged_in_client, web_db):
+    """Переподвязка меняет, на какой товар спишется заказ. Случайно загруженный
+    старый файл не должен молча переразнести каталог."""
+    from app.models import Barcode
+
+    _seed_two_sizes(web_db)
+
+    _post_import(logged_in_client, _repoint_file([("u-l", "bc-L"), ("u-m", "bc-M")]))
+
+    web_db.expire_all()
+    assert web_db.query(Barcode).filter(Barcode.barcode == "bc-L").one().uid_1c == "u-m"
+    assert "разрешить переподвязку" in logged_in_client.get("/mapping").text
+
+
+def test_swapped_barcodes_are_put_back_in_one_import(logged_in_client, web_db):
+    """Обмен местами проходит одним файлом: баркод уникален сам по себе, мы его
+    не пересоздаём, а переставляем ссылку — двум строкам столкнуться не на чем."""
+    from app.models import Barcode
+
+    _seed_two_sizes(web_db)
+
+    _post_import(logged_in_client, _repoint_file([("u-l", "bc-L"), ("u-m", "bc-M")]),
+                 repoint=True)
+
+    web_db.expire_all()
+    assert web_db.query(Barcode).filter(Barcode.barcode == "bc-L").one().uid_1c == "u-l"
+    assert web_db.query(Barcode).filter(Barcode.barcode == "bc-M").one().uid_1c == "u-m"
+    assert "Переподвязано: 2" in logged_in_client.get("/mapping").text
+
+
+def test_repointing_drops_the_done_mark_on_both_products(logged_in_client, web_db):
+    """Расчёт собирал заказы по прежнему набору баркодов — к новому его вывод
+    не относится. Оставить «актуализирован» значило бы разрешить трансляцию
+    остатка, сверенного не по тем продажам."""
+    from app.models import Product
+
+    _seed_two_sizes(web_db)
+
+    _post_import(logged_in_client, _repoint_file([("u-l", "bc-L")]), repoint=True)
+
+    web_db.expire_all()
+    for uid in ("u-l", "u-m"):
+        product = web_db.query(Product).filter(Product.uid_1c == uid).one()
+        assert product.recalc_done_at is None, uid
+        assert product.recalc_account_ids is None, uid
+
+
+def test_an_unchanged_row_is_not_counted_as_repointed(logged_in_client, web_db):
+    """Файл выгружают целиком, а правят одну-две строки. Остальные должны
+    проходить как «уже сопоставлены», а не тревожить сбросом расчёта."""
+    from app.models import Product
+
+    _seed_two_sizes(web_db)
+
+    _post_import(logged_in_client, _repoint_file([("u-m", "bc-L")]), repoint=True)
+
+    web_db.expire_all()
+    body = logged_in_client.get("/mapping").text
+    assert "Уже были сопоставлены: 1" in body
+    assert "Переподвязано" not in body
+    assert web_db.query(Product).filter(Product.uid_1c == "u-m").one().recalc_done_at is not None
+
+
+def test_export_carries_size_and_colour(logged_in_client, web_db):
+    """Без них строки файла различаются только двумя непрозрачными
+    идентификаторами, и перепутать размеры в нём проще, чем исправить."""
+    _seed_two_sizes(web_db)
+
+    r = logged_in_client.get("/mapping/export?view=mapped")
+
+    ws = load_workbook(io.BytesIO(r.content)).active
+    header = [c.value for c in ws[1]]
+    assert "Размер" in header and "Цвет" in header
+    rows = {r[header.index("Баркод")].value: r[header.index("Размер")].value
+            for r in ws.iter_rows(min_row=2)}
+    assert rows["bc-L"] == "M"        # пока перепутано — файл это и показывает
+    assert rows["bc-M"] == "L"
