@@ -363,7 +363,7 @@ def test_a_row_with_a_threshold_but_no_catch_up_is_not_ready(logged_in_client, w
 
 
 def test_a_row_after_the_catch_up_says_it_is_ready(logged_in_client, web_db):
-    from app.timeutils import now_utc
+    from app.timeutils import now_utc, today_local
 
     _with_cabinet(web_db, "u1", broadcast=False, offset_base_date=date(2026, 8, 7),
                   offset_base_stock=14, fact_at_date=14, recalc_done_at=now_utc())
@@ -375,7 +375,7 @@ def test_a_row_after_the_catch_up_says_it_is_ready(logged_in_client, web_db):
 
 
 def test_an_already_broadcasting_row_is_not_told_to_switch_on(logged_in_client, web_db):
-    from app.timeutils import now_utc
+    from app.timeutils import now_utc, today_local
 
     _with_cabinet(web_db, "u1", broadcast=True, offset_base_date=date(2026, 8, 7),
                   offset_base_stock=14, fact_at_date=14, recalc_done_at=now_utc())
@@ -590,7 +590,7 @@ def test_a_cabinet_shows_what_would_be_sent_after_switching_on(logged_in_client,
     """Оператор смотрит в колонку кабинета ПЕРЕД включением. «0, потому что
     выключено» не отвечает на его вопрос — ему нужно число, которое уйдёт, если
     нажать «Вкл»."""
-    from app.timeutils import now_utc
+    from app.timeutils import now_utc, today_local
 
     product = _with_cabinet(web_db, "u1", broadcast=False,
                             offset_base_date=date(2026, 8, 7), offset_base_stock=30,
@@ -686,7 +686,7 @@ def test_a_cabinet_added_after_the_catch_up_makes_the_row_ask_for_a_recount(
         logged_in_client, web_db):
     """«Актуализирован» на такой строке — неправда, а именно на неё оператор
     опирается, когда включает трансляцию."""
-    from app.timeutils import now_utc
+    from app.timeutils import now_utc, today_local
 
     _with_cabinet(web_db, "u1", covered=False, offset_base_date=date(2026, 8, 7),
                   offset_base_stock=14, fact_at_date=14, recalc_done_at=now_utc())
@@ -725,7 +725,7 @@ def test_the_ready_badge_does_not_swallow_the_whole_row(logged_in_client, web_db
     """Подсказка «перемещения в 1С созданы» жила ВНУТРИ значка, а значок не
     переносится: колонка расчёта растягивалась на всю ширину и выдавливала
     «Размер» и «Цвет» за край таблицы. Теперь подсказка — отдельная строка."""
-    from app.timeutils import now_utc
+    from app.timeutils import now_utc, today_local
 
     _with_cabinet(web_db, "u1", broadcast=False, offset_base_date=date(2026, 8, 7),
                   offset_base_stock=14, fact_at_date=14, recalc_done_at=now_utc())
@@ -874,7 +874,7 @@ def test_bulk_cabinet_off_withdraws_only_where_we_did_send(logged_in_client, web
     """Правило то же, что у галочки в строке: ноль уходит только туда, куда мы
     реально отправляли остаток. Иначе массовое снятие обнулило бы живые карточки."""
     from app.models import DispatchQueueItem, DispatchStatus, SyncSetting
-    from app.timeutils import now_utc
+    from app.timeutils import now_utc, today_local
 
     account = _account(web_db)
     _product(web_db, "u1", broadcast=True)
@@ -939,7 +939,7 @@ def test_the_cabinet_picker_is_on_the_page(logged_in_client, web_db):
 def test_ticking_a_cabinet_stamps_active_since(logged_in_client, web_db):
     """Отметка кабинета и есть момент, с которого товар живёт на площадке. Дату
     этого момента оператор вписывал руками — то есть забывал."""
-    from app.timeutils import now_utc
+    from app.timeutils import now_utc, today_local
 
     account = _account(web_db)
     _product(web_db, "u1")
@@ -948,7 +948,7 @@ def test_ticking_a_cabinet_stamps_active_since(logged_in_client, web_db):
 
     web_db.expire_all()
     p = web_db.query(Product).filter(Product.uid_1c == "u1").one()
-    assert p.broadcast_active_since == now_utc().date()
+    assert p.broadcast_active_since == today_local()
 
 
 def test_an_existing_active_since_is_not_overwritten(logged_in_client, web_db):
@@ -965,7 +965,7 @@ def test_an_existing_active_since_is_not_overwritten(logged_in_client, web_db):
 
 
 def test_bulk_cabinet_on_stamps_active_since_too(logged_in_client, web_db):
-    from app.timeutils import now_utc
+    from app.timeutils import now_utc, today_local
 
     account = _account(web_db)
     _product(web_db, "u1")
@@ -975,4 +975,4 @@ def test_bulk_cabinet_on_stamps_active_since_too(logged_in_client, web_db):
 
     web_db.expire_all()
     assert web_db.query(Product).filter(Product.uid_1c == "u1").one() \
-        .broadcast_active_since == now_utc().date()
+        .broadcast_active_since == today_local()

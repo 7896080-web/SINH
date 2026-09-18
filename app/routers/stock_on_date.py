@@ -30,7 +30,7 @@ from app.excel_utils import build_xlsx_response
 from app.flash import set_flash, pop_flash
 from app.models import StockDateRow, StockDateSnapshot, StockDateStatus, User
 from app.offset_base import open_request
-from app.timeutils import now_utc
+from app.timeutils import today_local
 
 router = APIRouter()
 templates = Jinja2Templates(directory="app/templates")
@@ -102,7 +102,7 @@ def _render(request: Request, db: Session, user: User, template: str,
         "total": total, "shown": len(rows), "quantity_total": quantity_total,
         "rows_limit": ROWS_LIMIT, "q": q, "nonzero": nonzero,
         "status_labels": STATUS_LABELS,
-        "today": now_utc().date().isoformat(),
+        "today": today_local().isoformat(),
         "flash": pop_flash(request) if template == "stock_on_date.html" else None,
     })
 
@@ -138,7 +138,7 @@ def request_stock_on_date(
         set_flash(request, "Дата должна быть в формате ГГГГ-ММ-ДД.", "warn")
         return RedirectResponse("/stock-on-date", status_code=303)
 
-    if snapshot_date > now_utc().date():
+    if snapshot_date > today_local():
         set_flash(request, "Остатков на будущую дату в 1С нет — выберите сегодняшнее или "
                            "прошедшее число.", "warn")
         return RedirectResponse("/stock-on-date", status_code=303)

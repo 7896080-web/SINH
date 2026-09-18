@@ -15,7 +15,7 @@ import pytest
 
 from app.models import (Barcode, DispatchQueueItem, Product, StockDateRow, StockDateSnapshot,
                         StockDateStatus, SyncSetting)
-from app.timeutils import now_utc
+from app.timeutils import now_utc, today_local
 from app.workers.ftp_channel import (LocalExchange, MAX_DATE_REQUESTS_PER_BATCH,
                                      STOCK_ON_DATE_TIMEOUT_MINUTES, apply_stock_on_date_files,
                                      build_task_batch, detect_timed_out_stock_date_requests,
@@ -345,7 +345,7 @@ def test_bad_date_is_refused_with_a_message(logged_in_client, web_db):
 
 
 def test_future_date_is_refused(logged_in_client, web_db):
-    tomorrow = (now_utc().date() + timedelta(days=1)).isoformat()
+    tomorrow = (today_local() + timedelta(days=1)).isoformat()
 
     r = logged_in_client.post("/stock-on-date/request", data={"value": tomorrow},
                               follow_redirects=True)

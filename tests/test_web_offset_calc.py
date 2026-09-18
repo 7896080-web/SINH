@@ -8,7 +8,7 @@ from datetime import date, timedelta
 
 from app.models import (Platform, PlatformAccount, Product, StockDateRow, StockDateSnapshot,
                         StockDateStatus)
-from app.timeutils import now_utc
+from app.timeutils import now_utc, today_local
 
 DAY = date(2026, 8, 7)
 
@@ -81,7 +81,7 @@ def test_waiting_for_1c_is_visible_in_the_row(logged_in_client, web_db):
 
 def test_future_date_is_refused(logged_in_client, web_db):
     product = _product(web_db)
-    tomorrow = (now_utc().date() + timedelta(days=1)).isoformat()
+    tomorrow = (today_local() + timedelta(days=1)).isoformat()
 
     r = logged_in_client.post("/products/u1/base-date", data={"value": tomorrow})
 
@@ -164,7 +164,7 @@ def test_bulk_fact_from_stock_does_not_overwrite_typed_values(logged_in_client, 
 
 def test_bulk_future_date_is_refused(logged_in_client, web_db):
     product = _product(web_db)
-    tomorrow = (now_utc().date() + timedelta(days=1)).isoformat()
+    tomorrow = (today_local() + timedelta(days=1)).isoformat()
 
     logged_in_client.post("/products/bulk", data={
         "action": "set_base_date", "uids": ["u1"], "date_value": tomorrow})
@@ -346,7 +346,7 @@ def test_import_still_honours_a_hand_typed_threshold_without_a_date(logged_in_cl
 
 def test_import_refuses_a_future_date(logged_in_client, web_db):
     product = _product(web_db)
-    tomorrow = (now_utc().date() + timedelta(days=1)).isoformat()
+    tomorrow = (today_local() + timedelta(days=1)).isoformat()
 
     _upload(logged_in_client, _xlsx(["ID_1С", "Дата расчёта"], [["u1", tomorrow]]))
 
