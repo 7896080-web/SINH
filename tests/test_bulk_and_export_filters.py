@@ -492,3 +492,40 @@ def test_with_a_cabinet_the_normal_states_come_back(logged_in_client, web_db):
 
     assert "нужен расчёт" in body
     assert "не выбран кабинет" not in body
+
+
+def test_enter_in_the_search_does_not_download_a_file(logged_in_client, web_db):
+    """К форме фильтров привязана кнопка экспорта, и она единственная submit —
+    значит Enter браузер трактовал как её нажатие: оператор вводил артикул, а
+    вместо поиска сам собой скачивался файл выгрузки. Поиск живой (htmx по
+    keyup), Enter в нём не нужен вовсе."""
+    _product(web_db, "u1")
+
+    body = logged_in_client.get("/products").text
+    # элемент целиком, а не строка файла: атрибуты переносятся
+    search = body.split('id="q"', 1)[1].split(">", 1)[0]
+
+    assert "event.preventDefault()" in search
+
+
+def test_export_and_import_stand_together(logged_in_client, web_db):
+    """Пара кнопок не должна разъезжаться по разным углам страницы: оператор
+    искал импорт там, где всегда был экспорт, и решил, что импорт пропал."""
+    _product(web_db, "u1")
+
+    body = logged_in_client.get("/products").text
+    toolbar = body.split('<div class="toolbar">', 1)[1].split("</div>", 1)[0]
+
+    assert "Экспорт в Excel" in toolbar
+    assert "Импорт из Excel" in toolbar
+
+
+def test_the_export_button_still_follows_the_live_filters(logged_in_client, web_db):
+    """Кнопка стоит ВНЕ формы фильтров, но привязана к ней атрибутом form= —
+    браузер соберёт текущие значения полей, а не те, что были при загрузке."""
+    _product(web_db, "u1")
+
+    body = logged_in_client.get("/products").text
+
+    assert 'form="pr-filters"' in body
+    assert 'id="pr-filters"' in body

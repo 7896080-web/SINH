@@ -42,7 +42,7 @@
 
 <div class="pr-allfilter">
     Галочка в шапке таблицы выбирает <b>весь текущий отбор</b>
-    {% if total is defined %}— {% if total < 0 %}{{ -total }}+{% else %}{{ total }}{% endif %} товаров{% endif %},
+    {% if total is defined %}— все {% if total < 0 %}{{ -total }}+{% else %}{{ total }}{% endif %}{% endif %},
     а не только показанные строки. Массовая правка применится ко всем им.
     {% if total is defined and (total > rows|length or total < 0) %}
     <div class="pr-hint pr-hint--warn">Показано {{ rows|length }} — остальные под отбор
