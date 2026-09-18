@@ -29,6 +29,7 @@ from app.transmit import (explain, sku_quantity, enqueue_full_resend, enqueue_wi
                           offset_from_base, recompute_offset)
 from app.offset_base import (ensure_snapshot_requested, set_base_date, stock_at_date,
                               stock_lookup)
+from app.recalc import active_job, create_job, last_job
 
 router = APIRouter()
 templates = Jinja2Templates(directory="app/templates")
@@ -72,8 +73,11 @@ def _calc_status(product: Product) -> tuple[str, str]:
     не понять — пустой факт выглядит одинаково и когда его не вводили, и когда
     решили, что учёт 1С верен.
 
-    `ready` означает: остаток приведён к выбранной дате, порог посчитан и
-    подтверждён оператором — строку можно включать в трансляцию.
+    `ready` означает всё сразу: порог посчитан и подтверждён, отгрузки площадок
+    за период проведены в 1С, остаток ЦС актуален — товар можно включать в
+    трансляцию. Раньше этим словом назывался только посчитанный порог, но это
+    разные состояния, и путать их нельзя: с непроведёнными отгрузками остаток
+    завышен, и включённая трансляция отправит на площадки лишнее.
     """
     if product.offset_base_date is None:
         return ("none", "расчёт не начат")
@@ -83,7 +87,12 @@ def _calc_status(product: Product) -> tuple[str, str]:
         # Порог уже считается (сводится к брони), но человек цифру не подтвердил.
         # Пока не подтвердил — строка не «обработана».
         return ("need_fact", "нужен факт")
-    return ("ready", "готово")
+    if product.recalc_done_at is None:
+        # Порог посчитан, но отгрузки на маркетплейсы за период в 1С ещё не
+        # проведены: остаток ЦС завышен, и включать трансляцию рано — уедет
+        # число больше реального.
+        return ("need_recalc", "нужен расчёт")
+    return ("ready", "актуализирован")
 
 
 def _row(product: Product, accounts: list[PlatformAccount],
@@ -280,6 +289,8 @@ def _render(request: Request, db: Session, user: User, q: str, only_proposals: b
         "q": q, "only_proposals": only_proposals, "only_blocked": only_blocked,
         "hide_size_u": hide_size_u,
         "only_unfinished": only_unfinished,
+        "recalc_job": active_job(db) or last_job(db),
+        "recalc_running": active_job(db) is not None,
         "accounts": accounts,
         "dispatch": _dispatch_summary(db),
         "flash": pop_flash(request) if template == "products.html" else None,
@@ -654,6 +665,16 @@ def set_threshold(
 
 # --------------------------------------------------------------------------- массовые действия
 
+@router.get("/products/recalc-progress", response_class=HTMLResponse)
+def recalc_progress(request: Request, db: Session = Depends(get_db),
+                    user: User = Depends(get_current_user)):
+    """Фрагмент прогресса — его страница опрашивает, пока расчёт идёт."""
+    job = active_job(db) or last_job(db)
+    return templates.TemplateResponse(request, "products_recalc.html", {
+        "request": request, "recalc_job": job, "recalc_running": active_job(db) is not None,
+    })
+
+
 @router.post("/products/bulk")
 def bulk_edit(
     request: Request, action: str = Form(...), uids: list[str] = Form(default=[]),
@@ -729,6 +750,32 @@ def bulk_edit(
         # были бы лишние два запроса на каждую строку.
         ensure_snapshot_requested(db, d, user.username)
 
+    if action == "recalc":
+        # Не правка строк, а задание воркеру: по каждому товару надо опросить
+        # каждый его кабинет по историческим заказам. В запросе это минуты.
+        running = active_job(db)
+        if running is not None:
+            set_flash(request, f"Расчёт уже идёт (задание #{running.id}): обработано "
+                               f"{running.processed} из {running.total}. Дождитесь конца — "
+                               f"два задания шли бы по одним товарам и дублировали бы "
+                               f"обращения к площадкам.", "warn")
+            return back()
+        ready = [p for p in products if p.offset_base_date is not None]
+        if not ready:
+            set_flash(request, "Ни у одного из выбранных товаров не задана дата расчёта. "
+                               "Сначала «Записать остаток ЦС на дату».", "warn")
+            return back()
+        job = create_job(db, ready, user.username)
+        log_action(db, user.username, "recalc_started",
+                   f"задание #{job.id}, товаров {len(ready)}")
+        db.commit()
+        message = f"Расчёт запущен: {len(ready)} товаров. Прогресс виден на этой странице."
+        if len(ready) < len(products):
+            message += (f" Пропущено {len(products) - len(ready)} — у них не задана "
+                        f"дата расчёта.")
+        set_flash(request, message, "good")
+        return back()
+
     changed = skipped = 0
     for p in products:
         if action == "set_reserve":
@@ -754,6 +801,8 @@ def bulk_edit(
         elif action == "set_fact":
             p.fact_at_date = n
             recompute_offset(p)
+        elif action == "recalc":
+            pass          # обрабатывается до цикла: это задание, а не правка строк
         elif action == "stock_to_fact":
             # «Записать остаток ЦС на дату» — весь расчёт одним нажатием для
             # самого частого случая: цифра 1С верна, порог надо просто закрепить

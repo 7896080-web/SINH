@@ -47,6 +47,7 @@
   .pr-status--none{background:#eef0f4;color:#667}
   .pr-status--waiting{background:#fbf1de;color:#b5750f}
   .pr-status--need_fact{background:#fbf1de;color:#b5750f}
+  .pr-status--need_recalc{background:#e8eef7;color:#2f5d9f}
   .pr-status--ready{background:#e7f3ec;color:#2f7d4f;font-weight:600}
   .pr-allfilter{margin:8px 0 0;padding:8px 10px;border:1px solid #f0d9a8;background:#fdf6e6;border-radius:6px;font-size:13px}
 </style>
@@ -85,6 +86,8 @@
     <b>остаток ЦС сейчас − порог</b>: заказы, приходы, списания и пересортица двигают остаток,
     а порог стоит на месте.</p>
 </details>
+
+{% if recalc_job %}{% include "products_recalc.html" %}{% endif %}
 
 <h3>Рассылка по площадкам (пауза)</h3>
 <div class="pr-masters">
@@ -155,6 +158,9 @@
   <button name="action" value="set_reserve">Резерв (бронь) =</button>
   <button name="action" value="set_fact">Факт на дату =</button>
   <button name="action" value="fact_from_stock" title="Там, где факт не введён, подставить остаток ЦС на дату">Факт = остаток ЦС</button>
+  <button name="action" value="recalc" class="btn-primary"
+          title="Поднять с площадок реальные заказы с даты расчёта и провести их: списать остаток и создать перемещения в 1С. На площадки при этом не уходит ничего — трансляция включается потом, вручную.">
+      Расчёт</button>
   <button name="action" value="stock_to_fact" class="pr-on"
           title="Весь расчёт одним нажатием: поставить дату (из поля справа или уже заданную), подтянуть остаток ЦС на неё и записать его как факт. Строка станет «готово».">
       Записать остаток ЦС на дату</button>
