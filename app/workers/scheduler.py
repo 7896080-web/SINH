@@ -401,6 +401,11 @@ def job_catalog_poll(account_id: int):
         account = db.query(PlatformAccount).filter(PlatformAccount.id == account_id).first()
         if account is None or not account.is_active:
             return
+        hb = db.query(WorkerHeartbeat).filter(
+            WorkerHeartbeat.worker_name == worker_name).first()
+        if hb is not None and hb.last_success \
+                and now_utc() - hb.last_run_at < CATALOG_POLL_MIN_GAP:
+            return
         client = build_client(db, account_id)
         load_stats = load_platform_catalog(db, client, account)
         proposal_stats = poll_catalog(db, account)
@@ -417,6 +422,22 @@ def job_catalog_poll(account_id: int):
 
 POLL_ORDERS_JOB_PREFIX = "poll_orders_account_"
 CATALOG_POLL_JOB_PREFIX = "catalog_poll_account_"
+
+# Выгрузка каталога кабинета — раз в сутки. Но триггер `interval` у APScheduler
+# отсчитывает ПЕРВЫЙ запуск от момента добавления задания, а задания живут в
+# памяти процесса и навешиваются заново при каждом старте воркера. Значит суточное
+# задание срабатывает, только если процесс проработал сутки без перезапуска — а на
+# бою он перезапускается чаще. 19.09 это и вскрылось: у `catalog_poll_account_5`
+# не было ни одной отметки о прогоне ВООБЩЕ, снимок каталога Kit лежал от 14.09
+# (его сделали руками со страницы «Мэппинг»). Поэтому явно просим первый запуск
+# вскоре после старта, а не через сутки.
+CATALOG_POLL_INTERVAL_HOURS = 24
+CATALOG_POLL_FIRST_RUN_DELAY = timedelta(minutes=2)
+# Раз задание теперь запускается после каждого старта, а стартов за сутки бывает
+# много, саму выгрузку пропускаем, если она недавно уже отработала успешно.
+# Считаем по своей же отметке: пропуск её НЕ трогает, иначе он сдвигал бы срок
+# вперёд на каждом рестарте и выгрузка снова не случилась бы никогда.
+CATALOG_POLL_MIN_GAP = timedelta(hours=20)
 
 
 def reconcile_account_jobs(sched, db) -> dict:
@@ -441,8 +462,14 @@ def reconcile_account_jobs(sched, db) -> dict:
             added += 1
         catalog_id = f"{CATALOG_POLL_JOB_PREFIX}{account_id}"
         if catalog_id not in existing_catalog:
-            sched.add_job(job_catalog_poll, "interval", hours=24, args=[account_id],
-                          id=catalog_id, max_instances=1)
+            # `next_run_time` обязателен: без него первый прогон — через сутки
+            # после старта, до которых процесс не доживает (см. константы выше).
+            # Планировщик поднят с timezone="UTC", naive-время он трактует в ней
+            # же, так что `now_utc()` тут ровно то, что нужно.
+            sched.add_job(job_catalog_poll, "interval",
+                          hours=CATALOG_POLL_INTERVAL_HOURS, args=[account_id],
+                          id=catalog_id, max_instances=1,
+                          next_run_time=now_utc() + CATALOG_POLL_FIRST_RUN_DELAY)
             added += 1
 
     dropped_heartbeats = 0

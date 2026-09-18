@@ -78,6 +78,19 @@ REQUIRED_WORKERS = {
 
 ACCOUNT_WORKER_PREFIXES = ("poll_orders_account_", "catalog_poll_account_")
 
+# Per-account задания тоже ОБЯЗАНЫ отработать — по одному на каждый активный
+# кабинет. В REQUIRED_WORKERS их не перечислить: имена зависят от id кабинета.
+# Без этой проверки задание, которое не отработало НИ РАЗУ, было мониторингу
+# невидимо: строки heartbeat нет, а проверяются только существующие строки. Ровно
+# так и вышло 19.09 — суточная выгрузка каталога не запускалась вовсе (первый
+# запуск откладывался на сутки, а процесс столько не живёт), снимок каталога Kit
+# лежал пятидневной давности, и /health всё это время был зелёный. Значение —
+# сколько ждём ПЕРВОГО прогона после старта планировщика.
+ACCOUNT_REQUIRED_GRACE = {
+    "poll_orders_account_": 600,
+    "catalog_poll_account_": 1800,
+}
+
 # Текст ошибки воркера содержит, например, адрес эндпоинта площадки, а /health
 # открыт без авторизации. Наружу отдаём только факт ошибки; сам текст видно на
 # странице «Диагностика» — она под логином.
@@ -182,6 +195,13 @@ def health(db: Session = Depends(get_db)):
         for name, grace in REQUIRED_WORKERS.items():
             if name not in present and uptime > grace:
                 missing.append(name)
+        for prefix, grace in ACCOUNT_REQUIRED_GRACE.items():
+            if uptime <= grace:
+                continue
+            for account_id in live_account_ids:
+                name = f"{prefix}{account_id}"
+                if name not in present:
+                    missing.append(name)
         if missing:
             overall_ok = False
 
