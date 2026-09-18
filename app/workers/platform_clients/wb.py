@@ -17,6 +17,15 @@ CONTENT_BASE_URL = "https://content-api.wildberries.ru"
 # сверкой — их НЕ реверсим.
 CANCELLED_SUPPLIER_STATUSES = {"cancel"}
 
+# `/api/v3/orders` отдаёт ОКНО фиксированной длины, начинающееся от `dateFrom`, а
+# не «все заказы с этой даты». Установлено на живом кабинете 18.09.2026:
+# dateFrom=07.08 вернул 520 заказов с датами 07.08 .. 05.09 и на этом закончился,
+# хотя заказы после 05.09 существуют; dateFrom=01.07 вернул НОЛЬ при 244 от 07.08.
+# Одним запросом от базовой даты мы теряли всё, что новее её плюс месяц: по одному
+# кабинету недосчитывались 253 заказа, и расчёт при этом рапортовал «проведено 0,
+# проблем нет» и ставил товару «актуализирован». Поэтому ленту берём окнами.
+ORDERS_WINDOW_DAYS = 29
+
 
 class WbClient(PlatformClient):
     name = "wb"
@@ -26,6 +35,9 @@ class WbClient(PlatformClient):
         self.warehouse_id = warehouse_id
         self.session = session or requests.Session()
         self.session.headers.update({"Authorization": token})
+        # Выдачу оборвал защитный предел, а не конец данных. Картина неполная —
+        # см. get_orders_since.
+        self.last_truncated = False
 
     def _get(self, path: str, **kwargs):
         def call():
@@ -84,26 +96,69 @@ class WbClient(PlatformClient):
             ))
         return result
 
-    def get_orders_since(self, date_from):
-        """FBS-заказы (сборочные задания) с даты date_from через
-        /api/v3/orders?dateFrom=<unix>. Пагинация курсором `next`; createdAt →
-        order_date. Этот эндпоинт отдаёт именно FBS-задания (модель FBS)."""
-        from datetime import datetime, timezone, date as _date
-        if isinstance(date_from, _date):
-            ts = int(datetime(date_from.year, date_from.month, date_from.day, tzinfo=timezone.utc).timestamp())
-        else:
-            ts = int(date_from)
+    def _orders_window(self, day) -> list[dict]:
+        """Сырая выдача `/api/v3/orders` от одной даты, со всеми её страницами.
 
-        result = []
-        next_cursor = 0
-        for _ in range(200):  # защитный предел на число страниц
-            data = self._get("/api/v3/orders", params={"limit": 1000, "next": next_cursor, "dateFrom": ts})
+        Листаем ПО КУРСОРУ `next`, а не по размеру страницы. Соседний метод
+        `get_catalog_items` эту же грабку уже прошёл: WB отдаёт меньше лимита за
+        страницу, но данные при этом не кончились. Стоп — пустая страница, нет
+        курсора или курсор не сдвинулся (защита от зацикливания).
+        """
+        from datetime import datetime, timezone
+
+        ts = int(datetime(day.year, day.month, day.day, tzinfo=timezone.utc).timestamp())
+        out, cursor, prev = [], 0, None
+        for _ in range(200):          # защитный предел на число страниц
+            data = self._get("/api/v3/orders",
+                             params={"limit": 1000, "next": cursor, "dateFrom": ts})
             orders = data.get("orders", [])
-            for o in orders:
+            out.extend(orders)
+            nxt = data.get("next", 0)
+            if not orders or not nxt or nxt == prev:
+                break
+            prev, cursor = nxt, nxt
+        else:
+            # Вышли по пределу страниц, а не потому что данные кончились.
+            self.last_truncated = True
+        return out
+
+    def get_orders_since(self, date_from):
+        """FBS-заказы (сборочные задания) с даты date_from.
+
+        Идём ОКНАМИ по `ORDERS_WINDOW_DAYS` дней от даты до сегодняшнего дня:
+        `/api/v3/orders?dateFrom=` отдаёт окно, а не всё с даты (см. комментарий
+        у константы). Окна перекрываются на день, поэтому склеиваем с
+        дедупликацией по id заказа — иначе один заказ провёлся бы дважды.
+
+        `last_truncated` — признак, что выдачу оборвал защитный предел, а не
+        конец данных. Вызывающий обязан считать такую картину неполной:
+        `recalc.collect_orders` превращает его в проблему и не даёт поставить
+        товару «актуализирован» по заказам, которых не видел.
+        """
+        from datetime import date as _date, datetime, timedelta, timezone
+
+        self.last_truncated = False
+
+        if isinstance(date_from, datetime):
+            start = date_from.date()
+        elif isinstance(date_from, _date):
+            start = date_from
+        else:
+            start = datetime.fromtimestamp(int(date_from), tz=timezone.utc).date()
+        today = datetime.now(timezone.utc).date()
+
+        result, seen = [], set()
+        day = start
+        while True:
+            for o in self._orders_window(day):
+                oid = str(o.get("id"))
+                if not oid or oid in seen:
+                    continue
                 skus = o.get("skus") or []
                 barcode = skus[0] if skus else None
                 if not barcode:
                     continue
+                seen.add(oid)
                 order_date = None
                 created = o.get("createdAt")
                 if created:
@@ -112,12 +167,12 @@ class WbClient(PlatformClient):
                     except ValueError:
                         order_date = None
                 result.append(PlatformOrder(
-                    order_id=str(o["id"]), barcode=barcode, quantity=1,
+                    order_id=oid, barcode=barcode, quantity=1,
                     raw_status=str(o.get("supplierStatus") or "new"), order_date=order_date,
                 ))
-            next_cursor = data.get("next", 0)
-            if not next_cursor or len(orders) < 1000:
+            if day >= today:
                 break
+            day = min(day + timedelta(days=ORDERS_WINDOW_DAYS), today)
         return result
 
     def get_cancelled_orders(self, order_ids: list[str]) -> list[PlatformOrder]:
