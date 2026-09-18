@@ -735,3 +735,244 @@ def test_the_ready_badge_does_not_swallow_the_whole_row(logged_in_client, web_db
     badge = body.split('class="pr-status')[1].split("</div>")[0]
     assert "можно включать трансляцию" not in badge, \
         "длинный текст внутри nowrap-значка ломает ширину колонок"
+
+
+# ------------------------------------------------ панель массовых действий
+
+def test_the_date_input_stays_next_to_the_buttons_that_read_it(logged_in_client, web_db):
+    """Кнопки шли сплошным потоком, и при переносе строки поле даты оставалось в
+    конце первого ряда, рядом с «Трансляция выкл», а «Дата расчёта =» уезжала на
+    второй. Поле читалось как чужое — оператор решил, что массовой установки даты
+    вообще нет. Теперь ввод и кнопки, которые его забирают, в одной группе."""
+    _product(web_db, "u1")
+
+    body = logged_in_client.get("/products").text
+    panel = body.split('id="bulk-form"')[1].split("</form>")[0]
+    groups = [g.split("</span>")[0] for g in panel.split('<span class="pr-group">')[1:]]
+
+    with_date = [g for g in groups if 'name="date_value"' in g]
+    assert len(with_date) == 1, "поле даты должно быть ровно в одной группе"
+    for action in ("set_base_date", "stock_to_fact", "set_active_since"):
+        assert action in with_date[0], f"{action} читает дату — значит стоит рядом с полем"
+
+
+def test_every_bulk_action_is_still_reachable(logged_in_client, web_db):
+    """Страховка от перегруппировки: ни одно действие не должно потеряться."""
+    _product(web_db, "u1")
+
+    body = logged_in_client.get("/products").text
+
+    for action in ("set_reserve", "set_fact", "fact_from_stock", "recalc",
+                   "stock_to_fact", "clear_offset", "broadcast_on", "broadcast_off",
+                   "set_base_date", "set_active_since"):
+        assert f'value="{action}"' in body, action
+
+
+def test_bulk_base_date_applies_to_the_selected_rows(logged_in_client, web_db):
+    """Само действие: дата проставляется всем отмеченным товарам."""
+    _product(web_db, "u1")
+    _product(web_db, "u2")
+    _product(web_db, "u3")
+
+    logged_in_client.post("/products/bulk", data={
+        "action": "set_base_date", "uids": ["u1", "u2"], "date_value": "2026-08-07",
+    })
+
+    web_db.expire_all()
+    assert web_db.query(Product).filter(Product.uid_1c == "u1").one().offset_base_date == date(2026, 8, 7)
+    assert web_db.query(Product).filter(Product.uid_1c == "u2").one().offset_base_date == date(2026, 8, 7)
+    assert web_db.query(Product).filter(Product.uid_1c == "u3").one().offset_base_date is None
+
+
+def test_the_number_input_says_what_it_feeds(logged_in_client, web_db):
+    """«число» жило только в placeholder: исчезало при первом вводе и не говорило,
+    кому это число достанется. Подпись остаётся на месте, а кнопки, которые его
+    забирают, стоят в той же группе."""
+    _product(web_db, "u1")
+
+    body = logged_in_client.get("/products").text
+    panel = body.split('id="bulk-form"')[1].split("</form>")[0]
+    groups = [g.split("</span>")[0] for g in panel.split('<span class="pr-group">')[1:]]
+
+    with_int = [g for g in groups if 'name="int_value"' in g]
+    assert len(with_int) == 1
+    assert 'for="bulk-int"' in with_int[0], "у поля должна быть видимая подпись"
+    for action in ("set_reserve", "set_fact"):
+        assert action in with_int[0], f"{action} читает это число — значит стоит рядом"
+
+
+# ------------------------------------------------ отбор и фильтры переживают F5
+
+def test_filters_survive_a_page_reload(logged_in_client, web_db):
+    """Фильтры применяются живьём, адресная строка при этом не менялась, и F5
+    возвращал пустую страницу без артикула в поиске. А обновить её мы сами же и
+    просим — после расчёта строки показаны на момент загрузки."""
+    _product(web_db, "u1", name="Джемпер")
+    _product(web_db, "u2", name="Свитшот")
+
+    # Ровно то, что произойдёт после перезагрузки с восстановленным адресом.
+    body = logged_in_client.get("/products?q=A-u1&hide_size_u=true").text
+
+    assert 'value="A-u1"' in body, "поиск должен вернуться заполненным"
+    assert 'name="hide_size_u" value="true" checked' in body
+    assert "Джемпер" in body and "Свитшот" not in body
+
+
+def test_the_page_mirrors_the_filters_into_the_address_bar(logged_in_client, web_db):
+    """Без этого перезагружать было бы нечего: /products и /products/rows
+    принимают одни и те же параметры, но htmx ходит только во второй."""
+    _product(web_db, "u1")
+
+    body = logged_in_client.get("/products").text
+
+    assert "history.replaceState" in body
+    assert '"/products?"' in body
+
+
+def test_the_selection_survives_a_table_redraw(logged_in_client, web_db):
+    """htmx подменяет таблицу целиком при каждом изменении фильтра — вместе с
+    разметкой уезжали и проставленные галочки."""
+    _product(web_db, "u1")
+
+    body = logged_in_client.get("/products").text
+
+    assert "sessionStorage" in body
+    assert "htmx:afterSwap" in body
+
+
+def test_the_bulk_bar_shows_how_many_rows_are_selected(logged_in_client, web_db):
+    """«Ставлю галочки, а в панели ничего не меняется» — галочки в таблице,
+    панель над ней, и без числа непонятно, на что подействует кнопка."""
+    _product(web_db, "u1")
+
+    body = logged_in_client.get("/products").text
+
+    assert 'id="pr-count"' in body
+    assert "ничего не отмечено" in body
+    assert 'id="pr-clear"' in body
+
+
+# ------------------------------------------------ массовая отметка кабинетов
+
+def test_bulk_cabinet_on_ticks_the_selected_products(logged_in_client, web_db):
+    from app.models import SyncSetting
+
+    account = _account(web_db)
+    _product(web_db, "u1")
+    _product(web_db, "u2")
+    _product(web_db, "u3")
+
+    logged_in_client.post("/products/bulk", data={
+        "action": "cabinet_on", "uids": ["u1", "u2"], "account_id": str(account.id)})
+
+    web_db.expire_all()
+    on = {s.uid_1c for s in web_db.query(SyncSetting).filter(SyncSetting.enabled.is_(True))}
+    assert on == {"u1", "u2"}
+
+
+def test_bulk_cabinet_off_withdraws_only_where_we_did_send(logged_in_client, web_db):
+    """Правило то же, что у галочки в строке: ноль уходит только туда, куда мы
+    реально отправляли остаток. Иначе массовое снятие обнулило бы живые карточки."""
+    from app.models import DispatchQueueItem, DispatchStatus, SyncSetting
+    from app.timeutils import now_utc
+
+    account = _account(web_db)
+    _product(web_db, "u1", broadcast=True)
+    _product(web_db, "u2", broadcast=True)
+    web_db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
+    web_db.add(SyncSetting(uid_1c="u2", account_id=account.id, enabled=True))
+    web_db.add(DispatchQueueItem(
+        uid_1c="u1", account_id=account.id, quantity=10, sent_quantity=10,
+        reason="manual_enable", status=DispatchStatus.sent, sent_at=now_utc()))
+    web_db.commit()
+
+    logged_in_client.post("/products/bulk", data={
+        "action": "cabinet_off", "uids": ["u1", "u2"], "account_id": str(account.id)})
+
+    web_db.expire_all()
+    withdrawals = web_db.query(DispatchQueueItem).filter(
+        DispatchQueueItem.reason == "manual_disable").all()
+    assert [w.uid_1c for w in withdrawals] == ["u1"]
+    assert web_db.query(SyncSetting).filter(SyncSetting.enabled.is_(True)).count() == 0
+
+
+def test_bulk_cabinet_without_a_chosen_cabinet_says_so(logged_in_client, web_db):
+    # Кабинет заводим, хотя и не выбираем: без активных кабинетов страница
+    # показывает своё сообщение и затирает это.
+    _account(web_db)
+    _product(web_db, "u1")
+
+    # Ответ уже прошёл редирект на страницу — сообщение показано на ней.
+    r = logged_in_client.post("/products/bulk", data={
+        "action": "cabinet_on", "uids": ["u1"], "account_id": ""})
+
+    assert "Выберите кабинет" in r.text
+
+
+def test_bulk_cabinet_applies_to_the_whole_filter(logged_in_client, web_db):
+    """«Весь отбор» работает и здесь — ради этого массовая отметка и нужна."""
+    from app.models import SyncSetting
+
+    account = _account(web_db)
+    _product(web_db, "u1", name="Джемпер")
+    _product(web_db, "u2", name="Свитшот")
+
+    logged_in_client.post("/products/bulk", data={
+        "action": "cabinet_on", "all_filtered": "true", "q": "Джемпер",
+        "account_id": str(account.id)})
+
+    web_db.expire_all()
+    on = {s.uid_1c for s in web_db.query(SyncSetting).filter(SyncSetting.enabled.is_(True))}
+    assert on == {"u1"}
+
+
+def test_the_cabinet_picker_is_on_the_page(logged_in_client, web_db):
+    _account(web_db)
+    _product(web_db, "u1")
+
+    body = logged_in_client.get("/products").text
+
+    assert 'name="account_id"' in body
+    assert 'value="cabinet_on"' in body and 'value="cabinet_off"' in body
+
+
+def test_ticking_a_cabinet_stamps_active_since(logged_in_client, web_db):
+    """Отметка кабинета и есть момент, с которого товар живёт на площадке. Дату
+    этого момента оператор вписывал руками — то есть забывал."""
+    from app.timeutils import now_utc
+
+    account = _account(web_db)
+    _product(web_db, "u1")
+
+    logged_in_client.post(f"/products/u1/{account.id}/toggle", data={"enabled": "true"})
+
+    web_db.expire_all()
+    p = web_db.query(Product).filter(Product.uid_1c == "u1").one()
+    assert p.broadcast_active_since == now_utc().date()
+
+
+def test_an_existing_active_since_is_not_overwritten(logged_in_client, web_db):
+    """Уже проставленная дата отмечает ПЕРВОЕ включение — перетирать её повторной
+    отметкой значило бы терять историю."""
+    account = _account(web_db)
+    _product(web_db, "u1", broadcast_active_since=date(2026, 8, 1))
+
+    logged_in_client.post(f"/products/u1/{account.id}/toggle", data={"enabled": "true"})
+
+    web_db.expire_all()
+    assert web_db.query(Product).filter(Product.uid_1c == "u1").one() \
+        .broadcast_active_since == date(2026, 8, 1)
+
+
+def test_bulk_cabinet_on_stamps_active_since_too(logged_in_client, web_db):
+    from app.timeutils import now_utc
+
+    account = _account(web_db)
+    _product(web_db, "u1")
+
+    logged_in_client.post("/products/bulk", data={
+        "action": "cabinet_on", "uids": ["u1"], "account_id": str(account.id)})
+
+    web_db.expire_all()
+    assert web_db.query(Product).filter(Product.uid_1c == "u1").one() \
+        .broadcast_active_since == now_utc().date()

@@ -46,6 +46,10 @@
   .pr-masters form{display:flex;align-items:center;gap:6px;border:1px solid #dfe3ea;border-radius:8px;padding:6px 10px;background:#fafbfc}
   .pr-bulk{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:10px 0;padding:8px 10px;border:1px dashed #c7cdd6;border-radius:8px;background:#fbfcfe}
   .pr-bulk input{width:auto}
+  .pr-group{display:inline-flex;align-items:center;gap:6px;flex-wrap:nowrap}
+  .pr-group__label{font-size:12px;color:#556;white-space:nowrap}
+  .pr-count{font-size:12px;padding:1px 8px;border-radius:999px;background:#eef0f4;color:#667;white-space:nowrap}
+  .pr-count--on{background:#e8eef7;color:#2f5d9f;font-weight:600}
   .pr-ladder{font-size:13px;line-height:1.7;margin:6px 0 0}
   .pr-ladder li{margin-bottom:2px}
   .pr-status{display:inline-block;font-size:11px;padding:1px 7px;border-radius:999px;margin-bottom:4px;white-space:nowrap;max-width:100%}
@@ -164,39 +168,174 @@
 
 {# Фильтры для этой формы приходят из фрагмента таблицы (products_rows.html):
    он перерисовывается при каждом изменении отбора, а шапка страницы — нет. #}
+{# Панель разбита на группы, и каждая группа не переносится внутри себя.
+   Раньше кнопки шли сплошным потоком: при переносе строки поле даты осталось в
+   конце первого ряда, рядом с «Трансляция выкл», а «Дата расчёта =» уехала на
+   второй — и поле читалось как чужое. Теперь ввод стоит вместе с кнопками,
+   которые его забирают, и разъехаться они не могут. #}
 <form id="bulk-form" method="post" action="/products/bulk" class="pr-bulk">
+  {# Счётчик, а не просто подпись: галочки стоят в таблице, панель — над ней, и
+     без числа непонятно, на что вообще подействует кнопка. Оператор жаловался
+     ровно на это: «ставлю галочки, а в панели ничего не меняется». Заодно
+     счётчик не даёт применить действие к отбору, про который забыли. #}
   <span class="muted">С отмеченными:</span>
-  <input type="number" name="int_value" placeholder="число" style="width:80px;">
-  <button name="action" value="set_reserve">Резерв (бронь) =</button>
-  <button name="action" value="set_fact">Факт на дату =</button>
-  <button name="action" value="fact_from_stock" title="Там, где факт не введён, подставить остаток ЦС на дату">Факт = остаток ЦС</button>
-  <button name="action" value="recalc" class="btn-primary"
-          title="Поднять с площадок реальные заказы с даты расчёта и провести их: списать остаток и создать перемещения в 1С. На площадки при этом не уходит ничего — трансляция включается потом, вручную.">
-      Расчёт</button>
-  <button name="action" value="stock_to_fact" class="pr-on"
-          title="Весь расчёт одним нажатием: поставить дату (из поля справа или уже заданную), подтянуть остаток ЦС на неё и записать его как факт. Строка станет «готово».">
-      Записать остаток ЦС на дату</button>
-  <button name="action" value="clear_offset">Сбросить порог</button>
-  <button name="action" value="broadcast_on" class="pr-on">Трансляция вкл</button>
-  <button name="action" value="broadcast_off" class="pr-off">Трансляция выкл</button>
-  <input type="date" name="date_value">
-  <button name="action" value="set_base_date">Дата расчёта =</button>
-  <button name="action" value="set_active_since">Активно с =</button>
+  <span class="pr-count" id="pr-count">ничего не отмечено</span>
+  <button type="button" class="pr-mini" id="pr-clear" hidden>снять выбор</button>
+
+  <span class="pr-group">
+    {# Подпись, а не подсказка внутри поля: «число» в placeholder исчезало при
+       первом же вводе и не говорило, кому это число достанется. Теперь читается
+       слева направо: «число 5 → Резерв (бронь) =», то есть «поставить бронь 5». #}
+    <label class="pr-group__label" for="bulk-int">число</label>
+    <input type="number" id="bulk-int" name="int_value" style="width:70px;"
+           title="Число, которое подставят кнопки справа — бронь или факт на дату.">
+    <button name="action" value="set_reserve"
+            title="Поставить эту бронь всем отмеченным товарам.">Резерв (бронь) =</button>
+    <button name="action" value="set_fact"
+            title="Записать это число как «сколько лежало на складе на самом деле» на заданную дату. Порог пересчитается сразу.">
+        Факт на дату =</button>
+  </span>
+
+  <span class="pr-group">
+    <label class="pr-group__label" for="bulk-date">на дату</label>
+    <input type="date" id="bulk-date" name="date_value">
+    <button name="action" value="set_base_date"
+            title="Проставить эту дату в поле «на дату» всем отмеченным товарам. Снимок ЦС на неё подставится сразу, если он уже есть; если нет — строки встанут в ожидание и досчитаются, когда придёт ответ 1С.">
+        Дата расчёта =</button>
+    <button name="action" value="stock_to_fact" class="pr-on"
+            title="Весь расчёт одним нажатием: поставить эту дату (или взять уже заданную у товара), подтянуть остаток ЦС на неё и записать его как факт.">
+        Записать остаток ЦС на дату</button>
+    <button name="action" value="set_active_since">Активно с =</button>
+  </span>
+
+  <span class="pr-group">
+    <button name="action" value="fact_from_stock" title="Там, где факт не введён, подставить остаток ЦС на дату">Факт = остаток ЦС</button>
+    <button name="action" value="recalc" class="btn-primary"
+            title="Поднять с площадок реальные заказы с даты расчёта и провести их: списать остаток и создать перемещения в 1С. На площадки при этом не уходит ничего — трансляция включается потом, вручную.">
+        Расчёт</button>
+    <button name="action" value="clear_offset">Сбросить порог</button>
+  </span>
+
+  <span class="pr-group">
+    <button name="action" value="broadcast_on" class="pr-on">Трансляция вкл</button>
+    <button name="action" value="broadcast_off" class="pr-off">Трансляция выкл</button>
+  </span>
+
+  {# Кабинет — отдельная группа со своим списком: правила те же, что у галочки в
+     строке. Включение ставит доотправку в очередь, снятие — отзыв, и только
+     если на этот кабинет реально что-то уходило. #}
+  <span class="pr-group">
+    <label class="pr-group__label" for="bulk-account">кабинет</label>
+    <select id="bulk-account" name="account_id">
+        <option value="">— выберите —</option>
+        {% for a in accounts %}
+        <option value="{{ a.id }}">{{ a.name }} ({{ a.platform.value|upper }})</option>
+        {% endfor %}
+    </select>
+    <button name="action" value="cabinet_on" class="pr-on"
+            title="Отметить этот кабинет всем отмеченным товарам. Остаток уйдёт туда только после расчёта — как и по галочке в строке.">
+        Отметить</button>
+    <button name="action" value="cabinet_off" class="pr-off"
+            title="Снять этот кабинет у отмеченных товаров. Ноль на площадку уйдёт только там, куда мы реально отправляли остаток.">
+        Снять</button>
+  </span>
 </form>
 
 <script>
-// Чекбокс в шапке — это «весь отбор»: он сам уходит в форму как all_filtered,
-// и сервер применяет правку ко всем подходящим товарам, а не к показанным
-// строкам. Здесь только визуальная часть: отмечаем видимые строки, чтобы было
-// видно, что выбор сделан. Обработчик делегированный — htmx подменяет таблицу
-// целиком при каждом изменении фильтра, и обработчик, повешенный прямо на
-// чекбокс, не пережил бы первую же перерисовку.
-document.addEventListener("change", function (e) {
-    if (e.target.id !== "pr-all") return;
-    document.querySelectorAll('input[name="uids"]').forEach(function (cb) {
-        cb.checked = e.target.checked;
+// Отбор и фильтры переживают и перерисовку таблицы, и перезагрузку страницы.
+//
+// Два разных сброса, на которые жаловался оператор:
+//   1. htmx подменяет #pr-table целиком при каждом изменении фильтра — вместе с
+//      разметкой уезжали и проставленные галочки;
+//   2. фильтры применяются живьём, адресная строка при этом не менялась, и F5
+//      возвращал пустую страницу без артикула в поиске. А обновлять её мы сами
+//      же и просим — после расчёта строки в таблице показаны на момент загрузки.
+//
+// Выбор держим в sessionStorage (переживает F5, умирает с вкладкой), фильтры —
+// в адресной строке: /products принимает ровно те же параметры, что и
+// /products/rows, поэтому перезагрузка восстанавливает отбор сама.
+(function () {
+    var KEY = "pr-selected";
+
+    function load() {
+        try { return new Set(JSON.parse(sessionStorage.getItem(KEY) || "[]")); }
+        catch (e) { return new Set(); }        // приватный режим, запрет на хранилище
+    }
+    function save(set) {
+        try { sessionStorage.setItem(KEY, JSON.stringify(Array.from(set))); }
+        catch (e) { /* не смогли запомнить — работаем без памяти, но работаем */ }
+    }
+
+    var selected = load();
+
+    function boxes() { return document.querySelectorAll('input[name="uids"]'); }
+
+    function paint() {
+        var all = document.getElementById("pr-all");
+        var whole = all && all.checked;
+        var count = document.getElementById("pr-count");
+        var clear = document.getElementById("pr-clear");
+        if (count) {
+            count.textContent = whole ? "весь отбор"
+                : selected.size ? selected.size + " шт" : "ничего не отмечено";
+            count.classList.toggle("pr-count--on", whole || selected.size > 0);
+        }
+        if (clear) clear.hidden = !(whole || selected.size > 0);
+    }
+
+    function restore() {
+        boxes().forEach(function (cb) { cb.checked = selected.has(cb.value); });
+        paint();
+    }
+
+    document.addEventListener("change", function (e) {
+        var t = e.target;
+        if (t.id === "pr-all") {
+            // Галочка в шапке — «весь текущий отбор»: она уходит на сервер как
+            // all_filtered, и правка применяется ко ВСЕМ подходящим товарам, а не
+            // к показанным строкам. Здесь только видимая часть.
+            boxes().forEach(function (cb) {
+                cb.checked = t.checked;
+                if (t.checked) { selected.add(cb.value); } else { selected.delete(cb.value); }
+            });
+            save(selected); paint(); return;
+        }
+        if (t.name === "uids") {
+            if (t.checked) { selected.add(t.value); } else { selected.delete(t.value); }
+            save(selected); paint();
+        }
     });
-});
+
+    document.addEventListener("click", function (e) {
+        if (e.target.id !== "pr-clear") return;
+        selected.clear(); save(selected);
+        var all = document.getElementById("pr-all");
+        if (all) all.checked = false;
+        boxes().forEach(function (cb) { cb.checked = false; });
+        paint();
+    });
+
+    // Таблицу подменил htmx — вернуть галочки на место.
+    document.body.addEventListener("htmx:afterSwap", function (e) {
+        if (e.target && e.target.id === "pr-table") restore();
+    });
+
+    // Фильтры отработали — переписать адресную строку, чтобы F5 их не терял.
+    // Именно replaceState: каждое нажатие клавиши в поиске иначе добавляло бы
+    // запись в историю, и «назад» пришлось бы жать по разу на символ.
+    document.body.addEventListener("htmx:afterRequest", function (e) {
+        var form = document.getElementById("pr-filters");
+        if (!form || !e.target || !form.contains(e.target) && e.target !== form) return;
+        var params = new URLSearchParams();
+        new FormData(form).forEach(function (value, key) {
+            if (value !== "" && value !== null) params.append(key, value);
+        });
+        var qs = params.toString();
+        history.replaceState(null, "", qs ? "/products?" + qs : "/products");
+    });
+
+    restore();
+})();
 </script>
 
 <div class="card table-scroll" style="padding:0;">
