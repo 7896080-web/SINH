@@ -42,6 +42,13 @@
     </td>
 
     <td class="pr-calcbox">
+        <div class="pr-status pr-status--{{ row.calc_status }}">
+            {% if row.calc_status == 'ready' %}
+                ✓ {{ row.calc_status_label }}{% if not row.broadcast_enabled %} — можно включать трансляцию{% endif %}
+            {% else %}
+                {{ row.calc_status_label }}
+            {% endif %}
+        </div>
         <div class="pr-calcrow">
             <label>на дату</label>
             <input type="date" value="{{ row.base_date.isoformat() if row.base_date else '' }}" class="pr-date"

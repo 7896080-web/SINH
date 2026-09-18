@@ -64,6 +64,28 @@ def _parse_date(raw: str) -> date | None:
     return datetime.strptime(raw, "%Y-%m-%d").date()
 
 
+def _calc_status(product: Product) -> tuple[str, str]:
+    """Состояние расчёта строки: (код, подпись для оператора).
+
+    Отвечает на единственный вопрос, который у оператора возникает на каталоге в
+    152 тысячи SKU: «эту строку я уже обработал или нет?». По цифрам в ячейке это
+    не понять — пустой факт выглядит одинаково и когда его не вводили, и когда
+    решили, что учёт 1С верен.
+
+    `ready` означает: остаток приведён к выбранной дате, порог посчитан и
+    подтверждён оператором — строку можно включать в трансляцию.
+    """
+    if product.offset_base_date is None:
+        return ("none", "расчёт не начат")
+    if product.offset_base_stock is None:
+        return ("waiting", "ждём 1С")
+    if product.fact_at_date is None:
+        # Порог уже считается (сводится к брони), но человек цифру не подтвердил.
+        # Пока не подтвердил — строка не «обработана».
+        return ("need_fact", "нужен факт")
+    return ("ready", "готово")
+
+
 def _row(product: Product, accounts: list[PlatformAccount],
          all_accounts: dict[int, PlatformAccount] | None = None) -> dict:
     """Строка таблицы. По каждому кабинету — реальное число и причина нуля."""
@@ -118,6 +140,8 @@ def _row(product: Product, accounts: list[PlatformAccount],
         "computed_offset": offset_from_base(product),
         "waiting_for_1c": (product.offset_base_date is not None
                            and product.offset_base_stock is None),
+        "calc_status": _calc_status(product)[0],
+        "calc_status_label": _calc_status(product)[1],
         "transmit_override": product.transmit_override,   # legacy: только предупреждение
         "broadcast_enabled": product.broadcast_enabled,
         "active_since": product.broadcast_active_since,
@@ -129,8 +153,18 @@ def _row(product: Product, accounts: list[PlatformAccount],
     }
 
 
-PAGE_LIMIT = 300          # строк на странице; больше браузеру показывать бессмысленно
+PAGE_LIMIT = 300          # без фильтров: «первые 300 из 152 тысяч по алфавиту» —
+                          # витрина, работают всегда через отбор
+# С ФИЛЬТРАМИ отдаём весь отбор. Потолок всё же нужен: строка тяжёлая (дата,
+# факт, бронь плюс по несколько полей на каждый кабинет), и каталог целиком
+# браузер не построит.
+FILTERED_LIMIT = 5000
 EXPORT_LIMIT = 50000      # потолок выгрузки: защита от попытки собрать .xlsx на весь каталог
+# Потолок массовой правки «по всему фильтру». Каждая строка тянет за собой запись
+# в очередь рассылки на каждый отмеченный кабинет, а база — SQLite, в которую в
+# это же время пишет планировщик. Правка всего каталога разом заняла бы её
+# минутами, и страница висела бы без признаков жизни.
+BULK_LIMIT = 20000
 
 
 def _base_query(db: Session, q: str, only_proposals: bool, only_blocked: bool,
@@ -231,7 +265,12 @@ def _render(request: Request, db: Session, user: User, q: str, only_proposals: b
             only_unfinished: bool = False):
     accounts = _active_accounts(db)
     all_accounts = {a.id: a for a in db.query(PlatformAccount).all()}
+    # С фильтрами показываем ВЕСЬ отбор: оператор сузил список именно затем,
+    # чтобы увидеть его целиком. Без фильтров — витрина в 300 строк: «первые 300
+    # из 152 тысяч по алфавиту» всё равно ни о чём не говорят.
+    filtered = bool(q or only_proposals or only_blocked or hide_size_u or only_unfinished)
     products, total = _load_products(db, q, only_proposals, only_blocked, accounts,
+                                     limit=FILTERED_LIMIT if filtered else PAGE_LIMIT,
                                      hide_size_u=hide_size_u,
                                      only_unfinished=only_unfinished)
     rows = [_row(p, accounts, all_accounts) for p in products]
@@ -285,8 +324,28 @@ def _as_int(raw: str) -> int | None:
         return None
 
 
-def _back(q: str) -> RedirectResponse:
-    return RedirectResponse(f"/products{'?q=' + q if q else ''}", status_code=303)
+def _filter_query(q: str, only_proposals: bool = False, only_blocked: bool = False,
+                  hide_size_u: bool = False, only_unfinished: bool = False) -> str:
+    """Фильтры страницы в виде строки запроса."""
+    from urllib.parse import urlencode
+
+    params = {"q": q} if q else {}
+    for name, on in (("only_proposals", only_proposals), ("only_blocked", only_blocked),
+                     ("hide_size_u", hide_size_u), ("only_unfinished", only_unfinished)):
+        if on:
+            params[name] = "true"
+    return urlencode(params)
+
+
+def _back(q: str, only_proposals: bool = False, only_blocked: bool = False,
+          hide_size_u: bool = False, only_unfinished: bool = False) -> RedirectResponse:
+    """Назад на страницу С ТЕМИ ЖЕ ФИЛЬТРАМИ.
+
+    Раньше возвращался только поиск: оператор отбирал строки фильтром «только
+    незавершённый расчёт», применял массовую правку — и попадал на полный список,
+    где отобранных строк уже не найти."""
+    query = _filter_query(q, only_proposals, only_blocked, hide_size_u, only_unfinished)
+    return RedirectResponse(f"/products{'?' + query if query else ''}", status_code=303)
 
 
 # --------------------------------------------------------------------------- страница
@@ -588,14 +647,25 @@ def set_threshold(
 def bulk_edit(
     request: Request, action: str = Form(...), uids: list[str] = Form(default=[]),
     int_value: str = Form(""), date_value: str = Form(""), q: str = Form(""),
+    only_proposals: bool = Form(False), only_blocked: bool = Form(False),
+    hide_size_u: bool = Form(False), only_unfinished: bool = Form(False),
+    all_filtered: bool = Form(False),
     db: Session = Depends(get_db), user: User = Depends(get_current_user),
 ):
     """Массовая правка отмеченных строк: set_reserve | set_offset | clear_offset |
     broadcast_on | broadcast_off | set_active_since | set_base_date | set_fact |
-    fact_from_stock."""
-    if not uids:
+    fact_from_stock.
+
+    `all_filtered` — применить КО ВСЕМ строкам, подходящим под текущий фильтр, а
+    не только к отмеченным галочками. Без этого режима «отметить все» на странице
+    означало бы «первые 300 из 4812 подходящих», и оператор, отобрав фильтром
+    нужное и нажав «отметить все», тихо обработал бы малую часть — а решил бы,
+    что обработал всё. На каталоге в 152 тысячи SKU это неизбежно."""
+    back = lambda: _back(q, only_proposals, only_blocked, hide_size_u, only_unfinished)
+
+    if not uids and not all_filtered:
         set_flash(request, "Не выбрано ни одной строки.", "warn")
-        return _back(q)
+        return back()
 
     n = d = None
     if action in ("set_reserve", "set_offset", "set_fact"):
@@ -603,33 +673,52 @@ def bulk_edit(
             n = int((int_value or "").strip())
         except ValueError:
             set_flash(request, "Введите число для массовой правки.", "warn")
-            return _back(q)
+            return back()
         if action in ("set_reserve", "set_fact"):
             n = max(0, n)          # бронь и факт отрицательными не бывают, порог — бывает
-    if action in ("set_active_since", "set_base_date"):
+    if action in ("set_active_since", "set_base_date", "stock_to_fact"):
         try:
             d = _parse_date(date_value)
         except ValueError:
             set_flash(request, "Дата должна быть в формате ГГГГ-ММ-ДД.", "warn")
-            return _back(q)
-        if action == "set_base_date" and d is not None and d > now_utc().date():
+            return back()
+        if action in ("set_base_date", "stock_to_fact") and d is not None and d > now_utc().date():
             set_flash(request, "Остатков на будущую дату в 1С нет.", "warn")
-            return _back(q)
+            return back()
 
-    products = db.query(Product).options(joinedload(Product.sync_settings)) \
-        .filter(Product.uid_1c.in_(uids)).all()
+    if all_filtered:
+        query = _base_query(db, q, only_proposals, only_blocked, hide_size_u, only_unfinished)
+        # `only_blocked` — фильтр не SQL-ный: точный расчёт «уходит 0» идёт по
+        # лестнице приоритетов уже в Python, и массово применять правку по
+        # приблизительному отбору нельзя. Отправляем оператора отметить строки.
+        if only_blocked:
+            set_flash(request, "С фильтром «только те, где уходит 0» массовая правка по "
+                               "всему отбору не делается — точный список считается построчно. "
+                               "Отметьте нужные строки галочками.", "warn")
+            return back()
+        matched = query.count()
+        if matched > BULK_LIMIT:
+            set_flash(request, f"Под фильтр попало {matched} строк — это больше предела "
+                               f"в {BULK_LIMIT}. Уточните поиск или фильтр и повторите: "
+                               f"правка такого объёма за один раз надолго заняла бы базу.",
+                      "warn")
+            return back()
+        products = query.options(joinedload(Product.sync_settings)).all()
+    else:
+        products = db.query(Product).options(joinedload(Product.sync_settings)) \
+            .filter(Product.uid_1c.in_(uids)).all()
 
     # Снимок на дату читаем ОДИН раз на всю пачку, а не по товару: иначе
     # простановка даты трёмстам отмеченным строкам — это шестьсот запросов.
     lookup = None
-    if action == "set_base_date" and d is not None:
+    if action in ("set_base_date", "stock_to_fact") and d is not None:
         lookup = stock_lookup(db, d)
         # Заявка на выгрузку — ОДНА на всю пачку, а не по товару: дата у всех
         # одна, и вторая заявка на неё всё равно не создаётся. Внутри цикла это
         # были бы лишние два запроса на каждую строку.
         ensure_snapshot_requested(db, d, user.username)
 
-    changed = 0
+    changed = skipped = 0
     for p in products:
         if action == "set_reserve":
             p.reserve = n
@@ -654,6 +743,21 @@ def bulk_edit(
         elif action == "set_fact":
             p.fact_at_date = n
             recompute_offset(p)
+        elif action == "stock_to_fact":
+            # «Записать остаток ЦС на дату» — весь расчёт одним нажатием для
+            # самого частого случая: цифра 1С верна, порог надо просто закрепить
+            # на эту дату. Если в форме указана дата — ставим её и подтягиваем
+            # остаток; иначе берём уже заданную у товара.
+            if d is not None:
+                set_base_date(db, p, d, lookup=lookup)
+            if p.offset_base_stock is None:
+                # Ответа 1С ещё нет — записывать нечего. Не ошибка: строка
+                # досчитается сама, когда придёт файл. Но в отчёте это надо
+                # назвать, иначе оператор решит, что обработаны все.
+                skipped += 1
+                continue
+            p.fact_at_date = p.offset_base_stock
+            recompute_offset(p)
         elif action == "fact_from_stock":
             # «Факт = остаток ЦС» — только там, где оператор ничего не вводил:
             # затирать введённые руками цифры массовой кнопкой нельзя.
@@ -662,15 +766,20 @@ def bulk_edit(
                 recompute_offset(p)
         else:
             set_flash(request, "Неизвестное действие.", "warn")
-            return _back(q)
+            return back()
         if action != "set_active_since":
             _repropagate(db, p, reason="bulk_edit")
         changed += 1
 
-    log_action(db, user.username, "products_bulk", f"{action} x{changed}")
+    scope = "по отбору" if all_filtered else "по отмеченным"
+    log_action(db, user.username, "products_bulk", f"{action} {scope} x{changed}")
     db.commit()
-    set_flash(request, f"Массовая правка: изменено строк — {changed}.", "good")
-    return _back(q)
+    message = f"Массовая правка ({scope}): изменено строк — {changed}."
+    if skipped:
+        message += (f" Пропущено {skipped}: 1С ещё не прислала выгрузку на эту дату — "
+                    f"порог у них посчитается сам, когда придёт ответ.")
+    set_flash(request, message, "good" if not skipped else "warn")
+    return back()
 
 
 @router.post("/products/dispatch-toggle")
@@ -704,12 +813,18 @@ def dispatch_toggle(
 @router.get("/products/export")
 def products_export(
     q: str = Query(""), only_proposals: bool = Query(False), only_blocked: bool = Query(False),
-    hide_size_u: bool = Query(False),
+    hide_size_u: bool = Query(False), only_unfinished: bool = Query(False),
     db: Session = Depends(get_db), user: User = Depends(get_current_user),
 ):
+    """Выгрузка отдаёт РОВНО ТО, что отобрано фильтрами на странице.
+
+    Фильтр `only_unfinished` здесь отсутствовал: ссылка его передавала, а
+    эндпоинт не принимал, и FastAPI молча его отбрасывал — оператор отбирал
+    незавершённые строки, выгружал и получал весь каталог."""
     accounts = _active_accounts(db)
     products, total = _load_products(db, q, only_proposals, only_blocked, accounts,
-                                     limit=EXPORT_LIMIT, hide_size_u=hide_size_u)
+                                     limit=EXPORT_LIMIT, hide_size_u=hide_size_u,
+                                     only_unfinished=only_unfinished)
     total = abs(total)          # для файла знак «счёт оборван» роли не играет
 
     # Порядок колонок расчёта — тот же, что в строке на странице: дата, что
