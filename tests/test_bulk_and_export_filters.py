@@ -590,13 +590,13 @@ def test_a_cabinet_shows_what_would_be_sent_after_switching_on(logged_in_client,
     """Оператор смотрит в колонку кабинета ПЕРЕД включением. «0, потому что
     выключено» не отвечает на его вопрос — ему нужно число, которое уйдёт, если
     нажать «Вкл»."""
-    from app.models import SyncSetting
+    from app.timeutils import now_utc
 
-    account = _account(web_db)
-    product = _product(web_db, "u1", broadcast=False)
-    product.stock_on_hand = 18
-    product.broadcast_offset = -28          # реального склада на 28 больше учёта
-    web_db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
+    product = _with_cabinet(web_db, "u1", broadcast=False,
+                            offset_base_date=date(2026, 8, 7), offset_base_stock=30,
+                            fact_at_date=58, broadcast_offset=-28,
+                            recalc_done_at=now_utc())
+    product.stock_on_hand = 18              # реального склада на 28 больше учёта
     web_db.commit()
 
     body = logged_in_client.get("/products/rows").text
@@ -695,3 +695,27 @@ def test_a_cabinet_added_after_the_catch_up_makes_the_row_ask_for_a_recount(
 
     assert "нужен пересчёт: добавлен кабинет" in body
     assert "актуализирован" not in body
+
+
+def test_an_unfinished_row_promises_nothing(logged_in_client, web_db):
+    """Строка ZJYM269002 XL: «ждём 1С», а рядом «→ 21 после включения» — число от
+    порога, оставшегося с другой даты. Обещать его нельзя: включать ещё рано."""
+    _with_cabinet(web_db, "u1", offset_base_date=date(2026, 8, 14),
+                  broadcast=False, broadcast_offset=0)
+
+    body = logged_in_client.get("/products/rows").text
+
+    assert "после включения" not in body
+    assert "после расчёта" in body
+
+
+def test_a_leftover_offset_does_not_pretend_to_be_manual(logged_in_client, web_db):
+    """Порог остался от прошлой даты — стирать его нельзя, но и называть
+    «заданным вручную» неправда: считали его мы, и на другое число."""
+    _with_cabinet(web_db, "u1", offset_base_date=date(2026, 8, 14),
+                  broadcast=False, broadcast_offset=0)
+
+    body = logged_in_client.get("/products/rows").text
+
+    assert "от прошлого расчёта" in body
+    assert "задан вручную" not in body
