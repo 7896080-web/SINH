@@ -111,6 +111,9 @@ def run_dispatch_cycle(db: Session, clients: dict, active_accounts: list[Platfor
                 continue
             barcode, external_id, article = target
             quantity = _quantity_to_send(db, uid_1c, account.id, item.quantity)
+            # Фиксируем ИМЕННО ТО число, которое уходит на площадку. `item.quantity`
+            # для этого не годится: там исходный остаток, а не итог лестницы.
+            item.sent_quantity = quantity
             push_items.append(StockPushItem(
                 barcode=barcode, quantity=quantity, external_id=external_id, article=article,
             ))

@@ -26,7 +26,8 @@ from app.audit import log_action
 from app.timeutils import now_utc
 from app.excel_utils import build_xlsx_response, read_xlsx_rows, parse_bool_ru, ExcelReadError
 from app.transmit import (explain, sku_quantity, enqueue_full_resend, enqueue_withdrawal,
-                          offset_from_base, recompute_offset)
+                          offset_from_base, recompute_offset, sku_mode, MODE_AUTO,
+                          covered_accounts)
 from app.offset_base import (ensure_snapshot_requested, set_base_date, stock_at_date,
                               stock_lookup)
 from app.recalc import active_job, create_job, last_job
@@ -65,7 +66,8 @@ def _parse_date(raw: str) -> date | None:
     return datetime.strptime(raw, "%Y-%m-%d").date()
 
 
-def _calc_status(product: Product, has_cabinet: bool = True) -> tuple[str, str]:
+def _calc_status(product: Product, has_cabinet: bool = True,
+                 enabled_ids: set[int] | None = None) -> tuple[str, str]:
     """Состояние расчёта строки: (код, подпись для оператора).
 
     Отвечает на единственный вопрос, который у оператора возникает на каталоге в
@@ -98,6 +100,12 @@ def _calc_status(product: Product, has_cabinet: bool = True) -> tuple[str, str]:
         # проведены: остаток ЦС завышен, и включать трансляцию рано — уедет
         # число больше реального.
         return ("need_recalc", "нужен расчёт")
+    # Расчёт был, но после него отметили ещё кабинет. По нему заказы не поднимали,
+    # значит остаток не сверен именно с его продажами — «актуализирован» тут было
+    # бы неправдой, а ровно на эту неправду оператор и опирается, включая
+    # трансляцию. Транслировать в такой кабинет лестница не даёт (ступень 2).
+    if enabled_ids and not enabled_ids.issubset(covered_accounts(product)):
+        return ("need_recalc_account", "нужен пересчёт: добавлен кабинет")
     return ("ready", "актуализирован")
 
 
@@ -117,6 +125,11 @@ def _row(product: Product, accounts: list[PlatformAccount],
             "has_proposal": setting.has_proposal if setting else False,
             "proposal_date": setting.proposal_date if setting else None,
             "min_threshold": setting.min_threshold if setting else 0,
+            # Порог кабинета применяется ТОЛЬКО в автоматическом режиме. При
+            # заданном пороге трансляции он молча ни на что не влияет — и так же
+            # молча срабатывает, если порог трансляции потом сбросить. Строка
+            # обязана показывать это состояние, иначе число выглядит рабочим.
+            "threshold_active": sku_mode(product) == MODE_AUTO,
             "quantity": result.quantity,
             "potential": result.potential,
             "blocked": result.blocked,
@@ -143,6 +156,7 @@ def _row(product: Product, accounts: list[PlatformAccount],
 
     # Кабинеты уже загружены (joinedload) — лишнего запроса на строку не будет.
     has_cabinet = any(s.enabled for s in product.sync_settings)
+    enabled_ids = {s.account_id for s in product.sync_settings if s.enabled}
 
     return {
         "uid_1c": product.uid_1c, "article": product.article, "name": product.name,
@@ -159,8 +173,8 @@ def _row(product: Product, accounts: list[PlatformAccount],
         "computed_offset": offset_from_base(product),
         "waiting_for_1c": (product.offset_base_date is not None
                            and product.offset_base_stock is None),
-        "calc_status": _calc_status(product, has_cabinet)[0],
-        "calc_status_label": _calc_status(product, has_cabinet)[1],
+        "calc_status": _calc_status(product, has_cabinet, enabled_ids)[0],
+        "calc_status_label": _calc_status(product, has_cabinet, enabled_ids)[1],
         "transmit_override": product.transmit_override,   # legacy: только предупреждение
         "broadcast_enabled": product.broadcast_enabled,
         "active_since": product.broadcast_active_since,
@@ -625,7 +639,17 @@ def toggle_sync(
     Снятие галочки ОТЗЫВАЕТ остаток с площадки (ставит в очередь ноль). Иначе на
     площадке остаётся последнее отправленное число, она продолжает продавать, а
     заказы по снятой паре гейт отбора уже пропускает: ни списания у нас, ни
-    документа в 1С. Главный выключатель товара всегда вёл себя именно так."""
+    документа в 1С. Главный выключатель товара всегда вёл себя именно так.
+
+    **Но только если трансляция товара включена.** При выключенной трансляции по
+    автоматическим путям наружу не уходило НИЧЕГО (`enqueue_full_resend` такой
+    товар в очередь не ставит вовсе), отзывать нечего — а ноль, отправленный «на
+    всякий случай», обнуляет чужую карточку, по которой идут продажи. Это ровно
+    та асимметрия, из-за которой 18.09 на Озон и Kit уехали нули по товару,
+    который мы туда ни разу не транслировали: доотправку почини́ли, а отзыв нет.
+
+    Случай «транслировали, потом сняли галочку» не страдает: там трансляция
+    включена, число на площадку уходило, и отзыв по-прежнему нужен."""
     setting = db.query(SyncSetting).filter(
         SyncSetting.uid_1c == uid_1c, SyncSetting.account_id == account_id,
     ).first()
@@ -641,8 +665,13 @@ def toggle_sync(
         enqueue_full_resend(db, uid_1c, account_id)
         log_action(db, user.username, "sync_enabled", f"{uid_1c} / кабинет #{account_id}")
     elif not enabled and was_enabled:
-        enqueue_withdrawal(db, uid_1c, account_id)
-        log_action(db, user.username, "sync_disabled", f"{uid_1c} / кабинет #{account_id} (в очередь 0)")
+        product = _get_product(db, uid_1c)
+        if product is not None and not product.broadcast_enabled:
+            log_action(db, user.username, "sync_disabled",
+                       f"{uid_1c} / кабинет #{account_id} (трансляция выключена — отзыв не нужен)")
+        else:
+            enqueue_withdrawal(db, uid_1c, account_id)
+            log_action(db, user.username, "sync_disabled", f"{uid_1c} / кабинет #{account_id} (в очередь 0)")
     db.commit()
     return _row_response(request, db, uid_1c)
 
@@ -1081,6 +1110,12 @@ def products_import(
                 setting.enabled_at = now_utc()
                 setting.has_proposal = False
                 enqueue_full_resend(db, uid_1c, account.id)
+            elif current_enabled and not desired_enabled and product.broadcast_enabled:
+                # Снятие галочки через Excel — тот же осознанный отзыв, что и
+                # галочкой в интерфейсе: без него на площадке остаётся последнее
+                # отправленное число и она продолжает продавать. При выключенной
+                # трансляции отзыв не нужен — туда ничего и не уходило.
+                enqueue_withdrawal(db, uid_1c, account.id)
             setting.enabled = desired_enabled
             setting.min_threshold = max(0, desired_threshold)
             touched = True

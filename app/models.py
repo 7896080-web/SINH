@@ -170,6 +170,14 @@ class Product(Base):
     # порог посчитан и остаток актуализирован — разные состояния, и оператор
     # должен видеть, какое из них достигнуто.
     recalc_done_at = Column(DateTime, nullable=True)
+    # Кабинеты, заказы которых расчёт РЕАЛЬНО прочитал (id через запятую).
+    # «Актуализирован» — свойство пары товар+кабинет, а не одного товара: расчёт
+    # поднимает заказы только с отмеченных кабинетов, и для неотмеченного его
+    # остаток ничем не подтверждён. Без этого списка галочку можно было
+    # поставить на кабинет, которого расчёт не касался, и через 45 секунд туда
+    # уезжал остаток, не сверенный с его продажами. NULL — расчёт был до
+    # появления этой колонки: считаем, что не покрыт никто, и требуем пересчёт.
+    recalc_account_ids = Column(Text, nullable=True)
     # Дата «активно с» — для аудита и backfill (подтягивание отгрузок с даты).
     broadcast_active_since = Column(Date, nullable=True)
     updated_at = Column(DateTime, default=now_utc, onupdate=now_utc)
@@ -278,6 +286,14 @@ class DispatchQueueItem(Base):
     uid_1c = Column(String(36), ForeignKey("products.uid_1c"), nullable=False)
     account_id = Column(Integer, ForeignKey("platform_accounts.id"), nullable=False)
     quantity = Column(Integer, nullable=False)  # абсолютное значение на момент постановки в очередь
+    # Сколько ушло на площадку НА САМОМ ДЕЛЕ. Не то же самое, что `quantity`:
+    # та — исходный остаток на момент постановки в очередь, а итог считается в
+    # момент отправки по всей лестнице (`transmit.quantity_for_account`), и с
+    # заданным порогом трансляции отличается от неё всегда. Без этой колонки
+    # вопрос «какое число мы отправили на площадку» по базе не восстановить —
+    # только пересчитать задним числом по текущим настройкам, а они могли уже
+    # измениться. NULL — запись ещё не отправляли.
+    sent_quantity = Column(Integer, nullable=True)
     reason = Column(String(64), nullable=False)  # 'order' / 'cancel' / 'manual_enable' / 'reconciliation'
     status = Column(Enum(DispatchStatus), default=DispatchStatus.pending, nullable=False)
     attempts = Column(Integer, default=0)

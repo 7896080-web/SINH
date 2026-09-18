@@ -149,11 +149,21 @@
                        title="Передавать этот товар в кабинет «{{ account.name }}».">
             {% endif %}
             <span class="pr-cab__name">{{ account.name }}</span>
-            <input type="number" value="{{ state.min_threshold }}" min="0" class="pr-input pr-input--tiny"
-                   hx-post="/products/{{ row.uid_1c }}/{{ account.id }}/threshold" hx-trigger="change"
-                   hx-vals="js:{min_threshold: event.target.value}"
-                   hx-target="#row-{{ row.uid_1c }}" hx-swap="outerHTML"
-                   title="Порог кабинета: если доступно не больше этого числа — уходит 0. 0 — выключен. Не применяется, когда задан порог трансляции.">
+            {# Поле «порог кабинета» с этой строки убрано. Оно применяется только в
+               автоматическом режиме, то есть при заданном пороге трансляции молчит —
+               и при этом стоит вплотную к расчётному числу, из-за чего туда вписывали
+               количество для трансляции. Сохранённое ненулевое значение по-прежнему
+               видно, и его можно снять: скрывать его было бы хуже, чем показывать. #}
+            {% if state.min_threshold %}
+                <span class="pr-thr {{ 'pr-thr--live' if state.threshold_active else 'pr-thr--idle' }}"
+                      title="{% if state.threshold_active %}Пока доступно не больше {{ state.min_threshold }} — на площадку уходит 0.{% else %}Не применяется: задан порог трансляции. Сработает, если порог трансляции сбросить.{% endif %}">
+                    порог кабинета {{ state.min_threshold }}{% if not state.threshold_active %} · не применяется{% endif %}
+                    <button type="button" class="pr-mini"
+                            hx-post="/products/{{ row.uid_1c }}/{{ account.id }}/threshold"
+                            hx-vals='{"min_threshold": "0"}'
+                            hx-target="#row-{{ row.uid_1c }}" hx-swap="outerHTML">снять</button>
+                </span>
+            {% endif %}
             {{ field_error('threshold:' ~ account.id) }}
             {% if not state.enabled %}
                 <span class="pr-hint">не передаётся</span>

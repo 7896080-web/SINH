@@ -10,15 +10,22 @@
 
 0. `Product.broadcast_enabled = False`  → 0  (SKU снят с продажи)
 1. кабинет не отмечен для товара        → 0  (`SyncSetting.enabled`)
-2. рассылка на кабинет на паузе         → 0  (`PlatformAccount.dispatch_enabled`)
-3. задан порог трансляции               → max(0, остаток ЦС − порог)
-4. задан ручной остаток (legacy)        → max(0, ручной остаток)
-5. иначе                                → max(0, остаток ЦС − резерв),
+2. расчёт не покрывал этот кабинет      → 0  (`Product.recalc_account_ids`)
+3. рассылка на кабинет на паузе         → 0  (`PlatformAccount.dispatch_enabled`)
+4. задан порог трансляции               → max(0, остаток ЦС − порог)
+5. задан ручной остаток (legacy)        → max(0, ручной остаток)
+6. иначе                                → max(0, остаток ЦС − резерв),
    и если это не больше порога кабинета → 0
 
-Шаги 0–2 — «выключатели», 3–5 — «сколько». Порог кабинета применяется только
-в автоматическом режиме (шаг 5): и порог трансляции, и ручной остаток заданы
+Шаги 0–3 — «выключатели», 4–6 — «сколько». Порог кабинета применяется только
+в автоматическом режиме (шаг 6): и порог трансляции, и ручной остаток заданы
 оператором явно, поверх них страховой буфер не навешиваем.
+
+Шаг 2 появился после разбора 18.09: «актуализирован» — свойство пары
+товар+кабинет, а не одного товара. Расчёт поднимает заказы только с кабинетов,
+отмеченных в его момент, и для кабинета, отмеченного позже, остаток не сверен
+ничем. Раньше галочка на таком кабинете отправляла туда полный остаток через
+45 секунд.
 """
 
 from __future__ import annotations
@@ -115,6 +122,20 @@ def sku_quantity(product: Product | None, raw_stock: int | None = None) -> int:
     return max(0, (stock or 0) - (product.reserve or 0))
 
 
+def covered_accounts(product: Product | None) -> set[int]:
+    """Кабинеты, по которым остаток товара действительно сверен расчётом.
+
+    Пишет сюда `recalc.catch_up_product` — и только те кабинеты, чьи заказы
+    удалось прочитать целиком. Пустое множество значит «ни один», в том числе
+    для товаров, рассчитанных до появления колонки: считать их покрытыми было бы
+    ровно тем допущением, из-за которого остаток уезжал на несверенный кабинет.
+    """
+    raw = ((product.recalc_account_ids if product is not None else "") or "").strip()
+    if not raw:
+        return set()
+    return {int(p) for p in (x.strip() for x in raw.split(",")) if p.isdigit()}
+
+
 def sku_mode(product: Product | None) -> str:
     if product is not None and product.broadcast_offset is not None:
         return MODE_OFFSET
@@ -169,6 +190,17 @@ def explain(product: Product | None, setting, account) -> Transmit:
                         "колонка «Трансляция» в этой строке",
                         potential=_after_switches(product, setting))
 
+    # Расчёт сверяет остаток по заказам ТОЛЬКО тех кабинетов, что были отмечены
+    # в его момент. Для кабинета, отмеченного позже, остаток ничем не подтверждён:
+    # его продажи с базовой даты в 1С не проведены, и уйдёт туда завышенное число.
+    # Прогноза здесь намеренно нет — правильный ответ не «столько уйдёт», а
+    # «сначала пересчёт», и после пересчёта число всё равно станет другим.
+    if (account is not None and product.recalc_done_at is not None
+            and account.id not in covered_accounts(product)):
+        return Transmit(0, True,
+                        f"расчёт не покрывал кабинет «{account.name}» — остаток по нему не сверен",
+                        "запустить «Расчёт» с этой галочкой")
+
     if account is not None and not account.dispatch_enabled:
         return Transmit(0, True, f"рассылка на «{account.name}» на паузе",
                         "переключатели площадок вверху страницы",
@@ -206,6 +238,8 @@ def quantity_for_account(db: Session, uid_1c: str, account_id: int, raw_stock: i
     ).first()
     if setting is None or not setting.enabled:
         return 0
+    if product.recalc_done_at is not None and account_id not in covered_accounts(product):
+        return 0
     account = db.query(PlatformAccount).filter(PlatformAccount.id == account_id).first()
     if account is not None and not account.dispatch_enabled:
         return 0
@@ -238,6 +272,12 @@ def enqueue_full_resend(db: Session, uid_1c: str, account_id: int, reason: str =
     """
     product = db.query(Product).filter(Product.uid_1c == uid_1c).first()
     if product is not None and not product.broadcast_enabled:
+        return
+    # Кабинет, которого расчёт не касался, — тот же случай: в очереди по нему
+    # выйдет ноль (ступень 2 лестницы), и этот ноль уедет на площадку, обнулив
+    # живую карточку. Отправлять туда нечего, пока не прошёл пересчёт.
+    if (product is not None and product.recalc_done_at is not None
+            and account_id not in covered_accounts(product)):
         return
     quantity = product.stock_on_hand if product else 0
     db.add(DispatchQueueItem(uid_1c=uid_1c, account_id=account_id, quantity=quantity, reason=reason))
