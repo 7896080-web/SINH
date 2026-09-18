@@ -19,6 +19,7 @@ from app.workers.catalog_sync import load_platform_catalog
 from app.workers.catalog_poller import poll_catalog
 from app.workers.ftp_channel import (
     LocalExchange, build_task_batch, apply_result_batch, detect_timed_out_tasks,
+    repost_stuck_movements,
     fetch_stock_export_files, fetch_stock_export_snapshot, fetch_barcode_dict_files,
     apply_stock_on_date_files, detect_timed_out_stock_date_requests,
     prune_stock_date_snapshots,
@@ -204,6 +205,12 @@ def job_ftp_send(request_stock_export: bool = False, request_barcode_export: boo
     db = SessionLocal()
     try:
         exchange = _build_ftp_exchange()
+        # Зависшие перемещения возвращаем в очередь ПЕРЕД сборкой файла, чтобы они
+        # уехали этим же циклом. Механизм сам решает, включён ли он, и сам держит
+        # предел повторов — здесь никаких условий не дублируем.
+        repost_stats = repost_stuck_movements(db)
+        if repost_stats["reposted"] or repost_stats["exhausted"]:
+            logger.info("ftp_send: перепроведение зависших %s", repost_stats)
         batch = build_task_batch(db, request_stock_export=request_stock_export,
                                  request_barcode_export=request_barcode_export,
                                  exchange=exchange)
