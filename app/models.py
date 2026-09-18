@@ -163,6 +163,13 @@ class Product(Base):
     offset_base_date = Column(Date, nullable=True)
     offset_base_stock = Column(Integer, nullable=True)
     fact_at_date = Column(Integer, nullable=True)
+    # Когда по товару в последний раз прошла АКТУАЛИЗАЦИЯ: с базовой даты подняты
+    # реальные заказы площадок и по ним созданы перемещения в 1С. До этого момента
+    # остаток ЦС отражает склад без учёта отгрузок на маркетплейсы, и включать
+    # трансляцию рано — уедет завышенное число. Отдельно от порога намеренно:
+    # порог посчитан и остаток актуализирован — разные состояния, и оператор
+    # должен видеть, какое из них достигнуто.
+    recalc_done_at = Column(DateTime, nullable=True)
     # Дата «активно с» — для аудита и backfill (подтягивание отгрузок с даты).
     broadcast_active_since = Column(Date, nullable=True)
     updated_at = Column(DateTime, default=now_utc, onupdate=now_utc)
@@ -515,3 +522,61 @@ class StockDateRow(Base):
     quantity = Column(Integer, nullable=False, default=0)
 
     snapshot = relationship("StockDateSnapshot", back_populates="rows")
+
+
+# ---------------------------------------------------------------------------
+# Массовая актуализация остатков («Расчёт» на странице «Товары и остатки»).
+#
+# Почему это задание в базе, а не работа внутри запроса: по каждому товару надо
+# опросить каждый его кабинет по историческим заказам. На полусотне позиций это
+# сотни обращений к API площадок и минуты работы — браузер столько не ждёт, а
+# перезагрузка страницы посреди прогона оставила бы половину товаров
+# необработанными без следа. Задание создаёт веб, выполняет ВОРКЕР (у него и
+# ключи площадок, и канал 1С), прогресс виден на странице.
+# ---------------------------------------------------------------------------
+
+class RecalcStatus(str, enum.Enum):
+    pending = "pending"     # создано, воркер ещё не взял
+    running = "running"     # идёт
+    done = "done"
+    failed = "failed"       # воркер не смог начать (список пуст, сбой на старте)
+    cancelled = "cancelled"  # снято оператором
+
+
+class RecalcJob(Base):
+    """Один запуск массовой актуализации."""
+    __tablename__ = "recalc_jobs"
+
+    id = Column(Integer, primary_key=True)
+    status = Column(Enum(RecalcStatus), default=RecalcStatus.pending, nullable=False, index=True)
+    created_by = Column(String(64), nullable=True)
+    created_at = Column(DateTime, default=now_utc, nullable=False)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    total = Column(Integer, default=0, nullable=False)
+    processed = Column(Integer, default=0, nullable=False)     # товаров пройдено
+    orders_applied = Column(Integer, default=0, nullable=False)
+    orders_skipped = Column(Integer, default=0, nullable=False)  # уже проведены раньше
+    failed_items = Column(Integer, default=0, nullable=False)
+    note = Column(Text, nullable=True)
+
+    items = relationship("RecalcItem", back_populates="job",
+                         cascade="all, delete-orphan", passive_deletes=True)
+
+
+class RecalcItem(Base):
+    """Один товар внутри задания. Список фиксируется в момент создания: отбор
+    по фильтру мог бы измениться, пока задание стоит в очереди, и оператор
+    обработал бы не то, что видел на экране."""
+    __tablename__ = "recalc_items"
+
+    id = Column(Integer, primary_key=True)
+    job_id = Column(Integer, ForeignKey("recalc_jobs.id", ondelete="CASCADE"),
+                    nullable=False, index=True)
+    uid_1c = Column(String(36), nullable=False, index=True)
+    done = Column(Boolean, default=False, nullable=False, index=True)
+    orders_applied = Column(Integer, default=0, nullable=False)
+    orders_skipped = Column(Integer, default=0, nullable=False)
+    error = Column(Text, nullable=True)
+
+    job = relationship("RecalcJob", back_populates="items")

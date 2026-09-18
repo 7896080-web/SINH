@@ -1,0 +1,36 @@
+{# Прогресс массовой актуализации. Обёртка с опросом — ЧАСТЬ фрагмента: htmx
+   подменяет элемент целиком (outerHTML), и будь она снаружи, первая же подмена
+   унесла бы с собой hx-trigger, а прогресс замер бы на первом значении. #}
+<div id="recalc-box" class="card" style="padding:12px 14px;"
+     {% if recalc_running %}hx-get="/products/recalc-progress" hx-trigger="every 3s"
+     hx-target="this" hx-swap="outerHTML"{% endif %}>
+<div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;">
+    <b>Расчёт остатков</b>
+    {% if recalc_running %}
+        <span class="badge badge--warn">идёт</span>
+        <span class="mono">{{ recalc_job.processed }} из {{ recalc_job.total }}</span>
+    {% elif recalc_job.status.value == 'done' %}
+        <span class="badge badge--good">завершён</span>
+        <span class="mono">{{ recalc_job.processed }} из {{ recalc_job.total }}</span>
+    {% else %}
+        <span class="badge badge--bad">{{ recalc_job.status.value }}</span>
+    {% endif %}
+    <span class="help-text">
+        заказов проведено {{ recalc_job.orders_applied }},
+        уже было проведено ранее {{ recalc_job.orders_skipped }}{% if recalc_job.failed_items %},
+        товаров с ошибкой <b>{{ recalc_job.failed_items }}</b>{% endif %}
+    </span>
+</div>
+{% if recalc_running %}
+<div style="height:6px;background:#eef0f4;border-radius:3px;margin-top:8px;overflow:hidden;">
+    <div style="height:100%;background:#2f5d9f;width:{{ (100 * recalc_job.processed / recalc_job.total) if recalc_job.total else 0 }}%;"></div>
+</div>
+<p class="help-text" style="margin-top:6px;">Работает планировщик, страницу можно
+закрыть — расчёт не прервётся. На площадки в это время не уходит ничего.</p>
+{% endif %}
+{% if recalc_job.failed_items %}
+<p class="help-text pr-hint--warn" style="margin-top:6px;">По части товаров
+поднять заказы не удалось — причины в строках задания; такие товары остались
+без отметки «актуализирован».</p>
+{% endif %}
+</div>

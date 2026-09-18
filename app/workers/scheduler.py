@@ -284,6 +284,30 @@ def _export_request_answered(db) -> bool:
     return applied >= requested
 
 
+def job_recalc():
+    """Массовая актуализация остатков — порциями, чтобы не занимать базу надолго.
+
+    Раз в 20 секунд берёт незавершённое задание и обрабатывает несколько товаров.
+    Нет задания — мгновенно выходит. Работу делает воркер, а не веб: здесь и ключи
+    площадок, и канал 1С, и запрос от браузера столько не живёт.
+    """
+    from app.recalc import run_tick
+
+    db = SessionLocal()
+    try:
+        result = run_tick(db, build_client, lambda platform: PENDING_WAREHOUSE_NAME.get(
+            platform, "Ожидает"))
+        if result.get("job") and not result.get("finished"):
+            logger.info("recalc: задание #%s — обработано %s из %s",
+                        result["job"], result.get("processed"), result.get("total"))
+        _heartbeat(db, "recalc", True)
+    except Exception as e:
+        logger.exception("recalc failed")
+        _heartbeat(db, "recalc", False, str(e))
+    finally:
+        db.close()
+
+
 def job_reconciliation():
     db = SessionLocal()
     try:
@@ -504,6 +528,9 @@ def build_scheduler() -> BlockingScheduler:
                   hours=24, id="ftp_send_barcode_request", max_instances=1,
                   next_run_time=start + timedelta(seconds=40))
     sched.add_job(job_import_barcodes, "interval", minutes=15, id="import_barcodes", max_instances=1)
+    # Массовая актуализация: частый опрос дешёвый (без задания — один SELECT),
+    # зато прогресс на странице двигается заметно для человека.
+    sched.add_job(job_recalc, "interval", seconds=20, id="recalc", max_instances=1)
 
     # Per-account задания: первичная простановка + периодическая сверка.
     db = SessionLocal()

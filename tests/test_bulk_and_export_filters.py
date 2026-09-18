@@ -328,21 +328,124 @@ def test_a_row_with_no_fact_is_not_called_done(logged_in_client, web_db):
     assert "готово" not in body
 
 
-def test_a_finished_row_says_it_is_ready_to_broadcast(logged_in_client, web_db):
+def test_a_row_with_a_threshold_but_no_catch_up_is_not_ready(logged_in_client, web_db):
+    """Порог посчитан — но отгрузки площадок за период в 1С ещё не проведены,
+    остаток ЦС завышен. Включать трансляцию рано: уедет число больше реального.
+    Раньше такая строка называлась «готово», и это было опасное враньё."""
     _product(web_db, "u1", broadcast=False, offset_base_date=date(2026, 8, 7),
              offset_base_stock=14, fact_at_date=14)
 
     body = logged_in_client.get("/products/rows").text
 
-    assert "готово" in body
-    assert "можно включать трансляцию" in body
+    assert "нужен расчёт" in body
+    assert "можно включать трансляцию" not in body
 
 
-def test_an_already_broadcasting_row_is_not_told_to_switch_on(logged_in_client, web_db):
-    _product(web_db, "u1", broadcast=True, offset_base_date=date(2026, 8, 7),
-             offset_base_stock=14, fact_at_date=14)
+def test_a_row_after_the_catch_up_says_it_is_ready(logged_in_client, web_db):
+    from app.timeutils import now_utc
+
+    _product(web_db, "u1", broadcast=False, offset_base_date=date(2026, 8, 7),
+             offset_base_stock=14, fact_at_date=14, recalc_done_at=now_utc())
 
     body = logged_in_client.get("/products/rows").text
 
-    assert "готово" in body
+    assert "актуализирован" in body
+    assert "перемещения в 1С созданы, можно включать трансляцию" in body
+
+
+def test_an_already_broadcasting_row_is_not_told_to_switch_on(logged_in_client, web_db):
+    from app.timeutils import now_utc
+
+    _product(web_db, "u1", broadcast=True, offset_base_date=date(2026, 8, 7),
+             offset_base_stock=14, fact_at_date=14, recalc_done_at=now_utc())
+
+    body = logged_in_client.get("/products/rows").text
+
+    assert "актуализирован" in body
     assert "можно включать трансляцию" not in body
+
+
+# ------------------------------------------------ кнопка «Расчёт»
+
+def test_recalc_creates_a_job_instead_of_working_in_the_request(logged_in_client, web_db):
+    """По каждому товару надо опросить каждый его кабинет по историческим
+    заказам — в запросе это минуты. Веб только заводит задание, работает воркер."""
+    from app.models import RecalcItem, RecalcJob
+
+    _account(web_db)
+    _product(web_db, "u1", offset_base_date=date(2026, 8, 7))
+
+    r = logged_in_client.post("/products/bulk", data={
+        "action": "recalc", "uids": ["u1"], "q": ""})
+
+    assert "Расчёт запущен" in r.text
+    assert web_db.query(RecalcJob).count() == 1
+    assert [i.uid_1c for i in web_db.query(RecalcItem).all()] == ["u1"]
+
+
+def test_recalc_skips_products_without_a_date_and_says_so(logged_in_client, web_db):
+    from app.models import RecalcItem
+
+    _account(web_db)
+    _product(web_db, "u1", offset_base_date=date(2026, 8, 7))
+    _product(web_db, "u2")
+
+    r = logged_in_client.post("/products/bulk", data={
+        "action": "recalc", "uids": ["u1", "u2"], "q": ""})
+
+    assert "Пропущено 1" in r.text
+    assert [i.uid_1c for i in web_db.query(RecalcItem).all()] == ["u1"]
+
+
+def test_recalc_refuses_when_nothing_has_a_date(logged_in_client, web_db):
+    from app.models import RecalcJob
+
+    _account(web_db)
+    _product(web_db, "u1")
+
+    r = logged_in_client.post("/products/bulk", data={
+        "action": "recalc", "uids": ["u1"], "q": ""})
+
+    assert "не задана дата расчёта" in r.text
+    assert web_db.query(RecalcJob).count() == 0
+
+
+def test_a_second_job_is_not_started_while_one_runs(logged_in_client, web_db):
+    """Два задания шли бы по одним и тем же товарам и дублировали обращения к
+    площадкам."""
+    from app.models import RecalcJob
+
+    _account(web_db)
+    _product(web_db, "u1", offset_base_date=date(2026, 8, 7))
+    logged_in_client.post("/products/bulk", data={"action": "recalc", "uids": ["u1"], "q": ""})
+
+    r = logged_in_client.post("/products/bulk", data={
+        "action": "recalc", "uids": ["u1"], "q": ""})
+
+    assert "уже идёт" in r.text
+    assert web_db.query(RecalcJob).count() == 1
+
+
+def test_the_page_shows_the_progress(logged_in_client, web_db):
+    _account(web_db)
+    _product(web_db, "u1", offset_base_date=date(2026, 8, 7))
+    logged_in_client.post("/products/bulk", data={"action": "recalc", "uids": ["u1"], "q": ""})
+
+    body = logged_in_client.get("/products").text
+
+    assert "Расчёт остатков" in body
+    assert "страницу можно" in body      # работает планировщик, не браузер
+
+
+def test_the_progress_fragment_keeps_polling_itself(logged_in_client, web_db):
+    """Обёртка с опросом — часть фрагмента: htmx подменяет элемент целиком, и
+    будь она снаружи, первая же подмена унесла бы hx-trigger, а прогресс замер бы
+    на первом значении."""
+    _account(web_db)
+    _product(web_db, "u1", offset_base_date=date(2026, 8, 7))
+    logged_in_client.post("/products/bulk", data={"action": "recalc", "uids": ["u1"], "q": ""})
+
+    fragment = logged_in_client.get("/products/recalc-progress").text
+
+    assert 'hx-trigger="every 3s"' in fragment
+    assert 'id="recalc-box"' in fragment

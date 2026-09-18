@@ -33,6 +33,7 @@ EXPECTED_INTERVAL_SECONDS = {
     "reconciliation_applied": 3600 * 3,
     "reconcile_accounts": 300 * 3,
     "import_barcodes": 900 * 3,
+    "recalc": 20 * 6,
     # Метка недельного ПОЛНОГО импорта справочника 1С (scheduler.job_import_barcodes):
     # пишется раз в 7 дней, без своей записи здесь протухала бы через 10 минут и
     # держала /health в 503 всю неделю.
@@ -72,6 +73,7 @@ REQUIRED_WORKERS = {
     "reconciliation_applied": 3 * 3600,
     "reconcile_accounts": 900,
     "import_barcodes": 1800,
+    "recalc": 300,
 }
 
 ACCOUNT_WORKER_PREFIXES = ("poll_orders_account_", "catalog_poll_account_")

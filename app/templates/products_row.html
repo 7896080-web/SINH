@@ -44,7 +44,7 @@
     <td class="pr-calcbox">
         <div class="pr-status pr-status--{{ row.calc_status }}">
             {% if row.calc_status == 'ready' %}
-                ✓ {{ row.calc_status_label }}{% if not row.broadcast_enabled %} — можно включать трансляцию{% endif %}
+                ✓ {{ row.calc_status_label }}{% if not row.broadcast_enabled %} — перемещения в 1С созданы, можно включать трансляцию{% endif %}
             {% else %}
                 {{ row.calc_status_label }}
             {% endif %}
