@@ -131,6 +131,25 @@ class Transmit:
     blocked: bool          # True — уходит 0 из-за выключателя или порога кабинета
     reason: str            # человеческая причина; пусто, если ничего не мешает
     fix_hint: str = ""     # что сделать оператору, чтобы разблокировать
+    # Сколько ушло бы, если снять мешающий ВЫКЛЮЧАТЕЛЬ (трансляция товара, пауза
+    # площадки). Ноль с причиной не отвечает на вопрос, ради которого оператор
+    # смотрит в эту колонку перед включением: «а что уйдёт, если я нажму Вкл?».
+    # Для неотмеченного кабинета прогноза нет — туда не передают по решению
+    # оператора, а не из-за выключателя.
+    potential: int = 0
+
+
+def _after_switches(product: Product, setting) -> int:
+    """Сколько ушло бы в этот кабинет, будь выключатели сняты.
+
+    Считается по той же лестнице, только без проверки самих выключателей: порог
+    кабинета здесь участвует, потому что он останется и после включения.
+    """
+    base = sku_quantity(product)
+    threshold = getattr(setting, "min_threshold", 0) or 0
+    if sku_mode(product) == MODE_AUTO and threshold and base <= threshold:
+        return 0
+    return base
 
 
 def explain(product: Product | None, setting, account) -> Transmit:
@@ -139,17 +158,21 @@ def explain(product: Product | None, setting, account) -> Transmit:
     if product is None:
         return Transmit(0, True, "товар не найден")
 
+    # Неотмеченный кабинет проверяем ПЕРВЫМ: туда не передают по решению
+    # оператора, и прогноз «сколько ушло бы» там бессмыслен — включать нечего.
+    if account is not None and (setting is None or not setting.enabled):
+        return Transmit(0, True, f"кабинет «{account.name}» не отмечен для товара",
+                        "галочка в колонке кабинета")
+
     if not product.broadcast_enabled:
         return Transmit(0, True, "трансляция товара выключена",
-                        "колонка «Трансляция» в этой строке")
+                        "колонка «Трансляция» в этой строке",
+                        potential=_after_switches(product, setting))
 
-    if account is not None:
-        if setting is None or not setting.enabled:
-            return Transmit(0, True, f"кабинет «{account.name}» не отмечен для товара",
-                            "галочка в колонке кабинета")
-        if not account.dispatch_enabled:
-            return Transmit(0, True, f"рассылка на «{account.name}» на паузе",
-                            "переключатели площадок вверху страницы")
+    if account is not None and not account.dispatch_enabled:
+        return Transmit(0, True, f"рассылка на «{account.name}» на паузе",
+                        "переключатели площадок вверху страницы",
+                        potential=_after_switches(product, setting))
 
     base = sku_quantity(product)
     mode = sku_mode(product)
