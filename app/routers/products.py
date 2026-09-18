@@ -110,6 +110,19 @@ def _calc_status(product: Product, has_cabinet: bool = True,
     return ("ready", "актуализирован")
 
 
+def _stamp_active_since(db: Session, uid_1c: str) -> None:
+    """Проставить «Активно с» текущей датой при первой отметке кабинета.
+
+    Отметка кабинета и есть момент, с которого товар начинает жить на площадке,
+    и дату этого момента оператор раньше вписывал руками — то есть забывал.
+    Заполняем ТОЛЬКО пустое: если дата уже стоит, она отмечает первое включение,
+    и перетирать её повторной отметкой значило бы терять историю.
+    """
+    product = db.query(Product).filter(Product.uid_1c == uid_1c).first()
+    if product is not None and product.broadcast_active_since is None:
+        product.broadcast_active_since = now_utc().date()
+
+
 def _blocks_broadcast_on(product: Product) -> str | None:
     """Почему этот товар нельзя включать в трансляцию. None — можно.
 
@@ -693,6 +706,7 @@ def toggle_sync(
     if enabled and not was_enabled:
         setting.enabled_at = now_utc()
         setting.has_proposal = False
+        _stamp_active_since(db, uid_1c)
         enqueue_full_resend(db, uid_1c, account_id)
         log_action(db, user.username, "sync_enabled", f"{uid_1c} / кабинет #{account_id}")
     elif not enabled and was_enabled:
@@ -751,7 +765,8 @@ def recalc_progress(request: Request, db: Session = Depends(get_db),
 @router.post("/products/bulk")
 def bulk_edit(
     request: Request, action: str = Form(...), uids: list[str] = Form(default=[]),
-    int_value: str = Form(""), date_value: str = Form(""), q: str = Form(""),
+    int_value: str = Form(""), date_value: str = Form(""), account_id: str = Form(""),
+    q: str = Form(""),
     only_proposals: bool = Form(False), only_blocked: bool = Form(False),
     hide_size_u: bool = Form(False), only_unfinished: bool = Form(False),
     all_filtered: bool = Form(False),
@@ -849,8 +864,49 @@ def bulk_edit(
         set_flash(request, message, "good")
         return back()
 
+    target_account = None
+    if action in ("cabinet_on", "cabinet_off"):
+        try:
+            target_account = db.query(PlatformAccount).filter(
+                PlatformAccount.id == int(account_id)).first()
+        except (TypeError, ValueError):
+            target_account = None
+        if target_account is None:
+            set_flash(request, "Выберите кабинет в списке рядом с кнопкой.", "warn")
+            return back()
+
     changed = skipped = refused = 0
     for p in products:
+        if action in ("cabinet_on", "cabinet_off"):
+            # Отметка кабинета сразу по всему отбору. Правила ровно те же, что у
+            # галочки в строке (`toggle_sync`), и списаны с неё не случайно: там
+            # включение ставит доотправку в очередь, а снятие — отзыв, и только
+            # если на этот кабинет реально что-то уходило. Разойтись этим двум
+            # путям нельзя, иначе массовое снятие обнулит живые карточки.
+            if target_account is None:
+                continue
+            setting = next((x for x in p.sync_settings
+                            if x.account_id == target_account.id), None)
+            if setting is None:
+                setting = SyncSetting(uid_1c=p.uid_1c, account_id=target_account.id)
+                db.add(setting)
+            want = action == "cabinet_on"
+            if setting.enabled == want:
+                continue                      # уже так — не действие
+            if want:
+                setting.enabled = True
+                setting.enabled_at = now_utc()
+                setting.has_proposal = False
+                if p.broadcast_active_since is None:
+                    p.broadcast_active_since = now_utc().date()
+                enqueue_full_resend(db, p.uid_1c, target_account.id)
+            else:
+                if should_withdraw(db, p, target_account.id):
+                    enqueue_withdrawal(db, p.uid_1c, target_account.id)
+                setting.enabled = False
+            changed += 1
+            continue
+
         if action == "broadcast_on" and _blocks_broadcast_on(p) is not None:
             # Молча пропустить нельзя: оператор решил бы, что включил всё
             # отобранное. Считаем и называем в отчёте.
@@ -905,11 +961,16 @@ def bulk_edit(
         else:
             set_flash(request, "Неизвестное действие.", "warn")
             return back()
-        if action != "set_active_since":
+        if action not in ("set_active_since", "cabinet_on", "cabinet_off"):
+            # У действий с кабинетом своя отправка — по тому кабинету, которого
+            # они касаются. Общая доотправка добавила бы к ней записи по всем
+            # остальным, ничего не изменив по сути.
             _repropagate(db, p, reason="bulk_edit")
         changed += 1
 
     scope = "по отбору" if all_filtered else "по отмеченным"
+    if target_account is not None:
+        scope += f", кабинет «{target_account.name}»"
     log_action(db, user.username, "products_bulk", f"{action} {scope} x{changed}")
     db.commit()
     message = f"Массовая правка ({scope}): изменено строк — {changed}."
