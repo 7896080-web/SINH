@@ -8,6 +8,7 @@ from app.models import (
     Product, SyncSetting, SyncAnomaly, AnomalyReason, ProcessedOrder,
     OrderProcessStatus, DispatchQueueItem, FtpTask, Barcode, PlatformAccount,
 )
+from app.transmit import covered_accounts
 from app.workers.matching import resolve_barcode
 from app.workers.platform_clients.base import PlatformClient, PlatformOrder
 
@@ -65,9 +66,16 @@ def _enqueue_dispatch_to_others(db: Session, uid_1c: str, source_account_id: int
         SyncSetting.uid_1c == uid_1c, SyncSetting.enabled.is_(True),
     ).all()
 
+    # Кабинеты, которых расчёт не касался, пропускаем по той же причине: по ним
+    # рассылка посчитает ноль и отправит его на живую карточку.
+    covered = covered_accounts(product)
+    gate_by_recalc = product is not None and product.recalc_done_at is not None
+
     targets = []
     for setting in settings:
         if setting.account_id == source_account_id:
+            continue
+        if gate_by_recalc and setting.account_id not in covered:
             continue
         db.add(DispatchQueueItem(
             uid_1c=uid_1c, account_id=setting.account_id, quantity=new_quantity, reason=reason,

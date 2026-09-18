@@ -29,11 +29,35 @@ CONFIRMED_STATUSES = {
 class KitClient(PlatformClient):
     name = "kit"
 
-    def __init__(self, token: str, session: requests.Session | None = None):
+    def __init__(self, token: str, session: requests.Session | None = None,
+                 variant_map_loader=None):
         self.session = session or requests.Session()
         # Авторизация Bearer — подтверждена на живом API (вызовы /v1/orders,
         # /v1/warehouses, /v1/variants возвращают 200 с этим заголовком).
         self.session.headers.update({"Authorization": f"Bearer {token}"})
+
+        # `variant_map_loader` — функция без аргументов, отдающая уже известное
+        # соответствие variant_id -> баркод из НАШЕЙ базы (снимок каталога
+        # кабинета, `platform_catalog_items`, где для Kit external_id и есть
+        # идентификатор варианта). Без неё клиент спрашивает баркод у площадки
+        # отдельным GET на КАЖДУЮ строку КАЖДОГО заказа: на одной странице их
+        # больше сотни, страниц до двухсот, и всё это заново на каждый товар —
+        # Kit отвечает на такое 429, а 429 здесь оборачивается потерей заказа.
+        # Загружаем лениво и один раз на экземпляр клиента.
+        self._variant_map_loader = variant_map_loader
+        self._variant_map: dict[str, str] | None = None
+
+        # Сколько строк заказов пришлось выбросить, потому что баркод узнать НЕ
+        # УДАЛОСЬ (429 после всех повторов, сетевая ошибка, 4xx). Это не то же
+        # самое, что вариант без баркода: там ответ получен и он пустой — такой
+        # товар просто не наш. Разница принципиальна: пустой ответ это факт, а
+        # неудача — пробел, и расчёт, не знающий о пробеле, поставит товару
+        # «актуализирован» по заказам, которых не видел.
+        self.last_unresolved = 0
+        # Варианты, по которым запрос уже провалился в пределах текущего вызова.
+        # Нужны отдельно от кэша баркодов: в кэше пустая строка значит «ответ
+        # получен, баркода нет» — это не потеря, и путать их нельзя.
+        self._failed_variants: set[str] = set()
 
     def _get(self, path: str, params=None):
         def call():
@@ -70,6 +94,8 @@ class KitClient(PlatformClient):
     def get_orders_awaiting_confirmation(self) -> list[PlatformOrder]:
         result = []
         variant_barcode_cache: dict[str, str] = {}
+        self.last_unresolved = 0
+        self._failed_variants = set()
 
         page = 1
         while True:
@@ -89,10 +115,7 @@ class KitClient(PlatformClient):
                         # напрямую (см. предупреждение в base.py — этот участок
                         # закрывает ту нестыковку). Резолвим через тот же
                         # объект Variant, где 'barcode' — подтверждённое поле.
-                        barcode = variant_barcode_cache.get(variant_id)
-                        if barcode is None:
-                            barcode = self._resolve_variant_barcode(variant_id)
-                            variant_barcode_cache[variant_id] = barcode or ""
+                        barcode = self._barcode_for_variant(variant_id, variant_barcode_cache)
                         if not barcode:
                             continue
 
@@ -116,6 +139,8 @@ class KitClient(PlatformClient):
 
         result = []
         variant_barcode_cache: dict[str, str] = {}
+        self.last_unresolved = 0
+        self._failed_variants = set()
         page = 1
         while page <= 200:  # защитный предел на число страниц
             data = self._get("/v1/orders", params={"page": page, "per_page": 100})
@@ -135,10 +160,7 @@ class KitClient(PlatformClient):
                 for chunk in o.get("delivery_chunks", []):
                     for item in chunk.get("items", []):
                         variant_id = item["product_variant_id"]
-                        barcode = variant_barcode_cache.get(variant_id)
-                        if barcode is None:
-                            barcode = self._resolve_variant_barcode(variant_id)
-                            variant_barcode_cache[variant_id] = barcode or ""
+                        barcode = self._barcode_for_variant(variant_id, variant_barcode_cache)
                         if not barcode:
                             continue
                         result.append(PlatformOrder(
@@ -151,12 +173,53 @@ class KitClient(PlatformClient):
             page += 1
         return result
 
+    def _local_variant_map(self) -> dict[str, str]:
+        if self._variant_map is None:
+            try:
+                self._variant_map = dict(self._variant_map_loader() or {}) \
+                    if self._variant_map_loader else {}
+            except Exception:   # своя база недоступна — просто идём в API, как раньше
+                self._variant_map = {}
+        return self._variant_map
+
     def _resolve_variant_barcode(self, variant_id: str) -> str | None:
-        try:
-            variant = self._get(f"/v1/variants/{variant_id}")
-            return variant.get("barcode") or None
-        except requests.HTTPError:
+        """Баркод варианта, или None — если у варианта его нет.
+
+        ПОДНИМАЕТ исключение, если спросить не удалось. Раньше здесь стоял
+        `except requests.HTTPError: return None`, и 429 после исчерпания попыток
+        становился неотличим от «у варианта нет баркода»: заказ молча исчезал,
+        наверх не уходило ничего, и расчёт считал, что кабинет честно ответил
+        «продаж не было». Отличать отсутствие от неудачи обязан вызывающий."""
+        variant = self._get(f"/v1/variants/{variant_id}")
+        return variant.get("barcode") or None
+
+    def _barcode_for_variant(self, variant_id: str, cache: dict[str, str]) -> str | None:
+        """Баркод строки заказа: своя база → кэш вызова → площадка.
+
+        None означает «этой строки у нас не будет». Если причина — неудачный
+        запрос, счётчик `last_unresolved` растёт, и вызывающий узнает, что
+        картина неполная."""
+        # Считаем ПОТЕРЯННЫЕ СТРОКИ, а не различающиеся варианты: один и тот же
+        # вариант встречается в разных заказах, и каждая его строка — отдельная
+        # непроведённая отгрузка. Повторно спрашивать площадку при этом не идём.
+        if variant_id in self._failed_variants:
+            self.last_unresolved += 1
             return None
+        if variant_id in cache:
+            return cache[variant_id] or None
+
+        barcode = self._local_variant_map().get(variant_id)
+        if not barcode:
+            try:
+                barcode = self._resolve_variant_barcode(variant_id)
+            except requests.RequestException:
+                # Больше по этому варианту в пределах вызова не ходим: если Kit
+                # уже отвечает 429, повторы только усугубят лимит.
+                self._failed_variants.add(variant_id)
+                self.last_unresolved += 1
+                return None
+        cache[variant_id] = barcode or ""
+        return barcode or None
 
     def get_cancelled_orders(self, order_ids: list[str]) -> list[PlatformOrder]:
         # Учитываем ТОЛЬКО НАШУ (продавцовскую) отмену до отгрузки. В разобранном

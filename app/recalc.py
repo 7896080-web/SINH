@@ -86,7 +86,8 @@ def _enabled_accounts(db: Session, uid_1c: str) -> list[PlatformAccount]:
     ).order_by(PlatformAccount.id).all()
 
 
-def collect_orders(db: Session, product: Product, since: date, build_client) -> tuple[list, list]:
+def collect_orders(db: Session, product: Product, since: date,
+                   build_client) -> tuple[list, list, list]:
     """Читает с площадок заказы товара с даты. Ничего не меняет.
 
     Фильтр строго по баркодам этого товара, а не через общее сопоставление: иначе
@@ -95,16 +96,17 @@ def collect_orders(db: Session, product: Product, since: date, build_client) -> 
     """
     barcodes = {b.barcode for b in db.query(Barcode).filter(Barcode.uid_1c == product.uid_1c).all()}
     if not barcodes:
-        return [], ["нет баркодов — товар не сопоставлен"]
+        return [], ["нет баркодов — товар не сопоставлен"], []
 
     accounts = _enabled_accounts(db, product.uid_1c)
     if not accounts:
         # Спрашивать заказы негде. Молча вернуть «ничего не нашлось» нельзя: тогда
         # товар получил бы отметку «актуализирован», хотя мы никуда не заглядывали,
         # и оператор включил бы трансляцию, считая остаток проверенным.
-        return [], ["не отмечен ни один кабинет — заказы спрашивать негде"]
+        return [], ["не отмечен ни один кабинет — заказы спрашивать негде"], []
 
     rows, problems = [], []
+    covered: list[int] = []
     for account in accounts:
         try:
             client = build_client(db, account.id)
@@ -117,6 +119,21 @@ def collect_orders(db: Session, product: Product, since: date, build_client) -> 
             problems.append(f"{account.name}: {type(e).__name__}: {e}")
             continue
 
+        # Площадка могла ответить, но не по всем строкам: у Kit баркод узнаётся
+        # отдельным запросом на вариант, и 429 после всех повторов раньше просто
+        # выбрасывал заказ. Тишина и пустой ответ выглядели одинаково, а значат
+        # разное — «продаж не было» против «мы не увидели часть продаж». Пробел
+        # обязан дойти сюда: иначе товар получит «актуализирован» по заказам,
+        # которых расчёт не видел, и оператор включит трансляцию завышенного
+        # остатка.
+        lost = getattr(client, "last_unresolved", 0) or 0
+        if lost:
+            problems.append(
+                f"{account.name}: не удалось получить баркод по {lost} строкам заказов "
+                f"(лимит запросов площадки) — часть продаж могла остаться неучтённой")
+            continue
+
+        covered.append(account.id)
         seen = set()
         for o in orders:
             if o.order_id in seen or o.barcode not in barcodes:
@@ -124,7 +141,7 @@ def collect_orders(db: Session, product: Product, since: date, build_client) -> 
             seen.add(o.order_id)
             rows.append((account, o))
     rows.sort(key=lambda r: (r[1].order_date or date(1970, 1, 1), r[0].id))
-    return rows, problems
+    return rows, problems, covered
 
 
 def catch_up_product(db: Session, product: Product, build_client, pending_warehouse) -> dict:
@@ -142,14 +159,16 @@ def catch_up_product(db: Session, product: Product, build_client, pending_wareho
     from app.workers.order_poller import process_new_order   # локально: цикл импортов
     from app.workers.platform_clients.base import PlatformOrder
 
-    stats = {"applied": 0, "skipped": 0, "failed": 0, "problems": []}
+    stats = {"applied": 0, "skipped": 0, "failed": 0, "problems": [],
+             "covered_accounts": []}
 
     if product.offset_base_date is None:
         stats["problems"].append("не задана дата расчёта")
         return stats
 
-    rows, problems = collect_orders(db, product, product.offset_base_date, build_client)
+    rows, problems, covered = collect_orders(db, product, product.offset_base_date, build_client)
     stats["problems"] += problems
+    stats["covered_accounts"] = covered
 
     for account, o in rows:
         already = db.query(ProcessedOrder).filter(
@@ -185,6 +204,10 @@ def catch_up_product(db: Session, product: Product, build_client, pending_wareho
     # помешало посмотреть — иначе «актуализирован» было бы неправдой.
     if not stats["problems"]:
         product.recalc_done_at = now_utc()
+        # Запоминаем ИМЕННО те кабинеты, чьи заказы удалось прочитать целиком.
+        # Кабинет, отмеченный позже, в этот список не попадёт — и трансляция в
+        # него не начнётся, пока расчёт не пройдёт заново уже с ним.
+        product.recalc_account_ids = ",".join(str(i) for i in sorted(covered)) or None
     return stats
 
 

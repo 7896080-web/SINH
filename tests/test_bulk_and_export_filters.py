@@ -29,15 +29,23 @@ def _product(web_db, uid, name="Товар", size="M", broadcast=True, **kw):
     return p
 
 
-def _with_cabinet(web_db, uid, **kw):
+def _with_cabinet(web_db, uid, covered=True, **kw):
     """Товар с отмеченным кабинетом. Состояния расчёта проверяются именно на
     таком: без кабинета строка честно пишет «не выбран кабинет» и всё остальное
-    становится неважным — заказы спрашивать негде и транслировать некуда."""
+    становится неважным — заказы спрашивать негде и транслировать некуда.
+
+    `covered` — попал ли этот кабинет в прошедший расчёт. По умолчанию да: расчёт
+    поднимает заказы с отмеченных кабинетов, так что «прошёл расчёт» и «кабинет
+    им покрыт» — обычно одно и то же событие. Ложь означает «кабинет отметили
+    ПОСЛЕ расчёта» — по нему заказы не поднимали, и остаток не сверен.
+    """
     from app.models import SyncSetting
 
     account = _account(web_db)
     product = _product(web_db, uid, **kw)
     web_db.add(SyncSetting(uid_1c=uid, account_id=account.id, enabled=True))
+    if covered and kw.get("recalc_done_at") is not None:
+        product.recalc_account_ids = str(account.id)
     web_db.commit()
     return product
 
@@ -627,3 +635,63 @@ def test_a_transmitting_cabinet_shows_the_real_number(logged_in_client, web_db):
 
     assert "после включения" not in body
     assert "→ 18" in body
+
+
+# ------------------------------------------------ поле «порог кабинета»
+
+def test_the_cabinet_threshold_is_no_longer_an_editable_box(logged_in_client, web_db):
+    """Поле стояло вплотную к расчётному числу и принимало ввод, хотя при заданном
+    пороге трансляции ни на что не влияло. В него вписали 46 — количество для
+    трансляции, — и оно молча ждало момента, когда порог трансляции сбросят."""
+    _with_cabinet(web_db, "u1")
+
+    body = logged_in_client.get("/products/rows").text
+
+    assert "pr-input--tiny" not in body
+
+
+def test_a_leftover_threshold_is_shown_and_can_be_dropped(logged_in_client, web_db):
+    """Скрыть сохранённое значение было бы хуже, чем показать: оно продолжает
+    лежать в базе и сработает, если режим сменится."""
+    from app.models import SyncSetting
+
+    _with_cabinet(web_db, "u1", offset_base_date=date(2026, 8, 7),
+                  offset_base_stock=30, fact_at_date=58, broadcast_offset=-28)
+    setting = web_db.query(SyncSetting).filter(SyncSetting.uid_1c == "u1").one()
+    setting.min_threshold = 46
+    web_db.commit()
+
+    body = logged_in_client.get("/products/rows").text
+
+    assert "порог кабинета 46" in body
+    assert "не применяется" in body, "при заданном пороге трансляции он молчит"
+    assert "снять" in body
+
+
+def test_a_threshold_that_really_works_is_not_called_idle(logged_in_client, web_db):
+    from app.models import SyncSetting
+
+    _with_cabinet(web_db, "u1")            # без порога трансляции — режим автоматический
+    setting = web_db.query(SyncSetting).filter(SyncSetting.uid_1c == "u1").one()
+    setting.min_threshold = 5
+    web_db.commit()
+
+    body = logged_in_client.get("/products/rows").text
+
+    assert "порог кабинета 5" in body
+    assert "не применяется" not in body
+
+
+def test_a_cabinet_added_after_the_catch_up_makes_the_row_ask_for_a_recount(
+        logged_in_client, web_db):
+    """«Актуализирован» на такой строке — неправда, а именно на неё оператор
+    опирается, когда включает трансляцию."""
+    from app.timeutils import now_utc
+
+    _with_cabinet(web_db, "u1", covered=False, offset_base_date=date(2026, 8, 7),
+                  offset_base_stock=14, fact_at_date=14, recalc_done_at=now_utc())
+
+    body = logged_in_client.get("/products/rows").text
+
+    assert "нужен пересчёт: добавлен кабинет" in body
+    assert "актуализирован" not in body
