@@ -371,7 +371,7 @@ def test_a_row_after_the_catch_up_says_it_is_ready(logged_in_client, web_db):
     body = logged_in_client.get("/products/rows").text
 
     assert "актуализирован" in body
-    assert "перемещения в 1С созданы, можно включать трансляцию" in body
+    assert "перемещения в 1С созданы — можно включать трансляцию" in body
 
 
 def test_an_already_broadcasting_row_is_not_told_to_switch_on(logged_in_client, web_db):
@@ -719,3 +719,19 @@ def test_a_leftover_offset_does_not_pretend_to_be_manual(logged_in_client, web_d
 
     assert "от прошлого расчёта" in body
     assert "задан вручную" not in body
+
+
+def test_the_ready_badge_does_not_swallow_the_whole_row(logged_in_client, web_db):
+    """Подсказка «перемещения в 1С созданы» жила ВНУТРИ значка, а значок не
+    переносится: колонка расчёта растягивалась на всю ширину и выдавливала
+    «Размер» и «Цвет» за край таблицы. Теперь подсказка — отдельная строка."""
+    from app.timeutils import now_utc
+
+    _with_cabinet(web_db, "u1", broadcast=False, offset_base_date=date(2026, 8, 7),
+                  offset_base_stock=14, fact_at_date=14, recalc_done_at=now_utc())
+
+    body = logged_in_client.get("/products/rows").text
+
+    badge = body.split('class="pr-status')[1].split("</div>")[0]
+    assert "можно включать трансляцию" not in badge, \
+        "длинный текст внутри nowrap-значка ломает ширину колонок"
