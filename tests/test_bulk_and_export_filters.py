@@ -529,3 +529,101 @@ def test_the_export_button_still_follows_the_live_filters(logged_in_client, web_
 
     assert 'form="pr-filters"' in body
     assert 'id="pr-filters"' in body
+
+
+def test_a_finished_job_tells_the_operator_to_refresh(logged_in_client, web_db):
+    """Карточка прогресса обновляет себя опросом, а таблица под ней — нет: строки
+    остаются от момента загрузки и показывают состояние ДО расчёта. Оператор
+    видел «завершён, 7 заказов» и рядом «нужен расчёт» в строке — и решил, что
+    расчёт не сработал. Найдено на живой работе."""
+    from app.models import RecalcJob, RecalcStatus
+
+    _account(web_db)
+    _product(web_db, "u1", offset_base_date=date(2026, 8, 7))
+    web_db.add(RecalcJob(status=RecalcStatus.done, total=1, processed=1, orders_applied=7))
+    web_db.commit()
+
+    fragment = logged_in_client.get("/products/recalc-progress").text
+
+    assert "Обновить страницу" in fragment
+
+
+def test_a_running_job_does_not_nag_about_refreshing(logged_in_client, web_db):
+    """Пока идёт — обновлять нечего, и лишняя строка только отвлекает."""
+    from app.models import RecalcJob, RecalcStatus
+
+    _account(web_db)
+    _product(web_db, "u1", offset_base_date=date(2026, 8, 7))
+    web_db.add(RecalcJob(status=RecalcStatus.running, total=5, processed=2))
+    web_db.commit()
+
+    fragment = logged_in_client.get("/products/recalc-progress").text
+
+    assert "Обновить страницу" not in fragment
+
+
+def test_a_fresh_page_load_does_not_nag(logged_in_client, web_db):
+    """На только что открытой странице строки и так свежие."""
+    from app.models import RecalcJob, RecalcStatus
+
+    _account(web_db)
+    _product(web_db, "u1", offset_base_date=date(2026, 8, 7))
+    web_db.add(RecalcJob(status=RecalcStatus.done, total=1, processed=1))
+    web_db.commit()
+
+    body = logged_in_client.get("/products").text
+
+    assert "Обновить страницу" not in body
+
+
+# ------------------------------------------------ прогноз вместо нуля
+
+def test_a_cabinet_shows_what_would_be_sent_after_switching_on(logged_in_client, web_db):
+    """Оператор смотрит в колонку кабинета ПЕРЕД включением. «0, потому что
+    выключено» не отвечает на его вопрос — ему нужно число, которое уйдёт, если
+    нажать «Вкл»."""
+    from app.models import SyncSetting
+
+    account = _account(web_db)
+    product = _product(web_db, "u1", broadcast=False)
+    product.stock_on_hand = 18
+    product.broadcast_offset = -28          # реального склада на 28 больше учёта
+    web_db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
+    web_db.commit()
+
+    body = logged_in_client.get("/products/rows").text
+
+    assert "46" in body                     # 18 − (−28)
+    assert "после включения" in body
+
+
+def test_an_unchecked_cabinet_gets_no_forecast(logged_in_client, web_db):
+    """Туда не передают по решению оператора, а не из-за выключателя: включать
+    нечего, и прогноз только запутал бы."""
+    from app.models import SyncSetting
+
+    account = _account(web_db)
+    product = _product(web_db, "u1", broadcast=False)
+    product.stock_on_hand = 18
+    web_db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=False))
+    web_db.commit()
+
+    body = logged_in_client.get("/products/rows").text
+
+    assert "не передаётся" in body
+    assert "после включения" not in body
+
+
+def test_a_transmitting_cabinet_shows_the_real_number(logged_in_client, web_db):
+    from app.models import SyncSetting
+
+    account = _account(web_db)
+    product = _product(web_db, "u1", broadcast=True)
+    product.stock_on_hand = 18
+    web_db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
+    web_db.commit()
+
+    body = logged_in_client.get("/products/rows").text
+
+    assert "после включения" not in body
+    assert "→ 18" in body

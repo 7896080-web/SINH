@@ -118,6 +118,7 @@ def _row(product: Product, accounts: list[PlatformAccount],
             "proposal_date": setting.proposal_date if setting else None,
             "min_threshold": setting.min_threshold if setting else 0,
             "quantity": result.quantity,
+            "potential": result.potential,
             "blocked": result.blocked,
             "reason": result.reason,
             "fix_hint": result.fix_hint,
@@ -681,6 +682,9 @@ def recalc_progress(request: Request, db: Session = Depends(get_db),
     job = active_job(db) or last_job(db)
     return templates.TemplateResponse(request, "products_recalc.html", {
         "request": request, "recalc_job": job, "recalc_running": active_job(db) is not None,
+        # Сюда попадают только опросом: значит страница открыта давно, и строки
+        # таблицы под карточкой показывают состояние ДО расчёта.
+        "polled": True,
     })
 
 

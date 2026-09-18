@@ -157,6 +157,12 @@
             {{ field_error('threshold:' ~ account.id) }}
             {% if not state.enabled %}
                 <span class="pr-hint">не передаётся</span>
+            {% elif state.blocked and state.potential %}
+                {# Прогноз вместо нуля: оператор смотрит сюда перед включением,
+                   и «0, потому что выключено» не отвечает на его вопрос — ему
+                   нужно знать, какое число уйдёт, если нажать «Вкл». #}
+                <span class="pr-hint pr-hint--pending" title="{{ state.reason }}. {{ state.fix_hint }}">
+                    → <b>{{ state.potential }}</b> после включения</span>
             {% elif state.blocked %}
                 <span class="pr-hint pr-hint--warn" title="{{ state.fix_hint }}">→ 0: {{ state.reason }}</span>
             {% else %}
