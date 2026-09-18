@@ -61,6 +61,15 @@
         рядом написана причина.</p>
     </div>
     <div class="toolbar">
+        {# Кнопка ЧУЖОЙ формы: атрибут form= привязывает её к форме фильтров ниже,
+           поэтому браузер соберёт ТЕКУЩИЕ значения полей, хотя сама кнопка стоит
+           здесь, рядом с импортом. Раньше она жила внутри формы фильтров — и пара
+           «экспорт/импорт» разъехалась по разным углам страницы. #}
+        <button type="submit" form="pr-filters" formaction="/products/export" formmethod="get"
+                class="btn"
+                title="Выгружает всё, что подходит под фильтры — ровно то, что сейчас в таблице">
+            Экспорт в Excel
+        </button>
         <form method="post" action="/products/import" enctype="multipart/form-data" style="display:inline;">
             <label class="btn file-upload-btn">
                 Импорт из Excel
@@ -112,13 +121,19 @@
   </form>
 </div>
 
-<form class="filters"
+<form class="filters" id="pr-filters"
       hx-get="/products/rows" hx-target="#pr-table"
       hx-trigger="keyup changed delay:400ms from:input, change from:input[type=checkbox]"
       hx-include="this">
     <div class="field">
         <label for="q">Поиск</label>
-        <input type="search" id="q" name="q" value="{{ q }}" placeholder="артикул, наименование">
+        {# Enter в поиске НЕ должен ничего отправлять. К форме привязана кнопка
+           экспорта, а она единственная submit-кнопка — значит нажатие Enter
+           браузер трактовал как её нажатие, и при вводе артикула сам собой
+           скачивался файл выгрузки. Поиск и так живой (htmx по keyup), Enter в
+           нём не нужен вовсе. #}
+        <input type="search" id="q" name="q" value="{{ q }}" placeholder="артикул, наименование"
+               onkeydown="if (event.key === 'Enter') event.preventDefault();">
     </div>
     <label class="checkbox-inline" style="padding-bottom:8px;">
         <input type="checkbox" name="only_proposals" value="true" {% if only_proposals %}checked{% endif %}>
@@ -138,17 +153,6 @@
         <input type="checkbox" name="only_unfinished" value="true" {% if only_unfinished %}checked{% endif %}>
         Только незавершённый расчёт
     </label>
-    {# Экспорт — кнопка ЭТОЙ ЖЕ формы. Была отдельная ссылка, и её параметры
-       ставились при загрузке страницы: фильтры применяются живьём (htmx меняет
-       только таблицу), поэтому оператор менял отбор, видел новые строки, жал
-       «Экспорт» и получал файл по ПРЕЖНЕМУ фильтру. Кнопка формы собирает
-       значения полей в момент нажатия, разойтись им теперь не с чем.
-       htmx submit не перехватывает: в hx-trigger только keyup и change. #}
-    <button type="submit" formaction="/products/export" formmethod="get" class="btn"
-            style="margin-left:auto;"
-            title="Выгружает всё, что подходит под фильтры выше — ровно то, что сейчас в таблице">
-        Экспорт в Excel
-    </button>
 </form>
 
 {# Фильтры для этой формы приходят из фрагмента таблицы (products_rows.html):
