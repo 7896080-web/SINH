@@ -31,8 +31,14 @@ class FakeClient:
         return []
 
 
-def _seed_product(db, uid="u1", stock=10, barcode="111", enabled_accounts=()):
-    db.add(Product(uid_1c=uid, article="A1", name="Товар", stock_on_hand=stock))
+def _seed_product(db, uid="u1", stock=10, barcode="111", enabled_accounts=(),
+                  broadcast=True):
+    # broadcast=True — товар, который УЖЕ транслируется: именно о таком все тесты
+    # рассылки ниже. С выключенной трансляцией в очередь не попадает ничего (см.
+    # `_enqueue_dispatch_to_others`), и это отдельно закреплено тестом
+    # `test_order_on_a_silent_product_queues_nothing`.
+    db.add(Product(uid_1c=uid, article="A1", name="Товар", stock_on_hand=stock,
+                   broadcast_enabled=broadcast))
     db.add(Barcode(barcode=barcode, uid_1c=uid))
     for account in enabled_accounts:
         db.add(SyncSetting(uid_1c=uid, account_id=account.id, enabled=True))
@@ -292,3 +298,31 @@ def test_new_order_can_drive_stock_negative(db):
         PlatformOrder(order_id="o1", barcode="111", quantity=3, raw_status="new"),
     ]), account, "WB.Ожидает")
     assert db.query(Product).filter(Product.uid_1c == "u1").first().stock_on_hand == -2  # 1 - 3
+
+
+# --------------------------------------------- до включения трансляции — тишина
+
+def test_order_on_a_silent_product_queues_nothing(db):
+    """Товар ещё не транслируется: идёт расчёт, оператор трансляцию не включал.
+
+    Заказ обработать надо — списать остаток, создать перемещение в 1С, — но на
+    площадки в этот момент не должно уйти НИЧЕГО. Раньше уходило: запись всё
+    равно попадала в очередь, рассылка считала по выключенному товару ноль и
+    отправляла его. Для карточки, по которой идут продажи, это обнуление, а не
+    отзыв остатка: мы туда ни разу ничего не отправляли.
+
+    Особенно это било по актуализации задним числом — там заказы проводятся
+    именно до включения трансляции, и каждый проведённый заказ слал ноль.
+    """
+    source = make_account(db, Platform.wb, name="Источник")
+    other = make_account(db, Platform.ozon, name="Другой")
+    _seed_product(db, enabled_accounts=(source, other), broadcast=False)
+
+    client = FakeClient(new_orders=[
+        PlatformOrder(order_id="o1", barcode="111", quantity=3, raw_status="new"),
+    ])
+    poll_new_orders(db, client, source, warehouse_pending="WB.Ожидает")
+
+    assert db.query(DispatchQueueItem).count() == 0
+    # при этом сам заказ обработан: остаток списан
+    assert db.query(Product).filter(Product.uid_1c == "u1").first().stock_on_hand == 7
