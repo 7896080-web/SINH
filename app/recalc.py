@@ -36,6 +36,7 @@ from sqlalchemy.orm import Session
 from app.models import (Barcode, PlatformAccount, ProcessedOrder, Product, RecalcItem,
                         RecalcJob, RecalcStatus, SyncSetting)
 from app.timeutils import now_utc
+from app.transmit import covered_accounts, enqueue_full_resend
 from app.workers.credentials import CredentialsMissing
 
 logger = logging.getLogger("sync_worker")
@@ -203,11 +204,23 @@ def catch_up_product(db: Session, product: Product, build_client, pending_wareho
     # период их и не было, а остаток уже актуален. Не ставим только когда что-то
     # помешало посмотреть — иначе «актуализирован» было бы неправдой.
     if not stats["problems"]:
+        was_covered = covered_accounts(product)
         product.recalc_done_at = now_utc()
         # Запоминаем ИМЕННО те кабинеты, чьи заказы удалось прочитать целиком.
         # Кабинет, отмеченный позже, в этот список не попадёт — и трансляция в
         # него не начнётся, пока расчёт не пройдёт заново уже с ним.
         product.recalc_account_ids = ",".join(str(i) for i in sorted(covered)) or None
+
+        # Кабинет, покрытый ВПЕРВЫЕ, надо ещё и толкнуть. Ворота ему открыл
+        # именно этот расчёт, а событие, которое поставило бы доотправку в
+        # очередь, уже прошло: галочку отмечали ДО расчёта, и тогда ступень 2
+        # справедливо отказала. Без этого получается состояние «трансляция
+        # включена, кабинет покрыт, строка показывает число» — и при этом
+        # наружу не ушло ничего до ближайшего изменения остатка из 1С.
+        # Так и вышло 18.09 с Kit: карточка осталась стоять в нуле, который мы
+        # же туда и отправили.
+        for account_id in sorted(set(covered) - was_covered):
+            enqueue_full_resend(db, product.uid_1c, account_id, reason="recalc_covered")
     return stats
 
 

@@ -185,3 +185,59 @@ def test_an_order_that_did_arrive_is_still_applied(db):
     assert stats["applied"] == 1
     db.refresh(product)
     assert product.stock_on_hand == 18
+
+
+# ------------------------------------------------ расчёт толкает новый кабинет
+
+def test_a_newly_covered_cabinet_gets_the_stock_pushed_to_it(db):
+    """18.09: галочку на Kit поставили, расчёт её покрыл — и наружу не ушло
+    ничего. Ворота открылись, а толкнуть было некому: событие, которое ставит
+    доотправку, случилось ДО расчёта, когда ступень 2 справедливо отказала.
+    Карточка на Kit так и осталась стоять в нуле, который мы туда и отправили."""
+    wb = make_account(db, Platform.wb, name="ИП ЯВОРСКАЯ")
+    kit = make_account(db, Platform.kit, name="КИТ")
+    product = _product(db, broadcast=True)
+    _tick(db, "u1", wb.id)
+
+    catch_up_product(db, product, lambda d, aid: FakeClient(), _wh)   # покрыт только WB
+    db.commit()
+    _tick(db, "u1", kit.id)
+    db.query(DispatchQueueItem).delete()
+    db.commit()
+
+    catch_up_product(db, product, lambda d, aid: FakeClient(), _wh)   # теперь и Kit
+    db.commit()
+
+    queued = db.query(DispatchQueueItem).filter(
+        DispatchQueueItem.account_id == kit.id).all()
+    assert len(queued) == 1
+    assert queued[0].reason == "recalc_covered"
+
+
+def test_a_cabinet_already_covered_is_not_pushed_again(db):
+    """Повторный расчёт не должен сыпать доотправки на ровном месте."""
+    wb = make_account(db, Platform.wb, name="ИП ЯВОРСКАЯ")
+    product = _product(db, broadcast=True)
+    _tick(db, "u1", wb.id)
+
+    catch_up_product(db, product, lambda d, aid: FakeClient(), _wh)
+    db.commit()
+    db.query(DispatchQueueItem).delete()
+    db.commit()
+
+    catch_up_product(db, product, lambda d, aid: FakeClient(), _wh)
+    db.commit()
+
+    assert db.query(DispatchQueueItem).count() == 0
+
+
+def test_nothing_is_pushed_while_broadcast_is_off(db):
+    """Расчёт идёт ДО включения трансляции — и сам её включать не должен."""
+    wb = make_account(db, Platform.wb, name="ИП ЯВОРСКАЯ")
+    product = _product(db, broadcast=False)
+    _tick(db, "u1", wb.id)
+
+    catch_up_product(db, product, lambda d, aid: FakeClient(), _wh)
+    db.commit()
+
+    assert db.query(DispatchQueueItem).count() == 0

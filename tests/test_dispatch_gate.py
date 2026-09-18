@@ -36,6 +36,22 @@ def _stocked_product(db, stock: int = 12, uid: str = "u1", barcode: str = "111")
     return p
 
 
+def _already_transmitted(db, account_id: int, uid: str = "u1", quantity: int = 12):
+    """Отправка, которая реально дошла до площадки.
+
+    Отзыв остатка с неё и начинается: ноль снимает НАШЕ число, а если мы ничего
+    не отправляли, он обнуляет чужую карточку. Раньше здесь этого не было — до
+    18.09 отзыв срабатывал по одной только включённой трансляции, и на Озон с
+    Kit уехали нули по товару, который туда ни разу не транслировался.
+    """
+    from app.timeutils import now_utc
+
+    db.add(DispatchQueueItem(
+        uid_1c=uid, account_id=account_id, quantity=quantity, sent_quantity=quantity,
+        reason="manual_enable", status=DispatchStatus.sent, sent_at=now_utc()))
+    db.commit()
+
+
 # ------------------------------------------------ 6. снятие галочки отзывает остаток
 
 def test_unchecking_cabinet_enqueues_zero(logged_in_client, web_db):
@@ -44,11 +60,13 @@ def test_unchecking_cabinet_enqueues_zero(logged_in_client, web_db):
     account = make_account(web_db, name="Кабинет")
     web_db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
     web_db.commit()
+    _already_transmitted(web_db, account.id)
 
     r = logged_in_client.post(f"/products/u1/{account.id}/toggle", data={"enabled": "false"})
 
     assert r.status_code == 200
-    queued = web_db.query(DispatchQueueItem).filter(DispatchQueueItem.account_id == account.id).all()
+    queued = web_db.query(DispatchQueueItem).filter(
+        DispatchQueueItem.reason == "manual_disable").all()
     assert [(q.quantity, q.reason) for q in queued] == [(0, "manual_disable")]
 
 
@@ -89,10 +107,13 @@ def test_repeated_uncheck_does_not_pile_up_zeros(logged_in_client, web_db):
     web_db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
     web_db.commit()
 
+    _already_transmitted(web_db, account.id)
+
     for _ in range(3):
         logged_in_client.post(f"/products/u1/{account.id}/toggle", data={"enabled": "false"})
 
-    assert web_db.query(DispatchQueueItem).count() == 1
+    assert web_db.query(DispatchQueueItem).filter(
+        DispatchQueueItem.reason == "manual_disable").count() == 1
 
 
 def test_uncheck_is_written_to_audit(logged_in_client, web_db):
@@ -102,6 +123,8 @@ def test_uncheck_is_written_to_audit(logged_in_client, web_db):
     account = make_account(web_db, name="Кабинет")
     web_db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
     web_db.commit()
+
+    _already_transmitted(web_db, account.id)
 
     logged_in_client.post(f"/products/u1/{account.id}/toggle", data={"enabled": "false"})
 
@@ -266,9 +289,11 @@ def test_switching_a_product_off_still_withdraws_the_stock(web_db, logged_in_cli
                        broadcast_enabled=True))
     web_db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
     web_db.commit()
+    _already_transmitted(web_db, account.id, quantity=10)
 
     logged_in_client.post("/products/u1/broadcast", data={"enabled": "false"})
 
-    queued = web_db.query(DispatchQueueItem).all()
+    queued = web_db.query(DispatchQueueItem).filter(
+        DispatchQueueItem.reason == "broadcast_off").all()
     assert len(queued) == 1
     assert queued[0].quantity == 0

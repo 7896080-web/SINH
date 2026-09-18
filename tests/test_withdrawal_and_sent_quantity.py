@@ -60,48 +60,62 @@ def test_unticking_a_cabinet_of_a_silent_product_sends_nothing(logged_in_client,
 def test_unticking_a_broadcasting_product_still_withdraws(logged_in_client, web_db):
     """Обратная сторона: где остаток реально уходил, отзыв обязателен — иначе
     площадка продолжит продавать по последнему присланному числу."""
+    from app.timeutils import now_utc
+
     account = make_account(web_db, Platform.wb, name="ИП ЯВОРСКАЯ")
     _product(web_db, broadcast=True, recalc_ids=None)
     web_db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
+    web_db.add(DispatchQueueItem(
+        uid_1c="u1", account_id=account.id, quantity=18, sent_quantity=46,
+        reason="manual_enable", status=DispatchStatus.sent, sent_at=now_utc()))
     web_db.commit()
 
     logged_in_client.post(f"/products/u1/{account.id}/toggle", data={"enabled": "false"})
 
-    items = web_db.query(DispatchQueueItem).all()
+    items = web_db.query(DispatchQueueItem).filter(
+        DispatchQueueItem.reason == "manual_disable").all()
     assert [i.quantity for i in items] == [0]
-    assert items[0].reason == "manual_disable"
 
 
 def test_turning_broadcast_off_still_withdraws(logged_in_client, web_db):
     """Главный выключатель — осознанный отзыв: его трогать нельзя."""
+    from app.timeutils import now_utc
+
     account = make_account(web_db, Platform.wb, name="ИП ЯВОРСКАЯ")
     _product(web_db, broadcast=True)
     web_db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
+    web_db.add(DispatchQueueItem(
+        uid_1c="u1", account_id=account.id, quantity=18, sent_quantity=46,
+        reason="manual_enable", status=DispatchStatus.sent, sent_at=now_utc()))
     web_db.commit()
 
     logged_in_client.post("/products/u1/broadcast", data={"enabled": "false"})
 
-    items = web_db.query(DispatchQueueItem).all()
+    items = web_db.query(DispatchQueueItem).filter(
+        DispatchQueueItem.reason == "broadcast_off").all()
     assert [i.quantity for i in items] == [0]
-    assert items[0].reason == "broadcast_off"
 
 
-def test_excel_import_withdraws_like_the_interface(logged_in_client, web_db):
+def test_excel_import_withdraws_like_the_interface(web_db):
     """Снятие галочки через Excel раньше не отзывало остаток вовсе: на площадке
-    оставалось последнее число, а заказы по снятой паре гейт уже пропускал."""
-    from app.transmit import enqueue_withdrawal
+    оставалось последнее число, а заказы по снятой паре гейт уже пропускал.
+    Условие то же, что и в интерфейсе: отзываем, если было что отзывать."""
+    from app.timeutils import now_utc
+    from app.transmit import should_withdraw
 
     account = make_account(web_db, Platform.wb, name="ИП ЯВОРСКАЯ")
-    _product(web_db, broadcast=True)
-    setting = SyncSetting(uid_1c="u1", account_id=account.id, enabled=True)
-    web_db.add(setting)
+    product = _product(web_db, broadcast=True)
+    web_db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
     web_db.commit()
 
-    # Прямой вызов того же пути, что и импорт: галочка была, стала снята.
-    enqueue_withdrawal(web_db, "u1", account.id)
+    assert should_withdraw(web_db, product, account.id) is False
+
+    web_db.add(DispatchQueueItem(
+        uid_1c="u1", account_id=account.id, quantity=18, sent_quantity=46,
+        reason="manual_enable", status=DispatchStatus.sent, sent_at=now_utc()))
     web_db.commit()
 
-    assert web_db.query(DispatchQueueItem).count() == 1
+    assert should_withdraw(web_db, product, account.id) is True
 
 
 # ------------------------------------------------ что ушло на самом деле
@@ -135,3 +149,102 @@ def test_sent_quantity_stays_empty_until_something_is_sent(db):
 
     item = db.query(DispatchQueueItem).one()
     assert item.sent_quantity is None
+
+
+# ------------------------------------------------ отзывать только то, что слали
+
+def test_unticking_a_cabinet_we_never_sent_to_stays_silent(logged_in_client, web_db):
+    """Продолжение разбора. Первый фикс смотрел только на трансляцию, а тут она
+    ВКЛЮЧЕНА: галочку на Kit поставили, расчёт её покрыл, но остаток туда ещё не
+    уехал. Снятие галочки в этот момент отправило бы ноль на карточку, которой мы
+    ни разу не касались, — ровно та же ошибка, что и 18.09."""
+    account = make_account(web_db, Platform.kit, name="КИТ")
+    _product(web_db, broadcast=True, recalc_ids=None)
+    web_db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
+    web_db.commit()
+
+    logged_in_client.post(f"/products/u1/{account.id}/toggle", data={"enabled": "false"})
+
+    assert web_db.query(DispatchQueueItem).count() == 0
+
+
+def test_a_cabinet_we_did_send_to_is_still_withdrawn(logged_in_client, web_db):
+    from app.timeutils import now_utc
+
+    account = make_account(web_db, Platform.wb, name="ИП ЯВОРСКАЯ")
+    _product(web_db, broadcast=True)
+    web_db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
+    web_db.add(DispatchQueueItem(
+        uid_1c="u1", account_id=account.id, quantity=18, sent_quantity=46,
+        reason="manual_enable", status=DispatchStatus.sent, sent_at=now_utc()))
+    web_db.commit()
+
+    logged_in_client.post(f"/products/u1/{account.id}/toggle", data={"enabled": "false"})
+
+    assert web_db.query(DispatchQueueItem).filter(
+        DispatchQueueItem.reason == "manual_disable").count() == 1
+
+
+def test_past_withdrawals_do_not_count_as_transmissions(web_db):
+    """На кабинет уходили одни нули — значит отзывать по-прежнему нечего."""
+    from app.timeutils import now_utc
+    from app.transmit import ever_transmitted
+
+    account = make_account(web_db, Platform.kit, name="КИТ")
+    _product(web_db, broadcast=True)
+    web_db.add(DispatchQueueItem(
+        uid_1c="u1", account_id=account.id, quantity=0, sent_quantity=0,
+        reason="manual_disable", status=DispatchStatus.sent, sent_at=now_utc()))
+    web_db.commit()
+
+    assert ever_transmitted(web_db, "u1", account.id) is False
+
+
+def test_a_row_older_than_sent_quantity_is_judged_by_its_reason(web_db):
+    """Записи до pm45 точного числа не хранят. Судить остаётся по причине —
+    иначе товар, который реально транслировался, перестал бы отзываться."""
+    from app.timeutils import now_utc
+    from app.transmit import ever_transmitted
+
+    account = make_account(web_db, Platform.wb, name="ИП ЯВОРСКАЯ")
+    _product(web_db, broadcast=True)
+    web_db.add(DispatchQueueItem(
+        uid_1c="u1", account_id=account.id, quantity=18, sent_quantity=None,
+        reason="broadcast_toggled", status=DispatchStatus.sent, sent_at=now_utc()))
+    web_db.commit()
+
+    assert ever_transmitted(web_db, "u1", account.id) is True
+
+
+def test_a_queued_but_unsent_row_is_not_a_transmission(web_db):
+    """Запись, которая до площадки не доехала, ничего туда не положила."""
+    from app.transmit import ever_transmitted
+
+    account = make_account(web_db, Platform.wb, name="ИП ЯВОРСКАЯ")
+    _product(web_db, broadcast=True)
+    web_db.add(DispatchQueueItem(uid_1c="u1", account_id=account.id, quantity=18,
+                                 reason="manual_enable"))
+    web_db.commit()
+
+    assert ever_transmitted(web_db, "u1", account.id) is False
+
+
+def test_turning_broadcast_off_skips_cabinets_that_never_got_anything(
+        logged_in_client, web_db):
+    from app.timeutils import now_utc
+
+    wb = make_account(web_db, Platform.wb, name="ИП ЯВОРСКАЯ")
+    kit = make_account(web_db, Platform.kit, name="КИТ")
+    _product(web_db, broadcast=True)
+    web_db.add(SyncSetting(uid_1c="u1", account_id=wb.id, enabled=True))
+    web_db.add(SyncSetting(uid_1c="u1", account_id=kit.id, enabled=True))
+    web_db.add(DispatchQueueItem(
+        uid_1c="u1", account_id=wb.id, quantity=18, sent_quantity=46,
+        reason="manual_enable", status=DispatchStatus.sent, sent_at=now_utc()))
+    web_db.commit()
+
+    logged_in_client.post("/products/u1/broadcast", data={"enabled": "false"})
+
+    withdrawals = web_db.query(DispatchQueueItem).filter(
+        DispatchQueueItem.reason == "broadcast_off").all()
+    assert [w.account_id for w in withdrawals] == [wb.id]

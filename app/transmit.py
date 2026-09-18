@@ -34,7 +34,7 @@ from dataclasses import dataclass
 
 from sqlalchemy.orm import Session
 
-from app.models import DispatchQueueItem, Product
+from app.models import DispatchQueueItem, DispatchStatus, Product
 
 
 # Как посчитана цифра уровня SKU — для подписи в интерфейсе.
@@ -281,6 +281,47 @@ def enqueue_full_resend(db: Session, uid_1c: str, account_id: int, reason: str =
         return
     quantity = product.stock_on_hand if product else 0
     db.add(DispatchQueueItem(uid_1c=uid_1c, account_id=account_id, quantity=quantity, reason=reason))
+
+
+# Причины, по которым в очередь кладётся заведомо ноль. Нужны для разбора
+# записей, сделанных до появления `sent_quantity`: у них точного отправленного
+# числа нет, и единственное, по чему можно судить, — зачем запись создавали.
+WITHDRAWAL_REASONS = frozenset({"manual_disable", "broadcast_off"})
+
+
+def ever_transmitted(db: Session, uid_1c: str, account_id: int) -> bool:
+    """Отправляли ли мы КОГДА-НИБУДЬ на этот кабинет непустой остаток.
+
+    Ответ на вопрос «есть ли нам что отзывать». Площадка держит наше число
+    только если мы его туда посылали; если не посылали — ноль не отзовёт
+    остаток, а обнулит чужую карточку, по которой идут продажи.
+
+    Прошлые ОТЗЫВЫ отправками не считаются: если на кабинет уходили одни нули,
+    отзывать по-прежнему нечего. Записи старше колонки `sent_quantity` судим по
+    причине — точного числа у них нет, но видно, отзыв это был или доотправка.
+    """
+    items = db.query(DispatchQueueItem).filter(
+        DispatchQueueItem.uid_1c == uid_1c,
+        DispatchQueueItem.account_id == account_id,
+        DispatchQueueItem.status == DispatchStatus.sent,
+        DispatchQueueItem.sent_at.isnot(None),
+        DispatchQueueItem.is_test.is_(False),
+    ).all()
+    for item in items:
+        if item.sent_quantity is not None:
+            if item.sent_quantity > 0:
+                return True
+        elif item.reason not in WITHDRAWAL_REASONS:
+            return True
+    return False
+
+
+def should_withdraw(db: Session, product: Product | None, account_id: int) -> bool:
+    """Нужен ли отзыв остатка с кабинета при снятии галочки или выключении
+    трансляции. Ноль отправляем, только когда есть что снимать."""
+    if product is None or not product.broadcast_enabled:
+        return False
+    return ever_transmitted(db, product.uid_1c, account_id)
 
 
 def enqueue_withdrawal(db: Session, uid_1c: str, account_id: int, reason: str = "manual_disable"):
