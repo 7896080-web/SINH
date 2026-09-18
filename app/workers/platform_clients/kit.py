@@ -13,6 +13,10 @@ BASE_URL = "https://api.kit.yandex.net"
 # риском не добрать часть данных после исчерпания попыток.
 _THROTTLE_SECONDS = 0.25
 
+# Защитный предел на число страниц ленты заказов за один обход. Упёрлись в него
+# — картина неполная, и клиент обязан сказать об этом (`last_truncated`).
+MAX_ORDER_PAGES = 200
+
 # Статусы заказа подтверждены по OpenAPI-спеке Kit (skill yandex-kit-cabinet).
 # WAIT_FOR_CONFIRMATION — «ожидает подтверждения продавца» (наш триггер приёма).
 CANCELLED_STATUSES = {"CANCELLED", "DELIVERY_CANCELLED", "FULL_REFUND"}
@@ -54,6 +58,10 @@ class KitClient(PlatformClient):
         # неудача — пробел, и расчёт, не знающий о пробеле, поставит товару
         # «актуализирован» по заказам, которых не видел.
         self.last_unresolved = 0
+        # Выдачу оборвал защитный предел страниц, а не конец данных — картина
+        # неполная (см. `_walk_orders`), и `recalc.collect_orders` превращает это
+        # в проблему, не давая поставить товару «актуализирован».
+        self.last_truncated = False
         # Варианты, по которым запрос уже провалился в пределах текущего вызова.
         # Нужны отдельно от кэша баркодов: в кэше пустая строка значит «ответ
         # получен, баркода нет» — это не потеря, и путать их нельзя.
@@ -91,43 +99,62 @@ class KitClient(PlatformClient):
         except requests.RequestException as e:
             return False, f"Не удалось связаться с Kit: {e}"
 
+    def _walk_orders(self):
+        """Сырая лента `/v1/orders` постранично.
+
+        Конец ленты определяет `total_count` из ответа, а НЕ длина страницы.
+        Короткая страница у площадки не обязана значить «данные кончились»: ровно
+        на этом WB терял заказы неделями (см. `wb.ORDERS_WINDOW_DAYS`), и здесь
+        стоял тот же стоп `len(orders) < 100`. 18.09 на живом кабинете он оказался
+        честным — страницы 100/100/88, четвёртая пустая, `total_count` = 288
+        сошёлся с собранным, — но это совпадение, а не гарантия. `total_count` Kit
+        отдаёт сам и отвечает на вопрос прямо, так что спрашиваем его.
+
+        Если `total_count` в ответе нет, идём до пустой страницы: лишний запрос
+        дешевле пропущенной продажи. Упёрлись в `MAX_ORDER_PAGES` — поднимаем
+        `last_truncated`: выдачу оборвали мы, а не площадка.
+        """
+        collected = 0
+        for page in range(1, MAX_ORDER_PAGES + 1):
+            data = self._get("/v1/orders", params={"page": page, "per_page": 100})
+            orders = data.get("orders", [])
+            if not orders:
+                return
+            yield from orders
+            collected += len(orders)
+            total = data.get("total_count")
+            if isinstance(total, int) and collected >= total:
+                return
+        self.last_truncated = True
+
     def get_orders_awaiting_confirmation(self) -> list[PlatformOrder]:
         result = []
         variant_barcode_cache: dict[str, str] = {}
         self.last_unresolved = 0
+        self.last_truncated = False
         self._failed_variants = set()
 
-        page = 1
-        while True:
-            data = self._get("/v1/orders", params={"page": page, "per_page": 100})
-            orders = data.get("orders", [])
-            if not orders:
-                break
+        for o in self._walk_orders():
+            if o.get("status") != "WAIT_FOR_CONFIRMATION":
+                continue
+            for chunk in o.get("delivery_chunks", []):
+                for item in chunk.get("items", []):
+                    variant_id = item["product_variant_id"]
 
-            for o in orders:
-                if o.get("status") != "WAIT_FOR_CONFIRMATION":
-                    continue
-                for chunk in o.get("delivery_chunks", []):
-                    for item in chunk.get("items", []):
-                        variant_id = item["product_variant_id"]
+                    # У Kit заказ отдаёт product_variant_id, а не баркод
+                    # напрямую (см. предупреждение в base.py — этот участок
+                    # закрывает ту нестыковку). Резолвим через тот же
+                    # объект Variant, где 'barcode' — подтверждённое поле.
+                    barcode = self._barcode_for_variant(variant_id, variant_barcode_cache)
+                    if not barcode:
+                        continue
 
-                        # У Kit заказ отдаёт product_variant_id, а не баркод
-                        # напрямую (см. предупреждение в base.py — этот участок
-                        # закрывает ту нестыковку). Резолвим через тот же
-                        # объект Variant, где 'barcode' — подтверждённое поле.
-                        barcode = self._barcode_for_variant(variant_id, variant_barcode_cache)
-                        if not barcode:
-                            continue
-
-                        result.append(PlatformOrder(
-                            order_id=f"{o['id']}:{chunk['id']}:{item['id']}",
-                            barcode=barcode,
-                            quantity=item.get("quantity", 1),
-                            raw_status="WAIT_FOR_CONFIRMATION",
-                        ))
-            if len(orders) < 100:
-                break
-            page += 1
+                    result.append(PlatformOrder(
+                        order_id=f"{o['id']}:{chunk['id']}:{item['id']}",
+                        barcode=barcode,
+                        quantity=item.get("quantity", 1),
+                        raw_status="WAIT_FOR_CONFIRMATION",
+                    ))
         return result
 
     def get_orders_since(self, date_from):
@@ -140,37 +167,29 @@ class KitClient(PlatformClient):
         result = []
         variant_barcode_cache: dict[str, str] = {}
         self.last_unresolved = 0
+        self.last_truncated = False
         self._failed_variants = set()
-        page = 1
-        while page <= 200:  # защитный предел на число страниц
-            data = self._get("/v1/orders", params={"page": page, "per_page": 100})
-            orders = data.get("orders", [])
-            if not orders:
-                break
-            for o in orders:
-                order_date = None
-                raw = o.get("created_at") or o.get("created")
-                if raw:
-                    try:
-                        order_date = _dt.fromisoformat(str(raw).replace("Z", "+00:00")).date()
-                    except ValueError:
-                        order_date = None
-                if order_date is not None and order_date < threshold:
-                    continue
-                for chunk in o.get("delivery_chunks", []):
-                    for item in chunk.get("items", []):
-                        variant_id = item["product_variant_id"]
-                        barcode = self._barcode_for_variant(variant_id, variant_barcode_cache)
-                        if not barcode:
-                            continue
-                        result.append(PlatformOrder(
-                            order_id=f"{o['id']}:{chunk['id']}:{item['id']}",
-                            barcode=barcode, quantity=item.get("quantity", 1),
-                            raw_status=str(o.get("status") or ""), order_date=order_date,
-                        ))
-            if len(orders) < 100:
-                break
-            page += 1
+        for o in self._walk_orders():
+            order_date = None
+            raw = o.get("created_at") or o.get("created")
+            if raw:
+                try:
+                    order_date = _dt.fromisoformat(str(raw).replace("Z", "+00:00")).date()
+                except ValueError:
+                    order_date = None
+            if order_date is not None and order_date < threshold:
+                continue
+            for chunk in o.get("delivery_chunks", []):
+                for item in chunk.get("items", []):
+                    variant_id = item["product_variant_id"]
+                    barcode = self._barcode_for_variant(variant_id, variant_barcode_cache)
+                    if not barcode:
+                        continue
+                    result.append(PlatformOrder(
+                        order_id=f"{o['id']}:{chunk['id']}:{item['id']}",
+                        barcode=barcode, quantity=item.get("quantity", 1),
+                        raw_status=str(o.get("status") or ""), order_date=order_date,
+                    ))
         return result
 
     def _local_variant_map(self) -> dict[str, str]:
