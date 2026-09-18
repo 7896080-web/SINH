@@ -23,6 +23,7 @@ from app.offset_base import ensure_snapshot_requested, set_base_date
 from app.workers.platform_clients.base import PlatformOrder, StockPushItem
 from app.audit import log_action
 from app.flash import set_flash, pop_flash
+from app.timeutils import today_local
 
 router = APIRouter()
 templates = Jinja2Templates(directory="app/templates")
@@ -732,7 +733,7 @@ def testing_offset_calc(
         except ValueError:
             set_flash(request, "Дата расчёта: формат ГГГГ-ММ-ДД.", "warn")
             return redirect
-        if day > date.today():
+        if day > today_local():
             set_flash(request, "Остатков на будущую дату в 1С нет.", "warn")
             return redirect
     else:

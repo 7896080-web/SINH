@@ -23,7 +23,7 @@ from app.dependencies import get_current_user
 from app.models import Product, PlatformAccount, Platform, SyncSetting, User
 from app.flash import set_flash, pop_flash
 from app.audit import log_action
-from app.timeutils import now_utc
+from app.timeutils import now_utc, today_local
 from app.excel_utils import build_xlsx_response, read_xlsx_rows, parse_bool_ru, ExcelReadError
 from app.transmit import (explain, sku_quantity, enqueue_full_resend, enqueue_withdrawal,
                           should_withdraw, ever_transmitted,
@@ -120,7 +120,7 @@ def _stamp_active_since(db: Session, uid_1c: str) -> None:
     """
     product = db.query(Product).filter(Product.uid_1c == uid_1c).first()
     if product is not None and product.broadcast_active_since is None:
-        product.broadcast_active_since = now_utc().date()
+        product.broadcast_active_since = today_local()
 
 
 def _blocks_broadcast_on(product: Product) -> str | None:
@@ -500,7 +500,7 @@ def set_base_date_route(
     except ValueError:
         return _row_response(request, db, uid_1c,
                              error="Дата: формат ГГГГ-ММ-ДД.", error_field="base_date")
-    if day is not None and day > now_utc().date():
+    if day is not None and day > today_local():
         return _row_response(request, db, uid_1c,
                              error="Остатков на будущую дату в 1С нет.", error_field="base_date")
 
@@ -802,7 +802,7 @@ def bulk_edit(
         except ValueError:
             set_flash(request, "Дата должна быть в формате ГГГГ-ММ-ДД.", "warn")
             return back()
-        if action in ("set_base_date", "stock_to_fact") and d is not None and d > now_utc().date():
+        if action in ("set_base_date", "stock_to_fact") and d is not None and d > today_local():
             set_flash(request, "Остатков на будущую дату в 1С нет.", "warn")
             return back()
 
@@ -898,7 +898,7 @@ def bulk_edit(
                 setting.enabled_at = now_utc()
                 setting.has_proposal = False
                 if p.broadcast_active_since is None:
-                    p.broadcast_active_since = now_utc().date()
+                    p.broadcast_active_since = today_local()
                 enqueue_full_resend(db, p.uid_1c, target_account.id)
             else:
                 if should_withdraw(db, p, target_account.id):
@@ -1132,7 +1132,7 @@ def products_import(
                 except ValueError:
                     errors.append(f"строка {i}: дата расчёта — формат ГГГГ-ММ-ДД")
                     desired_day = product.offset_base_date
-            if desired_day is not None and desired_day > now_utc().date():
+            if desired_day is not None and desired_day > today_local():
                 errors.append(f"строка {i}: остатков на будущую дату в 1С нет")
             elif desired_day != product.offset_base_date:
                 if desired_day is not None and desired_day not in lookups:

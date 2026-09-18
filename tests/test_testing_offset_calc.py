@@ -13,7 +13,7 @@ from datetime import date, timedelta
 
 from app.models import (Barcode, Platform, PlatformAccount, Product, StockDateRow,
                         StockDateSnapshot, StockDateStatus)
-from app.timeutils import now_utc
+from app.timeutils import now_utc, today_local
 
 DAY = date(2026, 8, 7)
 
@@ -135,7 +135,7 @@ def test_waiting_is_explained_on_the_page(logged_in_client, web_db):
 
 def test_a_future_date_is_refused(logged_in_client, web_db):
     product = _product(web_db)
-    tomorrow = (now_utc().date() + timedelta(days=1)).isoformat()
+    tomorrow = (today_local() + timedelta(days=1)).isoformat()
 
     _calc(logged_in_client, base_date=tomorrow)
 
