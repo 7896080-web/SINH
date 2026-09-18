@@ -26,6 +26,7 @@ from app.audit import log_action
 from app.timeutils import now_utc
 from app.excel_utils import build_xlsx_response, read_xlsx_rows, parse_bool_ru, ExcelReadError
 from app.transmit import (explain, sku_quantity, enqueue_full_resend, enqueue_withdrawal,
+                          should_withdraw, ever_transmitted,
                           offset_from_base, recompute_offset, sku_mode, MODE_AUTO,
                           covered_accounts)
 from app.offset_base import (ensure_snapshot_requested, set_base_date, stock_at_date,
@@ -601,7 +602,10 @@ def toggle_broadcast(
             # обычную доотправку, а та считала ноль); теперь автоматические пути
             # такой товар вообще не ставят в очередь, поэтому отзыв делается явно.
             for setting in product.sync_settings:
-                if setting.enabled:
+                # `should_withdraw` здесь не годится: трансляцию мы уже
+                # выключили, и она ответила бы «нечего» по всем кабинетам сразу.
+                # Спрашиваем то единственное, что важно: уходил ли туда остаток.
+                if setting.enabled and ever_transmitted(db, uid_1c, setting.account_id):
                     enqueue_withdrawal(db, uid_1c, setting.account_id,
                                        reason="broadcast_off")
         db.commit()
@@ -666,12 +670,12 @@ def toggle_sync(
         log_action(db, user.username, "sync_enabled", f"{uid_1c} / кабинет #{account_id}")
     elif not enabled and was_enabled:
         product = _get_product(db, uid_1c)
-        if product is not None and not product.broadcast_enabled:
-            log_action(db, user.username, "sync_disabled",
-                       f"{uid_1c} / кабинет #{account_id} (трансляция выключена — отзыв не нужен)")
-        else:
+        if should_withdraw(db, product, account_id):
             enqueue_withdrawal(db, uid_1c, account_id)
             log_action(db, user.username, "sync_disabled", f"{uid_1c} / кабинет #{account_id} (в очередь 0)")
+        else:
+            log_action(db, user.username, "sync_disabled",
+                       f"{uid_1c} / кабинет #{account_id} (на этот кабинет остаток не уходил — отзывать нечего)")
     db.commit()
     return _row_response(request, db, uid_1c)
 
@@ -1110,11 +1114,12 @@ def products_import(
                 setting.enabled_at = now_utc()
                 setting.has_proposal = False
                 enqueue_full_resend(db, uid_1c, account.id)
-            elif current_enabled and not desired_enabled and product.broadcast_enabled:
+            elif (current_enabled and not desired_enabled
+                    and should_withdraw(db, product, account.id)):
                 # Снятие галочки через Excel — тот же осознанный отзыв, что и
                 # галочкой в интерфейсе: без него на площадке остаётся последнее
-                # отправленное число и она продолжает продавать. При выключенной
-                # трансляции отзыв не нужен — туда ничего и не уходило.
+                # отправленное число и она продолжает продавать. Если на кабинет
+                # остаток не уходил, отзывать нечего.
                 enqueue_withdrawal(db, uid_1c, account.id)
             setting.enabled = desired_enabled
             setting.min_threshold = max(0, desired_threshold)
