@@ -29,6 +29,19 @@ def _product(web_db, uid, name="Товар", size="M", broadcast=True, **kw):
     return p
 
 
+def _with_cabinet(web_db, uid, **kw):
+    """Товар с отмеченным кабинетом. Состояния расчёта проверяются именно на
+    таком: без кабинета строка честно пишет «не выбран кабинет» и всё остальное
+    становится неважным — заказы спрашивать негде и транслировать некуда."""
+    from app.models import SyncSetting
+
+    account = _account(web_db)
+    product = _product(web_db, uid, **kw)
+    web_db.add(SyncSetting(uid_1c=uid, account_id=account.id, enabled=True))
+    web_db.commit()
+    return product
+
+
 def _account(web_db):
     a = PlatformAccount(platform=Platform.wb, name="WB-1", warehouse_id="wh")
     web_db.add(a)
@@ -306,13 +319,13 @@ def test_rows_still_waiting_for_1c_are_counted_as_skipped(logged_in_client, web_
 # ------------------------------------------------ индикатор готовности строки
 
 def test_a_row_without_a_date_says_the_calculation_has_not_started(logged_in_client, web_db):
-    _product(web_db, "u1")
+    _with_cabinet(web_db, "u1")
 
     assert "расчёт не начат" in logged_in_client.get("/products/rows").text
 
 
 def test_a_row_waiting_for_1c_says_so(logged_in_client, web_db):
-    _product(web_db, "u1", offset_base_date=date(2026, 8, 7))
+    _with_cabinet(web_db, "u1", offset_base_date=date(2026, 8, 7))
 
     assert "ждём 1С" in logged_in_client.get("/products/rows").text
 
@@ -320,7 +333,7 @@ def test_a_row_waiting_for_1c_says_so(logged_in_client, web_db):
 def test_a_row_with_no_fact_is_not_called_done(logged_in_client, web_db):
     """Пустой факт выглядит одинаково и когда его не вводили, и когда решили, что
     учёт 1С верен. Пока человек цифру не подтвердил — строка не обработана."""
-    _product(web_db, "u1", offset_base_date=date(2026, 8, 7), offset_base_stock=14)
+    _with_cabinet(web_db, "u1", offset_base_date=date(2026, 8, 7), offset_base_stock=14)
 
     body = logged_in_client.get("/products/rows").text
 
@@ -332,8 +345,8 @@ def test_a_row_with_a_threshold_but_no_catch_up_is_not_ready(logged_in_client, w
     """Порог посчитан — но отгрузки площадок за период в 1С ещё не проведены,
     остаток ЦС завышен. Включать трансляцию рано: уедет число больше реального.
     Раньше такая строка называлась «готово», и это было опасное враньё."""
-    _product(web_db, "u1", broadcast=False, offset_base_date=date(2026, 8, 7),
-             offset_base_stock=14, fact_at_date=14)
+    _with_cabinet(web_db, "u1", broadcast=False, offset_base_date=date(2026, 8, 7),
+                  offset_base_stock=14, fact_at_date=14)
 
     body = logged_in_client.get("/products/rows").text
 
@@ -344,8 +357,8 @@ def test_a_row_with_a_threshold_but_no_catch_up_is_not_ready(logged_in_client, w
 def test_a_row_after_the_catch_up_says_it_is_ready(logged_in_client, web_db):
     from app.timeutils import now_utc
 
-    _product(web_db, "u1", broadcast=False, offset_base_date=date(2026, 8, 7),
-             offset_base_stock=14, fact_at_date=14, recalc_done_at=now_utc())
+    _with_cabinet(web_db, "u1", broadcast=False, offset_base_date=date(2026, 8, 7),
+                  offset_base_stock=14, fact_at_date=14, recalc_done_at=now_utc())
 
     body = logged_in_client.get("/products/rows").text
 
@@ -356,8 +369,8 @@ def test_a_row_after_the_catch_up_says_it_is_ready(logged_in_client, web_db):
 def test_an_already_broadcasting_row_is_not_told_to_switch_on(logged_in_client, web_db):
     from app.timeutils import now_utc
 
-    _product(web_db, "u1", broadcast=True, offset_base_date=date(2026, 8, 7),
-             offset_base_stock=14, fact_at_date=14, recalc_done_at=now_utc())
+    _with_cabinet(web_db, "u1", broadcast=True, offset_base_date=date(2026, 8, 7),
+                  offset_base_stock=14, fact_at_date=14, recalc_done_at=now_utc())
 
     body = logged_in_client.get("/products/rows").text
 
@@ -449,3 +462,33 @@ def test_the_progress_fragment_keeps_polling_itself(logged_in_client, web_db):
 
     assert 'hx-trigger="every 3s"' in fragment
     assert 'id="recalc-box"' in fragment
+
+
+def test_a_row_without_cabinets_says_so_first(logged_in_client, web_db):
+    """Ни одного отмеченного кабинета: заказы спрашивать негде и транслировать
+    некуда. Без этой подписи оператор видел «нужен расчёт», запускал — и получал
+    молчаливый пустой проход, а причина оставалась в строке задания, которой на
+    странице нет. Найдено на первом живом прогоне."""
+    _account(web_db)          # кабинет в системе есть, но для товара НЕ отмечен
+    _product(web_db, "u1", offset_base_date=date(2026, 8, 7), offset_base_stock=14,
+             fact_at_date=14)
+
+    body = logged_in_client.get("/products/rows").text
+
+    assert "не выбран кабинет" in body
+    assert "нужен расчёт" not in body
+
+
+def test_with_a_cabinet_the_normal_states_come_back(logged_in_client, web_db):
+    from app.models import SyncSetting
+
+    account = _account(web_db)
+    _product(web_db, "u1", offset_base_date=date(2026, 8, 7), offset_base_stock=14,
+             fact_at_date=14)
+    web_db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
+    web_db.commit()
+
+    body = logged_in_client.get("/products/rows").text
+
+    assert "нужен расчёт" in body
+    assert "не выбран кабинет" not in body

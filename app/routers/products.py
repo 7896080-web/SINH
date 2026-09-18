@@ -65,7 +65,7 @@ def _parse_date(raw: str) -> date | None:
     return datetime.strptime(raw, "%Y-%m-%d").date()
 
 
-def _calc_status(product: Product) -> tuple[str, str]:
+def _calc_status(product: Product, has_cabinet: bool = True) -> tuple[str, str]:
     """Состояние расчёта строки: (код, подпись для оператора).
 
     Отвечает на единственный вопрос, который у оператора возникает на каталоге в
@@ -79,6 +79,12 @@ def _calc_status(product: Product) -> tuple[str, str]:
     разные состояния, и путать их нельзя: с непроведёнными отгрузками остаток
     завышен, и включённая трансляция отправит на площадки лишнее.
     """
+    if not has_cabinet:
+        # Ни одного отмеченного кабинета: заказы спрашивать негде и транслировать
+        # некуда. Без этой подписи оператор видел «нужен расчёт», запускал его и
+        # получал молчаливый пустой проход — задание отчитывалось «0 заказов», а
+        # причина оставалась только в строке задания, которой на странице нет.
+        return ("no_cabinet", "не выбран кабинет")
     if product.offset_base_date is None:
         return ("none", "расчёт не начат")
     if product.offset_base_stock is None:
@@ -134,6 +140,9 @@ def _row(product: Product, accounts: list[PlatformAccount],
         })
     proposals.sort(key=lambda p: p["name"])
 
+    # Кабинеты уже загружены (joinedload) — лишнего запроса на строку не будет.
+    has_cabinet = any(s.enabled for s in product.sync_settings)
+
     return {
         "uid_1c": product.uid_1c, "article": product.article, "name": product.name,
         "proposals": proposals,
@@ -149,8 +158,8 @@ def _row(product: Product, accounts: list[PlatformAccount],
         "computed_offset": offset_from_base(product),
         "waiting_for_1c": (product.offset_base_date is not None
                            and product.offset_base_stock is None),
-        "calc_status": _calc_status(product)[0],
-        "calc_status_label": _calc_status(product)[1],
+        "calc_status": _calc_status(product, has_cabinet)[0],
+        "calc_status_label": _calc_status(product, has_cabinet)[1],
         "transmit_override": product.transmit_override,   # legacy: только предупреждение
         "broadcast_enabled": product.broadcast_enabled,
         "active_since": product.broadcast_active_since,
