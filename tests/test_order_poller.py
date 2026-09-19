@@ -354,3 +354,38 @@ def test_open_orders_older_than_the_window_are_not_asked_about(db):
     db.commit()
 
     assert [o.order_id for o in _real_open_orders(db, account)] == ["fresh"]
+
+
+def test_a_backfilled_old_order_is_still_inside_the_window(db):
+    """Окно считается от МОМЕНТА ПРИЁМА заказа у нас, а не от даты заказа на
+    площадке. Это принципиально для старта задним числом: расчёт с базовой датой
+    за 90 дней проводит заказы столетней давности, но `ProcessedOrder` заводится
+    сейчас (`processed_at` = default `now_utc`), и отмены по ним отслеживаются
+    ещё 30 дней. Если когда-нибудь `processed_at` начнут заполнять датой заказа
+    (`order_date`), весь бэкфилл окажется ЗА окном в момент создания — отмены по
+    нему перестанут видеть вовсе. Этот тест такую правку уронит."""
+    from datetime import date, timedelta
+
+    from app.timeutils import now_utc
+    from app.workers.order_poller import (OPEN_ORDER_WINDOW_DAYS, _real_open_orders,
+                                          process_new_order)
+
+    account = make_account(db, name="Кабинет")
+    _seed_product(db, stock=10, enabled_accounts=[account])
+
+    старый = date.today() - timedelta(days=90)
+    process_new_order(db, PlatformOrder(order_id="old-1", barcode="111", quantity=1,
+                                        raw_status="new", order_date=старый),
+                      account, "WB.Ожидает", order_date=старый)
+    db.commit()
+
+    запись = db.query(ProcessedOrder).filter(ProcessedOrder.order_id == "old-1").first()
+    assert (now_utc() - запись.processed_at) < timedelta(days=1)   # принят СЕЙЧАС
+    assert [o.order_id for o in _real_open_orders(db, account)] == ["old-1"]
+
+    # А документ в 1С при этом датирован реальной датой заказа — это разные вещи
+    # и путать их нельзя.
+    задание = db.query(FtpTask).filter(FtpTask.order_id == "old-1").first()
+    assert задание.movement_date == старый
+
+    assert OPEN_ORDER_WINDOW_DAYS == 30
