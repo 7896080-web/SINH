@@ -19,6 +19,81 @@
 </div>
 
 <div class="card">
+    <h3 style="margin-top:0">Зависшие задания 1С — нужен разбор</h3>
+    {% if stuck_tasks %}
+    <p class="help-text" style="margin-top:0">
+        1С забрала файл задания и не ответила по нему — ни «OK», ни «ERROR».
+        Пока задание не закрыто, его количество считается «в пути»: остаток товара
+        у нас <strong>занижен</strong> на это число, и на площадки уходит меньше,
+        чем есть на складе.
+        {% if repost_enabled %}
+            Автоматически повторяем до {{ max_reposts }} раз; строки ниже предел уже исчерпали.
+        {% else %}
+            Автоповтор <strong>выключен</strong> (нет идемпотентности в 1С по номеру заказа),
+            поэтому разбирать нужно руками.
+        {% endif %}
+    </p>
+    <div class="table-scroll"><table>
+        <thead><tr>
+            <th>Товар</th><th>Кабинет</th><th style="text-align:right">Кол-во</th>
+            <th style="text-align:right">Висит</th><th>Ответ 1С</th><th>Решение</th>
+        </tr></thead>
+        <tbody>
+        {% for row in stuck_tasks %}
+            <tr>
+                <td>
+                    {% if row.product %}
+                        {{ row.product.article }} · {{ row.product.size }} · {{ row.product.color }}
+                    {% else %}
+                        <span class="help-text">товар по баркоду не найден</span>
+                    {% endif %}
+                    <div class="help-text mono">{{ row.task.barcode }} → {{ row.task.warehouse_to }}</div>
+                </td>
+                <td>{{ row.account }}</td>
+                <td class="mono" style="text-align:right">{{ row.task.quantity }}</td>
+                <td class="mono" style="text-align:right">
+                    {% if row.age_hours is not none %}{{ row.age_hours }} ч{% else %}—{% endif %}
+                    {% if row.task.repost_count %}
+                    <div class="help-text">повторов: {{ row.task.repost_count }}</div>
+                    {% endif %}
+                </td>
+                <td>
+                    {% if row.task.status.value == 'failed' %}
+                        <span class="badge badge--bad">ERROR</span>
+                        <div class="help-text">{{ row.task.result_detail }}</div>
+                    {% else %}
+                        <span class="badge badge--bad">ответа нет</span>
+                    {% endif %}
+                </td>
+                <td style="white-space:nowrap">
+                    <form method="post" action="/diagnostics/stuck-tasks/{{ row.task.id }}/resolve"
+                          style="display:inline">
+                        <input type="hidden" name="document_exists" value="yes">
+                        <button type="submit" class="btn btn--small"
+                                title="Документ перемещения по этому заказу в 1С есть. Задание закроется как проведённое, остаток сойдётся с 1С.">
+                            1С документ создала
+                        </button>
+                    </form>
+                    <form method="post" action="/diagnostics/stuck-tasks/{{ row.task.id }}/resolve"
+                          style="display:inline"
+                          onsubmit="return confirm('Документа в 1С нет — значит эта единица у 1С не списана, и после сверки остаток вырастет на {{ row.task.quantity }}.\n\nЕсли товар на самом деле ОТГРУЖЕН, площадки начнут продавать проданное.\n\nПродолжить?')">
+                        <input type="hidden" name="document_exists" value="no">
+                        <button type="submit" class="btn btn--small btn--danger"
+                                title="Документа в 1С нет и не будет. Единица вернётся в остаток — применяйте, только если товар физически на складе.">
+                            документа нет
+                        </button>
+                    </form>
+                </td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table></div>
+    {% else %}
+    <p class="help-text" style="margin-bottom:0">Зависших заданий нет.</p>
+    {% endif %}
+</div>
+
+<div class="card">
     <h3 style="margin-top:0">Общие фоновые процессы</h3>
     <div class="table-scroll"><table>
         <thead><tr><th>Процесс</th><th>Последний запуск</th><th>Статус</th></tr></thead>
