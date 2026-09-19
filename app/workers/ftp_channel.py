@@ -35,9 +35,9 @@ MOVEMENT_REPOST_ENV = "MOVEMENT_REPOST_ENABLED"
 # приходит за 4–7 минут, `timeout` ставится через 15 — к этому сроку опоздавший
 # ответ уже закрыл бы задание сам (`apply_result_batch` принимает и поздние).
 REPOST_AFTER_MINUTES = 30
-# Больше трёх раз не долбим: если и после них тишина, дело не в случайности —
-# задание остаётся `timeout` и ждёт человека, а не молотит вечно.
-MAX_REPOSTS = 3
+# Больше пяти раз не долбим: если и после них тишина, дело не в случайности —
+# задание уходит в ручной разбор на «Диагностику», а не молотит вечно.
+MAX_REPOSTS = 5
 # Повторы уходят ОТДЕЛЬНЫМ маленьким файлом, а не подмешиваются к свежим
 # заданиям. Причина та же, из-за которой они и зависли: 1С роняет файл ЦЕЛИКОМ,
 # и строка, на которой она спотыкается, утащила бы за собой ни в чём не повинные
@@ -672,6 +672,61 @@ def repost_stuck_movements(db: Session) -> dict:
         logger.info("repost_stuck_movements: вернули в очередь %d зависших перемещений",
                     stats["reposted"])
     return stats
+
+
+def tasks_needing_review(db: Session) -> list[FtpTask]:
+    """Задания, которые сами уже не разберутся — их закрывает человек.
+
+    Сюда попадают три случая:
+      * `failed` — 1С ответила ERROR, документа заведомо нет;
+      * `timeout`, исчерпавший `MAX_REPOSTS` повторов;
+      * `timeout` при ВЫКЛЮЧЕННОМ перепроведении — иначе, пока в 1С нет
+        идемпотентности, зависшие задания не попадали бы в разбор вовсе и
+        остаток молча занижался бы дальше. Именно это состояние на бою сейчас.
+
+    Свежий `timeout` не берём: опоздавший ответ 1С закрывает такое задание сам
+    (`apply_result_batch` принимает и поздние), и звать человека рано.
+    """
+    cutoff = now_utc() - timedelta(minutes=REPOST_AFTER_MINUTES)
+    rows = db.query(FtpTask).filter(
+        FtpTask.status.in_([FtpTaskStatus.timeout, FtpTaskStatus.failed]),
+        FtpTask.is_test.is_(False),
+    ).order_by(FtpTask.id).all()
+
+    out = []
+    for t in rows:
+        if t.status is FtpTaskStatus.failed:
+            out.append(t)
+            continue
+        if t.sent_at is not None and t.sent_at >= cutoff:
+            continue                                  # ещё может закрыться сам
+        if (t.repost_count or 0) >= MAX_REPOSTS or not repost_enabled():
+            out.append(t)
+    return out
+
+
+def resolve_stuck_task(db: Session, task: FtpTask, document_exists: bool,
+                       actor: str) -> FtpTask:
+    """Закрывает зависшее задание решением человека, посмотревшего в 1С.
+
+    `document_exists=True` — документ в 1С есть: задание закрываем как
+    проведённое, «в пути» снимается, остаток сходится с 1С сам собой.
+
+    `document_exists=False` — документа нет и не будет: задание получает
+    `no_document`. Это ТОЖЕ снимает «в пути», и остаток вырастет на количество
+    задания — потому что 1С эту единицу у себя так и не списала. Решение опасное
+    и сознательно оставлено человеку: если товар на самом деле отгружен, возврат
+    единицы в остаток означает, что площадки начнут продавать проданное.
+    """
+    task.status = FtpTaskStatus.done if document_exists else FtpTaskStatus.no_document
+    task.result_status = "OK" if document_exists else "NO_DOCUMENT"
+    task.result_detail = ("разобрано вручную (%s): документ в 1С %s"
+                          % (actor, "найден" if document_exists else "не найден"))[:255]
+    task.completed_at = now_utc()
+    db.commit()
+    logger.info("resolve_stuck_task: #%s %s -> %s (%s)",
+                task.id, task.order_id, task.status.value, actor)
+    return task
 
 
 def detect_timed_out_tasks(db: Session) -> list[FtpTask]:

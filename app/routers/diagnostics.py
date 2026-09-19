@@ -1,7 +1,7 @@
 from datetime import datetime
 from app.timeutils import now_utc
 
-from fastapi import APIRouter, Request, Depends
+from fastapi import APIRouter, Request, Depends, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
@@ -11,8 +11,11 @@ from app.database import get_db
 from app.dependencies import get_current_user
 from app.models import (
     PlatformAccount, WorkerHeartbeat, DispatchQueueItem, DispatchStatus,
-    FtpTask, FtpTaskStatus, MappingConflict, SyncAnomaly, AnomalyStatus, User,
+    Barcode, FtpTask, FtpTaskStatus, MappingConflict, Product, SyncAnomaly,
+    AnomalyStatus, User,
 )
+from app.workers.ftp_channel import (MAX_REPOSTS, repost_enabled, resolve_stuck_task,
+                                     tasks_needing_review)
 from app.workers.client_factory import build_client
 from app.workers.credentials import CredentialsMissing
 from app.workers.order_poller import poll_new_orders, poll_cancellations
@@ -99,8 +102,31 @@ def diagnostics_page(request: Request, db: Session = Depends(get_db), user: User
         "request": request, "current_user": user, "active_page": "diagnostics",
         "account_rows": account_rows, "shared_heartbeats": shared_heartbeats,
         "global_stats": global_stats, "now": now_utc(),
+        "stuck_tasks": _stuck_rows(db),
+        "repost_enabled": repost_enabled(), "max_reposts": MAX_REPOSTS,
         "flash": pop_flash(request),
     })
+
+
+def _stuck_rows(db: Session) -> list[dict]:
+    """Зависшие задания 1С с тем, что нужно человеку для решения: какой товар,
+    сколько штук, сколько висит и что ответила 1С."""
+    now = now_utc()
+    rows = []
+    for t in tasks_needing_review(db):
+        product = None
+        if t.barcode:
+            bc = db.query(Barcode).filter(Barcode.barcode == t.barcode).first()
+            if bc is not None:
+                product = db.query(Product).filter(Product.uid_1c == bc.uid_1c).first()
+        started = t.sent_at or t.created_at
+        rows.append({
+            "task": t,
+            "product": product,
+            "age_hours": round((now - started).total_seconds() / 3600, 1) if started else None,
+            "account": t.account.name if t.account else str(t.account_id),
+        })
+    return rows
 
 
 @router.post("/diagnostics/accounts/{account_id}/test-connection")
@@ -198,4 +224,43 @@ def reset_failures(
     db.commit()
 
     set_flash(request, f"Счётчик сбоев для «{account.name}» сброшен.", "good")
+    return RedirectResponse("/diagnostics", status_code=303)
+
+
+@router.post("/diagnostics/stuck-tasks/{task_id}/resolve")
+def resolve_stuck(
+    request: Request, task_id: int, document_exists: str = Form(""),
+    db: Session = Depends(get_db), user: User = Depends(get_current_user),
+):
+    """Разбор зависшего задания решением человека, посмотревшего в 1С.
+
+    Два исхода различаются не формулировкой, а последствием для остатка, поэтому
+    флаг обязателен и не имеет умолчания: «документ создан» просто закрывает
+    задание, «документа нет» ВОЗВРАЩАЕТ единицу в наш остаток. Пустое или
+    неизвестное значение — отказ, а не догадка.
+    """
+    task = db.query(FtpTask).filter(FtpTask.id == task_id).first()
+    if task is None:
+        set_flash(request, "Задание не найдено.", "warn")
+        return RedirectResponse("/diagnostics", status_code=303)
+    if task.status not in (FtpTaskStatus.timeout, FtpTaskStatus.failed):
+        set_flash(request, "Задание уже закрыто — разбирать нечего.", "info")
+        return RedirectResponse("/diagnostics", status_code=303)
+    if document_exists not in ("yes", "no"):
+        set_flash(request, "Не указано, есть ли документ в 1С.", "warn")
+        return RedirectResponse("/diagnostics", status_code=303)
+
+    exists = document_exists == "yes"
+    resolve_stuck_task(db, task, exists, user.username)
+    log_action(db, user.username, "stuck_task_resolved",
+               f"#{task.id} {task.command} заказ {task.order_id}: "
+               f"документ в 1С {'найден' if exists else 'НЕ найден'}")
+    db.commit()
+
+    if exists:
+        set_flash(request, f"Задание #{task.id} закрыто как проведённое.", "good")
+    else:
+        set_flash(request, f"Задание #{task.id} закрыто: документа в 1С нет. "
+                           f"{task.quantity or 0} шт. вернутся в остаток после ближайшей сверки.",
+                  "warn")
     return RedirectResponse("/diagnostics", status_code=303)
