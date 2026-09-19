@@ -33,6 +33,13 @@
             поэтому разбирать нужно руками.
         {% endif %}
     </p>
+    <p class="help-text">
+        <strong>Как решить:</strong> в 1С открыть список «Перемещение товаров», отбор по
+        Комментарию → «содержит» → вставить строку <span class="mono">order_id=…</span> из
+        нужной строки ниже. Нашёлся проведённый документ — «1С документ создала».
+        Не нашёлся — «документа нет», но сперва убедитесь, что товар физически на складе:
+        эта кнопка вернёт его количество в остаток.
+    </p>
     <div class="table-scroll"><table>
         <thead><tr>
             <th>Товар</th><th>Кабинет</th><th style="text-align:right">Кол-во</th>
@@ -48,6 +55,13 @@
                         <span class="help-text">товар по баркоду не найден</span>
                     {% endif %}
                     <div class="help-text mono">{{ row.task.barcode }} → {{ row.task.warehouse_to }}</div>
+                    <div class="help-text">
+                        искать в 1С по комментарию:
+                        <span class="mono">order_id={{ row.task.order_id }}</span>
+                    </div>
+                    {% if row.task.batch_filename %}
+                    <div class="help-text mono">файл задания: {{ row.task.batch_filename }}</div>
+                    {% endif %}
                 </td>
                 <td>{{ row.account }}</td>
                 <td class="mono" style="text-align:right">{{ row.task.quantity }}</td>
