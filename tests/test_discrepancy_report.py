@@ -1,0 +1,369 @@
+"""Отчёт о расхождениях: что он находит, чего не находит и что при этом говорит.
+
+Главное, что здесь проверяется, — не «страница открывается», а два свойства, без
+которых отчёт бесполезен:
+
+  * он МОЛЧИТ, когда всё в порядке (отчёт, который всегда что-то показывает,
+    перестают читать через неделю);
+  * он называет СЛЕДСТВИЕ, а не факт — «12 заданий в статусе timeout» человек
+    пролистывает, «остаток занижен, наружу уходит меньше, чем есть» нет.
+
+И третье, менее очевидное: одна упавшая проверка не уносит весь отчёт. Отчёт,
+который молчит из-за собственной ошибки, неотличим от отчёта, которому нечего
+сказать, — а это ровно тот отказ, ради предотвращения которого он написан.
+"""
+
+from datetime import datetime, timedelta
+
+from app.models import (
+    AnomalyReason, Barcode, DispatchQueueItem, DispatchStatus, FtpTask,
+    FtpTaskStatus, Platform, PlatformAccount, PlatformCatalogItem, Product,
+    SyncAnomaly, WorkerHeartbeat,
+)
+from app.report import CRITICAL, WARNING, collect_findings, summary_line
+from app.timeutils import now_utc
+from tests.factories import make_account
+
+
+def _keys(findings) -> set[str]:
+    return {f.key for f in findings}
+
+
+def _by_key(findings, key):
+    return next((f for f in findings if f.key == key), None)
+
+
+# ------------------------------------------------------------------ тишина
+
+def test_a_quiet_system_produces_no_findings(db):
+    """Пустая база — расхождений нет. Отчёт, который всегда что-то показывает,
+    ничем не отличается от отчёта, которого нет."""
+    assert collect_findings(db) == []
+    assert summary_line([]) == "расхождений нет"
+
+
+def test_a_fresh_cabinet_with_a_fresh_catalog_is_quiet(db):
+    account = make_account(db, name="ИП Яворская")
+    db.add(PlatformCatalogItem(account_id=account.id, external_id="x1", barcode="111",
+                               fetched_at=now_utc()))
+    db.add(WorkerHeartbeat(worker_name="reconciliation_applied", last_run_at=now_utc()))
+    db.commit()
+
+    assert collect_findings(db) == []
+
+
+# ------------------------------------------------------------- что находит
+
+def test_dispatch_errors_are_critical_and_name_the_consequence(db):
+    """Самое дорогое расхождение: у нас списано, на площадку не уехало."""
+    account = make_account(db)
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    db.add(DispatchQueueItem(uid_1c="u1", account_id=account.id, quantity=5,
+                             reason="order", status=DispatchStatus.error,
+                             last_error="429 после пяти попыток"))
+    db.commit()
+
+    finding = _by_key(collect_findings(db), "dispatch_errors")
+
+    assert finding is not None
+    assert finding.level == CRITICAL
+    assert "продаёт то, чего нет" in finding.consequence
+    assert "429" in finding.details[0]
+
+
+def test_a_test_dispatch_error_is_not_a_discrepancy(db):
+    """Симуляция со страницы «Тестирование» на площадку не уходила и остаток не
+    двигала — в отчёте ей делать нечего. Это та же граница `is_test`, что и
+    везде, и нарушить её здесь значит звать человека разбирать собственный тест."""
+    account = make_account(db)
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    db.add(DispatchQueueItem(uid_1c="u1", account_id=account.id, quantity=5,
+                             reason="order", status=DispatchStatus.error, is_test=True))
+    db.commit()
+
+    assert "dispatch_errors" not in _keys(collect_findings(db))
+
+
+def test_broadcasting_without_a_recalc_is_critical(db):
+    """Интерфейс такого не даёт — значит товар прошёл мимо него."""
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5,
+                   broadcast_enabled=True))
+    db.commit()
+
+    finding = _by_key(collect_findings(db), "broadcast_without_recalc")
+
+    assert finding is not None
+    assert finding.level == CRITICAL
+    assert "оверселл" in finding.consequence
+
+
+def test_a_cabinet_killed_by_the_breaker_is_critical(db):
+    account = make_account(db, name="Озон")
+    account.is_active = False
+    account.consecutive_failures = 5
+    account.last_error = "401 Unauthorized"
+    db.commit()
+
+    finding = _by_key(collect_findings(db), "breaker_disabled")
+
+    assert finding is not None
+    assert finding.level == CRITICAL
+    assert "не опрашиваются" in finding.consequence
+
+
+def test_a_stale_catalog_is_found(db):
+    """Ровно случай 19.09: снимок каталога Kit лежал пятидневной давности, а
+    /health при этом был зелёный."""
+    from app.report import CATALOG_STALE
+
+    account = make_account(db, name="КИТ")
+    db.add(PlatformCatalogItem(account_id=account.id, external_id="x1", barcode="111",
+                               fetched_at=now_utc() - CATALOG_STALE - timedelta(days=1)))
+    db.commit()
+
+    finding = _by_key(collect_findings(db), "stale_catalog")
+
+    assert finding is not None
+    assert finding.level == WARNING
+    assert "КИТ" in finding.details[0]
+
+
+def test_a_cabinet_without_any_catalog_at_all_is_found(db):
+    """Выгрузка не отработала НИ РАЗУ — строк нет вовсе. Это тот же дефект, что
+    и протухший каталог, и пропустить его легче всего: пустая выборка выглядит
+    как «проверять нечего»."""
+    from app.report import CATALOG_STALE
+
+    account = make_account(db, name="Старый кабинет")
+    account.created_at = now_utc() - CATALOG_STALE - timedelta(days=1)
+    db.commit()
+
+    finding = _by_key(collect_findings(db), "stale_catalog")
+
+    assert finding is not None
+    assert "никогда" in finding.details[0]
+
+
+def test_a_cabinet_added_a_minute_ago_is_not_blamed_for_an_empty_catalog(db):
+    """Выгрузка каталога идёт через две минуты после старта и занимает время.
+    Ругать только что заведённый кабинет значит приучить оператора пролистывать
+    отчёт — а тогда он не заметит и настоящую находку."""
+    make_account(db, name="Только что заведён")
+    db.commit()
+
+    assert "stale_catalog" not in _keys(collect_findings(db))
+
+
+def test_an_old_anomaly_pile_becomes_critical(db):
+    """Сотня аномалий, старейшей неделя, — это уже не «разберём на днях»."""
+    from app.report import ANOMALY_OLD
+
+    account = make_account(db)
+    db.add(SyncAnomaly(uid_1c="u1", account_id=account.id,
+                       reason=AnomalyReason.missing_barcode,
+                       detected_at=now_utc() - ANOMALY_OLD - timedelta(days=1)))
+    db.commit()
+
+    finding = _by_key(collect_findings(db), "open_anomalies")
+
+    assert finding is not None
+    assert finding.level == CRITICAL
+
+
+def test_a_fresh_anomaly_is_only_a_warning(db):
+    account = make_account(db)
+    db.add(SyncAnomaly(uid_1c="u1", account_id=account.id,
+                       reason=AnomalyReason.missing_barcode, detected_at=now_utc()))
+    db.commit()
+
+    assert _by_key(collect_findings(db), "open_anomalies").level == WARNING
+
+
+def test_a_stale_reconciliation_is_found(db):
+    """Метка `reconciliation_applied` — факт применения выгрузки, а не запуска
+    задания. Разъехались эти два смысла на бою 17.09, и /health был зелёный."""
+    from app.report import RECONCILIATION_STALE
+
+    db.add(WorkerHeartbeat(worker_name="reconciliation_applied",
+                           last_run_at=now_utc() - RECONCILIATION_STALE - timedelta(hours=1)))
+    db.commit()
+
+    finding = _by_key(collect_findings(db), "stale_reconciliation")
+
+    assert finding is not None
+    assert finding.level == WARNING
+
+
+def test_negative_stock_is_reported(db):
+    db.add(Product(uid_1c="u1", article="46 NAVY", name="Товар", stock_on_hand=-9))
+    db.commit()
+
+    finding = _by_key(collect_findings(db), "negative_stock")
+
+    assert finding is not None
+    assert "-9" in finding.details[0]
+
+
+# ------------------------------------------- зависшие задания не двоятся
+
+def test_a_task_waiting_for_a_human_is_not_also_counted_as_in_flight(db, monkeypatch):
+    """Одна и та же строка не должна попасть и в «ждут разбора», и в «без
+    ответа». Отчёт, который повторяется, читают невнимательно — а он ровно для
+    того и написан, чтобы его читали внимательно."""
+    import app.workers.ftp_channel as ftp
+
+    monkeypatch.setattr(ftp, "repost_enabled", lambda: False)   # тогда timeout идёт в разбор
+
+    account = make_account(db)
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    db.add(Barcode(barcode="111", uid_1c="u1"))
+    db.add(FtpTask(command="CREATE_MOVEMENT", barcode="111", quantity=2, order_id="o1",
+                   account_id=account.id, status=FtpTaskStatus.timeout,
+                   created_at=now_utc() - timedelta(hours=5),
+                   sent_at=now_utc() - timedelta(hours=5)))
+    db.commit()
+
+    findings = collect_findings(db)
+
+    assert "tasks_needing_review" in _keys(findings)
+    assert "stuck_1c_tasks" not in _keys(findings)
+
+
+# --------------------------------------- отчёт не падает целиком из-за одной
+
+def test_a_broken_check_does_not_silence_the_rest(db, monkeypatch):
+    """Упавшая проверка превращается в собственную находку, а не в пустой отчёт.
+    Молчание отчёта обязано означать «расхождений нет», и ничего другого."""
+    import app.report as report
+
+    def boom(db):
+        raise RuntimeError("сломалась выборка")
+
+    monkeypatch.setattr(report, "CHECKS", (boom, report._check_negative_stock))
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=-1))
+    db.commit()
+
+    findings = report.collect_findings(db)
+
+    assert "boom_failed" in _keys(findings)
+    assert "negative_stock" in _keys(findings)          # остальные отработали
+    assert "сломалась выборка" in _by_key(findings, "boom_failed").details[0]
+
+
+# --------------------------------------------------- порядок и строка лога
+
+def test_critical_findings_come_first(db):
+    account = make_account(db, name="Кабинет")
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=-1))
+    db.add(DispatchQueueItem(uid_1c="u1", account_id=account.id, quantity=5,
+                             reason="order", status=DispatchStatus.error))
+    db.commit()
+
+    findings = collect_findings(db)
+
+    assert findings[0].level == CRITICAL
+
+
+def test_the_log_line_is_readable_without_opening_the_page(db):
+    account = make_account(db)
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    db.add(DispatchQueueItem(uid_1c="u1", account_id=account.id, quantity=5,
+                             reason="order", status=DispatchStatus.error))
+    db.commit()
+
+    line = summary_line(collect_findings(db))
+
+    assert "критичных" in line and "dispatch_errors=1" in line
+
+
+def test_every_finding_states_a_consequence(db):
+    """Инвариант модуля: находка без следствия — это просто число, и человек её
+    пролистает. Проверяем на всех проверках разом, чтобы новая не проехала."""
+    account = make_account(db, name="Кабинет")
+    account.is_active = False
+    account.consecutive_failures = 5
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=-1,
+                   broadcast_enabled=True))
+    db.add(SyncAnomaly(uid_1c="u1", account_id=account.id,
+                       reason=AnomalyReason.missing_barcode, detected_at=now_utc()))
+    db.commit()
+
+    findings = collect_findings(db)
+
+    assert findings, "фикстура обязана дать хотя бы одну находку"
+    for f in findings:
+        assert f.consequence.strip(), f"{f.key}: нет следствия"
+        assert f.title.strip(), f"{f.key}: нет заголовка"
+
+
+# ------------------------------------------------------------------ страница
+
+def test_the_report_page_opens_and_says_it_is_quiet(logged_in_client):
+    r = logged_in_client.get("/report")
+
+    assert r.status_code == 200
+    assert "Расхождений нет" in r.text
+
+
+def test_the_report_page_shows_a_finding_with_its_consequence(logged_in_client, web_db):
+    account = PlatformAccount(platform=Platform.wb, name="ИП Яворская", warehouse_id="wh-1")
+    web_db.add(account)
+    web_db.commit()
+    web_db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    web_db.add(DispatchQueueItem(uid_1c="u1", account_id=account.id, quantity=5,
+                                 reason="order", status=DispatchStatus.error))
+    web_db.commit()
+
+    r = logged_in_client.get("/report")
+
+    assert "Рассылка не доехала" in r.text
+    assert "продаёт то, чего нет" in r.text
+
+
+def test_the_diagnostics_page_links_to_the_report(logged_in_client):
+    """Оператор ходит на «Диагностику». Если отчёт есть, а узнать о нём неоткуда,
+    он ничем не лучше лога, в который никто не смотрит."""
+    r = logged_in_client.get("/diagnostics")
+
+    assert "/report" in r.text
+
+
+def test_the_report_needs_a_login(client):
+    """Страница показывает остатки, номера заказов и тексты ошибок площадок."""
+    r = client.get("/report", follow_redirects=False)
+
+    assert r.status_code in (302, 303, 307)
+
+
+# ------------------------------------------- отчёт действительно собирается сам
+
+def test_the_report_job_is_registered_in_the_scheduler(web_db):
+    """Отчёт, который никто не запускает, — это просто страница.
+
+    Проверяем и то, что задание есть, и то, что оно просит ПЕРВЫЙ прогон вскоре
+    после старта, а не через час. `interval` отсчитывает первый запуск от момента
+    добавления задания, а воркер перезапускается чаще — ровно так суточная
+    выгрузка каталога не отработала ни разу (19.09, `job_catalog_poll`).
+    """
+    from datetime import timezone
+
+    from app.workers.scheduler import build_scheduler
+
+    # web_db, а не db: build_scheduler пишет отметку старта через SessionLocal,
+    # то есть в движок самого приложения, а не в движок юнит-фикстуры.
+    sched = build_scheduler()          # не запускаем — только состав заданий
+    job = sched.get_job("discrepancy_report")
+
+    assert job is not None
+    assert (job.next_run_time - datetime.now(timezone.utc)).total_seconds() < 300
+
+
+def test_the_report_worker_is_watched_by_health():
+    """Если отчёт перестанет собираться, это не будет заметно никак — поэтому он
+    перечислен среди обязательных воркеров, как и рабочие задания."""
+    from app.routers.health import EXPECTED_INTERVAL_SECONDS, REQUIRED_WORKERS
+
+    assert "discrepancy_report" in REQUIRED_WORKERS
+    # Без своей записи об интервале он протухал бы по умолчанию через 10 минут и
+    # держал /health красным между часовыми прогонами.
+    assert EXPECTED_INTERVAL_SECONDS["discrepancy_report"] > 3600

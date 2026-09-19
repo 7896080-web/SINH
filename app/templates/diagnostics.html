@@ -10,6 +10,34 @@
 </div>
 
 <div class="card">
+    <h3 style="margin-top:0">
+        Расхождения
+        {% if report_critical %}
+            <span class="badge badge--bad">критичных {{ report_critical }}</span>
+        {% elif report_findings %}
+            <span class="badge badge--warn">{{ report_findings|length }}</span>
+        {% else %}
+            <span class="badge badge--good">нет</span>
+        {% endif %}
+    </h3>
+    {% if report_findings %}
+    <ul style="margin:0 0 10px; padding-left:18px">
+        {% for f in report_findings[:5] %}
+        <li>{{ f.title }}</li>
+        {% endfor %}
+    </ul>
+    {% if report_findings|length > 5 %}
+        <p class="help-text">…и ещё {{ report_findings|length - 5 }}.</p>
+    {% endif %}
+    {% else %}
+    <p class="help-text" style="margin-top:0">
+        Очереди не стоят, задания 1С закрываются, каталоги свежие, разбирать нечего.
+    </p>
+    {% endif %}
+    <p style="margin-bottom:0"><a href="/report">Полный отчёт о расхождениях →</a></p>
+</div>
+
+<div class="card">
     <h3 style="margin-top:0">Общая картина</h3>
     <div class="table-scroll"><table>
         <tr><td>Конфликтов сопоставления</td><td class="mono" style="text-align:right">{{ global_stats.conflicts }}</td></tr>
