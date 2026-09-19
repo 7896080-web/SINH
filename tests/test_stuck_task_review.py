@@ -164,6 +164,21 @@ def test_the_page_lists_the_stuck_task_with_what_is_needed_to_decide(logged_in_c
     assert "1С документ создала" in page.text and "документа нет" in page.text
 
 
+def test_the_row_shows_what_to_search_for_in_1c(logged_in_client, web_db):
+    """Без номера заказа строка бесполезна: решение принимается по документу в
+    1С, а найти его там можно только по комментарию с этим номером."""
+    acc = _account(web_db)
+    _product(web_db)
+    t = _stuck(web_db, acc)
+    t.batch_filename = "task_20260918220431691346.txt"
+    web_db.commit()
+
+    page = logged_in_client.get("/diagnostics")
+
+    assert f"order_id={t.order_id}" in page.text
+    assert "task_20260918220431691346.txt" in page.text
+
+
 def test_the_page_says_when_there_is_nothing_to_review(logged_in_client, web_db):
     page = logged_in_client.get("/diagnostics")
 
