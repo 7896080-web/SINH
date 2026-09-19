@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from app.timeutils import now_utc
 
 from sqlalchemy.orm import Session
@@ -23,13 +23,35 @@ logger = logging.getLogger("sync_worker")
 TEST_ORDER_PREFIX = "TEST-"
 
 
+# Сколько дней после приёма заказ ещё считается «живым» и опрашивается на
+# отмену/подтверждение.
+#
+# Окно обязано быть конечным. Заказы WB и Ozon НЕ ЗАКРЫВАЮТСЯ НИКОГДА: детект
+# подтверждения у этих площадок не реализован (`base.get_confirmed_orders`
+# возвращает пустой список), поэтому заказ навсегда остаётся `processed`. Без
+# окна список открытых заказов рос бы со скоростью продаж, а его идентификаторы
+# каждые две минуты уходят в запрос отмен — то есть в предел площадки на размер
+# запроса мы упёрлись бы рано или поздно обязательно.
+#
+# Тридцать дней с запасом: отмена неподтверждённого заказа приходит в первые дни,
+# у месячного отменять уже нечего. Цена ошибки в эту сторону безопасна: пропущенная
+# отмена означает, что мы не вернули единицу на склад, то есть остаток занижен —
+# недоотправка, а не оверселл.
+OPEN_ORDER_WINDOW_DAYS = 30
+
+
 def _real_open_orders(db: Session, account: PlatformAccount) -> list[ProcessedOrder]:
-    """Принятые, но ещё не закрытые заказы кабинета — только НАСТОЯЩИЕ.
-    Их идентификаторы уходят прямо в API площадки, поэтому синтетика исключается."""
+    """Принятые, но ещё не закрытые заказы кабинета — только НАСТОЯЩИЕ и только
+    за последние `OPEN_ORDER_WINDOW_DAYS` дней.
+
+    Их идентификаторы уходят прямо в API площадки, поэтому синтетика исключается,
+    а список ограничен по возрасту (см. комментарий у константы)."""
+    cutoff = now_utc() - timedelta(days=OPEN_ORDER_WINDOW_DAYS)
     return db.query(ProcessedOrder).filter(
         ProcessedOrder.account_id == account.id,
         ProcessedOrder.status == OrderProcessStatus.processed,
         ProcessedOrder.order_id.notlike(f"{TEST_ORDER_PREFIX}%"),
+        ProcessedOrder.processed_at >= cutoff,
     ).all()
 
 

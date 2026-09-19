@@ -19,6 +19,10 @@ from tests.factories import make_account
 
 
 def _product(db, stock: int, uid: str = "u1", barcode: str = "111", **kw) -> Product:
+    # Трансляция включена по умолчанию: эти тесты про то, СКОЛЬКО уходит на
+    # площадку, а сверка ставит в очередь только передаваемые товары. С
+    # выключенной трансляцией проверять было бы нечего — очередь пуста всегда.
+    kw.setdefault("broadcast_enabled", True)
     p = Product(uid_1c=uid, article="A1", name="Товар", stock_on_hand=stock, **kw)
     db.add(p)
     db.add(Barcode(barcode=barcode, uid_1c=uid))

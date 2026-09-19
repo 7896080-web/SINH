@@ -26,6 +26,10 @@ CANCELLED_SUPPLIER_STATUSES = {"cancel"}
 # проблем нет» и ставил товару «актуализирован». Поэтому ленту берём окнами.
 ORDERS_WINDOW_DAYS = 29
 
+# Сколько идентификаторов заказов влезает в один запрос статусов
+# (`/api/v3/orders/status`). Предел площадки, а не наш выбор.
+STATUS_BATCH_IDS = 1000
+
 
 class WbClient(PlatformClient):
     name = "wb"
@@ -179,20 +183,29 @@ class WbClient(PlatformClient):
         if not order_ids:
             return []
 
-        # /api/v3/orders/status принимает пачками до 1000 int64 ID
-        int_ids = [int(x) for x in order_ids]
-        data = self._post("/api/v3/orders/status", {"orders": int_ids})
-
+        # `/api/v3/orders/status` принимает не больше STATUS_BATCH_IDS
+        # идентификаторов за запрос — РЕЖЕМ НА ПАЧКИ. Раньше предел был только в
+        # комментарии: весь список уходил одним запросом, и как только открытых
+        # заказов набралось бы больше тысячи, площадка отвергала бы его целиком.
+        # Отмены перестали бы отслеживаться СРАЗУ ПО ВСЕМУ кабинету, а выглядело
+        # бы это обычной ошибкой опроса — после пяти подряд предохранитель гасит
+        # кабинет. Заказы WB при этом не закрываются никогда (площадка не отдаёт
+        # подтверждения, см. base.get_confirmed_orders), так что список растёт со
+        # скоростью продаж и предел — вопрос времени, а не гипотеза.
         cancelled = []
-        for o in data.get("orders", []):
-            supplier_status = o.get("supplierStatus")
-            # Только НАША отмена (supplierStatus=cancel) = возврат резерва на ЦС.
-            # Клиентские отмены (wbStatus) игнорируем — это возврат после отгрузки.
-            if supplier_status in CANCELLED_SUPPLIER_STATUSES:
-                cancelled.append(PlatformOrder(
-                    order_id=str(o["id"]), barcode="", quantity=0,
-                    raw_status=supplier_status or "", is_cancellation=True,
-                ))
+        int_ids = [int(x) for x in order_ids]
+        for start in range(0, len(int_ids), STATUS_BATCH_IDS):
+            chunk = int_ids[start:start + STATUS_BATCH_IDS]
+            data = self._post("/api/v3/orders/status", {"orders": chunk})
+            for o in data.get("orders", []):
+                supplier_status = o.get("supplierStatus")
+                # Только НАША отмена (supplierStatus=cancel) = возврат резерва на ЦС.
+                # Клиентские отмены (wbStatus) игнорируем — это возврат после отгрузки.
+                if supplier_status in CANCELLED_SUPPLIER_STATUSES:
+                    cancelled.append(PlatformOrder(
+                        order_id=str(o["id"]), barcode="", quantity=0,
+                        raw_status=supplier_status or "", is_cancellation=True,
+                    ))
         return cancelled
 
     def push_stock(self, warehouse_id: str, items: list[StockPushItem]) -> dict:

@@ -157,3 +157,41 @@ def test_a_clean_walk_leaves_the_feed_complete():
     c.get_orders_since(_today())
 
     assert c.last_truncated is False
+
+
+# --------------------------------------------- статусы заказов режутся на пачки
+
+def test_status_request_is_split_into_batches():
+    """`/api/v3/orders/status` принимает не больше STATUS_BATCH_IDS за раз.
+    Заказы WB не закрываются никогда (площадка не отдаёт подтверждения), поэтому
+    список открытых растёт со скоростью продаж: без деления на пачки площадка
+    рано или поздно отвергла бы запрос ЦЕЛИКОМ, и отмены перестали бы
+    отслеживаться сразу по всему кабинету."""
+    from app.workers.platform_clients.wb import STATUS_BATCH_IDS
+
+    sizes = []
+
+    c = WbClient(token="t", warehouse_id="wh")
+
+    def fake_post(path, body=None, **kw):
+        sizes.append(len(body["orders"]))
+        return {"orders": [{"id": i, "supplierStatus": "cancel"} for i in body["orders"]]}
+
+    c._post = fake_post
+    ids = [str(i) for i in range(STATUS_BATCH_IDS * 2 + 7)]
+
+    res = c.get_cancelled_orders(ids)
+
+    assert sizes == [STATUS_BATCH_IDS, STATUS_BATCH_IDS, 7]
+    assert len(res) == len(ids)          # ни один заказ не потерян при делении
+
+
+def test_a_small_status_request_stays_one_call():
+    c = WbClient(token="t", warehouse_id="wh")
+    calls = []
+    c._post = lambda path, body=None, **kw: (calls.append(len(body["orders"])),
+                                             {"orders": []})[1]
+
+    c.get_cancelled_orders(["1", "2", "3"])
+
+    assert calls == [3]
