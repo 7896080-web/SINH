@@ -326,3 +326,31 @@ def test_order_on_a_silent_product_queues_nothing(db):
     assert db.query(DispatchQueueItem).count() == 0
     # при этом сам заказ обработан: остаток списан
     assert db.query(Product).filter(Product.uid_1c == "u1").first().stock_on_hand == 7
+
+
+# ------------------------------------- окно открытых заказов ограничено по возрасту
+
+def test_open_orders_older_than_the_window_are_not_asked_about(db):
+    """Заказы WB и Ozon не закрываются никогда — детекта подтверждения у этих
+    площадок нет, и `processed` остаётся навсегда. Без окна список открытых рос
+    бы со скоростью продаж, а его идентификаторы каждые две минуты уходят в
+    запрос отмен: рано или поздно он упёрся бы в предел площадки, и отмены
+    перестали бы отслеживаться сразу по всему кабинету."""
+    from datetime import timedelta
+
+    from app.timeutils import now_utc
+    from app.workers.order_poller import OPEN_ORDER_WINDOW_DAYS, _real_open_orders
+
+    account = make_account(db, warehouse_id="wh-1")
+    db.add_all([
+        ProcessedOrder(order_id="fresh", account_id=account.id, uid_1c="u1",
+                       quantity=1, status=OrderProcessStatus.processed,
+                       processed_at=now_utc() - timedelta(days=1)),
+        ProcessedOrder(order_id="stale", account_id=account.id, uid_1c="u1",
+                       quantity=1, status=OrderProcessStatus.processed,
+                       processed_at=now_utc() - timedelta(
+                           days=OPEN_ORDER_WINDOW_DAYS + 1)),
+    ])
+    db.commit()
+
+    assert [o.order_id for o in _real_open_orders(db, account)] == ["fresh"]

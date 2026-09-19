@@ -26,7 +26,11 @@ def test_classify_delta_zero_stock_treated_as_needs_review_unless_zero_delta():
 
 
 def test_run_reconciliation_auto_plus_updates_stock_and_enqueues_dispatch(db):
-    p = Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=10)
+    # Трансляция ВКЛЮЧЕНА: сверка ставит в очередь только то, что действительно
+    # передаётся. Раньше товар здесь создавался с выключенной трансляцией и всё
+    # равно попадал в очередь — на площадку по нему уходил ноль.
+    p = Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=10,
+                broadcast_enabled=True)
     db.add(p)
     db.add(Barcode(barcode="111", uid_1c="u1"))
     account = make_account(db)
@@ -95,3 +99,58 @@ def test_run_reconciliation_accounts_for_in_flight_tasks(db):
     stats = run_reconciliation(db, {"111": 10})
 
     assert stats["normal"] == 1
+
+
+# --------------------------------------------- сверка уважает гейты трансляции
+
+def test_reconciliation_does_not_queue_a_product_with_broadcast_off(db):
+    """18.09 на бою по такому товару ушли нули на Озон и Kit. Гейты тогда
+    добавили в приём заказа и в `enqueue_full_resend`, а путь сверки остался
+    мимо них и обнулял живые карточки каждый час."""
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=10,
+                   broadcast_enabled=False))
+    db.add(Barcode(barcode="111", uid_1c="u1"))
+    account = make_account(db)
+    db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
+    db.commit()
+
+    run_reconciliation(db, {"111": 12})
+
+    from app.models import DispatchQueueItem
+    assert db.query(DispatchQueueItem).count() == 0
+
+
+def test_reconciliation_does_not_queue_an_account_the_recalc_did_not_cover(db):
+    """Ступень 2 лестницы: по непокрытому кабинету уйдёт ноль, а он обнулит
+    карточку, на которую мы ещё ничего не отправляли."""
+    from app.timeutils import now_utc
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=10,
+                   broadcast_enabled=True, recalc_done_at=now_utc(),
+                   recalc_account_ids=""))
+    db.add(Barcode(barcode="111", uid_1c="u1"))
+    account = make_account(db)
+    db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
+    db.commit()
+
+    run_reconciliation(db, {"111": 12})
+
+    from app.models import DispatchQueueItem
+    assert db.query(DispatchQueueItem).count() == 0
+
+
+def test_reconciliation_queues_a_covered_account(db):
+    """Обратная сторона: покрытый кабинет получить обновление обязан."""
+    from app.timeutils import now_utc
+    account = make_account(db)
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=10,
+                   broadcast_enabled=True, recalc_done_at=now_utc(),
+                   recalc_account_ids=str(account.id)))
+    db.add(Barcode(barcode="111", uid_1c="u1"))
+    db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
+    db.commit()
+
+    run_reconciliation(db, {"111": 12})
+
+    from app.models import DispatchQueueItem
+    rows = db.query(DispatchQueueItem).all()
+    assert len(rows) == 1 and rows[0].quantity == 12 and rows[0].reason == "reconciliation"

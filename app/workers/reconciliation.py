@@ -3,9 +3,10 @@ from datetime import datetime
 from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
+from app.transmit import enqueue_full_resend
 from app.models import (
     Product, Barcode, FtpTask, FtpTaskStatus, ReconciliationLog,
-    ReconciliationClassification, DispatchQueueItem, SyncSetting,
+    ReconciliationClassification, SyncSetting,
     PlatformCatalogItem, MappingConflict,
 )
 
@@ -288,14 +289,22 @@ def run_reconciliation(db: Session, stock_from_1c: dict[str, int],
             # Рассылаем актуальное значение на включённые кабинеты (дефицит — риск
             # оверселла, поэтому сразу, не ждём батч-цикл). Если задан override,
             # dispatch отправит именно его (см. _quantity_to_send).
+            #
+            # ЧЕРЕЗ `enqueue_full_resend`, а не прямым `db.add`. Раньше было
+            # прямым, и это обходило ОБА гейта трансляции: товар с выключенной
+            # трансляцией и кабинет, не покрытый расчётом, всё равно попадали в
+            # очередь. Дальше `quantity_for_account` честно возвращал по ним 0
+            # (ступени 0 и 2 лестницы), и этот ноль уходил на площадку — рассылка
+            # нули не пропускает. Для карточки, на которую мы ни разу не
+            # отправляли остаток, это не отзыв, а обнуление чужих продаж: ровно
+            # то, что случилось 18.09 с Озоном и Kit. Тогда гейты добавили в приём
+            # заказа и в саму `enqueue_full_resend`, а путь сверки остался мимо
+            # них и продолжал обнулять каждый час.
             enabled_platforms = db.query(SyncSetting).filter(
                 SyncSetting.uid_1c == uid_1c, SyncSetting.enabled.is_(True),
             ).all()
             for setting in enabled_platforms:
-                db.add(DispatchQueueItem(
-                    uid_1c=uid_1c, account_id=setting.account_id, quantity=new_stock,
-                    reason="reconciliation",
-                ))
+                enqueue_full_resend(db, uid_1c, setting.account_id, reason="reconciliation")
 
     db.commit()
     return stats
