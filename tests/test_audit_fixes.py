@@ -43,19 +43,19 @@ def test_stale_stock_snapshot_is_skipped(tmp_path):
     """Файл старше последнего запроса выгрузки не применяется, а архивируется."""
     ex = _exchange(tmp_path)
     requested_at = now_utc()
-    _write_stock(ex, "stock_old.txt", "u1|A|Т|10|111", mtime=requested_at - timedelta(hours=1))
+    _write_stock(ex, "stock_20260919010000.txt", "u1|A|Т|10|111", mtime=requested_at - timedelta(hours=1))
 
     rows = fetch_stock_export_rows(ex, not_older_than=requested_at)
 
     assert rows == []
-    assert (tmp_path / "a" / "stock_old.txt").exists()      # унесён в архив, не залипает
-    assert not (tmp_path / "r" / "stock_old.txt").exists()
+    assert (tmp_path / "a" / "stock_20260919010000.txt").exists()      # унесён в архив, не залипает
+    assert not (tmp_path / "r" / "stock_20260919010000.txt").exists()
 
 
 def test_fresh_stock_snapshot_is_applied(tmp_path):
     ex = _exchange(tmp_path)
     requested_at = now_utc() - timedelta(minutes=5)
-    _write_stock(ex, "stock_new.txt", "u1|A|Т|8|111", mtime=now_utc())
+    _write_stock(ex, "stock_20260919020000.txt", "u1|A|Т|8|111", mtime=now_utc())
 
     rows = fetch_stock_export_rows(ex, not_older_than=requested_at)
 
@@ -83,7 +83,7 @@ def test_stale_snapshot_no_longer_inflates_stock(db, tmp_path):
 
     ex = _exchange(tmp_path)
     requested_at = now_utc()
-    _write_stock(ex, "stock_old.txt", "u1|A|Т|10|111", mtime=requested_at - timedelta(hours=1))
+    _write_stock(ex, "stock_20260919010000.txt", "u1|A|Т|10|111", mtime=requested_at - timedelta(hours=1))
     rows = fetch_stock_export_rows(ex, not_older_than=requested_at)
     if rows:
         run_reconciliation(db, {"111": rows[0]["quantity"]}, missing_means_zero=True)
