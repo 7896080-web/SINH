@@ -154,8 +154,9 @@ def test_a_cabinet_added_a_minute_ago_is_not_blamed_for_an_empty_catalog(db):
     assert "stale_catalog" not in _keys(collect_findings(db))
 
 
-def test_an_old_anomaly_pile_becomes_critical(db):
-    """Сотня аномалий, старейшей неделя, — это уже не «разберём на днях»."""
+def test_an_old_pile_of_unmatched_barcodes_becomes_critical(db):
+    """Заказ без сопоставленного баркода не рассосётся сам: документа в 1С нет и
+    не будет. Старейшему неделя — это уже не «разберём на днях»."""
     from app.report import ANOMALY_OLD
 
     account = make_account(db)
@@ -170,7 +171,27 @@ def test_an_old_anomaly_pile_becomes_critical(db):
     assert finding.level == CRITICAL
 
 
-def test_a_fresh_anomaly_is_only_a_warning(db):
+def test_orders_on_products_we_have_not_connected_are_not_a_discrepancy(db):
+    """Пока идёт переход, часть каталога транслирует ещё старая система, и
+    продажи по этим карточкам идут мимо нас В ПОРЯДКЕ ВЕЩЕЙ: товар у нас не
+    отмечен, остаток по нему мы не рассылали и не списывали. Разбирать нечего,
+    следствия нет — значит это не расхождение, а мера того, какая часть каталога
+    ещё не переехала.
+
+    Держать из-за них отчёт постоянно непустым нельзя: человек привыкнет его
+    пролистывать и не заметит настоящую находку. С полным переходом строки
+    исчезнут сами."""
+    account = make_account(db)
+    for i in range(50):
+        db.add(SyncAnomaly(uid_1c="u1", account_id=account.id,
+                           reason=AnomalyReason.order_on_disabled,
+                           detected_at=now_utc() - timedelta(days=30)))
+    db.commit()
+
+    assert "open_anomalies" not in _keys(collect_findings(db))
+
+
+def test_a_fresh_unmatched_barcode_is_only_a_warning(db):
     account = make_account(db)
     db.add(SyncAnomaly(uid_1c="u1", account_id=account.id,
                        reason=AnomalyReason.missing_barcode, detected_at=now_utc()))

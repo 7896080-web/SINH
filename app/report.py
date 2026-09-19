@@ -27,9 +27,9 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.models import (
-    AnomalyStatus, DispatchQueueItem, DispatchStatus, FtpTask, FtpTaskStatus,
-    MappingConflict, PlatformAccount, PlatformCatalogItem, Product,
-    ReconciliationClassification, ReconciliationLog, StockDateSnapshot,
+    AnomalyReason, AnomalyStatus, DispatchQueueItem, DispatchStatus, FtpTask,
+    FtpTaskStatus, MappingConflict, PlatformAccount, PlatformCatalogItem,
+    Product, ReconciliationClassification, ReconciliationLog, StockDateSnapshot,
     StockDateStatus, SyncAnomaly, WorkerHeartbeat,
 )
 from app.timeutils import now_utc
@@ -283,11 +283,27 @@ def _check_dispatch_stuck(db: Session) -> Finding | None:
 
 
 def _check_open_anomalies(db: Session) -> Finding | None:
-    """Неразобранные аномалии. Очередь, которая не убывает, перестаёт быть
-    сигналом — поэтому смотрим не только число, но и возраст старейшей."""
+    """Неразобранные аномалии — но НЕ ВСЕ, а только те, что действительно наши.
+
+    `order_on_disabled` («заказ по неподключенному товару») в отчёт не попадает
+    СОЗНАТЕЛЬНО. Пока идёт переход, остатки по части каталога транслирует ещё
+    старая система, и продажи по этим карточкам идут мимо нас в порядке вещей:
+    товар у нас не отмечен, остаток мы по нему не рассылали и не списывали,
+    разбирать тут нечего. Следствия — того самого, которое обязана называть
+    каждая находка, — здесь просто нет, а значит это не расхождение, а мера
+    того, какая часть каталога ещё не переехала. С полным переходом эти строки
+    исчезнут сами; до тех пор они бы держали отчёт постоянно непустым, и человек
+    привык бы его пролистывать. Ровно так инструмент и умирает.
+
+    `missing_barcode` — другое дело. Там заказ ЕСТЬ, а разнести его не на что:
+    перемещение в 1С не создано и не создастся, пока баркод не сопоставят, и
+    каждый следующий заказ по нему повторит то же самое. Это не рассосётся
+    переходом.
+    """
     rows = db.query(SyncAnomaly).filter(
         SyncAnomaly.status == AnomalyStatus.new,
         SyncAnomaly.is_test.is_(False),
+        SyncAnomaly.reason == AnomalyReason.missing_barcode,
     ).all()
     if not rows:
         return None
@@ -296,9 +312,10 @@ def _check_open_anomalies(db: Session) -> Finding | None:
     level = WARNING if oldest is None or oldest > now_utc() - ANOMALY_OLD else CRITICAL
     return Finding(
         key="open_anomalies", level=level,
-        title=f"Неразобранных аномалий: {len(rows)} (старейшей {_age(oldest)})",
-        consequence="Каждая — заказ, который система не смогла разнести сама: товар "
-                    "продан, а остаток и документ в 1С по нему не изменились.",
+        title=f"Заказов без сопоставленного баркода: {len(rows)} (старейшему {_age(oldest)})",
+        consequence="Товар продан, а разнести продажу не на что: документа в 1С нет и "
+                    "не будет, пока баркод не сопоставят. Каждый следующий заказ по "
+                    "этому баркоду повторит то же самое.",
         count=len(rows), link="/anomalies",
     )
 
