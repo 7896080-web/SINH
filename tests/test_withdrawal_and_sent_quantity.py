@@ -216,6 +216,50 @@ def test_a_row_older_than_sent_quantity_is_judged_by_its_reason(web_db):
     assert ever_transmitted(web_db, "u1", account.id) is True
 
 
+def test_a_legacy_reconciliation_row_counts_as_a_transmission(web_db):
+    """Находка 4 аудита: легаси-строка `reconciliation` могла унести ноль (до
+    18.09 сверка ставила в очередь и товар с выключенной трансляцией, и кабинет
+    вне расчёта, а лестница обнуляла их уже при отправке) — и всё равно считается
+    здесь отправкой.
+
+    Это осознанный выбор направления ошибки, а не недосмотр. Строка со статусом
+    `sent` и непустым `sent_at` означает, что `push_stock` по этой карточке мы
+    уже звали: ушёл там ноль — карточка и так на нуле, лишний отзыв не меняет
+    ничего. Обратная трактовка стоила бы оверселла: товар, который правда
+    транслировался до появления колонки, при снятии галочки не был бы отозван,
+    площадка продолжила бы им торговать, а заказы по снятой паре живой опрос
+    пропускает целиком — ни списания, ни документа в 1С."""
+    from app.timeutils import now_utc
+    from app.transmit import ever_transmitted
+
+    account = make_account(web_db, Platform.ozon, name="Озон")
+    _product(web_db, broadcast=True)
+    web_db.add(DispatchQueueItem(
+        uid_1c="u1", account_id=account.id, quantity=18, sent_quantity=None,
+        reason="reconciliation", status=DispatchStatus.sent, sent_at=now_utc()))
+    web_db.commit()
+
+    assert ever_transmitted(web_db, "u1", account.id) is True
+
+
+def test_an_absorbed_row_is_not_a_transmission(web_db):
+    """`dispatch` схлопывает несколько изменений по товару за цикл и помечает
+    поглощённые статусом `sent` — на площадку они не уходили, и `sent_at` у них
+    пуст. Без условия на `sent_at` любая такая строка сошла бы за отправку и
+    открыла бы отзыв там, где отзывать нечего."""
+    from app.transmit import ever_transmitted
+
+    account = make_account(web_db, Platform.wb, name="ИП ЯВОРСКАЯ")
+    _product(web_db, broadcast=True)
+    web_db.add(DispatchQueueItem(
+        uid_1c="u1", account_id=account.id, quantity=18, sent_quantity=None,
+        reason="order", status=DispatchStatus.sent, sent_at=None,
+        last_error="поглощено более новым изменением в этом цикле"))
+    web_db.commit()
+
+    assert ever_transmitted(web_db, "u1", account.id) is False
+
+
 def test_a_queued_but_unsent_row_is_not_a_transmission(web_db):
     """Запись, которая до площадки не доехала, ничего туда не положила."""
     from app.transmit import ever_transmitted
