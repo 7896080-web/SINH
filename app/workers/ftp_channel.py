@@ -8,7 +8,7 @@ from app.timeutils import now_utc
 from sqlalchemy.orm import Session
 
 from app.models import (FtpTask, FtpTaskStatus, Platform, StockDateRow, StockDateSnapshot,
-                        StockDateStatus)
+                        StockDateStatus, StockDeltaDocument)
 
 logger = logging.getLogger("sync_worker")
 
@@ -43,6 +43,33 @@ MAX_REPOSTS = 5
 # и строка, на которой она спотыкается, утащила бы за собой ни в чём не повинные
 # свежие перемещения.
 REPOST_BATCH_LINES = 3
+
+# --- Оперативное изменение остатка ЦС ---------------------------------------
+# 1С сама кладёт `delta_ГГГГММДДЧЧММСС.txt`, когда меняется остаток ЦС, — чтобы не
+# ждать часовой выгрузки (полный снимок это 152 тыс. товаров, чаще его не просят).
+# Строка: `баркод|новый остаток ЦС|источник|идентификатор документа`.
+#
+# Количество — НОВЫЙ АБСОЛЮТНЫЙ остаток, а не приращение. Приращения копят ошибку:
+# один потерянный или задвоенный файл — и расхождение остаётся навсегда, а
+# абсолютное число самолечится следующим же сообщением.
+#
+# Два разных предохранителя, и нужны оба:
+#  1. ИСТОЧНИК. Документы, созданные по нашим же заданиям, 1С помечает `sync`.
+#     Их надо отбрасывать: наше перемещение уже уменьшило остаток в момент приёма
+#     заказа, и применить его ещё раз значит списать единицу дважды. Это эхо
+#     собственных действий, а не новость со склада.
+#  2. ИДЕНТИФИКАТОР ДОКУМЕНТА. Один и тот же документ приезжает повторно при
+#     переотправке файла, повторном проведении, ручном перезапуске обработки.
+#     Применённые идентификаторы храним (`StockDeltaDocument`) и второй раз не
+#     применяем — иначе порядок файлов начинает решать, и старое сообщение может
+#     затереть новое.
+#
+# И главное: частичный файл применяется ТОЛЬКО как частичный. Полный снимок
+# обнуляет всё, чего в нём нет (иначе распроданный товар транслировался бы
+# вечно), и дельта, применённая как снимок, обнулила бы весь каталог с первого
+# же сообщения.
+STOCK_DELTA_FIELDS = 4
+SYNC_SOURCE = "sync"
 
 # Выгрузка остатков на заданное число: команда в task_*.txt и ответ ondate_*.txt.
 STOCK_ON_DATE_COMMAND = "EXPORT_STOCK_ON_DATE"
@@ -97,9 +124,27 @@ class LocalExchange:
         return sorted(p.name for p in self.dir_results.glob("result_*.txt"))
 
     def list_stock_files(self) -> list[str]:
+        """Полные снимки склада: `stock_ГГГГММДДЧЧММСС.txt`.
+
+        Цифра в шаблоне не для красоты. Снимок применяется как ПОЛНЫЙ — товар,
+        которого в нём нет, обнуляется, — поэтому попасть сюда не должен никакой
+        другой файл, чьё имя начинается на `stock_`. Достаточно завести рядом
+        `stock_delta_*` или `stock_backup_*`, и он был бы разобран как снимок
+        склада со всеми последствиями.
+        """
         if not self.dir_results.exists():
             return []
-        return sorted(p.name for p in self.dir_results.glob("stock_*.txt"))
+        return sorted(p.name for p in self.dir_results.glob("stock_[0-9]*.txt"))
+
+    def list_stock_delta_files(self) -> list[str]:
+        """Оперативные изменения остатка ЦС: `delta_ГГГГММДДЧЧММСС.txt`.
+
+        Префикс намеренно НЕ начинается на `stock_`: это частичный файл, и
+        применять его как снимок нельзя ни при каких обстоятельствах.
+        """
+        if not self.dir_results.exists():
+            return []
+        return sorted(p.name for p in self.dir_results.glob("delta_*.txt"))
 
     def list_stock_on_date_files(self) -> list[str]:
         """Выгрузка остатков НА ДАТУ. Префикс намеренно другой (`ondate_`, а не
@@ -325,6 +370,92 @@ def parse_stock_export_file(content: str) -> dict[str, int]:
         for barcode in barcodes:
             result[barcode] = quantity
     return result
+
+
+def parse_stock_delta_file(content: str) -> list[dict]:
+    """Разбор `delta_*.txt`: `баркод|новый остаток|источник|идентификатор документа`.
+
+    Формат намеренно свой и минимальный, а не расширение строки `stock_*.txt`: там
+    поля разбираются справа из-за наименований с «|» внутри, и подмешивать туда
+    ещё два поля значило бы делать разбор хрупким ради экономии.
+    """
+    rows = []
+    for line in content.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split("|")
+        if len(parts) < STOCK_DELTA_FIELDS:
+            continue
+        barcode = parts[0].strip()
+        digits = parts[1].strip().lstrip("-")
+        if not barcode or not digits.isdigit():
+            continue
+        rows.append({
+            "barcode": barcode,
+            "quantity": int(parts[1]),
+            "source": parts[2].strip().lower(),
+            "document_id": parts[3].strip(),
+        })
+    return rows
+
+
+def collect_stock_delta(db: Session, exchange: "LocalExchange") -> tuple[dict[str, int], dict]:
+    """Забирает и архивирует `delta_*.txt`, отсеивая всё, что применять нельзя.
+
+    Возвращает `({баркод: новый остаток}, статистика)`. САМ НИЧЕГО НЕ ПРИМЕНЯЕТ:
+    остаток двигает `run_reconciliation` — та же функция, что и на часовой
+    выгрузке, чтобы формула «остаток = 1С минус в пути» жила в одном месте.
+    Вызывающий обязан звать её с `missing_means_zero=False`.
+    """
+    stats = {"files": 0, "lines": 0, "ours_skipped": 0, "already_applied": 0,
+             "no_document_id": 0, "applied": 0}
+    mapping: dict[str, int] = {}
+    fresh_documents: dict[str, dict] = {}
+
+    for filename in exchange.list_stock_delta_files():
+        content = exchange.download_and_archive_result(filename)
+        stats["files"] += 1
+        for row in parse_stock_delta_file(content):
+            stats["lines"] += 1
+
+            if row["source"] == SYNC_SOURCE:
+                # Наш же документ: остаток по нему уже списан в момент приёма
+                # заказа. Применить ещё раз — списать дважды.
+                stats["ours_skipped"] += 1
+                continue
+
+            doc_id = row["document_id"]
+            if not doc_id:
+                # Без идентификатора повтор не отличить от новости, и порядок
+                # файлов начал бы решать. Пропускаем: часовая выгрузка всё равно
+                # принесёт этот остаток, самое позднее через час.
+                stats["no_document_id"] += 1
+                continue
+
+            if doc_id not in fresh_documents and db.query(StockDeltaDocument).filter(
+                    StockDeltaDocument.document_id == doc_id).first() is not None:
+                stats["already_applied"] += 1
+                continue
+
+            mapping[row["barcode"]] = row["quantity"]
+            entry = fresh_documents.setdefault(doc_id, {"source": row["source"], "lines": 0})
+            entry["lines"] += 1
+            stats["applied"] += 1
+
+    for doc_id, entry in fresh_documents.items():
+        db.add(StockDeltaDocument(document_id=doc_id, source=entry["source"],
+                                  lines=entry["lines"]))
+    if fresh_documents:
+        db.commit()
+
+    if stats["files"]:
+        logger.info("stock_delta: %s", stats)
+    if stats["no_document_id"]:
+        logger.warning("stock_delta: %d строк без идентификатора документа — "
+                       "пропущены, защита от задвоения без него невозможна",
+                       stats["no_document_id"])
+    return mapping, stats
 
 
 def fetch_stock_export_files(exchange: "LocalExchange") -> dict[str, int]:

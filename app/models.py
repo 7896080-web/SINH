@@ -400,6 +400,27 @@ class FtpTask(Base):
 # ни при чём: сверяем физический остаток ЦС, а не то, что на какой площадке.
 # ---------------------------------------------------------------------------
 
+class StockDeltaDocument(Base):
+    """Документ 1С, изменение по которому мы уже применили.
+
+    1С сама кладёт `delta_*.txt`, когда меняется остаток ЦС, — чтобы не ждать
+    часовой выгрузки. Файл может приехать повторно: переотправка, повторное
+    проведение, ручной перезапуск обработки. Второй раз тот же документ
+    применять нельзя, поэтому его идентификатор запоминаем здесь.
+
+    Своих движений тут не бывает: документы, созданные по нашим заданиям, 1С
+    помечает источником `sync`, и такие строки отбрасываются раньше — иначе мы
+    получили бы эхо собственных действий и списали бы единицу дважды.
+    """
+    __tablename__ = "stock_delta_documents"
+
+    id = Column(Integer, primary_key=True)
+    document_id = Column(String(128), unique=True, nullable=False, index=True)
+    source = Column(String(32), nullable=True)
+    applied_at = Column(DateTime, default=now_utc, nullable=False)
+    lines = Column(Integer, default=0, nullable=False)
+
+
 class ReconciliationClassification(str, enum.Enum):
     normal = "normal"
     auto_plus = "auto_plus"

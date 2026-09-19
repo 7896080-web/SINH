@@ -18,8 +18,8 @@ from app.workers.dispatch import run_dispatch_cycle
 from app.workers.catalog_sync import load_platform_catalog
 from app.workers.catalog_poller import poll_catalog
 from app.workers.ftp_channel import (
-    LocalExchange, build_task_batch, apply_result_batch, detect_timed_out_tasks,
-    repost_stuck_movements,
+    LocalExchange, build_task_batch, apply_result_batch, collect_stock_delta,
+    detect_timed_out_tasks, repost_stuck_movements,
     fetch_stock_export_files, fetch_stock_export_snapshot, fetch_barcode_dict_files,
     apply_stock_on_date_files, detect_timed_out_stock_date_requests,
     prune_stock_date_snapshots,
@@ -234,6 +234,18 @@ def job_ftp_receive():
             content = exchange.download_and_archive_result(filename)
             stats = apply_result_batch(db, content)
             logger.info("ftp_receive: %s -> %s", filename, stats)
+
+        # Оперативные изменения остатка ЦС: 1С кладёт их сама, не дожидаясь
+        # часовой выгрузки. Применяются ТОЛЬКО как частичные —
+        # `missing_means_zero=False`: товар, которого в файле нет, не трогаем.
+        # Полный снимок обнуляет отсутствующих намеренно, и дельта, применённая
+        # как снимок, обнулила бы весь каталог с первого же сообщения.
+        delta, delta_stats = collect_stock_delta(db, exchange)
+        if delta:
+            recon = run_reconciliation(db, delta, missing_means_zero=False,
+                                       snapshot_at=now_utc())
+            logger.info("ftp_receive: изменение остатка ЦС %s -> сверка %s",
+                        delta_stats, recon)
 
         # Выгрузки остатков на дату — отдельный префикс файлов и отдельная
         # таблица: в остаток товара и в сверку они не попадают никогда.
