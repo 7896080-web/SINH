@@ -8,6 +8,7 @@ from app.timeutils import now_utc
 from apscheduler.schedulers.blocking import BlockingScheduler
 
 from app.database import SessionLocal
+from app.report import CRITICAL, collect_findings, summary_line
 from app.models import Platform, PlatformAccount, WorkerHeartbeat
 from app.routers.health import SCHEDULER_START_MARKER
 from app.workers.credentials import CredentialsMissing
@@ -525,6 +526,36 @@ def job_reconcile_accounts(sched):
         db.close()
 
 
+# Отчёт о расхождениях — раз в час. Ничего не чинит и не отправляет наружу,
+# только читает и пишет ОДНУ строку в лог. Смысл именно в строке: каждый
+# серьёзный дефект сентября был виден в данных за часы до того, как его нашли, —
+# не хватало не данных, а того, кто посмотрит. Теперь смотреть можно по логу, не
+# открывая браузер.
+DISCREPANCY_REPORT_INTERVAL_MINUTES = 60
+
+
+def job_discrepancy_report():
+    db = SessionLocal()
+    try:
+        findings = collect_findings(db)
+        line = summary_line(findings)
+        if any(f.level == CRITICAL for f in findings):
+            # WARNING, а не INFO: критичная находка — это деньги, и она обязана
+            # отличаться от обычного «посмотрел, всё в порядке» при поиске по логу.
+            logger.warning("расхождения: %s", line)
+        else:
+            # Пишем и когда всё чисто. Отсутствие строки должно означать «отчёт не
+            # собирался», а не «расхождений не было» — иначе молчание неотличимо
+            # от поломки самого отчёта.
+            logger.info("расхождения: %s", line)
+        _heartbeat(db, "discrepancy_report", True)
+    except Exception as e:
+        logger.exception("discrepancy_report failed")
+        _heartbeat(db, "discrepancy_report", False, str(e))
+    finally:
+        db.close()
+
+
 def build_scheduler() -> BlockingScheduler:
     """Статические задания навешиваются один раз, per-account задания —
     через reconcile_account_jobs() (первый прогон при старте плюс
@@ -577,6 +608,12 @@ def build_scheduler() -> BlockingScheduler:
     # Массовая актуализация: частый опрос дешёвый (без задания — один SELECT),
     # зато прогресс на странице двигается заметно для человека.
     sched.add_job(job_recalc, "interval", seconds=20, id="recalc", max_instances=1)
+    # Первый прогон вскоре после старта, а не через час: суточные и часовые задания
+    # на `interval` отсчитывают первый запуск от момента добавления, а воркер
+    # перезапускается чаще (см. историю `job_catalog_poll` выше).
+    sched.add_job(job_discrepancy_report, "interval",
+                  minutes=DISCREPANCY_REPORT_INTERVAL_MINUTES, id="discrepancy_report",
+                  max_instances=1, next_run_time=start + timedelta(minutes=2))
 
     # Per-account задания: первичная простановка + периодическая сверка.
     db = SessionLocal()

@@ -22,6 +22,7 @@ from app.workers.order_poller import poll_new_orders, poll_cancellations
 from app.workers.catalog_sync import load_platform_catalog
 from app.workers.scheduler import PENDING_WAREHOUSE_NAME
 from app.audit import log_action
+from app.report import CRITICAL as REPORT_CRITICAL, collect_findings
 from app.flash import set_flash, pop_flash
 
 router = APIRouter()
@@ -90,6 +91,8 @@ def diagnostics_page(request: Request, db: Session = Depends(get_db), user: User
                       "reconciliation_applied"]
     shared_heartbeats = [{"name": w, "hb": _heartbeat_for(db, w)} for w in shared_workers]
 
+    report_findings = collect_findings(db)
+
     global_stats = {
         "conflicts": db.query(MappingConflict).count(),
         "anomalies_new": db.query(SyncAnomaly).filter(
@@ -105,6 +108,13 @@ def diagnostics_page(request: Request, db: Session = Depends(get_db), user: User
         "stuck_tasks": _stuck_rows(db),
         "repost_enabled": repost_enabled(), "max_reposts": MAX_REPOSTS,
         "flash": pop_flash(request),
+        # Сводка отчёта о расхождениях — здесь, а не сам отчёт: «Диагностика»
+        # отвечает на вопрос «жива ли система», отчёт — «где она разошлась с
+        # реальностью». Смешать их значит получить страницу, которую читают по
+        # диагонали. Но оператор ходит СЮДА, поэтому одну строку со ссылкой
+        # показываем: иначе отчёт есть, а узнать о нём неоткуда.
+        "report_findings": report_findings,
+        "report_critical": sum(1 for f in report_findings if f.level == REPORT_CRITICAL),
     })
 
 

@@ -10,7 +10,7 @@ from app.database import Base, engine
 from app.dependencies import NotAuthenticated
 from app.routers import (
     auth, api_keys, mapping, products, anomalies, health, diagnostics, testing,
-    platform_matching, stock_on_date,
+    platform_matching, stock_on_date, report,
 )
 
 
@@ -52,6 +52,7 @@ app.include_router(products.router)
 app.include_router(anomalies.router)
 app.include_router(health.router)
 app.include_router(diagnostics.router)
+app.include_router(report.router)
 app.include_router(testing.router)
 app.include_router(stock_on_date.router)
 

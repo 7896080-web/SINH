@@ -38,6 +38,9 @@ EXPECTED_INTERVAL_SECONDS = {
     # пишется раз в 7 дней, без своей записи здесь протухала бы через 10 минут и
     # держала /health в 503 всю неделю.
     "import_barcodes_full": 7 * 86400 * 3,
+    # Отчёт о расхождениях ходит раз в час. Без своей записи он протухал бы по
+    # умолчанию через 10 минут и держал /health красным всё остальное время.
+    "discrepancy_report": 3600 * 3,
 }
 # Per-account воркеры пишут heartbeat с ДИНАМИЧЕСКИМ именем
 # (`poll_orders_account_<id>`, `catalog_poll_account_<id>`) — сопоставляем по
@@ -74,6 +77,10 @@ REQUIRED_WORKERS = {
     "reconcile_accounts": 900,
     "import_barcodes": 1800,
     "recalc": 300,
+    # Отчёт о расхождениях ходит раз в час. Он сам по себе ничего не чинит, но
+    # если он перестанет собираться, это заметно не будет никак — потому и
+    # перечислен здесь наравне с рабочими заданиями.
+    "discrepancy_report": 2 * 3600,
 }
 
 ACCOUNT_WORKER_PREFIXES = ("poll_orders_account_", "catalog_poll_account_")
