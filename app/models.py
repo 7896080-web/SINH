@@ -294,6 +294,20 @@ class DispatchQueueItem(Base):
     # только пересчитать задним числом по текущим настройкам, а они могли уже
     # измениться. NULL — запись ещё не отправляли.
     sent_quantity = Column(Integer, nullable=True)
+    # Идентификатор, КОТОРЫМ отправляли (для WB это баркод-sku, для Ozon артикул,
+    # для Kit variant_id). Без него по базе не восстановить, под каким ключом
+    # число ушло на площадку: у товара бывает несколько баркодов, и выбор делает
+    # `dispatch._resolve_push_target` в момент отправки. 19.09 разбор «почему на
+    # WB ноль» из-за этого занял час вместо минуты — количество знали, ключ нет.
+    sent_sku = Column(String(64), nullable=True)
+    # Что площадка держит по этому sku, когда мы спросили ПОСЛЕ отправки, и когда
+    # спрашивали. Нужно, потому что успешный ответ на отправку не означает, что
+    # число там и осталось: 19.09 на бою выяснилось, что в кабинет пишет ещё одна
+    # система и перетирает наши остатки за три минуты. Расхождение этих двух
+    # чисел — единственный способ такое увидеть, отправка о нём не знает.
+    # NULL — ещё не проверяли (или площадка не умеет отдавать остатки обратно).
+    verified_at = Column(DateTime, nullable=True)
+    verified_quantity = Column(Integer, nullable=True)
     reason = Column(String(64), nullable=False)  # 'order' / 'cancel' / 'manual_enable' / 'reconciliation'
     status = Column(Enum(DispatchStatus), default=DispatchStatus.pending, nullable=False)
     attempts = Column(Integer, default=0)

@@ -71,6 +71,55 @@ def test_dispatch_errors_are_critical_and_name_the_consequence(db):
     assert "429" in finding.details[0]
 
 
+def test_a_platform_holding_more_than_we_sent_is_critical(db):
+    """Найдено на бою 19.09: в кабинет писала вторая система и перетирала наши
+    остатки. Направление решает срочность — БОЛЬШЕ нашего значит площадка
+    продаёт то, чего нет."""
+    account = make_account(db)
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    db.add(DispatchQueueItem(
+        uid_1c="u1", account_id=account.id, quantity=5, sent_quantity=5,
+        sent_sku="111", reason="order", status=DispatchStatus.sent,
+        sent_at=now_utc(), verified_at=now_utc(), verified_quantity=12))
+    db.commit()
+
+    finding = _by_key(collect_findings(db), "platform_divergence")
+
+    assert finding is not None
+    assert finding.level == CRITICAL
+    assert "продаёт то, чего нет" in finding.consequence
+    assert "отправили 5, площадка держит 12" in finding.details[0]
+
+
+def test_a_platform_holding_less_than_we_sent_is_a_warning(db):
+    """Ровно сегодняшний случай: отправили 68, площадка держит 0. Теряются
+    продажи, но не деньги покупателя — значит не критично."""
+    account = make_account(db)
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=68))
+    db.add(DispatchQueueItem(
+        uid_1c="u1", account_id=account.id, quantity=68, sent_quantity=68,
+        sent_sku="2004896744404", reason="broadcast_toggled",
+        status=DispatchStatus.sent, sent_at=now_utc(),
+        verified_at=now_utc(), verified_quantity=0))
+    db.commit()
+
+    assert _by_key(collect_findings(db), "platform_divergence").level == WARNING
+
+
+def test_an_unverified_row_is_not_a_divergence(db):
+    """Сверка не отработала (площадка молчит, sku она не знает, ещё не спрашивали)
+    — это отсутствие проверки, а не расхождение."""
+    account = make_account(db)
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    db.add(DispatchQueueItem(
+        uid_1c="u1", account_id=account.id, quantity=5, sent_quantity=5,
+        sent_sku="111", reason="order", status=DispatchStatus.sent,
+        sent_at=now_utc(), verified_at=now_utc(), verified_quantity=None))
+    db.commit()
+
+    assert "platform_divergence" not in _keys(collect_findings(db))
+
+
 def test_a_test_dispatch_error_is_not_a_discrepancy(db):
     """Симуляция со страницы «Тестирование» на площадку не уходила и остаток не
     двигала — в отчёте ей делать нечего. Это та же граница `is_test`, что и

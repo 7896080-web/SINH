@@ -140,6 +140,29 @@ def test_the_queue_records_the_number_that_actually_left(db):
     assert [i.quantity for i in platform.pushed[0]] == [46]
 
 
+def test_the_queue_records_the_sku_it_was_sent_with(db):
+    """У товара бывает несколько баркодов, и какой из них уйдёт, решает
+    `_resolve_push_target` уже в момент отправки. Без записи ключ по базе потом
+    не восстановить: 19.09 разбор «почему на WB ноль» из-за этого занял час —
+    количество знали, sku нет. Он же нужен сверке, чтобы спросить площадку про
+    ТОТ идентификатор, которым отправляли, а не про любой баркод товара."""
+    account = make_account(db, Platform.wb, name="ИП ЯВОРСКАЯ")
+    _product(db, stock=18, broadcast=True, recalc_ids=str(account.id))
+    db.add(Barcode(barcode="второй", uid_1c="u1"))
+    db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
+    db.add(DispatchQueueItem(uid_1c="u1", account_id=account.id, quantity=18,
+                             reason="manual_enable"))
+    db.commit()
+
+    platform = FakePlatform()
+    run_dispatch_cycle(db, {account.id: platform}, [account])
+
+    item = db.query(DispatchQueueItem).one()
+    assert item.sent_sku, "sku, которым отправляли, обязан быть записан"
+    assert item.sent_sku == platform.pushed[0][0].barcode, \
+        "записан именно тот идентификатор, который ушёл на площадку"
+
+
 def test_sent_quantity_stays_empty_until_something_is_sent(db):
     account = make_account(db, Platform.wb, name="ИП ЯВОРСКАЯ")
     _product(db, stock=18, broadcast=True)
