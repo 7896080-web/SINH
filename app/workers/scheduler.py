@@ -9,6 +9,7 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 
 from app.database import SessionLocal
 from app.report import CRITICAL, collect_findings, summary_line
+from app.workers.verify_stock import verify_all
 from app.models import Platform, PlatformAccount, WorkerHeartbeat
 from app.routers.health import SCHEDULER_START_MARKER
 from app.workers.credentials import CredentialsMissing
@@ -526,6 +527,32 @@ def job_reconcile_accounts(sched):
         db.close()
 
 
+# Сверка отправленного с тем, что площадка держит на самом деле. Раз в полчаса:
+# чаще незачем (проверяем не сиюминутное состояние, а «осталось ли наше число»),
+# реже — теряем связь с событием. Ходит В API ПЛОЩАДОК, поэтому вынесена в
+# отдельное задание, а не в отчёт: отчёт обязан оставаться чистым чтением базы.
+VERIFY_STOCK_INTERVAL_MINUTES = 30
+
+
+def job_verify_stock():
+    db = SessionLocal()
+    try:
+        accounts = _active_accounts(db)
+        stats = verify_all(db, build_client, accounts)
+        if stats["diverged"]:
+            # WARNING: площадка держит не то, что мы отправили. Либо кто-то
+            # пишет поверх нас, либо отправка поняла ответ неверно.
+            logger.warning("сверка остатков: %s", stats)
+        else:
+            logger.info("сверка остатков: %s", stats)
+        _heartbeat(db, "verify_stock", True)
+    except Exception as e:
+        logger.exception("verify_stock failed")
+        _heartbeat(db, "verify_stock", False, str(e))
+    finally:
+        db.close()
+
+
 # Отчёт о расхождениях — раз в час. Ничего не чинит и не отправляет наружу,
 # только читает и пишет ОДНУ строку в лог. Смысл именно в строке: каждый
 # серьёзный дефект сентября был виден в данных за часы до того, как его нашли, —
@@ -614,6 +641,11 @@ def build_scheduler() -> BlockingScheduler:
     sched.add_job(job_discrepancy_report, "interval",
                   minutes=DISCREPANCY_REPORT_INTERVAL_MINUTES, id="discrepancy_report",
                   max_instances=1, next_run_time=start + timedelta(minutes=2))
+    # Первый прогон через три минуты после старта — по той же причине, что и у
+    # отчёта: `interval` отсчитывает первый запуск от момента добавления задания.
+    sched.add_job(job_verify_stock, "interval",
+                  minutes=VERIFY_STOCK_INTERVAL_MINUTES, id="verify_stock",
+                  max_instances=1, next_run_time=start + timedelta(minutes=3))
 
     # Per-account задания: первичная простановка + периодическая сверка.
     db = SessionLocal()

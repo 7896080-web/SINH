@@ -195,3 +195,99 @@ def test_a_small_status_request_stays_one_call():
     c.get_cancelled_orders(["1", "2", "3"])
 
     assert calls == [3]
+
+
+# ------------------------------------- отправка остатков: ответ больше не глотаем
+
+def test_a_successful_push_reports_every_sku():
+    """Штатный случай: 204 с пустым телом — приняты все позиции."""
+    from app.workers.platform_clients.base import StockPushItem
+
+    c = WbClient(token="t", warehouse_id="wh")
+
+    class Resp:
+        status_code = 204
+        text = ""
+
+    c.session.put = lambda *a, **kw: Resp()
+    Resp.raise_for_status = lambda self: None
+
+    res = c.push_stock("wh", [StockPushItem(barcode="111", quantity=5),
+                              StockPushItem(barcode="222", quantity=7)])
+
+    assert res == {"ok": ["111", "222"], "errors": []}
+
+
+def test_a_success_code_with_a_body_is_not_silently_accepted():
+    """Успех у WB — 204 с ПУСТЫМ телом (проверено на живом кабинете 19.09).
+    Успешный код с телом означает что-то, чего мы не ждали; записать такое в
+    «отправлено всё» значит соврать себе о том, что лежит на площадке. Схему
+    ошибок внутри 2xx мы не знаем, поэтому отдаём текст наверх как есть."""
+    from app.workers.platform_clients.base import StockPushItem
+
+    c = WbClient(token="t", warehouse_id="wh")
+
+    class Resp:
+        status_code = 200
+        text = '{"errors": ["sku 111 не найден"]}'
+
+        def raise_for_status(self):
+            return None
+
+    c.session.put = lambda *a, **kw: Resp()
+
+    res = c.push_stock("wh", [StockPushItem(barcode="111", quantity=5)])
+
+    assert res["ok"] == []
+    assert "не найден" in res["errors"][0]["detail"]
+
+
+def test_reading_stocks_back_splits_into_batches_and_keeps_zero_apart_from_missing():
+    """Обратная сторона отправки: что площадка ДЕРЖИТ. Ноль и отсутствие sku —
+    разные вещи: ноль это «карточка есть, пусто», отсутствие — «такого sku тут
+    нет вовсе»."""
+    from app.workers.platform_clients.wb import STOCKS_BATCH_SKUS
+
+    c = WbClient(token="t", warehouse_id="wh")
+    sizes = []
+
+    class Resp:
+        status_code = 200
+
+        def __init__(self, skus):
+            self._skus = skus
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            # площадка отвечает не по всем: «333» она не знает
+            return {"stocks": [{"sku": s, "amount": 0 if s == "111" else 4}
+                               for s in self._skus if s != "333"]}
+
+    def fake_post(url, json=None, **kw):
+        sizes.append(len(json["skus"]))
+        return Resp(json["skus"])
+
+    c.session.post = fake_post
+
+    held = c.get_stocks("wh", ["111", "222", "333"])
+
+    assert held == {"111": 0, "222": 4}     # 333 отсутствует, а не ноль
+    assert sizes == [3]
+    assert STOCKS_BATCH_SKUS == 1000
+
+
+def test_a_silent_platform_returns_none_not_an_empty_dict():
+    """Пустой словарь означал бы «на площадке ничего нет» и объявил бы все наши
+    отправки расхождением. Молчание площадки — это отсутствие ответа."""
+    import requests
+
+    c = WbClient(token="t", warehouse_id="wh")
+
+    def boom(*a, **kw):
+        raise requests.ConnectionError("нет сети")
+
+    c.session.post = boom
+
+    assert c.get_stocks("wh", ["111"]) is None

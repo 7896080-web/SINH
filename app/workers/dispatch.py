@@ -114,6 +114,11 @@ def run_dispatch_cycle(db: Session, clients: dict, active_accounts: list[Platfor
             # Фиксируем ИМЕННО ТО число, которое уходит на площадку. `item.quantity`
             # для этого не годится: там исходный остаток, а не итог лестницы.
             item.sent_quantity = quantity
+            # И идентификатор, под которым оно уходит. У товара бывает несколько
+            # баркодов, выбор делает `_resolve_push_target` прямо здесь — без
+            # записи восстановить ключ по базе потом невозможно. 19.09 разбор
+            # «почему на WB ноль» из-за этого занял час: число знали, sku нет.
+            item.sent_sku = barcode
             push_items.append(StockPushItem(
                 barcode=barcode, quantity=quantity, external_id=external_id, article=article,
             ))

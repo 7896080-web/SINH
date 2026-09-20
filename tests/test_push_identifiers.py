@@ -9,6 +9,13 @@ from app.workers.platform_clients.kit import KitClient
 
 
 class _Resp:
+    # `status_code` и `text` — как у настоящего requests.Response: клиент WB
+    # теперь ЧИТАЕТ тело успешного ответа, а не считает любой 2xx успехом по
+    # всем позициям (19.09: успешный ответ на отправку ничего не говорил о том,
+    # что на площадке действительно осталось). Успех у WB — 204 с пустым телом.
+    status_code = 204
+    text = ""
+
     def __init__(self, body):
         self._body = body
 

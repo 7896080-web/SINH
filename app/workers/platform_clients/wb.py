@@ -30,6 +30,10 @@ ORDERS_WINDOW_DAYS = 29
 # (`/api/v3/orders/status`). Предел площадки, а не наш выбор.
 STATUS_BATCH_IDS = 1000
 
+# Сколько sku влезает в один запрос остатков (`/api/v3/stocks/{warehouseId}`).
+# Тот же предел площадки, что и у статусов.
+STOCKS_BATCH_SKUS = 1000
+
 
 class WbClient(PlatformClient):
     name = "wb"
@@ -209,6 +213,17 @@ class WbClient(PlatformClient):
         return cancelled
 
     def push_stock(self, warehouse_id: str, items: list[StockPushItem]) -> dict:
+        """Отправка остатков. Успех — 204 с ПУСТЫМ телом (проверено на живом
+        кабинете 19.09.2026: `PUT` одним sku вернул 204, и число применилось).
+
+        Тело ответа раньше не читалось вовсе: любой 2xx считался успехом по ВСЕМ
+        позициям. Так нельзя. Если WB когда-нибудь ответит успешным кодом с
+        телом, это будет означать что-то, чего мы не ждали, — и молча записать
+        такой ответ в «отправлено всё» значит соврать самим себе о том, что
+        лежит на площадке. Схему возможных ошибок в 2xx мы не знаем (на бою её не
+        видели), поэтому не выдумываем: непустое тело при успешном коде отдаём
+        наверх как ошибку с самим текстом, пусть человек посмотрит.
+        """
         body = {"stocks": [{"sku": i.barcode, "amount": i.quantity} for i in items]}
 
         def call():
@@ -217,14 +232,61 @@ class WbClient(PlatformClient):
             return resp
 
         try:
-            with_retry(call)
-            return {"ok": [i.barcode for i in items], "errors": []}
+            resp = with_retry(call)
         except requests.HTTPError as e:
-            # WB возвращает детали невалидных элементов в errors — при желании
-            # можно распарсить e.response.json()['errors'] для точечного репорта
-            return {"ok": [], "errors": [{"detail": str(e)}]}
+            detail = str(e)
+            text = (e.response.text or "").strip() if e.response is not None else ""
+            if text:
+                detail = f"{detail}: {text[:300]}"
+            return {"ok": [], "errors": [{"detail": detail}]}
         except requests.RequestException as e:
             return {"ok": [], "errors": [{"detail": str(e)}]}
+
+        text = (resp.text or "").strip()
+        if text:
+            return {"ok": [], "errors": [
+                {"detail": f"HTTP {resp.status_code} с телом (ожидали пустое): {text[:300]}"},
+            ]}
+        return {"ok": [i.barcode for i in items], "errors": []}
+
+    def get_stocks(self, warehouse_id: str, skus: list[str]) -> dict[str, int] | None:
+        """Что WB держит по этим sku на этом складе.
+
+        `POST /api/v3/stocks/{warehouseId}` — метод ЧТЕНИЯ, несмотря на глагол:
+        тело запроса со списком sku, в ответе `stocks` с количеством. Проверено
+        на живом кабинете 19.09.2026.
+
+        Sku, которых WB на складе не знает, в ответе просто нет — и в словаре их
+        тоже не будет. Отличать «нет в ответе» от нуля обязательно: ноль значит
+        «карточка есть, остаток пуст», отсутствие — «такого sku здесь нет вовсе»,
+        и это разные поводы для разбора.
+        """
+        if not skus:
+            return {}
+
+        out: dict[str, int] = {}
+        for start in range(0, len(skus), STOCKS_BATCH_SKUS):
+            chunk = skus[start:start + STOCKS_BATCH_SKUS]
+
+            def call(chunk=chunk):
+                resp = self.session.post(f"{BASE_URL}/api/v3/stocks/{warehouse_id}",
+                                          json={"skus": chunk}, timeout=30)
+                resp.raise_for_status()
+                return resp
+
+            try:
+                data = with_retry(call).json()
+            except requests.RequestException:
+                # Площадка не ответила — это НЕ «остатков нет». Возвращаем None,
+                # чтобы сверка честно осталась непроведённой: записать сюда
+                # пустой словарь значило бы объявить все наши отправки
+                # расхождением и позвать человека разбирать сетевой сбой.
+                return None
+            for row in data.get("stocks", []):
+                sku = str(row.get("sku") or "")
+                if sku:
+                    out[sku] = int(row.get("amount") or 0)
+        return out
 
     def get_catalog_items(self) -> list[CatalogItem]:
         """Список карточек — content-api, метод v2 (`/content/v2/get/cards/list`).

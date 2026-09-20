@@ -108,6 +108,53 @@ def _check_dispatch_errors(db: Session) -> Finding | None:
     )
 
 
+def _check_platform_divergence(db: Session) -> Finding | None:
+    """Площадка держит не то, что мы ей отправили.
+
+    Сверку делает отдельный воркер (`app/workers/verify_stock.py`) — он ходит в
+    API площадок; отчёт читает уже сохранённое в очереди и наружу не ходит.
+
+    Направление расхождения важнее самого факта, поэтому уровень от него и
+    зависит. Площадка держит БОЛЬШЕ нашего — она продаёт то, чего нет, это
+    оверселл и критично. МЕНЬШЕ — недоотправка: теряются продажи, но не деньги
+    покупателя.
+
+    19.09.2026 на боевом WB нашли ровно это: в кабинет писала вторая система
+    (та, с которой идёт переход) и перетирала наши остатки за три минуты, а
+    отправка каждый раз отвечала успехом. Без такой сверки это видно только
+    глазами и только если пойти смотреть.
+    """
+    rows = db.query(DispatchQueueItem).filter(
+        DispatchQueueItem.verified_at.isnot(None),
+        DispatchQueueItem.verified_quantity.isnot(None),
+        DispatchQueueItem.sent_quantity.isnot(None),
+        DispatchQueueItem.verified_quantity != DispatchQueueItem.sent_quantity,
+        DispatchQueueItem.is_test.is_(False),
+    ).order_by(DispatchQueueItem.verified_at.desc()).limit(200).all()
+    if not rows:
+        return None
+
+    higher = [r for r in rows if r.verified_quantity > r.sent_quantity]
+    level = CRITICAL if higher else WARNING
+    if higher:
+        consequence = ("На площадке лежит БОЛЬШЕ, чем мы отправляли, — она продаёт "
+                       "то, чего нет. Наше число кто-то переписал: либо в кабинет "
+                       "пишет вторая система, либо отправка поняла ответ площадки "
+                       "не так.")
+    else:
+        consequence = ("На площадке лежит МЕНЬШЕ, чем мы отправляли: продажи по этим "
+                       "карточкам идут не с тем остатком, который есть на складе. "
+                       "Наше число кто-то переписал поверх.")
+    return Finding(
+        key="platform_divergence", level=level,
+        title=f"Площадка держит не то, что мы отправили: {len(rows)} позиций",
+        consequence=consequence,
+        count=len(rows), link="/diagnostics",
+        details=[f"{r.sent_sku}: отправили {r.sent_quantity}, площадка держит "
+                 f"{r.verified_quantity} ({_age(r.verified_at)} назад)" for r in rows[:10]],
+    )
+
+
 def _check_tasks_needing_review(db: Session) -> Finding | None:
     """Задания 1С, исчерпавшие автоповтор, — решение за человеком."""
     from app.workers.ftp_channel import tasks_needing_review   # локально: цикл импортов
@@ -404,6 +451,7 @@ def _check_worker_failures(db: Session) -> Finding | None:
 
 CHECKS = (
     _check_dispatch_errors,
+    _check_platform_divergence,
     _check_tasks_needing_review,
     _check_broadcast_without_recalc,
     _check_breaker_disabled,
