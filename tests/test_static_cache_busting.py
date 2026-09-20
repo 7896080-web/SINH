@@ -68,8 +68,11 @@ def test_every_page_uses_the_shared_templates():
     и страница вернулась бы к ссылке без версии — молча."""
     import pathlib
 
+    # encoding обязателен. На боевом сервере Windows, и там умолчание —
+    # cp1251: файл роутера с кириллицей в комментариях читается с ошибкой, и
+    # тест падает не на том, что проверяет. Поймано ровно так, на накате 20.09.
     own = [p.name for p in pathlib.Path("app/routers").glob("*.py")
-           if "Jinja2Templates(directory=" in p.read_text()]
+           if "Jinja2Templates(directory=" in p.read_text(encoding="utf-8")]
 
     assert own == [], f"свой шаблонизатор остался в: {own}"
 
@@ -107,3 +110,30 @@ def test_no_template_links_static_without_a_version():
                 bad.append(f"{p.name}: {line.strip()[:70]}")
 
     assert bad == [], f"ссылки на статику без версии: {bad}"
+
+
+def test_no_test_reads_a_source_file_without_saying_the_encoding():
+    """Тесты читают шаблоны и роутеры, чтобы проверить разметку. Прогоняются они
+    и на боевом сервере — а он Windows, где кодировка чтения по умолчанию не
+    UTF-8, а cp1251. Файл с кириллицей в комментариях там не читается вовсе, и тест
+    падает по причине, к своей проверке отношения не имеющей.
+
+    На здешнем Linux этого не видно никогда: там умолчание как раз UTF-8. Ровно
+    поэтому проверка и нужна — иначе о дефекте узнаёшь на накате, посреди
+    боевого прогона.
+    """
+    import pathlib
+    import re
+
+    # Имена собраны из кусочков намеренно: напиши их тут вызовом, и проверка
+    # нашла бы саму себя.
+    calls = ("op" + "en", "read_" + "text")
+    pattern = re.compile(r"(?<!\.)\b(%s)\(" % "|".join(calls))
+
+    bad = []
+    for path in pathlib.Path("tests").glob("*.py"):
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if pattern.search(line) and "encoding" not in line:
+                bad.append(f"{path.name}:{number}: {line.strip()[:60]}")
+
+    assert bad == [], f"чтение файла без encoding — на Windows упадёт: {bad}"
