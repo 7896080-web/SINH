@@ -133,3 +133,103 @@ def test_selection_is_restored_after_any_htmx_swap():
         "восстановление снова сузили до подмены всей таблицы — одиночная строка "
         "опять потеряет отметку"
     )
+
+
+# ------------------------------------------- фильтр «только отмеченные кабинеты»
+
+def _marked(web_db, account, uid):
+    from app.models import SyncSetting
+    web_db.add(SyncSetting(uid_1c=uid, account_id=account.id, enabled=True))
+
+
+def test_the_marked_filter_keeps_only_products_with_a_checked_cabinet(logged_in_client, web_db):
+    """Отбор по принятому решению, а не по наличию карточки: «найден на
+    площадке» говорит, что подключать есть куда, а этот фильтр — что уже
+    подключили."""
+    account = _seed(web_db)
+    _marked(web_db, account, "u-найден")
+    web_db.commit()
+
+    page = logged_in_client.get("/products?only_marked=true")
+
+    assert "Есть на площадке" in page.text
+    assert "Только в 1С" not in page.text
+
+
+def test_an_unchecked_cabinet_does_not_count_as_marked(logged_in_client, web_db):
+    """Снятая галочка — такое же решение оператора, как и поставленная."""
+    from app.models import SyncSetting
+
+    account = _seed(web_db)
+    web_db.add(SyncSetting(uid_1c="u-найден", account_id=account.id, enabled=False))
+    web_db.commit()
+
+    page = logged_in_client.get("/products?only_marked=true")
+
+    assert "Есть на площадке" not in page.text
+
+
+def test_a_switched_off_cabinet_still_counts_as_marked(logged_in_client, web_db):
+    """Галочку ставил человек, и выключение кабинета его решения не отменяет —
+    иначе отбор моргал бы вместе с предохранителем."""
+    account = _seed(web_db)
+    _marked(web_db, account, "u-найден")
+    account.is_active = False
+    web_db.commit()
+
+    page = logged_in_client.get("/products?only_marked=true")
+
+    assert "Есть на площадке" in page.text
+
+
+def test_the_marked_filter_is_offered_on_the_page(logged_in_client, web_db):
+    _seed(web_db)
+
+    page = logged_in_client.get("/products")
+
+    assert 'name="only_marked"' in page.text
+    assert "Только отмеченные кабинеты" in page.text
+
+
+def test_the_marked_filter_survives_a_bulk_edit(logged_in_client, web_db):
+    account = _seed(web_db)
+    _marked(web_db, account, "u-найден")
+    web_db.commit()
+
+    r = logged_in_client.post("/products/bulk", data={
+        "action": "set_reserve", "int_value": "1", "uids": ["u-найден"],
+        "only_marked": "true",
+    }, follow_redirects=False)
+
+    assert r.status_code == 303
+    assert "only_marked=true" in r.headers["location"]
+
+
+def test_the_export_narrows_down_to_the_marked_products(logged_in_client, web_db):
+    """Ссылка выгрузки передавала фильтр, а эндпоинт его не принимал — FastAPI
+    молча отбрасывал параметр, и оператор получал весь каталог вместо отбора.
+    Так уже было с `only_unfinished`, поэтому проверяем каждый новый."""
+    account = _seed(web_db)
+    _marked(web_db, account, "u-найден")
+    web_db.commit()
+
+    r = logged_in_client.get("/products/export?only_marked=true")
+
+    assert r.status_code == 200
+    assert len(r.content) > 0
+
+
+def test_every_filter_reaches_the_bulk_form():
+    """Массовая правка «по всему отбору» берёт фильтры из ЭТОГО фрагмента. Фильтр,
+    которого здесь нет, до неё не доедет — и правка применится к списку ШИРЕ
+    того, что оператор видит на экране. Именно это и случилось с
+    `only_on_platform`: галочка на странице была, скрытого поля не было."""
+    page = open("app/templates/products.html", encoding="utf-8").read()
+    rows = open("app/templates/products_rows.html", encoding="utf-8").read()
+
+    import re
+    on_page = set(re.findall(r'<input type="checkbox" name="(only_\w+|hide_\w+)"', page))
+    in_form = set(re.findall(r'<input type="hidden" name="(only_\w+|hide_\w+)"', rows))
+
+    assert on_page, "фильтры на странице не нашлись — проверка перестала что-либо стеречь"
+    assert on_page <= in_form, f"до массовой правки не доедут: {sorted(on_page - in_form)}"
