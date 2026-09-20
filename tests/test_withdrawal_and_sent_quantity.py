@@ -315,3 +315,31 @@ def test_turning_broadcast_off_skips_cabinets_that_never_got_anything(
     withdrawals = web_db.query(DispatchQueueItem).filter(
         DispatchQueueItem.reason == "broadcast_off").all()
     assert [w.account_id for w in withdrawals] == [wb.id]
+
+
+def test_the_queue_is_sent_in_batches(db):
+    """Каждая площадка ограничивает размер одного запроса остатков. При обычной
+    работе очередь за цикл короткая и пачка выходит одна, но массовая
+    переотправка кладёт в очередь сразу все транслируемые товары — без деления
+    это был бы один запрос на столько позиций, сколько их есть."""
+    from app.workers.dispatch import PUSH_BATCH_SIZE
+
+    account = make_account(db, Platform.wb, name="ИП ЯВОРСКАЯ")
+    total = PUSH_BATCH_SIZE + 3
+    for i in range(total):
+        uid = f"u{i}"
+        db.add(Product(uid_1c=uid, article=f"A{i}", name="Товар", stock_on_hand=5,
+                       broadcast_enabled=True, recalc_account_ids=str(account.id)))
+        db.add(Barcode(barcode=f"bc{i}", uid_1c=uid))
+        db.add(SyncSetting(uid_1c=uid, account_id=account.id, enabled=True))
+        db.add(DispatchQueueItem(uid_1c=uid, account_id=account.id, quantity=5,
+                                 reason="manual_resend_all"))
+    db.commit()
+
+    platform = FakePlatform()
+    run_dispatch_cycle(db, {account.id: platform}, [account])
+
+    assert [len(batch) for batch in platform.pushed] == [PUSH_BATCH_SIZE, 3]
+    assert db.query(DispatchQueueItem).filter(
+        DispatchQueueItem.status == DispatchStatus.sent).count() == total, \
+        "все записи закрыты, а не только первая пачка"

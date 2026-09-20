@@ -47,6 +47,10 @@ def _quantity_to_send(db: Session, uid_1c: str, account_id: int, quantity: int) 
 # Сколько раз пробуем отправить одну запись, прежде чем признать сбой
 # окончательным, и пауза перед каждой следующей попыткой.
 MAX_ATTEMPTS = 5
+
+# Сколько позиций уходит на площадку в ОДНОМ запросе. См. комментарий в
+# run_dispatch_cycle: предел у каждой площадки свой, сто проходит везде.
+PUSH_BATCH_SIZE = 100
 RETRY_BACKOFF_MINUTES = (1, 2, 5, 15)   # после 1-й, 2-й, 3-й и 4-й неудачи
 
 
@@ -124,9 +128,25 @@ def run_dispatch_cycle(db: Session, clients: dict, active_accounts: list[Platfor
             ))
             uid_to_items[barcode] = item
 
+        # Пачками, а не всё разом. Каждая площадка ограничивает размер одного
+        # запроса остатков, и предел у всех разный (у Ozon он самый тесный).
+        # Сто — осторожное значение, которое проходит везде: ошибка в меньшую
+        # сторону стоит лишнего запроса, в большую — отказа ВСЕЙ пачки.
+        #
+        # При обычной работе очередь за цикл короткая и пачка выходит одна. Но
+        # массовая переотправка (`enqueue_resend_all`) кладёт в очередь сразу все
+        # транслируемые товары, и без деления это был бы один запрос на столько
+        # позиций, сколько их есть. Делим здесь, а не в клиентах: запрос собирает
+        # рассылка, и предел должен соблюдаться в одном месте.
         result = {"ok": [], "errors": []}
-        if push_items:
-            result = client.push_stock(account.warehouse_id, push_items)
+        for start in range(0, len(push_items), PUSH_BATCH_SIZE):
+            part = client.push_stock(account.warehouse_id,
+                                     push_items[start:start + PUSH_BATCH_SIZE])
+            # Складываем, а не заменяем: отказ одной пачки не должен отменять
+            # успех остальных — иначе одна сбойная позиция вернула бы в очередь
+            # весь каталог и площадка получила бы его заново следующим циклом.
+            result["ok"] += list(part.get("ok", []))
+            result["errors"] += list(part.get("errors", []))
 
         ok_set = set(result.get("ok", []))
         errors_text = str(result.get("errors"))[:400]
