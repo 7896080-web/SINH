@@ -23,6 +23,7 @@ from app.workers.catalog_sync import load_platform_catalog
 from app.workers.scheduler import PENDING_WAREHOUSE_NAME
 from app.audit import log_action
 from app.report import CRITICAL as REPORT_CRITICAL, collect_findings
+from app.transmit import enqueue_resend_all
 from app.flash import set_flash, pop_flash
 
 router = APIRouter()
@@ -163,6 +164,42 @@ def test_connection(
     db.commit()
 
     set_flash(request, f"«{account.name}»: {message}", "good" if ok else "warn")
+    return RedirectResponse("/diagnostics", status_code=303)
+
+
+@router.post("/diagnostics/resend-all")
+def resend_all(
+    request: Request,
+    db: Session = Depends(get_db), user: User = Depends(get_current_user),
+):
+    """Поставить в очередь текущий остаток по ВСЕМ транслируемым товарам.
+
+    Рассылка событийная: отправив число, она считает его доставленным и сама к
+    нему не возвращается. Если на площадке наше число кто-то перетёр — а именно
+    это делала вторая система во время перехода, — сдвинуть её картину нечем:
+    событий по товару больше не будет, остаток-то не менялся. Эта команда и есть
+    такое событие, поставленное руками.
+
+    Ничего не обходит: каждая пара идёт через те же гейты, что и обычная
+    доотправка. Товар без включённой трансляции и кабинет, которого не касался
+    расчёт, в очередь не попадут — по ним ушёл бы ноль и обнулил живую карточку.
+
+    Отправляет не сразу: кладёт в очередь, дальше её разбирает штатный цикл
+    рассылки. Так команда не зависит от доступности площадки в момент нажатия, а
+    сбой отправки повторяется обычным порядком.
+    """
+    stats = enqueue_resend_all(db)
+    log_action(db, user.username, "resend_all",
+               f"переотправка: товаров {stats['products']}, записей {stats['queued']}")
+    db.commit()
+
+    if not stats["queued"]:
+        set_flash(request, "Переотправлять нечего: ни по одному транслируемому товару "
+                           "нет кабинета, покрытого расчётом.", "warn")
+    else:
+        set_flash(request, f"В очередь поставлено {stats['queued']} записей "
+                           f"по {stats['products']} товарам — уйдут ближайшими "
+                           f"циклами рассылки.", "good")
     return RedirectResponse("/diagnostics", status_code=303)
 
 

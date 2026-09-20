@@ -32,7 +32,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.models import DispatchQueueItem, DispatchStatus, Product
 
@@ -254,7 +254,8 @@ def quantity_for_account(db: Session, uid_1c: str, account_id: int, raw_stock: i
     return base
 
 
-def enqueue_full_resend(db: Session, uid_1c: str, account_id: int, reason: str = "manual_enable"):
+def enqueue_full_resend(db: Session, uid_1c: str, account_id: int,
+                        reason: str = "manual_enable") -> bool:
     """Разовая доотправка полного текущего остатка (раздел 10 спецификации).
     Кладёт запись в очередь — реальную отправку делает воркер dispatch.py.
 
@@ -269,18 +270,80 @@ def enqueue_full_resend(db: Session, uid_1c: str, account_id: int, reason: str =
     оператор снимает галочку кабинета или выключает трансляцию. Здесь же путь
     автоматический: доотправка после правки брони, факта, порога. Пока расчёт не
     закончен и трансляция не включена, наружу не должно уходить ничего.
+
+    Возвращает True, если запись действительно поставлена, и False, если её
+    отсекли гейты. Нужно вызывающим, которые считают статистику (массовая
+    переотправка): определять это со стороны, заглядывая в сессию, значило бы
+    повторять здешние правила снаружи — а разойдясь, они соврали бы оператору
+    про то, сколько всего уедет.
     """
     product = db.query(Product).filter(Product.uid_1c == uid_1c).first()
     if product is not None and not product.broadcast_enabled:
-        return
+        return False
     # Кабинет, которого расчёт не касался, — тот же случай: в очереди по нему
     # выйдет ноль (ступень 2 лестницы), и этот ноль уедет на площадку, обнулив
     # живую карточку. Отправлять туда нечего, пока не прошёл пересчёт.
     if (product is not None and product.recalc_done_at is not None
             and account_id not in covered_accounts(product)):
-        return
+        return False
     quantity = product.stock_on_hand if product else 0
     db.add(DispatchQueueItem(uid_1c=uid_1c, account_id=account_id, quantity=quantity, reason=reason))
+    return True
+
+
+def enqueue_resend_all(db: Session, reason: str = "manual_resend_all") -> dict:
+    """Массовая переотправка: поставить в очередь ТЕКУЩИЙ остаток по всем
+    транслируемым товарам и всем отмеченным у них кабинетам.
+
+    Зачем понадобилось. Рассылка событийная: отправив число, она считает его
+    доставленным и сама к нему не возвращается. Пока в кабинет писала вторая
+    система (переход, 19.09), наши числа там перетирались — а у нас всё это
+    время значилось «отправлено». Когда вторая система замолкает, на площадке
+    остаётся ЕЁ картина, и сдвинуть её нечем: у нас событий больше не будет,
+    остаток-то не менялся. Эта команда и есть такое событие, поставленное руками.
+
+    Ничего не обходит. Каждая пара идёт через `enqueue_full_resend`, то есть
+    через ОБА гейта: товар с выключенной трансляцией и кабинет, которого не
+    касался расчёт, в очередь не попадут. Это не придирчивость — отправка по
+    таким парам даёт ноль (ступени 0 и 2 лестницы), и массовая команда без
+    гейтов обнулила бы разом все карточки, до которых мы ещё не дошли. Ровно то,
+    что случилось 18.09 с Озоном и Kit, только сразу по всему каталогу.
+
+    Само число берётся не отсюда: в очередь кладётся текущий остаток, а итог
+    считает лестница в момент отправки. Поэтому команду безопасно давать дважды
+    подряд — уйдёт то же самое, что ушло бы само.
+
+    Пачками с промежуточными фиксациями: транслируемых товаров может стать
+    много, а держать всю выборку и всю очередь в одной транзакции незачем.
+    """
+    stats = {"products": 0, "queued": 0}
+
+    CHUNK = 500
+    last_uid = ""
+    while True:
+        products = db.query(Product).options(joinedload(Product.sync_settings)).filter(
+            Product.broadcast_enabled.is_(True),
+            Product.uid_1c > last_uid,
+        ).order_by(Product.uid_1c).limit(CHUNK).all()
+        if not products:
+            break
+        # Смещение по uid, а не offset: мы ДОБАВЛЯЕМ строки в очередь, но сами
+        # товары не меняем, поэтому выборка от прогона к прогону не сдвигается.
+        # Курсор по ключу всё равно надёжнее — он не зависит от того, что
+        # происходит с таблицей между пачками.
+        last_uid = products[-1].uid_1c
+
+        for product in products:
+            stats["products"] += 1
+            for setting in product.sync_settings:
+                if not setting.enabled:
+                    continue
+                if enqueue_full_resend(db, product.uid_1c, setting.account_id,
+                                       reason=reason):
+                    stats["queued"] += 1
+        db.commit()
+
+    return stats
 
 
 # Причины, по которым в очередь кладётся заведомо ноль. Нужны для разбора
