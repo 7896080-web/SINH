@@ -97,6 +97,8 @@ def api_keys_page(request: Request, db: Session = Depends(get_db), user: User = 
             "id": account.id, "name": account.name, "platform": account.platform.value,
             "platform_label": PLATFORM_LABELS[account.platform],
             "warehouse_id": account.warehouse_id or "", "is_active": account.is_active,
+            "publish_hidden_on_stock": account.publish_hidden_on_stock,
+            "supports_publish": account.platform == Platform.kit,
             "fields": fields,
         })
 
@@ -194,6 +196,37 @@ def update_warehouse(
     db.commit()
 
     set_flash(request, f"Склад для «{account.name}» обновлён.", "good")
+    return RedirectResponse("/api-keys", status_code=303)
+
+
+@router.post("/api-keys/accounts/{account_id}/publish-hidden")
+def update_publish_hidden(
+    request: Request, account_id: int,
+    publish_hidden_on_stock: str = Form(""),
+    db: Session = Depends(get_db), user: User = Depends(get_current_user),
+):
+    """Возвращать ли на витрину карточки, спрятанные площадкой за нулевой остаток.
+
+    Пишется в журнал: это действие наружу — после включения мы сами меняем
+    статус чужих карточек, и человек должен потом видеть, кто и когда разрешил.
+    """
+    account = db.query(PlatformAccount).filter(PlatformAccount.id == account_id).first()
+    if account is None:
+        return RedirectResponse("/api-keys", status_code=303)
+
+    was = account.publish_hidden_on_stock
+    account.publish_hidden_on_stock = publish_hidden_on_stock == "on"
+    if account.publish_hidden_on_stock != was:
+        log_action(db, user.username, "publish_hidden_changed",
+                   f"{account.name}: автопубликация скрытых карточек "
+                   f"{'включена' if account.publish_hidden_on_stock else 'выключена'}")
+    db.commit()
+
+    set_flash(request, (
+        f"Скрытые карточки «{account.name}» будут возвращаться на витрину при ненулевом остатке."
+        if account.publish_hidden_on_stock else
+        f"Автопубликация скрытых карточек «{account.name}» выключена."
+    ), "good")
     return RedirectResponse("/api-keys", status_code=303)
 
 

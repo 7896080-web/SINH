@@ -37,6 +37,8 @@ STOCKS_BATCH_SKUS = 1000
 
 class WbClient(PlatformClient):
     name = "wb"
+    # Остаток WB адресует sku, а sku у него — это баркод.
+    stock_key = "barcode"
 
     def __init__(self, token: str, warehouse_id: str, session: requests.Session | None = None):
         self.token = token

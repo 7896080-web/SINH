@@ -81,6 +81,28 @@
         <button type="submit" class="btn-primary">Сохранить</button>
     </form>
 
+    {% if account.supports_publish %}
+    <form method="post" action="/api-keys/accounts/{{ account.id }}/publish-hidden"
+          style="display:flex; align-items:flex-end; gap:12px; margin-bottom: 12px;">
+        <div class="field" style="flex:1">
+            <label>
+                <input type="checkbox" name="publish_hidden_on_stock" value="on"
+                       {% if account.publish_hidden_on_stock %}checked{% endif %}>
+                Возвращать скрытые карточки на витрину при ненулевом остатке
+            </label>
+            <div class="help-text">
+                На витрине включена настройка «скрывать товары с нулевым остатком»:
+                распроданная карточка уходит в «не опубликована» и сама оттуда не
+                возвращается — прихода остатка ей мало. С этой галочкой мы переводим
+                такую карточку обратно, когда на неё уходит ненулевой остаток.
+                Карточку, которую спрятали руками, это тоже вернёт: площадка не
+                различает, кто её спрятал.
+            </div>
+        </div>
+        <button type="submit" class="btn-primary">Сохранить</button>
+    </form>
+    {% endif %}
+
     {% for field in account.fields %}
     <form method="post" action="/api-keys/accounts/{{ account.id }}/{{ field.field_name }}"
           style="display:flex; align-items:flex-end; gap:12px; margin-bottom: 12px;">
