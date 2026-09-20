@@ -5,7 +5,7 @@ from app.timeutils import now_utc
 
 from sqlalchemy import (
     Column, String, Boolean, Integer, DateTime, Date, Enum, ForeignKey,
-    UniqueConstraint, Text,
+    Index, UniqueConstraint, Text,
 )
 from sqlalchemy.orm import relationship
 
@@ -214,7 +214,12 @@ class Barcode(Base):
 
     id = Column(Integer, primary_key=True)
     barcode = Column(String(64), unique=True, nullable=False, index=True)
-    uid_1c = Column(String(36), ForeignKey("products.uid_1c"), nullable=False)
+    # Индекс обязателен, и не ради «на всякий случай». По этой колонке баркоды
+    # ищут ВСЕ: поиск товара по штрихкоду, подтягивание баркодов к строке,
+    # гашение аномалий, выбор ключа отправки. Без него SQLite читает все 154
+    # тысячи строк на каждое обращение, а поиск по штрихкоду делает это на
+    # каждый из 152 тысяч товаров — страница не отвечала вовсе.
+    uid_1c = Column(String(36), ForeignKey("products.uid_1c"), nullable=False, index=True)
     # Площадка (не кабинет) — чисто информационная пометка "откуда впервые
     # увидели баркод"; баркод физический и от конкретного кабинета не зависит.
     source_platform = Column(String(16), nullable=True)
@@ -277,7 +282,7 @@ class SyncAnomaly(Base):
     reason = Column(Enum(AnomalyReason), nullable=False)
     order_id = Column(String(128), nullable=True)
     detected_at = Column(DateTime, default=now_utc)
-    status = Column(Enum(AnomalyStatus), default=AnomalyStatus.new, nullable=False)
+    status = Column(Enum(AnomalyStatus), default=AnomalyStatus.new, nullable=False, index=True)
     # Симулированный заказ — не должен путаться с реальными аномалиями на
     # общей странице «Аномалии» (страница тестирования показывает результат
     # сама, ей отдельная страница не нужна).
@@ -327,6 +332,14 @@ class DispatchQueueItem(Base):
     # NULL — ещё не проверяли (или площадка не умеет отдавать остатки обратно).
     verified_at = Column(DateTime, nullable=True)
     verified_quantity = Column(Integer, nullable=True)
+
+    # Очередь спрашивают двумя способами, и оба были полным чтением таблицы:
+    # по паре товар+кабинет (постановка, отзыв, «было ли что отзывать») и по
+    # статусу (рассылка забирает pending, отчёт считает error).
+    __table_args__ = (
+        Index("ix_dispatch_queue_pair", "uid_1c", "account_id"),
+        Index("ix_dispatch_queue_status", "status"),
+    )
     reason = Column(String(64), nullable=False)  # 'order' / 'cancel' / 'manual_enable' / 'reconciliation'
     status = Column(Enum(DispatchStatus), default=DispatchStatus.pending, nullable=False)
     attempts = Column(Integer, default=0)
@@ -362,7 +375,7 @@ class ProcessedOrder(Base):
     id = Column(Integer, primary_key=True)
     account_id = Column(Integer, ForeignKey("platform_accounts.id"), nullable=False)
     order_id = Column(String(128), nullable=False)
-    uid_1c = Column(String(36), ForeignKey("products.uid_1c"), nullable=True)
+    uid_1c = Column(String(36), ForeignKey("products.uid_1c"), nullable=True, index=True)
     quantity = Column(Integer, nullable=False, default=0)
     status = Column(Enum(OrderProcessStatus), default=OrderProcessStatus.processed, nullable=False)
     processed_at = Column(DateTime, default=now_utc)
@@ -400,11 +413,14 @@ class FtpTask(Base):
     warehouse_from = Column(String(64), nullable=True)
     warehouse_to = Column(String(64), nullable=True)
     quantity = Column(Integer, nullable=True)
-    order_id = Column(String(128), nullable=False)
+    order_id = Column(String(128), nullable=False, index=True)
     account_id = Column(Integer, ForeignKey("platform_accounts.id"), nullable=False)
     # Дата документа перемещения в 1С (старт задним числом). NULL = текущая дата.
     movement_date = Column(Date, nullable=True)
-    status = Column(Enum(FtpTaskStatus), default=FtpTaskStatus.pending, nullable=False)
+    # Задания разбирают по статусу: «в пути» для расчёта остатка, `timeout` для
+    # повтора, `pending` для сборки файла. Каждый такой разбор читал таблицу
+    # целиком.
+    status = Column(Enum(FtpTaskStatus), default=FtpTaskStatus.pending, nullable=False, index=True)
     batch_filename = Column(String(128), nullable=True)  # какой task_*.txt унёс эту строку
     created_at = Column(DateTime, default=now_utc)
     sent_at = Column(DateTime, nullable=True)
@@ -465,8 +481,10 @@ class ReconciliationLog(Base):
     __tablename__ = "reconciliation_log"
 
     id = Column(Integer, primary_key=True)
-    uid_1c = Column(String(36), ForeignKey("products.uid_1c"), nullable=False)
-    checked_at = Column(DateTime, default=now_utc)
+    # Самая большая таблица системы: 276 тысяч строк на бою и растёт каждый час.
+    # Отчёт берёт из неё сутки по `checked_at`, «Диагностика» — историю товара.
+    uid_1c = Column(String(36), ForeignKey("products.uid_1c"), nullable=False, index=True)
+    checked_at = Column(DateTime, default=now_utc, index=True)
     python_stock = Column(Integer, nullable=False)
     in_flight = Column(Integer, nullable=False, default=0)
     expected_1c = Column(Integer, nullable=False)
