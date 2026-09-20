@@ -192,3 +192,34 @@ def test_excel_can_always_switch_broadcast_off(logged_in_client, web_db):
     logged_in_client.post("/products/import", files={"file": ("t.xlsx", buf.getvalue())})
 
     assert web_db.query(Product).filter(Product.uid_1c == "u1").one().broadcast_enabled is False
+
+
+# ------------------------------------------- поле «число» и его две кнопки
+
+def test_the_number_field_is_visibly_tied_to_its_buttons():
+    """21.09 оператор спросил про поле «число»: «за ним пустое поле, зачем оно».
+
+    Подпись и подсказка у него были, а вот рамки не было: поле и две кнопки,
+    которые его применяют, стояли в общем ряду с тем же зазором, что и всё
+    остальное. Читалось как самостоятельное поле неизвестно для чего. Рамка
+    отвечает на вопрос без единого слова: внутри неё — одно действие.
+    """
+    page = open("app/templates/products.html", encoding="utf-8").read()
+    rule = page.split(".pr-group{", 1)[1].split("}", 1)[0]
+
+    assert "border" in rule, "без рамки группа снова сольётся с рядом"
+
+
+def test_the_label_points_at_the_buttons():
+    """«число →» читается слева направо: число пять → Резерв (бронь) = ."""
+    page = open("app/templates/products.html", encoding="utf-8").read()
+
+    assert "число →" in page
+
+
+def test_the_number_field_still_says_what_it_feeds():
+    page = open("app/templates/products.html", encoding="utf-8").read()
+    block = page.split('id="bulk-int"', 1)[1][:300]
+
+    assert "title=" in block
+    assert "бронь" in block or "факт" in block.lower()

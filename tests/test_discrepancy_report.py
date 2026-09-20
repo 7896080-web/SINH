@@ -783,20 +783,27 @@ def test_a_missing_card_finding_names_the_article_and_the_cabinet(db):
     assert "u1" not in finding.details[0]
 
 
-def test_a_dispatch_error_finding_names_the_article_too(db):
-    """Та же беда была и здесь: uid плюс кусок технического текста."""
+def test_a_dispatch_error_finding_names_the_article_and_the_reason(db):
+    """Та же беда была и здесь: uid плюс кусок технического текста.
+
+    Счётчик попыток из строки убран намеренно (21.09). Эта находка берёт ТОЛЬКО
+    записи в статусе `error`, то есть попытки по ним заведомо исчерпаны — «за 5
+    попыток» не добавляет ничего, зато занимает место, на котором должен стоять
+    ответ площадки. Ровно на этом оператор и споткнулся: причина обрывалась на
+    адресе ручки, разобрать по ней было нечего."""
     account = _kit_account(db)
     db.add(Product(uid_1c="u1", article="D86321", name="Даунтлесс Куртка",
                    stock_on_hand=5))
     db.add(DispatchQueueItem(
         uid_1c="u1", account_id=account.id, quantity=5, reason="order",
-        status=DispatchStatus.error, last_error="не отправлено за 5 попыток: 500"))
+        status=DispatchStatus.error,
+        last_error="не отправлено за 5 попыток: 500 склад недоступен"))
     db.commit()
 
     finding = _by_key(collect_findings(db), "dispatch_errors")
 
     assert "D86321" in finding.details[0]
-    assert "5 попыток" in finding.details[0], "текст ошибки тоже нужен"
+    assert "склад недоступен" in finding.details[0], "ответ площадки тоже нужен"
 
 
 def test_a_product_missing_from_the_catalogue_still_gets_a_line(db):

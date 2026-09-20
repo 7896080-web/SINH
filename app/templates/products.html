@@ -44,9 +44,15 @@
   .pr-thr .pr-mini{margin-left:4px}
   .pr-masters{display:flex;flex-wrap:wrap;gap:10px;margin:8px 0 14px}
   .pr-masters form{display:flex;align-items:center;gap:6px;border:1px solid #dfe3ea;border-radius:8px;padding:6px 10px;background:#fafbfc}
-  .pr-bulk{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:10px 0;padding:8px 10px;border:1px dashed #c7cdd6;border-radius:8px;background:#fbfcfe}
+  .pr-bulk{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin:10px 0;padding:8px 10px;border:1px dashed #c7cdd6;border-radius:8px;background:#fbfcfe}
   .pr-bulk input{width:auto}
-  .pr-group{display:inline-flex;align-items:center;gap:6px;flex-wrap:nowrap}
+  /* Рамка у группы обязательна, и это не украшение. Поле и кнопки, которые его
+     применяют, стояли в общем ряду с тем же зазором, что и всё остальное, —
+     и «число» читалось как самостоятельное поле неизвестно для чего. 21.09
+     оператор ровно так и спросил: «за ним пустое поле, зачем оно». Рамка
+     отвечает на это без единого слова: внутри неё — одно действие. */
+  .pr-group{display:inline-flex;align-items:center;gap:6px;flex-wrap:nowrap;
+            padding:4px 8px;border:1px solid #dfe4ec;border-radius:8px;background:#fff}
   .pr-group__label{font-size:12px;color:#556;white-space:nowrap}
   .pr-count{font-size:12px;padding:1px 8px;border-radius:999px;background:#eef0f4;color:#667;white-space:nowrap}
   .pr-count--on{background:#e8eef7;color:#2f5d9f;font-weight:600}
@@ -229,7 +235,7 @@
     {# Подпись, а не подсказка внутри поля: «число» в placeholder исчезало при
        первом же вводе и не говорило, кому это число достанется. Теперь читается
        слева направо: «число 5 → Резерв (бронь) =», то есть «поставить бронь 5». #}
-    <label class="pr-group__label" for="bulk-int">число</label>
+    <label class="pr-group__label" for="bulk-int">число →</label>
     <input type="number" id="bulk-int" name="int_value" style="width:70px;"
            title="Число, которое подставят кнопки справа — бронь или факт на дату.">
     <button name="action" value="set_reserve"
@@ -240,7 +246,7 @@
   </span>
 
   <span class="pr-group">
-    <label class="pr-group__label" for="bulk-date">на дату</label>
+    <label class="pr-group__label" for="bulk-date">на дату →</label>
     <input type="date" id="bulk-date" name="date_value">
     <button name="action" value="set_base_date"
             title="Проставить эту дату в поле «на дату» всем отмеченным товарам. Снимок ЦС на неё подставится сразу, если он уже есть; если нет — строки встанут в ожидание и досчитаются, когда придёт ответ 1С.">

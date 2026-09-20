@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
@@ -31,11 +32,11 @@ from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
 from app.models import (
-    AnomalyReason, AnomalyStatus, DispatchQueueItem, DispatchStatus, FtpTask,
-    FtpTaskStatus, MappingConflict, PlatformAccount, PlatformCatalogItem,
-    OrderProcessStatus, ProcessedOrder, Product, ReconciliationClassification,
-    ReconciliationLog, StockDateSnapshot, StockDateStatus, SyncAnomaly,
-    WorkerHeartbeat,
+    AnomalyReason, AnomalyStatus, Barcode, DispatchQueueItem, DispatchStatus,
+    FtpTask, FtpTaskStatus, MappingConflict, Platform, PlatformAccount,
+    PlatformCatalogItem, OrderProcessStatus, ProcessedOrder, Product,
+    ReconciliationClassification, ReconciliationLog, StockDateSnapshot,
+    StockDateStatus, SyncAnomaly, SyncSetting, WorkerHeartbeat,
 )
 from app.timeutils import now_utc
 
@@ -110,6 +111,42 @@ UNKNOWN_SKU_MARK = "площадка не знает этот sku"
 # та же: чинить надо мэппинг, а не связь.
 NO_CARD_MARK = "нет карточки в каталоге кабинета"
 CARD_MISSING_MARKS = (UNKNOWN_SKU_MARK, NO_CARD_MARK)
+
+
+def _error_gist(text: str | None, limit: int = 160) -> str:
+    """Оставить от ошибки то, по чему её можно разобрать.
+
+    21.09 оператор увидел в отчёте ровно это и спросил, как с этим быть:
+
+        2403 · Конко Джемпер … · КИТ — [{'detail': '400 Client Error: Bad
+        Request for url: https://api.kit.yandex.net/v1/variants
+
+    Причина обрывается на полуслове, и не потому, что её нет: ответ площадки
+    рассылка сохраняет целиком (`kit._push_stock_chunk` кладёт тело в `detail`).
+    Съедала её обвязка — «не отправлено за 5 попыток», питоновский repr списка
+    словарей, слова «Client Error: Bad Request» и полный адрес ручки. На сам
+    ответ площадки, единственное, что тут имеет смысл, не оставалось ни символа.
+
+    Чистим по порядку: счётчик попыток, скобки repr, боилерплейт requests. Код
+    ответа сохраняем — 400 и 409 у площадок значат разное. Адрес ручки режем по
+    первому «двоеточие с пробелом»: в URL такого сочетания не бывает, а тело
+    ответа начинается ровно после него.
+    """
+    text = (text or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"^(не отправлено за \d+ попыт\w+|попытка \d+ из \d+)\s*:\s*", "", text)
+    text = re.sub(r"^\[?\{?\s*'?detail'?\s*:\s*", "", text)
+    text = text.strip().strip("[]{}'\"")
+
+    match = re.match(r"^(\d{3})\s+\w+ Error:.*?for url:\s*(.*)$", text, re.S)
+    if match:
+        code, rest = match.group(1), match.group(2).strip()
+        # URL и тело разделены «: » — внутри самого адреса его быть не может
+        # (после «https:» идут слэши, а не пробел).
+        body = rest.split(": ", 1)[1].strip() if ": " in rest else ""
+        text = f"{code}: {body}" if body else f"{code}, ответ пустой ({rest})"
+    return text[:limit].strip()
 
 
 def _describe_pairs(db: Session, rows: list[DispatchQueueItem],
@@ -198,15 +235,7 @@ def latest_queue_ids(db: Session) -> set[int]:
     return {mark[1] for mark in best.values()}
 
 
-def _check_unknown_sku(db: Session) -> Finding | None:
-    """Товар отмечен для кабинета, а карточки на его складе нет.
-
-    20.09 на бою: один такой баркод в пачке из ста ронял ВЕСЬ запрос ответом
-    `409 NotFound`, и девяносто девять живых карточек не получали остаток.
-    Теперь виновники вынимаются из запроса, остальное уезжает — но сама пара
-    остаётся неразрешённой, и решить её может только человек: либо карточка на
-    площадке появится, либо галочку с кабинета надо снять.
-    """
+def _q_unknown_sku(db: Session) -> list[DispatchQueueItem]:
     rows = db.query(DispatchQueueItem).filter(
         DispatchQueueItem.status == DispatchStatus.error,
         DispatchQueueItem.is_test.is_(False),
@@ -217,7 +246,19 @@ def _check_unknown_sku(db: Session) -> Finding | None:
     # переотправки по одному и тому же нерешённому товару лежит две записи, а
     # разбирать человеку нечего дважды — это одна неразрешённая пара.
     latest = latest_queue_ids(db)
-    rows = [r for r in rows if r.id in latest]
+    return [r for r in rows if r.id in latest]
+
+
+def _check_unknown_sku(db: Session) -> Finding | None:
+    """Товар отмечен для кабинета, а карточки на его складе нет.
+
+    20.09 на бою: один такой баркод в пачке из ста ронял ВЕСЬ запрос ответом
+    `409 NotFound`, и девяносто девять живых карточек не получали остаток.
+    Теперь виновники вынимаются из запроса, остальное уезжает — но сама пара
+    остаётся неразрешённой, и решить её может только человек: либо карточка на
+    площадке появится, либо галочку с кабинета надо снять.
+    """
+    rows = _q_unknown_sku(db)
     if not rows:
         return None
     return Finding(
@@ -227,19 +268,13 @@ def _check_unknown_sku(db: Session) -> Finding | None:
                     "Остаток туда не уедет никогда — ни сейчас, ни после повторов. "
                     "Оверселла тут не будет (продавать нечего), но пара висит "
                     "нерешённой: либо карточку заводить, либо снимать галочку.",
-        count=len(rows), link="/products",
+        count=len(rows), link="/report/rows/unknown_sku",
         details=_describe_pairs(db, rows),
     )
 
 
-def _check_dispatch_errors(db: Session) -> Finding | None:
-    """Рассылка исчерпала попытки. Самое дорогое расхождение в системе.
-
-    Позиции «площадка не знает такой sku» сюда НЕ входят: у них другое следствие
-    и другой разбор, их показывает `_check_unknown_sku`. Смешать их значило бы
-    написать про несуществующую карточку «она продолжает продавать то, чего
-    нет» — и человек пошёл бы чинить связь вместо мэппинга.
-    """
+def _q_dispatch_errors(db: Session) -> list[DispatchQueueItem]:
+    """Запрос отдельно от находки: те же строки нужны и полному списку."""
     rows = db.query(DispatchQueueItem).filter(
         DispatchQueueItem.status == DispatchStatus.error,
         DispatchQueueItem.is_test.is_(False),
@@ -251,10 +286,21 @@ def _check_dispatch_errors(db: Session) -> Finding | None:
             and_(*[~DispatchQueueItem.last_error.like(f"%{mark}%")
                    for mark in CARD_MISSING_MARKS])),
     ).all()
-    # Показываем только ПОСЛЕДНЮЮ запись пары товар+кабинет: всё, что было до
-    # неё, описывает прошлое состояние, а не текущее (см. `_superseded`).
+    # Только ПОСЛЕДНЯЯ запись пары товар+кабинет: всё, что было до неё,
+    # описывает прошлое состояние, а не текущее.
     latest = latest_queue_ids(db)
-    rows = [r for r in rows if r.id in latest]
+    return [r for r in rows if r.id in latest]
+
+
+def _check_dispatch_errors(db: Session) -> Finding | None:
+    """Рассылка исчерпала попытки. Самое дорогое расхождение в системе.
+
+    Позиции «площадка не знает такой sku» сюда НЕ входят: у них другое следствие
+    и другой разбор, их показывает `_check_unknown_sku`. Смешать их значило бы
+    написать про несуществующую карточку «она продолжает продавать то, чего
+    нет» — и человек пошёл бы чинить связь вместо мэппинга.
+    """
+    rows = _q_dispatch_errors(db)
     if not rows:
         return None
     return Finding(
@@ -262,8 +308,8 @@ def _check_dispatch_errors(db: Session) -> Finding | None:
         title=f"Рассылка не доехала до площадки: {len(rows)} записей",
         consequence="Остаток у нас уже списан, а на площадку новое число не ушло — "
                     "она продолжает продавать по старому, то есть продаёт то, чего нет.",
-        count=len(rows), link="/diagnostics#accounts",
-        details=[f"{line} — {(row.last_error or '')[:90]}"
+        count=len(rows), link="/report/rows/dispatch_errors",
+        details=[f"{line} — {_error_gist(row.last_error)}"
                  for line, row in zip(_describe_pairs(db, rows), rows[:10])],
     )
 
@@ -365,14 +411,18 @@ def _check_tasks_needing_review(db: Session) -> Finding | None:
     )
 
 
+def _q_broadcast_without_recalc(db: Session) -> list[Product]:
+    return db.query(Product).filter(
+        Product.broadcast_enabled.is_(True),
+        Product.recalc_done_at.is_(None),
+    ).order_by(Product.article).all()
+
+
 def _check_broadcast_without_recalc(db: Session) -> Finding | None:
     """Трансляция включена, а расчёта не было. Интерфейс такого не даёт
     (`products._blocks_broadcast_on`), поэтому строка здесь означает, что товар
     прошёл мимо интерфейса — импортом, правкой в базе или дефектом."""
-    rows = db.query(Product).filter(
-        Product.broadcast_enabled.is_(True),
-        Product.recalc_done_at.is_(None),
-    ).all()
+    rows = _q_broadcast_without_recalc(db)
     if not rows:
         return None
     return Finding(
@@ -380,9 +430,78 @@ def _check_broadcast_without_recalc(db: Session) -> Finding | None:
         title=f"Транслируются без расчёта: {len(rows)} товаров",
         consequence="На площадки уходит ПОЛНЫЙ остаток, не сверенный с их продажами. "
                     "Каждая такая карточка — прямой риск оверселла.",
-        count=len(rows), link="/products",
+        count=len(rows), link="/report/rows/broadcast_without_recalc",
         details=[f"{p.article or p.uid_1c} — {p.name or ''}"[:120] for p in rows[:10]],
     )
+
+
+def _check_wb_without_chrt(db: Session) -> Finding | None:
+    """Позиции WB, у которых в каталоге нет chrtId: остаток уходит баркодом.
+
+    Спрятанная находка, которую нельзя увидеть ни на одной странице, пока её тут
+    нет: отправка баркодом РАБОТАЕТ — сегодня. В спеке WB тело отправки остатков
+    описано ключом `chrtId`, про `sku` там не сказано ни слова, зато заготовлен
+    отказ `400 SKUUploadDisabled` («uploading stock is not allowed by 'sku'»).
+    То есть приём баркода площадка умеет выключать, и в день, когда выключит,
+    именно эти карточки перестанут получать остаток — молча, до первого отказа
+    рассылки.
+
+    Лечится не кодом, а выгрузкой каталога кабинета: chrtId приезжает оттуда
+    (`external_id` = `nmID:chrtID`). Пустой правый кусок значит, что карточки
+    размера в нашем снимке каталога нет — либо снимок старый, либо размер на
+    площадке не заведён.
+
+    Считаем ТЕМИ ЖЕ правилами, что и отправка (`wb._chrt_id`): правый кусок
+    `external_id`, только цифры, не ноль. Разойдись счёт с отправкой — находка
+    называла бы не то, что произойдёт на самом деле.
+    """
+    rows = _q_wb_without_chrt(db)
+    if not rows:
+        return None
+    return Finding(
+        key="wb_without_chrt", level=WARNING,
+        title=f"На WB уходят баркодом, без chrtId: {len(rows)} пар",
+        consequence="Сегодня работает, завтра может перестать: WB умеет отключать "
+                    "приём остатков по баркоду (400 SKUUploadDisabled), и тогда эти "
+                    "карточки перестанут получать остаток молча. Лечится выгрузкой "
+                    "каталога кабинета — chrtId приезжает оттуда.",
+        count=len(rows), link="/report/rows/wb_without_chrt",
+        details=[f"{a} {size} {color} · {n} · {acc}".replace("  ", " ")[:120]
+                 for a, size, color, n, acc in rows[:10]],
+    )
+
+
+def _q_wb_without_chrt(db: Session) -> list[tuple]:
+    """(артикул, размер, цвет, наименование, кабинет) — пары без chrtId."""
+    pairs = (
+        db.query(Product.uid_1c, Product.article, Product.name,
+                 Product.size, Product.color,
+                 PlatformAccount.name.label("account"),
+                 PlatformCatalogItem.external_id)
+        .join(SyncSetting, SyncSetting.uid_1c == Product.uid_1c)
+        .join(PlatformAccount, PlatformAccount.id == SyncSetting.account_id)
+        .join(Barcode, Barcode.uid_1c == Product.uid_1c)
+        .outerjoin(PlatformCatalogItem,
+                   and_(PlatformCatalogItem.account_id == PlatformAccount.id,
+                        PlatformCatalogItem.barcode == Barcode.barcode))
+        .filter(SyncSetting.enabled.is_(True),
+                Product.broadcast_enabled.is_(True),
+                PlatformAccount.platform == Platform.wb)
+        .all()
+    )
+
+    # Товар с несколькими баркодами даёт несколько строк, и chrtId может быть
+    # хоть у одной. Достаточно одной: отправка возьмёт именно её.
+    best: dict[tuple, tuple] = {}
+    for uid, article, name, size, color, account, external_id in pairs:
+        tail = (external_id or "").split(":")[-1].strip()
+        has = tail.isdigit() and tail != "0"
+        key = (uid, account)
+        if key not in best or has:
+            best[key] = (article or uid, size or "", color or "",
+                         name or "", account, has)
+
+    return sorted((v[:5] for v in best.values() if not v[5]))
 
 
 def _check_breaker_disabled(db: Session) -> Finding | None:
@@ -593,9 +712,14 @@ def _check_mapping_conflicts(db: Session) -> Finding | None:
     )
 
 
+def _q_negative_stock(db: Session) -> list[Product]:
+    return db.query(Product).filter(
+        Product.stock_on_hand < 0).order_by(Product.article).all()
+
+
 def _check_negative_stock(db: Session) -> Finding | None:
     """Отрицательный остаток — пересортица, не ошибка кода."""
-    rows = db.query(Product).filter(Product.stock_on_hand < 0).all()
+    rows = _q_negative_stock(db)
     if not rows:
         return None
     return Finding(
@@ -603,7 +727,7 @@ def _check_negative_stock(db: Session) -> Finding | None:
         title=f"Товаров с отрицательным остатком: {len(rows)}",
         consequence="Мы списали больше, чем числилось. Наружу по ним уходит ноль, "
                     "то есть продажи по этим карточкам стоят до разбора в 1С.",
-        count=len(rows), link="/products",
+        count=len(rows), link="/report/rows/negative_stock",
         details=[f"{p.article or p.uid_1c}: {p.stock_on_hand}" for p in rows[:10]],
     )
 
@@ -681,6 +805,7 @@ CHECKS = (
     _check_platform_divergence,
     _check_tasks_needing_review,
     _check_broadcast_without_recalc,
+    _check_wb_without_chrt,
     _check_breaker_disabled,
     _check_stuck_1c_tasks,
     _check_stale_catalog,
@@ -729,3 +854,79 @@ def summary_line(findings: list[Finding]) -> str:
     parts = [f"{f.key}={f.count}" for f in findings]
     head = f"критичных {len(critical)} из {len(findings)}"
     return f"{head}: " + ", ".join(parts)
+
+
+# --------------------------------------------------------- полные списки
+# Находка показывает десять строк и пишет «и ещё N — полный список по ссылке
+# ниже». 21.09 выяснилось, что ссылка ведёт в общий каталог товаров, где
+# никакого списка нет: обещание было, страницы не было. Здесь она и живёт.
+#
+# Списки собираются ОТДЕЛЬНО от находок и только по запросу страницы. Держать
+# их внутри `Finding` нельзя: отчёт собирается раз в час и на каждой загрузке
+# «Диагностики», а строк бывают тысячи.
+
+
+def _rows_dispatch_errors(db: Session) -> list[list[str]]:
+    return _queue_rows(db, _q_dispatch_errors(db))
+
+
+def _rows_unknown_sku(db: Session) -> list[list[str]]:
+    return _queue_rows(db, _q_unknown_sku(db))
+
+
+def _queue_rows(db: Session, rows: list[DispatchQueueItem]) -> list[list[str]]:
+    """Строки очереди в виде, с которым идут разбираться: товар, кабинет, причина."""
+    uids = {r.uid_1c for r in rows}
+    products = {p.uid_1c: p for p in
+                db.query(Product).filter(Product.uid_1c.in_(uids)).all()} if uids else {}
+    names = {a.id: a.name for a in db.query(PlatformAccount).all()}
+    out = []
+    for r in rows:
+        p = products.get(r.uid_1c)
+        out.append([
+            (p.article if p else "") or r.uid_1c,
+            (p.size if p else "") or "",
+            (p.color if p else "") or "",
+            (p.name if p else "") or "",
+            names.get(r.account_id, ""),
+            r.sent_sku or "",
+            str(r.quantity),
+            _error_gist(r.last_error, limit=400),
+        ])
+    return out
+
+
+def _rows_wb_without_chrt(db: Session) -> list[list[str]]:
+    return [[a, size, color, n, acc, "баркодом"]
+            for a, size, color, n, acc in _q_wb_without_chrt(db)]
+
+
+def _rows_broadcast_without_recalc(db: Session) -> list[list[str]]:
+    return [[p.article or p.uid_1c, p.size or "", p.color or "", p.name or "",
+             str(p.stock_on_hand or 0)]
+            for p in _q_broadcast_without_recalc(db)]
+
+
+def _rows_negative_stock(db: Session) -> list[list[str]]:
+    return [[p.article or p.uid_1c, p.size or "", p.color or "", p.name or "",
+             str(p.stock_on_hand or 0)]
+            for p in _q_negative_stock(db)]
+
+
+QUEUE_COLUMNS = ["Артикул", "Размер", "Цвет", "Наименование", "Кабинет",
+                 "SKU, которым ушло", "Количество", "Что ответила площадка"]
+PRODUCT_COLUMNS = ["Артикул", "Размер", "Цвет", "Наименование", "Остаток ЦС"]
+
+# key находки → (заголовок страницы, колонки, функция строк).
+FULL_LISTS = {
+    "dispatch_errors": ("Рассылка не доехала до площадки", QUEUE_COLUMNS,
+                        _rows_dispatch_errors),
+    "unknown_sku": ("Площадка не знает наш sku", QUEUE_COLUMNS, _rows_unknown_sku),
+    "wb_without_chrt": ("На WB уходят баркодом, без chrtId",
+                        ["Артикул", "Размер", "Цвет", "Наименование", "Кабинет",
+                         "Чем адресуется"], _rows_wb_without_chrt),
+    "broadcast_without_recalc": ("Транслируются без расчёта", PRODUCT_COLUMNS,
+                                 _rows_broadcast_without_recalc),
+    "negative_stock": ("Товары с отрицательным остатком", PRODUCT_COLUMNS,
+                       _rows_negative_stock),
+}

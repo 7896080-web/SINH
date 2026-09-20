@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}{{ title }}{% endblock %}
+{% block content %}
+
+<div class="page-header">
+    <div>
+        <h1>{{ title }}</h1>
+        <p>Полный список строк находки. Отчёт показывает первые десять — здесь все.</p>
+    </div>
+    <div class="toolbar">
+        <a class="btn" href="/report">← к отчёту</a>
+        {% if rows %}
+        <a class="btn" href="/report/rows/{{ key }}/export">Выгрузить в Excel</a>
+        {% endif %}
+    </div>
+</div>
+
+<div class="card">
+    {% if not columns %}
+        <div class="empty-state">Такой находки нет. Вернитесь к отчёту и откройте
+        ссылку «Разобрать» заново — список собирается по текущему состоянию.</div>
+    {% elif not rows %}
+        <div class="empty-state">Сейчас по этой находке ничего нет — она разобрана.</div>
+    {% else %}
+        <p class="help-text" style="margin-top:0">
+            Всего строк: <b>{{ total }}</b>{% if total > rows|length %},
+            показано {{ rows|length }} — остальные в выгрузке Excel{% endif %}.
+        </p>
+        <div class="table-scroll"><table>
+            <thead><tr>{% for c in columns %}<th>{{ c }}</th>{% endfor %}</tr></thead>
+            <tbody>
+            {% for row in rows %}
+                <tr>{% for cell in row %}<td{% if loop.last %} class="help-text"{% endif %}>{{ cell }}</td>{% endfor %}</tr>
+            {% endfor %}
+            </tbody>
+        </table></div>
+    {% endif %}
+</div>
+
+{% endblock %}
