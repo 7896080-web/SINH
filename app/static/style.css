@@ -43,21 +43,110 @@ a:hover { text-decoration: underline; }
     padding: 20px 0;
 }
 
+.nav {
+    /* Ширину меняет только эта переменная — остальное считается от неё, и
+       свёрнутое состояние не приходится описывать второй раскладкой. */
+    display: flex;
+    flex-direction: column;
+    transition: width .12s ease;
+}
+
 .nav__brand {
-    padding: 0 20px 20px;
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 0 12px 20px 20px;
     font-weight: 600;
     font-size: 16px;
     border-bottom: 1px solid var(--line-soft);
     margin-bottom: 12px;
 }
 
+.nav__brand-text { flex: 1; min-width: 0; }
+
+.nav__toggle {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--surface);
+    color: var(--ink-soft);
+    cursor: pointer;
+}
+
+.nav__toggle:hover { background: var(--bg); color: var(--ink); }
+
+.nav__icon {
+    width: 16px;
+    height: 16px;
+    flex-shrink: 0;
+}
+
 .nav__item {
-    display: block;
+    display: flex;
+    align-items: center;
+    gap: 10px;
     padding: 10px 20px;
     color: var(--ink-soft);
     font-size: 14px;
     border-left: 3px solid transparent;
 }
+
+.nav__label { min-width: 0; }
+
+/* --------------------------------------------------------------------------
+   Свёрнутое меню: узкая полоса с иконками, основная область забирает ширину
+   сама (у .main стоит flex: 1). Класс висит на <html>, а не на <body>, потому
+   что выставляется скриптом в <head> — до первой отрисовки, иначе на каждом
+   переходе между страницами меню видимо прыгало бы шириной.
+   -------------------------------------------------------------------------- */
+.nav-collapsed .nav { width: 60px; }
+
+.nav-collapsed .nav__brand {
+    padding: 0 0 16px;
+    justify-content: center;
+    gap: 0;
+}
+
+.nav-collapsed .nav__brand-text { display: none; }
+
+.nav-collapsed .nav__item {
+    justify-content: center;
+    padding: 10px 0;
+    /* Полоска активного пункта уезжает вниз: слева места под неё не осталось,
+       а без метки активной страницы свёрнутое меню теряет ориентир. */
+    border-left-width: 0;
+    border-bottom: 2px solid transparent;
+}
+
+.nav-collapsed .nav__item.active {
+    border-left-color: transparent;
+    border-bottom-color: var(--accent);
+}
+
+.nav-collapsed .nav__label { display: none; }
+
+.nav__user { display: block; margin-bottom: 4px; }
+
+.nav__logout {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.nav-collapsed .nav__footer {
+    padding: 16px 0 0;
+}
+
+.nav-collapsed .nav__logout { justify-content: center; }
+
+/* Кнопка разворачивает стрелку обратно. */
+.nav-collapsed .nav__toggle .nav__icon { transform: rotate(180deg); }
 
 .nav__item:hover { background: var(--bg); text-decoration: none; }
 
@@ -345,6 +434,13 @@ tr:hover td { background: var(--bg); }
     .nav__item { border-left: none; border-bottom: 3px solid transparent; padding: 8px 14px; }
     .nav__item.active { border-left: none; border-bottom-color: var(--accent); }
     .nav__footer { margin: 0 0 0 auto; border: none; padding: 0 16px; }
+    /* Горизонтальное меню сворачивать нечему: ширину оно не занимает, а
+       узкая полоса с иконками поверх страницы только мешала бы. */
+    .nav__toggle { display: none; }
+    .nav-collapsed .nav { width: 100%; }
+    .nav-collapsed .nav__brand-text,
+    .nav-collapsed .nav__label { display: inline; }
+    .nav-collapsed .nav__item { justify-content: flex-start; padding: 8px 14px; }
     .main { padding: 20px 16px; max-width: none; }
     .page-header { flex-direction: column; align-items: flex-start; gap: 10px; }
     .filters { gap: 10px; }

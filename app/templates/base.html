@@ -13,6 +13,18 @@
          перерисовывались, и никакой ошибки оператор не видел. Для системы,
          которая управляет остатками на площадках, «тихо не сработало» —
          худший из возможных отказов. -->
+    <script>
+        // Состояние меню восстанавливается ДО первой отрисовки, прямо в <head>.
+        // Страницы здесь обычные (не SPA) и перерисовываются целиком, поэтому
+        // тот же код в конце body давал бы видимый скачок ширины на КАЖДОМ
+        // переходе. localStorage может быть недоступен (приватное окно,
+        // политика браузера) — тогда просто работаем с развёрнутым меню.
+        try {
+            if (localStorage.getItem("nav-collapsed") === "1") {
+                document.documentElement.classList.add("nav-collapsed");
+            }
+        } catch (e) { /* неважно: меню останется развёрнутым */ }
+    </script>
     <script src="/static/htmx.min.js"></script>
     <script>
         // Если файл всё же не загрузился (потеряли при обновлении, не тот путь),
@@ -30,20 +42,107 @@
 </head>
 <body>
     <div class="shell">
+        {# Иконки лежат СВОИМ спрайтом, а не тянутся шрифтом или библиотекой:
+           боевой сервер живёт без интернета, и внешняя иконочная библиотека
+           означала бы меню без подписей и без картинок — то есть девять
+           одинаковых пустых квадратов. #}
+        <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+            <symbol id="i-mapping" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                    stroke-width="1.6" stroke-linecap="round">
+                <path d="M6.5 9.5 9.5 6.5"/>
+                <path d="M9 4.5 10.5 3a2.5 2.5 0 0 1 3.5 3.5L12.5 8"/>
+                <path d="M7 12l-1.5 1.5A2.5 2.5 0 0 1 2 10l1.5-1.5"/>
+            </symbol>
+            <symbol id="i-matching" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                    stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M2 5h7M7 3l2 2-2 2"/>
+                <path d="M14 11H7M9 9l-2 2 2 2"/>
+            </symbol>
+            <symbol id="i-products" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                    stroke-width="1.6" stroke-linejoin="round">
+                <path d="M2 5.5 8 2l6 3.5v5L8 14l-6-3.5z"/>
+                <path d="M2 5.5 8 9l6-3.5M8 9v5"/>
+            </symbol>
+            <symbol id="i-anomalies" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                    stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M8 2 15 14H1z"/>
+                <path d="M8 6.5v3.5M8 12h.01"/>
+            </symbol>
+            <symbol id="i-stock-date" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                    stroke-width="1.6" stroke-linecap="round">
+                <rect x="2" y="3" width="12" height="11" rx="1.5"/>
+                <path d="M2 6.5h12M5.5 2v2.5M10.5 2v2.5"/>
+            </symbol>
+            <symbol id="i-diagnostics" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                    stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M1.5 8.5h3L6 5l2.5 7L10.5 8.5h4"/>
+            </symbol>
+            <symbol id="i-report" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                    stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M3 2.5h7L13 6v7.5H3z"/>
+                <path d="M9.5 2.5V6H13M5.5 9h5M5.5 11.5h3"/>
+            </symbol>
+            <symbol id="i-testing" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                    stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M6.5 2v4.2L3 12.2A1.5 1.5 0 0 0 4.3 14.5h7.4A1.5 1.5 0 0 0 13 12.2L9.5 6.2V2"/>
+                <path d="M5.5 2h5M4.8 10h6.4"/>
+            </symbol>
+            <symbol id="i-api-keys" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                    stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="5" cy="8" r="3"/>
+                <path d="M8 8h6M11.5 8v2.5M13.5 8v2"/>
+            </symbol>
+            <symbol id="i-logout" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                    stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M6.5 2.5H3.5v11h3"/>
+                <path d="M9.5 5.5 12.5 8l-3 2.5M12.5 8H6"/>
+            </symbol>
+            <symbol id="i-collapse" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                    stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M9.5 4 5.5 8l4 4"/>
+            </symbol>
+        </svg>
+
         <nav class="nav">
-            <div class="nav__brand">Синхронизация площадок</div>
-            <a class="nav__item {% if active_page == 'mapping' %}active{% endif %}" href="/mapping">Мэппинг</a>
-            <a class="nav__item {% if active_page == 'platform-matching' %}active{% endif %}" href="/platform-matching">Сопоставление площадок</a>
-            <a class="nav__item {% if active_page == 'products' %}active{% endif %}" href="/products">Товары и остатки</a>
-            <a class="nav__item {% if active_page == 'anomalies' %}active{% endif %}" href="/anomalies">Аномалии</a>
-            <a class="nav__item {% if active_page == 'stock-on-date' %}active{% endif %}" href="/stock-on-date">Остатки на дату</a>
-            <a class="nav__item {% if active_page == 'diagnostics' %}active{% endif %}" href="/diagnostics">Диагностика</a>
-            <a class="nav__item {% if active_page == 'report' %}active{% endif %}" href="/report">Расхождения</a>
-            <a class="nav__item {% if active_page == 'testing' %}active{% endif %}" href="/testing">Тестирование</a>
-            <a class="nav__item {% if active_page == 'api-keys' %}active{% endif %}" href="/api-keys">API-ключи</a>
+            <div class="nav__brand">
+                <span class="nav__brand-text">Синхронизация площадок</span>
+                {# Подпись меняется скриптом; в разметке лежит «свернуть», потому
+                   что по умолчанию меню развёрнуто. #}
+                <button type="button" class="nav__toggle" id="nav-toggle"
+                        title="Свернуть меню" aria-label="Свернуть меню">
+                    <svg class="nav__icon" aria-hidden="true"><use href="#i-collapse"/></svg>
+                </button>
+            </div>
+            {% set items = [
+                ('mapping', '/mapping', 'Мэппинг', 'i-mapping'),
+                ('platform-matching', '/platform-matching', 'Сопоставление площадок', 'i-matching'),
+                ('products', '/products', 'Товары и остатки', 'i-products'),
+                ('anomalies', '/anomalies', 'Аномалии', 'i-anomalies'),
+                ('stock-on-date', '/stock-on-date', 'Остатки на дату', 'i-stock-date'),
+                ('diagnostics', '/diagnostics', 'Диагностика', 'i-diagnostics'),
+                ('report', '/report', 'Расхождения', 'i-report'),
+                ('testing', '/testing', 'Тестирование', 'i-testing'),
+                ('api-keys', '/api-keys', 'API-ключи', 'i-api-keys'),
+            ] %}
+            {% for key, href, label, icon in items %}
+            {# title обязателен: в свёрнутом меню подпись не видна, и без него
+               иконки становятся ребусом. #}
+            <a class="nav__item {% if active_page == key %}active{% endif %}"
+               href="{{ href }}" title="{{ label }}">
+                <svg class="nav__icon" aria-hidden="true"><use href="#{{ icon }}"/></svg>
+                <span class="nav__label">{{ label }}</span>
+            </a>
+            {% endfor %}
             <div class="nav__footer">
-                {{ current_user.username if current_user else '' }}<br>
-                <a href="/logout">Выйти</a>
+                {# Имя пользователя в свёрнутом меню не помещается, а «Выйти»
+                   обязано остаться доступным: без него выход ищут перезагрузкой
+                   или закрытием вкладки. Поэтому имя прячется, ссылка остаётся
+                   иконкой с подписью в title. #}
+                <span class="nav__label nav__user">{{ current_user.username if current_user else '' }}</span>
+                <a class="nav__logout" href="/logout" title="Выйти">
+                    <svg class="nav__icon" aria-hidden="true"><use href="#i-logout"/></svg>
+                    <span class="nav__label">Выйти</span>
+                </a>
             </div>
         </nav>
         <main class="main">
@@ -53,5 +152,30 @@
             {% block content %}{% endblock %}
         </main>
     </div>
+    <script>
+        // Переключатель меню. Состояние живёт в localStorage и восстанавливается
+        // в <head> — здесь только щелчок и подписи.
+        (function () {
+            var button = document.getElementById("nav-toggle");
+            if (!button) return;
+            var root = document.documentElement;
+
+            function describe() {
+                var collapsed = root.classList.contains("nav-collapsed");
+                var text = collapsed ? "Развернуть меню" : "Свернуть меню";
+                button.title = text;
+                button.setAttribute("aria-label", text);
+            }
+
+            describe();
+            button.addEventListener("click", function () {
+                var collapsed = root.classList.toggle("nav-collapsed");
+                try {
+                    localStorage.setItem("nav-collapsed", collapsed ? "1" : "0");
+                } catch (e) { /* не сохранилось — свёрнуто останется до перехода */ }
+                describe();
+            });
+        })();
+    </script>
 </body>
 </html>
