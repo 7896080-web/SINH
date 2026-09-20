@@ -5,7 +5,8 @@ from sqlalchemy.orm import Session
 
 from app.transmit import quantity_for_account
 from app.models import (
-    DispatchQueueItem, DispatchStatus, SyncSetting, PlatformAccount, Barcode, PlatformCatalogItem, Product,
+    AuditLog, DispatchQueueItem, DispatchStatus, SyncSetting, PlatformAccount, Barcode,
+    PlatformCatalogItem, Product,
 )
 from app.workers.order_poller import _representative_barcode
 from app.workers.platform_clients.base import PlatformClient, StockPushItem
@@ -60,6 +61,63 @@ def _retry_delay(attempts: int) -> timedelta:
     return timedelta(minutes=RETRY_BACKOFF_MINUTES[idx])
 
 
+def _publish_restocked(db: Session, account: PlatformAccount, client: PlatformClient,
+                       sent_keys: dict[str, int]) -> int:
+    """Вернуть на витрину карточки, которые площадка спрятала за нулевой остаток.
+
+    Зачем это вообще: у Kit при настройке «скрывать товары с нулевым остатком»
+    распроданная карточка переходит в `HIDDEN` и САМА оттуда не возвращается.
+    Мы шлём приход, площадка его принимает — а товара на витрине нет, и не
+    появится никогда. Остаток передан, продаж нет, и снаружи это выглядит как
+    наша поломка.
+
+    Три ограничения, и каждое обязательно:
+
+    Только по явному разрешению кабинета (`publish_hidden_on_stock`). Карточку
+    мог спрятать и человек — снял с продажи, спорный товар, не сезон, — а
+    статус `HIDDEN` у площадки один на оба случая, отличить их нельзя. Поэтому
+    решение «возвращать автоматически» принимает человек один раз по кабинету,
+    а не мы за него по каждой карточке.
+
+    Только по ненулевому остатку. Ноль карточку на витрине не удержит, а
+    публиковать пустую — значит показать людям товар, которого нет.
+
+    Только по тем, что площадка СЕЙЧАС держит скрытыми. Не смогли спросить —
+    не публикуем вовсе: `None` от клиента значит «мы не знаем», и трогать по
+    нему чужие статусы нельзя.
+    """
+    if not account.publish_hidden_on_stock:
+        return 0
+    restocked = {key for key, quantity in sent_keys.items() if (quantity or 0) > 0}
+    if not restocked:
+        return 0
+
+    ask = getattr(client, "hidden_stock_keys", None)
+    hidden = ask() if callable(ask) else None
+    if not hidden:
+        # None — спросить не удалось; пустое множество — скрытых нет. В обоих
+        # случаях делать нечего, но различать их важно для чтения логов.
+        return 0
+
+    published = 0
+    for key in sorted(restocked & hidden):
+        if client.publish_stock_key(key):
+            published += 1
+            db.add(AuditLog(
+                actor="system", action="variant_published",
+                details=f"{account.name}: карточка {key} возвращена на витрину — "
+                        f"на неё ушёл остаток {sent_keys.get(key)}",
+            ))
+        else:
+            db.add(AuditLog(
+                actor="system", action="variant_publish_failed",
+                details=f"{account.name}: карточку {key} вернуть на витрину не удалось — "
+                        f"остаток на площадке есть, а товар покупателям не виден",
+            ))
+    db.commit()
+    return published
+
+
 def run_dispatch_cycle(db: Session, clients: dict, active_accounts: list[PlatformAccount] | None = None) -> dict:
     """Раз в 30-60 секунд (см. планировщик): забирает накопленную очередь по
     каждому активному кабинету, схлопывает по товару (если за цикл пришло
@@ -105,6 +163,13 @@ def run_dispatch_cycle(db: Session, clients: dict, active_accounts: list[Platfor
         now = now_utc()
         push_items = []
         uid_to_items = {}
+        # Ключи отправки, уже занятые в этом цикле. У Kit пара товар+склад не
+        # может повторяться в одном запросе (`DUPLICATE_ITEM`), и повтор ронял
+        # бы ВЕСЬ запрос, а не лишнюю строку.
+        keys_in_request: dict[str, str] = {}
+        # Чем площадка адресует остаток: WB — баркодом, Ozon — артикулом,
+        # Kit — variant_id. Спрашиваем у клиента, а не угадываем здесь.
+        stock_key = getattr(client, "stock_key", "barcode")
         for uid_1c, item in latest_by_uid.items():
             if item.next_attempt_at is not None and item.next_attempt_at > now:
                 continue          # пауза после сбоя ещё не вышла
@@ -114,6 +179,31 @@ def run_dispatch_cycle(db: Session, clients: dict, active_accounts: list[Platfor
                 item.last_error = "нет баркода для отправки"
                 continue
             barcode, external_id, article = target
+            # Позиция без идентификатора, которым адресует ЭТА площадка, в
+            # запрос не идёт вовсе. Отправить её «баркодом, вдруг поймёт» —
+            # значит уронить весь запрос: и Kit, и WB бракуют тело целиком,
+            # а не отдельный элемент. 20.09 на бою по кабинету КИТ так не
+            # уехало ни одного остатка: 11% позиций были без карточки в
+            # каталоге, и каждая пачка падала из-за них.
+            identifier = {"barcode": barcode, "external_id": external_id,
+                          "article": article}.get(stock_key, barcode)
+            if not identifier:
+                item.status = DispatchStatus.error
+                item.next_attempt_at = None
+                item.last_error = ("нет карточки в каталоге кабинета — остаток "
+                                   "отправить не по чему, сначала мэппинг")
+                continue
+            if identifier in keys_in_request:
+                # Два товара 1С ведут на одну карточку площадки. Число уедет по
+                # первому, но молчать нельзя: это дефект мэппинга, и решать его
+                # человеку — списывать продажи будут на разные товары.
+                item.status = DispatchStatus.error
+                item.next_attempt_at = None
+                item.last_error = ("на одну карточку площадки ведут два товара 1С "
+                                   f"({keys_in_request[identifier]} и {uid_1c}) — "
+                                   "отправлен первый, мэппинг надо поправить")
+                continue
+            keys_in_request[identifier] = uid_1c
             quantity = _quantity_to_send(db, uid_1c, account.id, item.quantity)
             # Фиксируем ИМЕННО ТО число, которое уходит на площадку. `item.quantity`
             # для этого не годится: там исходный остаток, а не итог лестницы.
@@ -122,7 +212,7 @@ def run_dispatch_cycle(db: Session, clients: dict, active_accounts: list[Platfor
             # баркодов, выбор делает `_resolve_push_target` прямо здесь — без
             # записи восстановить ключ по базе потом невозможно. 19.09 разбор
             # «почему на WB ноль» из-за этого занял час: число знали, sku нет.
-            item.sent_sku = barcode
+            item.sent_sku = identifier
             push_items.append(StockPushItem(
                 barcode=barcode, quantity=quantity, external_id=external_id, article=article,
             ))
@@ -189,9 +279,18 @@ def run_dispatch_cycle(db: Session, clients: dict, active_accounts: list[Platfor
 
         db.commit()
 
+        # Ненулевой остаток на скрытую карточку — повод вернуть её на витрину.
+        # Считаем по ключам отправки, а не по баркодам: публикуется карточка
+        # площадки, и адресуется она тем же идентификатором, которым ушёл
+        # остаток.
+        sent_keys = {item.sent_sku: item.sent_quantity
+                     for barcode, item in uid_to_items.items()
+                     if barcode in ok_set and item.sent_sku}
+        published = _publish_restocked(db, account, client, sent_keys)
+
         stats[account.name] = {
             "sent": len(ok_set), "errors": len(result.get("errors", [])),
-            "queued": len(pending), "retry": retried,
+            "queued": len(pending), "retry": retried, "published": published,
         }
 
     return stats

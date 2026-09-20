@@ -17,6 +17,8 @@ def _iso(dt: datetime) -> str:
 
 class OzonClient(PlatformClient):
     name = "ozon"
+    # Остаток Ozon адресует offer_id — артикулом продавца, не баркодом.
+    stock_key = "article"
 
     def __init__(self, client_id: str, api_key: str, session: requests.Session | None = None):
         self.session = session or requests.Session()
