@@ -567,3 +567,123 @@ def test_the_newest_error_of_a_pair_is_always_reported(db):
     finding = {f.key: f for f in collect_findings(db)}.get("dispatch_errors")
 
     assert finding is not None and finding.count == 1
+
+
+# ---------------------- продажа площадки — не «наше число переписали»
+
+def test_a_drop_explained_by_orders_is_not_a_divergence(db):
+    """20.09 на бою обе «находки» были ровно этим: отправили 39 — площадка
+    держит 38, отправили 29 — держит 28. Между отправкой и сверкой проходит
+    полчаса, и площадка сама уменьшает остаток, когда товар покупают. Звать
+    человека разбирать штатную продажу — верный способ отучить его читать
+    отчёт."""
+    from app.models import ProcessedOrder
+
+    account = make_account(db)
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=39))
+    db.add(DispatchQueueItem(
+        uid_1c="u1", account_id=account.id, quantity=39, sent_quantity=39,
+        sent_sku="2004896744503", reason="order", status=DispatchStatus.sent,
+        sent_at=now_utc() - timedelta(minutes=30),
+        verified_at=now_utc(), verified_quantity=38))
+    db.add(ProcessedOrder(account_id=account.id, order_id="o-1", uid_1c="u1",
+                          quantity=1, processed_at=now_utc() - timedelta(minutes=20)))
+    db.commit()
+
+    assert "platform_divergence" not in _keys(collect_findings(db))
+
+
+def test_a_drop_bigger_than_the_orders_is_still_a_divergence(db):
+    """Продажи объясняют падение ровно на своё количество. Всё, что сверх, —
+    это уже чужая запись поверх нашей, и её надо показывать."""
+    from app.models import ProcessedOrder
+
+    account = make_account(db)
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=39))
+    db.add(DispatchQueueItem(
+        uid_1c="u1", account_id=account.id, quantity=39, sent_quantity=39,
+        sent_sku="111", reason="order", status=DispatchStatus.sent,
+        sent_at=now_utc() - timedelta(minutes=30),
+        verified_at=now_utc(), verified_quantity=10))
+    db.add(ProcessedOrder(account_id=account.id, order_id="o-1", uid_1c="u1",
+                          quantity=1, processed_at=now_utc() - timedelta(minutes=20)))
+    db.commit()
+
+    assert "platform_divergence" in _keys(collect_findings(db))
+
+
+def test_a_cancelled_order_does_not_explain_a_drop(db):
+    """По отменённому заказу площадка остаток вернула — значит падением он не
+    объясняется."""
+    from app.models import OrderProcessStatus, ProcessedOrder
+
+    account = make_account(db)
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=39))
+    db.add(DispatchQueueItem(
+        uid_1c="u1", account_id=account.id, quantity=39, sent_quantity=39,
+        sent_sku="111", reason="order", status=DispatchStatus.sent,
+        sent_at=now_utc() - timedelta(minutes=30),
+        verified_at=now_utc(), verified_quantity=38))
+    db.add(ProcessedOrder(account_id=account.id, order_id="o-1", uid_1c="u1",
+                          quantity=1, status=OrderProcessStatus.cancelled,
+                          processed_at=now_utc() - timedelta(minutes=20)))
+    db.commit()
+
+    assert "platform_divergence" in _keys(collect_findings(db))
+
+
+def test_orders_on_another_cabinet_do_not_explain_a_drop(db):
+    """Остаток уменьшает та площадка, где купили. Заказ соседнего кабинета про
+    этот ничего не говорит."""
+    from app.models import ProcessedOrder
+
+    kit = make_account(db, Platform.kit, name="КИТ", warehouse_id="wh-2")
+    wb = make_account(db, Platform.wb, name="ИП ЯВОРСКАЯ")
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=39))
+    db.add(DispatchQueueItem(
+        uid_1c="u1", account_id=wb.id, quantity=39, sent_quantity=39,
+        sent_sku="111", reason="order", status=DispatchStatus.sent,
+        sent_at=now_utc() - timedelta(minutes=30),
+        verified_at=now_utc(), verified_quantity=38))
+    db.add(ProcessedOrder(account_id=kit.id, order_id="o-1", uid_1c="u1",
+                          quantity=1, processed_at=now_utc() - timedelta(minutes=20)))
+    db.commit()
+
+    assert "platform_divergence" in _keys(collect_findings(db))
+
+
+# ------------------------- расхождения сверки: свежие, а не архив
+
+def test_a_stale_reconciliation_difference_is_not_reported(db):
+    """20.09 на бою: 909 строк `needs_review` от 14–16.09, все неразрешённые.
+    Разрешать их некому — сверка с тех пор применяет любое движение сама, и
+    новых неразрешённых не появляется вовсе. Архив трёхдневной давности держал
+    отчёт жёлтым круглосуточно."""
+    from app.models import ReconciliationClassification, ReconciliationLog
+
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    db.add(ReconciliationLog(
+        uid_1c="u1", python_stock=-1, in_flight=0, expected_1c=-1, actual_1c=0,
+        delta=1, classification=ReconciliationClassification.needs_review,
+        resolved=False, checked_at=now_utc() - timedelta(days=4)))
+    db.commit()
+
+    assert "reconciliation_review" not in _keys(collect_findings(db))
+
+
+def test_a_fresh_large_difference_is_reported_even_if_applied(db):
+    """Сверка переписала остаток по 1С сама — но сама разница означает
+    пересортицу на складе, и увидеть её надо. Привязка к `resolved` этот сигнал
+    потеряла бы: свежие записи всегда применены."""
+    from app.models import ReconciliationClassification, ReconciliationLog
+
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    db.add(ReconciliationLog(
+        uid_1c="u1", python_stock=5, in_flight=0, expected_1c=5, actual_1c=17,
+        delta=12, classification=ReconciliationClassification.needs_review,
+        resolved=True, checked_at=now_utc() - timedelta(hours=2)))
+    db.commit()
+
+    finding = _by_key(collect_findings(db), "reconciliation_review")
+
+    assert finding is not None and finding.count == 1

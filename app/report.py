@@ -29,8 +29,9 @@ from sqlalchemy.orm import Session
 from app.models import (
     AnomalyReason, AnomalyStatus, DispatchQueueItem, DispatchStatus, FtpTask,
     FtpTaskStatus, MappingConflict, PlatformAccount, PlatformCatalogItem,
-    Product, ReconciliationClassification, ReconciliationLog, StockDateSnapshot,
-    StockDateStatus, SyncAnomaly, WorkerHeartbeat,
+    OrderProcessStatus, ProcessedOrder, Product, ReconciliationClassification,
+    ReconciliationLog, StockDateSnapshot, StockDateStatus, SyncAnomaly,
+    WorkerHeartbeat,
 )
 from app.timeutils import now_utc
 
@@ -94,6 +95,10 @@ def _age(moment) -> str:
 # отправки. Следствия у них РАЗНЫЕ, и мешать их в одну находку нельзя: там, где
 # карточки нет, продавать нечего и оверселла не будет, а человеку надо не
 # чинить связь, а решить судьбу самой пары товар+кабинет.
+# Окно свежести для расхождений сверки: сверка идёт раз в час, сутки дают
+# запас на ночь и выходные и при этом не тащат в отчёт прошлую неделю.
+RECONCILIATION_WINDOW = timedelta(hours=24)
+
 UNKNOWN_SKU_MARK = "площадка не знает этот sku"
 # Второй способ сказать то же самое: карточки этого товара в кабинете нет, и
 # рассылка это увидела ДО запроса — по отсутствию идентификатора, которым
@@ -198,6 +203,29 @@ def _check_dispatch_errors(db: Session) -> Finding | None:
     )
 
 
+def _sales_between(db: Session, row: DispatchQueueItem) -> int:
+    """Сколько единиц этого товара площадка продала между отправкой и сверкой.
+
+    Берём наши же принятые заказы по этой паре товар+кабинет. Окно начинается
+    чуть раньше отправки: заказ, уменьшивший остаток на площадке, мог быть
+    принят нами за считанные секунды до того, как ушло число, — и тогда он в
+    отправленном значении уже учтён, а на площадке уже применён.
+
+    Отменённые заказы не считаем: по ним площадка остаток вернула.
+    """
+    if row.sent_at is None:
+        return 0
+    until = row.verified_at or now_utc()
+    total = db.query(func.coalesce(func.sum(ProcessedOrder.quantity), 0)).filter(
+        ProcessedOrder.account_id == row.account_id,
+        ProcessedOrder.uid_1c == row.uid_1c,
+        ProcessedOrder.status != OrderProcessStatus.cancelled,
+        ProcessedOrder.processed_at >= row.sent_at - timedelta(minutes=2),
+        ProcessedOrder.processed_at <= until,
+    ).scalar()
+    return int(total or 0)
+
+
 def _check_platform_divergence(db: Session) -> Finding | None:
     """Площадка держит не то, что мы ей отправили.
 
@@ -221,6 +249,16 @@ def _check_platform_divergence(db: Session) -> Finding | None:
         DispatchQueueItem.verified_quantity != DispatchQueueItem.sent_quantity,
         DispatchQueueItem.is_test.is_(False),
     ).order_by(DispatchQueueItem.verified_at.desc()).limit(200).all()
+    # Площадка сама уменьшает остаток, когда товар покупают, — и между нашей
+    # отправкой и сверкой проходит полчаса. 20.09 на бою обе «находки» были
+    # ровно этим: отправили 39, площадка держит 38, отправили 29 — держит 28.
+    # Называть продажу «наше число кто-то переписал» значит звать человека
+    # разбирать штатную работу магазина, а отчёт, который зовёт зря, перестают
+    # читать. Поэтому падение, объяснённое принятыми заказами, отбрасываем;
+    # необъяснённое — оставляем, оно и есть расхождение.
+    rows = [r for r in rows
+            if r.verified_quantity > r.sent_quantity
+            or (r.sent_quantity - r.verified_quantity) > _sales_between(db, r)]
     if not rows:
         return None
 
@@ -506,18 +544,34 @@ def _check_negative_stock(db: Session) -> Finding | None:
 
 
 def _check_reconciliation_review(db: Session) -> Finding | None:
-    """Расхождения сверки, которые она не стала применять сама."""
+    """Крупные расхождения со складом 1С за последние сутки.
+
+    Раньше находка считала строки `needs_review`, которые ждут ручного решения.
+    Ждать их больше некому: с сентябрьской правки сверка применяет ЛЮБОЕ
+    движение склада сама (см. `reconciliation.run_reconciliation`) и тут же
+    ставит записи `resolved=True`. Новых неразрешённых не появляется вовсе, а
+    старые, от прежней версии, не рассосутся никогда — 20.09 на бою их было 909
+    штук от 14–16.09, и они держали отчёт жёлтым круглосуточно.
+
+    Но сам сигнал терять нельзя: крупная дельта — это пересортица или ошибка
+    учёта, и её стоит видеть. Поэтому находка теперь про СВЕЖИЕ крупные
+    расхождения, независимо от того, применены они или нет: остаток по ним уже
+    переписан по 1С, а вот почему он разошёлся — вопрос к складу.
+    """
+    since = now_utc() - RECONCILIATION_WINDOW
     count = db.query(ReconciliationLog).filter(
         ReconciliationLog.classification == ReconciliationClassification.needs_review,
-        ReconciliationLog.resolved.is_(False),
+        ReconciliationLog.checked_at >= since,
     ).count()
     if not count:
         return None
     return Finding(
         key="reconciliation_review", level=WARNING,
-        title=f"Расхождений сверки ждут решения: {count}",
-        consequence="Разница между нашим остатком и 1С слишком велика, чтобы "
-                    "применять её молча. До разбора наружу уходит НАШЕ число.",
+        title=f"Крупных расхождений со складом 1С за сутки: {count}",
+        consequence="Наш остаток разошёлся с 1С сильнее порога. Сверка уже "
+                    "переписала его по 1С — то есть наружу уходит число из 1С, — "
+                    "но сама разница означает пересортицу или ошибку учёта на "
+                    "складе, и её стоит разобрать там.",
         count=count, link="/diagnostics",
     )
 
