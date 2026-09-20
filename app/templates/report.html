@@ -8,75 +8,21 @@
         <p>
             Что протухло, что зависло, что накопилось. Этот же отчёт воркер собирает
             сам раз в час и пишет в лог — страница просто показывает его на текущий
-            момент. Собран {{ built_at.strftime("%d.%m.%Y %H:%M") }} UTC.
+            момент.
         </p>
+    </div>
+    <div>
+        <a class="btn" href="/report/missing-cards">Есть на складе — нет на площадке →</a>
     </div>
 </div>
 
-{% if not findings %}
-<div class="card">
-    <h3 style="margin-top:0">Расхождений нет</h3>
-    <p class="help-text" style="margin-bottom:0">
-        Все четырнадцать проверок прошли: очереди не стоят, задания 1С закрываются,
-        каталоги свежие, разбирать нечего. Это не то же самое, что «ошибок быть не
-        может» — отчёт видит только то, что умеет проверять.
-    </p>
-</div>
-{% else %}
-
-<div class="card">
-    <h3 style="margin-top:0">
-        Найдено расхождений: {{ findings|length }}
-        {% if critical_count %}
-            <span class="badge badge--bad">критичных {{ critical_count }}</span>
-        {% else %}
-            <span class="badge badge--warn">критичных нет</span>
-        {% endif %}
-    </h3>
-    <p class="help-text" style="margin-bottom:0">
-        Критичные — те, где прямо сейчас уходит неверный остаток или теряются продажи.
-        Остальные копятся и станут критичными, если их не трогать.
-    </p>
-</div>
-
-{% for f in findings %}
-<div class="card">
-    <h3 style="margin-top:0">
-        {% if f.level == "critical" %}
-            <span class="badge badge--bad">критично</span>
-        {% else %}
-            <span class="badge badge--warn">внимание</span>
-        {% endif %}
-        {{ f.title }}
-    </h3>
-    <p style="margin-top:0">{{ f.consequence }}</p>
-    {% if f.details %}
-    <div class="table-scroll"><table>
-        <tbody>
-        {% for line in f.details %}
-            <tr><td class="mono">{{ line }}</td></tr>
-        {% endfor %}
-        </tbody>
-    </table></div>
-    {% if f.count > f.details|length %}
-        <p class="help-text">…и ещё {{ f.count - f.details|length }}. Полный список — по ссылке ниже.</p>
-    {% endif %}
-    {% endif %}
-    {% if f.link %}
-        <p style="margin-bottom:0"><a href="{{ f.link }}">Разобрать →</a></p>
-    {% endif %}
-</div>
-{% endfor %}
-
-{% endif %}
-
-<div class="card">
-    <h3 style="margin-top:0">Строка для лога</h3>
-    <p class="help-text" style="margin-top:0">
-        Ровно это воркер пишет в <span class="mono">worker.err.log</span> каждый час —
-        по ней видно состояние, не открывая браузер.
-    </p>
-    <p class="mono" style="margin-bottom:0">{{ summary }}</p>
+{# Автообновление: отчёт собирается воркером раз в час, но находки меняются и
+   между прогонами — очередь разгребается, задания 1С закрываются. Оператор
+   держит страницу открытой; без этого он смотрел бы на снимок часовой
+   давности и не знал бы об этом. #}
+<div id="report-body" hx-get="/report/fragment"
+     hx-trigger="every {{ refresh_seconds }}s" hx-swap="innerHTML">
+    {% include "report_findings.html" %}
 </div>
 
 {% endblock %}

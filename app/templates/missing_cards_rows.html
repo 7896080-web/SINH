@@ -1,0 +1,53 @@
+{# Фрагмент таблицы. Его же страница перезапрашивает сама раз в несколько минут —
+   поэтому отметка времени сборки живёт ЗДЕСЬ, а не в шапке: иначе после
+   автообновления таблица была бы свежей, а время под ней — от первой загрузки,
+   и оператор читал бы список как устаревший. #}
+<div class="help-text" style="margin-bottom:8px;">
+    Собрано {{ built_at.strftime("%d.%m.%Y %H:%M") }} UTC ·
+    обновляется само раз в {{ (refresh_seconds / 60) | round | int }} мин
+</div>
+
+{% if not rows %}
+<div class="empty-state">
+    Нечего заводить: у всех товаров с остатком карточки на площадке есть.
+</div>
+{% else %}
+<table class="table">
+    <thead>
+        <tr>
+            <th>Артикул</th>
+            <th>Наименование</th>
+            <th>Размер</th>
+            <th>Цвет</th>
+            <th style="text-align:right">Остаток ЦС</th>
+            {% for p in columns %}<th>Нет на {{ labels[p] }}</th>{% endfor %}
+        </tr>
+    </thead>
+    <tbody>
+        {% for row in rows %}
+        <tr>
+            <td>{{ row.article }}</td>
+            <td>{{ row.name }}</td>
+            <td>{{ row.size }}</td>
+            <td>{{ row.color }}</td>
+            <td style="text-align:right">{{ row.stock }}</td>
+            {% for p in columns %}
+            <td>
+                {% if row.missing.get(p) %}
+                    <span class="badge badge--bad">нет</span>
+                {% else %}
+                    <span class="badge badge--good">есть</span>
+                {% endif %}
+            </td>
+            {% endfor %}
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+
+{% if total > rows|length %}
+<div class="pr-hint pr-hint--warn">
+    Показано {{ rows|length }} из {{ total }} — выгрузка в Excel отдаёт всё.
+</div>
+{% endif %}
+{% endif %}

@@ -238,10 +238,36 @@ class WbClient(PlatformClient):
             if not isinstance(entry, dict) or entry.get("code") != "NotFound":
                 continue
             for row in entry.get("data") or []:
-                sku = str((row or {}).get("sku") or "")
-                if sku:
-                    bad.add(sku)
+                # В ответе WB называет позицию обоими ключами сразу, а какой из
+                # них настоящий — зависит от того, чем мы её адресовали. Кладём
+                # оба непустых: дальше ищем совпадение по тому, чем слали.
+                for key in ("sku", "chrtId"):
+                    value = str((row or {}).get(key) or "")
+                    if value and value != "0":
+                        bad.add(value)
         return bad
+
+    def _error_code(self, response) -> str:
+        """Код ошибки из тела ответа, если он там есть."""
+        try:
+            payload = response.json()
+        except Exception:                      # noqa: BLE001 — тело не разобралось
+            return ""
+        if isinstance(payload, list):
+            payload = payload[0] if payload else {}
+        return str(payload.get("code") or "") if isinstance(payload, dict) else ""
+
+    @staticmethod
+    def _chrt_id(item: StockPushItem) -> str:
+        """chrtId позиции из строки каталога, если он там есть.
+
+        Каталог WB складывает `external_id` как `nmID:chrtID` (см.
+        `_parse_wb_cards`): карточка плюс размер. Отправке нужен именно правый
+        кусок — идентификатор РАЗМЕРА.
+        """
+        raw = (item.external_id or "").split(":")
+        tail = raw[-1].strip() if raw else ""
+        return tail if tail.isdigit() and tail != "0" else ""
 
     def push_stock(self, warehouse_id: str, items: list[StockPushItem]) -> dict:
         """Отправка остатков. Успех — 204 с ПУСТЫМ телом (проверено на живом
@@ -255,28 +281,80 @@ class WbClient(PlatformClient):
         видели), поэтому не выдумываем: непустое тело при успешном коде отдаём
         наверх как ошибку с самим текстом, пусть человек посмотрит.
 
-        ОДИН НЕИЗВЕСТНЫЙ SKU РОНЯЕТ ВСЮ ПАЧКУ, и это главное про этот метод.
-        20.09 на бою: в пачке из ста позиций один баркод WB на складе не знал, и
-        он ответил `409 NotFound` — ни одна из остальных девяноста девяти не
-        применилась. Повтор бессмыслен: неизвестным sku он и останется, а
-        значит сотня живых карточек не получила бы свой остаток НИКОГДА.
+        АДРЕСУЕМ ПО chrtId, А НЕ ПО БАРКОДУ — и это главное изменение 20.09.
+        В спеке WB (снимок dev.wildberries.ru от 10.09.2026) тело запроса — это
+        `stocks[] {chrtId, amount}`, про `sku` там нет ни слова, зато заготовлен
+        код ошибки `SKUUploadDisabled`: «Uploading stock is not allowed by 'sku'.
+        Please use the 'chrtId' key». То есть загрузку по баркоду WB умеет
+        отключать, и в день, когда он это сделает, остатки просто перестанут
+        уходить. Отдельно в описании метода сказано: названия параметров не
+        валидируются, неверное имя даёт 204 без обновления — то есть отказ может
+        оказаться и вовсе беззвучным.
 
-        Поэтому виновников вынимаем из запроса и шлём остальное. WB сам называет
-        их в теле ответа, гадать не приходится. Выброшенные возвращаются в
-        `errors` с пометкой `terminal`: повторять их незачем — пока карточки на
-        складе нет, ответ будет тот же, и пять попыток только оттянут момент,
-        когда человек про это узнает.
+        Переход сделан так, чтобы не потерять то, что работает сегодня. chrtId
+        берётся из каталога кабинета; позиции, для которых его нет (каталог не
+        выгружен, карточка новая), уходят старым путём — баркодом. Если WB не
+        принял chrtId (`409 NotFound`), позиция не закрывается, а переезжает в
+        баркодную пачку: неверный chrtId в каталоге не должен останавливать
+        отправку, которая до сих пор проходила.
+
+        ОДИН НЕИЗВЕСТНЫЙ SKU РОНЯЕТ ВСЮ ПАЧКУ — второе, что нужно знать про этот
+        метод. 20.09 на бою: в пачке из ста позиций один баркод WB на складе не
+        знал, и он ответил `409 NotFound` — ни одна из остальных девяноста
+        девяти не применилась. Повтор бессмыслен: неизвестным sku он и
+        останется, а значит сотня живых карточек не получила бы свой остаток
+        НИКОГДА. Поэтому виновников вынимаем из запроса и шлём остальное.
         """
+        by_chrt = [i for i in items if self._chrt_id(i)]
+        by_sku = [i for i in items if not self._chrt_id(i)]
+
+        ok: list[str] = []
+        errors: list[dict] = []
+
+        if by_chrt:
+            part_ok, part_errors, fallback = self._push_batch(
+                warehouse_id, by_chrt, use_chrt=True)
+            ok += part_ok
+            errors += part_errors
+            # Позиции, которых WB не знает ПО chrtId, пробуем старым ключом:
+            # каталог мог протухнуть, а баркод до сих пор принимался.
+            by_sku += fallback
+
+        if by_sku:
+            part_ok, part_errors, _ = self._push_batch(
+                warehouse_id, by_sku, use_chrt=False)
+            ok += part_ok
+            errors += part_errors
+
+        return {"ok": ok, "errors": errors}
+
+    def _push_batch(self, warehouse_id: str, items: list[StockPushItem],
+                    use_chrt: bool) -> tuple[list[str], list[dict], list[StockPushItem]]:
+        """Одна пачка одним ключом. Возвращает (ушло, ошибки, вернуть баркодом).
+
+        Третий список непустой только для chrtId-пачки: это позиции, которые WB
+        по chrtId не узнал, и их стоит попробовать баркодом, прежде чем объявлять
+        неразрешёнными.
+        """
+        def key_of(item: StockPushItem) -> str:
+            return self._chrt_id(item) if use_chrt else item.barcode
+
         remaining = list(items)
         dropped: list[dict] = []
+        fallback: list[StockPushItem] = []
 
-        # Цикл, а не одна попытка: WB перечисляет неизвестные sku в ответе, но
-        # обещания назвать ВСЕ сразу он не давал. Предел по числу позиций —
+        # Цикл, а не одна попытка: WB перечисляет неизвестные позиции в ответе,
+        # но обещания назвать ВСЕ сразу он не давал. Предел по числу позиций —
         # каждый проход выкидывает хотя бы одну, иначе выходим сами.
         for _ in range(len(items) + 1):
             if not remaining:
                 break
-            body = {"stocks": [{"sku": i.barcode, "amount": i.quantity} for i in remaining]}
+            if use_chrt:
+                body = {"stocks": [{"chrtId": int(self._chrt_id(i)), "amount": i.quantity}
+                                   for i in remaining]}
+            else:
+                body = {"stocks": [{"sku": i.barcode, "amount": i.quantity}
+                                   for i in remaining]}
 
             def call(body=body):
                 resp = self.session.put(f"{BASE_URL}/api/v3/stocks/{warehouse_id}",
@@ -293,36 +371,53 @@ class WbClient(PlatformClient):
                 if text:
                     detail = f"{detail}: {text[:300]}"
 
+                if response is not None and self._error_code(response) == "SKUUploadDisabled":
+                    # WB выключил загрузку по баркоду для этого кабинета. Повтор
+                    # не поможет и ничего не изменит: нужен chrtId, то есть
+                    # свежий каталог кабинета. Говорим это прямо, а не прячем за
+                    # «не отправлено за 5 попыток».
+                    return [i.barcode for i in items if i not in remaining], dropped + [
+                        {"sku": i.barcode, "terminal": True,
+                         "detail": "площадка больше не принимает остаток по баркоду "
+                                   "(SKUUploadDisabled) — нужен chrtId, обновите "
+                                   "каталог кабинета"}
+                        for i in remaining
+                    ], []
+
                 bad = self._not_found_skus(response) if response is not None else set()
-                bad &= {i.barcode for i in remaining}
+                bad &= {key_of(i) for i in remaining}
                 if not bad:
                     # Забраковано что-то другое — разбирать это самим мы не
                     # беремся, отдаём как есть по всей оставшейся пачке.
-                    return {"ok": [i.barcode for i in items if i not in remaining],
-                            "errors": dropped + [{"detail": detail}]}
+                    return ([i.barcode for i in items if i not in remaining],
+                            dropped + [{"detail": detail}], fallback)
 
-                for sku in sorted(bad):
-                    dropped.append({
-                        "sku": sku, "terminal": True,
-                        "detail": f"площадка не знает этот sku на складе {warehouse_id} "
-                                  f"(409 NotFound) — остаток по нему не уедет, пока "
-                                  f"карточки там нет",
-                    })
-                remaining = [i for i in remaining if i.barcode not in bad]
+                unknown = [i for i in remaining if key_of(i) in bad]
+                if use_chrt:
+                    fallback += unknown
+                else:
+                    for item in unknown:
+                        dropped.append({
+                            "sku": item.barcode, "terminal": True,
+                            "detail": f"площадка не знает этот sku на складе {warehouse_id} "
+                                      f"(409 NotFound) — остаток по нему не уедет, пока "
+                                      f"карточки там нет",
+                        })
+                remaining = [i for i in remaining if key_of(i) not in bad]
                 continue
             except requests.RequestException as e:
-                return {"ok": [i.barcode for i in items if i not in remaining],
-                        "errors": dropped + [{"detail": str(e)}]}
+                return ([i.barcode for i in items if i not in remaining],
+                        dropped + [{"detail": str(e)}], fallback)
 
             text = (resp.text or "").strip()
             if text:
-                return {"ok": [], "errors": dropped + [
+                return ([], dropped + [
                     {"detail": f"HTTP {resp.status_code} с телом (ожидали пустое): {text[:300]}"},
-                ]}
-            return {"ok": [i.barcode for i in remaining], "errors": dropped}
+                ], fallback)
+            return [i.barcode for i in remaining], dropped, fallback
 
         # Сюда попадаем, только если WB забраковал ВСЕ позиции по очереди.
-        return {"ok": [], "errors": dropped}
+        return [], dropped, fallback
 
     def get_stocks(self, warehouse_id: str, skus: list[str]) -> dict[str, int] | None:
         """Что WB держит по этим sku на этом складе.

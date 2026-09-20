@@ -687,3 +687,74 @@ def test_a_fresh_large_difference_is_reported_even_if_applied(db):
     finding = _by_key(collect_findings(db), "reconciliation_review")
 
     assert finding is not None and finding.count == 1
+
+
+# --------------------- закрытие старых расхождений сверки (кнопка)
+
+def test_the_button_closes_only_old_reconciliation_rows(logged_in_client, web_db):
+    """Закрывать можно ровно то, что отчёт уже не считает находкой. Свежие
+    трогать нельзя: кнопка гасила бы сигнал вместо того, чтобы убрать архив."""
+    from app.models import ReconciliationClassification, ReconciliationLog
+
+    web_db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    old = ReconciliationLog(
+        uid_1c="u1", python_stock=-1, in_flight=0, expected_1c=-1, actual_1c=0,
+        delta=1, classification=ReconciliationClassification.needs_review,
+        resolved=False, checked_at=now_utc() - timedelta(days=4))
+    fresh = ReconciliationLog(
+        uid_1c="u1", python_stock=5, in_flight=0, expected_1c=5, actual_1c=17,
+        delta=12, classification=ReconciliationClassification.needs_review,
+        resolved=False, checked_at=now_utc() - timedelta(hours=2))
+    web_db.add_all([old, fresh])
+    web_db.commit()
+
+    r = logged_in_client.post("/diagnostics/close-old-reconciliation",
+                              follow_redirects=False)
+
+    assert r.status_code == 303
+    web_db.refresh(old)
+    web_db.refresh(fresh)
+    assert old.resolved is True
+    assert fresh.resolved is False, "свежее расхождение — это сигнал, а не архив"
+
+
+def test_closing_old_rows_does_not_touch_stock(logged_in_client, web_db):
+    """Команда правит журнальную пометку и больше ничего: остаток трогать —
+    значит отправить на площадки число, которого никто не считал."""
+    from app.models import ReconciliationClassification, ReconciliationLog
+
+    web_db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    web_db.add(ReconciliationLog(
+        uid_1c="u1", python_stock=-1, in_flight=0, expected_1c=-1, actual_1c=0,
+        delta=1, classification=ReconciliationClassification.needs_review,
+        resolved=False, checked_at=now_utc() - timedelta(days=4)))
+    web_db.commit()
+
+    logged_in_client.post("/diagnostics/close-old-reconciliation")
+
+    product = web_db.query(Product).filter(Product.uid_1c == "u1").one()
+    assert product.stock_on_hand == 5
+    assert web_db.query(DispatchQueueItem).count() == 0
+
+
+def test_closing_old_rows_is_written_to_the_journal(logged_in_client, web_db):
+    from app.models import AuditLog, ReconciliationClassification, ReconciliationLog
+
+    web_db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    web_db.add(ReconciliationLog(
+        uid_1c="u1", python_stock=-1, in_flight=0, expected_1c=-1, actual_1c=0,
+        delta=1, classification=ReconciliationClassification.needs_review,
+        resolved=False, checked_at=now_utc() - timedelta(days=4)))
+    web_db.commit()
+
+    logged_in_client.post("/diagnostics/close-old-reconciliation")
+
+    assert web_db.query(AuditLog).filter(
+        AuditLog.action == "reconciliation_closed_old").count() == 1
+
+
+def test_the_command_needs_a_login(client):
+    r = client.post("/diagnostics/close-old-reconciliation", follow_redirects=False)
+
+    assert r.status_code in (302, 303, 307)
+    assert "/login" in r.headers.get("location", "")

@@ -188,3 +188,88 @@ def test_a_dispatch_error_without_any_text_is_still_shown(db):
     db.commit()
 
     assert "dispatch_errors" in {f.key for f in collect_findings(db)}
+
+
+# --------------------------------------------- переход на chrtId без потерь
+
+def _client_capturing():
+    """Клиент WB, который запоминает тела запросов и всё принимает."""
+    c = WbClient(token="t", warehouse_id="wh")
+    c.bodies = []
+
+    def put(url, json=None, **kw):
+        c.bodies.append(json["stocks"])
+        return _Resp()
+
+    c.session.put = put
+    return c
+
+
+def _item(barcode, quantity=5, external_id=""):
+    return StockPushItem(barcode=barcode, quantity=quantity, external_id=external_id)
+
+
+def test_a_mixed_batch_goes_in_two_requests():
+    """Ключи смешивать в одном теле нельзя: спека знает только `chrtId`, а
+    баркод принимается «пока» и без обещаний. Поэтому два запроса — один по
+    новому ключу, один по старому."""
+    c = _client_capturing()
+
+    res = c.push_stock("wh", [_item("111", external_id="1:100"), _item("222")])
+
+    assert len(c.bodies) == 2
+    assert c.bodies[0] == [{"chrtId": 100, "amount": 5}]
+    assert c.bodies[1] == [{"sku": "222", "amount": 5}]
+    assert sorted(res["ok"]) == ["111", "222"]
+
+
+def test_an_unknown_chrt_id_falls_back_to_the_barcode():
+    """Каталог мог протухнуть: карточку перезавели, chrtId сменился. Закрыть по
+    этому позицию терминально значило бы своими руками остановить отправку,
+    которая до сих пор проходила баркодом."""
+    c = WbClient(token="t", warehouse_id="wh")
+    c.bodies = []
+
+    def put(url, json=None, **kw):
+        rows = json["stocks"]
+        c.bodies.append(rows)
+        if any("chrtId" in r for r in rows):
+            return _Resp(409, text="конфликт", payload=[{
+                "data": [{"sku": "", "chrtId": 100, "amount": 0}],
+                "code": "NotFound", "message": "Not found"}])
+        return _Resp()
+
+    c.session.put = put
+
+    res = c.push_stock("wh", [_item("111", external_id="1:100")])
+
+    assert res["ok"] == ["111"], "ушло старым ключом"
+    assert c.bodies[-1] == [{"sku": "111", "amount": 5}]
+    assert res["errors"] == []
+
+
+def test_a_disabled_sku_upload_is_named_plainly(db):
+    """`SKUUploadDisabled` — это «переходите на chrtId», а не «сбой связи».
+    Спрятать его за «не отправлено за 5 попыток» значит отправить человека
+    чинить сеть, когда чинить надо выгрузку каталога."""
+    c = WbClient(token="t", warehouse_id="wh")
+    c.session.put = lambda *a, **kw: _Resp(400, text="нельзя", payload={
+        "code": "SKUUploadDisabled",
+        "message": "Uploading stock is not allowed by 'sku'. Please use the 'chrtId' key"})
+
+    res = c.push_stock("wh", [_item("111")])
+
+    assert res["ok"] == []
+    bad = res["errors"][0]
+    assert bad["terminal"] is True
+    assert "каталог" in bad["detail"]
+
+
+def test_an_unknown_barcode_is_still_terminal():
+    """Старый путь ведёт себя как раньше: карточки нет — повторять нечего."""
+    c = _client_rejecting({"плохой"})
+
+    res = c.push_stock("wh", [_item("плохой"), _item("хороший")])
+
+    assert res["ok"] == ["хороший"]
+    assert res["errors"][0]["terminal"] is True
