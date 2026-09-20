@@ -165,6 +165,11 @@
         Только незавершённый расчёт
     </label>
     <label class="checkbox-inline" style="padding-bottom:8px;"
+           title="Отмечен хотя бы один кабинет — то есть по этому товару уже принято решение передавать его наружу. Кабинет при этом не обязан быть активным: галочку ставил человек, и выключение кабинета его решения не отменяет.">
+        <input type="checkbox" name="only_marked" value="true" {% if only_marked %}checked{% endif %}>
+        Только отмеченные кабинеты
+    </label>
+    <label class="checkbox-inline" style="padding-bottom:8px;"
            title="Баркод товара нашёлся в каталоге хотя бы одного кабинета — значит карточка на площадке есть и подключать товар есть куда. Кабинет при этом не обязан быть активным: каталог остаётся и от выключенного, а товар на площадке от этого никуда не делся.">
         <input type="checkbox" name="only_on_platform" value="true" {% if only_on_platform %}checked{% endif %}>
         Только найденные на площадке
