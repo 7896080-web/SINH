@@ -341,3 +341,18 @@ def test_the_switch_turns_off_again(logged_in_client, web_db):
 
     web_db.refresh(account)
     assert account.publish_hidden_on_stock is False
+
+
+def test_the_switch_saves_without_a_separate_button():
+    """Дефект интерфейса: рядом стоят поля с кнопкой «Сохранить», и галочку
+    читают как переключатель — щёлкнул и ушёл на другую страницу. Настройка не
+    сохранялась, а при следующем открытии рисовалась из базы снятой, будто
+    «слетела». Теперь форма уходит сама по щелчку.
+
+    Проверяем разметку: JS в этом проекте не исполняется ни в одном тесте, и
+    выбор здесь — либо такая проверка, либо никакой."""
+    page = open("app/templates/api_keys.html", encoding="utf-8").read()
+
+    block = page.split('name="publish_hidden_on_stock"', 1)[1][:400]
+    assert "onchange=" in block, "галочка обязана отправлять форму сама"
+    assert "requestSubmit" in block
