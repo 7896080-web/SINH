@@ -82,11 +82,16 @@
     </form>
 
     {% if account.supports_publish %}
+    {# Галочка сохраняется СРАЗУ по щелчку, без отдельной кнопки. С кнопкой это
+       была ловушка: рядом стоят поля с «Сохранить», и галочку читают как
+       переключатель — щёлкнул и ушёл. Настройка при этом не сохранялась, а при
+       следующем открытии страницы рисовалась из базы снятой, будто «слетела». #}
     <form method="post" action="/api-keys/accounts/{{ account.id }}/publish-hidden"
           style="display:flex; align-items:flex-end; gap:12px; margin-bottom: 12px;">
         <div class="field" style="flex:1">
             <label>
                 <input type="checkbox" name="publish_hidden_on_stock" value="on"
+                       onchange="this.form.requestSubmit ? this.form.requestSubmit() : this.form.submit();"
                        {% if account.publish_hidden_on_stock %}checked{% endif %}>
                 Возвращать скрытые карточки на витрину при ненулевом остатке
             </label>
@@ -97,9 +102,10 @@
                 такую карточку обратно, когда на неё уходит ненулевой остаток.
                 Карточку, которую спрятали руками, это тоже вернёт: площадка не
                 различает, кто её спрятал.
+                <br>Сохраняется сразу по щелчку.
             </div>
         </div>
-        <button type="submit" class="btn-primary">Сохранить</button>
+        <noscript><button type="submit" class="btn-primary">Сохранить</button></noscript>
     </form>
     {% endif %}
 
