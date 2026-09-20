@@ -22,15 +22,36 @@ router = APIRouter()
 templates = Jinja2Templates(directory="app/templates")
 
 
-@router.get("/report", response_class=HTMLResponse)
-def report_page(request: Request, db: Session = Depends(get_db),
-                user: User = Depends(get_current_user)):
+# Как часто страница перезапрашивает себя сама. Отчёт собирается шестнадцатью
+# проверками по базе — ежеминутный опрос гонял бы их впустую, а находки за
+# минуту почти не меняются. Две минуты дают живую картину и не нагружают базу,
+# в которую одновременно пишут веб и планировщик.
+REFRESH_SECONDS = 120
+
+
+def _context(db: Session) -> dict:
     findings = collect_findings(db)
-    return templates.TemplateResponse(request, "report.html", {
-        "request": request, "current_user": user,
-        "active_page": "report",
+    return {
         "findings": findings,
         "critical_count": sum(1 for f in findings if f.level == CRITICAL),
         "summary": summary_line(findings),
         "built_at": now_utc(),
-    })
+        "refresh_seconds": REFRESH_SECONDS,
+    }
+
+
+@router.get("/report", response_class=HTMLResponse)
+def report_page(request: Request, db: Session = Depends(get_db),
+                user: User = Depends(get_current_user)):
+    ctx = _context(db)
+    ctx.update({"request": request, "current_user": user, "active_page": "report"})
+    return templates.TemplateResponse(request, "report.html", ctx)
+
+
+@router.get("/report/fragment", response_class=HTMLResponse)
+def report_fragment(request: Request, db: Session = Depends(get_db),
+                    user: User = Depends(get_current_user)):
+    """Тело отчёта — его и перезапрашивает страница сама."""
+    ctx = _context(db)
+    ctx.update({"request": request, "current_user": user})
+    return templates.TemplateResponse(request, "report_findings.html", ctx)

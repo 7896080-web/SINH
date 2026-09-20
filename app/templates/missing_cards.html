@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block title %}Есть на складе — нет на площадке{% endblock %}
+{% block content %}
+
+<div class="page-header">
+    <div>
+        <h1>Есть на складе — нет на площадке</h1>
+        <p>
+            Товар лежит на ЦС, продавать его можно, а карточки на площадке нет — значит
+            он не продаётся, и само это не всплывёт: рассылке по такой паре отправлять
+            не по чему, заказов по ней не будет. Список рабочий — с ним идут заводить
+            карточки.
+        </p>
+    </div>
+    <div>
+        <a class="btn" href="/report">← К расхождениям</a>
+    </div>
+</div>
+
+<div class="card">
+    <form class="filters" id="mc-filters"
+          hx-get="/report/missing-cards/rows" hx-target="#mc-table"
+          hx-trigger="change from:select">
+        <div class="field">
+            <label for="platform">Площадка</label>
+            <select id="platform" name="platform">
+                <option value="" {% if not platform %}selected{% endif %}>Любая из подключённых</option>
+                {% for value, label in platforms %}
+                <option value="{{ value }}" {% if platform == value %}selected{% endif %}>{{ label }}</option>
+                {% endfor %}
+            </select>
+        </div>
+        <div class="field" style="align-self:flex-end">
+            <button type="submit" class="btn" formaction="/report/missing-cards/export"
+                    formmethod="get" hx-boost="false">Выгрузить в Excel</button>
+        </div>
+    </form>
+    <p class="help-text" style="margin-bottom:0">
+        Кабинеты одной площадки считаются вместе: у WB их три (разные ИП), а карточка
+        заводится в одном — товар, заведённый у одного ИП, на витрине WB есть.
+        Каталог учитывается и от выключенного кабинета: он остаётся, и карточка на
+        площадке от выключения никуда не делась.
+    </p>
+</div>
+
+{# Автообновление: список меняется после выгрузки каталога кабинета и после
+   прихода остатков из 1С. Оператор держит страницу открытой и работает по ней —
+   руками он её не перезагрузит и будет заводить карточки по вчерашнему списку. #}
+<div class="card" id="mc-table"
+     hx-get="/report/missing-cards/rows"
+     hx-trigger="every {{ refresh_seconds }}s"
+     hx-include="#mc-filters"
+     hx-swap="innerHTML">
+    {% include "missing_cards_rows.html" %}
+</div>
+
+{% endblock %}

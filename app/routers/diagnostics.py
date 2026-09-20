@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from app.timeutils import now_utc
 
 from fastapi import APIRouter, Request, Depends, Form
@@ -11,8 +11,8 @@ from app.database import get_db
 from app.dependencies import get_current_user
 from app.models import (
     PlatformAccount, WorkerHeartbeat, DispatchQueueItem, DispatchStatus,
-    Barcode, FtpTask, FtpTaskStatus, MappingConflict, Product, SyncAnomaly,
-    AnomalyStatus, User,
+    Barcode, FtpTask, FtpTaskStatus, MappingConflict, Product, ReconciliationLog,
+    SyncAnomaly, AnomalyStatus, User,
 )
 from app.workers.ftp_channel import (MAX_REPOSTS, repost_enabled, resolve_stuck_task,
                                      tasks_needing_review)
@@ -28,6 +28,11 @@ from app.flash import set_flash, pop_flash
 
 router = APIRouter()
 templates = Jinja2Templates(directory="app/templates")
+
+# Насколько старым должно быть расхождение сверки, чтобы кнопка его закрыла.
+# Сутки — ровно то окно, по которому отчёт показывает свежие: закрыть можно
+# только то, что отчёт уже не считает находкой, иначе команда гасила бы сигнал.
+CLOSE_RECONCILIATION_OLDER_THAN = timedelta(hours=24)
 
 
 def _queue_counts(db: Session, account_id: int) -> dict:
@@ -200,6 +205,43 @@ def resend_all(
         set_flash(request, f"В очередь поставлено {stats['queued']} записей "
                            f"по {stats['products']} товарам — уйдут ближайшими "
                            f"циклами рассылки.", "good")
+    return RedirectResponse("/diagnostics", status_code=303)
+
+
+@router.post("/diagnostics/close-old-reconciliation")
+def close_old_reconciliation(
+    request: Request,
+    db: Session = Depends(get_db), user: User = Depends(get_current_user),
+):
+    """Закрыть старые расхождения сверки, которые ждут решения, которого нет.
+
+    До сентябрьской правки крупная разница с 1С помечалась `needs_review` и
+    ждала ручного решения. Теперь сверка применяет ЛЮБОЕ движение склада сама и
+    ставит `resolved` тут же — то есть решать эти строки некому и незачем: по
+    ним остаток давно переписан, а сами они остались висеть. 20.09 на бою таких
+    было 909 штук от 14–16.09.
+
+    Трогаем ТОЛЬКО журнальную пометку и ТОЛЬКО у старых записей. Остатки,
+    очередь и площадки эта команда не касается вовсе: расхождения, по которым и
+    правда стоит разобраться, отчёт показывает по свежим записям за сутки, и
+    порог `RECONCILIATION_WINDOW` тут не при чём — свежие сюда не попадут.
+    """
+    cutoff = now_utc() - CLOSE_RECONCILIATION_OLDER_THAN
+    rows = db.query(ReconciliationLog).filter(
+        ReconciliationLog.resolved.is_(False),
+        ReconciliationLog.checked_at < cutoff,
+    ).all()
+    for row in rows:
+        row.resolved = True
+    log_action(db, user.username, "reconciliation_closed_old",
+               f"закрыто старых расхождений сверки: {len(rows)}")
+    db.commit()
+
+    if not rows:
+        set_flash(request, "Старых расхождений сверки нет — закрывать нечего.", "good")
+    else:
+        set_flash(request, f"Закрыто старых расхождений сверки: {len(rows)}. "
+                           f"Остатки не тронуты — это пометка в журнале.", "good")
     return RedirectResponse("/diagnostics", status_code=303)
 
 

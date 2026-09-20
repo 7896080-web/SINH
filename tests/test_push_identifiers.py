@@ -47,14 +47,50 @@ class _CaptureSession:
         return self._rec("GET", url, k)
 
 
-def test_wb_push_uses_barcode_as_sku():
+def test_wb_push_uses_chrt_id_when_the_catalogue_knows_it():
+    """Спека WB (снимок 10.09.2026) знает у отправки остатков ровно один ключ —
+    `chrtId`, идентификатор размера. Баркод там не упомянут вовсе, зато заготовлен
+    отказ `SKUUploadDisabled`: «uploading stock is not allowed by 'sku'». Значит
+    адресовать надо тем, чего площадка ждёт, пока она не перестала принимать
+    остальное.
+
+    chrtId лежит в `external_id` строки каталога как `nmID:chrtID`."""
     s = _CaptureSession()
     client = WbClient(token="t", warehouse_id="wh", session=s)
-    res = client.push_stock("WH1", [StockPushItem(barcode="460123", quantity=5, external_id="nm:1", article="ART")])
+
+    res = client.push_stock("WH1", [StockPushItem(
+        barcode="460123", quantity=5, external_id="12345:67890", article="ART")])
+
     _, url, body = s.calls[0]
     assert "/api/v3/stocks/WH1" in url
+    assert body["stocks"][0] == {"chrtId": 67890, "amount": 5}
+    assert res["ok"] == ["460123"], "наверх результат всё равно в баркодах"
+
+
+def test_wb_push_falls_back_to_the_barcode_without_a_catalogue_row():
+    """Каталог кабинета мог быть не выгружен, карточка — заведена вчера. Баркод
+    сегодня принимается, и отказываться от работающего пути, пока новый не
+    доступен, значило бы перестать отправлять остаток вовсе."""
+    s = _CaptureSession()
+    client = WbClient(token="t", warehouse_id="wh", session=s)
+
+    client.push_stock("WH1", [StockPushItem(barcode="460123", quantity=5)])
+
+    _, _, body = s.calls[0]
     assert body["stocks"][0] == {"sku": "460123", "amount": 5}
-    assert res["ok"] == ["460123"]
+
+
+def test_a_catalogue_row_without_a_size_id_is_sent_by_barcode():
+    """`external_id` у WB бывает и без правой части (строка каталога от старой
+    выгрузки). Слать `chrtId: 0` нельзя — это адрес в никуда."""
+    s = _CaptureSession()
+    client = WbClient(token="t", warehouse_id="wh", session=s)
+
+    client.push_stock("WH1", [StockPushItem(barcode="460123", quantity=5,
+                                            external_id="12345:0")])
+
+    _, _, body = s.calls[0]
+    assert body["stocks"][0] == {"sku": "460123", "amount": 5}
 
 
 def test_ozon_push_uses_article_as_offer_id_and_ok_in_barcodes():
