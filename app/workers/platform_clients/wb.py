@@ -212,6 +212,35 @@ class WbClient(PlatformClient):
                     ))
         return cancelled
 
+    def _not_found_skus(self, response) -> set[str]:
+        """Sku, про которые WB в ответе 409 сказал «не знаю такого на складе».
+
+        Формат подтверждён на бою 20.09.2026:
+
+            [{"data":[{"sku":"2000932279695","chrtId":0,"amount":0}],
+              "code":"NotFound","message":"Not found"}]
+
+        Разбираем ТОЛЬКО `code == "NotFound"`. Другие коды 409 значат что-то
+        иное, и выкидывать по ним позиции из запроса нельзя: мы не знаем, что
+        именно площадка забраковала, и молча урезать отправку значило бы решить
+        за неё.
+        """
+        try:
+            payload = response.json()
+        except Exception:                      # noqa: BLE001 — тело не разобралось
+            return set()
+        if not isinstance(payload, list):
+            payload = [payload]
+        bad: set[str] = set()
+        for entry in payload:
+            if not isinstance(entry, dict) or entry.get("code") != "NotFound":
+                continue
+            for row in entry.get("data") or []:
+                sku = str((row or {}).get("sku") or "")
+                if sku:
+                    bad.add(sku)
+        return bad
+
     def push_stock(self, warehouse_id: str, items: list[StockPushItem]) -> dict:
         """Отправка остатков. Успех — 204 с ПУСТЫМ телом (проверено на живом
         кабинете 19.09.2026: `PUT` одним sku вернул 204, и число применилось).
@@ -223,31 +252,75 @@ class WbClient(PlatformClient):
         лежит на площадке. Схему возможных ошибок в 2xx мы не знаем (на бою её не
         видели), поэтому не выдумываем: непустое тело при успешном коде отдаём
         наверх как ошибку с самим текстом, пусть человек посмотрит.
+
+        ОДИН НЕИЗВЕСТНЫЙ SKU РОНЯЕТ ВСЮ ПАЧКУ, и это главное про этот метод.
+        20.09 на бою: в пачке из ста позиций один баркод WB на складе не знал, и
+        он ответил `409 NotFound` — ни одна из остальных девяноста девяти не
+        применилась. Повтор бессмыслен: неизвестным sku он и останется, а
+        значит сотня живых карточек не получила бы свой остаток НИКОГДА.
+
+        Поэтому виновников вынимаем из запроса и шлём остальное. WB сам называет
+        их в теле ответа, гадать не приходится. Выброшенные возвращаются в
+        `errors` с пометкой `terminal`: повторять их незачем — пока карточки на
+        складе нет, ответ будет тот же, и пять попыток только оттянут момент,
+        когда человек про это узнает.
         """
-        body = {"stocks": [{"sku": i.barcode, "amount": i.quantity} for i in items]}
+        remaining = list(items)
+        dropped: list[dict] = []
 
-        def call():
-            resp = self.session.put(f"{BASE_URL}/api/v3/stocks/{warehouse_id}", json=body, timeout=30)
-            resp.raise_for_status()
-            return resp
+        # Цикл, а не одна попытка: WB перечисляет неизвестные sku в ответе, но
+        # обещания назвать ВСЕ сразу он не давал. Предел по числу позиций —
+        # каждый проход выкидывает хотя бы одну, иначе выходим сами.
+        for _ in range(len(items) + 1):
+            if not remaining:
+                break
+            body = {"stocks": [{"sku": i.barcode, "amount": i.quantity} for i in remaining]}
 
-        try:
-            resp = with_retry(call)
-        except requests.HTTPError as e:
-            detail = str(e)
-            text = (e.response.text or "").strip() if e.response is not None else ""
+            def call(body=body):
+                resp = self.session.put(f"{BASE_URL}/api/v3/stocks/{warehouse_id}",
+                                        json=body, timeout=30)
+                resp.raise_for_status()
+                return resp
+
+            try:
+                resp = with_retry(call)
+            except requests.HTTPError as e:
+                detail = str(e)
+                response = e.response
+                text = (response.text or "").strip() if response is not None else ""
+                if text:
+                    detail = f"{detail}: {text[:300]}"
+
+                bad = self._not_found_skus(response) if response is not None else set()
+                bad &= {i.barcode for i in remaining}
+                if not bad:
+                    # Забраковано что-то другое — разбирать это самим мы не
+                    # беремся, отдаём как есть по всей оставшейся пачке.
+                    return {"ok": [i.barcode for i in items if i not in remaining],
+                            "errors": dropped + [{"detail": detail}]}
+
+                for sku in sorted(bad):
+                    dropped.append({
+                        "sku": sku, "terminal": True,
+                        "detail": f"площадка не знает этот sku на складе {warehouse_id} "
+                                  f"(409 NotFound) — остаток по нему не уедет, пока "
+                                  f"карточки там нет",
+                    })
+                remaining = [i for i in remaining if i.barcode not in bad]
+                continue
+            except requests.RequestException as e:
+                return {"ok": [i.barcode for i in items if i not in remaining],
+                        "errors": dropped + [{"detail": str(e)}]}
+
+            text = (resp.text or "").strip()
             if text:
-                detail = f"{detail}: {text[:300]}"
-            return {"ok": [], "errors": [{"detail": detail}]}
-        except requests.RequestException as e:
-            return {"ok": [], "errors": [{"detail": str(e)}]}
+                return {"ok": [], "errors": dropped + [
+                    {"detail": f"HTTP {resp.status_code} с телом (ожидали пустое): {text[:300]}"},
+                ]}
+            return {"ok": [i.barcode for i in remaining], "errors": dropped}
 
-        text = (resp.text or "").strip()
-        if text:
-            return {"ok": [], "errors": [
-                {"detail": f"HTTP {resp.status_code} с телом (ожидали пустое): {text[:300]}"},
-            ]}
-        return {"ok": [i.barcode for i in items], "errors": []}
+        # Сюда попадаем, только если WB забраковал ВСЕ позиции по очереди.
+        return {"ok": [], "errors": dropped}
 
     def get_stocks(self, warehouse_id: str, skus: list[str]) -> dict[str, int] | None:
         """Что WB держит по этим sku на этом складе.
