@@ -437,3 +437,87 @@ def test_the_report_worker_is_watched_by_health():
     # Без своей записи об интервале он протухал бы по умолчанию через 10 минут и
     # держал /health красным между часовыми прогонами.
     assert EXPECTED_INTERVAL_SECONDS["discrepancy_report"] > 3600
+
+
+# ------------------------------- отказ, перекрытый более поздней отправкой
+
+def _kit_account(db):
+    from app.models import Platform
+    return make_account(db, Platform.kit, name="КИТ", warehouse_id="wh-1")
+
+
+def test_a_missing_card_is_not_called_a_broken_dispatch(db):
+    """Рассылка видит отсутствие карточки ДО запроса — по отсутствию
+    идентификатора площадки. Следствие то же, что у неизвестного sku: продавать
+    нечего, оверселла не будет, чинить надо мэппинг. Написать про такую позицию
+    «площадка продаёт то, чего нет» значит отправить человека чинить связь."""
+    account = _kit_account(db)
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    db.add(DispatchQueueItem(
+        uid_1c="u1", account_id=account.id, quantity=5, reason="manual_resend_all",
+        status=DispatchStatus.error,
+        last_error="нет карточки в каталоге кабинета — остаток отправить не по чему, сначала мэппинг"))
+    db.commit()
+
+    findings = {f.key for f in collect_findings(db)}
+
+    assert "unknown_sku" in findings
+    assert "dispatch_errors" not in findings
+
+
+def test_an_error_covered_by_a_later_send_is_not_a_discrepancy(db):
+    """20.09 после починки Kit осталось 650 мёртвых записей от старого дефекта.
+    Число по этим товарам потом доехало — но сами записи навсегда остались в
+    `error`. Считать их расхождением значит держать отчёт красным вечно, а
+    вечно красный отчёт оператор пролистывает не читая."""
+    account = _kit_account(db)
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    db.add(DispatchQueueItem(
+        uid_1c="u1", account_id=account.id, quantity=5, reason="order",
+        status=DispatchStatus.error, last_error="не отправлено за 5 попыток: 400",
+        created_at=now_utc() - timedelta(hours=3)))
+    db.add(DispatchQueueItem(
+        uid_1c="u1", account_id=account.id, quantity=5, reason="manual_resend_all",
+        status=DispatchStatus.sent, sent_at=now_utc() - timedelta(minutes=10),
+        created_at=now_utc() - timedelta(minutes=12)))
+    db.commit()
+
+    assert "dispatch_errors" not in {f.key for f in collect_findings(db)}
+
+
+def test_an_error_with_no_later_send_is_still_reported(db):
+    """Перекрытие обязано быть ПОЗЖЕ отказа. Иначе достаточно одной старой
+    удачной отправки, чтобы навсегда заглушить все будущие сбои по товару."""
+    account = _kit_account(db)
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    db.add(DispatchQueueItem(
+        uid_1c="u1", account_id=account.id, quantity=5, reason="manual_resend_all",
+        status=DispatchStatus.sent, sent_at=now_utc() - timedelta(hours=5),
+        created_at=now_utc() - timedelta(hours=5)))
+    db.add(DispatchQueueItem(
+        uid_1c="u1", account_id=account.id, quantity=5, reason="order",
+        status=DispatchStatus.error, last_error="не отправлено за 5 попыток: 500",
+        created_at=now_utc() - timedelta(hours=1)))
+    db.commit()
+
+    assert "dispatch_errors" in {f.key for f in collect_findings(db)}
+
+
+def test_a_send_to_another_cabinet_does_not_cover_the_error(db):
+    """Пара — товар+кабинет. Удачная отправка на другой кабинет не говорит
+    ничего о том, что лежит на этом."""
+    from app.models import Platform
+
+    kit = _kit_account(db)
+    wb = make_account(db, Platform.wb, name="ИП ЯВОРСКАЯ", warehouse_id="wh-2")
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    db.add(DispatchQueueItem(
+        uid_1c="u1", account_id=kit.id, quantity=5, reason="order",
+        status=DispatchStatus.error, last_error="не отправлено за 5 попыток: 500",
+        created_at=now_utc() - timedelta(hours=2)))
+    db.add(DispatchQueueItem(
+        uid_1c="u1", account_id=wb.id, quantity=5, reason="order",
+        status=DispatchStatus.sent, sent_at=now_utc(), created_at=now_utc()))
+    db.commit()
+
+    assert "dispatch_errors" in {f.key for f in collect_findings(db)}

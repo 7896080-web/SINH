@@ -23,7 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import timedelta
 
-from sqlalchemy import func, or_
+from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
 from app.models import (
@@ -95,6 +95,12 @@ def _age(moment) -> str:
 # карточки нет, продавать нечего и оверселла не будет, а человеку надо не
 # чинить связь, а решить судьбу самой пары товар+кабинет.
 UNKNOWN_SKU_MARK = "площадка не знает этот sku"
+# Второй способ сказать то же самое: карточки этого товара в кабинете нет, и
+# рассылка это увидела ДО запроса — по отсутствию идентификатора, которым
+# адресует площадка. Следствие то же, что у неизвестного sku, поэтому и находка
+# та же: чинить надо мэппинг, а не связь.
+NO_CARD_MARK = "нет карточки в каталоге кабинета"
+CARD_MISSING_MARKS = (UNKNOWN_SKU_MARK, NO_CARD_MARK)
 
 
 def _check_unknown_sku(db: Session) -> Finding | None:
@@ -109,7 +115,8 @@ def _check_unknown_sku(db: Session) -> Finding | None:
     rows = db.query(DispatchQueueItem).filter(
         DispatchQueueItem.status == DispatchStatus.error,
         DispatchQueueItem.is_test.is_(False),
-        DispatchQueueItem.last_error.like(f"%{UNKNOWN_SKU_MARK}%"),
+        or_(*[DispatchQueueItem.last_error.like(f"%{mark}%")
+              for mark in CARD_MISSING_MARKS]),
     ).all()
     if not rows:
         return None
@@ -123,6 +130,18 @@ def _check_unknown_sku(db: Session) -> Finding | None:
         count=len(rows), link="/products",
         details=[f"{r.sent_sku or r.uid_1c}" for r in rows[:10]],
     )
+
+
+def _covered_by_later_send(db: Session, row: DispatchQueueItem) -> bool:
+    """Была ли по этой паре товар+кабинет успешная отправка ПОСЛЕ этого отказа."""
+    return db.query(DispatchQueueItem.id).filter(
+        DispatchQueueItem.uid_1c == row.uid_1c,
+        DispatchQueueItem.account_id == row.account_id,
+        DispatchQueueItem.status == DispatchStatus.sent,
+        DispatchQueueItem.is_test.is_(False),
+        DispatchQueueItem.sent_at.isnot(None),
+        DispatchQueueItem.sent_at > row.created_at,
+    ).first() is not None
 
 
 def _check_dispatch_errors(db: Session) -> Finding | None:
@@ -141,8 +160,16 @@ def _check_dispatch_errors(db: Session) -> Finding | None:
         # выпала бы из отчёта ВООБЩЕ — ни сюда, ни в находку про неизвестный sku.
         # Молча потерять ошибку рассылки хуже, чем показать её не в той группе.
         or_(DispatchQueueItem.last_error.is_(None),
-            ~DispatchQueueItem.last_error.like(f"%{UNKNOWN_SKU_MARK}%")),
+            and_(*[~DispatchQueueItem.last_error.like(f"%{mark}%")
+                   for mark in CARD_MISSING_MARKS])),
     ).all()
+    # Отказ, ПЕРЕКРЫТЫЙ более поздней успешной отправкой по той же паре
+    # товар+кабинет, расхождением не является: число до площадки доехало, просто
+    # позже. Без этого отчёт краснел бы вечно — 20.09 на бою после починки Kit
+    # осталось 650 мёртвых записей от старого дефекта, и каждая из них навсегда
+    # утверждала бы, что площадка продаёт то, чего нет. Вечно непустой отчёт
+    # оператор пролистывает не читая, и тогда он бесполезен весь.
+    rows = [r for r in rows if not _covered_by_later_send(db, r)]
     if not rows:
         return None
     return Finding(
