@@ -150,6 +150,14 @@ def run_dispatch_cycle(db: Session, clients: dict, active_accounts: list[Platfor
 
         ok_set = set(result.get("ok", []))
         errors_text = str(result.get("errors"))[:400]
+        # Ошибки, которые повтором не лечатся: площадка сказала про КОНКРЕТНЫЙ
+        # sku, что такого у неё на складе нет. Пять попыток с нарастающей паузой
+        # тут не помогут — ответ будет тот же, — зато оттянут на полчаса момент,
+        # когда человек узнает, что товар отмечен для кабинета, где его карточки
+        # не существует. Поэтому закрываем сразу и с внятным текстом.
+        terminal = {str(e.get("sku")): str(e.get("detail") or "")
+                    for e in result.get("errors", [])
+                    if isinstance(e, dict) and e.get("terminal") and e.get("sku")}
         retried = 0
         for barcode, item in uid_to_items.items():
             item.attempts += 1
@@ -157,6 +165,10 @@ def run_dispatch_cycle(db: Session, clients: dict, active_accounts: list[Platfor
                 item.status = DispatchStatus.sent
                 item.sent_at = now_utc()
                 item.next_attempt_at = None
+            elif barcode in terminal:
+                item.status = DispatchStatus.error
+                item.next_attempt_at = None
+                item.last_error = terminal[barcode]
             elif item.attempts < MAX_ATTEMPTS:
                 # Сбой не окончательный: пробуем ещё, с паузой. Остаток уже списан
                 # у нас — если не дослать его на площадку, она продаст то, чего нет.

@@ -23,7 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import timedelta
 
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.models import (
@@ -90,11 +90,58 @@ def _age(moment) -> str:
 # значения не имеет — итоговый список сортируется по уровню.
 
 
-def _check_dispatch_errors(db: Session) -> Finding | None:
-    """Рассылка исчерпала попытки. Самое дорогое расхождение в системе."""
+# По этому признаку отличаем «площадка не знает такого sku» от остальных сбоев
+# отправки. Следствия у них РАЗНЫЕ, и мешать их в одну находку нельзя: там, где
+# карточки нет, продавать нечего и оверселла не будет, а человеку надо не
+# чинить связь, а решить судьбу самой пары товар+кабинет.
+UNKNOWN_SKU_MARK = "площадка не знает этот sku"
+
+
+def _check_unknown_sku(db: Session) -> Finding | None:
+    """Товар отмечен для кабинета, а карточки на его складе нет.
+
+    20.09 на бою: один такой баркод в пачке из ста ронял ВЕСЬ запрос ответом
+    `409 NotFound`, и девяносто девять живых карточек не получали остаток.
+    Теперь виновники вынимаются из запроса, остальное уезжает — но сама пара
+    остаётся неразрешённой, и решить её может только человек: либо карточка на
+    площадке появится, либо галочку с кабинета надо снять.
+    """
     rows = db.query(DispatchQueueItem).filter(
         DispatchQueueItem.status == DispatchStatus.error,
         DispatchQueueItem.is_test.is_(False),
+        DispatchQueueItem.last_error.like(f"%{UNKNOWN_SKU_MARK}%"),
+    ).all()
+    if not rows:
+        return None
+    return Finding(
+        key="unknown_sku", level=WARNING,
+        title=f"Площадка не знает наш sku: {len(rows)} позиций",
+        consequence="Товар отмечен для кабинета, где его карточки на складе нет. "
+                    "Остаток туда не уедет никогда — ни сейчас, ни после повторов. "
+                    "Оверселла тут не будет (продавать нечего), но пара висит "
+                    "нерешённой: либо карточку заводить, либо снимать галочку.",
+        count=len(rows), link="/products",
+        details=[f"{r.sent_sku or r.uid_1c}" for r in rows[:10]],
+    )
+
+
+def _check_dispatch_errors(db: Session) -> Finding | None:
+    """Рассылка исчерпала попытки. Самое дорогое расхождение в системе.
+
+    Позиции «площадка не знает такой sku» сюда НЕ входят: у них другое следствие
+    и другой разбор, их показывает `_check_unknown_sku`. Смешать их значило бы
+    написать про несуществующую карточку «она продолжает продавать то, чего
+    нет» — и человек пошёл бы чинить связь вместо мэппинга.
+    """
+    rows = db.query(DispatchQueueItem).filter(
+        DispatchQueueItem.status == DispatchStatus.error,
+        DispatchQueueItem.is_test.is_(False),
+        # `or_` с проверкой на NULL обязателен: в SQL `NOT LIKE` по пустому полю
+        # даёт NULL, то есть «не истина», и запись с незаполненной ошибкой
+        # выпала бы из отчёта ВООБЩЕ — ни сюда, ни в находку про неизвестный sku.
+        # Молча потерять ошибку рассылки хуже, чем показать её не в той группе.
+        or_(DispatchQueueItem.last_error.is_(None),
+            ~DispatchQueueItem.last_error.like(f"%{UNKNOWN_SKU_MARK}%")),
     ).all()
     if not rows:
         return None
@@ -451,6 +498,7 @@ def _check_worker_failures(db: Session) -> Finding | None:
 
 CHECKS = (
     _check_dispatch_errors,
+    _check_unknown_sku,
     _check_platform_divergence,
     _check_tasks_needing_review,
     _check_broadcast_without_recalc,
