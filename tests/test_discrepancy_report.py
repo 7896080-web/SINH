@@ -466,7 +466,7 @@ def test_a_missing_card_is_not_called_a_broken_dispatch(db):
 
 
 def test_an_error_covered_by_a_later_send_is_not_a_discrepancy(db):
-    """20.09 после починки Kit осталось 650 мёртвых записей от старого дефекта.
+    """20.09 после починки Kit осталось 659 мёртвых записей от старого дефекта.
     Число по этим товарам потом доехало — но сами записи навсегда остались в
     `error`. Считать их расхождением значит держать отчёт красным вечно, а
     вечно красный отчёт оператор пролистывает не читая."""
@@ -521,3 +521,49 @@ def test_a_send_to_another_cabinet_does_not_cover_the_error(db):
     db.commit()
 
     assert "dispatch_errors" in {f.key for f in collect_findings(db)}
+
+
+def test_an_error_superseded_by_a_newer_error_is_not_reported_twice(db):
+    """Случай, которого не покрывало прежнее условие «перекрыто успехом»: у
+    товара нет карточки в кабинете, успешной отправки не будет НИКОГДА, а старых
+    отказов по нему накопилось два. Показывать надо текущее состояние пары —
+    последнюю запись, — а не каждую историческую попытку.
+
+    На бою 20.09 таких было сто: они вечно утверждали бы «площадка продаёт то,
+    чего нет», хотя свежая запись по той же паре говорит совсем другое —
+    «карточки нет, разбирайте мэппинг»."""
+    account = _kit_account(db)
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    db.add(DispatchQueueItem(
+        uid_1c="u1", account_id=account.id, quantity=5, reason="order",
+        status=DispatchStatus.error, last_error="не отправлено за 5 попыток: 400",
+        created_at=now_utc() - timedelta(hours=6)))
+    db.add(DispatchQueueItem(
+        uid_1c="u1", account_id=account.id, quantity=5, reason="manual_resend_all",
+        status=DispatchStatus.error,
+        last_error="нет карточки в каталоге кабинета — остаток отправить не по чему",
+        created_at=now_utc() - timedelta(minutes=5)))
+    db.commit()
+
+    findings = {f.key: f for f in collect_findings(db)}
+
+    assert "dispatch_errors" not in findings, "старый отказ описывает прошлое пары"
+    assert findings["unknown_sku"].count == 1, "текущее состояние пары — одна строка"
+
+
+def test_the_newest_error_of_a_pair_is_always_reported(db):
+    """Гашение не должно съедать пару целиком: последняя запись обязана
+    остаться, иначе две записи одной секунды погасили бы друг друга."""
+    account = _kit_account(db)
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    moment = now_utc() - timedelta(minutes=5)
+    for _ in range(2):
+        db.add(DispatchQueueItem(
+            uid_1c="u1", account_id=account.id, quantity=5, reason="order",
+            status=DispatchStatus.error, last_error="не отправлено за 5 попыток: 500",
+            created_at=moment))
+    db.commit()
+
+    finding = {f.key: f for f in collect_findings(db)}.get("dispatch_errors")
+
+    assert finding is not None and finding.count == 1

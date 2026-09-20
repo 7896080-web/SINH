@@ -103,6 +103,34 @@ NO_CARD_MARK = "нет карточки в каталоге кабинета"
 CARD_MISSING_MARKS = (UNKNOWN_SKU_MARK, NO_CARD_MARK)
 
 
+def _superseded(db: Session, row: DispatchQueueItem) -> bool:
+    """Есть ли по этой паре товар+кабинет запись НОВЕЕ этой.
+
+    Очередь событийная: каждая новая запись по паре отменяет смысл всех
+    предыдущих — отправлять будут её. Поэтому расхождение описывает ПОСЛЕДНЯЯ
+    запись пары, а не каждая историческая попытка.
+
+    20.09 на бою это стало видно наглядно. После починки Kit осталось 659
+    записей, перекрытых успешной отправкой, и ещё 100 — от товаров, у которых
+    карточки в кабинете нет вовсе. Вторые успехом не перекроются НИКОГДА, и
+    отчёт вечно писал бы по ним «площадка продаёт то, чего нет», хотя текущее
+    состояние этих пар уже сказано свежей записью: «нет карточки, разбор
+    мэппинга». Вечно красный отчёт оператор пролистывает не читая.
+    """
+    return db.query(DispatchQueueItem.id).filter(
+        DispatchQueueItem.uid_1c == row.uid_1c,
+        DispatchQueueItem.account_id == row.account_id,
+        DispatchQueueItem.is_test.is_(False),
+        DispatchQueueItem.id != row.id,
+        DispatchQueueItem.created_at >= row.created_at,
+    ).filter(
+        # Ровно «новее»: при равном времени решает id, иначе две записи одной
+        # секунды погасили бы друг друга и пара исчезла бы из отчёта совсем.
+        or_(DispatchQueueItem.created_at > row.created_at,
+            DispatchQueueItem.id > row.id),
+    ).first() is not None
+
+
 def _check_unknown_sku(db: Session) -> Finding | None:
     """Товар отмечен для кабинета, а карточки на его складе нет.
 
@@ -118,6 +146,10 @@ def _check_unknown_sku(db: Session) -> Finding | None:
         or_(*[DispatchQueueItem.last_error.like(f"%{mark}%")
               for mark in CARD_MISSING_MARKS]),
     ).all()
+    # Пара товар+кабинет считается один раз: после двух прогонов массовой
+    # переотправки по одному и тому же нерешённому товару лежит две записи, а
+    # разбирать человеку нечего дважды — это одна неразрешённая пара.
+    rows = [r for r in rows if not _superseded(db, r)]
     if not rows:
         return None
     return Finding(
@@ -130,18 +162,6 @@ def _check_unknown_sku(db: Session) -> Finding | None:
         count=len(rows), link="/products",
         details=[f"{r.sent_sku or r.uid_1c}" for r in rows[:10]],
     )
-
-
-def _covered_by_later_send(db: Session, row: DispatchQueueItem) -> bool:
-    """Была ли по этой паре товар+кабинет успешная отправка ПОСЛЕ этого отказа."""
-    return db.query(DispatchQueueItem.id).filter(
-        DispatchQueueItem.uid_1c == row.uid_1c,
-        DispatchQueueItem.account_id == row.account_id,
-        DispatchQueueItem.status == DispatchStatus.sent,
-        DispatchQueueItem.is_test.is_(False),
-        DispatchQueueItem.sent_at.isnot(None),
-        DispatchQueueItem.sent_at > row.created_at,
-    ).first() is not None
 
 
 def _check_dispatch_errors(db: Session) -> Finding | None:
@@ -163,13 +183,9 @@ def _check_dispatch_errors(db: Session) -> Finding | None:
             and_(*[~DispatchQueueItem.last_error.like(f"%{mark}%")
                    for mark in CARD_MISSING_MARKS])),
     ).all()
-    # Отказ, ПЕРЕКРЫТЫЙ более поздней успешной отправкой по той же паре
-    # товар+кабинет, расхождением не является: число до площадки доехало, просто
-    # позже. Без этого отчёт краснел бы вечно — 20.09 на бою после починки Kit
-    # осталось 650 мёртвых записей от старого дефекта, и каждая из них навсегда
-    # утверждала бы, что площадка продаёт то, чего нет. Вечно непустой отчёт
-    # оператор пролистывает не читая, и тогда он бесполезен весь.
-    rows = [r for r in rows if not _covered_by_later_send(db, r)]
+    # Показываем только ПОСЛЕДНЮЮ запись пары товар+кабинет: всё, что было до
+    # неё, описывает прошлое состояние, а не текущее (см. `_superseded`).
+    rows = [r for r in rows if not _superseded(db, r)]
     if not rows:
         return None
     return Finding(
