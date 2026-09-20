@@ -20,7 +20,8 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
 from app.dependencies import get_current_user
-from app.models import Product, PlatformAccount, Platform, SyncSetting, User
+from app.models import (Barcode, Platform, PlatformAccount, PlatformCatalogItem,
+                        Product, SyncSetting, User)
 from app.flash import set_flash, pop_flash
 from app.audit import log_action
 from app.timeutils import now_utc, today_local
@@ -235,7 +236,8 @@ BULK_LIMIT = 20000
 
 
 def _base_query(db: Session, q: str, only_proposals: bool, only_blocked: bool,
-                hide_size_u: bool = False, only_unfinished: bool = False):
+                hide_size_u: bool = False, only_unfinished: bool = False,
+                only_on_platform: bool = False):
     """Отбор в SQL — ДО ограничения по количеству строк.
 
     Раньше сначала брались первые 300 товаров по алфавиту, и лишь потом
@@ -266,6 +268,27 @@ def _base_query(db: Session, q: str, only_proposals: bool, only_blocked: bool,
             Product.offset_base_date.isnot(None),
             or_(Product.offset_base_stock.is_(None), Product.fact_at_date.is_(None)),
         )
+    if only_on_platform:
+        # Товар, чей баркод нашёлся в каталоге хоть одного кабинета, — то есть
+        # карточка на площадке существует и подключать его есть куда. Обратное
+        # («не найден») означает либо что каталог кабинета ещё не выгружали, либо
+        # что карточки там правда нет, и различить это фильтром нельзя.
+        #
+        # Кабинет НЕ обязан быть активным. Каталог остаётся от кабинета, который
+        # погасил предохранитель или выключили руками, и товар на площадке от
+        # этого никуда не делся. Привязка к активности заставляла бы отбор
+        # моргать вместе с состоянием кабинетов — фильтр должен отвечать на
+        # вопрос о товаре, а не о нашей связи с площадкой.
+        #
+        # Коррелированный EXISTS, а не `IN (подзапрос)`: у `platform_catalog_items`
+        # и `barcodes` баркод проиндексирован, и на каталоге в 152 тысячи SKU это
+        # разница между поиском по индексу и вычиткой всей таблицы в память.
+        query = query.filter(
+            db.query(PlatformCatalogItem.id)
+            .join(Barcode, Barcode.barcode == PlatformCatalogItem.barcode)
+            .filter(Barcode.uid_1c == Product.uid_1c)
+            .exists()
+        )
     return query.order_by(Product.name)
 
 
@@ -279,12 +302,14 @@ def _blocked_everywhere(product: Product, accounts: list[PlatformAccount]) -> bo
 def _load_products(db: Session, q: str, only_proposals: bool, only_blocked: bool,
                    accounts: list[PlatformAccount], limit: int = PAGE_LIMIT,
                    hide_size_u: bool = False,
-                   only_unfinished: bool = False) -> tuple[list[Product], int]:
+                   only_unfinished: bool = False,
+                   only_on_platform: bool = False) -> tuple[list[Product], int]:
     """Возвращает (строки, сколько всего подходит под фильтр). Второе число нужно,
     чтобы честно написать оператору «показано 300 из N», а не делать вид, что это всё.
     Отрицательное значение = счёт оборван на пределе сканирования, в интерфейсе
     показывается как «N+»."""
-    query = _base_query(db, q, only_proposals, only_blocked, hide_size_u, only_unfinished)
+    query = _base_query(db, q, only_proposals, only_blocked, hide_size_u,
+                        only_unfinished, only_on_platform)
 
     if not only_blocked:
         total = query.order_by(None).count()
@@ -329,17 +354,19 @@ def _dispatch_summary(db: Session) -> dict:
 
 def _render(request: Request, db: Session, user: User, q: str, only_proposals: bool,
             only_blocked: bool, hide_size_u: bool, template: str,
-            only_unfinished: bool = False):
+            only_unfinished: bool = False, only_on_platform: bool = False):
     accounts = _active_accounts(db)
     all_accounts = {a.id: a for a in db.query(PlatformAccount).all()}
     # С фильтрами показываем ВЕСЬ отбор: оператор сузил список именно затем,
     # чтобы увидеть его целиком. Без фильтров — витрина в 300 строк: «первые 300
     # из 152 тысяч по алфавиту» всё равно ни о чём не говорят.
-    filtered = bool(q or only_proposals or only_blocked or hide_size_u or only_unfinished)
+    filtered = bool(q or only_proposals or only_blocked or hide_size_u
+                    or only_unfinished or only_on_platform)
     products, total = _load_products(db, q, only_proposals, only_blocked, accounts,
                                      limit=FILTERED_LIMIT if filtered else PAGE_LIMIT,
                                      hide_size_u=hide_size_u,
-                                     only_unfinished=only_unfinished)
+                                     only_unfinished=only_unfinished,
+                                     only_on_platform=only_on_platform)
     rows = [_row(p, accounts, all_accounts) for p in products]
     return templates.TemplateResponse(request, template, {
         "request": request, "current_user": user, "active_page": "products",
@@ -347,6 +374,7 @@ def _render(request: Request, db: Session, user: User, q: str, only_proposals: b
         "q": q, "only_proposals": only_proposals, "only_blocked": only_blocked,
         "hide_size_u": hide_size_u,
         "only_unfinished": only_unfinished,
+        "only_on_platform": only_on_platform,
         "recalc_job": active_job(db) or last_job(db),
         "recalc_running": active_job(db) is not None,
         "accounts": accounts,
@@ -394,26 +422,30 @@ def _as_int(raw: str) -> int | None:
 
 
 def _filter_query(q: str, only_proposals: bool = False, only_blocked: bool = False,
-                  hide_size_u: bool = False, only_unfinished: bool = False) -> str:
+                  hide_size_u: bool = False, only_unfinished: bool = False,
+                  only_on_platform: bool = False) -> str:
     """Фильтры страницы в виде строки запроса."""
     from urllib.parse import urlencode
 
     params = {"q": q} if q else {}
     for name, on in (("only_proposals", only_proposals), ("only_blocked", only_blocked),
-                     ("hide_size_u", hide_size_u), ("only_unfinished", only_unfinished)):
+                     ("hide_size_u", hide_size_u), ("only_unfinished", only_unfinished),
+                     ("only_on_platform", only_on_platform)):
         if on:
             params[name] = "true"
     return urlencode(params)
 
 
 def _back(q: str, only_proposals: bool = False, only_blocked: bool = False,
-          hide_size_u: bool = False, only_unfinished: bool = False) -> RedirectResponse:
+          hide_size_u: bool = False, only_unfinished: bool = False,
+          only_on_platform: bool = False) -> RedirectResponse:
     """Назад на страницу С ТЕМИ ЖЕ ФИЛЬТРАМИ.
 
     Раньше возвращался только поиск: оператор отбирал строки фильтром «только
     незавершённый расчёт», применял массовую правку — и попадал на полный список,
     где отобранных строк уже не найти."""
-    query = _filter_query(q, only_proposals, only_blocked, hide_size_u, only_unfinished)
+    query = _filter_query(q, only_proposals, only_blocked, hide_size_u, only_unfinished,
+                          only_on_platform)
     return RedirectResponse(f"/products{'?' + query if query else ''}", status_code=303)
 
 
@@ -423,24 +455,26 @@ def _back(q: str, only_proposals: bool = False, only_blocked: bool = False,
 def products_page(
     request: Request, q: str = Query(""), only_proposals: bool = Query(False),
     only_blocked: bool = Query(False), hide_size_u: bool = Query(False),
-    only_unfinished: bool = Query(False),
+    only_unfinished: bool = Query(False), only_on_platform: bool = Query(False),
     db: Session = Depends(get_db), user: User = Depends(get_current_user),
 ):
     if not _active_accounts(db):
         set_flash(request, "Пока нет ни одного активного кабинета — добавьте его на странице «API-ключи».", "warn")
     return _render(request, db, user, q, only_proposals, only_blocked, hide_size_u,
-                   "products.html", only_unfinished=only_unfinished)
+                   "products.html", only_unfinished=only_unfinished,
+                   only_on_platform=only_on_platform)
 
 
 @router.get("/products/rows", response_class=HTMLResponse)
 def products_rows(
     request: Request, q: str = Query(""), only_proposals: bool = Query(False),
     only_blocked: bool = Query(False), hide_size_u: bool = Query(False),
-    only_unfinished: bool = Query(False),
+    only_unfinished: bool = Query(False), only_on_platform: bool = Query(False),
     db: Session = Depends(get_db), user: User = Depends(get_current_user),
 ):
     return _render(request, db, user, q, only_proposals, only_blocked, hide_size_u,
-                   "products_rows.html", only_unfinished=only_unfinished)
+                   "products_rows.html", only_unfinished=only_unfinished,
+                   only_on_platform=only_on_platform)
 
 
 # Старые адреса — на новую страницу (в закладках и в переписке они ещё живут).
@@ -769,6 +803,7 @@ def bulk_edit(
     q: str = Form(""),
     only_proposals: bool = Form(False), only_blocked: bool = Form(False),
     hide_size_u: bool = Form(False), only_unfinished: bool = Form(False),
+    only_on_platform: bool = Form(False),
     all_filtered: bool = Form(False),
     db: Session = Depends(get_db), user: User = Depends(get_current_user),
 ):
@@ -781,7 +816,8 @@ def bulk_edit(
     означало бы «первые 300 из 4812 подходящих», и оператор, отобрав фильтром
     нужное и нажав «отметить все», тихо обработал бы малую часть — а решил бы,
     что обработал всё. На каталоге в 152 тысячи SKU это неизбежно."""
-    back = lambda: _back(q, only_proposals, only_blocked, hide_size_u, only_unfinished)
+    back = lambda: _back(q, only_proposals, only_blocked, hide_size_u, only_unfinished,
+                         only_on_platform)
 
     if not uids and not all_filtered:
         set_flash(request, "Не выбрано ни одной строки.", "warn")
@@ -807,7 +843,8 @@ def bulk_edit(
             return back()
 
     if all_filtered:
-        query = _base_query(db, q, only_proposals, only_blocked, hide_size_u, only_unfinished)
+        query = _base_query(db, q, only_proposals, only_blocked, hide_size_u,
+                            only_unfinished, only_on_platform)
         # `only_blocked` — фильтр не SQL-ный: точный расчёт «уходит 0» идёт по
         # лестнице приоритетов уже в Python, и массово применять правку по
         # приблизительному отбору нельзя. Отправляем оператора отметить строки.
@@ -1017,6 +1054,7 @@ def dispatch_toggle(
 def products_export(
     q: str = Query(""), only_proposals: bool = Query(False), only_blocked: bool = Query(False),
     hide_size_u: bool = Query(False), only_unfinished: bool = Query(False),
+    only_on_platform: bool = Query(False),
     db: Session = Depends(get_db), user: User = Depends(get_current_user),
 ):
     """Выгрузка отдаёт РОВНО ТО, что отобрано фильтрами на странице.
@@ -1027,7 +1065,8 @@ def products_export(
     accounts = _active_accounts(db)
     products, total = _load_products(db, q, only_proposals, only_blocked, accounts,
                                      limit=EXPORT_LIMIT, hide_size_u=hide_size_u,
-                                     only_unfinished=only_unfinished)
+                                     only_unfinished=only_unfinished,
+                                     only_on_platform=only_on_platform)
     total = abs(total)          # для файла знак «счёт оборван» роли не играет
 
     # Порядок колонок расчёта — тот же, что в строке на странице: дата, что
