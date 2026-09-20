@@ -36,6 +36,7 @@ from sqlalchemy.orm import Session
 from app.models import (Barcode, PlatformAccount, ProcessedOrder, Product, RecalcItem,
                         RecalcJob, RecalcStatus, SyncSetting)
 from app.timeutils import now_utc
+from app.broadcast_gate import apply_pending_broadcast
 from app.transmit import covered_accounts, enqueue_full_resend
 from app.workers.credentials import CredentialsMissing
 
@@ -171,7 +172,7 @@ def catch_up_product(db: Session, product: Product, build_client, pending_wareho
     from app.workers.platform_clients.base import PlatformOrder
 
     stats = {"applied": 0, "skipped": 0, "failed": 0, "problems": [],
-             "covered_accounts": []}
+             "covered_accounts": [], "broadcast_on": 0}
 
     if product.offset_base_date is None:
         stats["problems"].append("не задана дата расчёта")
@@ -229,6 +230,20 @@ def catch_up_product(db: Session, product: Product, build_client, pending_wareho
         # наружу не ушло ничего до ближайшего изменения остатка из 1С.
         # Так и вышло 18.09 с Kit: карточка осталась стоять в нуле, который мы
         # же туда и отправили.
+        #
+        # Отложенное включение трансляции идёт ДО постановки в очередь, и это не
+        # косметика: нетранслируемый товар автоматические пути в очередь не
+        # ставят вовсе, поэтому включи мы его после — ворота открылись бы, а
+        # наружу до ближайшего изменения остатка не ушло бы ничего.
+        if apply_pending_broadcast(product):
+            stats["broadcast_on"] += 1
+            logger.info("расчёт: трансляция включена по просьбе из файла — %s",
+                        product.uid_1c)
+            # Кабинеты, покрытые не впервые, цикл ниже не затронет, а число по
+            # ним до сих пор не уезжало — трансляция была выключена.
+            for account_id in sorted(was_covered & set(covered)):
+                enqueue_full_resend(db, product.uid_1c, account_id,
+                                    reason="recalc_broadcast_on")
         for account_id in sorted(set(covered) - was_covered):
             enqueue_full_resend(db, product.uid_1c, account_id, reason="recalc_covered")
     return stats

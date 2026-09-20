@@ -19,6 +19,7 @@ from datetime import date
 from sqlalchemy.orm import Session, joinedload
 
 from app.models import Product, StockDateRow, StockDateSnapshot, StockDateStatus
+from app.broadcast_gate import apply_pending_broadcast
 from app.transmit import enqueue_full_resend, recompute_offset
 
 
@@ -148,7 +149,7 @@ def fill_waiting_products(db: Session, snapshot: StockDateSnapshot) -> dict:
     Изменившийся порог ставится в очередь рассылки — иначе новое число осталось
     бы только на экране, а на площадках висело бы старое.
     """
-    stats = {"filled": 0, "offsets_changed": 0, "queued": 0}
+    stats = {"filled": 0, "offsets_changed": 0, "queued": 0, "broadcast_on": 0}
 
     # ОБЯЗАТЕЛЬНЫЙ flush. Приложение работает с `autoflush=False`
     # (`app/database.py`), а вызывают нас сразу после того, как строки ответа
@@ -186,8 +187,18 @@ def fill_waiting_products(db: Session, snapshot: StockDateSnapshot) -> dict:
             # Товара нет в ответе — значит на эту дату его на складе не было.
             product.offset_base_stock = by_uid.get(product.uid_1c, 0)
             stats["filled"] += 1
-            if recompute_offset(product):
+            offset_changed = recompute_offset(product)
+            if offset_changed:
                 stats["offsets_changed"] += 1
+            # Второе место, где могут открыться ворота трансляции. Порядок
+            # прихода не определён: расчёт по товару мог закончиться РАНЬШЕ, чем
+            # 1С ответила на заявку о дате, и тогда в тот момент строка стояла
+            # «ждём 1С» и включиться не могла. Спроси мы только в расчёте —
+            # просьба из файла осталась бы висеть навсегда.
+            turned_on = apply_pending_broadcast(product)
+            if turned_on:
+                stats["broadcast_on"] += 1
+            if offset_changed or turned_on:
                 for setting in product.sync_settings:
                     if setting.enabled:
                         enqueue_full_resend(db, product.uid_1c, setting.account_id,

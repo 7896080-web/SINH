@@ -1,3 +1,4 @@
+import collections
 from datetime import datetime, timedelta
 from app.timeutils import now_utc
 
@@ -36,7 +37,7 @@ templates = shared_templates
 CLOSE_RECONCILIATION_OLDER_THAN = timedelta(hours=24)
 
 
-def _queue_counts(db: Session, account_id: int) -> dict:
+def _queue_counts(db: Session, account_id: int, errors: int | None = None) -> dict:
     dispatch_pending = db.query(DispatchQueueItem).filter(
         DispatchQueueItem.account_id == account_id, DispatchQueueItem.status == DispatchStatus.pending,
         DispatchQueueItem.is_test.is_(False),
@@ -44,7 +45,11 @@ def _queue_counts(db: Session, account_id: int) -> dict:
     # Считаем ТО ЖЕ, что показывает отчёт: последнюю запись пары товар+кабинет.
     # Иначе счётчик набирает мёртвые строки от давно починенных дефектов и
     # спорит с отчётом — на бою 20.09 он говорил «751» против «1 запись».
-    dispatch_errors = len(current_dispatch_errors(db, account_id))
+    #
+    # Число приходит готовым: считать его здесь значило бы проходить всю очередь
+    # заново на КАЖДЫЙ кабинет, а их пять.
+    dispatch_errors = (errors if errors is not None
+                       else len(current_dispatch_errors(db, account_id)))
     # Записи, которые уже сорвались и ждут следующей попытки: сама по себе это не
     # ошибка (площадка отвечает не всегда), но растущее число — повод посмотреть
     # в last_error, пока попытки не исчерпались и запись не стала ошибкой.
@@ -81,12 +86,16 @@ def _heartbeat_for(db: Session, worker_name: str):
 def diagnostics_page(request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     accounts = db.query(PlatformAccount).order_by(PlatformAccount.platform, PlatformAccount.name).all()
 
+    # Один проход по очереди на всю страницу, а не на каждый кабинет.
+    errors_by_account = collections.Counter(
+        r.account_id for r in current_dispatch_errors(db))
+
     account_rows = []
     for account in accounts:
         hb = _heartbeat_for(db, f"poll_orders_account_{account.id}")
         account_rows.append({
             "account": account,
-            "queue": _queue_counts(db, account.id),
+            "queue": _queue_counts(db, account.id, errors_by_account[account.id]),
             "heartbeat": hb,
         })
 

@@ -4,11 +4,27 @@ from urllib.parse import quote
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.datavalidation import DataValidation
 from fastapi.responses import StreamingResponse
 
+YES_NO = ["Да", "Нет"]
 
-def build_xlsx_response(headers: list[str], rows: list[list], filename: str) -> StreamingResponse:
-    """Собирает .xlsx в памяти и отдаёт как файл на скачивание."""
+
+def build_xlsx_response(headers: list[str], rows: list[list], filename: str,
+                        choices: dict[str, list[str]] | None = None) -> StreamingResponse:
+    """Собирает .xlsx в памяти и отдаёт как файл на скачивание.
+
+    `choices` — колонки, значение в которых выбирается из списка, а не пишется
+    руками: {заголовок: варианты}. Excel рисует в таких ячейках выпадающий
+    список и не принимает ничего другого.
+
+    Смысл не в удобстве. Импорт понимает «Да/Нет», а всё остальное молча читает
+    как «Нет» (`parse_bool_ru`): «да» с опечаткой, «+», «1» латиницей, пустая
+    ячейка после вычищенного фильтра — и файл ВЫКЛЮЧАЕТ то, что оператор
+    собирался включить, не сказав об этом ни слова. Проверка на стороне Excel
+    ловит это там, где человек ещё видит свою строку.
+    """
     wb = Workbook()
     ws = wb.active
     ws.title = "Данные"
@@ -19,6 +35,25 @@ def build_xlsx_response(headers: list[str], rows: list[list], filename: str) -> 
 
     for row in rows:
         ws.append(row)
+
+    # Выпадающие списки. Диапазон — ровно по выгруженным строкам: на пустом
+    # файле проверять нечего, а «на весь столбец» Excel тянет тяжелее.
+    if choices and rows:
+        for header, options in choices.items():
+            if header not in headers:
+                continue
+            letter = get_column_letter(headers.index(header) + 1)
+            rule = DataValidation(
+                type="list", formula1='"' + ",".join(options) + '"',
+                allow_blank=True, showErrorMessage=True,
+                errorTitle="Так нельзя",
+                error="Выберите значение из списка: " + ", ".join(options) + ".",
+            )
+            # Правило добавляется в лист ДО назначения диапазона: openpyxl
+            # связывает его с листом именно в этот момент, и обратный порядок
+            # молча даёт файл без проверок.
+            ws.add_data_validation(rule)
+            rule.add(f"{letter}2:{letter}{len(rows) + 1}")
 
     # автоширина колонок — грубая эвристика по длине содержимого
     for col_idx, header in enumerate(headers, start=1):

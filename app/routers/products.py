@@ -25,7 +25,8 @@ from app.models import (Barcode, Platform, PlatformAccount, PlatformCatalogItem,
 from app.flash import set_flash, pop_flash
 from app.audit import log_action
 from app.timeutils import now_utc, today_local
-from app.excel_utils import build_xlsx_response, read_xlsx_rows, parse_bool_ru, ExcelReadError
+from app.excel_utils import (build_xlsx_response, read_xlsx_rows, parse_bool_ru,
+                             ExcelReadError, YES_NO)
 from app.transmit import (explain, sku_quantity, enqueue_full_resend, enqueue_withdrawal,
                           should_withdraw, ever_transmitted,
                           offset_from_base, recompute_offset, sku_mode, MODE_AUTO,
@@ -33,6 +34,9 @@ from app.transmit import (explain, sku_quantity, enqueue_full_resend, enqueue_wi
 from app.offset_base import (ensure_snapshot_requested, set_base_date, stock_at_date,
                               stock_lookup)
 from app.recalc import active_job, create_job, last_job
+from app.broadcast_gate import (DEFERRABLE_CALC_STATUSES,
+                                calc_status as _calc_status,
+                                blocks_broadcast_on as _blocks_broadcast_on)
 
 router = APIRouter()
 templates = shared_templates
@@ -68,49 +72,6 @@ def _parse_date(raw: str) -> date | None:
     return datetime.strptime(raw, "%Y-%m-%d").date()
 
 
-def _calc_status(product: Product, has_cabinet: bool = True,
-                 enabled_ids: set[int] | None = None) -> tuple[str, str]:
-    """Состояние расчёта строки: (код, подпись для оператора).
-
-    Отвечает на единственный вопрос, который у оператора возникает на каталоге в
-    152 тысячи SKU: «эту строку я уже обработал или нет?». По цифрам в ячейке это
-    не понять — пустой факт выглядит одинаково и когда его не вводили, и когда
-    решили, что учёт 1С верен.
-
-    `ready` означает всё сразу: порог посчитан и подтверждён, отгрузки площадок
-    за период проведены в 1С, остаток ЦС актуален — товар можно включать в
-    трансляцию. Раньше этим словом назывался только посчитанный порог, но это
-    разные состояния, и путать их нельзя: с непроведёнными отгрузками остаток
-    завышен, и включённая трансляция отправит на площадки лишнее.
-    """
-    if not has_cabinet:
-        # Ни одного отмеченного кабинета: заказы спрашивать негде и транслировать
-        # некуда. Без этой подписи оператор видел «нужен расчёт», запускал его и
-        # получал молчаливый пустой проход — задание отчитывалось «0 заказов», а
-        # причина оставалась только в строке задания, которой на странице нет.
-        return ("no_cabinet", "не выбран кабинет")
-    if product.offset_base_date is None:
-        return ("none", "расчёт не начат")
-    if product.offset_base_stock is None:
-        return ("waiting", "ждём 1С")
-    if product.fact_at_date is None:
-        # Порог уже считается (сводится к брони), но человек цифру не подтвердил.
-        # Пока не подтвердил — строка не «обработана».
-        return ("need_fact", "нужен факт")
-    if product.recalc_done_at is None:
-        # Порог посчитан, но отгрузки на маркетплейсы за период в 1С ещё не
-        # проведены: остаток ЦС завышен, и включать трансляцию рано — уедет
-        # число больше реального.
-        return ("need_recalc", "нужен расчёт")
-    # Расчёт был, но после него отметили ещё кабинет. По нему заказы не поднимали,
-    # значит остаток не сверен именно с его продажами — «актуализирован» тут было
-    # бы неправдой, а ровно на эту неправду оператор и опирается, включая
-    # трансляцию. Транслировать в такой кабинет лестница не даёт (ступень 2).
-    if enabled_ids and not enabled_ids.issubset(covered_accounts(product)):
-        return ("need_recalc_account", "нужен пересчёт: добавлен кабинет")
-    return ("ready", "актуализирован")
-
-
 def _stamp_active_since(db: Session, uid_1c: str) -> None:
     """Проставить «Активно с» текущей датой при первой отметке кабинета.
 
@@ -122,26 +83,6 @@ def _stamp_active_since(db: Session, uid_1c: str) -> None:
     product = db.query(Product).filter(Product.uid_1c == uid_1c).first()
     if product is not None and product.broadcast_active_since is None:
         product.broadcast_active_since = today_local()
-
-
-def _blocks_broadcast_on(product: Product) -> str | None:
-    """Почему этот товар нельзя включать в трансляцию. None — можно.
-
-    Правило заказчика с самого начала одно: сначала расчёт, потом трансляция.
-    Ступень 2 лестницы закрывает случай «расчёт был, но кабинет отметили позже»,
-    а случай «расчёта не было вовсе» оставался открытым: у такого товара
-    `recalc_done_at` пуст, ступень не срабатывает, и включение отправляет на
-    площадки остаток, не сверенный ни с чем. Именно так выглядела строка
-    ZJYM269002 XL — «ждём 1С», а рядом «→ 21 после включения».
-
-    Проверяем на ВКЛЮЧЕНИИ. Выключение не трогаем никогда: снять с трансляции
-    должно быть можно в любой момент и без условий.
-    """
-    enabled_ids = {s.account_id for s in product.sync_settings if s.enabled}
-    code, label = _calc_status(product, bool(enabled_ids), enabled_ids)
-    if code == "ready":
-        return None
-    return label
 
 
 def _row(product: Product, accounts: list[PlatformAccount],
@@ -212,6 +153,10 @@ def _row(product: Product, accounts: list[PlatformAccount],
         "calc_status_label": _calc_status(product, has_cabinet, enabled_ids)[1],
         "transmit_override": product.transmit_override,   # legacy: только предупреждение
         "broadcast_enabled": product.broadcast_enabled,
+        # Просьба из файла Excel: трансляция включится сама, когда расчёт
+        # поставит отметку. Без этой подписи ожидание невидимо — строка просто
+        # стоит выключенной, и оператор включает её руками второй раз.
+        "broadcast_requested": product.broadcast_requested_at is not None,
         "active_since": product.broadcast_active_since,
         "has_barcode": len(product.barcodes) > 0,
         "sku_quantity": sku_quantity(product),
@@ -697,6 +642,10 @@ def toggle_broadcast(
                     error=f"Включать трансляцию рано: {blocked}. Сначала расчёт — "
                           f"иначе на площадки уйдёт остаток, не сверенный с их продажами.")
         product.broadcast_enabled = enabled
+        # Выключили руками — просьба «включить после расчёта» снимается вместе с
+        # галочкой. Иначе ближайший расчёт вернул бы трансляцию сам, молча и
+        # вопреки только что сделанному выключению.
+        product.broadcast_requested_at = None
         log_action(db, user.username, "broadcast_toggled", f"{uid_1c} -> {enabled}")
         if enabled:
             _repropagate(db, product, reason="broadcast_toggled")
@@ -992,8 +941,10 @@ def bulk_edit(
             p.fact_at_date = None
         elif action == "broadcast_on":
             p.broadcast_enabled = True
+            p.broadcast_requested_at = None
         elif action == "broadcast_off":
             p.broadcast_enabled = False
+            p.broadcast_requested_at = None    # см. toggle_broadcast
         elif action == "set_active_since":
             p.broadcast_active_since = d
         elif action == "set_base_date":
@@ -1134,7 +1085,14 @@ def products_export(
         # и импортирует обратно, считая, что охватил весь каталог.
         data.append([f"⚠ показаны первые {len(data)} строк из {total} — уточните поиск или фильтр"])
 
-    return build_xlsx_response(headers, data, "товары_и_остатки.xlsx")
+    # Да/Нет — выбором из списка, а не набором руками. Опечатку в этих двух
+    # колонках импорт читает как «Нет» и молча выключает то, что оператор
+    # включал: пустая ячейка, «+», «да» с лишним пробелом дают один и тот же
+    # результат, и увидеть его можно только по числу «изменено строк».
+    choices = {"Трансляция": YES_NO}
+    for account in accounts:
+        choices[f"{_account_label(account)} — Синхронизировать"] = YES_NO
+    return build_xlsx_response(headers, data, "товары_и_остатки.xlsx", choices=choices)
 
 
 @router.post("/products/import")
@@ -1164,6 +1122,10 @@ def products_import(
         return RedirectResponse("/products", status_code=303)
 
     updated, unchanged, errors = 0, 0, []
+    deferred = 0                # строк, которые включатся сами после расчёта
+    # По uid, а не списком: один товар может встретиться в файле дважды, и
+    # задание получило бы по нему две одинаковые строки.
+    needs_recalc: dict[str, Product] = {}
     # Кэш поиска остатка по датам, встретившимся в файле. Обычно дата одна на
     # весь файл, но полагаться на это нельзя. Без кэша импорт пятидесяти тысяч
     # строк — это сто тысяч запросов к базе.
@@ -1179,6 +1141,7 @@ def products_import(
             continue
 
         touched = False
+        date_changed = False    # дату задали этим файлом — значит дальше расчёт
 
         if "Резерв" in row:
             try:
@@ -1213,6 +1176,7 @@ def products_import(
                 set_base_date(db, product, desired_day,
                               lookup=lookups.get(desired_day))
                 touched = True
+                date_changed = True
 
         if "Факт на дату" in row:
             raw = row.get("Факт на дату")
@@ -1247,11 +1211,15 @@ def products_import(
                         product.transmit_override = None
                     touched = True
 
-        if "Трансляция" in row:
-            desired_broadcast = parse_bool_ru(row.get("Трансляция"))
-            if product.broadcast_enabled != desired_broadcast:
-                product.broadcast_enabled = desired_broadcast
-                touched = True
+        # Кабинеты разбираются РАНЬШЕ «Трансляции» намеренно. Гейт включения
+        # спрашивает, есть ли отмеченный кабинет, покрытый расчётом; разбери мы
+        # их после, в одном файле нельзя было бы и отметить кабинет, и включить
+        # трансляцию — самый обычный сценарий массовой настройки.
+        # Какие кабинеты окажутся отмеченными ПОСЛЕ применения файла. Считаем
+        # сами, а не через product.sync_settings: сессия живёт с autoflush=False,
+        # и только что добавленная настройка в коллекции объекта не появится —
+        # гейт включения увидел бы товар без единого кабинета и отказал.
+        enabled_after = {s.account_id for s in product.sync_settings if s.enabled}
 
         for label, account in label_to_account.items():
             sync_col = f"{label} — Синхронизировать"
@@ -1291,7 +1259,57 @@ def products_import(
                 enqueue_withdrawal(db, uid_1c, account.id)
             setting.enabled = desired_enabled
             setting.min_threshold = max(0, desired_threshold)
+            enabled_after.add(account.id) if desired_enabled else enabled_after.discard(account.id)
             touched = True
+
+        if "Трансляция" in row:
+            desired_broadcast = parse_bool_ru(row.get("Трансляция"))
+            # Тот же гейт, что и в интерфейсе: сначала расчёт, потом трансляция.
+            # Без него Excel оставался обходным путём — строку, которой страница
+            # включать не даёт, можно было включить файлом, и на площадки уехал
+            # бы остаток, не сверенный с их продажами. Причём сразу пачкой.
+            # Выключение не ограничено ничем и никогда.
+            code, label = _calc_status(product, bool(enabled_after), enabled_after)
+            blocked = None if (not desired_broadcast or code == "ready") else label
+            if blocked and not product.broadcast_enabled:
+                if code in DEFERRABLE_CALC_STATUSES:
+                    # Не ошибка, а ПРОСЬБА. Оператор одним файлом задаёт дату,
+                    # факт, кабинеты и трансляцию — так он и думает о работе.
+                    # Расчёт после этого идёт минутами и заканчивается уже без
+                    # него, поэтому включать приходилось вторым заходом, разыскав
+                    # те же строки в каталоге на сто пятьдесят тысяч позиций.
+                    # Гейт при этом не ослаблен ни на грамм: включит строку
+                    # `broadcast_gate.apply_pending_broadcast` ровно тогда, когда
+                    # её включила бы и страница.
+                    if product.broadcast_requested_at is None:
+                        product.broadcast_requested_at = now_utc()
+                        touched = True
+                    deferred += 1
+                else:
+                    # Само не рассосётся: без кабинета заказы спрашивать негде,
+                    # без даты расчёт не с чего начать, факт вводит человек.
+                    errors.append(f"строка {i}: трансляцию включить нельзя — {blocked}")
+            elif product.broadcast_enabled != desired_broadcast:
+                product.broadcast_enabled = desired_broadcast
+                touched = True
+            if not desired_broadcast and product.broadcast_requested_at is not None:
+                # «Нет» в файле снимает и просьбу тоже: иначе трансляция
+                # вернулась бы сама после ближайшего расчёта — молча и вопреки
+                # тому, что оператор только что написал в файле.
+                product.broadcast_requested_at = None
+                touched = True
+
+        # Расчёт — следующий шаг ровно для тех строк, которым его и не хватает.
+        # Запускаем его сами по двум поводам: дата задана этим файлом, или файл
+        # попросил включить трансляцию. Оператор запускал его руками и по
+        # памяти: в файле тысячи строк, отбор на странице к этому моменту уже
+        # другой, и найти в каталоге ровно те же строки нечем.
+        wants = product.broadcast_requested_at is not None
+        if ((date_changed or wants) and product.offset_base_date is not None
+                and enabled_after
+                and _calc_status(product, True, enabled_after)[0]
+                in DEFERRABLE_CALC_STATUSES):
+            needs_recalc[product.uid_1c] = product
 
         if touched:
             # Один пересчёт на строку, уже после того как применены и дата, и
@@ -1303,10 +1321,28 @@ def products_import(
         else:
             unchanged += 1
 
+    recalc_note = ""
+    if needs_recalc:
+        running = active_job(db)
+        if running is not None:
+            recalc_note = (f" Расчёт НЕ запущен: уже идёт задание #{running.id} "
+                           f"({running.processed} из {running.total}). Запустите его "
+                           f"по этим строкам сами, когда оно закончится.")
+        else:
+            job = create_job(db, list(needs_recalc.values()), user.username)
+            log_action(db, user.username, "recalc_started",
+                       f"задание #{job.id} из импорта Excel, товаров {len(needs_recalc)}")
+            recalc_note = f" Запущен расчёт: {len(needs_recalc)} товаров (задание #{job.id})."
+
     log_action(db, user.username, "products_bulk_import_excel", f"updated={updated}")
     db.commit()
 
     message = f"Изменено строк: {updated}. Без изменений: {unchanged}."
+    if deferred:
+        message += (f" Ждут расчёта и включатся сами: {deferred} — трансляцию по ним "
+                    f"откроет не файл, а расчёт, когда остаток будет сверен с "
+                    f"продажами площадок.")
+    message += recalc_note
     if errors:
         shown = "; ".join(errors[:5])
         more = f" и ещё {len(errors) - 5}" if len(errors) > 5 else ""

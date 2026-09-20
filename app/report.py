@@ -21,7 +21,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
+
+# Запись без времени создания (данные до появления колонки) не должна
+# выигрывать у свежих — считаем её самой старой.
+_OLDEST = datetime.min
 
 from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
@@ -146,7 +150,7 @@ def current_dispatch_errors(db: Session, account_id: int | None = None) -> list[
     отчёт. 20.09 на бою они разошлись: отчёт сказал «1 запись», а счётчик
     кабинета — «751», потому что считал все строки в `error` за всё время,
     включая мёртвые от уже починенного дефекта. Две страницы, противоречащие
-    друг другу, хуже одной неточной:верить перестают обеим.
+    друг другу, хуже одной неточной: верить перестают обеим.
     """
     query = db.query(DispatchQueueItem).filter(
         DispatchQueueItem.status == DispatchStatus.error,
@@ -154,11 +158,12 @@ def current_dispatch_errors(db: Session, account_id: int | None = None) -> list[
     )
     if account_id is not None:
         query = query.filter(DispatchQueueItem.account_id == account_id)
-    return [r for r in query.all() if not _superseded(db, r)]
+    latest = latest_queue_ids(db)
+    return [r for r in query.all() if r.id in latest]
 
 
-def _superseded(db: Session, row: DispatchQueueItem) -> bool:
-    """Есть ли по этой паре товар+кабинет запись НОВЕЕ этой.
+def latest_queue_ids(db: Session) -> set[int]:
+    """Id последних записей очереди по каждой паре товар+кабинет.
 
     Очередь событийная: каждая новая запись по паре отменяет смысл всех
     предыдущих — отправлять будут её. Поэтому расхождение описывает ПОСЛЕДНЯЯ
@@ -170,19 +175,27 @@ def _superseded(db: Session, row: DispatchQueueItem) -> bool:
     отчёт вечно писал бы по ним «площадка продаёт то, чего нет», хотя текущее
     состояние этих пар уже сказано свежей записью: «нет карточки, разбор
     мэппинга». Вечно красный отчёт оператор пролистывает не читая.
+
+    ОДИН запрос на всю очередь, а не запрос на строку. Сначала было наоборот, и
+    это стоило дорого: на бою в очереди 864 записи в `error`, то есть 864
+    запроса на каждую сборку отчёта — а его собирают страница «Расхождений»
+    (сама, раз в две минуты), сводка на «Диагностике», счётчик КАЖДОГО кабинета
+    и воркер раз в час. Три колонки по всей очереди читаются за миллисекунды.
     """
-    return db.query(DispatchQueueItem.id).filter(
-        DispatchQueueItem.uid_1c == row.uid_1c,
-        DispatchQueueItem.account_id == row.account_id,
-        DispatchQueueItem.is_test.is_(False),
-        DispatchQueueItem.id != row.id,
-        DispatchQueueItem.created_at >= row.created_at,
-    ).filter(
-        # Ровно «новее»: при равном времени решает id, иначе две записи одной
-        # секунды погасили бы друг друга и пара исчезла бы из отчёта совсем.
-        or_(DispatchQueueItem.created_at > row.created_at,
-            DispatchQueueItem.id > row.id),
-    ).first() is not None
+    best: dict[tuple[str, int], tuple] = {}
+    rows = db.query(
+        DispatchQueueItem.id, DispatchQueueItem.uid_1c,
+        DispatchQueueItem.account_id, DispatchQueueItem.created_at,
+    ).filter(DispatchQueueItem.is_test.is_(False)).all()
+
+    for row_id, uid_1c, account_id, created_at in rows:
+        key = (uid_1c, account_id)
+        # При равном времени решает id, иначе две записи одной секунды погасили
+        # бы друг друга и пара исчезла бы из отчёта совсем.
+        mark = (created_at or _OLDEST, row_id)
+        if key not in best or mark > best[key]:
+            best[key] = mark
+    return {mark[1] for mark in best.values()}
 
 
 def _check_unknown_sku(db: Session) -> Finding | None:
@@ -203,7 +216,8 @@ def _check_unknown_sku(db: Session) -> Finding | None:
     # Пара товар+кабинет считается один раз: после двух прогонов массовой
     # переотправки по одному и тому же нерешённому товару лежит две записи, а
     # разбирать человеку нечего дважды — это одна неразрешённая пара.
-    rows = [r for r in rows if not _superseded(db, r)]
+    latest = latest_queue_ids(db)
+    rows = [r for r in rows if r.id in latest]
     if not rows:
         return None
     return Finding(
@@ -239,7 +253,8 @@ def _check_dispatch_errors(db: Session) -> Finding | None:
     ).all()
     # Показываем только ПОСЛЕДНЮЮ запись пары товар+кабинет: всё, что было до
     # неё, описывает прошлое состояние, а не текущее (см. `_superseded`).
-    rows = [r for r in rows if not _superseded(db, r)]
+    latest = latest_queue_ids(db)
+    rows = [r for r in rows if r.id in latest]
     if not rows:
         return None
     return Finding(

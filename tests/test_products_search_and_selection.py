@@ -142,3 +142,53 @@ def test_the_filter_is_restored_after_a_redraw():
 
     restore = page.split("function restore()", 1)[1][:300]
     assert "applyOnlySelected()" in restore
+
+
+# ------------------------------- Excel не должен быть обходным путём
+
+def test_excel_cannot_switch_broadcast_on_without_the_calculation(logged_in_client, web_db):
+    """Интерфейс включить трансляцию у строки без расчёта не даёт вовсе: у
+    такого товара остаток ничем не сверен, и на площадки уедет завышённое
+    число. Через файл это делалось бы сразу пачкой — и молча."""
+    import io
+    from openpyxl import Workbook
+
+    web_db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=10))
+    web_db.commit()
+
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["ID_1С", "Трансляция"])
+    ws.append(["u1", "Да"])
+    buf = io.BytesIO()
+    wb.save(buf)
+
+    r = logged_in_client.post("/products/import",
+                              files={"file": ("t.xlsx", buf.getvalue())},
+                              follow_redirects=False)
+
+    assert r.status_code == 303
+    product = web_db.query(Product).filter(Product.uid_1c == "u1").one()
+    assert product.broadcast_enabled is False, "файл обошёл проверку страницы"
+
+
+def test_excel_can_always_switch_broadcast_off(logged_in_client, web_db):
+    """Выключение не ограничено ничем и никогда — снять с трансляции должно
+    быть можно в любой момент."""
+    import io
+    from openpyxl import Workbook
+
+    web_db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=10,
+                       broadcast_enabled=True))
+    web_db.commit()
+
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["ID_1С", "Трансляция"])
+    ws.append(["u1", "Нет"])
+    buf = io.BytesIO()
+    wb.save(buf)
+
+    logged_in_client.post("/products/import", files={"file": ("t.xlsx", buf.getvalue())})
+
+    assert web_db.query(Product).filter(Product.uid_1c == "u1").one().broadcast_enabled is False

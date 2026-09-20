@@ -51,6 +51,11 @@
                «Цвет» за край таблицы. #}
             <div class="pr-hint">перемещения в 1С созданы — можно включать трансляцию</div>
         {% endif %}
+        {% if row.broadcast_requested and not row.broadcast_enabled %}
+            {# Ожидание обязано быть видно: иначе строка выглядит просто
+               выключенной, и оператор включает её вторым заходом руками. #}
+            <div class="pr-hint">трансляция включится сама после расчёта (просьба из файла)</div>
+        {% endif %}
         <div class="pr-calcrow">
             <label>на дату</label>
             <input type="date" value="{{ row.base_date.isoformat() if row.base_date else '' }}" class="pr-date"
