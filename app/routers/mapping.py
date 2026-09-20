@@ -1,10 +1,10 @@
 from fastapi import APIRouter, Request, Depends, Query, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
-from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import or_
 
 from app.database import get_db
+from app.templating import templates as shared_templates
 from app.dependencies import get_current_user
 from app.models import Barcode, Product, MappingConflict, Platform, PlatformAccount, PlatformCatalogItem, User
 from app.excel_utils import build_xlsx_response, read_xlsx_rows, format_dt, ExcelReadError
@@ -15,7 +15,7 @@ from app.workers.catalog_sync import load_platform_catalog
 from app.workers.credentials import CredentialsMissing
 
 router = APIRouter()
-templates = Jinja2Templates(directory="app/templates")
+templates = shared_templates
 
 
 def _query_mapped(db: Session, q: str, source_platform: str):

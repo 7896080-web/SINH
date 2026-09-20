@@ -108,6 +108,55 @@ NO_CARD_MARK = "нет карточки в каталоге кабинета"
 CARD_MISSING_MARKS = (UNKNOWN_SKU_MARK, NO_CARD_MARK)
 
 
+def _describe_pairs(db: Session, rows: list[DispatchQueueItem],
+                    limit: int = 10) -> list[str]:
+    """Строки находки в виде, пригодном для разбора: артикул, название, кабинет.
+
+    20.09 на бою находка «площадка не знает наш sku» перечисляла внутренние
+    идентификаторы вида `051ce509-a048-11ef-…`: в базе по ним всё находится, а
+    человеку, который идёт с этим списком в кабинет площадки, они не говорят
+    ничего. Находка обязана называть товар так, как его называют люди.
+
+    Один запрос на всю пачку, а не по строке: отчёт собирается раз в час и на
+    каждой странице, и N+1 здесь стоил бы секунд на каталоге в 152 тысячи SKU.
+    """
+    rows = rows[:limit]
+    uids = {r.uid_1c for r in rows}
+    products = {p.uid_1c: p for p in
+                db.query(Product).filter(Product.uid_1c.in_(uids)).all()} if uids else {}
+    names = {a.id: a.name for a in db.query(PlatformAccount).all()}
+
+    out = []
+    for r in rows:
+        product = products.get(r.uid_1c)
+        article = (product.article if product else "") or r.uid_1c
+        name = (product.name if product else "") or ""
+        cabinet = names.get(r.account_id, "")
+        line = " · ".join(x for x in (article, name[:45], cabinet) if x)
+        if r.sent_sku:
+            line += f" (sku {r.sent_sku})"
+        out.append(line)
+    return out
+
+
+def current_dispatch_errors(db: Session, account_id: int | None = None) -> list[DispatchQueueItem]:
+    """Отказы рассылки, описывающие ТЕКУЩЕЕ состояние пар товар+кабинет.
+
+    Вынесено наружу, чтобы «Диагностика» считала ровно то же, что показывает
+    отчёт. 20.09 на бою они разошлись: отчёт сказал «1 запись», а счётчик
+    кабинета — «751», потому что считал все строки в `error` за всё время,
+    включая мёртвые от уже починенного дефекта. Две страницы, противоречащие
+    друг другу, хуже одной неточной:верить перестают обеим.
+    """
+    query = db.query(DispatchQueueItem).filter(
+        DispatchQueueItem.status == DispatchStatus.error,
+        DispatchQueueItem.is_test.is_(False),
+    )
+    if account_id is not None:
+        query = query.filter(DispatchQueueItem.account_id == account_id)
+    return [r for r in query.all() if not _superseded(db, r)]
+
+
 def _superseded(db: Session, row: DispatchQueueItem) -> bool:
     """Есть ли по этой паре товар+кабинет запись НОВЕЕ этой.
 
@@ -165,7 +214,7 @@ def _check_unknown_sku(db: Session) -> Finding | None:
                     "Оверселла тут не будет (продавать нечего), но пара висит "
                     "нерешённой: либо карточку заводить, либо снимать галочку.",
         count=len(rows), link="/products",
-        details=[f"{r.sent_sku or r.uid_1c}" for r in rows[:10]],
+        details=_describe_pairs(db, rows),
     )
 
 
@@ -199,7 +248,8 @@ def _check_dispatch_errors(db: Session) -> Finding | None:
         consequence="Остаток у нас уже списан, а на площадку новое число не ушло — "
                     "она продолжает продавать по старому, то есть продаёт то, чего нет.",
         count=len(rows), link="/diagnostics",
-        details=[f"{r.uid_1c}: {(r.last_error or '')[:120]}" for r in rows[:10]],
+        details=[f"{line} — {(row.last_error or '')[:90]}"
+                 for line, row in zip(_describe_pairs(db, rows), rows[:10])],
     )
 
 
@@ -565,6 +615,22 @@ def _check_reconciliation_review(db: Session) -> Finding | None:
     ).count()
     if not count:
         return None
+    rows = db.query(ReconciliationLog).filter(
+        ReconciliationLog.classification == ReconciliationClassification.needs_review,
+        ReconciliationLog.checked_at >= since,
+    ).order_by(ReconciliationLog.checked_at.desc()).limit(10).all()
+    products = {p.uid_1c: p for p in db.query(Product).filter(
+        Product.uid_1c.in_({r.uid_1c for r in rows})).all()} if rows else {}
+
+    def line(row):
+        product = products.get(row.uid_1c)
+        article = (product.article if product else "") or row.uid_1c
+        name = ((product.name if product else "") or "")[:40]
+        # Именно «у нас было / в 1С стало»: разница сама по себе ни о чём не
+        # говорит, а пара чисел сразу показывает, куда уехал склад.
+        return (f"{article} · {name} — у нас было {row.python_stock}, "
+                f"в 1С {row.actual_1c} (разница {row.delta:+d})")
+
     return Finding(
         key="reconciliation_review", level=WARNING,
         title=f"Крупных расхождений со складом 1С за сутки: {count}",
@@ -573,6 +639,7 @@ def _check_reconciliation_review(db: Session) -> Finding | None:
                     "но сама разница означает пересортицу или ошибку учёта на "
                     "складе, и её стоит разобрать там.",
         count=count, link="/diagnostics",
+        details=[line(r) for r in rows],
     )
 
 

@@ -143,7 +143,7 @@
            браузер трактовал как её нажатие, и при вводе артикула сам собой
            скачивался файл выгрузки. Поиск и так живой (htmx по keyup), Enter в
            нём не нужен вовсе. #}
-        <input type="search" id="q" name="q" value="{{ q }}" placeholder="артикул, наименование"
+        <input type="search" id="q" name="q" value="{{ q }}" placeholder="артикул, наименование, штрихкод"
                onkeydown="if (event.key === 'Enter') event.preventDefault();">
     </div>
     <label class="checkbox-inline" style="padding-bottom:8px;">
@@ -163,6 +163,14 @@
            title="Дата расчёта задана, но 1С ещё не ответила либо факт не введён.">
         <input type="checkbox" name="only_unfinished" value="true" {% if only_unfinished %}checked{% endif %}>
         Только незавершённый расчёт
+    </label>
+    {# Фильтр отметок — КЛИЕНТСКИЙ, и иначе быть не может: галочки строк живут
+       в браузере, сервер о них не знает вовсе. Поэтому он не уходит в запрос,
+       а прячет неотмеченные строки прямо на странице. #}
+    <label class="checkbox-inline" style="padding-bottom:8px;"
+           title="Прячет строки без галочки. Отметки живут в браузере, поэтому фильтр работает по загруженным строкам: если вы отмечали «все по фильтру», показаны будут только те из них, что есть на странице.">
+        <input type="checkbox" id="only-selected">
+        Только отмеченные товары
     </label>
     <label class="checkbox-inline" style="padding-bottom:8px;"
            title="Отмечен хотя бы один кабинет — то есть по этому товару уже принято решение передавать его наружу. Кабинет при этом не обязан быть активным: галочку ставил человек, и выключение кабинета его решения не отменяет.">
@@ -296,6 +304,25 @@
     function restore() {
         boxes().forEach(function (cb) { cb.checked = selected.has(cb.value); });
         paint();
+        applyOnlySelected();
+    }
+
+    // «Только отмеченные» — фильтр по галочкам строк. Он КЛИЕНТСКИЙ, и иначе
+    // быть не может: отметки живут в браузере (sessionStorage), сервер о них не
+    // знает вовсе, а отправить их запросом нельзя — отмеченных бывают сотни, и
+    // адрес строки такого не выдержит.
+    //
+    // Отсюда честное ограничение, о котором сказано в подсказке к галочке:
+    // прячутся строки НА СТРАНИЦЕ. Если оператор нажал «отметить весь отбор»,
+    // показаны будут только те из отбора, что уже загружены.
+    function applyOnlySelected() {
+        var on = document.getElementById("only-selected");
+        if (!on) return;
+        boxes().forEach(function (cb) {
+            var row = cb.closest("tr");
+            if (!row) return;
+            row.hidden = on.checked && !cb.checked;
+        });
     }
 
     document.addEventListener("change", function (e) {
@@ -343,6 +370,17 @@
     // потребует правки здесь — и не сможет сломать отбор молча.
     document.body.addEventListener("htmx:afterSwap", function () {
         restore();
+    });
+
+    // Щелчок по самому фильтру и по любой галочке строки: список скрытых строк
+    // обязан пересобираться сразу, иначе снятая отметка оставляет строку
+    // висеть в отфильтрованном списке — и её правят, думая, что она отмечена.
+    document.addEventListener("change", function (e) {
+        if (e.target && (e.target.id === "only-selected"
+                         || e.target.name === "uids"
+                         || e.target.id === "pr-all")) {
+            applyOnlySelected();
+        }
     });
 
     // Фильтры отработали — переписать адресную строку, чтобы F5 их не терял.

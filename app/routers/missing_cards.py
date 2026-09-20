@@ -12,10 +12,10 @@
 
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import HTMLResponse
-from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.templating import templates as shared_templates
 from app.dependencies import get_current_user
 from app.excel_utils import build_xlsx_response
 from app.missing_cards import (PAGE_LIMIT, PLATFORM_LABELS, collect_missing,
@@ -24,7 +24,7 @@ from app.models import Platform, User
 from app.timeutils import now_utc
 
 router = APIRouter()
-templates = Jinja2Templates(directory="app/templates")
+templates = shared_templates
 
 # Пересчёт идёт по всему каталогу с остатком, поэтому реже, чем на «Расхождениях»:
 # список меняется от выгрузки каталога (раз в сутки) и прихода из 1С (раз в час),

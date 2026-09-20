@@ -3,10 +3,10 @@ from datetime import datetime, date
 
 from fastapi import APIRouter, Request, Depends, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
-from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.templating import templates as shared_templates
 from app.dependencies import get_current_user
 from app.models import (
     Product, Barcode, SyncSetting, PlatformAccount, ProcessedOrder, OrderProcessStatus,
@@ -26,7 +26,7 @@ from app.flash import set_flash, pop_flash
 from app.timeutils import today_local
 
 router = APIRouter()
-templates = Jinja2Templates(directory="app/templates")
+templates = shared_templates
 
 
 

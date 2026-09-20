@@ -14,11 +14,11 @@ from datetime import date, datetime
 
 from fastapi import APIRouter, Request, Depends, Form, Query, UploadFile, File
 from fastapi.responses import HTMLResponse, RedirectResponse
-from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
+from app.templating import templates as shared_templates
 from app.dependencies import get_current_user
 from app.models import (Barcode, Platform, PlatformAccount, PlatformCatalogItem,
                         Product, SyncSetting, User)
@@ -35,7 +35,7 @@ from app.offset_base import (ensure_snapshot_requested, set_base_date, stock_at_
 from app.recalc import active_job, create_job, last_job
 
 router = APIRouter()
-templates = Jinja2Templates(directory="app/templates")
+templates = shared_templates
 
 
 def _active_accounts(db: Session) -> list[PlatformAccount]:
@@ -247,7 +247,20 @@ def _base_query(db: Session, q: str, only_proposals: bool, only_blocked: bool,
     query = db.query(Product).options(joinedload(Product.sync_settings), joinedload(Product.barcodes))
     if q:
         like = f"%{q}%"
-        query = query.filter(or_(Product.article.ilike(like), Product.name.ilike(like)))
+        # Штрихкод ищется наравне с артикулом и названием: оператор приходит сюда
+        # со сканером или из кабинета площадки, где у позиции виден ИМЕННО он, —
+        # и без этого поиска ему приходилось идти в «Мэппинг», там узнавать
+        # товар, а потом искать его здесь заново.
+        #
+        # Коррелированный EXISTS, а не JOIN: баркодов у товара несколько, и JOIN
+        # размножил бы строки товара по числу совпавших баркодов.
+        query = query.filter(or_(
+            Product.article.ilike(like),
+            Product.name.ilike(like),
+            db.query(Barcode.id)
+              .filter(Barcode.uid_1c == Product.uid_1c, Barcode.barcode.ilike(like))
+              .exists(),
+        ))
     if only_proposals:
         query = query.filter(Product.sync_settings.any(SyncSetting.has_proposal.is_(True)))
     if only_blocked:

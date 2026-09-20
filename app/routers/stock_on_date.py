@@ -19,12 +19,12 @@ from datetime import date, datetime
 
 from fastapi import APIRouter, Request, Depends, Form, Query
 from fastapi.responses import HTMLResponse, RedirectResponse
-from fastapi.templating import Jinja2Templates
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.audit import log_action
 from app.database import get_db
+from app.templating import templates as shared_templates
 from app.dependencies import get_current_user
 from app.excel_utils import build_xlsx_response
 from app.flash import set_flash, pop_flash
@@ -33,7 +33,7 @@ from app.offset_base import open_request
 from app.timeutils import today_local
 
 router = APIRouter()
-templates = Jinja2Templates(directory="app/templates")
+templates = shared_templates
 
 # Сколько строк показываем на странице. Выгрузка — это склад целиком (тысячи
 # позиций), рисовать её всю в браузере незачем: для полного списка есть Excel.
