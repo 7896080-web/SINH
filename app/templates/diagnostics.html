@@ -9,7 +9,7 @@
     </div>
 </div>
 
-<div class="card">
+<div class="card" id="findings">
     <h3 style="margin-top:0">
         Расхождения
         {% if report_critical %}
@@ -37,7 +37,7 @@
     <p style="margin-bottom:0"><a href="/report">Полный отчёт о расхождениях →</a></p>
 </div>
 
-<div class="card">
+<div class="card" id="resend">
     <h3 style="margin-top:0">Переотправка остатков</h3>
     <p class="help-text" style="margin-top:0">
         Ставит в очередь текущий остаток по всем транслируемым товарам и всем
@@ -53,7 +53,7 @@
     </form>
 </div>
 
-<div class="card">
+<div class="card" id="reconciliation">
     <h3 style="margin-top:0">Старые расхождения сверки</h3>
     <p class="help-text" style="margin-top:0">
         До сентябрьской правки крупная разница с 1С помечалась «ждёт решения» и
@@ -69,7 +69,7 @@
     </form>
 </div>
 
-<div class="card">
+<div class="card" id="overview">
     <h3 style="margin-top:0">Общая картина</h3>
     <div class="table-scroll"><table>
         <tr><td>Конфликтов сопоставления</td><td class="mono" style="text-align:right">{{ global_stats.conflicts }}</td></tr>
@@ -78,7 +78,7 @@
     </table></div>
 </div>
 
-<div class="card">
+<div class="card" id="stuck-tasks">
     <h3 style="margin-top:0">Зависшие задания 1С — нужен разбор</h3>
     {% if stuck_tasks %}
     <p class="help-text" style="margin-top:0">
@@ -167,7 +167,7 @@
     {% endif %}
 </div>
 
-<div class="card">
+<div class="card" id="workers">
     <h3 style="margin-top:0">Общие фоновые процессы</h3>
     <div class="table-scroll"><table>
         <thead><tr><th>Процесс</th><th>Последний запуск</th><th>Статус</th></tr></thead>
@@ -193,9 +193,10 @@
     </table></div>
 </div>
 
+<h3 id="accounts" style="margin-top:24px">Кабинеты площадок</h3>
 {% for row in account_rows %}
 {% set account = row.account %}
-<div class="card" style="{% if not account.is_active %}opacity:0.6;{% endif %}">
+<div class="card" id="account-{{ account.id }}" style="{% if not account.is_active %}opacity:0.6;{% endif %}">
     <div style="display:flex; justify-content:space-between; align-items:baseline; flex-wrap:wrap; gap:8px;">
         <h3 style="margin-top:0">
             {{ account.name }}

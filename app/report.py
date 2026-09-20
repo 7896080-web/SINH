@@ -262,7 +262,7 @@ def _check_dispatch_errors(db: Session) -> Finding | None:
         title=f"Рассылка не доехала до площадки: {len(rows)} записей",
         consequence="Остаток у нас уже списан, а на площадку новое число не ушло — "
                     "она продолжает продавать по старому, то есть продаёт то, чего нет.",
-        count=len(rows), link="/diagnostics",
+        count=len(rows), link="/diagnostics#accounts",
         details=[f"{line} — {(row.last_error or '')[:90]}"
                  for line, row in zip(_describe_pairs(db, rows), rows[:10])],
     )
@@ -342,7 +342,7 @@ def _check_platform_divergence(db: Session) -> Finding | None:
         key="platform_divergence", level=level,
         title=f"Площадка держит не то, что мы отправили: {len(rows)} позиций",
         consequence=consequence,
-        count=len(rows), link="/diagnostics",
+        count=len(rows), link="/diagnostics#accounts",
         details=[f"{r.sent_sku}: отправили {r.sent_quantity}, площадка держит "
                  f"{r.verified_quantity} ({_age(r.verified_at)} назад)" for r in rows[:10]],
     )
@@ -360,7 +360,7 @@ def _check_tasks_needing_review(db: Session) -> Finding | None:
         title=f"Заданий 1С ждут ручного разбора: {len(rows)}",
         consequence="Пока решение не принято, эти единицы считаются «в пути»: остаток "
                     "занижен, и наружу уходит меньше товара, чем есть на складе.",
-        count=len(rows), link="/diagnostics",
+        count=len(rows), link="/diagnostics#stuck-tasks",
         details=[f"заказ {t.order_id}, {t.barcode}, {t.quantity} шт" for t in rows[:10]],
     )
 
@@ -398,7 +398,7 @@ def _check_breaker_disabled(db: Session) -> Finding | None:
         title=f"Кабинетов отключено предохранителем: {len(rows)}",
         consequence="Заказы по ним не опрашиваются вовсе: продажи идут, а у нас "
                     "не списывается ничего и в 1С не создаётся ни одного документа.",
-        count=len(rows), link="/diagnostics",
+        count=len(rows), link="/diagnostics#accounts",
         details=[f"{a.name}: {(a.last_error or '')[:100]}" for a in rows[:10]],
     )
 
@@ -429,7 +429,7 @@ def _check_stuck_1c_tasks(db: Session) -> Finding | None:
         consequence=f"Эти {units} ед. считаются «в пути» и вычитаются из остатка — "
                     "наружу уходит меньше, чем есть. Автоповтор ещё не исчерпан, "
                     "но если число не убывает, разбирать придётся руками.",
-        count=len(rows), link="/diagnostics",
+        count=len(rows), link="/diagnostics#stuck-tasks",
         details=[f"заказ {t.order_id}, {t.barcode}, {t.quantity} шт, {t.status.value}"
                  for t in rows[:10]],
     )
@@ -499,7 +499,7 @@ def _check_stale_reconciliation(db: Session) -> Finding | None:
         title=f"Остаток ЦС не сверялся с 1С: {_age(last)}",
         consequence="Мы рассылаем на площадки своё представление об остатке, и чем "
                     "дольше оно не сверялось, тем дальше оно от того, что в 1С.",
-        count=1, link="/diagnostics",
+        count=1, link="/diagnostics#workers",
     )
 
 
@@ -518,7 +518,7 @@ def _check_dispatch_stuck(db: Session) -> Finding | None:
         title=f"Записей рассылки ждут дольше {_age(cutoff)}: {count}",
         consequence="Остаток у нас уже изменился, а на площадке всё ещё старое число. "
                     "Либо площадка не отвечает, либо цикл рассылки не идёт.",
-        count=count, link="/diagnostics",
+        count=count, link="/diagnostics#accounts",
     )
 
 
@@ -653,7 +653,7 @@ def _check_reconciliation_review(db: Session) -> Finding | None:
                     "переписала его по 1С — то есть наружу уходит число из 1С, — "
                     "но сама разница означает пересортицу или ошибку учёта на "
                     "складе, и её стоит разобрать там.",
-        count=count, link="/diagnostics",
+        count=count, link="/diagnostics#reconciliation",
         details=[line(r) for r in rows],
     )
 
@@ -670,7 +670,7 @@ def _check_worker_failures(db: Session) -> Finding | None:
         title=f"Воркеров с ошибкой в последнем прогоне: {len(rows)}",
         consequence="Задание отработало неуспешно. Что именно встало — видно по "
                     "имени: опрос заказов, рассылка, канал 1С или сверка.",
-        count=len(rows), link="/diagnostics",
+        count=len(rows), link="/diagnostics#workers",
         details=[f"{r.worker_name}: {(r.last_error or '')[:100]}" for r in rows[:10]],
     )
 

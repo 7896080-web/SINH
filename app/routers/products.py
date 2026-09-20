@@ -85,8 +85,24 @@ def _stamp_active_since(db: Session, uid_1c: str) -> None:
         product.broadcast_active_since = today_local()
 
 
+def _uids_with_barcode(db: Session, products: list[Product]) -> set[str]:
+    """У кого из показанных товаров есть хоть один баркод — ОДНИМ запросом.
+
+    Раньше это знание приезжало через `joinedload(Product.barcodes)`: к каждому
+    товару подтягивались все его баркоды, хотя строке нужен один-единственный
+    факт «есть или нет». На каталоге в 152 тысячи товаров и 154 тысячи баркодов
+    это лишний join на каждой загрузке страницы.
+    """
+    if not products:
+        return set()
+    uids = [p.uid_1c for p in products]
+    return {row[0] for row in
+            db.query(Barcode.uid_1c).filter(Barcode.uid_1c.in_(uids)).distinct().all()}
+
+
 def _row(product: Product, accounts: list[PlatformAccount],
-         all_accounts: dict[int, PlatformAccount] | None = None) -> dict:
+         all_accounts: dict[int, PlatformAccount] | None = None,
+         with_barcode: set[str] | None = None) -> dict:
     """Строка таблицы. По каждому кабинету — реальное число и причина нуля."""
     settings_map = {s.account_id: s for s in product.sync_settings}
     all_accounts = all_accounts or {a.id: a for a in accounts}
@@ -158,7 +174,11 @@ def _row(product: Product, accounts: list[PlatformAccount],
         # стоит выключенной, и оператор включает её руками второй раз.
         "broadcast_requested": product.broadcast_requested_at is not None,
         "active_since": product.broadcast_active_since,
-        "has_barcode": len(product.barcodes) > 0,
+        # `with_barcode` — готовый ответ на всю страницу. Без него спрашиваем
+        # сам объект: так зовут одиночные пути (перерисовка одной строки), и
+        # там joinedload на месте.
+        "has_barcode": (product.uid_1c in with_barcode if with_barcode is not None
+                        else len(product.barcodes) > 0),
         "sku_quantity": sku_quantity(product),
         "sku_blocked": sku.blocked,
         "sku_reason": sku.reason,
@@ -168,10 +188,17 @@ def _row(product: Product, accounts: list[PlatformAccount],
 
 PAGE_LIMIT = 300          # без фильтров: «первые 300 из 152 тысяч по алфавиту» —
                           # витрина, работают всегда через отбор
-# С ФИЛЬТРАМИ отдаём весь отбор. Потолок всё же нужен: строка тяжёлая (дата,
-# факт, бронь плюс по несколько полей на каждый кабинет), и каталог целиком
-# браузер не построит.
-FILTERED_LIMIT = 5000
+# С ФИЛЬТРАМИ показываем больше, но не «весь отбор»: строка весит около 6 КБ
+# (дата, факт, бронь плюс по несколько полей на каждый из пяти кабинетов), и
+# пять тысяч строк — это 32 МБ разметки. Столько не успевает ни сервер собрать,
+# ни браузер разложить: именно так выглядела «программа долго отрабатывает».
+# Замер 21.09 на боевом каталоге: 300 строк — 1,9 МБ и полсекунды, пять тысяч —
+# минуты.
+#
+# Массовой правке этот потолок не мешает НИКАК: галочка в шапке берёт весь отбор
+# целиком (`BULK_LIMIT`), сколько бы строк ни было показано, и страница об этом
+# прямо пишет. Экспорт в Excel тоже отдаёт всё.
+FILTERED_LIMIT = 500
 EXPORT_LIMIT = 50000      # потолок выгрузки: защита от попытки собрать .xlsx на весь каталог
 # Потолок массовой правки «по всему фильтру». Каждая строка тянет за собой запись
 # в очередь рассылки на каждый отмеченный кабинет, а база — SQLite, в которую в
@@ -189,23 +216,33 @@ def _base_query(db: Session, q: str, only_proposals: bool, only_blocked: bool,
     применялись фильтры: при каталоге в 152 тысячи SKU «Только с предложениями»
     и «Только те, где уходит 0» показывали пусто, потому что в первых 300 по
     алфавиту таких товаров не было."""
-    query = db.query(Product).options(joinedload(Product.sync_settings), joinedload(Product.barcodes))
+    # `joinedload(Product.barcodes)` здесь БЫЛ и убран намеренно. Строке нужен от
+    # баркодов ровно один факт — есть он или нет, — а join тянул к каждому товару
+    # все его баркоды из таблицы на 154 тысячи строк и размножал результат. Факт
+    # добирается одним запросом на страницу, см. `_uids_with_barcode`.
+    query = db.query(Product).options(joinedload(Product.sync_settings))
     if q:
         like = f"%{q}%"
+        conditions = [Product.article.ilike(like), Product.name.ilike(like)]
         # Штрихкод ищется наравне с артикулом и названием: оператор приходит сюда
         # со сканером или из кабинета площадки, где у позиции виден ИМЕННО он, —
         # и без этого поиска ему приходилось идти в «Мэппинг», там узнавать
         # товар, а потом искать его здесь заново.
         #
-        # Коррелированный EXISTS, а не JOIN: баркодов у товара несколько, и JOIN
-        # размножил бы строки товара по числу совпавших баркодов.
-        query = query.filter(or_(
-            Product.article.ilike(like),
-            Product.name.ilike(like),
-            db.query(Barcode.id)
-              .filter(Barcode.uid_1c == Product.uid_1c, Barcode.barcode.ilike(like))
-              .exists(),
-        ))
+        # Спрашиваем баркоды ОДИН раз на запрос, а не на каждый товар. Раньше тут
+        # стоял коррелированный EXISTS, и на боевом каталоге он означал буквально
+        # следующее: 152 тысячи товаров, на каждый — чтение всех 154 тысяч
+        # баркодов. Страница не отвечала вовсе, замер 21.09 на ней и завис.
+        # `IN (подзапрос)` SQLite считает один раз и складывает во временный
+        # индекс. JOIN тут не годится по-прежнему: баркодов у товара несколько,
+        # и он размножил бы строку товара по числу совпавших.
+        #
+        # В цифрах баркода быть обязано. Поиск «куртка» иначе всё равно шёл бы по
+        # таблице баркодов целиком — ради заведомо пустого результата.
+        if any(ch.isdigit() for ch in q):
+            conditions.append(Product.uid_1c.in_(
+                db.query(Barcode.uid_1c).filter(Barcode.barcode.ilike(like))))
+        query = query.filter(or_(*conditions))
     if only_proposals:
         query = query.filter(Product.sync_settings.any(SyncSetting.has_proposal.is_(True)))
     if only_blocked:
@@ -282,7 +319,10 @@ def _load_products(db: Session, q: str, only_proposals: bool, only_blocked: bool
                         only_unfinished, only_on_platform, only_marked)
 
     if not only_blocked:
-        total = query.order_by(None).count()
+        # `enable_eagerloads(False)`: считаем строки, а не собираем объекты.
+        # Без этого SQLAlchemy заворачивает в подсчёт и join настроек кабинетов —
+        # на каталоге в 152 тысячи это лишняя работа ровно впустую.
+        total = query.order_by(None).enable_eagerloads(False).count()
         return query.limit(limit).all(), total
 
     # «Уходит 0» точно считается только лестницей: идём порциями и останавливаемся,
@@ -339,7 +379,8 @@ def _render(request: Request, db: Session, user: User, q: str, only_proposals: b
                                      only_unfinished=only_unfinished,
                                      only_on_platform=only_on_platform,
                                      only_marked=only_marked)
-    rows = [_row(p, accounts, all_accounts) for p in products]
+    with_barcode = _uids_with_barcode(db, products)
+    rows = [_row(p, accounts, all_accounts, with_barcode) for p in products]
     return templates.TemplateResponse(request, template, {
         "request": request, "current_user": user, "active_page": "products",
         "rows": rows, "total": total, "page_limit": PAGE_LIMIT,

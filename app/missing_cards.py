@@ -93,21 +93,25 @@ def collect_missing(db: Session, platform: Platform | None = None,
 
     rows: list[MissingRow] = []
     total = 0
+    # КОЛОНКИ, а не объекты Product. Пройти надо по всему складу — иначе «всего»
+    # будет неправдой, — а это сто пятьдесят тысяч строк. Собирать из них
+    # полноценные объекты ORM (со всей обвязкой отслеживания изменений) стоило
+    # почти трёх секунд на страницу; нужны отсюда шесть полей.
     query = (
-        db.query(Product)
+        db.query(Product.uid_1c, Product.article, Product.name, Product.size,
+                 Product.color, Product.stock_on_hand)
         .filter(Product.stock_on_hand > 0)
         .order_by(Product.article, Product.name)
     )
-    for product in query.yield_per(1000):
-        missing = {p: product.uid_1c not in have[p] for p in wanted}
+    for uid, article, name, size, color, stock in query.yield_per(1000):
+        missing = {p: uid not in have[p] for p in wanted}
         if not any(missing.values()):
             continue
         total += 1
         if len(rows) < limit:
             rows.append(MissingRow(
-                uid_1c=product.uid_1c, article=product.article or "",
-                name=product.name or "", size=product.size or "",
-                color=product.color or "", stock=product.stock_on_hand or 0,
+                uid_1c=uid, article=article or "", name=name or "",
+                size=size or "", color=color or "", stock=stock or 0,
                 missing=missing,
             ))
     return rows, total
