@@ -1,9 +1,9 @@
 from fastapi import APIRouter, Request, Depends, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
-from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.templating import templates as shared_templates
 from app.dependencies import get_current_user
 from app.models import ApiCredential, PlatformAccount, Platform, User
 from app.crypto import encrypt_value, decrypt_value, mask_value
@@ -12,7 +12,7 @@ from app.flash import set_flash, pop_flash
 from app.workers.scheduler import PENDING_WAREHOUSE_NAME, SOLD_WAREHOUSE_NAME, SOURCE_WAREHOUSE_NAME
 
 router = APIRouter()
-templates = Jinja2Templates(directory="app/templates")
+templates = shared_templates
 
 # Поля, которые нужны любому кабинету данной площадки.
 PLATFORM_FIELDS = {

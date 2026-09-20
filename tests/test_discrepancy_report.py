@@ -758,3 +758,114 @@ def test_the_command_needs_a_login(client):
 
     assert r.status_code in (302, 303, 307)
     assert "/login" in r.headers.get("location", "")
+
+
+# ------------------- находка обязана называть товар так, как его зовут люди
+
+def test_a_missing_card_finding_names_the_article_and_the_cabinet(db):
+    """20.09 на бою находка перечисляла внутренние идентификаторы вида
+    `051ce509-a048-11ef-…`. В базе по ним всё находится, а человеку, который
+    идёт с этим списком в кабинет площадки, они не говорят ничего."""
+    account = _kit_account(db)
+    db.add(Product(uid_1c="u1", article="TC26-2735", name="БлекВинил Куртка демисезон",
+                   stock_on_hand=5))
+    db.add(DispatchQueueItem(
+        uid_1c="u1", account_id=account.id, quantity=5, reason="manual_resend_all",
+        status=DispatchStatus.error,
+        last_error="нет карточки в каталоге кабинета — остаток отправить не по чему"))
+    db.commit()
+
+    finding = _by_key(collect_findings(db), "unknown_sku")
+
+    assert "TC26-2735" in finding.details[0]
+    assert "БлекВинил" in finding.details[0]
+    assert "КИТ" in finding.details[0], "без кабинета непонятно, куда идти разбирать"
+    assert "u1" not in finding.details[0]
+
+
+def test_a_dispatch_error_finding_names_the_article_too(db):
+    """Та же беда была и здесь: uid плюс кусок технического текста."""
+    account = _kit_account(db)
+    db.add(Product(uid_1c="u1", article="D86321", name="Даунтлесс Куртка",
+                   stock_on_hand=5))
+    db.add(DispatchQueueItem(
+        uid_1c="u1", account_id=account.id, quantity=5, reason="order",
+        status=DispatchStatus.error, last_error="не отправлено за 5 попыток: 500"))
+    db.commit()
+
+    finding = _by_key(collect_findings(db), "dispatch_errors")
+
+    assert "D86321" in finding.details[0]
+    assert "5 попыток" in finding.details[0], "текст ошибки тоже нужен"
+
+
+def test_a_product_missing_from_the_catalogue_still_gets_a_line(db):
+    """Товар мог быть удалён из номенклатуры, а запись очереди осталась. Строка
+    обязана появиться всё равно — иначе находка насчитает больше, чем покажет."""
+    account = _kit_account(db)
+    db.add(DispatchQueueItem(
+        uid_1c="u-нет", account_id=account.id, quantity=5, reason="order",
+        status=DispatchStatus.error, last_error="не отправлено за 5 попыток: 500"))
+    db.commit()
+
+    finding = _by_key(collect_findings(db), "dispatch_errors")
+
+    assert finding.details and "u-нет" in finding.details[0]
+
+
+def test_the_sent_key_is_shown_when_it_is_known(db):
+    """Для WB sku — это то, чем ищут карточку в кабинете: без него по артикулу
+    искать дольше."""
+    account = make_account(db, Platform.wb, name="ИП ЯВОРСКАЯ")
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    db.add(DispatchQueueItem(
+        uid_1c="u1", account_id=account.id, quantity=5, sent_sku="2000932279695",
+        reason="order", status=DispatchStatus.error,
+        last_error="площадка не знает этот sku на складе 1923790 (409 NotFound)"))
+    db.commit()
+
+    finding = _by_key(collect_findings(db), "unknown_sku")
+
+    assert "2000932279695" in finding.details[0]
+
+
+def test_the_reconciliation_finding_shows_what_diverged(db):
+    """«Крупных расхождений: 14» без списка не отвечает на вопрос «что это».
+    Пара чисел «у нас было / в 1С стало» сразу показывает, куда уехал склад."""
+    from app.models import ReconciliationClassification, ReconciliationLog
+
+    db.add(Product(uid_1c="u1", article="32481 (O)", name="МСЛ Рубашка К/р KAHVE",
+                   stock_on_hand=5))
+    db.add(ReconciliationLog(
+        uid_1c="u1", python_stock=5, in_flight=0, expected_1c=5, actual_1c=17,
+        delta=12, classification=ReconciliationClassification.needs_review,
+        resolved=True, checked_at=now_utc() - timedelta(hours=2)))
+    db.commit()
+
+    finding = _by_key(collect_findings(db), "reconciliation_review")
+
+    assert "32481 (O)" in finding.details[0]
+    assert "5" in finding.details[0] and "17" in finding.details[0]
+    assert "+12" in finding.details[0]
+
+
+def test_the_diagnostics_counter_agrees_with_the_report(db):
+    """20.09 на бою отчёт говорил «1 запись», а счётчик кабинета — «751»: он
+    считал все строки в error за всё время. Две страницы, противоречащие друг
+    другу, хуже одной неточной — верить перестают обеим."""
+    from app.report import current_dispatch_errors
+
+    account = _kit_account(db)
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    db.add(DispatchQueueItem(
+        uid_1c="u1", account_id=account.id, quantity=5, reason="order",
+        status=DispatchStatus.error, last_error="старое, уже неактуальное",
+        created_at=now_utc() - timedelta(hours=6)))
+    db.add(DispatchQueueItem(
+        uid_1c="u1", account_id=account.id, quantity=5, reason="order",
+        status=DispatchStatus.sent, sent_at=now_utc(), created_at=now_utc()))
+    db.commit()
+
+    assert current_dispatch_errors(db) == []
+    assert current_dispatch_errors(db, account.id) == []
+    assert "dispatch_errors" not in _keys(collect_findings(db))

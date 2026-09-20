@@ -9,17 +9,17 @@
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse
-from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.templating import templates as shared_templates
 from app.dependencies import get_current_user
 from app.models import User
 from app.report import CRITICAL, collect_findings, summary_line
 from app.timeutils import now_utc
 
 router = APIRouter()
-templates = Jinja2Templates(directory="app/templates")
+templates = shared_templates
 
 
 # Как часто страница перезапрашивает себя сама. Отчёт собирается шестнадцатью

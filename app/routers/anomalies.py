@@ -3,20 +3,21 @@ from app.timeutils import now_utc
 
 from fastapi import APIRouter, Request, Depends, Query, UploadFile, File
 from fastapi.responses import HTMLResponse, RedirectResponse
-from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 from sqlalchemy import func, or_
 
 from app.database import get_db
+from app.templating import templates as shared_templates
 from app.dependencies import get_current_user
 from app.models import SyncAnomaly, SyncSetting, Product, PlatformAccount, AnomalyReason, AnomalyStatus, User
+from app.anomalies import close_fixed_anomalies
 from app.transmit import enqueue_full_resend
 from app.excel_utils import build_xlsx_response, read_xlsx_rows, parse_bool_ru, format_dt, ExcelReadError
 from app.flash import set_flash, pop_flash
 from app.audit import log_action
 
 router = APIRouter()
-templates = Jinja2Templates(directory="app/templates")
+templates = shared_templates
 
 REASON_LABELS = {
     AnomalyReason.order_on_disabled: "Заказ на невключённый товар",
@@ -94,7 +95,18 @@ def _resolve_sync_and_anomalies(db: Session, uid_1c: str, account_id: int) -> bo
     return changed
 
 
+# Как часто страница перезапрашивает себя сама. Аномалии появляются при опросе
+# заказов (раз в минуту-две) и исчезают по мере включения товаров — оператор
+# держит страницу открытой и работает по ней, руками он её не перезагрузит.
+REFRESH_SECONDS = 120
+
+
 def _render(request: Request, db: Session, user: User, status: str, q: str, account_id: str, reason: str, template: str):
+    # Причину аномалии устраняют не только кнопкой на этой странице: товар
+    # включают на «Товарах», массовой правкой, импортом, баркод приезжает из 1С.
+    # Без этого строки оставались в списке навсегда, и он не пустел от работы.
+    if close_fixed_anomalies(db):
+        db.commit()
     rows = _load_grouped_anomalies(db, status, q, account_id, reason)
     new_count = db.query(SyncAnomaly).filter(
         SyncAnomaly.status == AnomalyStatus.new.value, SyncAnomaly.is_test.is_(False),
@@ -106,6 +118,7 @@ def _render(request: Request, db: Session, user: User, status: str, q: str, acco
         "rows": rows, "status": status, "q": q, "account_id": account_id, "reason": reason,
         "accounts": accounts, "reasons": list(AnomalyReason), "reason_labels": REASON_LABELS,
         "new_count": new_count,
+        "refresh_seconds": REFRESH_SECONDS,
         "flash": pop_flash(request) if template == "anomalies.html" else None,
     })
 

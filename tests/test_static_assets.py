@@ -16,7 +16,9 @@ HTMX = pathlib.Path("app/static/htmx.min.js")
 
 
 def test_htmx_is_served_locally():
-    assert '<script src="/static/htmx.min.js"></script>' in BASE
+    """Адрес собирается `static_url` — он добавляет версию файла, чтобы браузер
+    не подсунул вчерашний htmx из кэша. Проверяем суть: путь свой, не внешний."""
+    assert "static_url('htmx.min.js')" in BASE or '/static/htmx.min.js' in BASE
 
 
 def test_no_external_scripts_or_styles_at_all():

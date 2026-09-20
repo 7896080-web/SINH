@@ -3,11 +3,11 @@ from app.timeutils import now_utc
 
 from fastapi import APIRouter, Request, Depends, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
-from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 
 from app.database import get_db
+from app.templating import templates as shared_templates
 from app.dependencies import get_current_user
 from app.models import (
     PlatformAccount, WorkerHeartbeat, DispatchQueueItem, DispatchStatus,
@@ -22,12 +22,13 @@ from app.workers.order_poller import poll_new_orders, poll_cancellations
 from app.workers.catalog_sync import load_platform_catalog
 from app.workers.scheduler import PENDING_WAREHOUSE_NAME
 from app.audit import log_action
-from app.report import CRITICAL as REPORT_CRITICAL, collect_findings
+from app.report import (CRITICAL as REPORT_CRITICAL, collect_findings,
+                        current_dispatch_errors)
 from app.transmit import enqueue_resend_all
 from app.flash import set_flash, pop_flash
 
 router = APIRouter()
-templates = Jinja2Templates(directory="app/templates")
+templates = shared_templates
 
 # Насколько старым должно быть расхождение сверки, чтобы кнопка его закрыла.
 # Сутки — ровно то окно, по которому отчёт показывает свежие: закрыть можно
@@ -40,10 +41,10 @@ def _queue_counts(db: Session, account_id: int) -> dict:
         DispatchQueueItem.account_id == account_id, DispatchQueueItem.status == DispatchStatus.pending,
         DispatchQueueItem.is_test.is_(False),
     ).count()
-    dispatch_errors = db.query(DispatchQueueItem).filter(
-        DispatchQueueItem.account_id == account_id, DispatchQueueItem.status == DispatchStatus.error,
-        DispatchQueueItem.is_test.is_(False),
-    ).count()
+    # Считаем ТО ЖЕ, что показывает отчёт: последнюю запись пары товар+кабинет.
+    # Иначе счётчик набирает мёртвые строки от давно починенных дефектов и
+    # спорит с отчётом — на бою 20.09 он говорил «751» против «1 запись».
+    dispatch_errors = len(current_dispatch_errors(db, account_id))
     # Записи, которые уже сорвались и ждут следующей попытки: сама по себе это не
     # ошибка (площадка отвечает не всегда), но растущее число — повод посмотреть
     # в last_error, пока попытки не исчерпались и запись не стала ошибкой.
@@ -104,7 +105,7 @@ def diagnostics_page(request: Request, db: Session = Depends(get_db), user: User
         "anomalies_new": db.query(SyncAnomaly).filter(
             SyncAnomaly.status == AnomalyStatus.new, SyncAnomaly.is_test.is_(False),
         ).count(),
-        "dispatch_errors_total": db.query(DispatchQueueItem).filter(DispatchQueueItem.status == DispatchStatus.error).count(),
+        "dispatch_errors_total": len(current_dispatch_errors(db)),
     }
 
     return templates.TemplateResponse(request, "diagnostics.html", {

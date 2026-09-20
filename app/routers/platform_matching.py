@@ -21,16 +21,16 @@ from collections import defaultdict
 
 from fastapi import APIRouter, Request, Depends, Query
 from fastapi.responses import HTMLResponse
-from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.templating import templates as shared_templates
 from app.dependencies import get_current_user
 from app.models import Barcode, Platform, PlatformAccount, PlatformCatalogItem, User
 from app.excel_utils import build_xlsx_response
 
 router = APIRouter()
-templates = Jinja2Templates(directory="app/templates")
+templates = shared_templates
 
 RESULT_LIMIT = 300
 
