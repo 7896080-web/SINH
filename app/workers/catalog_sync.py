@@ -49,6 +49,9 @@ def load_platform_catalog(db: Session, client: PlatformClient, account: Platform
         if len(uids) == 1:
             pool_uid[extid] = next(iter(uids))
 
+    # Баркоды, заведённые догадкой В ЭТОМ ЖЕ проходе: см. ниже, почему запроса
+    # к базе для этого мало.
+    guessed_here: set[str] = set()
     for item in items:
         if not item.barcode:
             stats["no_barcode"] += 1
@@ -76,6 +79,18 @@ def load_platform_catalog(db: Session, client: PlatformClient, account: Platform
         # заводим конфликт. Существующий конфликт по этому баркоду закрываем.
         uid = pool_uid.get(item.external_id)
         if uid is not None:
+            if item.barcode in guessed_here:
+                # Тот же баркод второй раз в ОДНОЙ выгрузке. Запрос выше его не
+                # найдёт: сессия живёт с `autoflush=False`, и первый `db.add` до
+                # базы ещё не дошёл. Второй `INSERT` на коммите давал
+                # `UNIQUE constraint failed: barcodes.barcode` — и падала ВСЯ
+                # загрузка каталога, причём падала бы каждый следующий раз, пока
+                # площадка отдаёт ту же выгрузку. Каталог при этом молча
+                # устаревает: по нему считаются chrtId для WB и variant_id для
+                # Kit, то есть ключи, которыми уходит остаток.
+                stats["already_mapped"] += 1
+                continue
+            guessed_here.add(item.barcode)
             db.add(Barcode(barcode=item.barcode, uid_1c=uid, source_platform=POOL_GUESS_SOURCE))
             db.query(MappingConflict).filter(
                 MappingConflict.barcode == item.barcode,
