@@ -680,6 +680,89 @@ def test_orders_on_another_cabinet_do_not_explain_a_drop(db):
     assert "platform_divergence" in _keys(collect_findings(db))
 
 
+# ------------------- застывшее расхождение: по паре уже ушло новое число
+
+def test_a_divergence_superseded_by_a_newer_send_is_not_reported(db):
+    """Боевой случай 22.09, найденный в чистом виде.
+
+    Находка показывала три позиции («отправили 60, площадка держит 59»), а
+    сверка тем же часом отвечала `diverged: 2` — и это были РАЗНЫЕ строки. По
+    всем трём из находки уже прошла новая отправка (59, 54, 0), которую
+    площадка и держала: обычная продажа, WB списал единицу, мы приняли заказ и
+    отправили новое число.
+
+    Старая строка при этом застывает навсегда: `rows_to_verify` перепроверяет
+    только ПОСЛЕДНЮЮ отправку по товару, статуса эта запись не сменит никогда,
+    и отчёт остаётся красным вечно. Разобрать такую находку нельзя ничем — она
+    описывает прошлое.
+    """
+    account = make_account(db)
+    db.add(Product(uid_1c="u1", article="256250-030", name="Товар",
+                   stock_on_hand=59))
+    db.add(DispatchQueueItem(                       # старая: 60 против 59
+        uid_1c="u1", account_id=account.id, quantity=60, sent_quantity=60,
+        sent_sku="2000932309286", reason="order", status=DispatchStatus.sent,
+        sent_at=now_utc() - timedelta(hours=8),
+        verified_at=now_utc() - timedelta(hours=7), verified_quantity=59))
+    db.add(DispatchQueueItem(                       # новая: 59 против 59
+        uid_1c="u1", account_id=account.id, quantity=59, sent_quantity=59,
+        sent_sku="2000932309286", reason="order", status=DispatchStatus.sent,
+        sent_at=now_utc() - timedelta(hours=1),
+        verified_at=now_utc(), verified_quantity=59))
+    db.commit()
+
+    assert "platform_divergence" not in _keys(collect_findings(db))
+
+
+def test_the_newest_send_still_diverging_is_reported(db):
+    """Обратная сторона: если расходится САМАЯ СВЕЖАЯ отправка, это живое
+    расхождение, и глушить его нельзя — предыдущая удачная отправка по той же
+    паре ничего о нынешней не говорит."""
+    account = make_account(db)
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=59))
+    db.add(DispatchQueueItem(
+        uid_1c="u1", account_id=account.id, quantity=60, sent_quantity=60,
+        sent_sku="111", reason="order", status=DispatchStatus.sent,
+        sent_at=now_utc() - timedelta(hours=8),
+        verified_at=now_utc() - timedelta(hours=7), verified_quantity=60))
+    db.add(DispatchQueueItem(
+        uid_1c="u1", account_id=account.id, quantity=59, sent_quantity=59,
+        sent_sku="111", reason="order", status=DispatchStatus.sent,
+        sent_at=now_utc() - timedelta(hours=1),
+        verified_at=now_utc(), verified_quantity=99))
+    db.commit()
+
+    finding = _by_key(collect_findings(db), "platform_divergence")
+
+    assert finding is not None and finding.count == 1
+    assert "отправили 59, площадка держит 99" in finding.details[0]
+
+
+def test_a_newer_send_to_another_cabinet_does_not_silence_this_one(db):
+    """Отправка живёт на ПАРЕ товар+кабинет. Свежее число, ушедшее на соседний
+    кабинет, про этот не говорит ничего — заглушить им расхождение значило бы
+    потерять оверселл на кабинете, которым давно не занимались."""
+    wb = make_account(db, Platform.wb, name="ИП ЯВОРСКАЯ")
+    kit = make_account(db, Platform.kit, name="КИТ", warehouse_id="wh-2")
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    db.add(DispatchQueueItem(
+        uid_1c="u1", account_id=wb.id, quantity=5, sent_quantity=5,
+        sent_sku="111", reason="order", status=DispatchStatus.sent,
+        sent_at=now_utc() - timedelta(hours=8),
+        verified_at=now_utc() - timedelta(hours=7), verified_quantity=12))
+    db.add(DispatchQueueItem(
+        uid_1c="u1", account_id=kit.id, quantity=5, sent_quantity=5,
+        sent_sku="v-1", reason="order", status=DispatchStatus.sent,
+        sent_at=now_utc() - timedelta(minutes=10),
+        verified_at=now_utc(), verified_quantity=5))
+    db.commit()
+
+    finding = _by_key(collect_findings(db), "platform_divergence")
+
+    assert finding is not None and finding.count == 1
+    assert finding.level == CRITICAL           # площадка держит БОЛЬШЕ
+
+
 # ------------------------- расхождения сверки: свежие, а не архив
 
 def test_a_stale_reconciliation_difference_is_not_reported(db):
