@@ -291,3 +291,87 @@ def test_the_worker_list_has_a_stable_order(client, web_db):
     names = [w["worker"] for w in client.get("/health").json()["workers"]]
 
     assert names == sorted(names)
+
+
+# --------------- срок протухания обязан соответствовать расписанию
+
+def _add_job_calls(source: str) -> list:
+    """Тела вызовов `sched.add_job(...)` целиком.
+
+    Скобки считаем руками, а не регуляркой до конца строки: вызовы занимают по
+    три-четыре строки, и разбор «до первого перевода» терял у них `id=` — то
+    есть проверка молча пропускала ровно те задания, ради которых написана.
+    """
+    calls, marker = [], "sched.add_job("
+    start = source.find(marker)
+    while start != -1:
+        depth, i = 0, start + len(marker) - 1
+        while i < len(source):
+            if source[i] == "(":
+                depth += 1
+            elif source[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        calls.append(source[start:i])
+        start = source.find(marker, i)
+    return calls
+
+
+def _scheduled_intervals() -> dict:
+    """{id задания: интервал в секундах} — из самого расписания.
+
+    Читаем исходник планировщика, а не поднимаем его: `build_scheduler` лезет
+    в базу и пишет heartbeat, а нам нужны только числа. Константы
+    (`BACKUP_INTERVAL_HOURS` и подобные) разрешаем через сам модуль.
+    """
+    import re
+
+    from app.workers import scheduler as sched_module
+
+    source = open("app/workers/scheduler.py", encoding="utf-8").read()
+    unit = {"seconds": 1, "minutes": 60, "hours": 3600, "days": 86400}
+    found = {}
+    for call in _add_job_calls(source):
+        job_id = re.search(r'id="([^"]+)"', call)
+        amount = re.search(r"\b(seconds|minutes|hours|days)=([\w.]+)", call)
+        if not job_id or not amount:
+            continue
+        raw = amount.group(2)
+        value = int(raw) if raw.isdigit() else getattr(sched_module, raw, None)
+        if value is None:
+            continue
+        found[job_id.group(1)] = int(value) * unit[amount.group(1)]
+    return found
+
+
+def test_every_scheduled_job_has_a_matching_staleness_window():
+    """Задание, которое ходит раз в сутки, по умолчанию протухает через десять
+    минут — и держит /health красным все оставшиеся двадцать три часа с
+    лишним. Так уже было с недельным импортом справочника, с часовым отчётом и
+    21.09 с бэкапом: механизм добавили, а сюда записать забыли, и мониторинг
+    покраснел через десять минут после первой копии.
+
+    Проверяем не «есть запись», а «срок не меньше двух интервалов»: запись,
+    сделанная с потолка, не спасает.
+    """
+    from app.routers.health import _expected_seconds
+
+    too_tight = {name: (interval, _expected_seconds(name))
+                 for name, interval in _scheduled_intervals().items()
+                 if _expected_seconds(name) < interval * 2}
+
+    assert too_tight == {}, (
+        "срок протухания короче двух интервалов — /health покраснеет сам собой: "
+        f"{too_tight}")
+
+
+def test_the_daily_jobs_are_actually_seen_by_this_check():
+    """Проверка выше полезна ровно настолько, насколько находит задания. Если
+    разбор расписания однажды перестанет их видеть, она замолчит молча."""
+    found = _scheduled_intervals()
+
+    assert found.get("backup") == 86400
+    assert found.get("retention") == 86400
+    assert found.get("dispatch") == 45
