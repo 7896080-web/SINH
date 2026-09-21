@@ -555,7 +555,23 @@ def job_catalog_poll(account_id: int):
         load_stats = load_platform_catalog(db, client, account)
         proposal_stats = poll_catalog(db, account)
         logger.info("%s (%s): загрузка=%s предложения=%s", worker_name, account.name, load_stats, proposal_stats)
-        _heartbeat(db, worker_name, True)
+        # Выдачу оборвал защитный предел страниц. Снимок каталога при этом
+        # выглядит свежим, но неполон: часть карточек осталась со старыми
+        # данными или не завелась вовсе. По снимку считаются ключи отправки —
+        # chrtId у WB, variant_id у Kit, — и по не попавшим в него позициям
+        # остаток либо уйдёт баркодом, либо не уйдёт совсем. Heartbeat, а не
+        # только лог: «Диагностика» показывает именно его, а лог на бою читают,
+        # когда уже что-то случилось.
+        if load_stats.get("truncated"):
+            logger.warning(
+                "%s (%s): выгрузка каталога ОБОРВАНА защитным пределом страниц — "
+                "снимок неполон, по не попавшим в него карточкам остаток может "
+                "уйти не тем ключом или не уйти вовсе", worker_name, account.name)
+            _heartbeat(db, worker_name, True,
+                       error="выгрузка каталога оборвана пределом страниц — "
+                             "снимок неполон")
+        else:
+            _heartbeat(db, worker_name, True)
     except CredentialsMissing as e:
         _heartbeat(db, worker_name, False, str(e))
     except Exception as e:

@@ -345,7 +345,17 @@ def catalog_now(
         clear_clusters_cache()
         log_action(db, user.username, "manual_catalog_sync", f"{account.name}: {stats}")
         db.commit()
-        set_flash(request, f"«{account.name}»: загружено {stats['fetched']} карточек, новых конфликтов {stats['new_conflicts']}.", "good")
+        done = (f"«{account.name}»: загружено {stats['fetched']} карточек, "
+                f"новых конфликтов {stats['new_conflicts']}.")
+        if stats.get("truncated"):
+            # См. тот же случай в `mapping.mapping_load_catalog`: зелёное
+            # «загружено N» на обрезанной выгрузке оставляет человека в
+            # уверенности, что каталог полон, — а по не попавшим карточкам
+            # остаток уйдёт не тем ключом или не уйдёт вовсе.
+            set_flash(request, done + " ВЫГРУЗКА ОБОРВАНА защитным пределом "
+                                      "страниц — снимок неполон.", "warn")
+        else:
+            set_flash(request, done, "good")
     except CredentialsMissing as e:
         set_flash(request, f"«{account.name}»: {e}", "warn")
     except Exception as e:

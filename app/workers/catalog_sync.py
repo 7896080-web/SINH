@@ -21,8 +21,18 @@ def load_platform_catalog(db: Session, client: PlatformClient, account: Platform
     придёт первый заказ, а не после."""
 
     items = client.get_catalog_items()
+    # Выдачу оборвал наш защитный предел страниц, а не конец данных. Карточки,
+    # не попавшие в обрезанную выдачу, остаются со СТАРЫМИ данными или не
+    # заводятся вовсе — а снимок при этом выглядит свежим: `fetched_at` у
+    # попавших обновлён. Дальше по этому снимку считаются ключи отправки: у WB
+    # chrtId (нет его — остаток уходит баркодом, а WB умеет приём баркода
+    # отключить), у Kit variant_id (нет — позиция не уедет вовсе и закроется
+    # терминально). Молчать об этом нельзя: клиенты признак поднимают
+    # (`last_truncated`), а здесь его до сих пор никто не спрашивал.
+    truncated = bool(getattr(client, "last_truncated", False))
     stats = {"fetched": len(items), "already_mapped": 0, "pool_matched": 0,
-             "new_conflicts": 0, "known_conflicts": 0, "no_barcode": 0}
+             "new_conflicts": 0, "known_conflicts": 0, "no_barcode": 0,
+             "truncated": truncated}
 
     # Ключ строки каталога — БАРКОД (у WB один external_id/nmID охватывает
     # несколько баркодов). Держим карту barcode -> row для этого кабинета,

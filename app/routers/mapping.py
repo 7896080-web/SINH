@@ -384,6 +384,17 @@ def mapping_load_catalog(
 
     log_action(db, user.username, "catalog_loaded", f"{account.name}: {stats}")
     db.commit()
-    set_flash(request, message, "good")
+    if stats.get("truncated"):
+        # Зелёное «загружено N карточек» на обрезанной выгрузке — худший вид
+        # молчания: человек нажал кнопку ровно затем, чтобы каталог стал полным,
+        # и уходит в уверенности, что стал. По не попавшим карточкам остаток
+        # уйдёт не тем ключом или не уйдёт вовсе.
+        message += (" ВЫГРУЗКА ОБОРВАНА защитным пределом страниц — снимок "
+                    "неполон, часть карточек осталась со старыми данными. "
+                    "Повторите загрузку; если повторяется, каталог кабинета "
+                    "больше нашего предела.")
+        set_flash(request, message, "warn")
+    else:
+        set_flash(request, message, "good")
 
     return RedirectResponse("/mapping?view=conflicts", status_code=303)
