@@ -211,7 +211,10 @@ def test_worker_error_text_is_not_exposed_anonymously(client, web_db):
     assert r.status_code == 503
     assert "wildberries.ru" not in r.text
     assert "401" not in r.text
-    worker = r.json()["workers"][0]
+    # ПО ИМЕНИ, а не по индексу: воркеров в ответе несколько, и «первый» — это
+    # не «наш». Раньше тест брал нулевой элемент и падал, стоило списку
+    # измениться (порядок строк в базе не задан, добавился новый воркер).
+    worker = next(w for w in r.json()["workers"] if w["worker"] == "dispatch")
     assert worker["last_success"] is False       # факт ошибки виден
     assert worker["last_error"] == ERROR_PLACEHOLDER
 
@@ -276,3 +279,15 @@ def test_a_disabled_account_does_not_demand_its_jobs(client, web_db):
 
     assert r.status_code == 200
     assert r.json()["missing_workers"] == []
+
+
+def test_the_worker_list_has_a_stable_order(client, web_db):
+    """Человек смотрит /health два раза подряд — и обязан видеть один и тот же
+    порядок. Без `order_by` SQLite отдаёт строки как ему удобно."""
+    _hb(web_db, "verify_stock")
+    _hb(web_db, "dispatch")
+    _hb(web_db, "backup")
+
+    names = [w["worker"] for w in client.get("/health").json()["workers"]]
+
+    assert names == sorted(names)

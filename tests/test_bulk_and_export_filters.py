@@ -976,3 +976,79 @@ def test_bulk_cabinet_on_stamps_active_since_too(logged_in_client, web_db):
     web_db.expire_all()
     assert web_db.query(Product).filter(Product.uid_1c == "u1").one() \
         .broadcast_active_since == today_local()
+
+
+# ------------------------------------------- фильтр «скрыть с нулевым остатком»
+
+def _stocked(db, uid, article, stock):
+    from app.models import Product
+    db.add(Product(uid_1c=uid, article=article, name="Товар", stock_on_hand=stock))
+
+
+def test_zero_stock_rows_can_be_hidden(logged_in_client, web_db):
+    """Каталог на 152 тысячи позиций почти весь распродан: нули — это шум, в
+    котором не видно строк, с которыми действительно работают."""
+    _stocked(web_db, "u1", "ЕСТЬОСТАТОК", 7)
+    _stocked(web_db, "u2", "НОЛЬ", 0)
+    web_db.commit()
+
+    page = logged_in_client.get("/products?hide_zero_stock=true").text
+
+    assert "ЕСТЬОСТАТОК" in page
+    assert "НОЛЬ" not in page
+
+
+def test_negative_stock_is_never_hidden(logged_in_client, web_db):
+    """Отрицательный остаток — пересортица, и это ровно то, что надо видеть и
+    разбирать в 1С. «Нулевым» он не является, прятать его нельзя."""
+    _stocked(web_db, "u1", "МИНУС", -3)
+    web_db.commit()
+
+    page = logged_in_client.get("/products?hide_zero_stock=true").text
+
+    assert "МИНУС" in page
+
+
+def test_without_the_filter_everything_is_shown(logged_in_client, web_db):
+    _stocked(web_db, "u2", "НОЛЬ", 0)
+    web_db.commit()
+
+    assert "НОЛЬ" in logged_in_client.get("/products").text
+
+
+def test_the_filter_reaches_the_export(logged_in_client, web_db):
+    """Фильтр, который страница передаёт, а эндпоинт не принимает, FastAPI
+    молча отбрасывает — оператор отбирает строки, выгружает и получает весь
+    каталог. На этом уже проехал `only_unfinished`."""
+    _stocked(web_db, "u1", "ЕСТЬОСТАТОК", 7)
+    _stocked(web_db, "u2", "НОЛЬ", 0)
+    web_db.commit()
+
+    import io
+    from openpyxl import load_workbook
+    r = logged_in_client.get("/products/export?hide_zero_stock=true")
+    ws = load_workbook(io.BytesIO(r.content)).active
+    articles = {row[1] for row in ws.iter_rows(min_row=2, values_only=True)}
+
+    assert "ЕСТЬОСТАТОК" in articles
+    assert "НОЛЬ" not in articles
+
+
+def test_the_filter_survives_a_bulk_edit(logged_in_client, web_db):
+    """Оператор сузил список именно затем, чтобы работать с ним."""
+    _stocked(web_db, "u1", "ЕСТЬОСТАТОК", 7)
+    web_db.commit()
+
+    r = logged_in_client.post("/products/bulk", data={
+        "action": "set_reserve", "int_value": "1", "uids": ["u1"],
+        "hide_zero_stock": "true",
+    }, follow_redirects=False)
+
+    assert "hide_zero_stock" in r.headers["location"]
+
+
+def test_the_page_offers_the_filter(logged_in_client, web_db):
+    page = logged_in_client.get("/products").text
+
+    assert 'name="hide_zero_stock"' in page
+    assert "нулевым остатком" in page
