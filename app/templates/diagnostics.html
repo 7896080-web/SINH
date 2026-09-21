@@ -90,9 +90,11 @@
     {% if stuck_tasks %}
     <p class="help-text" style="margin-top:0">
         1С забрала файл задания и не ответила по нему — ни «OK», ни «ERROR».
-        Пока задание не закрыто, его количество считается «в пути»: остаток товара
-        у нас <strong>занижен</strong> на это число, и на площадки уходит меньше,
-        чем есть на складе.
+        Пока задание не закрыто, его количество считается «в пути». Направление
+        ошибки зависит от команды и указано в каждой строке: незакрытое
+        <span class="mono">CREATE_MOVEMENT</span> ЗАНИЖАЕТ остаток (наружу уходит
+        меньше, чем есть), а незакрытое <span class="mono">CANCEL_MOVEMENT</span> —
+        наоборот ЗАВЫШАЕТ, и это уже риск оверселла.
         {% if repost_enabled %}
             Автоматически повторяем до {{ max_reposts }} раз; строки ниже предел уже исчерпали.
         {% else %}
@@ -121,7 +123,11 @@
                     {% else %}
                         <span class="help-text">товар по баркоду не найден</span>
                     {% endif %}
-                    <div class="help-text mono">{{ row.task.barcode }} → {{ row.task.warehouse_to }}</div>
+                    <div class="help-text mono">
+                        {{ row.task.barcode }}{% if row.task.warehouse_to %} → {{ row.task.warehouse_to }}{% endif %}
+                        · {{ row.task.command }}
+                    </div>
+                    <div class="help-text">{{ row.effect }}</div>
                     <div class="help-text">
                         искать в 1С по комментарию:
                         <span class="mono">order_id={{ row.task.order_id }}</span>
@@ -157,7 +163,7 @@
                     </form>
                     <form method="post" action="/diagnostics/stuck-tasks/{{ row.task.id }}/resolve"
                           style="display:inline"
-                          onsubmit="return confirm('Документа в 1С нет — значит эта единица у 1С не списана, и после сверки остаток вырастет на {{ row.task.quantity }}.\n\nЕсли товар на самом деле ОТГРУЖЕН, площадки начнут продавать проданное.\n\nПродолжить?')">
+                          onsubmit="return confirm('Документа в 1С нет.\n\nПоследствие: {{ row.no_document_effect }}.\n\n{% if row.is_cancel %}Применяйте, если возврата от площадки физически не было.{% else %}Если товар на самом деле ОТГРУЖЕН, площадки начнут продавать проданное.{% endif %}\n\nПродолжить?')">
                         <input type="hidden" name="document_exists" value="no">
                         <button type="submit" class="btn btn--small btn--danger"
                                 title="Документа в 1С нет и не будет. Единица вернётся в остаток — применяйте, только если товар физически на складе.">

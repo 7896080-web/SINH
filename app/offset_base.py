@@ -201,9 +201,15 @@ def fill_waiting_products(db: Session, snapshot: StockDateSnapshot) -> dict:
             if offset_changed or turned_on:
                 for setting in product.sync_settings:
                     if setting.enabled:
-                        enqueue_full_resend(db, product.uid_1c, setting.account_id,
-                                            reason="offset_base_filled")
-                        stats["queued"] += 1
+                        # Считаем ТОЛЬКО реально поставленные записи. Возвращаемое
+                        # значение у `enqueue_full_resend` есть ровно для этого:
+                        # гейты (трансляция выключена, кабинет вне расчёта) режут
+                        # запись молча, и безусловный счётчик писал в журнал
+                        # «в очередь рассылки 2500» при нуле поставленных — тот
+                        # самый случай «всё зелено, а наружу не ушло ничего».
+                        if enqueue_full_resend(db, product.uid_1c, setting.account_id,
+                                               reason="offset_base_filled"):
+                            stats["queued"] += 1
         db.commit()
 
     return stats

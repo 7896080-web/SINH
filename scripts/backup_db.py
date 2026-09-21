@@ -23,6 +23,12 @@ def main() -> int:
     result = make_backup()
     if not result.ok:
         print(f"БЭКАП НЕ СНЯТ: {result.error}")
+        if result.path_kept:
+            # Негодный файл оставлен для разбора, но ПОД ДРУГИМ ИМЕНЕМ: под
+            # обычным он прошёл бы у `last_backup` и у суточного задания за
+            # полноценную копию — и мониторинг был бы зелёным при отсутствующей
+            # копии.
+            print(f"неудавшаяся копия отложена: {result.path_kept}")
         return 1
     moment, total = last_backup()
     print(f"копия: {result.path}")

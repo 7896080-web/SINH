@@ -96,19 +96,30 @@ def test_second_cancellation_creates_no_second_task(db, status):
     assert len(_cancel_tasks(db)) == 1
 
 
-def test_repeated_partial_refunds_create_one_task(db):
-    """Частичный возврат оставляет заказ открытым, поэтому площадка может
-    прислать его повторно. Команда `CANCEL_MOVEMENT` в 1С отменяет ВЕСЬ заказ
-    (количество в ней вообще не участвует), так что второе задание — это ровно
-    повторная отмена, дающая фантом."""
+def test_partial_refunds_create_no_task_at_all(db):
+    """Частичный возврат не заводит задания в 1С ВООБЩЕ — ни первого, ни второго.
+
+    Раньше первое задание создавалось, и это было полдела: `CANCEL_MOVEMENT`
+    отменяет ВЕСЬ заказ (количества в команде нет ни поля), а себе мы возвращали
+    только отказанную часть. Заказ на 5, отказ от 2: у нас +2, в 1С +5, и
+    разницу в три единицы часовая сверка втягивает в остаток как приход — мы
+    начинаем продавать отгруженное. Второй отказ по тому же заказу отбрасывался
+    как дубль, то есть остаток по нему не возвращался вовсе, а площадка
+    приносила эту отмену каждые две минуты всё окно открытых заказов.
+
+    Провести частичный отказ нечем, пока протокол 1С не научится принимать
+    количество в команде отмены. До тех пор — отказ с записью в журнал.
+    """
     account, record, order_id = _order_accepted(db, quantity=5)
+    stock_before = db.query(Product).filter(Product.uid_1c == "u1").first().stock_on_hand
 
     first = _cancel(db, account, record, order_id, quantity=2, partial=True)
     second = _cancel(db, account, record, order_id, quantity=2, partial=True)
 
-    assert first["duplicate_cancel"] is False
-    assert second["duplicate_cancel"] is True
-    assert len(_cancel_tasks(db)) == 1
+    assert first["status"] == "unsupported"
+    assert second["status"] == "unsupported"
+    assert _cancel_tasks(db) == []
+    assert db.query(Product).filter(Product.uid_1c == "u1").first().stock_on_hand == stock_before
 
 
 # ------------------------------------------------ границы

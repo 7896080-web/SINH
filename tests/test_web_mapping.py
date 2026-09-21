@@ -272,8 +272,15 @@ def test_swapped_barcodes_are_put_back_in_one_import(logged_in_client, web_db):
 def test_repointing_drops_the_done_mark_on_both_products(logged_in_client, web_db):
     """Расчёт собирал заказы по прежнему набору баркодов — к новому его вывод
     не относится. Оставить «актуализирован» значило бы разрешить трансляцию
-    остатка, сверенного не по тем продажам."""
+    остатка, сверенного не по тем продажам.
+
+    Покрытие обнуляется в ПУСТУЮ СТРОКУ, а не в NULL, и это не мелочь. NULL
+    читается как «расчёта никогда не было» и отключает ступень 2 лестницы
+    целиком — то есть переподвязка ОТКРЫВАЛА бы трансляцию несверенного остатка
+    вместо того, чтобы закрыть её, ровно вопреки тому, что написано выше.
+    Пустая строка означает «покрытие отслеживаем, и не покрыт никто»."""
     from app.models import Product
+    from app.transmit import covered_accounts, coverage_is_tracked
 
     _seed_two_sizes(web_db)
 
@@ -283,7 +290,9 @@ def test_repointing_drops_the_done_mark_on_both_products(logged_in_client, web_d
     for uid in ("u-l", "u-m"):
         product = web_db.query(Product).filter(Product.uid_1c == uid).one()
         assert product.recalc_done_at is None, uid
-        assert product.recalc_account_ids is None, uid
+        assert covered_accounts(product) == set(), uid
+        assert coverage_is_tracked(product) is True, (
+            f"{uid}: покрытие перестало отслеживаться — ступень 2 отключена")
 
 
 def test_an_unchanged_row_is_not_counted_as_repointed(logged_in_client, web_db):

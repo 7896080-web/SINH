@@ -34,6 +34,11 @@ templates = shared_templates
 
 RESULT_LIMIT = 300
 
+# По сколько значений за раз кладём в `IN (...)`. У SQLite есть предел на число
+# параметров запроса (по умолчанию 999 в сборках до 3.32), и боевой каталог его
+# превышает в шестнадцать раз.
+_IN_CHUNK = 900
+
 
 class _UnionFind:
     def __init__(self):
@@ -55,15 +60,51 @@ class _UnionFind:
             self.parent[ra] = rb
 
 
+def _barcodes_1c_near(db: Session, catalog_barcodes: set[str]) -> list[tuple[str, str]]:
+    """Баркоды 1С, которые вообще могут попасть в кластер площадки.
+
+    Читать ВСЮ таблицу баркодов было незачем и дорого: на боевом каталоге это
+    154 232 строки на каждый запрос страницы, а сама страница перезапрашивает
+    таблицу на каждой паузе в наборе (`hx-trigger="keyup"`). Замер на копии
+    боевых данных: 1,33 с и 109 МБ пиковой памяти НА ЗАПРОС.
+
+    При этом в кластер попадает только тот товар 1С, у которого хотя бы один
+    баркод есть в каталоге площадок: кластеры заводятся по позициям каталога
+    (цикл по `items` ниже), а баркоды 1С лишь довязывают к ним свой uid. Значит
+    нужны баркоды ровно тех товаров 1С, что каталогом задеты, — на тех же
+    данных 18 124 строки вместо 154 232, за 0,25 с. Результат побайтово тот же:
+    отброшены строки, которые старый код прочитал бы и выбросил по `root in
+    clusters`.
+    """
+    if not catalog_barcodes:
+        return []
+    known = list(catalog_barcodes)
+    uids: set[str] = set()
+    # Порциями: у SQLite предел на число параметров в IN, и он ниже, чем размер
+    # боевого каталога.
+    for start in range(0, len(known), _IN_CHUNK):
+        uids.update(uid for (uid,) in db.query(Barcode.uid_1c).filter(
+            Barcode.barcode.in_(known[start:start + _IN_CHUNK])).distinct().all())
+    if not uids:
+        return []
+    rows: list[tuple[str, str]] = []
+    uid_list = list(uids)
+    for start in range(0, len(uid_list), _IN_CHUNK):
+        rows.extend(db.query(Barcode.barcode, Barcode.uid_1c).filter(
+            Barcode.uid_1c.in_(uid_list[start:start + _IN_CHUNK])).all())
+    return rows
+
+
 def _build_clusters(db: Session) -> list[dict]:
     """Строит кластеры товаров по пулам баркодов через все площадки и 1С."""
     items = db.query(
         PlatformCatalogItem.account_id, PlatformCatalogItem.external_id,
         PlatformCatalogItem.barcode, PlatformCatalogItem.article, PlatformCatalogItem.name,
     ).all()
-    platmap = {a.id: a.platform.value for a in db.query(PlatformAccount).all()}
-    cabmap = {a.id: a.name for a in db.query(PlatformAccount).all()}
-    barcodes_1c = db.query(Barcode.barcode, Barcode.uid_1c).all()
+    accounts = db.query(PlatformAccount).all()
+    platmap = {a.id: a.platform.value for a in accounts}
+    cabmap = {a.id: a.name for a in accounts}
+    barcodes_1c = _barcodes_1c_near(db, {bc for _a, _e, bc, _ar, _n in items})
     uid_of = {bc: uid for bc, uid in barcodes_1c}
 
     uf = _UnionFind()

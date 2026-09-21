@@ -35,6 +35,7 @@ from __future__ import annotations
 import logging
 from datetime import timedelta
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.models import DispatchQueueItem, DispatchStatus, PlatformAccount
@@ -66,7 +67,7 @@ def rows_to_verify(db: Session, account_id: int) -> list[DispatchQueueItem]:
     первыми четырьмя бессмысленно — они устарели законно.
     """
     now = now_utc()
-    rows = db.query(DispatchQueueItem).filter(
+    window = [
         DispatchQueueItem.account_id == account_id,
         DispatchQueueItem.status == DispatchStatus.sent,
         DispatchQueueItem.is_test.is_(False),
@@ -75,12 +76,30 @@ def rows_to_verify(db: Session, account_id: int) -> list[DispatchQueueItem]:
         DispatchQueueItem.sent_quantity.isnot(None),
         DispatchQueueItem.sent_at <= now - SETTLE_DELAY,
         DispatchQueueItem.sent_at >= now - LOOKBACK,
-    ).order_by(DispatchQueueItem.sent_at.desc()).all()
+    ]
 
-    latest: dict[str, DispatchQueueItem] = {}
-    for row in rows:
-        latest.setdefault(row.uid_1c, row)       # rows уже по убыванию времени
-    return list(latest.values())[:MAX_PER_ACCOUNT]
+    # Последнюю отправку по товару ищем В БАЗЕ, а не в памяти. Раньше здесь был
+    # `.all()` без предела, а срез `[:MAX_PER_ACCOUNT]` делался уже по готовому
+    # питоновскому списку: после «Переотправить остаток» в сутки попадает запись
+    # на КАЖДЫЙ транслируемый товар, и ради пятисот строк поднимались все сто
+    # пятьдесят тысяч ORM-объектов — каждые полчаса и на каждый кабинет. Замер:
+    # 3,94 с на in-memory базе, на файловой дороже. Тот же анти-паттерн уже
+    # чинили на странице «Товаров».
+    latest_ids = (
+        db.query(func.max(DispatchQueueItem.id))
+        .filter(*window)
+        .group_by(DispatchQueueItem.uid_1c)
+        .order_by(func.max(DispatchQueueItem.sent_at).desc())
+        .limit(MAX_PER_ACCOUNT)
+        .all()
+    )
+    ids = [row[0] for row in latest_ids]
+    if not ids:
+        return []
+    return (db.query(DispatchQueueItem)
+            .filter(DispatchQueueItem.id.in_(ids))
+            .order_by(DispatchQueueItem.sent_at.desc())
+            .all())
 
 
 def verify_account(db: Session, client, account: PlatformAccount) -> dict:

@@ -1,3 +1,4 @@
+import atexit
 import os
 import sys
 import tempfile
@@ -10,8 +11,27 @@ os.environ.setdefault("SECRETS_ENCRYPTION_KEY", "EfYA4-I-29JUEh7MiU9I4odQtKEB87p
 # Файловая, а не :memory: SQLite — TestClient гоняет запросы через пул потоков
 # (anyio.to_thread), а SQLite ":memory:" при подключении из разных потоков
 # каждый раз видит новую пустую базу. Файл на диске от этой проблемы избавлен.
-_web_db_path = os.path.join(tempfile.gettempdir(), "sync_admin_web_tests.db")
+#
+# Имя несёт номер процесса. Файл был один на всех, а фикстура `web_db` после
+# КАЖДОГО веб-теста делает `drop_all`: два прогона рядом (а во время разбора их
+# запускают именно так — один полный в фоне, один точечный руками) сносили
+# таблицы друг у друга. Выглядело это сотней ошибок вида «UNIQUE constraint
+# failed: users.username», то есть как поломка кода, а не как столкновение
+# прогонов — и на этом теряли время не один раз.
+_web_db_path = os.path.join(tempfile.gettempdir(),
+                            f"sync_admin_web_tests_{os.getpid()}.db")
 _default_url = f"sqlite:///{_web_db_path}"
+
+
+@atexit.register
+def _drop_web_db_file():
+    """Убрать свой файл базы после прогона — раз уж имя теперь у каждого своё,
+    иначе %TEMP% зарастёт по файлу на запуск."""
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            os.remove(_web_db_path + suffix)
+        except OSError:
+            pass
 
 
 def looks_like_test_database(url: str) -> bool:

@@ -18,7 +18,8 @@ from app.workers.order_poller import (process_new_order, process_cancellation, p
                                       TEST_ORDER_PREFIX, open_test_out)
 from app.workers.scheduler import PENDING_WAREHOUSE_NAME, SOLD_WAREHOUSE_NAME
 from app.workers.dispatch import _resolve_push_target, _quantity_to_send
-from app.transmit import explain, offset_from_base, recompute_offset, sku_quantity
+from app.transmit import (explain, offset_from_base, recompute_offset, sku_quantity,
+                          enqueue_full_resend, ever_transmitted)
 from app.offset_base import ensure_snapshot_requested, set_base_date
 from app.workers.platform_clients.base import PlatformOrder, StockPushItem
 from app.audit import log_action
@@ -341,6 +342,28 @@ def test_push_stock(
     barcode, external_id, article = target
     quantity = _quantity_to_send(db, uid_1c, account_id, product.stock_on_hand)
 
+    # Ноль на карточку, куда мы ни разу не отправляли непустой остаток, — это не
+    # проверка ключей, а обнуление чужой витрины. А кнопку нажимают ровно в этом
+    # состоянии: страница «Тестирование» для того и нужна, чтобы прогнать товар
+    # ДО включения трансляции, и лестница в этот момент даёт ноль. Оператор при
+    # этом видел зелёное «Остаток 0 шт. успешно отправлен».
+    #
+    # Условие то же, что у осознанного отзыва (`transmit.should_withdraw`):
+    # спрашиваем не «включено ли», а «было ли что отзывать».
+    if quantity == 0 and not ever_transmitted(db, uid_1c, account_id):
+        reason = ("трансляция у товара выключена" if not product.broadcast_enabled
+                  else "лестница приоритетов даёт 0")
+        _log(db, uid_1c, account_id, TestLogLevel.warn, "push_stock",
+             f"Отправка отменена: к отправке вышло 0 шт. ({reason}), а непустой остаток "
+             f"на этот кабинет не уходил ни разу. Ноль здесь не отозвал бы наш остаток, "
+             f"а обнулил бы карточку площадки, по которой идут чужие продажи.")
+        db.commit()
+        set_flash(request, "Отправка отменена: к отправке вышло 0 шт., а на этот кабинет мы "
+                           "ни разу не отправляли непустой остаток — ноль обнулил бы живую "
+                           "карточку. Сначала доведите товар до «актуализирован» и включите "
+                           "трансляцию, потом проверяйте отправку.", "warn")
+        return RedirectResponse(f"/testing?uid_1c={uid_1c}&account_id={account_id}", status_code=303)
+
     _log(db, uid_1c, account_id, TestLogLevel.info, "push_stock",
          f"Отправка: физический остаток {product.stock_on_hand}, к отправке {quantity} шт. "
          f"(после резерва/порога) по баркоду {barcode}...")
@@ -559,14 +582,20 @@ def cleanup_test_data(
         # Реальным кабинетам с включённой синхронизацией шлём текущий боевой
         # остаток: тестовые значения до них не доходили (is_test исключает записи
         # в dispatch.py), но лишняя сверка с реальностью после теста не мешает.
+        #
+        # ЧЕРЕЗ `enqueue_full_resend`, а не прямым `db.add`. Прямая постановка
+        # обходила ОБА гейта трансляции: у товара с выключенной трансляцией
+        # лестница считает ноль (ступень 0), и этот ноль уходил на площадку.
+        # Для карточки, на которую мы ни разу ничего не отправляли, это не отзыв
+        # остатка, а обнуление чужих продаж — ровно инцидент 18.09. И повторялся
+        # он тут особенно легко: страница «Тестирование» для того и нужна, чтобы
+        # прогнать товар ДО включения трансляции, то есть кнопку «Очистить»
+        # нажимают именно в том состоянии, в котором лестница даёт ноль.
         enabled_settings = db.query(SyncSetting).filter(
             SyncSetting.uid_1c == uid_1c, SyncSetting.enabled.is_(True),
         ).all()
         for setting in enabled_settings:
-            db.add(DispatchQueueItem(
-                uid_1c=uid_1c, account_id=setting.account_id,
-                quantity=product.stock_on_hand, reason="test_cleanup",
-            ))
+            enqueue_full_resend(db, uid_1c, setting.account_id, reason="test_cleanup")
 
     order_ids = [o.order_id for o in test_orders]
     deleted_ftp = deleted_anomaly = 0
@@ -820,12 +849,15 @@ def reset_backfill(
     deleted_log = db.query(TestLogEntry).filter(TestLogEntry.uid_1c == uid_1c).delete(synchronize_session=False)
 
     # Площадкам — актуальное значение заново (dispatch пересчитает от текущего
-    # остатка/порога в момент отправки).
+    # остатка/порога в момент отправки). ЧЕРЕЗ `enqueue_full_resend`, а не прямым
+    # `db.add`: см. ту же правку в `cleanup_test_data`. Прямая постановка обходила
+    # оба гейта, и по нетранслируемому товару на площадку уезжал ноль — обнуление
+    # живой карточки вместо отзыва нашего остатка.
     targets = []
-    for s in db.query(SyncSetting).filter(SyncSetting.uid_1c == uid_1c, SyncSetting.enabled.is_(True)).all():
-        db.add(DispatchQueueItem(uid_1c=uid_1c, account_id=s.account_id,
-                                 quantity=product.stock_on_hand, reason="backfill_reset"))
-        targets.append(s.account_id)
+    for setting in db.query(SyncSetting).filter(
+            SyncSetting.uid_1c == uid_1c, SyncSetting.enabled.is_(True)).all():
+        if enqueue_full_resend(db, uid_1c, setting.account_id, reason="backfill_reset"):
+            targets.append(setting.account_id)
 
     msg = (f"История бэкфилла сброшена: заказов {deleted_orders}, заданий 1С {deleted_ftp}, аномалий {deleted_anomaly}, "
            f"записей рассылки {deleted_dispatch}, записей журнала {deleted_log}. Остаток ЦС не менялся "

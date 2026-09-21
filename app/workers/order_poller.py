@@ -8,7 +8,7 @@ from app.models import (
     Product, SyncSetting, SyncAnomaly, AnomalyReason, ProcessedOrder,
     OrderProcessStatus, DispatchQueueItem, FtpTask, Barcode, PlatformAccount,
 )
-from app.transmit import covered_accounts
+from app.transmit import covered_accounts, coverage_is_tracked
 from app.workers.matching import resolve_barcode
 from app.workers.platform_clients.base import PlatformClient, PlatformOrder
 
@@ -105,7 +105,7 @@ def _enqueue_dispatch_to_others(db: Session, uid_1c: str, source_account_id: int
     # Кабинеты, которых расчёт не касался, пропускаем по той же причине: по ним
     # рассылка посчитает ноль и отправит его на живую карточку.
     covered = covered_accounts(product)
-    gate_by_recalc = product is not None and product.recalc_done_at is not None
+    gate_by_recalc = coverage_is_tracked(product)
 
     targets = []
     for setting in settings:
@@ -305,7 +305,35 @@ def process_cancellation(db: Session, cancelled_order: PlatformOrder, record: Pr
     result = {"status": None, "return_quantity": 0, "new_stock": None, "dispatched_to": [],
               "ftp_task_id": None, "duplicate_cancel": False}
 
-    return_quantity = cancelled_order.refused_quantity if cancelled_order.is_partial_refund else record.quantity
+    if cancelled_order.is_partial_refund:
+        # ЧАСТИЧНЫЙ отказ мы провести не можем, и делать вид, что можем, опаснее,
+        # чем отказаться.
+        #
+        # Мы вернули бы себе только отказанное количество, а в 1С ушло бы
+        # `CANCEL_MOVEMENT|order_id|площадка` — количества в этой команде нет ни
+        # поля, и `ОтменитьПеремещенияЗаказа` реверсит исходный документ ЦЕЛИКОМ.
+        # Заказ на 3, отказ от 1: у нас +1, в 1С +3. Расхождение в две единицы
+        # часовая сверка втянет в остаток как приход, и мы начнём продавать
+        # отгруженное. Второй частичный отказ по тому же заказу вдобавок
+        # отбрасывался как дубль — остаток не возвращался вовсе, а площадка
+        # приносила эту отмену каждые две минуты все тридцать дней окна.
+        #
+        # Сегодня путь спящий: `is_partial_refund` не выставляет ни один клиент.
+        # Поэтому это не потеря возможности, а запертая дверь — чтобы появившийся
+        # завтра частичный отказ не поехал по сломанной дороге молча. Открывать
+        # её надо вместе с протоколом 1С (количество в команде отмены и реверс на
+        # указанное число), а не здесь.
+        result["status"] = "unsupported"
+        logger.warning(
+            "частичный отказ по заказу %s (кабинет %s, отказано %s из %s) не проведён: "
+            "команда отмены в 1С отменяет документ целиком, частичный реверс протоколом "
+            "не предусмотрен — разберите вручную",
+            cancelled_order.order_id, account.id,
+            cancelled_order.refused_quantity, record.quantity,
+        )
+        return result
+
+    return_quantity = record.quantity
     if return_quantity <= 0:
         result["status"] = "skipped"
         return result
@@ -320,9 +348,11 @@ def process_cancellation(db: Session, cancelled_order: PlatformOrder, record: Pr
         result["status"] = "duplicate"
         result["duplicate_cancel"] = True
         result["ftp_task_id"] = already.id
-        if not cancelled_order.is_partial_refund and record.status != OrderProcessStatus.cancelled:
+        if record.status != OrderProcessStatus.cancelled:
             # Заказ всё-таки закрываем: иначе опрос будет приносить его каждые
-            # две минуты и каждый раз упираться в эту же проверку.
+            # две минуты и каждый раз упираться в эту же проверку. Оговорка про
+            # частичный отказ отсюда убрана: до этой строки он больше не доходит,
+            # его отсекает проверка в начале функции.
             record.status = OrderProcessStatus.cancelled
             record.cancelled_at = now_utc()
             db.commit()
@@ -353,12 +383,10 @@ def process_cancellation(db: Session, cancelled_order: PlatformOrder, record: Pr
     result["return_quantity"] = return_quantity
     result["new_stock"] = new_stock
 
-    if cancelled_order.is_partial_refund:
-        result["status"] = "partial"
-    else:
-        record.status = OrderProcessStatus.cancelled
-        record.cancelled_at = now_utc()
-        result["status"] = "reversed"
+    # Частичный отказ сюда не доходит — отсечён в начале функции.
+    record.status = OrderProcessStatus.cancelled
+    record.cancelled_at = now_utc()
+    result["status"] = "reversed"
 
     result["dispatched_to"] = _enqueue_dispatch_to_others(
         db, record.uid_1c, account.id, new_stock, reason="cancel", is_test=is_test,
@@ -421,13 +449,27 @@ def poll_new_orders(db: Session, client: PlatformClient, account: PlatformAccoun
     process_new_order, агрегируя статистику."""
 
     orders = client.get_orders_awaiting_confirmation()
-    stats = {"processed": 0, "already_processed": 0, "unmatched": 0, "anomalies": 0, "skipped_disabled": 0}
+    stats = {"processed": 0, "already_processed": 0, "unmatched": 0, "anomalies": 0,
+             "skipped_disabled": 0, "failed": 0, "problems": []}
 
     status_to_stat = {"processed": "processed", "already_processed": "already_processed",
                       "unmatched": "unmatched", "skipped_disabled": "skipped_disabled"}
 
     for order in orders:
-        result = process_new_order(db, order, account, warehouse_pending)
+        # Заказ обрабатывается ПООТДЕЛЬНО, как и в расчёте (`recalc.apply_orders`).
+        # Раньше цикл не был защищён ничем: исключение на одной строке — гонка за
+        # `database is locked` во время часовой сверки, ошибка целостности,
+        # что угодно — обрывало весь цикл, и остальные новые заказы кабинета в
+        # этом проходе не проводились вовсе. Без отката сессия вдобавок остаётся
+        # сломанной после неудачного commit внутри `process_new_order`, так что
+        # следующий заказ падал бы уже на ровном месте.
+        try:
+            result = process_new_order(db, order, account, warehouse_pending)
+        except Exception as e:                      # noqa: BLE001 — причина уходит наверх текстом
+            db.rollback()
+            stats["failed"] += 1
+            stats["problems"].append(f"заказ {order.order_id}: {type(e).__name__}: {e}")
+            continue
         stat_key = status_to_stat.get(result["status"])
         if stat_key:
             stats[stat_key] += 1
@@ -449,18 +491,32 @@ def poll_cancellations(db: Session, client: PlatformClient, account: PlatformAcc
     orders_by_id = {o.order_id: o for o in open_orders}
 
     cancelled = client.get_cancelled_orders(order_ids)
-    stats = {"reversed": 0, "partial": 0}
+    stats = {"reversed": 0, "unsupported": 0, "failed": 0, "problems": []}
 
     for c in cancelled:
         record = orders_by_id.get(c.order_id)
         if record is None or record.uid_1c is None:
             continue
 
-        result = process_cancellation(db, c, record, account)
+        # По одной отмене, как и в приёме заказов: пропущенная отмена — это
+        # невозвращённая на ЦС единица, и терять из-за неё весь остаток цикла
+        # нельзя. Без отката сессия после неудачного commit внутри
+        # `process_cancellation` остаётся сломанной.
+        try:
+            result = process_cancellation(db, c, record, account)
+        except Exception as e:                      # noqa: BLE001 — причина уходит наверх текстом
+            db.rollback()
+            stats["failed"] += 1
+            stats["problems"].append(f"отмена {c.order_id}: {type(e).__name__}: {e}")
+            continue
         if result["status"] == "reversed":
             stats["reversed"] += 1
-        elif result["status"] == "partial":
-            stats["partial"] += 1
+        elif result["status"] == "unsupported":
+            # Частичный отказ: провести нечем (см. process_cancellation). Считаем
+            # и называем — молчать о непроведённой отмене нельзя.
+            stats["unsupported"] += 1
+            stats["problems"].append(
+                f"отмена {c.order_id}: частичный отказ, протоколом 1С не поддержан")
 
     return stats
 
@@ -475,13 +531,22 @@ def poll_confirmations(db: Session, client: PlatformClient, account: PlatformAcc
     orders_by_id = {o.order_id: o for o in open_orders}
 
     confirmed = client.get_confirmed_orders(order_ids)
-    stats = {"confirmed": 0}
+    stats = {"confirmed": 0, "failed": 0, "problems": []}
 
     for c in confirmed:
         record = orders_by_id.get(c.order_id)
         if record is None or record.uid_1c is None:
             continue
-        result = process_confirmation(db, record, account, warehouse_pending, warehouse_sold)
+        # См. `poll_new_orders`: сбой на одном подтверждении не должен уносить
+        # ни остальные подтверждения, ни ОТМЕНЫ — они опрашиваются следующим
+        # шагом того же задания, и без этой защиты пропадали вместе с ним.
+        try:
+            result = process_confirmation(db, record, account, warehouse_pending, warehouse_sold)
+        except Exception as e:                      # noqa: BLE001 — причина уходит наверх текстом
+            db.rollback()
+            stats["failed"] += 1
+            stats["problems"].append(f"подтверждение {c.order_id}: {type(e).__name__}: {e}")
+            continue
         if result["status"] == "confirmed":
             stats["confirmed"] += 1
 

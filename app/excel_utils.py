@@ -3,12 +3,20 @@ from datetime import datetime, date
 from urllib.parse import quote
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.cell import WriteOnlyCell
 from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
 from fastapi.responses import StreamingResponse
 
 YES_NO = ["Да", "Нет"]
+
+# По скольким первым строкам прикидываем ширину колонок. Раньше мерили по ВСЕМ:
+# на выгрузке каталога это 152 тысячи строк на каждую из семи колонок, то есть
+# миллион вызовов len(str(...)) ради числа, которое всё равно упирается в
+# потолок в 60 символов. Пятисот строк хватает, чтобы колонка не оказалась
+# шириной в заголовок.
+WIDTH_SAMPLE_ROWS = 500
 
 
 def build_xlsx_response(headers: list[str], rows: list[list], filename: str,
@@ -24,20 +32,22 @@ def build_xlsx_response(headers: list[str], rows: list[list], filename: str,
     ячейка после вычищенного фильтра — и файл ВЫКЛЮЧАЕТ то, что оператор
     собирался включить, не сказав об этом ни слова. Проверка на стороне Excel
     ловит это там, где человек ещё видит свою строку.
+
+    Лист пишется ПОТОКОМ (`write_only`), а не собирается целиком в памяти.
+    Обычный режим openpyxl держит на каждую ячейку отдельный объект: замер на
+    боевом объёме дал 50 000 строк — 36,5 с и 344 МБ, 152 235 строк — 112 с и
+    829 МБ. Выгрузка остатков на дату не ограничена ничем, то есть это второе
+    число и есть рабочее: две минуты веб-служба занята одним запросом и держит
+    под него почти гигабайт. Потоком те же объёмы — 4,3 с / 50 МБ и
+    13,1 с / 103 МБ.
     """
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Данные"
+    wb = Workbook(write_only=True)
+    ws = wb.create_sheet("Данные")
 
-    ws.append(headers)
-    for cell in ws[1]:
-        cell.font = Font(bold=True)
-
-    for row in rows:
-        ws.append(row)
-
-    # Выпадающие списки. Диапазон — ровно по выгруженным строкам: на пустом
-    # файле проверять нечего, а «на весь столбец» Excel тянет тяжелее.
+    # Выпадающие списки объявляются ДО первой строки: в потоковом режиме лист
+    # после записи уже не переписать, а диапазон известен заранее — он ровно по
+    # числу выгруженных строк. На пустом файле проверять нечего, а «на весь
+    # столбец» Excel тянет тяжелее.
     if choices and rows:
         for header, options in choices.items():
             if header not in headers:
@@ -49,20 +59,32 @@ def build_xlsx_response(headers: list[str], rows: list[list], filename: str,
                 errorTitle="Так нельзя",
                 error="Выберите значение из списка: " + ", ".join(options) + ".",
             )
-            # Правило добавляется в лист ДО назначения диапазона: openpyxl
-            # связывает его с листом именно в этот момент, и обратный порядок
-            # молча даёт файл без проверок.
-            ws.add_data_validation(rule)
+            ws.data_validations.dataValidation.append(rule)
             rule.add(f"{letter}2:{letter}{len(rows) + 1}")
 
-    # автоширина колонок — грубая эвристика по длине содержимого
-    for col_idx, header in enumerate(headers, start=1):
-        letter = ws.cell(row=1, column=col_idx).column_letter
-        max_len = len(str(header))
-        for row in rows:
-            value = row[col_idx - 1] if col_idx - 1 < len(row) else ""
-            max_len = max(max_len, len(str(value)) if value is not None else 0)
-        ws.column_dimensions[letter].width = min(max_len + 3, 60)
+    bold = Font(bold=True)
+    header_cells = []
+    for header in headers:
+        cell = WriteOnlyCell(ws, value=header)
+        cell.font = bold
+        header_cells.append(cell)
+    ws.append(header_cells)
+
+    # Ширина колонок считается по первым WIDTH_SAMPLE_ROWS строкам — в том же
+    # проходе, что и запись: второй проход по выгрузке означал бы держать её в
+    # памяти целиком ради числа, ограниченного шестьюдесятью символами.
+    widths = [len(str(h)) for h in headers]
+    for index, row in enumerate(rows):
+        if index < WIDTH_SAMPLE_ROWS:
+            for col_idx, value in enumerate(row):
+                if col_idx < len(widths) and value is not None:
+                    length = len(str(value))
+                    if length > widths[col_idx]:
+                        widths[col_idx] = length
+        ws.append(row)
+
+    for col_idx, width in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(width + 3, 60)
 
     buffer = io.BytesIO()
     wb.save(buffer)
@@ -90,6 +112,24 @@ class ExcelReadError(Exception):
     .xls или .csv, переименованные в .xlsx) вылетала наружу как BadZipFile и
     превращалась в 500: все три импорта аккуратно собирают ошибки по строкам, но
     падали на открытии файла, ещё до первой строки."""
+
+
+# Потолок на размер загружаемого файла. Не «защита от злоумышленника» — вход под
+# паролем, — а защита от промаха: веб-служба читает файл целиком в память и
+# распаковывает его, и .xlsx в сотню мегабайт (или .zip, переименованный в .xlsx)
+# кладёт её вместе с приёмом заказов и рассылкой. Сорок мегабайт — это заведомо
+# больше, чем весит выгрузка всего каталога на 152 тысячи строк.
+MAX_UPLOAD_BYTES = 40 * 1024 * 1024
+
+
+def read_upload(file, limit: int = MAX_UPLOAD_BYTES) -> bytes:
+    """Читает загруженный файл, не давая ему съесть память веб-службы."""
+    data = file.read(limit + 1)
+    if len(data) > limit:
+        raise ExcelReadError(
+            f"Файл больше {limit // (1024 * 1024)} МБ — столько не весит даже "
+            "выгрузка всего каталога. Проверьте, что выбран нужный файл.")
+    return data
 
 
 def read_xlsx_rows(file_bytes: bytes) -> list[dict]:

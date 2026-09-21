@@ -450,7 +450,9 @@ class KitClient(PlatformClient):
         перестанет быть известным, мы получили бы ВЕСЬ каталог и опубликовали
         всё подряд. Поэтому статус каждой строки проверяем ещё и у себя.
 
-        `None` — спросить не удалось; публикация в этом случае не делается.
+        `None` — спросить не удалось ИЛИ список вышел неполным; публикация в этом
+        случае не делается вовсе. Неполный список опаснее отсутствующего: он
+        выглядит как ответ, и карточки за его границей остаются скрытыми молча.
         """
         found: set[str] = set()
         collected = 0
@@ -470,7 +472,12 @@ class KitClient(PlatformClient):
             total = data.get("total_count")
             if isinstance(total, int) and collected >= total:
                 return found
-        return found
+        # Упёрлись в предел страниц — список НЕПОЛНЫЙ, и вернуть его как полный
+        # нельзя: контракт у метода ровно обратный («None — спросить не удалось,
+        # публиковать вслепую нельзя»). Карточки за границей остались бы
+        # скрытыми навсегда: остаток передан, площадка его приняла, у нас всё
+        # зелено — а товара на витрине нет и продаж не будет.
+        return None
 
     def publish_stock_key(self, key: str) -> bool:
         """Вернуть карточку на витрину: `status` → `PUBLISHED`.
@@ -502,15 +509,35 @@ class KitClient(PlatformClient):
             return False
 
     def get_catalog_items(self) -> list[CatalogItem]:
+        """Каталог кабинета постранично.
+
+        Конец определяет `total_count`, а НЕ длина страницы — ровно по той же
+        причине, что и у ленты заказов (см. `_walk_orders`): короткая страница у
+        Kit не значит «данные кончились». Стоял здесь именно такой стоп, и
+        недогруженный каталог тихо стоит дорого: у части товаров нет
+        `external_id`, а без variant_id рассылка закрывает позицию как «нет
+        карточки в каталоге кабинета» — остаток туда не уедет никогда.
+
+        И обязательный предел страниц. Kit молча игнорирует неизвестные
+        параметры; перестань однажды действовать `page` — цикл `while True` не
+        закончился бы вовсе, бесконечно копя дубли в памяти воркера.
+        """
         result = []
-        page = 1
-        while True:
+        collected = 0
+        self.last_truncated = False
+        for page in range(1, MAX_ORDER_PAGES + 1):
             data = self._get("/v1/variants", params={"page": page, "per_page": 100})
-            result.extend(_parse_kit_variants(data))
             variants = data.get("variants", [])
-            if len(variants) < 100:
-                break
-            page += 1
+            if not variants:
+                return result
+            result.extend(_parse_kit_variants(data))
+            collected += len(variants)
+            total = data.get("total_count")
+            if isinstance(total, int) and collected >= total:
+                return result
+        # Выдачу оборвали мы, а не площадка: каталог неполон, и молчать об этом
+        # нельзя — иначе огрызок примут за полный каталог.
+        self.last_truncated = True
         return result
 
 

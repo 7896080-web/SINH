@@ -63,6 +63,27 @@ def calc_status(product: Product, has_cabinet: bool = True,
 DEFERRABLE_CALC_STATUSES = frozenset({"waiting", "need_recalc", "need_recalc_account"})
 
 
+def enabled_account_ids(product: Product) -> set[int]:
+    """Кабинеты, отмеченные для товара И ЖИВЫЕ.
+
+    Ворота сравнивают этот набор с тем, что покрыл расчёт, а расчёт опрашивает
+    только активные кабинеты (`recalc._enabled_accounts`). Пока ворота брали ВСЕ
+    отмеченные, кабинет, который сам себя выключил после пяти сбоёв подряд
+    (`circuit_breaker` — осознанное поведение, не баг), навсегда запирал строку в
+    состоянии «нужен пересчёт: добавлен кабинет»: расчёт его не опрашивает и в
+    покрытые не кладёт, значит `issubset` ложно всегда. Повторный расчёт ничего
+    не менял, подпись не называла виновника, а включить трансляцию было нельзя ни
+    по этому товару, ни по любому другому, отмеченному для того же кабинета, —
+    включая совершенно здоровые кабинеты того же товара. Отложенные просьбы из
+    Excel висели вечно.
+
+    Условие обязано совпадать с тем, по которому расчёт выбирает кабинеты, иначе
+    оно разойдётся второй раз.
+    """
+    return {s.account_id for s in product.sync_settings
+            if s.enabled and (s.account is None or s.account.is_active)}
+
+
 def blocks_broadcast_on(product: Product) -> str | None:
     """Почему этот товар нельзя включать в трансляцию. None — можно.
 
@@ -76,7 +97,7 @@ def blocks_broadcast_on(product: Product) -> str | None:
     Проверяем на ВКЛЮЧЕНИИ. Выключение не трогаем никогда: снять с трансляции
     должно быть можно в любой момент и без условий.
     """
-    enabled_ids = {s.account_id for s in product.sync_settings if s.enabled}
+    enabled_ids = enabled_account_ids(product)
     code, label = calc_status(product, bool(enabled_ids), enabled_ids)
     if code == "ready":
         return None

@@ -59,6 +59,10 @@ class BackupResult:
     checked: bool
     removed: int = 0
     error: str = ""
+    # Куда отложен негодный файл, если попытка сорвалась. Он остаётся на диске
+    # для разбора, но под именем, которое уборка и `last_backup` за копию не
+    # считают.
+    path_kept: str = ""
 
     @property
     def ok(self) -> bool:
@@ -82,6 +86,47 @@ def database_path(database_url: str | None = None) -> Path | None:
     if not tail or tail == ":memory:":
         return None
     return Path(tail)
+
+
+def _set_aside(target: Path) -> str:
+    """Убрать негодный файл из-под имени копии, не удаляя его.
+
+    `last_backup()` и `prune()` различают копии ПО ИМЕНИ, и оборванный файл
+    правильного вида проходил у них за полноценную копию: задание при следующем
+    запуске видело «свежая копия уже есть», писало зелёный heartbeat и не
+    пробовало снова двадцать часов, а находка отчёта молчала двое суток. Копии
+    нет — и все три механизма контроля утверждают обратное.
+
+    Удалять нельзя: по этому файлу разбираются, что именно пошло не так (кончился
+    диск, права, повреждение). Достаточно вывести его из-под шаблона имён.
+    """
+    if not target.exists():
+        _remove_companions(target)
+        return ""
+    bad = target.with_suffix(target.suffix + ".bad")
+    try:
+        if bad.exists():
+            bad.unlink()
+        target.replace(bad)
+    except OSError:
+        # Не переименовалось — беда меньшая, чем потерянная копия, но соврать об
+        # этом нельзя: возвращаем пустую строку, ошибка и так уже в результате.
+        return ""
+    _remove_companions(target)
+    return str(bad)
+
+
+def _remove_companions(target: Path) -> None:
+    """Убрать спутников файла: `-wal`, `-shm`, `-journal`.
+
+    `-journal` добавлен к списку после аудита: он остаётся от ОБОРВАННОЙ копии, а
+    уборка его не видела — такие файлы копились бы вечно.
+    """
+    for suffix in ("-wal", "-shm", "-journal"):
+        try:
+            target.with_name(target.name + suffix).unlink()
+        except OSError:
+            pass
 
 
 def _collapse_journal(path: Path) -> None:
@@ -161,9 +206,29 @@ def prune(directory: Path, keep_daily: int = KEEP_DAILY,
             files.append((moment, path))
     files.sort(reverse=True)
 
-    keep: set[Path] = {path for _, path in files[:keep_daily]}
+    # ПО ОДНОЙ НА КАЛЕНДАРНЫЙ ДЕНЬ, а не «первые keep_daily файлов».
+    #
+    # Было второе, и обещание «вернуться на любой из недавних дней» не
+    # выполнялось: стоило копиям пойти чаще раза в сутки — а `scripts/backup_db.py`
+    # прямо предлагается для планировщика Windows и, в отличие от задания, никакого
+    # `BACKUP_MIN_GAP` не проверяет, — и четырнадцать «ежедневных» превращались в
+    # четырнадцать ПОСЛЕДНИХ ЧАСОВ. Замер: 24 почасовых копии за сутки плюс 60
+    # суточных → после уборки осталось 15 последних часов и провал в неделю сразу
+    # за ними. Порчу данных (перепутанный мэппинг, неверный импорт) замечают через
+    # день-два, и восстанавливать было бы не из чего.
+    keep: set[Path] = set()
+    days_seen: set = set()
+    rest: list[tuple] = []
+    for moment, path in files:
+        day = moment.date()
+        if day not in days_seen and len(days_seen) < keep_daily:
+            days_seen.add(day)
+            keep.add(path)
+        else:
+            rest.append((moment, path))
+
     weeks_seen: set[tuple] = set()
-    for moment, path in files[keep_daily:]:
+    for moment, path in rest:
         week = moment.isocalendar()[:2]
         if week not in weeks_seen and len(weeks_seen) < keep_weekly:
             weeks_seen.add(week)
@@ -178,16 +243,44 @@ def prune(directory: Path, keep_daily: int = KEEP_DAILY,
             except OSError as e:
                 logger.warning("бэкап: не удалось удалить %s: %s", path, e)
                 continue
-            # Спутники WAL, если вдруг остались от старых копий: сами по себе
-            # они под шаблон имени не подходят и иначе лежали бы вечно.
-            for suffix in ("-wal", "-shm"):
-                sidecar = Path(str(path) + suffix)
-                if sidecar.exists():
-                    try:
-                        sidecar.unlink()
-                    except OSError:
-                        pass
+            # Спутники, если вдруг остались от старых копий: сами по себе они
+            # под шаблон имени не подходят и иначе лежали бы вечно. `-journal`
+            # остаётся от ОБОРВАННОЙ копии — его не видели вовсе.
+            _remove_companions(path)
     return removed
+
+
+def _copy_database(source: Path, target: Path) -> None:
+    """Снять копию живой базы штатным механизмом SQLite.
+
+    ОДНИМ шагом, а не порциями. Было `pages=1000`, и посылка под этим была
+    неверной: «длинная блокировка на живой базе нам не нужна». В WAL читатель
+    писателя не блокирует вовсе, так что порции не покупали ничего — а стоили
+    сходимости. `Connection.backup()` при чужой записи между шагами начинает
+    копирование ЗАНОВО, и на живой базе это означает, что копия может не сняться
+    никогда: замер на базе в 150 МБ при внешнем писателе дал десять коммитов в
+    секунду → 33,5 с и 1448 перезапусков, двадцать и сто коммитов в секунду → не
+    завершилось за минуту вовсе. Задание при этом не падает: оно крутится на
+    100% CPU, занимает поток планировщика, heartbeat не обновляет, а `-wal`
+    источника растёт всё это время, потому что длинный читатель не даёт его
+    чекпойнтить.
+
+    Частота такая в системе есть: сама чистка даёт около тридцати пяти коммитов
+    в секунду и стартует через четыре минуты после бэкапа, а приём заказов
+    коммитит на каждый заказ.
+
+    Одним шагом на том же стенде — 1,0 с при любой нагрузке; проверено и на
+    109 МБ при ста коммитах в секунду: 1,5 с.
+    """
+    src = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+    try:
+        dst = sqlite3.connect(target)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()
 
 
 def make_backup(database_url: str | None = None,
@@ -196,7 +289,10 @@ def make_backup(database_url: str | None = None,
 
     Битая копия НЕ удаляется и остаётся на диске: она может пригодиться для
     разбора, а главное — её присутствие вместе с ошибкой в журнале честнее, чем
-    пустой каталог, по которому не понять, была попытка или нет.
+    пустой каталог, по которому не понять, была попытка или нет. Но лежит она под
+    расширением `.bad` (`_set_aside`): под именем копии она проходила за
+    полноценную у `last_backup` и у задания, и одна сорвавшаяся попытка делала
+    мониторинг зелёным на сутки при отсутствующей копии.
     """
     source = database_path(database_url)
     if source is None:
@@ -211,20 +307,18 @@ def make_backup(database_url: str | None = None,
     target = directory / f"{NAME_PREFIX}{now_utc():%Y%m%d-%H%M%S}.db"
 
     try:
-        src = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
-        try:
-            dst = sqlite3.connect(target)
-            try:
-                # Порциями по тысяче страниц: длинная блокировка на живой базе
-                # нам не нужна — в неё в это же время пишут воркер и веб.
-                src.backup(dst, pages=1000)
-            finally:
-                dst.close()
-        finally:
-            src.close()
+        _copy_database(source, target)
     except Exception as e:
+        # Недоснятую копию УБИРАЕМ ИЗ-ПОД ИМЕНИ КОПИИ. Она остаётся на диске для
+        # разбора, но под расширением `.bad`, и это принципиально: `last_backup`
+        # читает только ИМЕНА, поэтому оборванный файл правильного вида выглядел
+        # свежей копией — и `job_backup` при следующем запуске видел «копия уже
+        # есть», писал зелёный heartbeat и не пробовал снова двадцать часов, а
+        # находка отчёта молчала двое суток. Копии нет, а все три механизма
+        # контроля говорят, что всё хорошо.
         return BackupResult(path=str(target), size_bytes=0, checked=False,
-                            error=f"копирование не удалось: {type(e).__name__}: {e}")
+                            error=f"копирование не удалось: {type(e).__name__}: {e}",
+                            path_kept=_set_aside(target))
 
     # Копия обязана быть ОДНИМ файлом. `backup()` переносит и режим журнала, то
     # есть копия тоже оказывается в WAL, и рядом с ней появляются `-wal` и
@@ -239,7 +333,8 @@ def make_backup(database_url: str | None = None,
     size = target.stat().st_size if target.exists() else 0
     if problem:
         return BackupResult(path=str(target), size_bytes=size, checked=False,
-                            error=f"копия не прошла проверку: {problem}")
+                            error=f"копия не прошла проверку: {problem}",
+                            path_kept=_set_aside(target))
 
     removed = prune(directory)
     return BackupResult(path=str(target), size_bytes=size, checked=True, removed=removed)

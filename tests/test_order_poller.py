@@ -182,7 +182,23 @@ def test_cancellation_reverses_stock(db):
     assert cancel_task is not None
 
 
-def test_partial_refund_returns_only_refused_quantity(db):
+def test_partial_refund_is_refused_rather_than_half_done(db):
+    """Частичный отказ НЕ проводится — и это безопаснее, чем провести его наполовину.
+
+    Раньше мы возвращали себе только отказанное количество, а в 1С уходило
+    `CANCEL_MOVEMENT|order_id|площадка` — количества в этой команде нет ни поля, и
+    `ОтменитьПеремещенияЗаказа` реверсит исходный документ ЦЕЛИКОМ. Заказ на 5,
+    отказ от 2: у нас +2, в 1С +5. Расхождение в три единицы часовая сверка
+    втянет в остаток как приход, и мы начнём продавать отгруженное. Второй
+    частичный отказ по тому же заказу вдобавок отбрасывался как дубль — остаток
+    не возвращался вовсе, а площадка приносила эту отмену каждые две минуты все
+    тридцать дней окна.
+
+    Сегодня путь спящий: `is_partial_refund` не выставляет ни один клиент.
+    Поэтому дверь заперта явно — чтобы появившийся завтра частичный отказ не
+    поехал по сломанной дороге молча. Открывать её надо вместе с протоколом 1С
+    (количество в команде отмены и реверс на указанное число).
+    """
     account = make_account(db, platform=Platform.kit, name="Kit")
     _seed_product(db, stock=10, enabled_accounts=[account])
 
@@ -200,9 +216,14 @@ def test_partial_refund_returns_only_refused_quantity(db):
     ]
     stats = poll_cancellations(db, client, account)
 
-    assert stats["partial"] == 1
+    # Считаем и называем: непроведённая отмена не должна пропадать молча.
+    assert stats["unsupported"] == 1
+    assert stats["problems"], "непроведённый отказ не попал в проблемы"
+
     db.refresh(product)
-    assert product.stock_on_hand == 7  # вернулось только 2, не все 5
+    assert product.stock_on_hand == 5, "остаток тронут при непроведённом отказе"
+    assert db.query(FtpTask).filter(FtpTask.command == "CANCEL_MOVEMENT").count() == 0, (
+        "в 1С ушла отмена, которая отменит документ целиком")
 
     po = db.query(ProcessedOrder).filter(ProcessedOrder.order_id == "o1").first()
     assert po.status == OrderProcessStatus.processed

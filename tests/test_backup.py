@@ -128,14 +128,28 @@ def test_a_corrupted_copy_is_not_reported_as_ok(tmp_path, source_db, monkeypatch
     assert "не прошла проверку" in result.error
 
 
-def test_a_failed_copy_is_left_on_disk(tmp_path, source_db, monkeypatch):
-    """Битый файл вместе с ошибкой в журнале честнее пустого каталога, по
-    которому не понять, была попытка или нет."""
+def test_a_failed_copy_is_left_on_disk_but_not_as_a_copy(tmp_path, source_db, monkeypatch):
+    """Битый файл остаётся на диске — но ПОД ДРУГИМ ИМЕНЕМ.
+
+    Он вместе с ошибкой в журнале честнее пустого каталога, по которому не
+    понять, была попытка или нет, — это по-прежнему так. Но под именем копии он
+    проходил у `last_backup()` за полноценную: та различает копии ПО ИМЕНИ.
+    Одна сорвавшаяся попытка — и следующий запуск задания видит «свежая копия
+    уже есть», пишет зелёный heartbeat, не пробует снова двадцать часов, а
+    находка отчёта молчит двое суток. Копии нет, а все три механизма контроля
+    говорят, что всё хорошо.
+    """
     monkeypatch.setattr(backup, "_verify", lambda path: "плохо")
+    directory = tmp_path / "b"
 
-    result = backup.make_backup(_url(source_db), tmp_path / "b")
+    result = backup.make_backup(_url(source_db), directory)
 
-    assert Path(result.path).exists()
+    assert not result.ok
+    assert result.path_kept, "файл не отложен — по чему разбираться?"
+    assert Path(result.path_kept).exists()
+    assert not Path(result.path).exists(), "негодный файл остался под именем копии"
+    moment, total = backup.last_backup(directory)
+    assert (moment, total) == (None, 0), "негодный файл засчитан за копию"
 
 
 # --------------------------------------------------------------- сроки копий
