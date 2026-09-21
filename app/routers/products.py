@@ -1431,7 +1431,14 @@ def products_import(
             code, label = _calc_status(product, bool(enabled_after), enabled_after)
             blocked = None if (not desired_broadcast or code == "ready") else label
             if blocked and not product.broadcast_enabled:
-                if code in DEFERRABLE_CALC_STATUSES:
+                # «Ждём 1С» рассосётся само — но рассосётся оно в «нужен факт»,
+                # если факта нет ни у товара, ни в этом файле. А «нужен факт»
+                # сам не пройдёт: цифру вводит человек. Просьба, запомненная
+                # здесь, повисла бы навсегда и молча — оператор ведь считает,
+                # что всё указал файлом. Поэтому спрашиваем не только код
+                # состояния, но и будет ли кому его закрыть.
+                will_stall = code == "waiting" and product.fact_at_date is None
+                if code in DEFERRABLE_CALC_STATUSES and not will_stall:
                     # Не ошибка, а ПРОСЬБА. Оператор одним файлом задаёт дату,
                     # факт, кабинеты и трансляцию — так он и думает о работе.
                     # Расчёт после этого идёт минутами и заканчивается уже без
@@ -1444,6 +1451,12 @@ def products_import(
                         product.broadcast_requested_at = now_utc()
                         touched = True
                     deferred += 1
+                elif will_stall:
+                    errors.append(
+                        f"строка {i}: трансляцию включить нельзя — нужен «Факт на "
+                        f"дату». Дата задана, 1С ответит через несколько минут, но "
+                        f"факт вводите вы: без него строка остановится на «нужен "
+                        f"факт» и сама не включится.")
                 else:
                     # Само не рассосётся: без кабинета заказы спрашивать негде,
                     # без даты расчёт не с чего начать, факт вводит человек.

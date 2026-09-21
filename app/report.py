@@ -482,6 +482,53 @@ def _check_broadcast_without_recalc(db: Session) -> Finding | None:
     )
 
 
+# Сколько просьба «включить трансляцию» может честно ждать своего расчёта.
+# Расчёт идёт минутами, ответ 1С на дату — до десяти минут; сутки означают, что
+# ждать уже нечего.
+PENDING_BROADCAST_STUCK = timedelta(hours=24)
+
+
+def _q_stuck_broadcast_requests(db: Session) -> list[Product]:
+    return db.query(Product).filter(
+        Product.broadcast_requested_at.isnot(None),
+        Product.broadcast_enabled.is_(False),
+        Product.broadcast_requested_at <= now_utc() - PENDING_BROADCAST_STUCK,
+    ).order_by(Product.broadcast_requested_at).all()
+
+
+def _check_stuck_broadcast_requests(db: Session) -> Finding | None:
+    """Файл попросил включить трансляцию, а она не включилась за сутки.
+
+    Просьба (`Product.broadcast_requested_at`) — это обещание: оператор одним
+    файлом задал дату, факт, кабинеты и «Трансляция = Да», а включит строку тот,
+    кто имеет право, — расчёт или приём ответа 1С, ровно тогда, когда включила бы
+    и страница. Обещание сдержано в подавляющем большинстве случаев, и потому
+    несдержанное особенно незаметно: оператор считает, что сделал работу файлом,
+    и больше к этим строкам не возвращается, а товар всё это время молчит —
+    остаток наружу не уходит, продаж нет, и никакой ошибки нигде не горит.
+
+    Зависнуть просьба может на том, что само не рассосётся: расчёт кончился
+    проблемами (неполная лента заказов, потерянные строки Kit), кабинет погасил
+    предохранитель, факт так и не ввели. Самый частый случай — последний — теперь
+    отсекается на входе (`products_import`: просьба из «ждём 1С» без факта
+    становится ошибкой импорта сразу). Эта находка ловит остальные.
+    """
+    rows = _q_stuck_broadcast_requests(db)
+    if not rows:
+        return None
+    oldest = min(p.broadcast_requested_at for p in rows)
+    return Finding(
+        key="stuck_broadcast_requests", level=WARNING,
+        title=f"Просьб включить трансляцию не выполнено: {len(rows)} "
+              f"(старейшей {_age(oldest)})",
+        consequence="Оператор включил эти строки файлом и считает работу сделанной, "
+                    "а трансляция так и не включилась: остаток наружу не уходит, "
+                    "продаж по ним нет. Строки молчат, и сами они не включатся.",
+        count=len(rows), link="/report/rows/stuck_broadcast_requests",
+        details=[f"{p.article or p.uid_1c} — {p.name or ''}"[:120] for p in rows[:10]],
+    )
+
+
 def _check_wb_without_chrt(db: Session) -> Finding | None:
     """Позиции WB, у которых в каталоге нет chrtId: остаток уходит баркодом.
 
@@ -972,6 +1019,7 @@ CHECKS = (
     _check_platform_divergence,
     _check_tasks_needing_review,
     _check_broadcast_without_recalc,
+    _check_stuck_broadcast_requests,
     _check_wb_without_chrt,
     _check_breaker_disabled,
     _check_stuck_1c_tasks,
@@ -1099,6 +1147,12 @@ def _rows_negative_stock(db: Session) -> list[list[str]]:
             for p in _q_negative_stock(db)]
 
 
+def _rows_stuck_broadcast_requests(db: Session) -> list[list[str]]:
+    return [[p.article or p.uid_1c, p.size or "", p.color or "", p.name or "",
+             str(p.stock_on_hand or 0)]
+            for p in _q_stuck_broadcast_requests(db)]
+
+
 QUEUE_COLUMNS = ["Артикул", "Размер", "Цвет", "Наименование", "Кабинет",
                  "SKU, которым ушло", "Количество", "Что ответила площадка"]
 PRODUCT_COLUMNS = ["Артикул", "Размер", "Цвет", "Наименование", "Остаток ЦС"]
@@ -1115,6 +1169,8 @@ FULL_LISTS = {
                                  _rows_broadcast_without_recalc),
     "negative_stock": ("Товары с отрицательным остатком", PRODUCT_COLUMNS,
                        _rows_negative_stock),
+    "stuck_broadcast_requests": ("Просьбы включить трансляцию, не выполненные за сутки",
+                                 PRODUCT_COLUMNS, _rows_stuck_broadcast_requests),
     "reconciliation_review": ("Крупные расхождения со складом 1С за сутки",
                               ["Артикул", "Размер", "Цвет", "Наименование",
                                "Когда сверяли", "Было у нас", "Стало по 1С",
