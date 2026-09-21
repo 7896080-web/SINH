@@ -141,8 +141,16 @@ def set_base_date(db: Session, product: Product, snapshot_date: date | None,
         # Пустая СТРОКА, а не NULL, — как при переподвязке баркода: покрытие
         # аннулировано, но отслеживать его мы продолжаем, иначе ступень 2
         # лестницы перестанет срабатывать вовсе (см. `transmit.coverage_is_tracked`).
-        product.recalc_done_at = None
-        product.recalc_account_ids = ""
+        if product.recalc_done_at is not None:
+            # Только если расчёт БЫЛ. У товара без расчёта `recalc_account_ids`
+            # пуст (NULL), и выставить здесь пустую СТРОКУ значило бы включить
+            # ступень 2 лестницы там, где она обязана молчать: «покрытие ведём,
+            # покрыт никто» — и на отмеченный кабинет ушёл бы ноль. Для товаров,
+            # которым трансляцию включили до появления расчёта, это было бы
+            # обнулением живых карточек по всему каталогу. Поймано тестом
+            # `test_changed_threshold_goes_into_the_dispatch_queue`.
+            product.recalc_done_at = None
+            product.recalc_account_ids = ""
     if snapshot_date is None:
         product.offset_base_stock = None
         product.fact_at_date = None
