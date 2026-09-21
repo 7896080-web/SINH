@@ -16,6 +16,7 @@ from datetime import timedelta
 from app.models import Barcode, FtpTask, FtpTaskStatus, Platform, PlatformAccount, Product, StockDeltaDocument
 from app.timeutils import now_utc
 from app.workers.ftp_channel import (LocalExchange, SYNC_SOURCE, collect_stock_delta,
+                                     finalize_stock_delta,
                                      parse_stock_delta_file)
 from app.workers.reconciliation import run_reconciliation
 
@@ -81,20 +82,39 @@ def test_our_own_documents_are_dropped(db, tmp_path):
 def test_a_document_is_applied_only_once(db, tmp_path):
     ex = _exchange(tmp_path)
     _delta(ex, "delta_20260919020000.txt", "111|7|Реализация|ЦБ1")
-    collect_stock_delta(db, ex)
+    _collect_and_finalize(db, ex)
 
     _delta(ex, "delta_20260919021000.txt", "111|5|Реализация|ЦБ1")   # тот же документ
-    mapping, stats = collect_stock_delta(db, ex)
+    mapping, stats = _collect_and_finalize(db, ex)
 
     assert mapping == {}
     assert stats["already_applied"] == 1
+
+
+def test_a_document_is_not_marked_applied_before_the_stock_moves(db, tmp_path):
+    """Пометка «применён» ставится только при закреплении.
+
+    Раньше она коммитилась при чтении: падение на применении остатка оставляло
+    документ помеченным, а остаток нетронутым — правка 1С пропадала насовсем, и
+    повторная присылка того же файла была бы отброшена как «уже применён».
+    """
+    ex = _exchange(tmp_path)
+    _delta(ex, "delta_20260919020000.txt", "111|7|Реализация|ЦБ1")
+
+    mapping, stats = collect_stock_delta(db, ex)
+
+    assert mapping == {"111": 7}
+    assert db.query(StockDeltaDocument).count() == 0, "документ помечен до применения"
+
+    finalize_stock_delta(db, ex, stats)
+    assert db.query(StockDeltaDocument).count() == 1
 
 
 def test_a_repeat_inside_one_file_is_counted_once(db, tmp_path):
     ex = _exchange(tmp_path)
     _delta(ex, "delta_20260919020000.txt", "111|7|Реализация|ЦБ1\n222|4|Реализация|ЦБ1")
 
-    mapping, _ = collect_stock_delta(db, ex)
+    mapping, _ = _collect_and_finalize(db, ex)
 
     assert mapping == {"111": 7, "222": 4}          # один документ, две позиции
     assert db.query(StockDeltaDocument).count() == 1
@@ -111,14 +131,36 @@ def test_a_line_without_a_document_id_is_skipped(db, tmp_path):
     assert mapping == {} and stats["no_document_id"] == 1
 
 
-def test_the_file_is_archived_so_it_is_not_read_twice(db, tmp_path):
+def _collect_and_finalize(db, ex):
+    """Прочитать дельту и ЗАКРЕПИТЬ её — так, как это делает планировщик.
+
+    Закрепление (пометка документов применёнными + архив файла) вынесено из
+    чтения намеренно: раньше оно делалось сразу, и сбой на ПРИМЕНЕНИИ остатка
+    оставлял файл в архиве, а документ помеченным — то есть правка 1С пропадала
+    насовсем, и повторная присылка того же файла была бы отброшена как «уже
+    применён». Теперь порядок такой: прочитали → применили остаток → закрепили.
+    """
+    mapping, stats = collect_stock_delta(db, ex)
+    finalize_stock_delta(db, ex, stats)
+    return mapping, stats
+
+
+def test_the_file_is_archived_after_it_is_applied(db, tmp_path):
+    """Файл уезжает в архив ПОСЛЕ закрепления, а не при чтении."""
     ex = _exchange(tmp_path)
     _delta(ex, "delta_20260919020000.txt", "111|7|Реализация|ЦБ1")
 
-    collect_stock_delta(db, ex)
+    mapping, stats = collect_stock_delta(db, ex)
+
+    assert (tmp_path / "r" / "delta_20260919020000.txt").exists(), (
+        "файл убран до применения — сбой на применении потерял бы правку 1С")
+
+    finalize_stock_delta(db, ex, stats)
 
     assert (tmp_path / "a" / "delta_20260919020000.txt").exists()
     assert not (tmp_path / "r" / "delta_20260919020000.txt").exists()
+
+
 
 
 # ------------------------------------------------------------------ частичность

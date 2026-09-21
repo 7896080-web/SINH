@@ -9,6 +9,45 @@ BASE_URL = "https://api-seller.ozon.ru"
 
 CANCELLED_STATUSES = {"cancelled"}
 
+# По сколько отправлений за страницу. Сто — предел ручки unfulfilled/list;
+# тысяча — предел fbs/list. Отдельные имена нужны, чтобы условие «страница
+# короче предела значит конец» считало по тому же числу, что ушло в запрос.
+ORDERS_PAGE_SIZE = 100
+CANCELLED_PAGE_SIZE = 1000
+# Защитный предел на число страниц: столько же, сколько у выгрузки заказов.
+MAX_PAGES = 200
+
+# Коды отказа по КОНКРЕТНОЙ позиции, которые повтором не лечатся: карточки или
+# склада у площадки нет, и через двадцать три минуты повторов ответ будет тот же.
+# Всё остальное (лимиты, временные сбои) оставляем повторам.
+OZON_TERMINAL_ITEM_CODES = frozenset({
+    "NOT_FOUND_ERROR", "PRODUCT_NOT_FOUND", "OFFER_NOT_FOUND",
+    "WAREHOUSE_NOT_FOUND", "INVALID_OFFER_ID",
+})
+
+
+def _error_codes(result: dict) -> set[str]:
+    """Коды ошибок из строки ответа Ozon по одной позиции."""
+    out = set()
+    for err in result.get("errors") or []:
+        if isinstance(err, dict):
+            code = str(err.get("code") or "").strip().upper()
+            if code:
+                out.add(code)
+    return out
+
+
+def _error_text(result: dict) -> str:
+    """Человеческая причина отказа: коды и сообщения площадки."""
+    parts = []
+    for err in result.get("errors") or []:
+        if not isinstance(err, dict):
+            continue
+        code = str(err.get("code") or "").strip()
+        message = str(err.get("message") or "").strip()
+        parts.append(": ".join(p for p in (code, message) if p))
+    return "; ".join(parts)[:300]
+
 
 def _iso(dt: datetime) -> str:
     """RFC3339 в UTC, как ждёт Ozon: 2026-09-14T10:00:00.000Z."""
@@ -59,34 +98,57 @@ class OzonClient(PlatformClient):
         # cutoff_to, иначе 400 «mismatch between cutoff & delivery date».
         # awaiting_approve — новые заказы, дедлайн упаковки в будущем; берём
         # широкое окно, чтобы не потерять ни одного.
+        # Лента листается ПО КУРСОРУ, как и в get_orders_since. Раньше здесь был
+        # ровно один запрос с offset=0: как только у кабинета одновременно висит
+        # больше сотни отправлений в awaiting_approve (выходные, распродажа,
+        # задержка подтверждения), заказы со сто первого не видел никто. И не
+        # увидел бы уже никогда: подтверждённое отправление уходит из
+        # awaiting_approve, то есть остаток по нему не списывается, документа в
+        # 1С нет, а наружу продолжает уходить завышенное число. Тот же класс
+        # дефекта, что окно 29 дней у WB, только тише.
         now = datetime.now(timezone.utc)
-        data = self._post("/v3/posting/fbs/unfulfilled/list", {
-            "dir": "ASC",
-            "filter": {
-                "cutoff_from": _iso(now - timedelta(days=2)),
-                "cutoff_to": _iso(now + timedelta(days=60)),
-                "status": "awaiting_approve",
-            },
-            "limit": 100,
-            "offset": 0,
-            "with": {"barcodes": True},
-        })
-
         result = []
-        for posting in data.get("result", {}).get("postings", []):
-            posting_number = posting.get("posting_number")
-            for product in posting.get("products", []):
-                barcode = product.get("barcode") or product.get("offer_id")
-                if not barcode:
-                    continue
-                # Отдельная строка задания на каждую позицию отправления —
-                # у одного posting_number может быть несколько товаров.
-                result.append(PlatformOrder(
-                    order_id=f"{posting_number}:{product.get('sku', barcode)}",
-                    barcode=barcode,
-                    quantity=int(product.get("quantity", 1)),
-                    raw_status="awaiting_approve",
-                ))
+        offset = 0
+        for _ in range(MAX_PAGES):         # защитный предел на число страниц
+            data = self._post("/v3/posting/fbs/unfulfilled/list", {
+                "dir": "ASC",
+                "filter": {
+                    "cutoff_from": _iso(now - timedelta(days=2)),
+                    "cutoff_to": _iso(now + timedelta(days=60)),
+                    "status": "awaiting_approve",
+                },
+                "limit": ORDERS_PAGE_SIZE,
+                "offset": offset,
+                "with": {"barcodes": True},
+            })
+            postings = data.get("result", {}).get("postings", [])
+            if not postings:
+                break
+            for posting in postings:
+                posting_number = posting.get("posting_number")
+                for product in posting.get("products", []):
+                    barcode = product.get("barcode") or product.get("offer_id")
+                    if not barcode:
+                        continue
+                    # Отдельная строка задания на каждую позицию отправления —
+                    # у одного posting_number может быть несколько товаров.
+                    result.append(PlatformOrder(
+                        order_id=f"{posting_number}:{product.get('sku', barcode)}",
+                        barcode=barcode,
+                        quantity=int(product.get("quantity", 1)),
+                        raw_status="awaiting_approve",
+                    ))
+            has_next = data.get("result", {}).get("has_next")
+            if has_next is None:
+                has_next = len(postings) >= ORDERS_PAGE_SIZE
+            if not has_next:
+                break
+            offset += len(postings)
+        else:
+            # Выдачу оборвал наш предел — картина неполная, и молчать об этом
+            # нельзя: `recalc.collect_orders` превращает этот признак в проблему
+            # и не даёт поставить товару «актуализирован».
+            self.last_truncated = True
         return result
 
     def get_orders_since(self, date_from):
@@ -103,11 +165,11 @@ class OzonClient(PlatformClient):
 
         result = []
         offset = 0
-        for _ in range(200):  # защитный предел на число страниц
+        for _ in range(MAX_PAGES):  # защитный предел на число страниц
             data = self._post("/v3/posting/fbs/list", {
                 "dir": "ASC",
                 "filter": {"since": _iso(since), "to": _iso(now)},
-                "limit": 1000, "offset": offset,
+                "limit": CANCELLED_PAGE_SIZE, "offset": offset,
                 "with": {"barcodes": True},
             })
             postings = data.get("result", {}).get("postings", [])
@@ -137,7 +199,7 @@ class OzonClient(PlatformClient):
             # терялись заказы целыми неделями (см. wb.ORDERS_WINDOW_DAYS).
             has_next = data.get("result", {}).get("has_next")
             if has_next is None:
-                has_next = len(postings) >= 1000
+                has_next = len(postings) >= CANCELLED_PAGE_SIZE
             if not has_next:
                 break
             offset += len(postings)
@@ -149,33 +211,54 @@ class OzonClient(PlatformClient):
         if not order_ids:
             return []
 
-        posting_numbers = {oid.split(":")[0] for oid in order_ids}
         cancelled = []
 
         # /v3/posting/fbs/list требует период since/to. Отмены отслеживаем по
         # недавним заказам — окна в 30 дней достаточно.
+        #
+        # Лента листается ПО КУРСОРУ. Раньше запрос был один, `dir: ASC` и
+        # `offset: 0`, то есть тысяча САМЫХ СТАРЫХ отмен за тридцать дней. У
+        # кабинета, где их больше тысячи, свежие отмены — ровно те, которые ещё
+        # можно отреверсить, — не доезжали вовсе: списанная под заказ единица не
+        # возвращалась на остаток, перемещение в 1С не отменялось, товар при этом
+        # физически лежал на ЦС. Наружу уходило заниженное число, то есть
+        # недопродажи, а в 1С оставался лишний документ.
         now = datetime.now(timezone.utc)
-        data = self._post("/v3/posting/fbs/list", {
-            "dir": "ASC",
-            "filter": {
-                "since": _iso(now - timedelta(days=30)),
-                "to": _iso(now),
-                "status": "cancelled",
-            },
-            "limit": 1000,
-            "offset": 0,
-        })
-        # Только НАША отмена: продавец отменил постинг ДО отгрузки (товар остался
-        # у нас → возврат резерва на ЦС). Клиент/Ozon/система и любая отмена ПОСЛЕ
-        # отгрузки (cancelled_after_ship) — это возврат, его не реверсим: он придёт
-        # в 1С отдельно и подтянется сверкой. Поле cancellation.cancellation_initiator
-        # ∈ {Seller, Client, Customer, Ozon, System, Delivery}.
         our_cancelled_numbers = set()
-        for p in data.get("result", {}).get("postings", []):
-            canc = p.get("cancellation") or {}
-            initiator = (canc.get("cancellation_initiator") or "").strip().lower()
-            if initiator == "seller" and not canc.get("cancelled_after_ship"):
-                our_cancelled_numbers.add(p.get("posting_number"))
+        offset = 0
+        for _ in range(MAX_PAGES):
+            data = self._post("/v3/posting/fbs/list", {
+                "dir": "ASC",
+                "filter": {
+                    "since": _iso(now - timedelta(days=30)),
+                    "to": _iso(now),
+                    "status": "cancelled",
+                },
+                "limit": CANCELLED_PAGE_SIZE,
+                "offset": offset,
+            })
+            postings = data.get("result", {}).get("postings", [])
+            if not postings:
+                break
+            # Только НАША отмена: продавец отменил постинг ДО отгрузки (товар
+            # остался у нас → возврат резерва на ЦС). Клиент/Ozon/система и любая
+            # отмена ПОСЛЕ отгрузки (cancelled_after_ship) — это возврат, его не
+            # реверсим: он придёт в 1С отдельно и подтянется сверкой. Поле
+            # cancellation.cancellation_initiator ∈ {Seller, Client, Customer,
+            # Ozon, System, Delivery}.
+            for posting in postings:
+                canc = posting.get("cancellation") or {}
+                initiator = (canc.get("cancellation_initiator") or "").strip().lower()
+                if initiator == "seller" and not canc.get("cancelled_after_ship"):
+                    our_cancelled_numbers.add(posting.get("posting_number"))
+            has_next = data.get("result", {}).get("has_next")
+            if has_next is None:
+                has_next = len(postings) >= CANCELLED_PAGE_SIZE
+            if not has_next:
+                break
+            offset += len(postings)
+        else:
+            self.last_truncated = True
 
         for oid in order_ids:
             if oid.split(":")[0] in our_cancelled_numbers:
@@ -202,10 +285,29 @@ class OzonClient(PlatformClient):
                 resp = self._post("/v2/products/stocks", body)
                 for result in resp.get("result", []):
                     # ok возвращаем в баркодах — так рассылка сматчит результат
+                    offer_id = result.get("offer_id")
+                    barcode = offer_to_barcode.get(offer_id, offer_id)
                     if result.get("updated"):
-                        ok.append(offer_to_barcode.get(result.get("offer_id"), result.get("offer_id")))
-                    else:
-                        errors.append(result)
+                        ok.append(barcode)
+                        continue
+                    # Отказ ПО КОНКРЕТНОЙ ПОЗИЦИИ отдаём в том же виде, что WB и
+                    # Kit: с ключом `sku` и признаком `terminal`. Раньше словарь
+                    # уходил наверх сырым — без обоих полей, — и рассылка не
+                    # могла отличить «этой карточки на складе нет» от обрыва
+                    # связи: пять попыток по нарастающей паузе (около двадцати
+                    # трёх минут) в заведомо неизменный ответ, а потом запись в
+                    # `error` с текстом «не отправлено за 5 попыток». Отчёт по
+                    # этому тексту относил её к «рассылка не доехала» (критично,
+                    # «площадка продаёт то, чего нет») вместо «неизвестный sku»
+                    # («продавать нечего, чинить мэппинг») — человека отправляли
+                    # чинить связь вместо сопоставления.
+                    codes = _error_codes(result)
+                    detail = _error_text(result) or str(result)[:300]
+                    errors.append({
+                        "sku": barcode,
+                        "terminal": bool(codes & OZON_TERMINAL_ITEM_CODES),
+                        "detail": detail,
+                    })
             except requests.HTTPError as e:
                 errors.append({"detail": str(e), "items": [it.barcode for it in chunk]})
         return {"ok": ok, "errors": errors}

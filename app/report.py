@@ -669,6 +669,37 @@ def _check_stale_reconciliation(db: Session) -> Finding | None:
     )
 
 
+def _check_suspicious_snapshot(db: Session) -> Finding | None:
+    """Сверка перестала обнулять распроданное — выгрузка 1С пришла обрезанной.
+
+    Когда снимок покрывает меньше половины прежних ненулевых товаров, сверка
+    включает предохранитель и ничего не обнуляет. Предохранитель правильный:
+    обрезанный файл не должен стереть весь каталог. Но следствие у его
+    срабатывания тяжёлое и отложенное — распроданный товар продолжает
+    транслироваться, то есть на площадки уходит остаток по тому, чего на складе
+    нет. И состояние самоподдерживающееся: снимок сам не вырастет, час за часом
+    будет одно и то же.
+
+    До аудита 21.09 об этом не говорил НИКТО: признак попадал в `stats` и уходил
+    одной строкой в журнал.
+    """
+    row = db.query(WorkerHeartbeat).filter(
+        WorkerHeartbeat.worker_name == "reconciliation_applied",
+    ).first()
+    if row is None or not row.last_error:
+        return None
+    if "обнуление" not in row.last_error:
+        return None
+    return Finding(
+        key="suspicious_snapshot", level=CRITICAL,
+        title=f"Выгрузка 1С пришла неполной — {row.last_error}",
+        consequence="Распроданные товары не обнуляются: на площадки продолжает "
+                    "уходить остаток по тому, чего на складе нет. Само не пройдёт — "
+                    "пока выгрузка приходит обрезанной, так будет каждый час.",
+        count=1, link="/diagnostics#workers",
+    )
+
+
 def _check_dispatch_stuck(db: Session) -> Finding | None:
     """Очередь рассылки стоит: записи ждут дольше, чем идёт цикл."""
     cutoff = now_utc() - DISPATCH_STUCK
@@ -705,6 +736,15 @@ def _check_open_anomalies(db: Session) -> Finding | None:
     перемещение в 1С не создано и не создастся, пока баркод не сопоставят, и
     каждый следующий заказ по нему повторит то же самое. Это не рассосётся
     переходом.
+
+    ОГОВОРКА, найденная аудитом 21.09. Аномалию этого типа сейчас не создаёт ни
+    одна строка кода: заказ с неизвестным баркодом `process_new_order` отдаёт со
+    статусом `unmatched`, а `resolve_barcode` пишет `MappingConflict` — аномалию
+    завести и нельзя, у неё `uid_1c` обязателен, а его-то как раз и нет. Значит
+    эта проверка сегодня молчит всегда, а живой сигнал по тому же случаю даёт
+    `_check_mapping_conflicts` ниже. Проверку не удаляем: аномалия может
+    появиться (например, баркод сопоставлен, а товар удалён), и тогда она нужна
+    именно здесь — но полагаться на неё как на ЕДИНСТВЕННЫЙ сигнал нельзя.
     """
     rows = db.query(SyncAnomaly).filter(
         SyncAnomaly.status == AnomalyStatus.new,
@@ -746,16 +786,34 @@ def _check_open_stock_date(db: Session) -> Finding | None:
 
 
 def _check_mapping_conflicts(db: Session) -> Finding | None:
-    """Баркоды с площадок, которых нет в 1С."""
-    count = db.query(MappingConflict).count()
-    if not count:
+    """Баркоды с площадок, которых нет в 1С.
+
+    Это НЕ «потенциальная проблема»: строка `MappingConflict` заводится в момент,
+    когда по баркоду пришёл реальный заказ и разнести его не удалось, а
+    `attempts` считает, сколько раз это повторилось. То есть каждая строка здесь
+    — уже случившаяся непроведённая продажа.
+
+    Поэтому уровень зависит от возраста, как у аномалий: свежий конфликт — это
+    «сопоставьте на днях», а висящий сутками означает, что продажи по нему идут
+    мимо нас всё это время и остаток по товару завышен ровно на них. Раньше
+    находка всегда была WARNING и обещала, что «заказ уйдёт в аномалии», — он
+    туда не уходит (см. оговорку в `_check_open_anomalies`), и полагаться на тот
+    сигнал было не на что.
+    """
+    rows = db.query(MappingConflict).all()
+    if not rows:
         return None
+    oldest = min((c.first_seen for c in rows if c.first_seen is not None), default=None)
+    level = WARNING if oldest is None or oldest > now_utc() - ANOMALY_OLD else CRITICAL
+    attempts = sum(c.attempts or 1 for c in rows)
     return Finding(
-        key="mapping_conflicts", level=WARNING,
-        title=f"Несопоставленных баркодов: {count}",
-        consequence="Заказ по такому баркоду разнести не на что: остаток не спишется, "
-                    "документ в 1С не создастся, заказ уйдёт в аномалии.",
-        count=count, link="/mapping",
+        key="mapping_conflicts", level=level,
+        title=f"Несопоставленных баркодов: {len(rows)} "
+              f"(заказов по ним {attempts}, старейшему {_age(oldest)})",
+        consequence="По этим баркодам уже приходили заказы, и разнести их не на что: "
+                    "остаток не списан, документа в 1С нет. Остаток товара завышен "
+                    "ровно на эти продажи, и на площадки уходит больше, чем есть.",
+        count=len(rows), link="/mapping",
     )
 
 
@@ -919,6 +977,7 @@ CHECKS = (
     _check_stuck_1c_tasks,
     _check_stale_catalog,
     _check_stale_reconciliation,
+    _check_suspicious_snapshot,
     _check_dispatch_stuck,
     _check_open_anomalies,
     _check_open_stock_date,

@@ -1,4 +1,5 @@
 import os
+import threading
 import logging
 import sys
 import time
@@ -23,7 +24,7 @@ from app.workers.catalog_sync import load_platform_catalog
 from app.workers.catalog_poller import poll_catalog
 from app.workers.ftp_channel import (
     LocalExchange, build_task_batch, apply_result_batch, collect_stock_delta,
-    detect_timed_out_tasks, repost_stuck_movements,
+    detect_timed_out_tasks, repost_stuck_movements, finalize_stock_delta,
     fetch_stock_export_files, fetch_stock_export_snapshot, fetch_barcode_dict_files,
     apply_stock_on_date_files, detect_timed_out_stock_date_requests,
     prune_stock_date_snapshots,
@@ -117,6 +118,28 @@ SOLD_WAREHOUSE_NAME = {
 
 
 def _heartbeat(db, worker_name: str, success: bool, error: str = ""):
+    """Отметка «задание отработало». ОТКАТ ПЕРВЫМ ДЕЛОМ — это не перестраховка.
+
+    Отметку почти всегда зовут из `except`-ветки, а самый важный класс сбоя —
+    упавший `commit` внутри задания (`database is locked` после `busy_timeout`,
+    ошибка целостности). После него сессия сломана, и `_heartbeat` падал САМ, с
+    `PendingRollbackError`: запись об ошибке не появлялась вовсе, а в базе
+    оставались время и `last_success=True` от ПРОШЛОГО удачного прогона. То есть
+    ровно в тот момент, когда задание перестало работать, `/health` оставался
+    зелёным, «Диагностика» пустой, а текст ошибки терялся. Для заданий с длинным
+    окном (сверка — три часа, бэкап и чистка — трое суток) зелёный держался
+    соответственно долго.
+
+    Откат стоит ЗДЕСЬ, а не в каждой ветке: иначе новое задание заведёт этот
+    дефект заново, а заметить его можно будет только по тишине.
+
+    Откатываем ТОЛЬКО сломанную сессию (`is_active` ложно ровно в этом случае —
+    проверено). Безусловный откат был бы лекарством хуже болезни: отметку зовут и
+    из успешных веток, а часть заданий коммитит свою работу тем же коммитом, что
+    и отметку.
+    """
+    if not db.is_active:
+        db.rollback()
     hb = db.query(WorkerHeartbeat).filter(WorkerHeartbeat.worker_name == worker_name).first()
     if hb is None:
         hb = WorkerHeartbeat(worker_name=worker_name, last_run_at=now_utc())
@@ -157,6 +180,14 @@ def job_poll_orders(account_id: int):
         cancel_stats = poll_cancellations(db, client, account)
         logger.info("%s (%s): new=%s confirm=%s cancel=%s",
                     worker_name, account.name, new_stats, confirm_stats, cancel_stats)
+        # Сбойные ОТДЕЛЬНЫЕ заказы цикл переживает (см. poll_new_orders), но
+        # молчать о них нельзя: пропущенный заказ — это несписанный остаток.
+        for label, st in (("заказов", new_stats), ("подтверждений", confirm_stats),
+                          ("отмен", cancel_stats)):
+            if st.get("failed"):
+                logger.warning("%s (%s): %s не проведено из-за ошибок: %d — %s",
+                               worker_name, account.name, label, st["failed"],
+                               "; ".join(st.get("problems") or [])[:500])
         record_success(db, account)
         db.commit()
         _heartbeat(db, worker_name, True)
@@ -165,6 +196,11 @@ def job_poll_orders(account_id: int):
         _heartbeat(db, worker_name, False, str(e))
     except Exception as e:
         logger.exception("%s failed", worker_name)
+        # Откат ПЕРЕД записью сбоя. Сессия после неудачного commit внутри цикла
+        # остаётся сломанной, и `record_failure` + `commit` по ней падали бы
+        # сами — вместе с ними терялись и счётчик предохранителя, и heartbeat,
+        # то есть сбой оставался невидимым и для «Диагностики», и для /health.
+        db.rollback()
         if account is not None:
             disabled = record_failure(db, account, str(e))
             db.commit()
@@ -196,6 +232,11 @@ def job_dispatch():
         db.close()
 
 
+# Замок на все три расписания `job_ftp_send`: см. его докстроку. Ставится на
+# уровне модуля, потому что расписания живут в одном процессе воркера.
+_FTP_SEND_LOCK = threading.Lock()
+
+
 def job_ftp_send(request_stock_export: bool = False, request_barcode_export: bool = False,
                  heartbeat_name: str = "ftp_send"):
     """Отправка накопленных заданий в 1С. Три расписания зовут эту же функцию:
@@ -205,7 +246,30 @@ def job_ftp_send(request_stock_export: bool = False, request_barcode_export: boo
     выгрузки — то есть фактическая остановка сверки — была бы не видна в /health.
 
     Время heartbeat часового запроса дополнительно служит отметкой «когда мы в
-    последний раз попросили выгрузку»: сверка применяет только снимок новее её."""
+    последний раз попросили выгрузку»: сверка применяет только снимок новее её.
+
+    ОДИН ЗАМОК НА ВСЕ ТРИ РАСПИСАНИЯ. `max_instances=1` действует на каждый `id`
+    по отдельности, а расписаний здесь три — то есть два прогона могли идти
+    одновременно в разных потоках пула. `build_task_batch` читает `pending`-задания
+    и помечает их отправленными в одной транзакции, но коммитит только в конце,
+    так что оба успевали прочитать ОДНИ И ТЕ ЖЕ строки и разложить их по ДВУМ
+    файлам для 1С. Для `CREATE_MOVEMENT` это безвредно — 1С идемпотентна по номеру
+    заказа. Для `CANCEL_MOVEMENT` нет: отмена идемпотентной не сделана и сделана
+    быть не может, второй файл создаёт ВТОРОЙ обратный документ, и на ЦС
+    возвращается вдвое больше, чем оттуда уезжало. `existing_cancel_task` тут не
+    помогает — она не даёт завести второе ЗАДАНИЕ, а здесь одно задание уезжает
+    дважды.
+
+    Расписания сами по себе разведены на 20 и 40 секунд и на секундной сетке не
+    сходятся. Но `misfire_grace_time` плюс `coalesce` означают, что после любой
+    паузы воркера все просроченные задания уходят в пул ОДНОВРЕМЕННО.
+    """
+    with _FTP_SEND_LOCK:
+        _job_ftp_send_locked(request_stock_export, request_barcode_export, heartbeat_name)
+
+
+def _job_ftp_send_locked(request_stock_export: bool, request_barcode_export: bool,
+                         heartbeat_name: str):
     db = SessionLocal()
     try:
         exchange = _build_ftp_exchange()
@@ -235,8 +299,23 @@ def job_ftp_receive():
     try:
         exchange = _build_ftp_exchange()
         for filename in exchange.list_result_files():
-            content = exchange.download_and_archive_result(filename)
-            stats = apply_result_batch(db, content)
+            # Читаем → разбираем → коммитим → и ТОЛЬКО ПОТОМ убираем в архив.
+            # Раньше файл уезжал в архив первым действием, и любой сбой разбора
+            # (на бою это `database is locked`) уносил ответы 1С безвозвратно:
+            # из архива их никто не перечитывает, задания оставались «в пути»
+            # навсегда, остаток — заниженным по созданиям и завышенным по
+            # отменам. Повторный разбор того же файла безопасен: задание
+            # закрывается один раз, повторный ответ по закрытому даёт
+            # `unmatched`. Потеря — нет.
+            content = exchange.read_result(filename)
+            try:
+                stats = apply_result_batch(db, content)
+            except Exception:
+                db.rollback()
+                logger.exception("ftp_receive: %s не разобран — файл оставлен в results "
+                                 "на следующий цикл", filename)
+                continue
+            exchange.archive_result(filename)
             logger.info("ftp_receive: %s -> %s", filename, stats)
 
         # Оперативные изменения остатка ЦС: 1С кладёт их сама, не дожидаясь
@@ -246,10 +325,24 @@ def job_ftp_receive():
         # как снимок, обнулила бы весь каталог с первого же сообщения.
         delta, delta_stats = collect_stock_delta(db, exchange)
         if delta:
-            recon = run_reconciliation(db, delta, missing_means_zero=False,
-                                       snapshot_at=now_utc())
+            # Момент снимка — время ФАЙЛА, а не время приёма: дельта описывает
+            # склад на ту минуту, когда 1С её записала. Со временем приёма
+            # задания, закрытые в промежутке, переставали считаться «в пути»,
+            # хотя в файле их ещё нет, и уже отгруженные единицы возвращались на
+            # склад. `finalize_stock_delta` помечает документы и убирает файлы в
+            # архив ТОЛЬКО после успешного применения — иначе правка 1С терялась
+            # насовсем.
+            recon = run_reconciliation(
+                db, delta, missing_means_zero=False,
+                snapshot_at=delta_stats.get("snapshot_at") or now_utc())
+            finalize_stock_delta(db, exchange, delta_stats)
             logger.info("ftp_receive: изменение остатка ЦС %s -> сверка %s",
-                        delta_stats, recon)
+                        {k: v for k, v in delta_stats.items()
+                         if k not in ("files_pending", "documents_pending")}, recon)
+        else:
+            # Применять нечего (все строки отсеяны), но файлы прочитаны — их
+            # надо убрать, иначе они будут перечитываться каждую минуту.
+            finalize_stock_delta(db, exchange, delta_stats)
 
         # Выгрузки остатков на дату — отдельный префикс файлов и отдельная
         # таблица: в остаток товара и в сверку они не попадают никогда.
@@ -353,9 +446,25 @@ def job_reconciliation():
             stats = run_reconciliation(db, stock, missing_means_zero=True,
                                        snapshot_at=snapshot_at)
             logger.info("reconciliation: %s", stats)
+            # Предохранитель «снимок подозрительный» сработал: сверка перестала
+            # обнулять распроданное. Это правильно (обрезанный файл не должен
+            # стереть каталог), но МОЛЧА так быть не может — состояние
+            # самоподдерживающееся, снимок сам не вырастет, и предохранитель
+            # будет срабатывать каждый час бесконечно. Всё это время на площадки
+            # уходит последнее ненулевое число по товарам, которых на складе нет.
+            suspicious = stats.get("snapshot_suspicious")
+            if suspicious:
+                logger.warning(
+                    "reconciliation: снимок 1С покрыл только %s позиций — это меньше "
+                    "половины прежних ненулевых, обнуление распроданного ОТКЛЮЧЕНО. "
+                    "Наружу продолжает уходить остаток по товарам, которых на складе "
+                    "нет. Проверьте выгрузку 1С: файл обрезан или сформирован не "
+                    "полностью.", suspicious)
             # Отдельная метка: сверка не просто отработала, а ФАКТИЧЕСКИ применила
             # снимок 1С. Ниже, в ветке пропуска, её намеренно нет — см. RECONCILIATION_APPLIED.
-            _heartbeat(db, RECONCILIATION_APPLIED, True)
+            _heartbeat(db, RECONCILIATION_APPLIED, True,
+                       error=(f"снимок покрыл {suspicious} позиций — обнуление "
+                              f"распроданного отключено" if suspicious else ""))
         elif not _export_request_answered(db):
             # Проверок теперь двенадцать в час, а ответ 1С — один. Писать строку на
             # каждый холостой заход значит вернуть в лог тот самый шум, ради которого
@@ -610,6 +719,13 @@ def job_backup():
     инвариант «свежая копия есть» выполнен, и heartbeat об этом и говорит.
     Молчать в журнале нельзя ни в одном из случаев: бэкап, о котором ничего не
     написано, неотличим от бэкапа, которого не было.
+
+    «Свежая копия есть» считается по `last_backup()`, то есть ПО ИМЕНИ ФАЙЛА, и
+    это безопасно ровно потому, что неудавшаяся попытка под именем копии не
+    остаётся: `make_backup` откладывает её в `.bad`. Пока этого не было, одна
+    сорвавшаяся попытка делала следующий запуск «пропуском при свежей копии» —
+    зелёный heartbeat, никакой новой попытки двадцать часов и молчащая находка
+    отчёта двое суток, при том что копии нет.
     """
     db = SessionLocal()
     try:

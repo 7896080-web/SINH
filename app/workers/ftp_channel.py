@@ -172,15 +172,37 @@ class LocalExchange:
             return []
         return sorted(p.name for p in self.dir_results.glob("barcodes_*.txt"))
 
-    def download_and_archive_result(self, filename: str) -> str:
+    def read_result(self, filename: str) -> str:
+        """Читает файл из results, НЕ трогая его на диске.
+
+        utf-8-sig: обработка 1С пишет файлы через ЗаписьТекста(…, КодировкаТекста.UTF8),
+        то есть С BOM. При чтении как чистого utf-8 три байта BOM прилипали к первому
+        полю первой строки — первая строка result_*.txt не сопоставлялась с заданием
+        (задание вечно "sent"), а первый uid в stock_*.txt/barcodes_*.txt искажался.
+        """
+        return (self.dir_results / filename).read_text(encoding="utf-8-sig")
+
+    def archive_result(self, filename: str) -> None:
+        """Убирает разобранный файл в архив. Отдельно от чтения намеренно."""
         self._ensure_dirs()
         src = self.dir_results / filename
-        # utf-8-sig: обработка 1С пишет файлы через ЗаписьТекста(…, КодировкаТекста.UTF8),
-        # то есть С BOM. При чтении как чистого utf-8 три байта BOM прилипали к первому
-        # полю первой строки — первая строка result_*.txt не сопоставлялась с заданием
-        # (задание вечно "sent"), а первый uid в stock_*.txt/barcodes_*.txt искажался.
-        content = src.read_text(encoding="utf-8-sig")
-        os.replace(src, self.dir_archive / filename)
+        if src.exists():
+            os.replace(src, self.dir_archive / filename)
+
+    def download_and_archive_result(self, filename: str) -> str:
+        """Читает и сразу архивирует.
+
+        Осталось для путей, где разбор ничего не пишет в базу. Там, где за
+        разбором идёт `commit`, так делать НЕЛЬЗЯ: сбой коммита (на бою это
+        `database is locked` — случай, ради которого сверку резали на порции)
+        оставлял бы файл только в архиве, откуда его никто не перечитывает.
+        Задания при этом навсегда оставались «в пути»: по созданию остаток
+        занижен, по отмене — завышен. Читай `read_result`, разбирай, коммить, и
+        только потом `archive_result`.
+        """
+        self._ensure_dirs()
+        content = self.read_result(filename)
+        self.archive_result(filename)
         return content
 
 
@@ -347,6 +369,22 @@ def build_task_batch(db: Session, max_lines: int = 500, request_stock_export: bo
         t.batch_filename = filename
         t.sent_at = now_utc()
 
+    # Пометка «отправлено» коммитится ДО публикации файла, и это ОСОЗНАННО —
+    # не забытый порядок.
+    #
+    # Соблазн переставить понятен: если публикация сорвётся (нет места, права,
+    # антивирус придержал файл), задания останутся `sent`, 1С их не получит, и
+    # они дойдут до `timeout` — остаток занижен на их количество. Но обратный
+    # порядок (сначала файл, потом пометка) платит хуже: при сбое коммита файл
+    # УЖЕ у 1С, задания остались `pending`, и следующий цикл отправит их второй
+    # раз. Для `CREATE_MOVEMENT` это безвредно — 1С идемпотентна по номеру
+    # заказа, проверено на бою 19.09. Для `CANCEL_MOVEMENT` нет и быть не может:
+    # второй файл создаст ВТОРОЙ обратный документ, на ЦС вернётся вдвое больше,
+    # чем оттуда уезжало, и это завышенный остаток, то есть оверселл.
+    #
+    # Потеря при нынешнем порядке видна и разбирается: задание висит в `sent`,
+    # уходит в `timeout` и попадает на «Диагностику» в ручной разбор. Двойной
+    # возврат не виден вообще ничем.
     db.commit()
     return filename, "\n".join(lines)
 
@@ -409,12 +447,29 @@ def collect_stock_delta(db: Session, exchange: "LocalExchange") -> tuple[dict[st
     Вызывающий обязан звать её с `missing_means_zero=False`.
     """
     stats = {"files": 0, "lines": 0, "ours_skipped": 0, "already_applied": 0,
-             "no_document_id": 0, "applied": 0}
+             "no_document_id": 0, "applied": 0,
+             # Время САМОГО СТАРОГО файла пачки, а не «сейчас». Вызывающий
+             # передаёт его в `run_reconciliation` как момент снимка: дельта
+             # описывает склад на ту минуту, когда 1С её записала, а не на
+             # минуту, когда мы её прочитали. Со временем приёма задания,
+             # закрытые в промежутке, переставали считаться «в пути», хотя в
+             # файле их ещё нет, — и уже отгруженные единицы возвращались на
+             # склад и уезжали на площадки. Берём самое раннее: ошибка в эту
+             # сторону занижает остаток, а не завышает.
+             "snapshot_at": None,
+             # Файлы архивируются ПОСЛЕ применения — см. `finalize_stock_delta`.
+             "files_pending": [],
+             "documents_pending": {}}
     mapping: dict[str, int] = {}
     fresh_documents: dict[str, dict] = {}
 
     for filename in exchange.list_stock_delta_files():
-        content = exchange.download_and_archive_result(filename)
+        content = exchange.read_result(filename)
+        stats["files_pending"].append(filename)
+        moment = exchange.file_mtime_utc(filename)
+        if moment is not None and (stats["snapshot_at"] is None
+                                   or moment < stats["snapshot_at"]):
+            stats["snapshot_at"] = moment
         stats["files"] += 1
         for row in parse_stock_delta_file(content):
             stats["lines"] += 1
@@ -443,11 +498,12 @@ def collect_stock_delta(db: Session, exchange: "LocalExchange") -> tuple[dict[st
             entry["lines"] += 1
             stats["applied"] += 1
 
-    for doc_id, entry in fresh_documents.items():
-        db.add(StockDeltaDocument(document_id=doc_id, source=entry["source"],
-                                  lines=entry["lines"]))
-    if fresh_documents:
-        db.commit()
+    # Документы НЕ помечаются применёнными здесь: остаток ещё не тронут. Раньше
+    # пометка коммитилась сразу, и падение на применении означало, что файл уже
+    # в архиве, документ уже «применён», а остаток не изменился — то есть правка
+    # 1С терялась насовсем, и повторная присылка того же файла ничего бы не
+    # исправила.
+    stats["documents_pending"] = fresh_documents
 
     if stats["files"]:
         logger.info("stock_delta: %s", stats)
@@ -569,10 +625,19 @@ def apply_stock_on_date_files(db: Session, exchange: "LocalExchange") -> dict:
     запросил всего лишь для справки. Всё, что делает функция, — складывает
     строки файла в отдельную таблицу и закрывает заявку."""
     stats = {"files": 0, "rows": 0, "unmatched": 0}
+    # Файлы, разбор которых дошёл до конца. Архивируем их ПОСЛЕ коммита: раньше
+    # файл уезжал в архив первым действием, и сбой на любом следующем шаге
+    # (`database is locked` на коммите, ошибка в `fill_waiting_products`) уносил
+    # ответ 1С безвозвратно — из архива его никто не перечитывает. Заявка при
+    # этом оставалась в `sent`, товары с этой базовой датой — в «ждём выгрузку»
+    # навсегда, а повторно 1С этот файл не пришлёт.
+    applied_files: list[str] = []
 
     for filename in exchange.list_stock_on_date_files():
         snapshot_date = parse_stock_on_date_filename(filename)
         if snapshot_date is None:
+            # Имя не разобрано — разбирать нечего и в следующем цикле тоже, файл
+            # можно убирать сразу: иначе он будет мозолить глаза каждую минуту.
             exchange.download_and_archive_result(filename)
             stats["unmatched"] += 1
             logger.warning("stock_on_date: имя %s не разобрано — файл убран в архив", filename)
@@ -583,8 +648,9 @@ def apply_stock_on_date_files(db: Session, exchange: "LocalExchange") -> dict:
             StockDateSnapshot.status != StockDateStatus.done,
         ).order_by(StockDateSnapshot.id.asc()).first()
 
-        content = exchange.download_and_archive_result(filename)
+        content = exchange.read_result(filename)
         if snapshot is None:
+            exchange.archive_result(filename)
             stats["unmatched"] += 1
             logger.warning("stock_on_date: выгрузка за %s не сопоставлена ни с одной заявкой "
                            "(файл %s лежит в архиве)", snapshot_date, filename)
@@ -612,6 +678,7 @@ def apply_stock_on_date_files(db: Session, exchange: "LocalExchange") -> dict:
         snapshot.note = "" if rows else "1С вернула пустую выгрузку"
         stats["files"] += 1
         stats["rows"] += len(rows)
+        applied_files.append(filename)
 
         # Товары, которым оператор задал эту дату для расчёта порога, ждали
         # именно этого файла. Подставляем им остаток на дату и пересчитываем
@@ -627,6 +694,9 @@ def apply_stock_on_date_files(db: Session, exchange: "LocalExchange") -> dict:
                         filled["offsets_changed"], filled["queued"])
 
     db.commit()
+    # Только теперь — разбор дошёл до базы.
+    for filename in applied_files:
+        exchange.archive_result(filename)
     return stats
 
 
@@ -648,10 +718,22 @@ def detect_timed_out_stock_date_requests(db: Session) -> list:
 
 
 def prune_stock_date_snapshots(db: Session, keep: int = STOCK_ON_DATE_KEEP) -> int:
-    """Оставляет последние `keep` заявок, остальные удаляет вместе со строками.
+    """Оставляет последние `keep` ОТВЕЧЕННЫХ заявок, остальные удаляет со строками.
+
     Каждая выгрузка — полный снимок склада (тысячи строк), а нужна она обычно
-    один раз; без уборки база росла бы от справок."""
+    один раз; без уборки база росла бы от справок.
+
+    Незавершённые заявки (`pending`/`sent`) не удаляются НИКОГДА, сколько бы их
+    ни накопилось. Раньше уборка шла просто по номеру: закажи оператор больше
+    десяти срезов подряд — и самые старые исчезали вместе с теми, на которые 1С
+    ещё не ответила. Пропадало сразу три вещи: сама заявка (ответ, когда он
+    придёт, лёг бы в никуда), находка отчёта «Заявок на срез без ответа 1С»
+    (ей не на что смотреть) и — главное — товары с этой базовой датой оставались
+    в «ждём выгрузку 1С» навсегда, потому что ждать стало нечего.
+    """
     ids = [row.id for row in db.query(StockDateSnapshot.id)
+           .filter(StockDateSnapshot.status.notin_(
+               [StockDateStatus.pending, StockDateStatus.sent]))
            .order_by(StockDateSnapshot.id.desc()).offset(keep).all()]
     if not ids:
         return 0
@@ -661,6 +743,24 @@ def prune_stock_date_snapshots(db: Session, keep: int = STOCK_ON_DATE_KEEP) -> i
         StockDateSnapshot.id.in_(ids)).delete(synchronize_session=False)
     db.commit()
     return len(ids)
+
+
+def finalize_stock_delta(db: Session, exchange: "LocalExchange", stats: dict) -> None:
+    """Закрепить применённую дельту: пометить документы и убрать файлы в архив.
+
+    Зовётся ТОЛЬКО после того, как остаток реально применён. Раньше и то и
+    другое делалось при чтении, до применения: сбой на применении оставлял файл
+    в архиве (оттуда его никто не перечитывает) и документ помеченным
+    применённым, то есть правка остатка из 1С пропадала насовсем — повторная
+    присылка того же файла была бы отброшена как «уже применён».
+    """
+    for doc_id, entry in (stats.get("documents_pending") or {}).items():
+        db.add(StockDeltaDocument(document_id=doc_id, source=entry["source"],
+                                  lines=entry["lines"]))
+    if stats.get("documents_pending"):
+        db.commit()
+    for filename in stats.get("files_pending") or []:
+        exchange.archive_result(filename)
 
 
 KNOWN_COMMANDS = ("CREATE_MOVEMENT", "CONFIRM_MOVEMENT", "CANCEL_MOVEMENT")

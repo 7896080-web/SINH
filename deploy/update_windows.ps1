@@ -19,8 +19,28 @@ if (-not (Test-Path $py)) {
 Write-Host "[*] Зависимости (на случай новых)..." -ForegroundColor Cyan
 & $py -m pip install -r (Join-Path $root "requirements.txt") | Out-Null
 
+# Копия базы ПЕРЕД миграцией — это единственный момент, когда она точно нужна:
+# суточная копия может быть двадцатичасовой давности, а неудачная миграция меняет
+# схему необратимо. Копия снимается штатным механизмом SQLite на живой базе, службы
+# останавливать не надо.
+Write-Host "[*] Копия базы перед миграцией..." -ForegroundColor Cyan
+& $py (Join-Path $root "scripts\backup_db.py")
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "[X] Копия не снялась — обновление остановлено. Разберитесь с бэкапом:" -ForegroundColor Red
+    Write-Host "    место на диске, права на C:\sync_admin\backups, переменная BACKUP_DIR." -ForegroundColor Red
+    exit 1
+}
+
 Write-Host "[*] Миграции базы..." -ForegroundColor Cyan
 & $py -m alembic upgrade head
+
+Write-Host "[*] Тесты..." -ForegroundColor Cyan
+& $py -m pytest -q
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "[!] Тесты не прошли. Службы НЕ перезапущены — код на диске новый," -ForegroundColor Yellow
+    Write-Host "    но работает ещё старый. Разберитесь до перезапуска." -ForegroundColor Yellow
+    exit 1
+}
 
 Write-Host "[*] Перезапуск служб..." -ForegroundColor Cyan
 & nssm restart sync_admin_web   | Out-Null

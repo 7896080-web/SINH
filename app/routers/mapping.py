@@ -7,7 +7,7 @@ from app.database import get_db
 from app.templating import templates as shared_templates
 from app.dependencies import get_current_user
 from app.models import Barcode, Product, MappingConflict, Platform, PlatformAccount, PlatformCatalogItem, User
-from app.excel_utils import build_xlsx_response, read_xlsx_rows, format_dt, ExcelReadError
+from app.excel_utils import build_xlsx_response, read_xlsx_rows, read_upload, format_dt, ExcelReadError
 from app.flash import set_flash, pop_flash
 from app.audit import log_action
 from app.workers.client_factory import build_client
@@ -17,8 +17,19 @@ from app.workers.credentials import CredentialsMissing
 router = APIRouter()
 templates = shared_templates
 
+# Сколько строк показывает страница. Столько же уходило и в выгрузку — молча:
+# файл назывался «мэппинг баркодов», а содержал триста последних из ста
+# пятидесяти четырёх тысяч, и нигде об этом не говорилось. Оператор открывает
+# этот файл, чтобы переподвязать баркод, и «моей строки здесь нет» он понимает
+# как «баркода нет в системе».
+PAGE_LIMIT = 300
+# Сколько уходит в выгрузку. Файл правят руками и загружают обратно, поэтому он
+# обязан содержать то, что оператор отобрал, а не первый экран. Потолок —
+# защита от попытки собрать весь справочник одним файлом.
+EXPORT_LIMIT = 50000
 
-def _query_mapped(db: Session, q: str, source_platform: str):
+
+def _mapped_query(db: Session, q: str, source_platform: str):
     query = db.query(Barcode).options(joinedload(Barcode.product))
 
     if q:
@@ -30,7 +41,16 @@ def _query_mapped(db: Session, q: str, source_platform: str):
     if source_platform:
         query = query.filter(Barcode.source_platform == source_platform)
 
-    return query.order_by(Barcode.created_at.desc()).limit(300).all()
+    return query.order_by(Barcode.created_at.desc())
+
+
+def _query_mapped(db: Session, q: str, source_platform: str, limit: int = PAGE_LIMIT):
+    return _mapped_query(db, q, source_platform).limit(limit).all()
+
+
+def _count_mapped(db: Session, q: str, source_platform: str) -> int:
+    return _mapped_query(db, q, source_platform).order_by(None) \
+        .enable_eagerloads(False).count()
 
 
 def _query_conflicts(db: Session, q: str, account_id: str):
@@ -75,8 +95,13 @@ def _render(request: Request, db: Session, user: User, view: str, q: str,
             source_platform: str, account_id: str, template: str):
     if view == "conflicts":
         rows = _query_conflicts(db, q, account_id)
+        total = len(rows)
     else:
         rows = _query_mapped(db, q, source_platform)
+        # Считаем ВСЕГДА, а не только когда строк ровно триста: страница обязана
+        # сказать, сколько их под отбором, иначе «моей строки нет» читается как
+        # «баркода нет в системе».
+        total = _count_mapped(db, q, source_platform)
 
     conflicts_count = db.query(MappingConflict).count()
     accounts = db.query(PlatformAccount).order_by(PlatformAccount.platform, PlatformAccount.name).all()
@@ -85,6 +110,7 @@ def _render(request: Request, db: Session, user: User, view: str, q: str,
         "request": request, "current_user": user, "active_page": "mapping",
         "rows": rows, "view": view, "q": q, "source_platform": source_platform, "account_id": account_id,
         "platforms": list(Platform), "accounts": accounts, "conflicts_count": conflicts_count,
+        "total": total, "page_limit": PAGE_LIMIT, "export_limit": EXPORT_LIMIT,
         "flash": pop_flash(request) if template == "mapping.html" else None,
     })
 
@@ -126,7 +152,7 @@ def mapping_export(
         ]
         filename = "конфликты_сопоставления.xlsx"
     else:
-        rows = _query_mapped(db, q, source_platform)
+        rows = _query_mapped(db, q, source_platform, limit=EXPORT_LIMIT)
         # Размер и цвет — не украшение: файл этой выгрузки правят руками, чтобы
         # переподвязать баркод, и без них строки различаются только двумя
         # непрозрачными идентификаторами. Перепутать размеры в таком файле проще,
@@ -171,7 +197,7 @@ def mapping_import(
     """
 
     try:
-        rows = read_xlsx_rows(file.file.read())
+        rows = read_xlsx_rows(read_upload(file.file))
     except ExcelReadError as e:
         set_flash(request, str(e), "warn")
         return RedirectResponse("/mapping", status_code=303)
@@ -219,7 +245,12 @@ def mapping_import(
                 p = db.query(Product).filter(Product.uid_1c == affected_uid).first()
                 if p is not None:
                     p.recalc_done_at = None
-                    p.recalc_account_ids = None
+                    # Пустая СТРОКА, а не NULL: покрытие аннулировано, но
+                    # отслеживаем мы его по-прежнему. NULL означал бы «расчёта
+                    # никогда не было», и ступень 2 лестницы перестала бы
+                    # срабатывать вовсе — переподвязка ОТКРЫВАЛА бы трансляцию
+                    # несверенного остатка вместо того, чтобы закрыть её.
+                    p.recalc_account_ids = ""
             log_action(db, user.username, "barcode_repointed",
                        f"{barcode}: {was_uid} -> {uid_1c}")
             repointed += 1

@@ -28,6 +28,13 @@ ORDERS_WINDOW_DAYS = 29
 
 # Сколько идентификаторов заказов влезает в один запрос статусов
 # (`/api/v3/orders/status`). Предел площадки, а не наш выбор.
+# Карточек за страницу каталога. По спеке WB у `cursor.limit` стоит
+# `maximum: 100` — больше площадка всё равно не отдаст.
+CATALOG_PAGE_SIZE = 100
+# Страниц каталога за один вызов. Сто карточек на страницу, то есть потолок —
+# двести тысяч позиций на кабинет; упёрлись в него — поднимаем `last_truncated`.
+CATALOG_MAX_PAGES = 2000
+
 STATUS_BATCH_IDS = 1000
 
 # Сколько sku влезает в один запрос остатков (`/api/v3/stocks/{warehouseId}`).
@@ -161,7 +168,18 @@ class WbClient(PlatformClient):
         day = start
         while True:
             for o in self._orders_window(day):
-                oid = str(o.get("id"))
+                # `str(None)` даёт непустую строку «None», и проверка `if not oid`
+                # её пропускала. Такой заказ проводился и оседал в
+                # `ProcessedOrder`, а дальше `get_cancelled_orders` падал на
+                # `int("None")` ЕЩЁ ДО похода в сеть — отмены переставали
+                # отслеживаться по ВСЕМУ кабинету (списанная единица не
+                # возвращалась на ЦС), исключение уходило в задание, и через пять
+                # опросов предохранитель гасил кабинет совсем. Само бы это не
+                # рассосалось: запись живёт всё окно открытых заказов.
+                raw_id = o.get("id")
+                if raw_id is None:
+                    continue
+                oid = str(raw_id)
                 if not oid or oid in seen:
                     continue
                 skus = o.get("skus") or []
@@ -199,7 +217,16 @@ class WbClient(PlatformClient):
         # подтверждения, см. base.get_confirmed_orders), так что список растёт со
         # скоростью продаж и предел — вопрос времени, а не гипотеза.
         cancelled = []
-        int_ids = [int(x) for x in order_ids]
+        # Нечисловой идентификатор отбрасываем, а не падаем на всей пачке: одна
+        # испорченная запись не должна отключать отслеживание отмен по кабинету.
+        int_ids = []
+        for raw in order_ids:
+            try:
+                int_ids.append(int(raw))
+            except (TypeError, ValueError):
+                continue
+        if not int_ids:
+            return []
         for start in range(0, len(int_ids), STATUS_BATCH_IDS):
             chunk = int_ids[start:start + STATUS_BATCH_IDS]
             data = self._post("/api/v3/orders/status", {"orders": chunk})
@@ -371,12 +398,23 @@ class WbClient(PlatformClient):
                 if text:
                     detail = f"{detail}: {text[:300]}"
 
+                # ВО ВСЕХ аварийных выходах ниже первым элементом идёт ПУСТОЙ
+                # список отправленных. Раньше там стояло «то, что выбыло из
+                # remaining» — и это был не успех, а ровно наоборот: выбыть из
+                # remaining позиция может ТОЛЬКО одним способом, если её отклонила
+                # площадка. Каждый запрос уходит целиком, частично успешных пачек
+                # не бывает. В итоге отклонённый баркод возвращался и в `ok`, и в
+                # `errors`, а рассылка проверяет `ok` раньше — запись закрывалась
+                # как `sent` с временем отправки. Мы считали остаток доставленным,
+                # в отчёт он не попадал ни как «не доехало», ни как «неизвестный
+                # sku», и только сверка через полчаса спрашивала площадку и
+                # получала «нет такого sku».
                 if response is not None and self._error_code(response) == "SKUUploadDisabled":
                     # WB выключил загрузку по баркоду для этого кабинета. Повтор
                     # не поможет и ничего не изменит: нужен chrtId, то есть
                     # свежий каталог кабинета. Говорим это прямо, а не прячем за
                     # «не отправлено за 5 попыток».
-                    return [i.barcode for i in items if i not in remaining], dropped + [
+                    return [], dropped + [
                         {"sku": i.barcode, "terminal": True,
                          "detail": "площадка больше не принимает остаток по баркоду "
                                    "(SKUUploadDisabled) — нужен chrtId, обновите "
@@ -389,7 +427,7 @@ class WbClient(PlatformClient):
                 if not bad:
                     # Забраковано что-то другое — разбирать это самим мы не
                     # беремся, отдаём как есть по всей оставшейся пачке.
-                    return ([i.barcode for i in items if i not in remaining],
+                    return ([],
                             dropped + [{"detail": detail}], fallback)
 
                 unknown = [i for i in remaining if key_of(i) in bad]
@@ -406,7 +444,7 @@ class WbClient(PlatformClient):
                 remaining = [i for i in remaining if key_of(i) not in bad]
                 continue
             except requests.RequestException as e:
-                return ([i.barcode for i in items if i not in remaining],
+                return ([],
                         dropped + [{"detail": str(e)}], fallback)
 
             text = (resp.text or "").strip()
@@ -464,10 +502,20 @@ class WbClient(PlatformClient):
         В v2 карточки и курсор — на верхнем уровне ответа, тело запроса — под
         ключом `settings` (подтверждено на живом API)."""
         result = []
-        limit = 1000
+        # Сто, а не тысяча. По спеке WB (`swagger/02-items.yaml`, снимок
+        # dev.wildberries.ru) у `cursor.limit` стоит `maximum: 100` — площадка
+        # режет запрос до сотни сама, и именно поэтому ниже появился комментарий
+        # «WB отдаёт меньше лимита за страницу». Следствие было в другом: предел
+        # в 200 страниц покрывал не двести тысяч карточек, как задумано, а
+        # двадцать тысяч, и признака обрыва клиент не поднимал вовсе. У карточек
+        # за границей нет строки каталога, значит нет chrtId — остаток уходит
+        # баркодом, и в день, когда WB включит `SKUUploadDisabled`, эти карточки
+        # замолчат.
+        limit = CATALOG_PAGE_SIZE
         cursor = {"limit": limit}
         prev_key = None
-        for _ in range(200):  # защитный предел на число страниц за один вызов
+        self.last_truncated = False
+        for _ in range(CATALOG_MAX_PAGES):
             data = self._post_content("/content/v2/get/cards/list", {
                 "settings": {"cursor": cursor, "filter": {"withPhoto": -1}},
             })
@@ -487,6 +535,10 @@ class WbClient(PlatformClient):
                 break
             prev_key = key
             cursor = {"limit": limit, "updatedAt": updated_at, "nmID": nm_id}
+        else:
+            # Цикл дошёл до предела, ни разу не встретив конца ленты: каталог
+            # неполон. Молчать нельзя — огрызок примут за полный каталог.
+            self.last_truncated = True
         return result
 
 

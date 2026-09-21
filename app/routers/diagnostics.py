@@ -35,6 +35,10 @@ templates = shared_templates
 # Сутки — ровно то окно, по которому отчёт показывает свежие: закрыть можно
 # только то, что отчёт уже не считает находкой, иначе команда гасила бы сигнал.
 CLOSE_RECONCILIATION_OLDER_THAN = timedelta(hours=24)
+# По сколько строк за раз и сколько порций за одно нажатие. Те же соображения,
+# что у `retention.CHUNK`: длинная транзакция блокирует запись всем остальным.
+CLOSE_RECONCILIATION_CHUNK = 500
+CLOSE_RECONCILIATION_MAX_CHUNKS = 200
 
 
 def _queue_counts(db: Session, account_id: int, errors: int | None = None) -> dict:
@@ -146,11 +150,31 @@ def _stuck_rows(db: Session) -> list[dict]:
             if bc is not None:
                 product = db.query(Product).filter(Product.uid_1c == bc.uid_1c).first()
         started = t.sent_at or t.created_at
+        # Направление ошибки у создания и у отмены ПРОТИВОПОЛОЖНОЕ, и карточка
+        # раньше объясняла оба одним текстом — по созданию. Открытое
+        # `CREATE_MOVEMENT` считается «в пути» со знаком плюс: остаток занижен,
+        # наружу уходит меньше, чем есть. Открытое `CANCEL_MOVEMENT` — со знаком
+        # минус: остаток ЗАВЫШЕН, наружу уходит больше, чем есть, то есть риск
+        # оверселла. Соответственно и решение «документа нет» по отмене остаток
+        # не поднимает, а опускает. Оператор, читающий предупреждение буквально,
+        # отказывался нажимать — и оставлял систему ровно в опасном состоянии.
+        cancel = t.command == "CANCEL_MOVEMENT"
         rows.append({
             "task": t,
             "product": product,
             "age_hours": round((now - started).total_seconds() / 3600, 1) if started else None,
             "account": t.account.name if t.account else str(t.account_id),
+            "is_cancel": cancel,
+            "effect": ("остаток завышен на {} — наружу уходит больше, чем есть "
+                       "(риск оверселла)".format(t.quantity) if cancel else
+                       "остаток занижен на {} — наружу уходит меньше, чем есть"
+                       .format(t.quantity)),
+            # Что произойдёт по кнопке «документа нет».
+            "no_document_effect": ("остаток УМЕНЬШИТСЯ на {}: 1С товар не вернула, "
+                                   "и возвращать его нам тоже не за чем"
+                                   .format(t.quantity) if cancel else
+                                   "остаток ВЫРАСТЕТ на {}: 1С единицу не списала"
+                                   .format(t.quantity)),
         })
     return rows
 
@@ -237,21 +261,40 @@ def close_old_reconciliation(
     порог `RECONCILIATION_WINDOW` тут не при чём — свежие сюда не попадут.
     """
     cutoff = now_utc() - CLOSE_RECONCILIATION_OLDER_THAN
-    rows = db.query(ReconciliationLog).filter(
-        ReconciliationLog.resolved.is_(False),
-        ReconciliationLog.checked_at < cutoff,
-    ).all()
-    for row in rows:
-        row.resolved = True
+    # ПОРЦИЯМИ, а не одной транзакцией на всю выборку. Раньше кнопка поднимала в
+    # память ORM-объекты по каждой подходящей строке и обновляла их одним
+    # коммитом: замер на 250 тысячах строк — 3,8 с на загрузку, 10,9 с на
+    # обновление, 857 МБ памяти, и всё это время писать в базу не может никто —
+    # ни рассылка, ни приём заказов, ни приём ответов 1С. За `busy_timeout` в
+    # тридцать секунд следует `database is locked`, нигде не перехваченный.
+    # Атомарность тут не нужна: каждая строка независима, недоделанное доделает
+    # следующее нажатие.
+    closed = 0
+    for _ in range(CLOSE_RECONCILIATION_MAX_CHUNKS):
+        ids = [row[0] for row in db.query(ReconciliationLog.id).filter(
+            ReconciliationLog.resolved.is_(False),
+            ReconciliationLog.checked_at < cutoff,
+        ).limit(CLOSE_RECONCILIATION_CHUNK).all()]
+        if not ids:
+            break
+        db.query(ReconciliationLog).filter(ReconciliationLog.id.in_(ids)).update(
+            {ReconciliationLog.resolved: True}, synchronize_session=False)
+        db.commit()
+        closed += len(ids)
+
     log_action(db, user.username, "reconciliation_closed_old",
-               f"закрыто старых расхождений сверки: {len(rows)}")
+               f"закрыто старых расхождений сверки: {closed}")
     db.commit()
 
-    if not rows:
+    if not closed:
         set_flash(request, "Старых расхождений сверки нет — закрывать нечего.", "good")
     else:
-        set_flash(request, f"Закрыто старых расхождений сверки: {len(rows)}. "
-                           f"Остатки не тронуты — это пометка в журнале.", "good")
+        tail = ""
+        if closed >= CLOSE_RECONCILIATION_CHUNK * CLOSE_RECONCILIATION_MAX_CHUNKS:
+            tail = (" Это предел за одно нажатие — строки могли остаться, "
+                    "нажмите ещё раз.")
+        set_flash(request, f"Закрыто старых расхождений сверки: {closed}. "
+                           f"Остатки не тронуты — это пометка в журнале.{tail}", "good")
     return RedirectResponse("/diagnostics", status_code=303)
 
 

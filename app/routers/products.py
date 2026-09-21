@@ -25,7 +25,7 @@ from app.models import (Barcode, Platform, PlatformAccount, PlatformCatalogItem,
 from app.flash import set_flash, pop_flash
 from app.audit import log_action
 from app.timeutils import now_utc, today_local
-from app.excel_utils import (build_xlsx_response, read_xlsx_rows, parse_bool_ru,
+from app.excel_utils import (build_xlsx_response, read_xlsx_rows, read_upload, parse_bool_ru,
                              ExcelReadError, YES_NO)
 from app.transmit import (explain, sku_quantity, enqueue_full_resend, enqueue_withdrawal,
                           should_withdraw, ever_transmitted,
@@ -34,7 +34,7 @@ from app.transmit import (explain, sku_quantity, enqueue_full_resend, enqueue_wi
 from app.offset_base import (ensure_snapshot_requested, set_base_date, stock_at_date,
                               stock_lookup)
 from app.recalc import active_job, create_job, last_job
-from app.broadcast_gate import (DEFERRABLE_CALC_STATUSES,
+from app.broadcast_gate import (DEFERRABLE_CALC_STATUSES, enabled_account_ids,
                                 calc_status as _calc_status,
                                 blocks_broadcast_on as _blocks_broadcast_on)
 
@@ -147,8 +147,11 @@ def _row(product: Product, accounts: list[PlatformAccount],
     proposals.sort(key=lambda p: p["name"])
 
     # Кабинеты уже загружены (joinedload) — лишнего запроса на строку не будет.
-    has_cabinet = any(s.enabled for s in product.sync_settings)
-    enabled_ids = {s.account_id for s in product.sync_settings if s.enabled}
+    # Только ЖИВЫЕ кабинеты — тот же набор, по которому ворота решают, можно ли
+    # включать трансляцию (`broadcast_gate.enabled_account_ids`). Разойдись они,
+    # строка показывала бы «актуализирован», а включение не срабатывало.
+    enabled_ids = enabled_account_ids(product)
+    has_cabinet = bool(enabled_ids)
 
     return {
         "uid_1c": product.uid_1c, "article": product.article, "name": product.name,
@@ -989,6 +992,12 @@ def bulk_edit(
             continue
         if action == "set_reserve":
             p.reserve = n
+            # Бронь входит в формулу порога — `recompute_offset` обязателен, как
+            # и в одиночной правке строки. Без него новая бронь оставалась
+            # словами: в пороге продолжала сидеть старая, и наружу уходило
+            # больше, чем оператор только что оставил в продаже. Массовой
+            # кнопкой — сразу по всему отбору.
+            recompute_offset(p)
         elif action == "set_offset":
             p.broadcast_offset = n
             p.transmit_override = None
@@ -1001,6 +1010,19 @@ def bulk_edit(
             p.broadcast_enabled = True
             p.broadcast_requested_at = None
         elif action == "broadcast_off":
+            # Отзыв — ровно как у галочки в строке (`toggle_broadcast`). Без него
+            # на площадке оставалось последнее отправленное число, и она
+            # продолжала по нему продавать, а заказы по этой паре живой опрос
+            # уже принимает (гейт там по `SyncSetting.enabled`, которого
+            # выключение трансляции не трогает): остаток у нас падает, у
+            # площадки — нет. Это оверселл, и массовой кнопкой сразу по всему
+            # отбору. `ever_transmitted`, а не `should_withdraw`: трансляцию мы
+            # выключаем этой же строкой, и `should_withdraw` ответил бы «нечего»
+            # по всем кабинетам.
+            for setting in p.sync_settings:
+                if setting.enabled and ever_transmitted(db, p.uid_1c, setting.account_id):
+                    enqueue_withdrawal(db, p.uid_1c, setting.account_id,
+                                       reason="broadcast_off")
             p.broadcast_enabled = False
             p.broadcast_requested_at = None    # см. toggle_broadcast
         elif action == "set_active_since":
@@ -1176,7 +1198,7 @@ def products_import(
     accounts = _active_accounts(db)
     label_to_account = {_account_label(a): a for a in accounts}
     try:
-        rows = read_xlsx_rows(file.file.read())
+        rows = read_xlsx_rows(read_upload(file.file))
     except ExcelReadError as e:
         set_flash(request, str(e), "warn")
         return RedirectResponse("/products", status_code=303)
@@ -1279,7 +1301,7 @@ def products_import(
         # сами, а не через product.sync_settings: сессия живёт с autoflush=False,
         # и только что добавленная настройка в коллекции объекта не появится —
         # гейт включения увидел бы товар без единого кабинета и отказал.
-        enabled_after = {s.account_id for s in product.sync_settings if s.enabled}
+        enabled_after = enabled_account_ids(product)
 
         for label, account in label_to_account.items():
             sync_col = f"{label} — Синхронизировать"
@@ -1350,6 +1372,18 @@ def products_import(
                     # без даты расчёт не с чего начать, факт вводит человек.
                     errors.append(f"строка {i}: трансляцию включить нельзя — {blocked}")
             elif product.broadcast_enabled != desired_broadcast:
+                if not desired_broadcast:
+                    # Выключение файлом — тот же осознанный отзыв, что и галочкой
+                    # в строке: без него на площадке остаётся последнее
+                    # отправленное число, она продолжает продавать, а заказы по
+                    # этой паре мы уже принимаем — остаток падает только у нас.
+                    # Снятие галочки КАБИНЕТА в этом же импорте отзыв делает
+                    # (см. выше), а выключение трансляции — нет; расхождение
+                    # ничем не объяснялось.
+                    for setting in product.sync_settings:
+                        if setting.enabled and ever_transmitted(db, uid_1c, setting.account_id):
+                            enqueue_withdrawal(db, uid_1c, setting.account_id,
+                                               reason="broadcast_off")
                 product.broadcast_enabled = desired_broadcast
                 touched = True
             if not desired_broadcast and product.broadcast_requested_at is not None:

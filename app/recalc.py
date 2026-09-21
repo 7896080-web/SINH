@@ -108,12 +108,44 @@ def collect_orders(db: Session, product: Product, since: date,
         return [], ["не отмечен ни один кабинет — заказы спрашивать негде"], []
 
     rows, problems = [], []
+
+    # Кабинет отмечен, но НЕактивен (выключен руками или предохранителем после
+    # пяти сбоёв подряд). Расчёт его не опрашивает — и раньше молчал об этом,
+    # ставя «актуализирован» по неполной картине: продажи этого кабинета в 1С не
+    # проведены, остаток ЦС завышен ровно на них, и включённая трансляция уводит
+    # завышенное число на все площадки. Это проблема, а не подробность.
+    live_ids = {a.id for a in accounts}
+    asleep = db.query(PlatformAccount).join(
+        SyncSetting, SyncSetting.account_id == PlatformAccount.id,
+    ).filter(
+        SyncSetting.uid_1c == product.uid_1c, SyncSetting.enabled.is_(True),
+        PlatformAccount.id.notin_(live_ids),   # live_ids непусто: accounts проверен выше
+    ).all()
+    for account in asleep:
+        problems.append(
+            f"{account.name}: кабинет отмечен, но отключён — заказы по нему не "
+            f"подняты, остаток с его продажами не сверен")
+
     covered: list[int] = []
     for account in accounts:
         try:
             client = build_client(db, account.id)
         except CredentialsMissing as e:
             problems.append(f"{account.name}: нет ключей ({e})")
+            continue
+        except Exception as e:                  # noqa: BLE001 — причина уходит в problems
+            # ЛЮБОЕ другое исключение тоже остаётся здесь. Раньше ловился только
+            # `CredentialsMissing`, а построение клиента идёт через расшифровку
+            # ключей: рассогласование `SECRETS_ENCRYPTION_KEY` (ротация, разный
+            # `.env` у веба и воркера, битая строка в `api_credentials`) даёт
+            # `InvalidToken`, который ему не родственник. Такое исключение
+            # улетало из `run_tick`, строка задания не помечалась обработанной —
+            # и задание оставалось `running` НАВСЕГДА: тот же товар падал каждые
+            # двадцать секунд, остальные товары не обрабатывались никогда, новые
+            # расчёты не стартовали (`active_job` возвращал это же задание), а
+            # без отметки «актуализирован» интерфейс не даёт включить
+            # трансляцию — вставал весь переход.
+            problems.append(f"{account.name}: {type(e).__name__}: {e}")
             continue
         try:
             orders = client.get_orders_since(since)
@@ -220,7 +252,9 @@ def catch_up_product(db: Session, product: Product, build_client, pending_wareho
         # Запоминаем ИМЕННО те кабинеты, чьи заказы удалось прочитать целиком.
         # Кабинет, отмеченный позже, в этот список не попадёт — и трансляция в
         # него не начнётся, пока расчёт не пройдёт заново уже с ним.
-        product.recalc_account_ids = ",".join(str(i) for i in sorted(covered)) or None
+        # Пустая СТРОКА при пустом покрытии, а не NULL: NULL читается как
+        # «расчёта никогда не было» и отключает ступень 2 лестницы целиком.
+        product.recalc_account_ids = ",".join(str(i) for i in sorted(covered))
 
         # Кабинет, покрытый ВПЕРВЫЕ, надо ещё и толкнуть. Ворота ему открыл
         # именно этот расчёт, а событие, которое поставило бы доотправку в

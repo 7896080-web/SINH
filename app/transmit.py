@@ -34,7 +34,7 @@ from dataclasses import dataclass
 
 from sqlalchemy.orm import Session, joinedload
 
-from app.models import DispatchQueueItem, DispatchStatus, Product
+from app.models import DispatchQueueItem, DispatchStatus, Product, SyncSetting
 
 
 # Как посчитана цифра уровня SKU — для подписи в интерфейсе.
@@ -136,6 +136,30 @@ def covered_accounts(product: Product | None) -> set[int]:
     return {int(p) for p in (x.strip() for x in raw.split(",")) if p.isdigit()}
 
 
+def coverage_is_tracked(product: Product | None) -> bool:
+    """Отслеживается ли у товара покрытие кабинетов расчётом.
+
+    Ступень 2 была написана как «расчёт БЫЛ и кабинет не покрыт», и из-за
+    первого условия снятие отметки «актуализирован» её ОТКЛЮЧАЛО: пока отметка
+    стоит — кабинет вне расчёта закрыт, а стоит её снять, и на все отмеченные
+    кабинеты уходит полный несверенный остаток. Переподвязка баркода
+    (`mapping.import_barcode_dict` с галочкой) делает ровно это и в комментарии
+    объясняет, что снимает отметку, чтобы остаток по новому набору баркодов не
+    уехал непересчитанным. Получалось наоборот.
+
+    Поэтому спрашиваем не «был ли расчёт», а «ведём ли мы список покрытых
+    кабинетов». Пустая СТРОКА в `recalc_account_ids` — ведём, и покрыт никто
+    (расчёт прошёл и никого не покрыл, либо покрытие аннулировано
+    переподвязкой). NULL — не ведём: это товар, которого расчёт никогда не
+    касался, и для него ступень 2 молчит, как молчала раньше. Различие важно:
+    закрой мы ступенью 2 и такие товары, у всех, кому трансляцию включили до
+    появления расчёта, на площадки уехал бы ноль.
+    """
+    if product is None:
+        return False
+    return product.recalc_done_at is not None or product.recalc_account_ids is not None
+
+
 def sku_mode(product: Product | None) -> str:
     if product is not None and product.broadcast_offset is not None:
         return MODE_OFFSET
@@ -195,7 +219,7 @@ def explain(product: Product | None, setting, account) -> Transmit:
     # его продажи с базовой даты в 1С не проведены, и уйдёт туда завышенное число.
     # Прогноза здесь намеренно нет — правильный ответ не «столько уйдёт», а
     # «сначала пересчёт», и после пересчёта число всё равно станет другим.
-    if (account is not None and product.recalc_done_at is not None
+    if (account is not None and coverage_is_tracked(product)
             and account.id not in covered_accounts(product)):
         return Transmit(0, True,
                         f"расчёт не покрывал кабинет «{account.name}» — остаток по нему не сверен",
@@ -238,7 +262,7 @@ def quantity_for_account(db: Session, uid_1c: str, account_id: int, raw_stock: i
     ).first()
     if setting is None or not setting.enabled:
         return 0
-    if product.recalc_done_at is not None and account_id not in covered_accounts(product):
+    if coverage_is_tracked(product) and account_id not in covered_accounts(product):
         return 0
     account = db.query(PlatformAccount).filter(PlatformAccount.id == account_id).first()
     if account is not None and not account.dispatch_enabled:
@@ -252,6 +276,39 @@ def quantity_for_account(db: Session, uid_1c: str, account_id: int, raw_stock: i
     if mode == MODE_AUTO and threshold and base <= threshold:
         return 0
     return base
+
+
+def blocked_by_switch(db: Session, uid_1c: str, account_id: int) -> bool:
+    """Даёт ли лестница ноль из-за ВЫКЛЮЧАТЕЛЯ (ступени 0–2), а не из-за расчёта.
+
+    Различие нужно ровно в одном месте — перед отправкой, — и оно не косметическое.
+    Ноль бывает двух совершенно разных сортов.
+
+    Ноль от РАСЧЁТА (ступени 3–6: остаток распродан, бронь съела остаток, порог
+    кабинета выше доступного) — это законное сообщение площадке: «не продавать».
+    Его надо отправлять даже первым сообщением по карточке: трансляция включена и
+    кабинет отмечен, то есть карточку мы сознательно берём под управление, и
+    промолчать значит оставить её торговать по чужому числу.
+
+    Ноль от ВЫКЛЮЧАТЕЛЯ (трансляция товара выключена, кабинет не отмечен, кабинет
+    не покрыт расчётом) означает обратное: этой карточкой мы НЕ управляем. Если мы
+    туда ни разу не писали, такой ноль не отзывает наш остаток, а обнуляет чужие
+    продажи — авария 18.09.
+    """
+    from app.models import PlatformAccount   # локально: избегаем цикла импортов
+
+    product = db.query(Product).filter(Product.uid_1c == uid_1c).first()
+    if product is None or not product.broadcast_enabled:
+        return True
+    setting = db.query(SyncSetting).filter(
+        SyncSetting.uid_1c == uid_1c, SyncSetting.account_id == account_id,
+    ).first()
+    if setting is None or not setting.enabled:
+        return True
+    if coverage_is_tracked(product) and account_id not in covered_accounts(product):
+        return True
+    account = db.query(PlatformAccount).filter(PlatformAccount.id == account_id).first()
+    return account is not None and not account.dispatch_enabled
 
 
 def enqueue_full_resend(db: Session, uid_1c: str, account_id: int,
@@ -283,8 +340,7 @@ def enqueue_full_resend(db: Session, uid_1c: str, account_id: int,
     # Кабинет, которого расчёт не касался, — тот же случай: в очереди по нему
     # выйдет ноль (ступень 2 лестницы), и этот ноль уедет на площадку, обнулив
     # живую карточку. Отправлять туда нечего, пока не прошёл пересчёт.
-    if (product is not None and product.recalc_done_at is not None
-            and account_id not in covered_accounts(product)):
+    if coverage_is_tracked(product) and account_id not in covered_accounts(product):
         return False
     quantity = product.stock_on_hand if product else 0
     db.add(DispatchQueueItem(uid_1c=uid_1c, account_id=account_id, quantity=quantity, reason=reason))
@@ -391,7 +447,22 @@ def ever_transmitted(db: Session, uid_1c: str, account_id: int) -> bool:
     цикл) тоже получают статус `sent`, хотя на площадку не уходили и
     `sent_quantity` у них пуст — без этого условия любая из них сошла бы за
     отправку.
+
+    ПЕРВЫМ делом спрашиваем отметку на самой паре (`SyncSetting`), и только потом
+    ищем в очереди. Очередь — недолговечная память: суточная чистка удаляет
+    терминальные записи старше тридцати суток, а у медленного размера остаток не
+    меняется месяцами. Последняя строка `sent` исчезала, система забывала, что
+    писала на карточку, и снятие галочки переставало отзывать остаток — площадка
+    продолжала продавать по нашему числу, а заказы по снятой паре живой опрос уже
+    пропускает. Отметка чистку переживает; очередь остаётся для пар, отправленных
+    до появления колонки.
     """
+    setting = db.query(SyncSetting).filter(
+        SyncSetting.uid_1c == uid_1c, SyncSetting.account_id == account_id,
+    ).first()
+    if setting is not None and setting.last_nonzero_sent_at is not None:
+        return True
+
     items = db.query(DispatchQueueItem).filter(
         DispatchQueueItem.uid_1c == uid_1c,
         DispatchQueueItem.account_id == account_id,
