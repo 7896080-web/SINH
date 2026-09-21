@@ -17,6 +17,12 @@ CANCELLED_PAGE_SIZE = 1000
 # Защитный предел на число страниц: столько же, сколько у выгрузки заказов.
 MAX_PAGES = 200
 
+# Позиций за страницу каталога (`/v3/product/list`, предел площадки) и страниц
+# за один вызов. Тысяча на страницу, то есть потолок — двести тысяч позиций на
+# кабинет; упёрлись в него — поднимаем `last_truncated`.
+CATALOG_PAGE_SIZE = 1000
+CATALOG_MAX_PAGES = 200
+
 # Коды отказа по КОНКРЕТНОЙ позиции, которые повтором не лечатся: карточки или
 # склада у площадки нет, и через двадцать три минуты повторов ответ будет тот же.
 # Всё остальное (лимиты, временные сбои) оставляем повторам.
@@ -157,8 +163,13 @@ class OzonClient(PlatformClient):
         Статус не фильтруем — берём все, чтобы не потерять уже
         отгруженные/доставленные заказы периода (модель FBS)."""
         from datetime import datetime as _dt, date as _date
+        from app.timeutils import local_date_of, local_day_start_utc
         if isinstance(date_from, _date):
-            since = _dt(date_from.year, date_from.month, date_from.day, tzinfo=timezone.utc)
+            # Начало МЕСТНЫХ суток: `_dt(y, m, d, tzinfo=utc)` — это 03:00 по
+            # Москве, и отправления первых трёх часов базового дня оставались
+            # за границей запроса. Ошибки при этом нет, расчёт молчит и ставит
+            # «актуализирован» — наружу уходит остаток, завышенный на них.
+            since = local_day_start_utc(date_from)
         else:
             since = date_from
         now = datetime.now(timezone.utc)
@@ -181,7 +192,9 @@ class OzonClient(PlatformClient):
                 raw = posting.get("in_process_at") or posting.get("created_at")
                 if raw:
                     try:
-                        order_date = _dt.fromisoformat(str(raw).replace("Z", "+00:00")).date()
+                        # Местная дата: уезжает в 1С датой перемещения.
+                        order_date = local_date_of(
+                            _dt.fromisoformat(str(raw).replace("Z", "+00:00")))
                     except ValueError:
                         order_date = None
                 for product in posting.get("products", []):
@@ -320,9 +333,11 @@ class OzonClient(PlatformClient):
         ответа (result.items, result.last_id)."""
         result = []
         last_id = ""
-        for _ in range(50):
+        self.last_truncated = False
+        for _ in range(CATALOG_MAX_PAGES):
             list_data = self._post("/v3/product/list", {
-                "filter": {"visibility": "ALL"}, "last_id": last_id, "limit": 1000,
+                "filter": {"visibility": "ALL"}, "last_id": last_id,
+                "limit": CATALOG_PAGE_SIZE,
             })
             items = list_data.get("result", {}).get("items", [])
             if not items:
@@ -336,6 +351,19 @@ class OzonClient(PlatformClient):
             last_id = list_data.get("result", {}).get("last_id", "")
             if not last_id:
                 break
+        else:
+            # Цикл дошёл до предела, ни разу не встретив конца ленты: каталог
+            # неполон, и огрызок примут за полный. У WB и Kit эта ветка есть, а
+            # здесь её не было вовсе — `last_truncated` оставался ложным, и
+            # предупреждение до оператора не доходило.
+            #
+            # У Ozon цена тишины выше, чем у соседей: остаток туда адресуется
+            # АРТИКУЛОМ из каталога, и позиция, не попавшая в огрызок, остаётся
+            # без ключа отправки. Рассылка закроет её как «нет карточки», а
+            # отчёт отнесёт к `unknown_sku` — «продавать нечего, оверселла не
+            # будет». Здесь это НЕПРАВДА: карточка на площадке есть и продаётся,
+            # просто мы её не выгрузили.
+            self.last_truncated = True
         return result
 
 

@@ -15,6 +15,7 @@
 """
 from datetime import date, datetime, timedelta, timezone
 
+from app.timeutils import local_date_of, today_local
 from app.workers.platform_clients.wb import ORDERS_WINDOW_DAYS, WbClient
 
 
@@ -34,7 +35,10 @@ class _Wb:
 
     def __call__(self, path, params=None, **kw):
         ts = (params or {}).get("dateFrom")
-        start = datetime.fromtimestamp(int(ts), tz=timezone.utc).date()
+        # Как и площадка, отметку времени превращаем в МЕСТНОЕ число: клиент
+        # спрашивает ленту от начала местных суток, и под Москвой это 21:00 UTC
+        # предыдущего дня (см. test_orders_window_local_day).
+        start = local_date_of(datetime.fromtimestamp(int(ts), tz=timezone.utc))
         self.asked.append(start)
         end = start + timedelta(days=self.window)
         out = []
@@ -55,7 +59,7 @@ def _client(fake):
 
 
 def _today():
-    return datetime.now(timezone.utc).date()
+    return today_local()
 
 
 # ------------------------------------------------ окно

@@ -186,9 +186,12 @@ class WbClient(PlatformClient):
         страницу, но данные при этом не кончились. Стоп — пустая страница, нет
         курсора или курсор не сдвинулся (защита от зацикливания).
         """
-        from datetime import datetime, timezone
+        from app.timeutils import local_day_start_utc
 
-        ts = int(datetime(day.year, day.month, day.day, tzinfo=timezone.utc).timestamp())
+        # Начало МЕСТНЫХ суток, а не UTC-шных. `datetime(y, m, d,
+        # tzinfo=utc)` — это 03:00 по Москве: заказы первых трёх часов дня
+        # оставались за границей запроса, а расчёт при этом не жаловался.
+        ts = int(local_day_start_utc(day).timestamp())
         out, cursor, prev = [], 0, None
         for _ in range(200):          # защитный предел на число страниц
             data = self._get("/api/v3/orders",
@@ -218,16 +221,17 @@ class WbClient(PlatformClient):
         товару «актуализирован» по заказам, которых не видел.
         """
         from datetime import date as _date, datetime, timedelta, timezone
+        from app.timeutils import local_date_of, today_local
 
         self.last_truncated = False
 
         if isinstance(date_from, datetime):
-            start = date_from.date()
+            start = local_date_of(date_from)
         elif isinstance(date_from, _date):
             start = date_from
         else:
-            start = datetime.fromtimestamp(int(date_from), tz=timezone.utc).date()
-        today = datetime.now(timezone.utc).date()
+            start = local_date_of(datetime.fromtimestamp(int(date_from), tz=timezone.utc))
+        today = today_local()
 
         result, seen = [], set()
         day = start
@@ -256,7 +260,10 @@ class WbClient(PlatformClient):
                 created = o.get("createdAt")
                 if created:
                     try:
-                        order_date = datetime.fromisoformat(str(created).replace("Z", "+00:00")).date()
+                        # Дата перемещения в 1С — местная: у заказа, сделанного
+                        # до трёх часов ночи, UTC-шная оказывается вчерашней.
+                        order_date = local_date_of(
+                            datetime.fromisoformat(str(created).replace("Z", "+00:00")))
                     except ValueError:
                         order_date = None
                 result.append(PlatformOrder(

@@ -14,6 +14,9 @@ WB умеет приём баркода отключить), у Kit — variant_
 from app.models import Platform
 from app.workers.catalog_sync import load_platform_catalog
 from app.workers.platform_clients.base import CatalogItem
+from app.workers.platform_clients.kit import KitClient
+from app.workers.platform_clients.ozon import OzonClient
+from app.workers.platform_clients.wb import WbClient
 from tests.factories import make_account
 
 
@@ -78,3 +81,88 @@ def test_a_complete_load_stays_green(logged_in_client, web_db, monkeypatch):
     page = logged_in_client.post(f"/mapping/load-catalog/{account.id}").text
 
     assert "ОБОРВАНА" not in page
+
+
+# ------------------------------- и признак обязан поднимать КАЖДЫЙ клиент
+
+# Само поднятие `last_truncated` — обязанность клиента, и обязанность общая.
+#
+# У Ozon этой ветки не было вовсе: `get_catalog_items` крутил `range(50)` без
+# `else`, то есть упёршись в предел, отдавал огрызок как полный каталог. Всё,
+# что проверено выше, при этом не срабатывало: `stats["truncated"]` оставался
+# ложным, предупреждения не было ни в логе, ни на странице.
+#
+# Цена у Ozon вдобавок выше, чем у соседей. Остаток туда адресуется АРТИКУЛОМ из
+# каталога: позиция, не попавшая в огрызок, ключа отправки не получает, рассылка
+# закрывает её как «нет карточки», а отчёт относит к `unknown_sku` — «продавать
+# нечего, оверселла не будет». Для не выгруженной карточки это неправда: на
+# площадке она есть и продаётся.
+
+
+def test_ozon_says_the_catalogue_was_cut():
+    """Лента, которая не кончается: `last_id` сдвигается всегда."""
+    n = [0]
+
+    def fake_post(path, body=None, **kw):
+        if "product/list" in path:
+            n[0] += 1
+            return {"result": {"items": [{"product_id": n[0]}], "last_id": f"c{n[0]}"}}
+        return {"items": [{"id": n[0], "barcodes": [f"b{n[0]}"], "offer_id": "A"}]}
+
+    c = OzonClient(client_id="c", api_key="k")
+    c._post = fake_post
+
+    items = c.get_catalog_items()
+
+    assert c.last_truncated is True
+    assert items, "огрызок всё равно возвращаем — он лучше, чем ничего"
+
+
+def test_ozon_does_not_cry_wolf_on_a_complete_catalogue():
+    def fake_post(path, body=None, **kw):
+        if "product/list" in path:
+            return {"result": {"items": [{"product_id": 1}], "last_id": ""}}
+        return {"items": [{"id": 1, "barcodes": ["b1"], "offer_id": "A"}]}
+
+    c = OzonClient(client_id="c", api_key="k")
+    c._post = fake_post
+
+    c.get_catalog_items()
+
+    assert c.last_truncated is False
+
+
+def test_wb_says_the_catalogue_was_cut():
+    n = [0]
+
+    def fake(path, body=None, **kw):
+        n[0] += 1
+        return {"cards": [{"nmID": n[0], "sizes": [{"chrtID": n[0], "skus": [f"b{n[0]}"]}]}],
+                "cursor": {"updatedAt": f"2026-09-{n[0] % 28 + 1:02d}", "nmID": n[0]}}
+
+    c = WbClient(token="t", warehouse_id="wh")
+    c._post_content = fake
+
+    c.get_catalog_items()
+
+    assert c.last_truncated is True
+
+
+class _Headers:
+    """Сессия-пустышка: клиенту Kit нужен только `headers` при сборке."""
+    headers: dict = {}
+
+
+def test_kit_says_the_catalogue_was_cut():
+    n = [0]
+
+    def fake(path, params=None):
+        n[0] += 1
+        return {"variants": [{"id": n[0], "barcodes": [f"b{n[0]}"]}], "total_count": 10 ** 9}
+
+    c = KitClient(token="t", session=_Headers())
+    c._get = fake
+
+    c.get_catalog_items()
+
+    assert c.last_truncated is True

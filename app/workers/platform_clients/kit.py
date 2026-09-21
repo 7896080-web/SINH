@@ -185,8 +185,14 @@ class KitClient(PlatformClient):
         """FBS-заказы Kit с даты date_from. /v1/orders постранично; фильтруем
         по created_at на нашей стороне (в разобранном API нет параметра
         диапазона дат). order_date = дата заказа."""
-        from datetime import datetime as _dt, date as _date
-        threshold = date_from.date() if isinstance(date_from, _dt) else date_from
+        from datetime import datetime as _dt, timezone
+        from app.timeutils import local_date_of, local_day_start_utc
+        # Граница — МОМЕНТ начала местных суток, а не UTC-шное число. Дата,
+        # взятая из UTC-времени, у заказа первых трёх часов дня оказывается
+        # вчерашней, и такой заказ отсеивался как «раньше базовой даты»:
+        # продажа не проводилась, остаток оставался завышенным на неё.
+        threshold_day = local_date_of(date_from) if isinstance(date_from, _dt) else date_from
+        threshold = local_day_start_utc(threshold_day)
 
         result = []
         variant_barcode_cache: dict[str, str] = {}
@@ -194,14 +200,19 @@ class KitClient(PlatformClient):
         self.last_truncated = False
         self._failed_variants = set()
         for o in self._walk_orders():
-            order_date = None
+            order_date, created_at = None, None
             raw = o.get("created_at") or o.get("created")
             if raw:
                 try:
-                    order_date = _dt.fromisoformat(str(raw).replace("Z", "+00:00")).date()
+                    created_at = _dt.fromisoformat(str(raw).replace("Z", "+00:00"))
                 except ValueError:
-                    order_date = None
-            if order_date is not None and order_date < threshold:
+                    created_at = None
+                if created_at is not None:
+                    if created_at.tzinfo is None:
+                        created_at = created_at.replace(tzinfo=timezone.utc)
+                    # Местная дата: уезжает в 1С датой перемещения.
+                    order_date = local_date_of(created_at)
+            if created_at is not None and created_at < threshold:
                 continue
             for chunk in o.get("delivery_chunks", []):
                 for item in chunk.get("items", []):
