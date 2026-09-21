@@ -65,6 +65,9 @@ FTP_STUCK = timedelta(hours=1)
 STOCK_DATE_STUCK = timedelta(hours=3)
 # Аномалия, которой больше трёх суток, уже не «разберём на днях».
 ANOMALY_OLD = timedelta(days=3)
+# Копия базы снимается раз в сутки. Двое суток — одна пропущенная копия плюс
+# запас на перезапуск воркера; дальше это уже не «не сложилось».
+BACKUP_STALE = timedelta(days=2)
 
 
 @dataclass
@@ -732,6 +735,21 @@ def _check_negative_stock(db: Session) -> Finding | None:
     )
 
 
+def _q_reconciliation_review(db: Session) -> list[ReconciliationLog]:
+    """Крупные расхождения ЗА ПОСЛЕДНИЕ СУТКИ.
+
+    Окно здесь и срок кнопки «Закрыть старые расхождения» на «Диагностике»
+    намеренно не пересекаются: кнопка берёт то, что СТАРШЕ суток, находка — то,
+    что моложе. Поэтому кнопка эту находку не гасит и гасить не должна, а
+    оператор, нажавший её и не увидевший изменений, прав в своём недоумении —
+    об этом теперь сказано прямо в тексте находки.
+    """
+    return db.query(ReconciliationLog).filter(
+        ReconciliationLog.classification == ReconciliationClassification.needs_review,
+        ReconciliationLog.checked_at >= now_utc() - RECONCILIATION_WINDOW,
+    ).order_by(ReconciliationLog.checked_at.desc()).all()
+
+
 def _check_reconciliation_review(db: Session) -> Finding | None:
     """Крупные расхождения со складом 1С за последние сутки.
 
@@ -747,17 +765,11 @@ def _check_reconciliation_review(db: Session) -> Finding | None:
     расхождения, независимо от того, применены они или нет: остаток по ним уже
     переписан по 1С, а вот почему он разошёлся — вопрос к складу.
     """
-    since = now_utc() - RECONCILIATION_WINDOW
-    count = db.query(ReconciliationLog).filter(
-        ReconciliationLog.classification == ReconciliationClassification.needs_review,
-        ReconciliationLog.checked_at >= since,
-    ).count()
+    all_rows = _q_reconciliation_review(db)
+    count = len(all_rows)
     if not count:
         return None
-    rows = db.query(ReconciliationLog).filter(
-        ReconciliationLog.classification == ReconciliationClassification.needs_review,
-        ReconciliationLog.checked_at >= since,
-    ).order_by(ReconciliationLog.checked_at.desc()).limit(10).all()
+    rows = all_rows[:10]
     products = {p.uid_1c: p for p in db.query(Product).filter(
         Product.uid_1c.in_({r.uid_1c for r in rows})).all()} if rows else {}
 
@@ -776,9 +788,62 @@ def _check_reconciliation_review(db: Session) -> Finding | None:
         consequence="Наш остаток разошёлся с 1С сильнее порога. Сверка уже "
                     "переписала его по 1С — то есть наружу уходит число из 1С, — "
                     "но сама разница означает пересортицу или ошибку учёта на "
-                    "складе, и её стоит разобрать там.",
-        count=count, link="/diagnostics#reconciliation",
+                    "складе, и разбирать её надо В 1С. Кнопка «Закрыть старые "
+                    "расхождения» на «Диагностике» этих строк НЕ касается: она "
+                    "закрывает то, что старше суток, а здесь — за последние сутки.",
+        count=count, link="/report/rows/reconciliation_review",
         details=[line(r) for r in rows],
+    )
+
+
+def _check_backup_missing(db: Session) -> Finding | None:
+    """Свежей копии базы нет.
+
+    Единственная находка отчёта, которая говорит не о том, что уже разошлось, а
+    о том, чем кончится СЛЕДУЮЩАЯ неприятность. Аудит 21.09: боевую базу не
+    копировал никто, а в ней лежит всё, что не восстанавливается ниоткуда —
+    соответствие баркодов товарам (собиралось руками), история проведённых
+    заказов, задания 1С с ответами. Ни 1С, ни площадки этого не знают.
+
+    Порог — двое суток при суточном расписании: одна пропущенная копия может
+    быть перезапуском воркера, две подряд означают, что механизм встал.
+
+    База не SQLite — находки нет вовсе: у PostgreSQL свой механизм, и делать
+    вид, что мы прикрыли и его, опаснее, чем молчать.
+    """
+    from app.backup import database_path, last_backup
+
+    if database_path() is None:
+        return None
+
+    # Задание бэкапа ещё ни разу не отрабатывало — значит это свежая установка
+    # или воркер только что поднялся. Ругаться тут нельзя: «отработало ли
+    # задание» — вопрос `/health`, а не отчёта, и там он задан
+    # (`REQUIRED_WORKERS["backup"]`). Молчание отчёта на исправной системе —
+    # обязательное свойство: ругать установку за то, что она свежая, верный
+    # способ приучить оператора пролистывать отчёт.
+    beat = db.query(WorkerHeartbeat).filter(
+        WorkerHeartbeat.worker_name == "backup").first()
+    if beat is None:
+        return None
+
+    moment, total = last_backup()
+    if moment is not None and now_utc() - moment < BACKUP_STALE:
+        return None
+
+    if moment is None:
+        title = "Резервной копии базы нет ни одной"
+        level = CRITICAL
+    else:
+        title = f"Последней копии базы {_age(moment)} (копий всего {total})"
+        level = CRITICAL if now_utc() - moment > BACKUP_STALE * 3 else WARNING
+    return Finding(
+        key="backup_missing", level=level, title=title,
+        consequence="В базе лежит то, чего нет больше нигде: мэппинг баркодов, "
+                    "история проведённых заказов, задания 1С. Потеря файла — это "
+                    "не «откатимся на вчера», а ручная настройка каталога заново. "
+                    "Копия снимается на живой базе, останавливать ничего не нужно.",
+        count=1, link="/diagnostics#workers",
     )
 
 
@@ -816,6 +881,7 @@ CHECKS = (
     _check_mapping_conflicts,
     _check_negative_stock,
     _check_reconciliation_review,
+    _check_backup_missing,
     _check_worker_failures,
 )
 
@@ -907,6 +973,23 @@ def _rows_broadcast_without_recalc(db: Session) -> list[list[str]]:
             for p in _q_broadcast_without_recalc(db)]
 
 
+def _rows_reconciliation_review(db: Session) -> list[list[str]]:
+    rows = _q_reconciliation_review(db)
+    products = {p.uid_1c: p for p in db.query(Product).filter(
+        Product.uid_1c.in_({r.uid_1c for r in rows})).all()} if rows else {}
+    out = []
+    for r in rows:
+        p = products.get(r.uid_1c)
+        out.append([
+            (p.article if p else "") or r.uid_1c,
+            (p.size if p else "") or "", (p.color if p else "") or "",
+            (p.name if p else "") or "",
+            r.checked_at.strftime("%d.%m.%Y %H:%M") if r.checked_at else "",
+            str(r.python_stock), str(r.actual_1c), f"{r.delta:+d}",
+        ])
+    return out
+
+
 def _rows_negative_stock(db: Session) -> list[list[str]]:
     return [[p.article or p.uid_1c, p.size or "", p.color or "", p.name or "",
              str(p.stock_on_hand or 0)]
@@ -929,4 +1012,8 @@ FULL_LISTS = {
                                  _rows_broadcast_without_recalc),
     "negative_stock": ("Товары с отрицательным остатком", PRODUCT_COLUMNS,
                        _rows_negative_stock),
+    "reconciliation_review": ("Крупные расхождения со складом 1С за сутки",
+                              ["Артикул", "Размер", "Цвет", "Наименование",
+                               "Когда сверяли", "Было у нас", "Стало по 1С",
+                               "Разница"], _rows_reconciliation_review),
 }

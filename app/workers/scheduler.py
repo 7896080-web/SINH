@@ -8,6 +8,8 @@ from app.timeutils import now_utc
 from apscheduler.schedulers.blocking import BlockingScheduler
 
 from app.database import SessionLocal
+from app.backup import last_backup, make_backup
+from app.retention import apply_retention
 from app.report import CRITICAL, collect_findings, summary_line
 from app.workers.verify_stock import verify_all
 from app.models import Platform, PlatformAccount, WorkerHeartbeat
@@ -453,6 +455,12 @@ CATALOG_POLL_JOB_PREFIX = "catalog_poll_account_"
 # (его сделали руками со страницы «Мэппинг»). Поэтому явно просим первый запуск
 # вскоре после старта, а не через сутки.
 CATALOG_POLL_INTERVAL_HOURS = 24
+# Сколько задание имеет право опоздать и всё-таки выполниться. Умолчание
+# APScheduler — ОДНА СЕКУНДА, и это означает «занят в момент запуска — значит
+# не выполнять». Пять минут покрывают любую разумную занятость воркера,
+# включая длинную транзакцию сверки и накат.
+MISFIRE_GRACE_SECONDS = 300
+
 CATALOG_POLL_FIRST_RUN_DELAY = timedelta(minutes=2)
 # Раз задание теперь запускается после каждого старта, а стартов за сутки бывает
 # много, саму выгрузку пропускаем, если она недавно уже отработала успешно.
@@ -583,13 +591,106 @@ def job_discrepancy_report():
         db.close()
 
 
+# Бэкап базы. Раз в сутки, первый прогон — вскоре после старта: суточное
+# задание на `interval` до своего первого запуска не доживает (процесс
+# перезапускается чаще раза в сутки, см. историю с выгрузкой каталога).
+BACKUP_INTERVAL_HOURS = 24
+BACKUP_FIRST_RUN_DELAY = timedelta(minutes=5)
+# Не снимать копию, если свежая уже есть. Иначе цепочка перезапусков воркера
+# наделала бы копий на каждый старт и вытеснила бы ими всю историю.
+BACKUP_MIN_GAP = timedelta(hours=20)
+
+
+def job_backup():
+    """Резервная копия базы — единственное, что отделяет от невосстановимой
+    потери мэппинга и истории проведения.
+
+    Копия снимается на живой базе штатным механизмом SQLite и сразу
+    проверяется (см. `app/backup.py`). Пропуск при свежей копии — тоже успех:
+    инвариант «свежая копия есть» выполнен, и heartbeat об этом и говорит.
+    Молчать в журнале нельзя ни в одном из случаев: бэкап, о котором ничего не
+    написано, неотличим от бэкапа, которого не было.
+    """
+    db = SessionLocal()
+    try:
+        moment, total = last_backup()
+        if moment is not None and now_utc() - moment < BACKUP_MIN_GAP:
+            logger.info("бэкап: свежая копия уже есть (%s), пропуск; всего копий %d",
+                        moment.strftime("%d.%m.%Y %H:%M"), total)
+            _heartbeat(db, "backup", True)
+            return
+
+        result = make_backup()
+        if result.ok:
+            logger.info("бэкап: %s, %.1f МБ, удалено старых %d",
+                        result.path, result.size_bytes / 1024 / 1024, result.removed)
+            _heartbeat(db, "backup", True)
+        else:
+            # WARNING, а не INFO: неснятая копия — это риск потерять всё, и в
+            # журнале она обязана отличаться от обычного прогона.
+            logger.warning("бэкап НЕ СНЯТ: %s", result.error)
+            _heartbeat(db, "backup", False, result.error)
+    except Exception as e:
+        logger.exception("backup failed")
+        _heartbeat(db, "backup", False, str(e))
+    finally:
+        db.close()
+
+
+# Чистка истории по срокам хранения. Раз в сутки и с тем же «первым прогоном
+# вскоре после старта», что и бэкап: суточное задание на `interval` до своего
+# первого запуска не доживает.
+RETENTION_INTERVAL_HOURS = 24
+RETENTION_FIRST_RUN_DELAY = timedelta(minutes=9)
+
+
+def job_retention():
+    """Удалить историю, вышедшую за срок хранения (`app/retention.py`).
+
+    Девять минут после старта, а не пять: бэкап идёт первым намеренно. Если
+    чистка когда-нибудь удалит лишнее, копия, снятая ДО неё, окажется тем
+    единственным, что это исправит.
+    """
+    db = SessionLocal()
+    try:
+        stats = apply_retention(db)
+        total = sum(stats.values())
+        if total:
+            logger.info("хранение: удалено %d строк (%s)", total,
+                        ", ".join(f"{k}={v}" for k, v in stats.items() if v))
+        else:
+            # Пишем и когда чистить нечего: молчание обязано означать «задание не
+            # отработало», а не «всё в пределах сроков».
+            logger.info("хранение: удалять нечего")
+        _heartbeat(db, "retention", True)
+    except Exception as e:
+        logger.exception("retention failed")
+        _heartbeat(db, "retention", False, str(e))
+    finally:
+        db.close()
+
+
 def build_scheduler() -> BlockingScheduler:
     """Статические задания навешиваются один раз, per-account задания —
     через reconcile_account_jobs() (первый прогон при старте плюс
     периодический каждые 5 минут). Новый активный кабинет из админки
     подхватывается автоматически в пределах этого интервала — перезапуск
     процесса больше не требуется."""
-    sched = BlockingScheduler(timezone="UTC")
+    # `job_defaults` обязателен, и вот почему. По умолчанию APScheduler даёт
+    # заданию `misfire_grace_time = 1` СЕКУНДУ: если момент запуска прошёл
+    # больше секунды назад (воркер был занят, машина притормозила, база держала
+    # блокировку), задание не выполняется вовсе — оно помечается пропущенным.
+    # Для рассылки раз в 45 секунд это безобидно, следующий цикл всё доделает.
+    # Но тем же правилом живут ЧАСОВОЙ запрос выгрузки остатков у 1С и СУТОЧНЫЙ
+    # запрос справочника баркодов: там пропуск означает час и сутки без данных
+    # соответственно — молча, и узнаёшь об этом по последствиям.
+    # `coalesce` не даёт накопившимся пропускам выполниться пачкой: нам нужен
+    # один прогон, а не пять подряд.
+    sched = BlockingScheduler(
+        timezone="UTC",
+        job_defaults={"misfire_grace_time": MISFIRE_GRACE_SECONDS,
+                      "coalesce": True, "max_instances": 1},
+    )
 
     # Отметка старта: по ней /health понимает, сколько планировщик работает, и не
     # объявляет пропавшим воркер, который просто ещё не отработал первый раз.
@@ -653,6 +754,11 @@ def build_scheduler() -> BlockingScheduler:
         reconcile_account_jobs(sched, db)
     finally:
         db.close()
+    sched.add_job(job_backup, "interval", hours=BACKUP_INTERVAL_HOURS, id="backup",
+                  max_instances=1, next_run_time=start + BACKUP_FIRST_RUN_DELAY)
+    sched.add_job(job_retention, "interval", hours=RETENTION_INTERVAL_HOURS,
+                  id="retention", max_instances=1,
+                  next_run_time=start + RETENTION_FIRST_RUN_DELAY)
     sched.add_job(job_reconcile_accounts, "interval", minutes=5, args=[sched],
                   id="reconcile_accounts", max_instances=1)
 

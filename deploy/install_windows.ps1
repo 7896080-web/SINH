@@ -190,6 +190,11 @@ if ($nssm) {
         & nssm set $name AppStderr (Join-Path $logDir "$name.err.log") | Out-Null
         & nssm set $name Start SERVICE_AUTO_START | Out-Null
         & nssm set $name AppExit Default Restart | Out-Null
+        # Ротация логов. Без неё worker.err.log растёт, пока есть диск, и
+        # однажды его нельзя ни открыть, ни найти в нём строку.
+        & nssm set $name AppRotateFiles 1 | Out-Null
+        & nssm set $name AppRotateOnline 1 | Out-Null
+        & nssm set $name AppRotateBytes 10485760 | Out-Null
     }
 
     Set-NssmService "sync_admin_web"    "-m uvicorn app.main:app --host 127.0.0.1 --port $WebPort"

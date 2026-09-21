@@ -183,6 +183,10 @@ def import_barcode_dict(db: Session, rows: list[dict], full: bool = False) -> di
 # весь ассортимент из-за обрезанного или подсунутого вручную файла.
 MIN_SNAPSHOT_COVERAGE = 0.5
 
+# По сколько товаров коммитить сверку. Двести — компромисс: блокировка держится
+# доли секунды, а накладные расходы на коммит не становятся заметными.
+RECONCILE_COMMIT_EVERY = 200
+
 
 def run_reconciliation(db: Session, stock_from_1c: dict[str, int],
                        missing_means_zero: bool = False,
@@ -235,7 +239,18 @@ def run_reconciliation(db: Session, stock_from_1c: dict[str, int],
                 uid_to_actual[uid] = 0
             stats["zeroed_missing"] = len(missing)
 
-    for uid_1c, actual_1c in uid_to_actual.items():
+    for processed, (uid_1c, actual_1c) in enumerate(uid_to_actual.items(), start=1):
+        # Коммит ПОРЦИЯМИ, а не один в конце. Раньше вся выгрузка — около
+        # полутора тысяч товаров — шла одной транзакцией, и всё это время писать
+        # в базу не мог никто: ни рассылка (цикл раз в 45 секунд), ни приём
+        # заказов, ни оператор в браузере. `busy_timeout` — тридцать секунд, за
+        # ним `database is locked`, а этот случай нигде не перехватывается.
+        # Атомарность тут не нужна и не нужна была: каждая строка независима, а
+        # недосчитанная порция досчитается в следующий час — сверка идемпотентна
+        # по построению, она сравнивает текущее состояние со снимком.
+        if processed % RECONCILE_COMMIT_EVERY == 1 and processed > 1:
+            db.commit()
+
         product = db.query(Product).filter(Product.uid_1c == uid_1c).first()
         if product is None:
             continue
