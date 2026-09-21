@@ -18,11 +18,29 @@ from datetime import datetime, timedelta
 from app.models import (
     AnomalyReason, Barcode, DispatchQueueItem, DispatchStatus, FtpTask,
     FtpTaskStatus, Platform, PlatformAccount, PlatformCatalogItem, Product,
-    SyncAnomaly, WorkerHeartbeat,
+    SyncAnomaly, SyncSetting, WorkerHeartbeat,
 )
 from app.report import CRITICAL, WARNING, collect_findings, summary_line
 from app.timeutils import now_utc
 from tests.factories import make_account
+
+
+def _tick_all(db):
+    """Отметить кабинет у всех пар, попавших в очередь.
+
+    Находка «рассылка не доехала» — про пару, на которую мы ВОЗИМ. По
+    неотмеченному кабинету, куда ни разу не отправляли непустой остаток, отказ
+    расхождением не считается (`report._only_live_pairs`): площадка держит наше
+    число, только если мы его туда посылали. Без этой отметки тест проверял бы
+    сценарий, которого в его собственном описании нет.
+    """
+    db.flush()
+    have = {(s.uid_1c, s.account_id) for s in db.query(SyncSetting).all()}
+    for uid, account_id in {(r.uid_1c, r.account_id)
+                            for r in db.query(DispatchQueueItem).all()}:
+        if (uid, account_id) not in have:
+            db.add(SyncSetting(uid_1c=uid, account_id=account_id, enabled=True))
+    db.commit()
 
 
 def _keys(findings) -> set[str]:
@@ -63,6 +81,7 @@ def test_dispatch_errors_are_critical_and_name_the_consequence(db):
                              last_error="429 после пяти попыток"))
     db.commit()
 
+    _tick_all(db)
     finding = _by_key(collect_findings(db), "dispatch_errors")
 
     assert finding is not None
@@ -329,6 +348,7 @@ def test_critical_findings_come_first(db):
                              reason="order", status=DispatchStatus.error))
     db.commit()
 
+    _tick_all(db)
     findings = collect_findings(db)
 
     assert findings[0].level == CRITICAL
@@ -341,6 +361,7 @@ def test_the_log_line_is_readable_without_opening_the_page(db):
                              reason="order", status=DispatchStatus.error))
     db.commit()
 
+    _tick_all(db)
     line = summary_line(collect_findings(db))
 
     assert "критичных" in line and "dispatch_errors=1" in line
@@ -382,6 +403,9 @@ def test_the_report_page_shows_a_finding_with_its_consequence(logged_in_client, 
     web_db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
     web_db.add(DispatchQueueItem(uid_1c="u1", account_id=account.id, quantity=5,
                                  reason="order", status=DispatchStatus.error))
+    # Кабинет отмечен: находка «рассылка не доехала» — про пару, на которую мы
+    # возим (см. `_tick_all` выше и `report._only_live_pairs`).
+    web_db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
     web_db.commit()
 
     r = logged_in_client.get("/report")
@@ -459,6 +483,7 @@ def test_a_missing_card_is_not_called_a_broken_dispatch(db):
         last_error="нет карточки в каталоге кабинета — остаток отправить не по чему, сначала мэппинг"))
     db.commit()
 
+    _tick_all(db)
     findings = {f.key for f in collect_findings(db)}
 
     assert "unknown_sku" in findings
@@ -520,6 +545,7 @@ def test_a_send_to_another_cabinet_does_not_cover_the_error(db):
         status=DispatchStatus.sent, sent_at=now_utc(), created_at=now_utc()))
     db.commit()
 
+    _tick_all(db)
     assert "dispatch_errors" in {f.key for f in collect_findings(db)}
 
 
@@ -545,6 +571,7 @@ def test_an_error_superseded_by_a_newer_error_is_not_reported_twice(db):
         created_at=now_utc() - timedelta(minutes=5)))
     db.commit()
 
+    _tick_all(db)
     findings = {f.key: f for f in collect_findings(db)}
 
     assert "dispatch_errors" not in findings, "старый отказ описывает прошлое пары"
@@ -564,6 +591,7 @@ def test_the_newest_error_of_a_pair_is_always_reported(db):
             created_at=moment))
     db.commit()
 
+    _tick_all(db)
     finding = {f.key: f for f in collect_findings(db)}.get("dispatch_errors")
 
     assert finding is not None and finding.count == 1
@@ -775,6 +803,7 @@ def test_a_missing_card_finding_names_the_article_and_the_cabinet(db):
         last_error="нет карточки в каталоге кабинета — остаток отправить не по чему"))
     db.commit()
 
+    _tick_all(db)
     finding = _by_key(collect_findings(db), "unknown_sku")
 
     assert "TC26-2735" in finding.details[0]
@@ -800,6 +829,7 @@ def test_a_dispatch_error_finding_names_the_article_and_the_reason(db):
         last_error="не отправлено за 5 попыток: 500 склад недоступен"))
     db.commit()
 
+    _tick_all(db)
     finding = _by_key(collect_findings(db), "dispatch_errors")
 
     assert "D86321" in finding.details[0]
@@ -815,6 +845,7 @@ def test_a_product_missing_from_the_catalogue_still_gets_a_line(db):
         status=DispatchStatus.error, last_error="не отправлено за 5 попыток: 500"))
     db.commit()
 
+    _tick_all(db)
     finding = _by_key(collect_findings(db), "dispatch_errors")
 
     assert finding.details and "u-нет" in finding.details[0]
@@ -831,6 +862,7 @@ def test_the_sent_key_is_shown_when_it_is_known(db):
         last_error="площадка не знает этот sku на складе 1923790 (409 NotFound)"))
     db.commit()
 
+    _tick_all(db)
     finding = _by_key(collect_findings(db), "unknown_sku")
 
     assert "2000932279695" in finding.details[0]

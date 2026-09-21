@@ -84,6 +84,32 @@ def database_path(database_url: str | None = None) -> Path | None:
     return Path(tail)
 
 
+def _collapse_journal(path: Path) -> None:
+    """Свести копию к одному файлу: журнал внутрь, спутники убрать.
+
+    Ошибку глотаем намеренно и с последствиями: копия уже снята и целостна,
+    а спутники — вопрос опрятности. Уронить из-за них снятый бэкап значило бы
+    потерять важное ради второстепенного. Если спутники всё же остались, их
+    уберёт `prune` вместе с самой копией.
+    """
+    try:
+        con = sqlite3.connect(path)
+        try:
+            con.execute("PRAGMA journal_mode=DELETE")
+            con.commit()
+        finally:
+            con.close()
+    except Exception as e:
+        logger.warning("бэкап: журнал копии не свёрнут (%s): %s", path, e)
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(str(path) + suffix)
+        if sidecar.exists():
+            try:
+                sidecar.unlink()
+            except OSError:
+                pass
+
+
 def _verify(path: Path) -> str:
     """Проверка копии. Пустая строка — всё в порядке, иначе причина.
 
@@ -151,6 +177,16 @@ def prune(directory: Path, keep_daily: int = KEEP_DAILY,
                 removed += 1
             except OSError as e:
                 logger.warning("бэкап: не удалось удалить %s: %s", path, e)
+                continue
+            # Спутники WAL, если вдруг остались от старых копий: сами по себе
+            # они под шаблон имени не подходят и иначе лежали бы вечно.
+            for suffix in ("-wal", "-shm"):
+                sidecar = Path(str(path) + suffix)
+                if sidecar.exists():
+                    try:
+                        sidecar.unlink()
+                    except OSError:
+                        pass
     return removed
 
 
@@ -189,6 +225,15 @@ def make_backup(database_url: str | None = None,
     except Exception as e:
         return BackupResult(path=str(target), size_bytes=0, checked=False,
                             error=f"копирование не удалось: {type(e).__name__}: {e}")
+
+    # Копия обязана быть ОДНИМ файлом. `backup()` переносит и режим журнала, то
+    # есть копия тоже оказывается в WAL, и рядом с ней появляются `-wal` и
+    # `-shm`. 21.09 на бою так и вышло: три файла вместо одного. Беда не в
+    # красоте — уборка старых копий ищет `sync_admin-*.db` и спутников не видит,
+    # они копились бы вечно; а копия, которую унесли без спутников, у читателя
+    # вызвала бы вопросы на ровном месте. `journal_mode=DELETE` дописывает
+    # журнал в сам файл и спутников удаляет.
+    _collapse_journal(target)
 
     problem = _verify(target)
     size = target.stat().st_size if target.exists() else 0

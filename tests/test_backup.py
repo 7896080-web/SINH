@@ -205,3 +205,52 @@ def test_no_backups_means_none_not_zero(tmp_path):
 
     assert moment is None
     assert total == 0
+
+
+# ------------------------------------------- копия — ОДИН файл, а не три
+
+def test_the_copy_is_a_single_file(tmp_path, source_db):
+    """21.09 на бою рядом с копией легли `-wal` и `-shm`: `backup()` переносит
+    и режим журнала, так что копия тоже оказывается в WAL.
+
+    Беда не в опрятности. Уборка старых копий ищет `sync_admin-*.db` и
+    спутников не видит — они копились бы вечно. А копия, унесённая без
+    спутников, у читателя вызвала бы вопросы на ровном месте.
+    """
+    result = backup.make_backup(_url(source_db), tmp_path / "b")
+
+    assert result.ok
+    assert not Path(result.path + "-wal").exists()
+    assert not Path(result.path + "-shm").exists()
+
+
+def test_the_single_file_copy_still_opens(tmp_path, source_db):
+    """Свернув журнал, легко испортить сам файл. Проверяем, что он читается."""
+    result = backup.make_backup(_url(source_db), tmp_path / "b")
+
+    con = sqlite3.connect(result.path)
+    try:
+        assert con.execute("SELECT COUNT(*) FROM products").fetchone()[0] == 50
+    finally:
+        con.close()
+
+
+def test_stray_sidecars_are_pruned_with_their_copy(tmp_path):
+    """Спутники от копий, снятых до этой правки, сами под шаблон имени не
+    подходят и иначе лежали бы вечно.
+
+    Файлов заводим на четыре месяца: недельные слоты должны заполниться, иначе
+    старая копия останется по правилу хранения — и проверка ничего не проверит.
+    """
+    for day in range(120):
+        path = _fake(tmp_path, day)
+        if day == 119:
+            doomed = path
+    (tmp_path / (doomed.name + "-wal")).write_bytes(b"")
+    (tmp_path / (doomed.name + "-shm")).write_bytes(b"x")
+
+    backup.prune(tmp_path)
+
+    assert not doomed.exists(), "копия должна была уйти по сроку"
+    assert not (tmp_path / (doomed.name + "-wal")).exists()
+    assert not (tmp_path / (doomed.name + "-shm")).exists()

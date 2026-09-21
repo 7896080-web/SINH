@@ -41,6 +41,24 @@ class _Resp:
             raise requests.HTTPError(f"{self.status_code} Client Error", response=self)
 
 
+def _tick_all(db):
+    """Отметить кабинет у всех пар, попавших в очередь.
+
+    Находка «рассылка не доехала» — про пару, на которую мы ВОЗИМ. По
+    неотмеченному кабинету, куда ни разу не отправляли непустой остаток, отказ
+    расхождением не считается (`report._only_live_pairs`): площадка держит наше
+    число, только если мы его туда посылали. Без этой отметки тест проверял бы
+    сценарий, которого в его собственном описании нет.
+    """
+    db.flush()
+    have = {(s.uid_1c, s.account_id) for s in db.query(SyncSetting).all()}
+    for uid, account_id in {(r.uid_1c, r.account_id)
+                            for r in db.query(DispatchQueueItem).all()}:
+        if (uid, account_id) not in have:
+            db.add(SyncSetting(uid_1c=uid, account_id=account_id, enabled=True))
+    db.commit()
+
+
 def _not_found(skus):
     return _Resp(409, text="конфликт", payload=[{
         "data": [{"sku": s, "chrtId": 0, "amount": 0} for s in skus],
@@ -169,6 +187,7 @@ def test_the_report_tells_an_unknown_sku_apart_from_a_broken_dispatch(db):
         last_error="площадка не знает этот sku на складе 1923790 (409 NotFound)"))
     db.commit()
 
+    _tick_all(db)
     findings = {f.key: f for f in collect_findings(db)}
 
     assert "unknown_sku" in findings
@@ -187,6 +206,7 @@ def test_a_dispatch_error_without_any_text_is_still_shown(db):
                              reason="order", status=DispatchStatus.error))
     db.commit()
 
+    _tick_all(db)
     assert "dispatch_errors" in {f.key for f in collect_findings(db)}
 
 
