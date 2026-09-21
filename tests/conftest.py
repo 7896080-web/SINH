@@ -125,3 +125,18 @@ def logged_in_client(client, web_db):
     web_db.commit()
     client.post("/login", data={"username": "admin", "password": "secret123"})
     return client
+
+
+@pytest.fixture(autouse=True)
+def _fresh_orders_cache():
+    """Лента заказов кэшируется в модуле `recalc` (одна выкачка на кабинет
+    вместо одной на товар). Кэш живёт пять минут и переживает границу теста,
+    поэтому без сброса второй тест видел бы заказы первого — и падал бы в
+    совершенно неожиданном месте. На бою кэш сбрасывает `create_job`: новое
+    задание — новая картина.
+    """
+    from app.recalc import clear_orders_cache
+
+    clear_orders_cache()
+    yield
+    clear_orders_cache()

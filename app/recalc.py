@@ -29,7 +29,7 @@ API площадок. Браузер столько не ждёт, а перез
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import date, datetime, timedelta
 
 from sqlalchemy.orm import Session
 
@@ -56,6 +56,9 @@ def create_job(db: Session, products: list[Product], username: str) -> RecalcJob
     задание стоит в очереди (пришла сверка, оператор поправил строку), и тогда
     обработалось бы не то, что человек видел на экране, когда нажимал кнопку.
     """
+    # Новое задание — новая картина: начинать его с лент, скачанных полчаса
+    # назад для прошлого расчёта, нельзя.
+    clear_orders_cache()
     job = RecalcJob(created_by=username, total=len(products))
     db.add(job)
     db.flush()                       # нужен job.id; autoflush в приложении выключен
@@ -86,6 +89,51 @@ def _enabled_accounts(db: Session, uid_1c: str) -> list[PlatformAccount]:
     return db.query(PlatformAccount).filter(
         PlatformAccount.id.in_(ids), PlatformAccount.is_active.is_(True),
     ).order_by(PlatformAccount.id).all()
+
+
+# Лента заказов кабинета — одна и та же для ВСЕХ товаров одного расчёта, а
+# скачивалась она на каждый товар заново. Расчёт по тысяче позиций при пяти
+# отмеченных кабинетах — это пять тысяч полных выкачек ленты, и каждая у WB идёт
+# окнами по 29 дней с листанием по курсору, то есть десятки запросов. Отсюда и
+# «расчёт идёт минутами», и упор в лимиты площадок — тот самый, из-за которого у
+# Kit терялись строки заказов (`last_unresolved`).
+#
+# Живёт кэш недолго и намеренно: расчёт больших пачек растягивается на десятки
+# тиков, и вечная лента означала бы, что заказы, пришедшие за это время, расчёт
+# не увидит, а отметку «актуализирован» поставит — ровно тот дефект, от которого
+# защищают `last_truncated` и `last_unresolved`. Пять минут: за это время
+# проходит несколько тиков, а незамеченный заказ всё равно проведёт живой опрос,
+# он идёт каждые сорок пять секунд по тем же отмеченным кабинетам.
+ORDERS_CACHE_TTL = timedelta(minutes=5)
+
+# (account_id, since) -> (когда взяли, заказы, last_unresolved, last_truncated)
+_orders_cache: dict[tuple[int, date], tuple[datetime, list, int, bool]] = {}
+
+
+def clear_orders_cache() -> None:
+    """Забыть скачанные ленты. Зовётся при создании задания: новый расчёт —
+    новая картина, и начинать его с чужого получаса нельзя."""
+    _orders_cache.clear()
+
+
+def _orders_for_account(client, account_id: int, since: date):
+    """Лента кабинета с даты: своя на прогон, а не на каждый товар.
+
+    Возвращает (заказы, last_unresolved, last_truncated) — признаки неполноты
+    кэшируются ВМЕСТЕ с лентой. Иначе второй товар получил бы ленту без них и
+    отметку «актуализирован» по картине, которую первый товар справедливо счёл
+    неполной.
+    """
+    key = (account_id, since)
+    hit = _orders_cache.get(key)
+    if hit is not None and now_utc() - hit[0] <= ORDERS_CACHE_TTL:
+        return hit[1], hit[2], hit[3]
+
+    orders = client.get_orders_since(since)
+    lost = getattr(client, "last_unresolved", 0) or 0
+    truncated = bool(getattr(client, "last_truncated", False))
+    _orders_cache[key] = (now_utc(), orders, lost, truncated)
+    return orders, lost, truncated
 
 
 def collect_orders(db: Session, product: Product, since: date,
@@ -148,7 +196,7 @@ def collect_orders(db: Session, product: Product, since: date,
             problems.append(f"{account.name}: {type(e).__name__}: {e}")
             continue
         try:
-            orders = client.get_orders_since(since)
+            orders, lost, truncated = _orders_for_account(client, account.id, since)
         except Exception as e:
             problems.append(f"{account.name}: {type(e).__name__}: {e}")
             continue
@@ -160,7 +208,6 @@ def collect_orders(db: Session, product: Product, since: date,
         # обязан дойти сюда: иначе товар получит «актуализирован» по заказам,
         # которых расчёт не видел, и оператор включит трансляцию завышенного
         # остатка.
-        lost = getattr(client, "last_unresolved", 0) or 0
         if lost:
             problems.append(
                 f"{account.name}: не удалось получить баркод по {lost} строкам заказов "
@@ -171,7 +218,7 @@ def collect_orders(db: Session, product: Product, since: date,
         # в защитный предел страниц. 18.09 на бою похожая тишина стоила 253
         # непроведённых заказа по одному кабинету: расчёт отчитался «проведено 0,
         # проблем нет» и поставил товару «актуализирован».
-        if getattr(client, "last_truncated", False):
+        if truncated:
             problems.append(
                 f"{account.name}: лента заказов оборвалась на защитном пределе — "
                 f"картина неполная, часть продаж не увидена")
