@@ -33,6 +33,13 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host "[*] Миграции базы..." -ForegroundColor Cyan
 & $py -m alembic upgrade head
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "[X] Миграция НЕ прошла. Службы не перезапускались — бой работает" -ForegroundColor Red
+    Write-Host "    на старом коде, схема осталась прежней или наполовину новой." -ForegroundColor Red
+    Write-Host "    Копия базы снята шагом выше: C:\sync_admin\backups." -ForegroundColor Red
+    Write-Host "    Посмотрите, до какой ревизии дошли:  .\.venv\Scripts\python.exe -m alembic current" -ForegroundColor Red
+    exit 1
+}
 
 Write-Host "[*] Тесты..." -ForegroundColor Cyan
 & $py -m pytest -q
