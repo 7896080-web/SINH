@@ -35,7 +35,7 @@ from sqlalchemy.orm import Session
 
 from app.models import (Barcode, PlatformAccount, ProcessedOrder, Product, RecalcItem,
                         RecalcJob, RecalcStatus, SyncSetting)
-from app.timeutils import now_utc
+from app.timeutils import now_utc, today_local
 from app.broadcast_gate import apply_pending_broadcast
 from app.transmit import covered_accounts, enqueue_full_resend
 from app.workers.credentials import CredentialsMissing
@@ -195,6 +195,26 @@ def collect_orders(db: Session, product: Product, since: date,
             # трансляцию — вставал весь переход.
             problems.append(f"{account.name}: {type(e).__name__}: {e}")
             continue
+        # Дата расчёта старше, чем лента площадки вообще помнит. Запрос при этом
+        # НЕ падает и не жалуется — он честно отвечает пустотой, и без этой
+        # проверки расчёт рапортует «проведено 0, проблем нет» и ставит товару
+        # «актуализирован», открывая трансляцию полного остатка по продажам,
+        # которых никто не видел. Это ровно исход инцидента 18.09, только
+        # причина другая: там лента молчала из-за окна, здесь — из-за возраста.
+        #
+        # Поле есть только у клиентов, где предел ПОДТВЕРЖДЁН (у WB — спекой и
+        # замером). Нет поля — нет и проверки: выдумывать предел за площадку
+        # значило бы поставить ложную проблему и не дать включить трансляцию
+        # там, где всё в порядке.
+        horizon = getattr(client, "orders_history_days", None)
+        if horizon and (today_local() - since).days > horizon:
+            problems.append(
+                f"{account.name}: дата расчёта {since.isoformat()} старше {horizon} "
+                f"суток — лента заказов площадки столько не хранит и ответит "
+                f"пустотой. Возьмите дату поближе, иначе продажи за период "
+                f"останутся непроведёнными, а остаток — завышенным")
+            continue
+
         try:
             orders, lost, truncated = _orders_for_account(client, account.id, since)
         except Exception as e:
