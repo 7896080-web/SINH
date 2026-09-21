@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Request, Depends, Query, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.orm import Session, joinedload
-from sqlalchemy import or_
+from sqlalchemy import and_, or_
 
 from app.database import get_db
 from app.templating import templates as shared_templates
@@ -53,7 +53,30 @@ def _count_mapped(db: Session, q: str, source_platform: str) -> int:
         .enable_eagerloads(False).count()
 
 
-def _query_conflicts(db: Session, q: str, account_id: str):
+def _count_conflicts(db: Session, q: str, account_id: str) -> int:
+    """Сколько конфликтов под отбором ВСЕГО. Отдельным запросом, а не длиной
+    показанного списка: страница показывает первые `PAGE_LIMIT`, и «300» вместо
+    «300 из 2412» читается как «столько их и есть». Каждая строка здесь —
+    случившаяся непроведённая продажа, и знать их число оператору важнее, чем
+    видеть первые триста."""
+    query = db.query(MappingConflict.id)
+    if q:
+        like = f"%{q.strip()}%"
+        query = query.outerjoin(
+            PlatformCatalogItem,
+            and_(PlatformCatalogItem.barcode == MappingConflict.barcode,
+                 PlatformCatalogItem.account_id == MappingConflict.account_id),
+        ).filter(or_(
+            MappingConflict.barcode.ilike(like),
+            PlatformCatalogItem.name.ilike(like),
+            PlatformCatalogItem.article.ilike(like),
+        ))
+    if account_id:
+        query = query.filter(MappingConflict.account_id == int(account_id))
+    return query.count()
+
+
+def _query_conflicts(db: Session, q: str, account_id: str, limit: int = PAGE_LIMIT):
     query = (
         db.query(MappingConflict, PlatformCatalogItem, PlatformAccount)
         .join(PlatformAccount, PlatformAccount.id == MappingConflict.account_id)
@@ -75,7 +98,7 @@ def _query_conflicts(db: Session, q: str, account_id: str):
     if account_id:
         query = query.filter(MappingConflict.account_id == int(account_id))
 
-    triples = query.order_by(MappingConflict.last_seen.desc()).limit(300).all()
+    triples = query.order_by(MappingConflict.last_seen.desc()).limit(limit).all()
     # Разворачиваем в удобные для шаблона объекты — конфликт + кабинет +
     # опциональная спецификация с площадки (если была загружена кнопкой)
     result = []
@@ -95,7 +118,7 @@ def _render(request: Request, db: Session, user: User, view: str, q: str,
             source_platform: str, account_id: str, template: str):
     if view == "conflicts":
         rows = _query_conflicts(db, q, account_id)
-        total = len(rows)
+        total = _count_conflicts(db, q, account_id)
     else:
         rows = _query_mapped(db, q, source_platform)
         # Считаем ВСЕГДА, а не только когда строк ровно триста: страница обязана
@@ -141,7 +164,14 @@ def mapping_export(
     db: Session = Depends(get_db), user: User = Depends(get_current_user),
 ):
     if view == "conflicts":
-        rows = _query_conflicts(db, q, account_id)
+        # Выгрузка берёт ВЕСЬ отбор, а не показанную страницу. Конфликт
+        # сопоставления — это уже случившаяся непроведённая продажа: заказ
+        # пришёл, разнести его не на что, и пока баркод не сопоставлен, каждый
+        # следующий повторит то же самое. Файл для того и выгружают, чтобы
+        # разобрать их пачкой; отдавать в нём первые триста и молчать об этом
+        # значит оставить остальные неразобранными — продажи по ним идут мимо
+        # нас, а остаток завышен ровно на них.
+        rows = _query_conflicts(db, q, account_id, limit=EXPORT_LIMIT)
         headers = ["ID_1С", "Баркод", "Кабинет", "Площадка", "Название на площадке", "Артикул на площадке",
                    "Попыток", "Впервые увиден", "Последний раз"]
         data = [
