@@ -16,6 +16,7 @@
 from datetime import date, datetime, timedelta, timezone
 
 from app.timeutils import local_date_of, today_local
+from app.workers.platform_clients.base import StockPushItem
 from app.workers.platform_clients.wb import ORDERS_WINDOW_DAYS, WbClient
 
 
@@ -246,39 +247,116 @@ def test_a_success_code_with_a_body_is_not_silently_accepted():
     assert "не найден" in res["errors"][0]["detail"]
 
 
-def test_reading_stocks_back_splits_into_batches_and_keeps_zero_apart_from_missing():
-    """Обратная сторона отправки: что площадка ДЕРЖИТ. Ноль и отсутствие sku —
-    разные вещи: ноль это «карточка есть, пусто», отсутствие — «такого sku тут
-    нет вовсе»."""
-    from app.workers.platform_clients.wb import STOCKS_BATCH_SKUS
+# ---------------------------------------- чтение остатков: тем же ключом
 
+# Сверка обязана спрашивать ТЕМ ЖЕ ключом, которым отправляли. До этой правки
+# запрос уходил телом `{"skus": [...]}` — и работает по сей день, площадка его
+# принимает. Но в спеке параметр называется `chrtIds`, ответ приходит с полем
+# `chrtId`, и там же сказано: имена параметров WB НЕ ВАЛИДИРУЕТ, неизвестное имя
+# даёт ответ без ошибки. То есть в день, когда `skus` перестанет пониматься,
+# отказа не будет вовсе: ответ придёт пустым, и сверка объявит ВСЕ отправки
+# кабинета неизвестными площадке — выглядит как разом сломавшийся мэппинг.
+
+
+class _StockResp:
+    status_code = 200
+
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
+def _reader(answer):
+    """Клиент WB с подставной сессией. `answer(body) -> payload`."""
     c = WbClient(token="t", warehouse_id="wh")
-    sizes = []
-
-    class Resp:
-        status_code = 200
-
-        def __init__(self, skus):
-            self._skus = skus
-
-        def raise_for_status(self):
-            return None
-
-        def json(self):
-            # площадка отвечает не по всем: «333» она не знает
-            return {"stocks": [{"sku": s, "amount": 0 if s == "111" else 4}
-                               for s in self._skus if s != "333"]}
+    asked = []
 
     def fake_post(url, json=None, **kw):
-        sizes.append(len(json["skus"]))
-        return Resp(json["skus"])
+        asked.append(json)
+        return _StockResp(answer(json))
 
     c.session.post = fake_post
+    return c, asked
 
-    held = c.get_stocks("wh", ["111", "222", "333"])
+
+def test_reading_stocks_back_asks_by_chrt_id():
+    """chrtId берётся из каталога тем же правилом, что и при отправке
+    (`_chrt_id`), а ответ переводится обратно на баркод — сверке он и нужен."""
+    def answer(body):
+        return {"stocks": [{"chrtId": chrt, "amount": 4} for chrt in body["chrtIds"]]}
+
+    c, asked = _reader(answer)
+
+    held = c.get_stocks("wh", [
+        StockPushItem(barcode="111", quantity=0, external_id="777:901"),
+        StockPushItem(barcode="222", quantity=0, external_id="777:902"),
+    ])
+
+    assert asked == [{"chrtIds": [901, 902]}], "спрашиваем chrtId, а не баркод"
+    assert held == {"111": 4, "222": 4}, "а отвечаем баркодами"
+
+
+def test_a_position_without_chrt_id_is_still_asked_by_barcode():
+    """Каталог кабинета не загружен или протух — позиция всё равно проверяема:
+    отказаться от баркодного запроса значило бы перестать проверять то, что до
+    сих пор проверялось. Ключи в одном теле не смешиваем — спека знает один."""
+    def answer(body):
+        if "chrtIds" in body:
+            return {"stocks": [{"chrtId": 901, "amount": 4}]}
+        return {"stocks": [{"sku": s, "amount": 7} for s in body["skus"]]}
+
+    c, asked = _reader(answer)
+
+    held = c.get_stocks("wh", [
+        StockPushItem(barcode="111", quantity=0, external_id="777:901"),
+        StockPushItem(barcode="222", quantity=0, external_id=""),
+    ])
+
+    assert asked == [{"chrtIds": [901]}, {"skus": ["222"]}]
+    assert held == {"111": 4, "222": 7}
+
+
+def test_two_products_on_one_card_both_get_the_answer():
+    """Два товара 1С могут вести на одну карточку площадки. Ответ приходит один,
+    а отнести его надо к обоим — иначе второй сойдёт за неизвестный площадке."""
+    def answer(body):
+        return {"stocks": [{"chrtId": 901, "amount": 3}]}
+
+    c, _ = _reader(answer)
+
+    held = c.get_stocks("wh", [
+        StockPushItem(barcode="111", quantity=0, external_id="777:901"),
+        StockPushItem(barcode="222", quantity=0, external_id="777:901"),
+    ])
+
+    assert held == {"111": 3, "222": 3}
+
+
+def test_reading_stocks_back_splits_into_batches_and_keeps_zero_apart_from_missing():
+    """Ноль и отсутствие позиции — разные вещи: ноль это «карточка есть, пусто»,
+    отсутствие — «такой позиции тут нет вовсе»."""
+    from app.workers.platform_clients.wb import STOCKS_BATCH_SKUS
+
+    def answer(body):
+        # площадка отвечает не по всем: 903 она не знает
+        return {"stocks": [{"chrtId": chrt, "amount": 0 if chrt == 901 else 4}
+                           for chrt in body["chrtIds"] if chrt != 903]}
+
+    c, asked = _reader(answer)
+
+    held = c.get_stocks("wh", [
+        StockPushItem(barcode="111", quantity=0, external_id="777:901"),
+        StockPushItem(barcode="222", quantity=0, external_id="777:902"),
+        StockPushItem(barcode="333", quantity=0, external_id="777:903"),
+    ])
 
     assert held == {"111": 0, "222": 4}     # 333 отсутствует, а не ноль
-    assert sizes == [3]
+    assert len(asked) == 1
     assert STOCKS_BATCH_SKUS == 1000
 
 
@@ -294,4 +372,25 @@ def test_a_silent_platform_returns_none_not_an_empty_dict():
 
     c.session.post = boom
 
-    assert c.get_stocks("wh", ["111"]) is None
+    assert c.get_stocks("wh", [StockPushItem(barcode="111", quantity=0)]) is None
+
+
+def test_silence_in_one_batch_leaves_the_whole_check_undone():
+    """Половина ответа опаснее отсутствующего: сверка считает позицию, про
+    которую площадка промолчала, неизвестной ей — то есть сетевой сбой по одной
+    пачке выглядел бы как «карточки на складе нет» по всей второй."""
+    import requests
+
+    def answer(body):
+        if "skus" in body:
+            raise requests.ConnectionError("нет сети")
+        return {"stocks": [{"chrtId": 901, "amount": 4}]}
+
+    c, _ = _reader(answer)
+
+    held = c.get_stocks("wh", [
+        StockPushItem(barcode="111", quantity=0, external_id="777:901"),
+        StockPushItem(barcode="222", quantity=0, external_id=""),
+    ])
+
+    assert held is None

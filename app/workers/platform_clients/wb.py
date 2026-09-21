@@ -599,43 +599,97 @@ class WbClient(PlatformClient):
         # Сюда попадаем, только если WB забраковал ВСЕ позиции по очереди.
         return [], dropped, fallback
 
-    def get_stocks(self, warehouse_id: str, skus: list[str]) -> dict[str, int] | None:
-        """Что WB держит по этим sku на этом складе.
+    def _read_stocks(self, warehouse_id: str, items: list[StockPushItem],
+                     use_chrt: bool) -> dict[str, int] | None:
+        """Одна пачка вопросов одним ключом. Ответ переведён обратно на баркоды.
 
-        `POST /api/v3/stocks/{warehouseId}` — метод ЧТЕНИЯ, несмотря на глагол:
-        тело запроса со списком sku, в ответе `stocks` с количеством. Проверено
-        на живом кабинете 19.09.2026.
-
-        Sku, которых WB на складе не знает, в ответе просто нет — и в словаре их
-        тоже не будет. Отличать «нет в ответе» от нуля обязательно: ноль значит
-        «карточка есть, остаток пуст», отсутствие — «такого sku здесь нет вовсе»,
-        и это разные поводы для разбора.
+        `None` — площадка не ответила. Возвращается СРАЗУ и по всей пачке:
+        частичный ответ здесь опаснее отсутствующего. Сверка считает позицию, по
+        которой площадка промолчала, неизвестной площадке (`verified_quantity`
+        пуст, `unknown_sku` в статистике) — то есть сетевой сбой выглядел бы как
+        «карточки на складе нет», а это разные поводы для разбора.
         """
-        if not skus:
-            return {}
-
+        field, back = ("chrtId", "chrtId") if use_chrt else ("sku", "sku")
         out: dict[str, int] = {}
-        for start in range(0, len(skus), STOCKS_BATCH_SKUS):
-            chunk = skus[start:start + STOCKS_BATCH_SKUS]
+        for start in range(0, len(items), STOCKS_BATCH_SKUS):
+            chunk = items[start:start + STOCKS_BATCH_SKUS]
+            # Ключ → баркоды. Множество, а не один баркод: два товара 1С могут
+            # вести на одну карточку площадки, и потерять второй значило бы
+            # объявить его неизвестным площадке.
+            owners: dict[str, set[str]] = {}
+            for item in chunk:
+                key = self._chrt_id(item) if use_chrt else item.barcode
+                owners.setdefault(key, set()).add(item.barcode)
 
-            def call(chunk=chunk):
+            if use_chrt:
+                body = {"chrtIds": [int(k) for k in owners]}
+            else:
+                body = {"skus": list(owners)}
+
+            def call(body=body):
                 resp = self.session.post(f"{BASE_URL}/api/v3/stocks/{warehouse_id}",
-                                          json={"skus": chunk}, timeout=30)
+                                          json=body, timeout=30)
                 resp.raise_for_status()
                 return resp
 
             try:
                 data = with_retry(call).json()
             except requests.RequestException:
-                # Площадка не ответила — это НЕ «остатков нет». Возвращаем None,
-                # чтобы сверка честно осталась непроведённой: записать сюда
-                # пустой словарь значило бы объявить все наши отправки
-                # расхождением и позвать человека разбирать сетевой сбой.
                 return None
             for row in data.get("stocks", []):
-                sku = str(row.get("sku") or "")
-                if sku:
-                    out[sku] = int(row.get("amount") or 0)
+                key = str(row.get(back) or "")
+                for barcode in owners.get(key, ()):
+                    out[barcode] = int(row.get("amount") or 0)
+        return out
+
+    def get_stocks(self, warehouse_id: str,
+                   items: list[StockPushItem]) -> dict[str, int] | None:
+        """Что WB держит по этим позициям на этом складе, ключ — баркод.
+
+        `POST /api/v3/stocks/{warehouseId}` — метод ЧТЕНИЯ, несмотря на глагол:
+        тело запроса со списком идентификаторов, в ответе `stocks` с
+        количеством. Проверено на живом кабинете 19.09.2026.
+
+        **Спрашиваем chrtId, а не баркод — тем же ключом, что и отправляем.** До
+        этой правки запрос уходил телом `{"skus": [...]}`, и работал: площадка
+        его принимает и сегодня. Но в спеке у этого метода параметр называется
+        `chrtIds`, а в ответе приходит `chrtId`, и там же, у соседнего метода,
+        сказано прямо: имена параметров WB НЕ ВАЛИДИРУЕТ, неизвестное имя даёт
+        ответ без ошибки. То есть в день, когда `skus` перестанет пониматься,
+        отказа мы не увидим — ответ придёт пустым, сверка объявит все отправки
+        неизвестными площадке, и выглядеть это будет как поломка мэппинга по
+        всему кабинету разом. Разойдись ключ чтения с ключом отправки — сверка
+        вдобавок спрашивала бы не про то, что отправляла.
+
+        Позиции без chrtId (каталог кабинета не загружен или протух) идут
+        ОТДЕЛЬНЫМ запросом по баркоду — ровно как в `push_stock`: смешивать
+        ключи в одном теле нельзя, спека знает только один. Отказаться от
+        баркодного запроса значило бы перестать проверять то, что до сих пор
+        проверялось; сколько таких позиций, видно в отчёте
+        (`_check_wb_without_chrt`).
+
+        Позиций, которых WB на складе не знает, в ответе просто нет — и в
+        словаре их тоже не будет. Отличать «нет в ответе» от нуля обязательно:
+        ноль значит «карточка есть, остаток пуст», отсутствие — «такой позиции
+        здесь нет вовсе», и это разные поводы для разбора.
+        """
+        if not items:
+            return {}
+
+        by_chrt = [i for i in items if self._chrt_id(i)]
+        by_sku = [i for i in items if not self._chrt_id(i)]
+
+        out: dict[str, int] = {}
+        for chunk, use_chrt in ((by_chrt, True), (by_sku, False)):
+            if not chunk:
+                continue
+            part = self._read_stocks(warehouse_id, chunk, use_chrt)
+            if part is None:
+                # Молчание в любой из двух пачек делает непроверенной ВСЮ
+                # сверку по кабинету. Отдать половину значило бы записать
+                # второй половине «площадка про вас не знает».
+                return None
+            out.update(part)
         return out
 
     def get_catalog_items(self) -> list[CatalogItem]:
