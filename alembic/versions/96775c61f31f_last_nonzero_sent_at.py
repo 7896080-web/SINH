@@ -59,24 +59,70 @@ _FTP_STATUS = sa.Enum('pending', 'sent', 'done', 'failed', 'timeout', 'no_docume
 _WITHDRAWAL_REASONS = ("manual_disable", "broadcast_off")
 
 
+def _has_column(table: str, column: str) -> bool:
+    return column in {c["name"] for c in sa.inspect(op.get_bind()).get_columns(table)}
+
+
 def upgrade():
-    with op.batch_alter_table('sync_settings', schema=None) as batch_op:
-        batch_op.add_column(sa.Column('last_nonzero_sent_at', sa.DateTime(), nullable=True))
+    # Каждый шаг здесь переживает ПОВТОРНЫЙ запуск, и это не перестраховка.
+    # Alembic на SQLite миграцию не откатывает: проверено 21.09 — оборванная
+    # посередине оставила и новую колонку, и временную таблицу, а версию в базе
+    # не сдвинула. Повторный `alembic upgrade head` падал на «duplicate column
+    # name», то есть накат вставал намертво: продолжить нельзя, повторить
+    # нельзя, службы не перезапущены. Оборваться посередине эта миграция может
+    # от чего угодно — кончилось место, `database is locked` от живых служб,
+    # закрытая консоль.
+    if not _has_column('sync_settings', 'last_nonzero_sent_at'):
+        with op.batch_alter_table('sync_settings', schema=None) as batch_op:
+            batch_op.add_column(sa.Column('last_nonzero_sent_at', sa.DateTime(), nullable=True))
 
     reasons = ", ".join(f"'{r}'" for r in _WITHDRAWAL_REASONS)
+
+    # Бэкфилл идёт АГРЕГАТОМ, а не подзапросом на строку, и это не про красоту.
+    # Коррелированный `SELECT MAX(...)` на каждую из 16 132 настроек SQLite
+    # выполняет через индекс по СТАТУСУ (`ix_dispatch_queue_status`), а не по
+    # паре: без `ANALYZE` оптимизатор считает их равноценными, а статус у всех
+    # интересных строк один и тот же — то есть на каждую настройку читается вся
+    # очередь целиком. Замер на боевом масштабе (16 132 настройки, 50 000 строк
+    # очереди): 134,9 с, и всё это время база держит эксклюзивную блокировку
+    # записи. `busy_timeout` у служб — 30 с, значит приём заказов, рассылка и
+    # веб за это время получили бы `database is locked`, нигде не перехваченный.
+    # Один проход с `GROUP BY` даёт ту же таблицу за один скан очереди, а поиск
+    # по ней идёт по первичному ключу пары.
+    op.execute("DROP TABLE IF EXISTS _backfill_nonzero_sent")
+    op.execute("""
+        CREATE TABLE _backfill_nonzero_sent (
+            uid_1c VARCHAR(100) NOT NULL,
+            account_id INTEGER NOT NULL,
+            sent_at DATETIME NOT NULL,
+            PRIMARY KEY (uid_1c, account_id)
+        )
+    """)
     op.execute(f"""
+        INSERT INTO _backfill_nonzero_sent (uid_1c, account_id, sent_at)
+        SELECT d.uid_1c, d.account_id, MAX(d.sent_at)
+        FROM dispatch_queue d
+        WHERE d.status = 'sent'
+          AND d.sent_at IS NOT NULL
+          AND d.is_test = 0
+          AND (d.sent_quantity > 0
+               OR (d.sent_quantity IS NULL AND d.reason NOT IN ({reasons})))
+        GROUP BY d.uid_1c, d.account_id
+    """)
+    op.execute("""
         UPDATE sync_settings SET last_nonzero_sent_at = (
-            SELECT MAX(d.sent_at) FROM dispatch_queue d
-            WHERE d.uid_1c = sync_settings.uid_1c
-              AND d.account_id = sync_settings.account_id
-              AND d.status = 'sent'
-              AND d.sent_at IS NOT NULL
-              AND d.is_test = 0
-              AND (d.sent_quantity > 0
-                   OR (d.sent_quantity IS NULL AND d.reason NOT IN ({reasons})))
+            SELECT b.sent_at FROM _backfill_nonzero_sent b
+            WHERE b.uid_1c = sync_settings.uid_1c
+              AND b.account_id = sync_settings.account_id
         )
         WHERE last_nonzero_sent_at IS NULL
+          AND EXISTS (
+            SELECT 1 FROM _backfill_nonzero_sent b
+            WHERE b.uid_1c = sync_settings.uid_1c
+              AND b.account_id = sync_settings.account_id
+          )
     """)
+    op.execute("DROP TABLE _backfill_nonzero_sent")
 
     with op.batch_alter_table('ftp_tasks', schema=None) as batch_op:
         batch_op.alter_column('status',

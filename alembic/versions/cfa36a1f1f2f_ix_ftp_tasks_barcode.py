@@ -15,6 +15,7 @@ Create Date: 2026-09-21
 времени. Построение индекса на 180 тысячах строк заняло меньше десятой секунды.
 """
 from alembic import op
+import sqlalchemy as sa
 
 
 revision = 'cfa36a1f1f2f'
@@ -24,7 +25,13 @@ depends_on = None
 
 
 def upgrade():
-    op.create_index('ix_ftp_tasks_barcode', 'ftp_tasks', ['barcode'], unique=False)
+    # С проверкой, потому что alembic на SQLite оборванную миграцию не
+    # откатывает (см. 96775c61f31f): индекс мог остаться от неудачного прогона,
+    # а `CREATE INDEX` по существующему имени падает — и повторить накат было
+    # бы нечем.
+    existing = {i["name"] for i in sa.inspect(op.get_bind()).get_indexes('ftp_tasks')}
+    if 'ix_ftp_tasks_barcode' not in existing:
+        op.create_index('ix_ftp_tasks_barcode', 'ftp_tasks', ['barcode'], unique=False)
 
 
 def downgrade():
