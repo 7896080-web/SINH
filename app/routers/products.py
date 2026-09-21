@@ -65,6 +65,33 @@ def _repropagate(db: Session, product: Product, reason: str = "manual_enable"):
             enqueue_full_resend(db, product.uid_1c, setting.account_id, reason=reason)
 
 
+# Пустая ячейка в файле импорта НИЧЕГО НЕ МЕНЯЕТ, и это правило общее на все
+# колонки. Раньше каждая понимала пустоту как самое разрушительное значение из
+# возможных: «Трансляция» и «<кабинет> — Синхронизировать» читались как «Нет»,
+# то есть снимали галочку И ОТЗЫВАЛИ остаток (ноль на живую карточку площадки);
+# «<кабинет> — Порог» становился нулём; «Порог трансляции» стирался, возвращая
+# на площадки полный остаток; «Дата расчёта» снимала расчёт вместе с ФАКТОМ,
+# который человек получил, пересчитав склад руками. Выгрузка все эти ячейки
+# заполняет, поэтому пустой ячейка становится ровно в двух случаях: её стёрли
+# или файл собран не из нашей выгрузки, — и ни один из них не значит «примени
+# ко всему файлу самое опасное». Снять значение по-прежнему можно, но сказав об
+# этом вслух: «-» в ячейке.
+CLEAR_CELL = ("-", "--", "—", "–")
+
+
+def _cell_intent(value):
+    """Что означает ячейка: (`действие`, `текст`).
+
+    `skip` — пусто, не трогаем. `clear` — явное «-», снимаем. `set` — значение.
+    """
+    text = "" if value is None else str(value).strip()
+    if not text:
+        return "skip", ""
+    if text in CLEAR_CELL:
+        return "clear", ""
+    return "set", text
+
+
 def _parse_date(raw: str) -> date | None:
     raw = (raw or "").strip()
     if not raw:
@@ -881,6 +908,18 @@ def bulk_edit(
         if action in ("set_base_date", "stock_to_fact") and d is not None and d > today_local():
             set_flash(request, "Остатков на будущую дату в 1С нет.", "warn")
             return back()
+        if action == "set_base_date" and d is None:
+            # Пустое поле — это «дату не ввели», а не «снять расчёт». Молча снять
+            # её стоило бы дороже всего остального на этой странице: `set_base_date`
+            # вместе с датой стирает и ФАКТ — число, которое человек получил,
+            # пересчитав склад руками, — и восстановить его нечем, а тут это
+            # происходит сразу по всему отбору (до BULK_LIMIT строк). Для чисел
+            # отказ при пустом поле уже стоял выше; дата была единственной
+            # дверью, где пустота проходила молча. Снять расчёт массово можно
+            # кнопкой «Сбросить порог» — она для этого и есть.
+            set_flash(request, "Введите дату. Чтобы снять расчёт, нажмите "
+                               "«Сбросить порог».", "warn")
+            return back()
 
     if all_filtered:
         query = _base_query(db, q, only_proposals, only_blocked, hide_size_u,
@@ -1226,29 +1265,41 @@ def products_import(
         date_changed = False    # дату задали этим файлом — значит дальше расчёт
 
         if "Резерв" in row:
+            intent, text = _cell_intent(row.get("Резерв"))
             try:
-                desired = max(0, int(row.get("Резерв") or 0))
+                # Пусто — не трогаем; «-» — бронь ноль (её снятие и есть ноль).
+                desired = None if intent == "skip" else (
+                    0 if intent == "clear" else max(0, int(float(text))))
             except (TypeError, ValueError):
                 errors.append(f"строка {i}: некорректный резерв")
-            else:
-                if product.reserve != desired:
-                    product.reserve = desired
-                    touched = True
+                desired = None
+            if desired is not None and product.reserve != desired:
+                product.reserve = desired
+                touched = True
 
         if "Дата расчёта" in row:
-            raw = row.get("Дата расчёта")
-            raw = "" if raw is None else str(raw).strip()
-            if isinstance(row.get("Дата расчёта"), datetime):
-                desired_day = row["Дата расчёта"].date()
-            elif isinstance(row.get("Дата расчёта"), date):
-                desired_day = row["Дата расчёта"]
+            cell = row.get("Дата расчёта")
+            intent, text = _cell_intent(cell)
+            skip_date = intent == "skip"      # пусто — дату не трогаем вовсе
+            if isinstance(cell, datetime):
+                desired_day = cell.date()
+            elif isinstance(cell, date):
+                desired_day = cell
+            elif intent == "clear":
+                # Явное «-»: снять расчёт. Вместе с датой уйдёт и факт — так же,
+                # как при снятии даты на странице.
+                desired_day = None
+            elif skip_date:
+                desired_day = product.offset_base_date
             else:
                 try:
-                    desired_day = _parse_date(raw[:10]) if raw else None
+                    desired_day = _parse_date(text[:10])
                 except ValueError:
                     errors.append(f"строка {i}: дата расчёта — формат ГГГГ-ММ-ДД")
                     desired_day = product.offset_base_date
-            if desired_day is not None and desired_day > today_local():
+            if skip_date:
+                pass
+            elif desired_day is not None and desired_day > today_local():
                 errors.append(f"строка {i}: остатков на будущую дату в 1С нет")
             elif desired_day != product.offset_base_date:
                 if desired_day is not None and desired_day not in lookups:
@@ -1261,26 +1312,31 @@ def products_import(
                 date_changed = True
 
         if "Факт на дату" in row:
-            raw = row.get("Факт на дату")
-            raw = "" if raw is None else str(raw).strip()
+            intent, text = _cell_intent(row.get("Факт на дату"))
             try:
-                desired_fact = max(0, int(float(raw))) if raw else None
+                desired_fact = None if intent == "clear" else max(0, int(float(text)))
             except ValueError:
                 errors.append(f"строка {i}: некорректный факт на дату")
             else:
-                if product.fact_at_date != desired_fact:
+                # Пустая ячейка факт НЕ стирает: он получен пересчётом склада
+                # руками, восстановить его нечем, а файл применяет правку сразу
+                # ко всем строкам. Снять — явным «-».
+                if intent != "skip" and product.fact_at_date != desired_fact:
                     product.fact_at_date = desired_fact
                     touched = True
 
         if "Порог трансляции" in row:
-            raw = row.get("Порог трансляции")
-            raw = "" if raw is None else str(raw).strip()
+            intent, text = _cell_intent(row.get("Порог трансляции"))
             try:
-                desired_offset = int(raw) if raw else None
+                desired_offset = None if intent == "clear" else int(float(text))
             except ValueError:
                 errors.append(f"строка {i}: некорректный порог трансляции")
             else:
-                if product.offset_base_date is not None:
+                if intent == "skip":
+                    # Пусто — порог не трогаем. Стереть его значило бы вернуть на
+                    # площадки ПОЛНЫЙ остаток, причём по всему файлу и молча.
+                    pass
+                elif product.offset_base_date is not None:
                     # Порог у такого товара расчётный. Сверяем с тем, что выйдет
                     # из даты и факта, и расхождение показываем ошибкой.
                     if desired_offset != offset_from_base(product):
@@ -1315,9 +1371,25 @@ def products_import(
             current_enabled = setting.enabled if setting else False
             current_threshold = setting.min_threshold if setting else 0
 
-            desired_enabled = parse_bool_ru(row.get(sync_col)) if sync_col in row else current_enabled
+            # Пустая ячейка — «не менять». Прочитать её как «Нет» значило бы
+            # снять галочку И ОТОЗВАТЬ остаток, то есть отправить ноль на живую
+            # карточку площадки — по всему файлу разом.
+            sync_intent, sync_text = _cell_intent(row.get(sync_col))
+            if sync_col not in row or sync_intent == "skip":
+                desired_enabled = current_enabled
+            elif sync_intent == "clear":
+                desired_enabled = False        # «-» — осознанное снятие
+            else:
+                desired_enabled = parse_bool_ru(sync_text)
+
+            th_intent, th_text = _cell_intent(row.get(threshold_col))
             try:
-                desired_threshold = int(row.get(threshold_col) or 0) if threshold_col in row else current_threshold
+                if threshold_col not in row or th_intent == "skip":
+                    desired_threshold = current_threshold
+                elif th_intent == "clear":
+                    desired_threshold = 0      # снять порог кабинета и есть ноль
+                else:
+                    desired_threshold = int(float(th_text))
             except (TypeError, ValueError):
                 errors.append(f"строка {i}: некорректный порог в колонке «{threshold_col}»")
                 continue
@@ -1344,8 +1416,13 @@ def products_import(
             enabled_after.add(account.id) if desired_enabled else enabled_after.discard(account.id)
             touched = True
 
-        if "Трансляция" in row:
-            desired_broadcast = parse_bool_ru(row.get("Трансляция"))
+        # Пустая ячейка «Трансляции» главный выключатель товара не трогает:
+        # «Нет» здесь не просто выключает, а ОТЗЫВАЕТ остаток со всех его
+        # отмеченных кабинетов — ноль на каждую живую карточку.
+        br_intent, br_text = _cell_intent(row.get("Трансляция")) if "Трансляция" in row else ("skip", "")
+        if "Трансляция" in row and br_intent != "skip":
+            desired_broadcast = (False if br_intent == "clear"
+                                 else parse_bool_ru(br_text))
             # Тот же гейт, что и в интерфейсе: сначала расчёт, потом трансляция.
             # Без него Excel оставался обходным путём — строку, которой страница
             # включать не даёт, можно было включить файлом, и на площадки уехал

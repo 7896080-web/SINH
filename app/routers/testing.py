@@ -22,6 +22,7 @@ from app.transmit import (explain, offset_from_base, recompute_offset, sku_quant
                           enqueue_full_resend, ever_transmitted)
 from app.offset_base import ensure_snapshot_requested, set_base_date
 from app.workers.platform_clients.base import PlatformOrder, StockPushItem
+from app.timeutils import now_utc
 from app.audit import log_action
 from app.flash import set_flash, pop_flash
 from app.timeutils import today_local
@@ -52,6 +53,32 @@ def _sku_send(product) -> int:
     """«Сейчас передаётся» на уровне SKU. Лестница — в app/transmit.py, один модуль
     на рассылку и интерфейс (пороги кабинетов применяются отдельно, по кабинету)."""
     return explain(product, None, None).quantity
+
+
+def _refuse_live_order(order_id: str) -> str | None:
+    """Почему этот заказ нельзя трогать со страницы «Тестирование».
+
+    `is_test` защищает от того, чтобы симуляция создала БОЕВУЮ побочную запись.
+    Здесь дыра с другой стороны: боевую запись можно было ПЕРЕДАТЬ в симуляцию.
+    Обе кнопки искали заказ только по номеру и кабинету, без единой проверки,
+    что он тестовый, а номер приходит формой.
+
+    Что происходило с боевым заказом. «Симулировать отмену» возвращает остаток
+    у НАС по-настоящему, а задание в 1С помечает `is_test=True` — значит
+    обратного документа там не будет никогда: товар вернулся в продажу у нас и
+    остался отгруженным в 1С, то есть наружу уходит больше, чем есть. Вдобавок
+    заказ помечен `cancelled`, и настоящую отмену, придя она позже, живой опрос
+    пропустит как уже обработанную. «Симулировать подтверждение» тем же способом
+    съедает перемещение «Ожидает → Склад»: у нас заказ закрыт, в 1С единица
+    вечно висит на промежуточном складе.
+    """
+    if not (order_id or "").startswith(TEST_ORDER_PREFIX):
+        return ("Это боевой заказ, а не тестовый. Симуляция закрыла бы его у нас, "
+                "не создав документа в 1С: остаток разошёлся бы с 1С, а настоящую "
+                f"отмену опрос потом пропустил бы как уже обработанную. Тестовые "
+                f"заказы начинаются с «{TEST_ORDER_PREFIX}» и создаются кнопкой "
+                "«Симулировать заказ» на этой же странице.")
+    return None
 
 
 def _real_processed_orders(db: Session, uid_1c: str) -> list:
@@ -342,6 +369,24 @@ def test_push_stock(
     barcode, external_id, article = target
     quantity = _quantity_to_send(db, uid_1c, account_id, product.stock_on_hand)
 
+    # Пауза кабинета — это «в этот кабинет сейчас не писать», и рассылка её
+    # соблюдает (`dispatch_enabled` в `run_dispatch_cycle`). Кнопка писала мимо
+    # неё: оператор останавливал кабинет ровно потому, что там что-то не так —
+    # переход, чужая система, разбор расхождений, — а проверка ключей молча
+    # клала туда число. Отказ громкий: иначе «ничего не произошло» выглядит как
+    # поломка кнопки.
+    account_row = db.query(PlatformAccount).filter(PlatformAccount.id == account_id).first()
+    if account_row is not None and not account_row.dispatch_enabled:
+        _log(db, uid_1c, account_id, TestLogLevel.warn, "push_stock",
+             "Отправка отменена: рассылка на этот кабинет стоит на паузе. "
+             "Боевая рассылка его тоже пропускает — проверка ключей не должна "
+             "быть единственным, что пишет в остановленный кабинет.")
+        db.commit()
+        set_flash(request, "Рассылка на этот кабинет стоит на паузе — отправка отменена. "
+                           "Снимите паузу на странице «Кабинеты», если проверять надо именно сейчас.",
+                  "warn")
+        return RedirectResponse(f"/testing?uid_1c={uid_1c}&account_id={account_id}", status_code=303)
+
     # Ноль на карточку, куда мы ни разу не отправляли непустой остаток, — это не
     # проверка ключей, а обнуление чужой витрины. А кнопку нажимают ровно в этом
     # состоянии: страница «Тестирование» для того и нужна, чтобы прогнать товар
@@ -377,6 +422,22 @@ def test_push_stock(
         ok = barcode in result.get("ok", [])
         log_action(db, user.username, "test_push_stock", f"{uid_1c} / кабинет #{account_id}: {result}")
         if ok:
+            if quantity > 0:
+                # То же, что пишет боевая рассылка при успешной отправке
+                # непустого остатка. Без этой отметки система забывает, что
+                # писала на карточку: очередь — недолговечная память (чистка
+                # уносит терминальные записи через тридцать суток), и снятие
+                # галочки потом не отзовёт остаток — площадка продолжит
+                # продавать по нашему числу. Отправка отсюда настоящая, значит и
+                # след от неё обязан быть настоящим.
+                setting = db.query(SyncSetting).filter(
+                    SyncSetting.uid_1c == uid_1c,
+                    SyncSetting.account_id == account_id,
+                ).first()
+                if setting is None:
+                    setting = SyncSetting(uid_1c=uid_1c, account_id=account_id, enabled=False)
+                    db.add(setting)
+                setting.last_nonzero_sent_at = now_utc()
             _log(db, uid_1c, account_id, TestLogLevel.good, "push_stock",
                  f"Успешно. Ответ площадки: ok={result.get('ok')}, errors={result.get('errors')}")
             set_flash(request, f"Остаток {quantity} шт. успешно отправлен в «{account.name}».", "good")
@@ -477,6 +538,14 @@ def simulate_confirm(
     """Шаг подтверждения: тот же process_confirmation, что и живой опрос —
     перемещение «<Площадка>.Ожидает» → «Склад <Площадка>». Остаток не меняет.
     Помечает задание в 1С is_test=True (в реальный файл не попадёт)."""
+    refusal = _refuse_live_order(order_id)
+    if refusal:
+        _log(db, uid_1c, account_id, TestLogLevel.warn, "simulate_confirm",
+             f"Заказ {order_id}: {refusal}")
+        db.commit()
+        set_flash(request, refusal, "warn")
+        return RedirectResponse(f"/testing?uid_1c={uid_1c}&account_id={account_id}", status_code=303)
+
     account = db.query(PlatformAccount).filter(PlatformAccount.id == account_id).first()
     record = db.query(ProcessedOrder).filter(
         ProcessedOrder.order_id == order_id, ProcessedOrder.account_id == account_id,
@@ -514,6 +583,14 @@ def simulate_cancel(
     db: Session = Depends(get_db), user: User = Depends(get_current_user),
 ):
     """Шаг 3: реверс тестового заказа — проверяет обратный ход (раздел 5)."""
+    refusal = _refuse_live_order(order_id)
+    if refusal:
+        _log(db, uid_1c, account_id, TestLogLevel.warn, "simulate_cancel",
+             f"Заказ {order_id}: {refusal}")
+        db.commit()
+        set_flash(request, refusal, "warn")
+        return RedirectResponse(f"/testing?uid_1c={uid_1c}&account_id={account_id}", status_code=303)
+
     account = db.query(PlatformAccount).filter(PlatformAccount.id == account_id).first()
     record = db.query(ProcessedOrder).filter(
         ProcessedOrder.order_id == order_id, ProcessedOrder.account_id == account_id,
