@@ -26,8 +26,13 @@ KIT_ERROR = ("не отправлено за 5 попыток: [{'detail': '400 
 
 def _failed(db, account, uid="u1", error=KIT_ERROR):
     db.add(Product(uid_1c=uid, article="2403", name="Конко Джемпер",
-                   size="50/50", color="A.INDIGOMEL", stock_on_hand=7))
+                   size="50/50", color="A.INDIGOMEL", stock_on_hand=7,
+                   broadcast_enabled=True))
     db.add(Barcode(barcode=f"bc-{uid}", uid_1c=uid))
+    # Кабинет ОТМЕЧЕН. Без этого пара «мёртвая» — по неотмеченному кабинету,
+    # на который мы ни разу не отправляли, отказ расхождением не считается
+    # (см. `report._only_live_pairs`), и проверять тут было бы нечего.
+    db.add(SyncSetting(uid_1c=uid, account_id=account.id, enabled=True))
     db.add(DispatchQueueItem(uid_1c=uid, account_id=account.id, quantity=7,
                              status=DispatchStatus.error, reason="test",
                              is_test=False, last_error=error, sent_sku="v-1"))

@@ -249,7 +249,9 @@ def _q_unknown_sku(db: Session) -> list[DispatchQueueItem]:
     # переотправки по одному и тому же нерешённому товару лежит две записи, а
     # разбирать человеку нечего дважды — это одна неразрешённая пара.
     latest = latest_queue_ids(db)
-    return [r for r in rows if r.id in latest]
+    # И только по живым парам: по выключенной решать нечего — решение уже
+    # принято, товар туда не транслируется.
+    return _only_live_pairs(db, [r for r in rows if r.id in latest])
 
 
 def _check_unknown_sku(db: Session) -> Finding | None:
@@ -292,7 +294,49 @@ def _q_dispatch_errors(db: Session) -> list[DispatchQueueItem]:
     # Только ПОСЛЕДНЯЯ запись пары товар+кабинет: всё, что было до неё,
     # описывает прошлое состояние, а не текущее.
     latest = latest_queue_ids(db)
-    return [r for r in rows if r.id in latest]
+    return _only_live_pairs(db, [r for r in rows if r.id in latest])
+
+
+def _only_live_pairs(db: Session, rows: list[DispatchQueueItem]) -> list[DispatchQueueItem]:
+    """Отбросить отказы, которые уже ничего не означают.
+
+    21.09 на бою отчёт держал КРИТИЧНУЮ находку по записи очереди **id=1** —
+    самой первой в системе, созданной 14.09, от дефекта Kit, починенного
+    двадцатого. Кабинет по этой паре не отмечен, и непустой остаток мы туда не
+    отправляли ни разу.
+
+    Тогда следствие находки — «остаток списан, а площадка продолжает продавать
+    по старому числу» — просто НЕПРАВДА: площадка держит наше число, только
+    если мы его туда посылали. А сама запись мёртвая: рассылка её не возьмёт
+    (галочки нет), статуса она не сменит никогда, и отчёт остался бы красным
+    навсегда. Вечно красный отчёт пролистывают не читая — это уже проходили с
+    650 записями от того же дефекта.
+
+    Условия ОБА, и второе обязательно. Снятая галочка сама по себе отказ не
+    отменяет: отправляли 50, человек снял галочку, отзыв (ноль) не доехал — на
+    площадке по-прежнему лежит 50, и она продаёт то, чего нет. Это настоящее
+    расхождение, и `ever_transmitted` его сохраняет.
+
+    Отсутствие товара в номенклатуре поводом НЕ считается: запись очереди
+    переживает удаление товара, и строка обязана появиться всё равно — иначе
+    находка насчитает больше, чем покажет (см. одноимённый тест).
+
+    Ничего не удаляем: пару включат — отказ вернётся в отчёт сам.
+    """
+    if not rows:
+        return rows
+    ticked = {
+        (s.uid_1c, s.account_id) for s in
+        db.query(SyncSetting.uid_1c, SyncSetting.account_id).filter(
+            SyncSetting.uid_1c.in_({r.uid_1c for r in rows}),
+            SyncSetting.enabled.is_(True)).all()
+    }
+
+    from app.transmit import ever_transmitted
+
+    return [r for r in rows
+            if (r.uid_1c, r.account_id) in ticked
+            or ever_transmitted(db, r.uid_1c, r.account_id)]
 
 
 def _check_dispatch_errors(db: Session) -> Finding | None:
