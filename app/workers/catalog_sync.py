@@ -52,6 +52,8 @@ def load_platform_catalog(db: Session, client: PlatformClient, account: Platform
     # Баркоды, заведённые догадкой В ЭТОМ ЖЕ проходе: см. ниже, почему запроса
     # к базе для этого мало.
     guessed_here: set[str] = set()
+    # То же для конфликтов сопоставления: см. ниже.
+    conflicted_here: set[str] = set()
     for item in items:
         if not item.barcode:
             stats["no_barcode"] += 1
@@ -101,7 +103,15 @@ def load_platform_catalog(db: Session, client: PlatformClient, account: Platform
         conflict = db.query(MappingConflict).filter(
             MappingConflict.barcode == item.barcode, MappingConflict.account_id == account.id,
         ).first()
-        if conflict is None:
+        if item.barcode in conflicted_here:
+            # Повтор в ЭТОЙ ЖЕ выгрузке: конфликт по нему мы уже завели строкой
+            # выше, но запрос его не видит — `autoflush=False`, до базы он ещё не
+            # дошёл. Уникального ограничения здесь нет, поэтому получилось бы не
+            # падение, а ДУБЛИ строк разбора: оператор разбирал бы один и тот же
+            # баркод дважды, а счётчик новых конфликтов врал бы в ту же сторону.
+            stats["known_conflicts"] += 1
+        elif conflict is None:
+            conflicted_here.add(item.barcode)
             db.add(MappingConflict(barcode=item.barcode, account_id=account.id, attempts=1))
             stats["new_conflicts"] += 1
         else:
