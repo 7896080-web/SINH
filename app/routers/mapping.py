@@ -206,6 +206,14 @@ def mapping_import(
     resolved_conflicts = 0
     repointed = 0
     conflicting = 0          # строки, где нужна переподвязка, а её не разрешили
+    # Баркоды, ПРИВЯЗАННЫЕ ЭТОЙ ЖЕ загрузкой. Поиск существующей привязки идёт
+    # запросом, а сессия живёт с `autoflush=False`: только что добавленный
+    # баркод запрос не видит, и второй такой же в файле уходил вторым `INSERT`.
+    # На коммите это `UNIQUE constraint failed: barcodes.barcode` — то есть 500
+    # и потеря ВСЕГО импорта, включая переподвязки, сделанные выше по файлу.
+    # А повтор в файле — вещь обычная: выгрузка с площадки, где один баркод у
+    # нескольких строк, или просто склеенный из двух файл.
+    in_file: dict[str, str] = {}
 
     for i, row in enumerate(rows, start=2):  # +2: строка 1 — заголовок, Excel считает с 1
         uid_1c = str(row.get("ID_1С") or "").strip()
@@ -220,6 +228,18 @@ def mapping_import(
         product = db.query(Product).filter(Product.uid_1c == uid_1c).first()
         if product is None:
             errors.append(f"строка {i}: товар с ID {uid_1c} не найден")
+            continue
+
+        seen_uid = in_file.get(barcode)
+        if seen_uid is not None:
+            if seen_uid == uid_1c:
+                already_mapped += 1          # та же строка дважды — не ошибка
+            else:
+                # Файл сам себе противоречит: один баркод на два товара. Молча
+                # взять любой значило бы решить за человека, на какой товар
+                # спишется заказ.
+                errors.append(f"строка {i}: баркод {barcode} в этом же файле уже "
+                              f"привязан к товару {seen_uid} — оставьте одну строку")
             continue
 
         existing = db.query(Barcode).filter(Barcode.barcode == barcode).first()
@@ -253,11 +273,13 @@ def mapping_import(
                     p.recalc_account_ids = ""
             log_action(db, user.username, "barcode_repointed",
                        f"{barcode}: {was_uid} -> {uid_1c}")
+            in_file[barcode] = uid_1c
             repointed += 1
             db.query(MappingConflict).filter(MappingConflict.barcode == barcode).delete()
             continue
 
         db.add(Barcode(barcode=barcode, uid_1c=uid_1c, source_platform="excel_import"))
+        in_file[barcode] = uid_1c
         added += 1
 
         # Если этот баркод раньше висел в конфликтах сопоставления (в любом
