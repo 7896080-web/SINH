@@ -7,7 +7,8 @@ from app.timeutils import now_utc
 
 from sqlalchemy.orm import Session
 
-from app.models import (FtpTask, FtpTaskStatus, Platform, StockDateRow, StockDateSnapshot,
+from app.models import (FtpTask, FtpTaskStatus, OrderProcessStatus, Platform,
+                        ProcessedOrder, StockDateRow, StockDateSnapshot,
                         StockDateStatus, StockDeltaDocument)
 
 logger = logging.getLogger("sync_worker")
@@ -868,7 +869,8 @@ def repost_stuck_movements(db: Session) -> dict:
     оно как считалось, так и считается: остаток не дёргается туда-сюда, пока
     ответа нет.
     """
-    stats = {"reposted": 0, "exhausted": 0, "skipped_disabled": 0}
+    stats = {"reposted": 0, "exhausted": 0, "skipped_disabled": 0,
+             "order_cancelled": 0}
 
     stuck = db.query(FtpTask).filter(
         FtpTask.status == FtpTaskStatus.timeout,
@@ -881,6 +883,28 @@ def repost_stuck_movements(db: Session) -> dict:
     cutoff = now_utc() - timedelta(minutes=REPOST_AFTER_MINUTES)
     ready = [t for t in stuck
              if t.sent_at is not None and t.sent_at < cutoff]
+
+    # Заказ УЖЕ ОТМЕНЁН — повторять создание нельзя ни в коем случае.
+    #
+    # Отмена уходит минутным файлом, а повтор — не раньше получаса, то есть
+    # всегда позже. `ОтменитьПеремещенияЗаказа` документа не находит (его и не
+    # было, ради этого повтор и написан), отвечает `OK|нет документов для
+    # отмены`, и задание отмены закрывается как выполненное. Следом приходит
+    # повтор создания, `НайтиПроведённоеПеремещение` пусто — и 1С СОЗДАЁТ
+    # перемещение по заказу, которого больше нет. Отменить его нечем:
+    # `existing_cancel_task` видит закрытое CANCEL_MOVEMENT в любом статусе и
+    # второго не выпустит, а сам заказ со статусом `cancelled` из опроса отмен
+    # выпал. Единица навсегда числится отгруженной, физически лёжа на ЦС.
+    #
+    # Идемпотентность 1С тут не помогает, а работает против: она обещана по
+    # СУЩЕСТВУЮЩЕМУ документу, а здесь документа нет вовсе.
+    #
+    # Обратный случай (1С документ создала, потерялся только ответ — ровно
+    # инцидент 19.09) от этой проверки не страдает: такое задание просто уходит
+    # в ручной разбор, где человек смотрит в 1С и закрывает его как проведённое.
+    cancelled = _orders_already_cancelled(db, ready)
+    stats["order_cancelled"] = len([t for t in ready if _pair(t) in cancelled])
+    ready = [t for t in ready if _pair(t) not in cancelled]
 
     stats["exhausted"] = len([t for t in ready if (t.repost_count or 0) >= MAX_REPOSTS])
     ready = [t for t in ready if (t.repost_count or 0) < MAX_REPOSTS]
@@ -905,15 +929,52 @@ def repost_stuck_movements(db: Session) -> dict:
     return stats
 
 
+def _pair(task: FtpTask) -> tuple[str | None, int | None]:
+    """Ключ заказа: номер плюс КАБИНЕТ. Номера заказов у разных площадок могут
+    совпасть, и сверять их без кабинета значило бы закрыть чужое задание."""
+    return (task.order_id, task.account_id)
+
+
+def _orders_already_cancelled(db: Session,
+                              tasks: list[FtpTask]) -> set[tuple[str | None, int | None]]:
+    """Из этих заданий — те пары заказ+кабинет, которые уже отменены.
+
+    ОДИН запрос на весь список: зависших заданий на бою бывают десятки, и запрос
+    на строку здесь ничего не стоил бы только пока их мало.
+    """
+    pairs = {_pair(t) for t in tasks if t.order_id}
+    if not pairs:
+        return set()
+    rows = db.query(ProcessedOrder.order_id, ProcessedOrder.account_id).filter(
+        ProcessedOrder.order_id.in_({p[0] for p in pairs}),
+        ProcessedOrder.status == OrderProcessStatus.cancelled,
+    ).all()
+    return {(order_id, account_id) for order_id, account_id in rows} & pairs
+
+
 def tasks_needing_review(db: Session) -> list[FtpTask]:
     """Задания, которые сами уже не разберутся — их закрывает человек.
 
-    Сюда попадают три случая:
+    Правило одно: зависшее задание, которого НЕ ВОЗЬМЁТ автоповтор, обязано
+    попасть сюда. Иначе оно висит вечно и невидимо, а «в пути» по нему считается
+    всё это время.
+
+    Автоповтор не берёт:
       * `failed` — 1С ответила ERROR, документа заведомо нет;
-      * `timeout`, исчерпавший `MAX_REPOSTS` повторов;
-      * `timeout` при ВЫКЛЮЧЕННОМ перепроведении — иначе, пока в 1С нет
-        идемпотентности, зависшие задания не попадали бы в разбор вовсе и
-        остаток молча занижался бы дальше. Именно это состояние на бою сейчас.
+      * `timeout`, исчерпавший `MAX_REPOSTS`;
+      * `timeout` при ВЫКЛЮЧЕННОМ перепроведении;
+      * **любую команду, кроме `CREATE_MOVEMENT`** — отмены и подтверждения
+        `repost_stuck_movements` не трогает никогда, и это закреплено тестом.
+        Раньше такое задание в разбор не попадало ВООБЩЕ: условие требовало
+        исчерпанных повторов, а счётчик повторов у отмены не растёт и не может.
+        При включённом на бою автоповторе зависшая отмена висела бы бесконечно,
+        а `_in_flight_adjustment` вычитал бы её количество — остаток завышен,
+        наружу уходит больше, чем есть, то есть прямой оверселл. Карточка
+        «Диагностики» этот случай уже умеет показывать (направление ошибки у
+        отмены обратное), ей просто никогда не доставалось таких строк;
+      * `CREATE_MOVEMENT`, заказ по которому уже отменён — повтор по нему
+        запрещён (см. `repost_stuck_movements`), а решить, есть ли документ в
+        1С, может только человек.
 
     Свежий `timeout` не берём: опоздавший ответ 1С закрывает такое задание сам
     (`apply_result_batch` принимает и поздние), и звать человека рано.
@@ -924,6 +985,11 @@ def tasks_needing_review(db: Session) -> list[FtpTask]:
         FtpTask.is_test.is_(False),
     ).order_by(FtpTask.id).all()
 
+    stale = [t for t in rows
+             if t.status is FtpTaskStatus.timeout
+             and not (t.sent_at is not None and t.sent_at >= cutoff)]
+    cancelled = _orders_already_cancelled(db, stale)
+
     out = []
     for t in rows:
         if t.status is FtpTaskStatus.failed:
@@ -932,6 +998,10 @@ def tasks_needing_review(db: Session) -> list[FtpTask]:
         if t.sent_at is not None and t.sent_at >= cutoff:
             continue                                  # ещё может закрыться сам
         if (t.repost_count or 0) >= MAX_REPOSTS or not repost_enabled():
+            out.append(t)
+        elif t.command != "CREATE_MOVEMENT":
+            out.append(t)
+        elif _pair(t) in cancelled:
             out.append(t)
     return out
 
