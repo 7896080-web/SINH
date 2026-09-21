@@ -43,6 +43,51 @@ ORDERS_WINDOW_DAYS = 29
 # и выдумывать его мы не станем — там проверки просто не будет.
 ORDERS_HISTORY_DAYS = 90
 
+# Коды отказа при отправке остатков. Спека `/api/v3/stocks/{warehouseId}`,
+# ответы 409 и 406. Делим их не по «серьёзности», а по ЕДИНСТВЕННОМУ вопросу:
+# изменит ли что-нибудь повтор — и знаем ли мы, КОГО именно площадка забраковала.
+#
+# Эти называют позиции поимённо в `data[].sku`/`chrtId`, и повтор с тем же
+# содержимым ответит тем же: позицию вынимаем из запроса и закрываем сразу, а
+# остальную пачку досылаем. Раньше любой из них ронял ВСЮ пачку в пять
+# бесполезных попыток, после чего отчёт относил её к «рассылка не доехала» —
+# то есть «чините связь», хотя связь тут ни при чём.
+STOCK_POSITION_TERMINAL_CODES = {
+    # Склад не подходит для этого типа груза — пока остаток шлют сюда, ничего
+    # не изменится; менять надо склад в настройках кабинета.
+    "CargoWarehouseRestrictionMGT": "склад кабинета не подходит для этого типа груза (МГТ)",
+    "CargoWarehouseRestrictionSGT": "склад кабинета не подходит для этого типа груза (СГТ)",
+    "CargoWarehouseRestrictionSGTKGTPlus": "склад кабинета не подходит для этого типа груза (СГТ/КГТ+)",
+    "CargoWarehouseRestrictionKGTPlus": "склад кабинета не подходит для этого типа груза (КГТ+)",
+    # Категория товара недоступна для продажи с этим типом доставки.
+    "DeliveryTypeRestriction": "категория товара недоступна для этого типа доставки",
+    # Количество вне допустимого (в примере спеки — 100001). Повтор уйдёт с тем
+    # же числом и получит тот же ответ.
+    "UploadDataLimit": "количество вне допустимого предела площадки",
+}
+
+# А эти повтор ПЕРЕЖИВУТ: состояние временное или снимается человеком. Метить
+# позиции терминальными по ним нельзя — остаток по ним не уехал бы уже никогда.
+# Но и прятать их за «не отправлено за 5 попыток» незачем: причина известна.
+STOCK_RETRYABLE_CODES = {
+    # 409: склад в процессе обновления или удаления, «повторите через несколько
+    # секунд» — прямая цитата из спеки.
+    "StoreIsProcessing": "склад площадки сейчас обновляется — повтор осмыслен",
+    # 406: то же самое, другим кодом.
+    "WarehouseStocksUpdateBlock": "склад площадки обрабатывается — повтор осмыслен",
+    # 406: обновление остатков заблокировано из-за БАНА ПОСТАВЩИКА. Связь тут ни
+    # при чём, и чинить надо не её: пока бан не снят, остатки по кабинету не
+    # обновляются вовсе.
+    "StatusNotAcceptable": "ОБНОВЛЕНИЕ ОСТАТКОВ ЗАБЛОКИРОВАНО (бан поставщика) — "
+                           "пока блокировка не снята, остаток по этому кабинету "
+                           "не уедет ни по одной карточке",
+    # 409 без `data`: спека не называет виновные позиции, поэтому вынуть их мы не
+    # можем, а выкинуть всю пачку — значит похоронить девяносто девять здоровых
+    # позиций из-за одной. Оставляем повторяемым, но с настоящей причиной.
+    "ProductPropertyConflict": "товары не допущены к продаже по выбранной схеме "
+                               "поставки (площадка не назвала, какие именно)",
+}
+
 # Сколько идентификаторов заказов влезает в один запрос статусов
 # (`/api/v3/orders/status`). Предел площадки, а не наш выбор.
 # Карточек за страницу каталога. По спеке WB у `cursor.limit` стоит
@@ -261,6 +306,39 @@ class WbClient(PlatformClient):
                     ))
         return cancelled
 
+    def _error_entries(self, response) -> list[tuple[str, set[str]]]:
+        """Отказы из тела ответа: [(код, названные позиции)].
+
+        Формат у всех кодов один и тот же — `[{"code": ..., "message": ...,
+        "data": [{"sku": ..., "chrtId": ..., "amount": ...}]}]`, — поэтому разбор
+        общий. `data` есть не у всех: `StoreIsProcessing` и
+        `ProductPropertyConflict` виновных не называют, и множество у них пустое.
+        """
+        try:
+            payload = response.json()
+        except Exception:                      # noqa: BLE001 — тело не разобралось
+            return []
+        if not isinstance(payload, list):
+            payload = [payload]
+        out: list[tuple[str, set[str]]] = []
+        for entry in payload:
+            if not isinstance(entry, dict):
+                continue
+            code = str(entry.get("code") or "")
+            if not code:
+                continue
+            named: set[str] = set()
+            for row in entry.get("data") or []:
+                # В ответе WB называет позицию обоими ключами сразу, а какой из
+                # них настоящий — зависит от того, чем мы её адресовали. Кладём
+                # оба непустых: дальше ищем совпадение по тому, чем слали.
+                for key in ("sku", "chrtId"):
+                    value = str((row or {}).get(key) or "")
+                    if value and value != "0":
+                        named.add(value)
+            out.append((code, named))
+        return out
+
     def _not_found_skus(self, response) -> set[str]:
         """Sku, про которые WB в ответе 409 сказал «не знаю такого на складе».
 
@@ -442,10 +520,47 @@ class WbClient(PlatformClient):
                         for i in remaining
                     ], []
 
+                entries = self._error_entries(response) if response is not None else []
+
+                # Отказ, названный поимённо и неизменный при повторе: позицию
+                # вынимаем и закрываем сразу, остальную пачку досылаем. Иначе
+                # одна такая позиция жгла пять попыток и уносила с собой всю
+                # пачку, а в отчёте это выглядело как «рассылка не доехала» —
+                # то есть «чините связь», хотя чинить надо настройки кабинета.
+                for code, named in entries:
+                    reason = STOCK_POSITION_TERMINAL_CODES.get(code)
+                    if not reason or not named:
+                        continue
+                    hit = named & {key_of(i) for i in remaining}
+                    if not hit:
+                        continue
+                    for item in [i for i in remaining if key_of(i) in hit]:
+                        dropped.append({
+                            "sku": item.barcode, "terminal": True,
+                            "detail": f"{reason} ({code}) — повтор ответит тем же",
+                        })
+                    remaining = [i for i in remaining if key_of(i) not in hit]
+                    if not remaining:
+                        return [], dropped, fallback
+                    break
+                else:
+                    # Отказ, который повтор переживёт (склад обновляется, бан
+                    # поставщика, неназванные позиции). Терминальным его метить
+                    # нельзя — остаток не уехал бы уже никогда, — но и прятать
+                    # за «не отправлено за 5 попыток» незачем: причина известна.
+                    for code, _named in entries:
+                        known = STOCK_RETRYABLE_CODES.get(code)
+                        if known:
+                            return ([], dropped + [
+                                {"detail": f"{known} ({code})"}], fallback)
+                if entries and any(
+                        code in STOCK_POSITION_TERMINAL_CODES for code, _ in entries):
+                    continue
+
                 bad = self._not_found_skus(response) if response is not None else set()
                 bad &= {key_of(i) for i in remaining}
                 if not bad:
-                    # Забраковано что-то другое — разбирать это самим мы не
+                    # Забраковано что-то ещё — разбирать это самим мы не
                     # беремся, отдаём как есть по всей оставшейся пачке.
                     return ([],
                             dropped + [{"detail": detail}], fallback)
