@@ -384,6 +384,47 @@ def _sales_between(db: Session, row: DispatchQueueItem) -> int:
     return int(total or 0)
 
 
+def _only_latest_send(db: Session,
+                     rows: list[DispatchQueueItem]) -> list[DispatchQueueItem]:
+    """Отбросить строки, по паре которых ПОЗЖЕ ушло новое число.
+
+    Сверка перепроверяет только ПОСЛЕДНЮЮ отправку по товару
+    (`verify_stock.rows_to_verify`), а находка брала любую строку с
+    несовпадением. Разница и есть дефект: как только по товару уходит новое
+    число, старая строка застывает со своим расхождением навсегда — сверка её
+    больше не тронет, статуса она не сменит, и отчёт остаётся красным вечно.
+
+    Найдено на бою 22.09 в чистом виде. Находка показывала три позиции
+    («отправили 60, площадка держит 59»), а сверка тем же часом отвечала
+    `diverged: 2` — и это были РАЗНЫЕ строки: по всем трём из находки уже
+    прошла новая отправка (59, 54, 0), которую площадка и держала. Обычная
+    продажа: WB списал единицу, мы приняли заказ и отправили новое число.
+    Разобрать такую находку нельзя ничем — она описывает прошлое.
+
+    Тот же приём, что у `_check_dispatch_errors` с отказами, по паре которых
+    позже была успешная отправка: вечно красный отчёт оператор пролистывает не
+    читая, и тогда он бесполезен весь.
+    """
+    if not rows:
+        return rows
+    uids = {r.uid_1c for r in rows}
+    accounts = {r.account_id for r in rows}
+    latest: dict[tuple[str, int], datetime] = {}
+    for uid, account_id, when in db.query(
+            DispatchQueueItem.uid_1c, DispatchQueueItem.account_id,
+            func.max(DispatchQueueItem.sent_at),
+    ).filter(
+        DispatchQueueItem.uid_1c.in_(uids),
+        DispatchQueueItem.account_id.in_(accounts),
+        DispatchQueueItem.sent_at.isnot(None),
+        DispatchQueueItem.is_test.is_(False),
+    ).group_by(DispatchQueueItem.uid_1c, DispatchQueueItem.account_id).all():
+        latest[(uid, account_id)] = when
+    return [r for r in rows
+            if r.sent_at is not None
+            and latest.get((r.uid_1c, r.account_id)) == r.sent_at]
+
+
 def _check_platform_divergence(db: Session) -> Finding | None:
     """Площадка держит не то, что мы ей отправили.
 
@@ -407,6 +448,7 @@ def _check_platform_divergence(db: Session) -> Finding | None:
         DispatchQueueItem.verified_quantity != DispatchQueueItem.sent_quantity,
         DispatchQueueItem.is_test.is_(False),
     ).order_by(DispatchQueueItem.verified_at.desc()).limit(200).all()
+    rows = _only_latest_send(db, rows)
     # Площадка сама уменьшает остаток, когда товар покупают, — и между нашей
     # отправкой и сверкой проходит полчаса. 20.09 на бою обе «находки» были
     # ровно этим: отправили 39, площадка держит 38, отправили 29 — держит 28.
