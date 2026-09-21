@@ -22,6 +22,17 @@ from app.timeutils import today_local
 TODAY = today_local()
 TOMORROW = TODAY + timedelta(days=1)
 
+# Взятие ДАТЫ из UTC-времени. Имя класса не фиксируем: в клиентах площадок он
+# зовётся `_dt`, а импорт `from datetime import datetime as _dt` — обычное дело.
+FROM_UTC = (r"now_utc\(\)\s*\.date\(\)"
+            r"|\bdate\.today\(\)"
+            r"|\.now\(\s*timezone\.utc\s*\)\s*\.date\(\)"
+            r"|\.fromtimestamp\([^\n]*\)\s*\.date\(\)"
+            r"|\.fromisoformat\([^\n]*\)\s*\.date\(\)")
+
+# Сборка момента из местного числа через UTC-полночь.
+UTC_MIDNIGHT = r"\w+\([^()\n]*\.year[^()\n]*tzinfo\s*=\s*timezone\.utc[^()\n]*\)"
+
 
 def _product(web_db, uid="u1") -> Product:
     p = Product(uid_1c=uid, article="A-1", name="Товар", stock_on_hand=11, reserve=0)
@@ -109,10 +120,38 @@ def test_no_calendar_day_is_taken_from_utc():
     app_dir = pathlib.Path(__file__).resolve().parent.parent / "app"
     offenders = []
     for path in app_dir.rglob("*.py"):
+        if path.name == "timeutils.py":
+            continue                      # сами преобразования живут там
         text = path.read_text(encoding="utf-8")
-        for m in re.finditer(r"now_utc\(\)\s*\.date\(\)|\bdate\.today\(\)", text):
+        for m in re.finditer(FROM_UTC, text):
             line = text[:m.start()].count("\n") + 1
             offenders.append(f"{path.relative_to(app_dir.parent)}:{line}: {m.group(0)}")
 
     assert not offenders, (
-        "календарный день берётся мимо today_local():\n  " + "\n  ".join(offenders))
+        "календарный день берётся мимо today_local()/local_date_of():\n  "
+        + "\n  ".join(offenders))
+
+
+def test_no_local_day_is_turned_into_a_moment_through_utc_midnight():
+    """Обратная сторона того же: местное число → момент времени.
+
+    `datetime(год, месяц, число, tzinfo=timezone.utc)` выглядит как «начало
+    этого дня», а даёт 03:00 по Москве. Все три клиента площадок так и
+    спрашивали ленту заказов от базовой даты — и продажи первых трёх часов
+    суток оставались за границей запроса, не мешая при этом поставить
+    «актуализирован». Правильное начало местных суток считает
+    `timeutils.local_day_start_utc`.
+    """
+    app_dir = pathlib.Path(__file__).resolve().parent.parent / "app"
+    offenders = []
+    for path in app_dir.rglob("*.py"):
+        if path.name == "timeutils.py":
+            continue
+        text = path.read_text(encoding="utf-8")
+        for m in re.finditer(UTC_MIDNIGHT, text):
+            line = text[:m.start()].count("\n") + 1
+            offenders.append(f"{path.relative_to(app_dir.parent)}:{line}: {m.group(0)}")
+
+    assert not offenders, (
+        "начало местных суток берётся мимо local_day_start_utc():\n  "
+        + "\n  ".join(offenders))

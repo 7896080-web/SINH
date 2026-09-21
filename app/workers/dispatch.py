@@ -66,7 +66,7 @@ def _retry_delay(attempts: int) -> timedelta:
 
 
 def _publish_restocked(db: Session, account: PlatformAccount, client: PlatformClient,
-                       sent_keys: dict[str, int]) -> int:
+                       sent_keys: dict[str, int]) -> dict:
     """Вернуть на витрину карточки, которые площадка спрятала за нулевой остаток.
 
     Зачем это вообще: у Kit при настройке «скрывать товары с нулевым остатком»
@@ -89,19 +89,44 @@ def _publish_restocked(db: Session, account: PlatformAccount, client: PlatformCl
     Только по тем, что площадка СЕЙЧАС держит скрытыми. Не смогли спросить —
     не публикуем вовсе: `None` от клиента значит «мы не знаем», и трогать по
     нему чужие статусы нельзя.
+
+    Но НЕ ПУБЛИКУЕМ и МОЛЧИМ — разные вещи, а код делал и то и другое: `if not
+    hidden: return 0` одинаково проглатывал «скрытых нет» и «спросить не
+    удалось», хотя сам комментарий рядом объявлял различие важным. Следствие у
+    второго случая своё и отложенное: остаток на карточку ушёл, площадка его
+    приняла, у нас всё зелено — а карточка осталась скрытой, покупателям товара
+    не видно, и сама она не вернётся. Второй попытки не будет: публикация идёт
+    по ключам, отправленным В ЭТОМ цикле, а следующая отправка по медленному
+    размеру случится, когда изменится остаток, то есть могут пройти месяцы.
+    Поэтому такой случай уходит в лог предупреждением и в журнал действий —
+    записью, которая переживёт ротацию логов.
     """
     if not account.publish_hidden_on_stock:
-        return 0
+        return {"published": 0, "unchecked": 0}
     restocked = {key for key, quantity in sent_keys.items() if (quantity or 0) > 0}
     if not restocked:
-        return 0
+        return {"published": 0, "unchecked": 0}
 
     ask = getattr(client, "hidden_stock_keys", None)
     hidden = ask() if callable(ask) else None
+    if hidden is None:
+        # Спросить не удалось (или список вышел неполным — клиент отвечает тем
+        # же `None`, см. `kit.hidden_stock_keys`).
+        logger.warning(
+            "dispatch: кабинет «%s» — не удалось узнать, какие карточки площадка "
+            "держит скрытыми; %d карточек получили остаток и могли остаться "
+            "невидимыми для покупателей", account.name, len(restocked))
+        db.add(AuditLog(
+            actor="system", action="variant_publish_unchecked",
+            details=f"{account.name}: площадка не ответила списком скрытых карточек — "
+                    f"{len(restocked)} карточек получили ненулевой остаток, и если "
+                    f"площадка прячет их за нулевой остаток, они остались скрытыми: "
+                    f"товар есть, купить нельзя, само не вернётся",
+        ))
+        db.commit()
+        return {"published": 0, "unchecked": len(restocked)}
     if not hidden:
-        # None — спросить не удалось; пустое множество — скрытых нет. В обоих
-        # случаях делать нечего, но различать их важно для чтения логов.
-        return 0
+        return {"published": 0, "unchecked": 0}      # скрытых нет — делать нечего
 
     published = 0
     for key in sorted(restocked & hidden):
@@ -119,7 +144,7 @@ def _publish_restocked(db: Session, account: PlatformAccount, client: PlatformCl
                         f"остаток на площадке есть, а товар покупателям не виден",
             ))
     db.commit()
-    return published
+    return {"published": published, "unchecked": 0}
 
 
 def _dispatch_one_account(db: Session, client: PlatformClient, account: PlatformAccount) -> dict | None:
@@ -318,11 +343,12 @@ def _dispatch_one_account(db: Session, client: PlatformClient, account: Platform
     sent_keys = {item.sent_sku: item.sent_quantity
                  for barcode, item in uid_to_items.items()
                  if barcode in ok_set and item.sent_sku}
-    published = _publish_restocked(db, account, client, sent_keys)
+    publish = _publish_restocked(db, account, client, sent_keys)
 
     return {
         "sent": len(ok_set), "errors": len(result.get("errors", [])),
-        "queued": len(pending), "retry": retried, "published": published,
+        "queued": len(pending), "retry": retried,
+        "published": publish["published"], "unchecked": publish["unchecked"],
     }
 
 
@@ -359,7 +385,8 @@ def run_dispatch_cycle(db: Session, clients: dict, active_accounts: list[Platfor
             db.rollback()
             logger.exception("dispatch: кабинет «%s» — сбой цикла", account.name)
             stats[account.name] = {"sent": 0, "errors": 0, "queued": 0, "retry": 0,
-                                   "published": 0, "failed": f"{type(e).__name__}: {e}"}
+                                   "published": 0, "unchecked": 0,
+                                   "failed": f"{type(e).__name__}: {e}"}
             continue
         if account_stats is not None:
             stats[account.name] = account_stats

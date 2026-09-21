@@ -238,8 +238,8 @@ def test_a_card_the_platform_does_not_call_hidden_is_left_alone(db):
     assert client.published == []
 
 
-def test_a_silent_platform_publishes_nothing(db):
-    """Спросить не удалось — не знаем, что скрыто. Публиковать вслепую нельзя."""
+def _silent(db):
+    """Кабинет, товар и клиент, у которого площадка молчит на вопрос о скрытых."""
     account = _kit_account(db)
     _product(db, account, "u1", "111", "v-скрыт", stock=7)
     db.commit()
@@ -249,10 +249,69 @@ def test_a_silent_platform_publishes_nothing(db):
         raise requests.ConnectionError("сеть")
 
     client.session.get = boom
+    return account, client
+
+
+def test_a_silent_platform_publishes_nothing(db):
+    """Спросить не удалось — не знаем, что скрыто. Публиковать вслепую нельзя."""
+    account, client = _silent(db)
 
     run_dispatch_cycle(db, {account.id: client}, [account])
 
     assert client.published == []
+
+
+def test_a_silent_platform_does_not_pass_unnoticed(db):
+    """Не публиковать и молчать — разные вещи, а код делал и то и другое:
+    `if not hidden: return 0` проглатывал одинаково «скрытых нет» и «спросить не
+    удалось». Следствие у второго своё: остаток ушёл, площадка его приняла, у
+    нас всё зелено — а карточка осталась скрытой, товар покупателям не виден и
+    сам не вернётся. Второй попытки не будет: публикация идёт по ключам,
+    отправленным В ЭТОМ цикле, а у медленного размера следующая отправка — когда
+    изменится остаток, то есть через месяцы."""
+    account, client = _silent(db)
+
+    stats = run_dispatch_cycle(db, {account.id: client}, [account])
+
+    assert stats["КИТ"]["unchecked"] == 1
+    entry = db.query(AuditLog).filter(
+        AuditLog.action == "variant_publish_unchecked").one()
+    assert "КИТ" in entry.details
+
+
+def test_an_empty_hidden_list_is_not_reported_as_a_failure(db):
+    """«Скрытых нет» — обычный и самый частый ответ. Предупреждение на нём
+    обесценило бы предупреждение на молчании так же верно, как и молчание."""
+    account = _kit_account(db)
+    _product(db, account, "u1", "111", "v-1", stock=7)
+    db.commit()
+    client = _Kit(hidden=[])
+
+    stats = run_dispatch_cycle(db, {account.id: client}, [account])
+
+    assert stats["КИТ"]["unchecked"] == 0
+    assert db.query(AuditLog).filter(
+        AuditLog.action == "variant_publish_unchecked").count() == 0
+
+
+def test_a_cabinet_without_the_switch_is_not_reported_either(db):
+    """Кабинет, которому публикация не разрешена, скрытые карточки не спрашивает
+    вовсе — значит и не узнать ему нечего."""
+    account = _kit_account(db, publish=False)
+    _product(db, account, "u1", "111", "v-скрыт", stock=7)
+    db.commit()
+    client = _Kit(hidden=["v-скрыт"])
+
+    def boom(url, params=None, timeout=None):
+        raise requests.ConnectionError("сеть")
+
+    client.session.get = boom
+
+    stats = run_dispatch_cycle(db, {account.id: client}, [account])
+
+    assert stats["КИТ"]["unchecked"] == 0
+    assert db.query(AuditLog).filter(
+        AuditLog.action == "variant_publish_unchecked").count() == 0
 
 
 def test_a_failed_push_never_publishes(db):
