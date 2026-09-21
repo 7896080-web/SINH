@@ -21,6 +21,7 @@ from app.workers.client_factory import build_client
 from app.workers.credentials import CredentialsMissing
 from app.workers.order_poller import poll_new_orders, poll_cancellations
 from app.workers.catalog_sync import load_platform_catalog
+from app.routers.platform_matching import clear_clusters_cache
 from app.workers.scheduler import PENDING_WAREHOUSE_NAME
 from app.audit import log_action
 from app.report import (CRITICAL as REPORT_CRITICAL, collect_findings,
@@ -337,6 +338,11 @@ def catalog_now(
     try:
         client = build_client(db, account_id)
         stats = load_platform_catalog(db, client, account)
+        # Картина кластеров на «Сопоставлении площадок» собрана по СТАРОМУ
+        # каталогу — после загрузки она врёт. Минута ожидания тут была бы
+        # особенно обидной: человек нажал «Загрузить каталог» ровно затем, чтобы
+        # увидеть новое.
+        clear_clusters_cache()
         log_action(db, user.username, "manual_catalog_sync", f"{account.name}: {stats}")
         db.commit()
         set_flash(request, f"«{account.name}»: загружено {stats['fetched']} карточек, новых конфликтов {stats['new_conflicts']}.", "good")

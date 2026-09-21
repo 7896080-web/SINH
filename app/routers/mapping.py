@@ -12,6 +12,7 @@ from app.flash import set_flash, pop_flash
 from app.audit import log_action
 from app.workers.client_factory import build_client
 from app.workers.catalog_sync import load_platform_catalog
+from app.routers.platform_matching import clear_clusters_cache
 from app.workers.credentials import CredentialsMissing
 
 router = APIRouter()
@@ -361,6 +362,11 @@ def mapping_load_catalog(
     try:
         client = build_client(db, account_id)
         stats = load_platform_catalog(db, client, account)
+        # Картина кластеров на «Сопоставлении площадок» собрана по СТАРОМУ
+        # каталогу — после загрузки она врёт. Минута ожидания тут была бы
+        # особенно обидной: человек нажал «Загрузить каталог» ровно затем, чтобы
+        # увидеть новое.
+        clear_clusters_cache()
     except CredentialsMissing as e:
         set_flash(request, f"Не удалось загрузить спецификацию «{account.name}»: {e}", "warn")
         return RedirectResponse("/mapping?view=conflicts", status_code=303)
