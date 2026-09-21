@@ -213,6 +213,11 @@
         Только отмеченные товары
     </label>
     <label class="checkbox-inline" style="padding-bottom:8px;"
+           title="Трансляция включена у самого товара — его остаток уходит наружу прямо сейчас. Это не то же, что отмеченный кабинет: галочка кабинета говорит, КУДА передавать, а трансляция — передаём ли вообще. Выключенная перекрывает любые галочки.">
+        <input type="checkbox" name="only_broadcasting" value="true" {% if only_broadcasting %}checked{% endif %}>
+        Только с включённой трансляцией
+    </label>
+    <label class="checkbox-inline" style="padding-bottom:8px;"
            title="Отмечен хотя бы один кабинет — то есть по этому товару уже принято решение передавать его наружу. Кабинет при этом не обязан быть активным: галочку ставил человек, и выключение кабинета его решения не отменяет.">
         <input type="checkbox" name="only_marked" value="true" {% if only_marked %}checked{% endif %}>
         Только отмеченные кабинеты
