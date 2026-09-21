@@ -2,6 +2,11 @@ from datetime import datetime
 from collections import defaultdict
 from app.timeutils import now_utc
 
+# Источник привязки, сделанной ДОГАДКОЙ по соседям в каталоге площадки. Отдельным
+# именем, потому что приём справочника 1С отличает её от остальных и только её
+# имеет право перебить (`reconciliation.import_barcode_dict`).
+POOL_GUESS_SOURCE = "pool_match"
+
 from sqlalchemy.orm import Session
 
 from app.models import PlatformCatalogItem, Barcode, MappingConflict, PlatformAccount
@@ -71,7 +76,7 @@ def load_platform_catalog(db: Session, client: PlatformClient, account: Platform
         # заводим конфликт. Существующий конфликт по этому баркоду закрываем.
         uid = pool_uid.get(item.external_id)
         if uid is not None:
-            db.add(Barcode(barcode=item.barcode, uid_1c=uid, source_platform="pool_match"))
+            db.add(Barcode(barcode=item.barcode, uid_1c=uid, source_platform=POOL_GUESS_SOURCE))
             db.query(MappingConflict).filter(
                 MappingConflict.barcode == item.barcode,
             ).delete(synchronize_session=False)

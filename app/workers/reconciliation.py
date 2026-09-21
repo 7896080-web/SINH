@@ -3,6 +3,8 @@ from datetime import datetime
 from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
+from app.audit import log_action
+from app.workers.catalog_sync import POOL_GUESS_SOURCE
 from app.transmit import enqueue_full_resend
 from app.models import (
     Product, Barcode, FtpTask, FtpTaskStatus, ReconciliationLog,
@@ -143,9 +145,15 @@ def import_barcode_dict(db: Session, rows: list[dict], full: bool = False) -> di
         r[0] for r in db.query(PlatformCatalogItem.barcode).distinct().all() if r[0]
     }
     existing_uids = {r[0] for r in db.query(Product.uid_1c).all()}
-    existing_bcs = {b.barcode for b in db.query(Barcode).all()}
+    # Нужен не только факт «баркод есть», но и К ЧЕМУ он привязан и КЕМ: догадку
+    # автопривязки справочник 1С обязан перебить (см. ниже). Тремя колонками, а
+    # не объектами ORM: строк сто пятьдесят четыре тысячи.
+    existing_map = {b: (uid, src) for b, uid, src in db.query(
+        Barcode.barcode, Barcode.uid_1c, Barcode.source_platform).all()}
+    existing_bcs = set(existing_map)
 
-    stats = {"products": 0, "barcodes": 0, "conflicts_cleared": 0, "full": full}
+    stats = {"products": 0, "barcodes": 0, "conflicts_cleared": 0, "full": full,
+             "repointed_guesses": 0}
     resolved = set()
     for r in rows:
         uid = (r.get("uid_1c") or "").strip()
@@ -164,8 +172,42 @@ def import_barcode_dict(db: Session, rows: list[dict], full: bool = False) -> di
             stats["products"] += 1
         if barcode not in existing_bcs:
             db.add(Barcode(barcode=barcode, uid_1c=uid, source_platform="1c_dict"))
+            existing_map[barcode] = (uid, "1c_dict")
             existing_bcs.add(barcode)
             stats["barcodes"] += 1
+        else:
+            known_uid, source = existing_map[barcode]
+            if known_uid != uid and source == POOL_GUESS_SOURCE:
+                # Привязку, сделанную ДОГАДКОЙ, справочник 1С перебивает — и
+                # только её. `pool_match` ставит `catalog_sync`, когда баркод
+                # незнаком, но его соседи по карточке площадки ведут к одному
+                # товару 1С. Догадка полезная, но она не первичный учёт: 1С
+                # ведёт баркод в карточке товара, и если числа разошлись, права
+                # 1С. Раньше приём справочника не менял существующие привязки
+                # НИКОГДА, поэтому ошибочная догадка жила вечно: заказ по этому
+                # баркоду списывался с чужого товара — у него остаток падал зря,
+                # а у настоящего оставался завышенным, то есть уезжал наружу.
+                # Конфликт при этом был удалён, и разбирать было нечего.
+                #
+                # Ручную переподвязку (`excel_repoint`) и записи самой 1С не
+                # трогаем: первое — осознанное решение человека под отдельной
+                # галочкой, второе и так отсюда.
+                row = db.query(Barcode).filter(Barcode.barcode == barcode).first()
+                if row is not None:
+                    row.uid_1c = uid
+                    row.source_platform = "1c_dict"
+                    existing_map[barcode] = (uid, "1c_dict")
+                    # Отметку «актуализирован» снимаем у ОБОИХ товаров: расчёт
+                    # собирал заказы по прежнему набору баркодов.
+                    for affected in (known_uid, uid):
+                        p = db.query(Product).filter(Product.uid_1c == affected).first()
+                        if p is not None:
+                            p.recalc_done_at = None
+                            p.recalc_account_ids = ""
+                    log_action(db, "1c_dict", "barcode_guess_corrected",
+                               f"{barcode}: {known_uid} -> {uid} (была догадка "
+                               f"автопривязки, справочник 1С поправил)")
+                    stats["repointed_guesses"] += 1
         resolved.add(barcode)
 
     db.flush()
@@ -206,11 +248,12 @@ def run_reconciliation(db: Session, stock_from_1c: dict[str, int],
     склад единицы, которые площадка уже продала."""
 
     stats = {"normal": 0, "auto_plus": 0, "auto_minus": 0, "needs_review": 0,
-             "unmatched_barcodes": 0, "zeroed_missing": 0}
+             "unmatched_barcodes": 0, "zeroed_missing": 0, "barcode_conflicts": 0}
 
     # Группируем полученные из 1С количества по uid_1c (может быть несколько
     # баркодов на один товар — считаем максимум, т.к. это один физический остаток)
     uid_to_actual = {}
+    conflicting_uids: set[str] = set()
     for barcode, qty in stock_from_1c.items():
         row = db.query(Barcode).filter(Barcode.barcode == barcode).first()
         if row is None:
@@ -222,7 +265,21 @@ def run_reconciliation(db: Session, stock_from_1c: dict[str, int],
         # специально хранит минус как есть (приём заказа, сверка), на площадку
         # всё равно уходит max(0, …). Поэтому первое значение берём как есть.
         previous = uid_to_actual.get(row.uid_1c)
+        if previous is not None and previous != qty:
+            # Несколько штрихкодов одного SKU держат ОДИН физический остаток, и
+            # 1С отдаёт по ним одно и то же число. Разные числа означают, что
+            # один из баркодов привязан к чужому товару, — и максимум тогда
+            # берёт ЧУЖОЙ остаток: на площадку уходит больше, чем лежит на
+            # складе. Формулу это не меняет (минимум и сумма врут так же, просто
+            # в другую сторону, а починка тут одна — мэппинг), но молчать об
+            # этом нельзя: предохранитель, сработавший молча, — половина
+            # предохранителя. Считаем и отдаём наверх.
+            conflicting_uids.add(row.uid_1c)
         uid_to_actual[row.uid_1c] = qty if previous is None else max(previous, qty)
+
+    # Считаем ТОВАРЫ, а не расхождения: разбирать человеку товар, и три
+    # разошедшихся баркода на одном товаре — это один разбор, а не два.
+    stats["barcode_conflicts"] = len(conflicting_uids)
 
     if missing_means_zero and uid_to_actual:
         # Товары с баркодами и ненулевым остатком, которых в снимке нет.
