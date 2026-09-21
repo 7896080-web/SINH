@@ -26,11 +26,14 @@ class FakePlatform:
         self._held = held          # None — «отдавать остатки не умеем/не ответила»
         self.asked = []
 
-    def get_stocks(self, warehouse_id, skus):
-        self.asked.append((warehouse_id, list(skus)))
+    def get_stocks(self, warehouse_id, items):
+        # На вход идут те же `StockPushItem`, что и в отправку: ключ запроса
+        # выбирает клиент площадки, а не сверка. Ключ ответа — баркод.
+        self.asked.append((warehouse_id, [i.barcode for i in items]))
         if self._held is None:
             return None
-        return {s: self._held[s] for s in skus if s in self._held}
+        return {i.barcode: self._held[i.barcode]
+                for i in items if i.barcode in self._held}
 
 
 def _sent(db, account, uid="u1", sku="111", sent=10, minutes_ago=10, **kw):

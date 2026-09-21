@@ -38,8 +38,10 @@ from datetime import timedelta
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.models import DispatchQueueItem, DispatchStatus, PlatformAccount
+from app.models import (DispatchQueueItem, DispatchStatus, PlatformAccount,
+                        PlatformCatalogItem)
 from app.timeutils import now_utc
+from app.workers.platform_clients.base import StockPushItem
 
 logger = logging.getLogger("sync_worker")
 
@@ -114,7 +116,26 @@ def verify_account(db: Session, client, account: PlatformAccount) -> dict:
     for row in rows:
         by_sku.setdefault(row.sent_sku, []).append(row)
 
-    held = client.get_stocks(account.warehouse_id, list(by_sku))
+    # Клиенту отдаём позиции целиком, а не список идентификаторов: ключ запроса
+    # выбирает он сам, и выбирает тот же, которым отправлял (у WB — chrtId из
+    # каталога, баркод — запасной путь). Повтори мы этот выбор здесь, однажды он
+    # разошёлся бы с отправкой, и сверка спрашивала бы не про то, что отправляла.
+    #
+    # `sent_sku` у WB — это баркод (`stock_key = "barcode"`), поэтому строку
+    # каталога ищем по нему. У Kit `sent_sku` — variant_id, но там `get_stocks`
+    # не реализован вовсе и до этого места дело не доходит; появится — искать
+    # придётся по `uid_1c`, и это надо будет сделать явно, а не понадеяться.
+    external = dict(
+        db.query(PlatformCatalogItem.barcode, PlatformCatalogItem.external_id)
+        .filter(PlatformCatalogItem.account_id == account.id,
+                PlatformCatalogItem.barcode.in_(list(by_sku)))
+        .all()
+    )
+    asked = [StockPushItem(barcode=sku, quantity=0,
+                           external_id=external.get(sku) or "")
+             for sku in by_sku]
+
+    held = client.get_stocks(account.warehouse_id, asked)
     if held is None:
         # Площадка не умеет отдавать остатки назад или не ответила. Это не
         # расхождение и не совпадение — это отсутствие проверки, и пометить
