@@ -19,9 +19,28 @@
 import io
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 LIVE = ROOT / "1c" / "ОбменССайтом_МодульОбъекта.txt"
 SRC = ROOT / "1c" / "src" / "ОбменССайтом" / "Ext" / "ObjectModule.bsl"
+
+# Эти проверки — про СОГЛАСОВАННОСТЬ ИСХОДНИКОВ, а не про установку. На боевом
+# сервере каталог `1c/` лежит в том виде, в каком его принесла первая установка:
+# блоки наката его намеренно не везут (копия на диске сервера на работу не
+# влияет), а модуль переносится в `.epf` Конфигуратором. Значит после наката
+# файлы там ЗАВЕДОМО старые — и тест, который сравнивает их между собой, упал бы
+# на каждом прогоне `pytest -q` после обновления, останавливая накат на ровном
+# месте.
+#
+# Признак «мы в репозитории» — каталог `.git`. На боевом сервере git не
+# установлен вовсе и файлы приносятся копированием, так что его там нет.
+IN_REPOSITORY = (ROOT / ".git").exists()
+repository_only = pytest.mark.skipif(
+    not IN_REPOSITORY,
+    reason="проверка согласованности исходников 1С имеет смысл только в репозитории: "
+           "на сервере каталог 1c/ накатом не обновляется",
+)
 
 
 def _lines(path: Path) -> list[str]:
@@ -34,6 +53,7 @@ def _lines(path: Path) -> list[str]:
     return text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
 
 
+@repository_only
 def test_the_buildable_source_matches_the_live_module():
     live, src = _lines(LIVE), _lines(SRC)
     assert live == src, (
@@ -42,6 +62,7 @@ def test_the_buildable_source_matches_the_live_module():
     )
 
 
+@repository_only
 def test_the_live_module_answers_with_the_command_name():
     """Ответ 1С обязан нести имя команды четвёртым полем.
 
@@ -60,6 +81,7 @@ def test_the_live_module_answers_with_the_command_name():
                 or '|CANCEL_MOVEMENT"' in line), f"ответ без имени команды: {line}"
 
 
+@repository_only
 def test_the_live_module_checks_field_count_before_indexing():
     """Длина строки задания проверяется ДО обращения к полям.
 
