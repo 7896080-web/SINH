@@ -67,3 +67,18 @@ def test_a_barcode_already_in_the_base_is_untouched(db):
 
     assert stats["already_mapped"] == 1
     assert db.query(Barcode).count() == 1
+
+
+def test_a_duplicate_unmapped_barcode_makes_one_conflict(db):
+    """У конфликтов сопоставления уникального ограничения нет, поэтому повтор
+    давал не падение, а ДУБЛИ строк разбора: оператор разбирал бы один и тот же
+    баркод дважды, а счётчик новых конфликтов врал в ту же сторону."""
+    from app.models import MappingConflict
+
+    account = make_account(db, Platform.wb)
+
+    stats = load_platform_catalog(db, FakeClient([
+        _item("b-nobody", "900:1"), _item("b-nobody", "900:1")]), account)
+
+    assert stats["new_conflicts"] == 1
+    assert db.query(MappingConflict).count() == 1
