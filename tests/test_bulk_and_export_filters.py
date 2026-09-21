@@ -989,13 +989,13 @@ def test_zero_stock_rows_can_be_hidden(logged_in_client, web_db):
     """Каталог на 152 тысячи позиций почти весь распродан: нули — это шум, в
     котором не видно строк, с которыми действительно работают."""
     _stocked(web_db, "u1", "ЕСТЬОСТАТОК", 7)
-    _stocked(web_db, "u2", "НОЛЬ", 0)
+    _stocked(web_db, "u2", "НОЛЬОСТАТОК", 0)
     web_db.commit()
 
     page = logged_in_client.get("/products?hide_zero_stock=true").text
 
     assert "ЕСТЬОСТАТОК" in page
-    assert "НОЛЬ" not in page
+    assert "НОЛЬОСТАТОК" not in page
 
 
 def test_negative_stock_is_never_hidden(logged_in_client, web_db):
@@ -1010,10 +1010,10 @@ def test_negative_stock_is_never_hidden(logged_in_client, web_db):
 
 
 def test_without_the_filter_everything_is_shown(logged_in_client, web_db):
-    _stocked(web_db, "u2", "НОЛЬ", 0)
+    _stocked(web_db, "u2", "НОЛЬОСТАТОК", 0)
     web_db.commit()
 
-    assert "НОЛЬ" in logged_in_client.get("/products").text
+    assert "НОЛЬОСТАТОК" in logged_in_client.get("/products").text
 
 
 def test_the_filter_reaches_the_export(logged_in_client, web_db):
@@ -1021,7 +1021,7 @@ def test_the_filter_reaches_the_export(logged_in_client, web_db):
     молча отбрасывает — оператор отбирает строки, выгружает и получает весь
     каталог. На этом уже проехал `only_unfinished`."""
     _stocked(web_db, "u1", "ЕСТЬОСТАТОК", 7)
-    _stocked(web_db, "u2", "НОЛЬ", 0)
+    _stocked(web_db, "u2", "НОЛЬОСТАТОК", 0)
     web_db.commit()
 
     import io
@@ -1031,7 +1031,7 @@ def test_the_filter_reaches_the_export(logged_in_client, web_db):
     articles = {row[1] for row in ws.iter_rows(min_row=2, values_only=True)}
 
     assert "ЕСТЬОСТАТОК" in articles
-    assert "НОЛЬ" not in articles
+    assert "НОЛЬОСТАТОК" not in articles
 
 
 def test_the_filter_survives_a_bulk_edit(logged_in_client, web_db):
