@@ -26,13 +26,16 @@
 """
 import os
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
+from app.timeutils import local_date_of, local_day_start_utc
 from app.workers.platform_clients.kit import KitClient
 from app.workers.platform_clients.ozon import OzonClient
 from app.workers.platform_clients.wb import WbClient
+
+MSK = timezone(timedelta(hours=3))
 
 BASE_DAY = date(2026, 9, 10)
 # Начало местных суток 10.09 в Москве: 21:00 UTC девятого.
@@ -44,17 +47,60 @@ BEFORE = "2026-09-09T20:00:00Z"
 
 
 @pytest.fixture
-def moscow():
-    """Часы машины по Москве — как на боевом сервере."""
+def moscow(monkeypatch):
+    """Пересчёт местного времени — по Москве, как на боевом сервере.
+
+    Первая версия этой фикстуры переставляла часовой пояс процесса
+    (`TZ` + `time.tzset()`) — и падала на бою ВСЕГДА: `time.tzset()` есть только
+    на posix, а боевой сервер Windows. Пояс процесса там вообще не переставить,
+    поэтому подменяем не часы машины, а две функции пересчёта. Клиенты площадок
+    импортируют их ВНУТРИ методов, так что подмена до них доходит.
+
+    Что при этом доказывается: клиент спрашивает ленту от начала МЕСТНЫХ суток и
+    ставит заказу МЕСТНУЮ дату — то есть ходит через `timeutils`, а не считает
+    время сам. Ровно это и было сломано. Правильность самих функций проверяет
+    `test_the_helpers_really_follow_the_machine_clock` ниже, на настоящем поясе.
+    """
+    def day_start(day):
+        return datetime(day.year, day.month, day.day, tzinfo=MSK).astimezone(timezone.utc)
+
+    def date_of(moment):
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        return moment.astimezone(MSK).date()
+
+    monkeypatch.setattr("app.timeutils.local_day_start_utc", day_start)
+    monkeypatch.setattr("app.timeutils.local_date_of", date_of)
+
+
+# ----------------------------------------- сами функции, на настоящем поясе
+
+@pytest.mark.skipif(not hasattr(time, "tzset"),
+                    reason="часовой пояс процесса переставляется только на posix; "
+                           "на боевом Windows-сервере он и так московский")
+def test_the_helpers_really_follow_the_machine_clock():
+    """Часы машины действительно решают, где начинается день.
+
+    Тесты клиентов выше идут на подменённом пересчёте — они про то, ЧТО клиент
+    спрашивает. Этот про сам пересчёт, и он единственный трогает настоящий пояс:
+    на машине разработки и на CI он UTC, где местная полночь и UTC-шная
+    совпадают, и разницы не видно ни одному другому тесту.
+    """
     was = os.environ.get("TZ")
     os.environ["TZ"] = "Europe/Moscow"
     time.tzset()
-    yield
-    if was is None:
-        del os.environ["TZ"]
-    else:
-        os.environ["TZ"] = was
-    time.tzset()
+    try:
+        assert local_day_start_utc(BASE_DAY) == LOCAL_MIDNIGHT
+        assert local_date_of(datetime.fromisoformat(EARLY.replace("Z", "+00:00"))) == BASE_DAY
+        assert local_date_of(datetime.fromisoformat(BEFORE.replace("Z", "+00:00"))) < BASE_DAY
+        # Наивный момент считаем UTC-шным: так хранятся все DateTime-колонки.
+        assert local_date_of(datetime(2026, 9, 9, 22, 30)) == BASE_DAY
+    finally:
+        if was is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = was
+        time.tzset()
 
 
 # ------------------------------------------------------------------ WB
