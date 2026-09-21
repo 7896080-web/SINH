@@ -1,4 +1,4 @@
-{% if view != 'conflicts' and total is defined and total > rows|length %}
+{% if total is defined and total > rows|length %}
 <p class="help-text">Показаны первые {{ rows|length }} из {{ total }} строк отбора — страница не грузит весь справочник целиком. Уточните поиск, чтобы увидеть нужную, или выгрузите отбор в Excel: в файл уходит до {{ export_limit }} строк.</p>
 {% endif %}
 {% if view == 'conflicts' %}
