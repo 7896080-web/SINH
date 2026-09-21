@@ -17,6 +17,8 @@ SKU, сопоставленные между площадками и с 1С. К�
 поштучным по баркоду (см. matching.resolve_barcode) — денежный путь не
 меняется: каждый размер должен резолвиться своим баркодом.
 """
+from datetime import datetime, timedelta
+
 from collections import defaultdict
 
 from fastapi import APIRouter, Request, Depends, Query
@@ -26,6 +28,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.templating import templates as shared_templates
 from app.dependencies import get_current_user
+from app.timeutils import now_utc
 from app.models import Barcode, Platform, PlatformAccount, PlatformCatalogItem, User
 from app.excel_utils import build_xlsx_response
 
@@ -92,6 +95,43 @@ def _barcodes_1c_near(db: Session, catalog_barcodes: set[str]) -> list[tuple[str
     for start in range(0, len(uid_list), _IN_CHUNK):
         rows.extend(db.query(Barcode.barcode, Barcode.uid_1c).filter(
             Barcode.uid_1c.in_(uid_list[start:start + _IN_CHUNK])).all())
+    return rows
+
+
+# Сколько живёт собранная картина кластеров.
+#
+# Сборка читает ВЕСЬ каталог площадок и связанные с ним баркоды 1С и строит по
+# ним union-find. Замер 21.09 на боевом масштабе (16 127 карточек, 154 232
+# баркода): 3,5 с и 52 МБ на КАЖДЫЙ запрос. А запросов много: фильтры на странице
+# живые, htmx дёргает фрагмент через 400 мс после набора, то есть поиск из шести
+# букв — это несколько полных пересборок подряд, и всё это время веб-служба
+# занята ими, а она же принимает заказы с площадок.
+#
+# После кэша: первый заход те же 3,4 с, следующие — 0,05 с и 1 МБ.
+#
+# Минута безопасна: каталог меняется не сам по себе, а загрузкой — кнопкой со
+# страницы «Мэппинг» или суточным заданием, — и оба пути кэш сбрасывают
+# (`clear_clusters_cache`). То есть минута — это предел для случая, когда каталог
+# поменяли МИМО приложения, прямо в базе.
+CLUSTERS_CACHE_TTL = timedelta(minutes=1)
+
+_clusters_cache: tuple[datetime, list[dict]] | None = None
+
+
+def clear_clusters_cache() -> None:
+    """Забыть собранную картину. Зовётся после загрузки каталога кабинета: иначе
+    оператор, нажавший «Загрузить каталог», минуту видел бы прежнее."""
+    global _clusters_cache
+    _clusters_cache = None
+
+
+def _clusters(db: Session) -> list[dict]:
+    """Кластеры из кэша или собранные заново."""
+    global _clusters_cache
+    if _clusters_cache is not None and now_utc() - _clusters_cache[0] <= CLUSTERS_CACHE_TTL:
+        return _clusters_cache[1]
+    rows = _build_clusters(db)
+    _clusters_cache = (now_utc(), rows)
     return rows
 
 
@@ -178,7 +218,7 @@ def _build_clusters(db: Session) -> list[dict]:
 
 
 def _filtered(db: Session, q: str, coverage: str, mapped: str) -> list[dict]:
-    rows = _build_clusters(db)
+    rows = _clusters(db)
 
     if coverage == "multi":
         rows = [r for r in rows if r["platform_count"] >= 2]
