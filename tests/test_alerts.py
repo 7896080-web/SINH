@@ -338,3 +338,73 @@ def test_the_test_button_does_not_eat_the_next_real_alarm(db, channel, monkeypat
     assert db.query(AlertState).count() == 0
 
     assert alerts.run_alert_cycle(db)["action"] == "alarm"
+
+
+# --------------------------------------------------------------------------
+# Внешний сторож: единственное, что переживает смерть воркера
+# --------------------------------------------------------------------------
+
+def test_the_watchdog_is_pinged_on_every_run(monkeypatch):
+    """Задание `alerts` живёт ВНУТРИ воркера.
+
+    Умер воркер — умерли и уведомления, и главный сценарий («ночью обе службы
+    легли») остался бы непокрытым. Изнутри это не решается в принципе: процесс,
+    которого нет, не может сообщить, что его нет. Поэтому обратная полярность —
+    регулярно говорим «жив», а молчание разбирает внешний сервис.
+    """
+    called = []
+
+    class Resp:
+        def raise_for_status(self):
+            pass
+
+    monkeypatch.setenv("ALERT_HEARTBEAT_URL", "https://hc.example/ping/abc")
+    monkeypatch.setattr(alerts.requests, "get",
+                        lambda url, **kw: (called.append(url), Resp())[1])
+
+    assert alerts.ping_alive() == ""
+    assert called == ["https://hc.example/ping/abc"]
+
+
+def test_no_watchdog_configured_is_not_an_error(monkeypatch):
+    """Сторож необязателен: без него работают обычные уведомления."""
+    monkeypatch.delenv("ALERT_HEARTBEAT_URL", raising=False)
+    assert alerts.ping_alive() == ""
+
+
+def test_a_silent_watchdog_is_reported(monkeypatch):
+    """Сторож, о котором мы думаем, что он сторожит, хуже отсутствующего."""
+    monkeypatch.setenv("ALERT_HEARTBEAT_URL", "https://hc.example/ping/abc")
+
+    def boom(url, **kw):
+        raise RuntimeError("сеть недоступна")
+
+    monkeypatch.setattr(alerts.requests, "get", boom)
+
+    problem = alerts.ping_alive()
+
+    assert "сеть недоступна" in problem
+
+
+def test_the_watchdog_is_pinged_even_when_the_system_is_broken(db, monkeypatch):
+    """Сторож отвечает на ОДИН вопрос — «жив ли воркер».
+
+    Пропусти он пинг из-за находок внутри — человек получил бы от сторожа
+    сигнал, неотличимый от упавшей службы, а о настоящей беде ему и так скажет
+    обычное уведомление.
+    """
+    from app.workers import scheduler
+
+    _healthy(db)
+    _critical_finding(db)
+    pings = []
+
+    monkeypatch.setattr(alerts, "ping_alive", lambda: (pings.append(1), "")[1])
+    monkeypatch.setattr(alerts, "configured_channels", lambda: ["telegram"])
+    monkeypatch.setattr(alerts, "deliver", lambda s, b: (["telegram"], []))
+    monkeypatch.setattr(scheduler, "SessionLocal", lambda: db)
+    monkeypatch.setattr(db, "close", lambda: None)
+
+    scheduler.job_alerts()
+
+    assert pings == [1]
