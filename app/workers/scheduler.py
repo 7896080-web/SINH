@@ -797,7 +797,10 @@ def job_backup():
             _heartbeat(db, "backup", True)
             return
 
-        result = make_backup()
+        # Сессию передаём свою: папку зеркала задаёт страница настроек, и
+        # без неё `make_backup` открыл бы вторую — лишнее соединение к той же
+        # базе ровно в тот момент, когда с неё снимается копия.
+        result = make_backup(db=db)
         if result.ok:
             logger.info("бэкап: %s, %.1f МБ, удалено старых %d",
                         result.path, result.size_bytes / 1024 / 1024, result.removed)

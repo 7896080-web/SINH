@@ -61,8 +61,8 @@ MIRROR_DIR_ENV = "BACKUP_MIRROR_DIR"
 # недельных — квартал. Но это ВТОРАЯ ПЛОЩАДКА, а не глубина хранения: зеркало
 # повторяет то, что есть, и удаление здесь идёт по своему правилу, а не следом
 # за локальным.
-MIRROR_KEEP_DAILY = int(os.environ.get("BACKUP_MIRROR_KEEP_DAILY", "30"))
-MIRROR_KEEP_WEEKLY = int(os.environ.get("BACKUP_MIRROR_KEEP_WEEKLY", "12"))
+MIRROR_KEEP_DAILY = 30
+MIRROR_KEEP_WEEKLY = 12
 
 # Сколько храним. Ежедневных две недели — этого хватает, чтобы заметить порчу
 # данных, которую видно не сразу (перепутанный мэппинг, неверный импорт).
@@ -311,13 +311,64 @@ def _copy_database(source: Path, target: Path) -> None:
         src.close()
 
 
-def mirror_dir() -> Path | None:
+def _setting(db, name: str, default: str = "") -> str:
+    """Значение настройки: страница «Уведомления», иначе `.env`, иначе умолчание.
+
+    `db` передаёт тот, у кого сессия уже есть (суточное задание). Её нет у
+    `scripts/backup_db.py` — и это не оплошность вызывающего, а его смысл: этот
+    скрипт запускают руками ИМЕННО ТОГДА, когда что-то идёт не так, и требовать
+    от него исправной базы значило бы отнять копию в единственный час, когда она
+    по-настоящему нужна. Саму базу он копирует файлом через `sqlite3`, минуя
+    SQLAlchemy, поэтому снять копию он может и с той базы, которую приложение
+    открыть не в состоянии (нет `SECRETS_ENCRYPTION_KEY`, побит пул, занят порт).
+
+    Отсюда двойная страховка: сессию заводим свою, а любую неудачу на этом пути
+    ГЛОТАЕМ и читаем окружение. Хуже недоступной настройки только копия, которая
+    из-за неё не снялась.
+    """
+    if db is not None:
+        try:
+            from app import settings_store
+
+            return settings_store.get(db, name)
+        except Exception:                            # noqa: BLE001 — см. докстринг
+            pass
+    else:
+        try:
+            from app import settings_store
+            from app.database import SessionLocal
+
+            own = SessionLocal()
+            try:
+                return settings_store.get(own, name)
+            finally:
+                own.close()
+        except Exception:                            # noqa: BLE001 — см. докстринг
+            pass
+    return (os.environ.get(name) or default).strip()
+
+
+def _setting_int(db, name: str, default: int) -> int:
+    """Число из настройки. Мусор и ноль — это умолчание, а не «не хранить».
+
+    Опечатка в поле не должна уметь стереть зеркало целиком: ноль у `prune`
+    означал бы «оставить ноль копий», то есть удалить всё, ради чего вторая
+    площадка и заводилась.
+    """
+    try:
+        value = int(_setting(db, name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+def mirror_dir(db=None) -> Path | None:
     """Папка зеркала, если настроена."""
-    raw = (os.environ.get(MIRROR_DIR_ENV) or "").strip()
+    raw = _setting(db, MIRROR_DIR_ENV)
     return Path(raw) if raw else None
 
 
-def mirror_backup(source: Path, directory: Path | None = None) -> str:
+def mirror_backup(source: Path, directory: Path | None = None, db=None) -> str:
     """Положить ГОТОВУЮ копию на вторую площадку. Пустая строка — всё хорошо.
 
     Копируем через временное имя и переименовываем: под финальным именем файл
@@ -337,7 +388,12 @@ def mirror_backup(source: Path, directory: Path | None = None) -> str:
     молча тоже нельзя: зеркало, о котором мы думаем, что оно есть, хуже
     отсутствующего.
     """
-    directory = directory or mirror_dir()
+    # `db` передаём дальше ОБЯЗАТЕЛЬНО. Забыв его здесь, мы получили бы самый
+    # неприятный из возможных исходов: папку, заданную на странице, зеркало не
+    # видит, путь берётся из окружения, а при пустом окружении функция
+    # возвращает «всё хорошо» — бэкап зелёный, `mirror_error` пуст, находка
+    # отчёта молчит, и второй площадки просто нет. Поймано тестом.
+    directory = directory or mirror_dir(db)
     if directory is None:
         return ""
     try:
@@ -353,8 +409,9 @@ def mirror_backup(source: Path, directory: Path | None = None) -> str:
         return f"{type(e).__name__}: {e}"[:200]
 
     try:
-        prune(directory, keep_daily=MIRROR_KEEP_DAILY,
-              keep_weekly=MIRROR_KEEP_WEEKLY)
+        prune(directory,
+              keep_daily=_setting_int(db, "BACKUP_MIRROR_KEEP_DAILY", MIRROR_KEEP_DAILY),
+              keep_weekly=_setting_int(db, "BACKUP_MIRROR_KEEP_WEEKLY", MIRROR_KEEP_WEEKLY))
     except Exception as e:                           # noqa: BLE001
         # Копия УЖЕ в зеркале — это главное. Неубранные старые файлы место
         # занимают, но ничего не ломают, а уронить из-за них доставленную копию
@@ -364,7 +421,7 @@ def mirror_backup(source: Path, directory: Path | None = None) -> str:
 
 
 def make_backup(database_url: str | None = None,
-                directory: Path | None = None) -> BackupResult:
+                directory: Path | None = None, db=None) -> BackupResult:
     """Снять копию, проверить её и подчистить старые.
 
     Битая копия НЕ удаляется и остаётся на диске: она может пригодиться для
@@ -420,7 +477,7 @@ def make_backup(database_url: str | None = None,
     # Зеркало — ПОСЛЕ проверки: в облако уезжает только копия, которую мы уже
     # прочитали и признали целой. Непроверенная копия на второй площадке — это
     # две надежды вместо одной.
-    mirror_error = mirror_backup(target)
+    mirror_error = mirror_backup(target, db=db)
     return BackupResult(path=str(target), size_bytes=size, checked=True,
                         removed=removed, mirror_error=mirror_error)
 

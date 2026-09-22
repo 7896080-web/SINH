@@ -296,3 +296,131 @@ def test_clearing_an_env_value_is_a_change_and_reaches_the_log(db, monkeypatch):
 
     # А повтор того же действия изменением уже не считается.
     assert settings_store.set_value(db, "ALERT_EMAIL_TO", "") is False
+
+
+# --------------------------------------------------------------------------
+# Зеркало резервных копий
+# --------------------------------------------------------------------------
+
+def test_the_mirror_folder_is_taken_from_the_page(db, tmp_path, monkeypatch):
+    """Ради этого перенос и делался: правка действует без перезапуска службы."""
+    from app import backup
+
+    monkeypatch.delenv("BACKUP_MIRROR_DIR", raising=False)
+    assert backup.mirror_dir(db) is None
+
+    settings_store.set_value(db, "BACKUP_MIRROR_DIR", str(tmp_path / "cloud"))
+    db.commit()
+
+    assert backup.mirror_dir(db) == tmp_path / "cloud"
+
+
+def test_clearing_the_mirror_does_not_resurrect_the_env_path(db, tmp_path, monkeypatch):
+    """Та же ловушка, что и с каналами, но цена другая.
+
+    Вернись путь из `.env`, копии продолжили бы уезжать в папку, которую человек
+    со страницы убрал, — а он при этом видел бы пустое поле и считал, что
+    зеркала нет. Ошибка в обе стороны опасна: и «пишем туда, куда не просили»,
+    и «думаем, что не пишем».
+    """
+    from app import backup
+
+    monkeypatch.setenv("BACKUP_MIRROR_DIR", str(tmp_path / "из-файла"))
+    settings_store.set_value(db, "BACKUP_MIRROR_DIR", "")
+    db.commit()
+
+    assert backup.mirror_dir(db) is None
+
+
+def test_a_backup_actually_lands_in_the_mirror_set_on_the_page(db, tmp_path, monkeypatch):
+    """Проверяем не настройку, а её следствие: файл на второй площадке."""
+    from app import backup
+
+    import sqlite3
+
+    source = tmp_path / "src.db"
+    conn = sqlite3.connect(source)
+    # Таблица именно `products`: копия проверяется не только `integrity_check`,
+    # но и чтением товаров — непрочитанная копия это надежда, а не копия.
+    conn.execute("CREATE TABLE products (uid_1c TEXT)")
+    conn.execute("INSERT INTO products VALUES ('u1')")
+    conn.commit()
+    conn.close()
+
+    local = tmp_path / "backups"
+    cloud = tmp_path / "cloud"
+    cloud.mkdir()
+    monkeypatch.delenv("BACKUP_MIRROR_DIR", raising=False)
+    settings_store.set_value(db, "BACKUP_MIRROR_DIR", str(cloud))
+    db.commit()
+
+    result = backup.make_backup(database_url=f"sqlite:///{source}",
+                                directory=local, db=db)
+
+    assert result.ok and not result.mirror_error, result.error or result.mirror_error
+    copies = list(cloud.glob("sync_admin-*.db"))
+    assert len(copies) == 1
+    # Временное имя не должно остаться: уборка ищет `sync_admin-*.db` и файлов
+    # `.part` не видит — они копились бы вечно.
+    assert not list(cloud.glob("*.part"))
+
+
+def test_a_nonsense_retention_number_does_not_wipe_the_mirror(db, tmp_path):
+    """Ноль у `prune` означал бы «оставить ноль копий» — то есть удалить всё.
+
+    Ровно то, ради чего вторая площадка и заводилась. Опечатка в поле не должна
+    уметь этого сделать.
+    """
+    from app import backup
+
+    for bad in ("0", "-5", "", "тридцать"):
+        settings_store.set_value(db, "BACKUP_MIRROR_KEEP_DAILY", bad)
+        db.commit()
+        assert backup._setting_int(db, "BACKUP_MIRROR_KEEP_DAILY",
+                                   backup.MIRROR_KEEP_DAILY) == backup.MIRROR_KEEP_DAILY, bad
+
+    settings_store.set_value(db, "BACKUP_MIRROR_KEEP_DAILY", "7")
+    db.commit()
+    assert backup._setting_int(db, "BACKUP_MIRROR_KEEP_DAILY", 30) == 7
+
+
+def test_the_manual_script_still_works_when_the_database_is_unreachable(monkeypatch,
+                                                                       tmp_path):
+    """`scripts/backup_db.py` запускают ИМЕННО когда что-то пошло не так.
+
+    Требовать от него исправной базы значило бы отнять копию в единственный час,
+    когда она по-настоящему нужна: саму базу он копирует файлом, минуя
+    SQLAlchemy, и снимет её даже с той, которую приложение открыть не может.
+    Поэтому сбой на пути к настройке ГЛОТАЕТСЯ, а путь берётся из окружения.
+    """
+    from app import backup
+    import app.database as database
+
+    def boom():
+        raise RuntimeError("база недоступна")
+
+    monkeypatch.setattr(database, "SessionLocal", boom)
+    monkeypatch.setenv("BACKUP_MIRROR_DIR", str(tmp_path / "из-файла"))
+
+    assert backup.mirror_dir() == tmp_path / "из-файла"
+
+
+def test_the_page_shows_where_copies_land_and_does_not_let_it_be_changed(
+        logged_in_client, web_db):
+    """`BACKUP_DIR` полем не выставлен намеренно.
+
+    Указать туда папку облака нельзя — SQLite пишет в целевой файл на месте,
+    рядом мелькают `-wal`/`-shm`, а клиент синхронизации держит их открытыми.
+    Текстовое поле ровно к этому и приглашает, а последствие отложенное.
+    """
+    page = logged_in_client.get("/notifications").text
+
+    assert "BACKUP_MIRROR_DIR" in page
+    assert 'value="BACKUP_DIR"' not in page
+
+    logged_in_client.post("/notifications/save",
+                          data={"name": "BACKUP_DIR", "value": r"C:\cloud"},
+                          follow_redirects=True)
+    from app.models import AppSetting
+    assert web_db.query(AppSetting).filter(
+        AppSetting.key == "BACKUP_DIR").count() == 0

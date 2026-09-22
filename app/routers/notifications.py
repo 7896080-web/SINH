@@ -1,5 +1,9 @@
 """Страница «Уведомления» — куда система зовёт человека, когда сама не справилась.
 
+Там же зеркало резервных копий. Соседство не случайное: обе настройки отвечают
+на один вопрос — «что будет, когда всё пойдёт не так», — и обе до сих пор жили
+в файле, то есть правились раз и больше не проверялись.
+
 Сделана по образцу «API-ключей» и ровно по той же причине: доступ, от которого
 зависит работа, человек должен заводить в интерфейсе, а не в файле на сервере.
 Разница только в том, куда ведут ключи — там в кабинет площадки, здесь в чат
@@ -41,12 +45,16 @@ templates = shared_templates
 def notifications_page(request: Request, db: Session = Depends(get_db),
                        user: User = Depends(get_current_user)):
     from app.alerts import telegram_configured, email_configured
+    from app.backup import backup_dir
 
     return templates.TemplateResponse(request, "notifications.html", {
         "request": request, "current_user": user, "active_page": "notifications",
         "cards": settings_store.as_cards(db),
         "telegram_on": telegram_configured(db),
         "email_on": email_configured(db),
+        # Только для чтения: путь, куда копия снимается ПЕРВОЙ. Менять его
+        # отсюда нельзя — см. `settings_store.BACKUP_FIELDS`.
+        "backup_dir": backup_dir(),
         "flash": pop_flash(request),
     })
 

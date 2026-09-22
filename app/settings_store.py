@@ -94,7 +94,29 @@ COMMON_FIELDS = [
           hint="Через сколько повторить сообщение о той же никуда не девшейся поломке."),
 ]
 
-ALL_FIELDS = TELEGRAM_FIELDS + EMAIL_FIELDS + COMMON_FIELDS
+# Зеркало копий базы. Здесь, а не в `.env`, ровно по той же причине, что и
+# каналы: файл читается один раз на старте, и правка без перезапуска службы не
+# действует — а человек при этом уверен, что вторая площадка у него есть.
+#
+# `BACKUP_DIR` (куда копия снимается СНАЧАЛА) полем НЕ выставлен намеренно.
+# Указать туда папку облака нельзя: `Connection.backup()` пишет прямо в целевой
+# файл, рядом мелькают `-wal`/`-shm`, а клиент синхронизации держит файлы
+# открытыми и мешает уборке. Текстовое поле ровно к этому и приглашает, а
+# последствие отложенное — копии как будто есть. Страница показывает этот путь
+# только для чтения.
+BACKUP_FIELDS = [
+    Field("BACKUP_MIRROR_DIR", "Папка зеркала",
+          placeholder=r"C:\YandexDisk\sync_admin_backups",
+          hint="Папка синхронизации облака, сетевая шара или второй диск. "
+               "Пусто — зеркала нет, и все копии лежат на том же диске, что и база."),
+    Field("BACKUP_MIRROR_KEEP_DAILY", "Хранить ежедневных", placeholder="30",
+          hint="Сколько последних календарных дней держать в зеркале."),
+    Field("BACKUP_MIRROR_KEEP_WEEKLY", "Хранить недельных", placeholder="12",
+          hint="Плюс по одной копии на неделю — они ловят порчу данных, "
+               "замеченную поздно."),
+]
+
+ALL_FIELDS = TELEGRAM_FIELDS + EMAIL_FIELDS + COMMON_FIELDS + BACKUP_FIELDS
 BY_NAME = {f.name: f for f in ALL_FIELDS}
 
 
@@ -171,6 +193,7 @@ def as_cards(db: Session) -> list[dict]:
         ("telegram", "Telegram", TELEGRAM_FIELDS),
         ("email", "Почта", EMAIL_FIELDS),
         ("common", "Общие настройки", COMMON_FIELDS),
+        ("backup", "Зеркало резервных копий", BACKUP_FIELDS),
     ]
     cards = []
     for key, title, fields in groups:
