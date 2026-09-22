@@ -154,3 +154,78 @@ def test_the_mirror_keeps_its_own_depth(live_db):
 
     assert left > backup.KEEP_DAILY, "в зеркале держим глубже, чем локально"
     assert left <= backup.MIRROR_KEEP_DAILY + backup.MIRROR_KEEP_WEEKLY
+
+
+def test_a_mirror_pointing_at_the_backup_folder_is_refused(live_db, monkeypatch):
+    """«Вторая площадка», совпадающая с первой, — не площадка.
+
+    Отказ диска унесёт обе разом, то есть защита не работает вовсе. А выглядит
+    это исправнее исправного: файл «доезжает» (переписывает сам себя), ошибки
+    нет, `mirror_error` пуст, находка отчёта молчит, а скрипт бодро печатает
+    «зеркало: <путь>». Сличить два пути в разных разделах страницы — занятие
+    для того, кто и не ошибётся.
+    """
+    monkeypatch.setenv("BACKUP_MIRROR_DIR", str(live_db / "backups"))
+
+    result = backup.make_backup()
+
+    assert result.ok, "сам бэкап этим не портится — копия снята и проверена"
+    assert "совпадает с каталогом копий" in result.mirror_error
+
+
+def test_the_manual_script_says_when_there_is_no_second_site(live_db, monkeypatch,
+                                                             capsys):
+    """Молчание не должно означать «всё хорошо».
+
+    Скрипт запускают именно чтобы УБЕДИТЬСЯ: ненастроенная площадка обязана
+    выглядеть иначе, чем настроенная и работающая.
+    """
+    import importlib
+
+    monkeypatch.delenv("BACKUP_MIRROR_DIR", raising=False)
+    monkeypatch.delenv("BACKUP_RCLONE_REMOTE", raising=False)
+
+    module = importlib.import_module("scripts.backup_db")
+    assert module.main() == 0
+
+    printed = capsys.readouterr().out
+    assert "зеркало (папка): не настроено" in printed
+    assert "зеркало (облако): не настроено" in printed
+    assert "второй площадки нет" in printed
+
+
+def test_the_manual_script_names_both_second_sites(live_db, monkeypatch, capsys):
+    """Настроенное облако обязано быть НАЗВАНО.
+
+    Раньше про него не было ни слова: молчание одинаково значило «выгрузили» и
+    «выгружать некуда».
+    """
+    import importlib
+    import subprocess
+
+    monkeypatch.setenv("BACKUP_RCLONE_REMOTE", "yandex:backups")
+    monkeypatch.setenv("BACKUP_RCLONE_EXE", str(live_db / "rclone.exe"))
+    monkeypatch.setenv("BACKUP_RCLONE_CONFIG", str(live_db / "rclone.conf"))
+
+    def fake_run(command, capture_output=True, text=True, timeout=None):
+        sub = command[command.index("--log-level") + 2]
+        if sub == "lsjson":
+            name = os.path.basename(command[-1])
+            # Отвечаем так, будто на той стороне лежит ровно то, что послали.
+            import json as _json
+            src = live_db / "backups"
+            files = sorted(src.glob("sync_admin-*.db"))
+            return subprocess.CompletedProcess(
+                command, 0,
+                _json.dumps([{"Name": f.name, "Size": f.stat().st_size}
+                             for f in files]), "")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    module = importlib.import_module("scripts.backup_db")
+    assert module.main() == 0
+
+    printed = capsys.readouterr().out
+    assert "зеркало (облако): yandex:backups" in printed
+    assert "доставлена и проверена" in printed
