@@ -17,6 +17,40 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.chdir(ROOT)
 
+# --- Своя база, и только своя. ДО первого импорта из `app`. ---------------
+#
+# Скрипт не мокает базу: он заводит боевые по типу объекты (`PlatformAccount`,
+# `Product`, заказы через `process_new_order`, записи очереди) и зовёт настоящие
+# функции. `DATABASE_URL` раньше не подменялся вовсе, а `app/__init__.py` вне
+# pytest читает `.env` — на боевом сервере это живая `C:/sync_admin/sync_admin.db`.
+#
+# Дальше начиналось непоправимое: `build_task_batch` забирает ВСЕ задания в
+# `pending` с `is_test=False`, до пятисот строк, помечает их `sent` и коммитит, а
+# содержимое скрипт никуда не публикует — каталог обмена у него временный. Для
+# `CANCEL_MOVEMENT` это без обратного хода: автоповтор их не берёт, второго
+# задания `existing_cancel_task` не даст, обратного документа в 1С не будет
+# никогда. То есть один запуск «аудита» на сервере тихо съедал бы настоящие
+# задания 1С.
+#
+# Отсюда два предохранителя. Свой файл базы задаём принудительно; а если кто-то
+# указал `DATABASE_URL` руками — требуем, чтобы он был явно тестовым, тем же
+# правилом, что и `tests/conftest.py`. Отказ, а не молчаливая подмена: человек,
+# задавший переменную, должен узнать, что его не послушались.
+_own_url = "sqlite:///./e2e_audit.db"
+_given = os.environ.get("DATABASE_URL")
+if _given and _given != _own_url:
+    _p = _given[len("sqlite:///"):].replace("\\", "/").lower() \
+        if _given.startswith("sqlite:///") else ""
+    if not (_p and (_p == ":memory:" or "test" in os.path.basename(_p))):
+        sys.exit(
+            "DATABASE_URL указывает на НЕ тестовую базу: " + _given + "\n"
+            "Этот скрипт заводит боевые по типу объекты и ЗАБИРАЕТ настоящие "
+            "задания 1С из очереди, никуда их не публикуя. Уберите переменную "
+            "(в PowerShell: Remove-Item Env:DATABASE_URL) и запустите заново."
+        )
+else:
+    os.environ["DATABASE_URL"] = _own_url
+
 FAIL = []
 STEP = [0]
 

@@ -113,7 +113,24 @@ UNKNOWN_SKU_MARK = "площадка не знает этот sku"
 # адресует площадка. Следствие то же, что у неизвестного sku, поэтому и находка
 # та же: чинить надо мэппинг, а не связь.
 NO_CARD_MARK = "нет карточки в каталоге кабинета"
+# Тексты остаются ТОЛЬКО ради записей, лежащих в базе с прежних времён: признак
+# теперь несёт колонка `DispatchQueueItem.card_missing`, которую ставит рассылка
+# по ответу площадки. Подстроками это не работало: у Kit слова другие
+# («площадка не знает такой ТОВАР (variant_id …)», «карточка товара в архиве»),
+# а Ozon кладёт в `detail` сообщение площадки по-английски — ни одна русская
+# метка туда не попадала. Все такие записи становились КРИТИЧНОЙ находкой
+# «рассылка не доехала: остаток списан, площадка продаёт то, чего нет» — при
+# том, что продавать там нечего вовсе. И навсегда: запись терминальная,
+# успешной отправки по паре не будет, снять её нечем ни `latest_queue_ids`, ни
+# `_not_overtaken_by_a_later_send`, ни `_only_live_pairs`.
 CARD_MISSING_MARKS = (UNKNOWN_SKU_MARK, NO_CARD_MARK)
+
+
+def _card_missing_clause():
+    """«Карточки нет» — по колонке, а для старых записей ещё и по тексту."""
+    return or_(DispatchQueueItem.card_missing.is_(True),
+               *[DispatchQueueItem.last_error.like(f"%{mark}%")
+                 for mark in CARD_MISSING_MARKS])
 
 
 def _error_gist(text: str | None, limit: int = 160) -> str:
@@ -242,8 +259,7 @@ def _q_unknown_sku(db: Session) -> list[DispatchQueueItem]:
     rows = db.query(DispatchQueueItem).filter(
         DispatchQueueItem.status == DispatchStatus.error,
         DispatchQueueItem.is_test.is_(False),
-        or_(*[DispatchQueueItem.last_error.like(f"%{mark}%")
-              for mark in CARD_MISSING_MARKS]),
+        _card_missing_clause(),
     ).all()
     # Пара товар+кабинет считается один раз: после двух прогонов массовой
     # переотправки по одному и тому же нерешённому товару лежит две записи, а
@@ -288,10 +304,12 @@ def _q_dispatch_errors(db: Session) -> list[DispatchQueueItem]:
     rows = db.query(DispatchQueueItem).filter(
         DispatchQueueItem.status == DispatchStatus.error,
         DispatchQueueItem.is_test.is_(False),
-        # `or_` с проверкой на NULL обязателен: в SQL `NOT LIKE` по пустому полю
-        # даёт NULL, то есть «не истина», и запись с незаполненной ошибкой
-        # выпала бы из отчёта ВООБЩЕ — ни сюда, ни в находку про неизвестный sku.
-        # Молча потерять ошибку рассылки хуже, чем показать её не в той группе.
+        # Ровно дополнение к `_card_missing_clause`. `or_` с проверкой на NULL
+        # обязателен: в SQL `NOT LIKE` по пустому полю даёт NULL, то есть «не
+        # истина», и запись с незаполненной ошибкой выпала бы из отчёта ВООБЩЕ —
+        # ни сюда, ни в находку про неизвестный sku. Молча потерять ошибку
+        # рассылки хуже, чем показать её не в той группе.
+        DispatchQueueItem.card_missing.is_(False),
         or_(DispatchQueueItem.last_error.is_(None),
             and_(*[~DispatchQueueItem.last_error.like(f"%{mark}%")
                    for mark in CARD_MISSING_MARKS])),
@@ -471,6 +489,41 @@ def _only_latest_send(db: Session,
             and latest.get((r.uid_1c, r.account_id)) == r.sent_at]
 
 
+# Сколько строк расхождения поднимаем за раз. Предел нужен — необъяснённость
+# каждой строки проверяется отдельным запросом (`_sales_between`), — но он
+# стоит ПОСЛЕ отсева, а не до. Раньше `.limit(200)` шёл до `_only_latest_send`
+# и до отбрасывания продаж, поэтому `count` не мог превысить двухсот НИ ПРИ
+# КАКОМ числе расхождений, а само обрезание ничем не помечалось: отчёт молча
+# показывал двести и выглядел точным. Речь о единственной находке, которая
+# ловит перезапись наших остатков второй системой.
+DIVERGENCE_SCAN_LIMIT = 2000
+
+
+def _q_platform_divergence(db: Session) -> list[DispatchQueueItem]:
+    """Запрос отдельно от находки: те же строки нужны и полному списку.
+
+    Разойдись они — список показывал бы не то, что насчитала находка.
+    """
+    rows = db.query(DispatchQueueItem).filter(
+        DispatchQueueItem.verified_at.isnot(None),
+        DispatchQueueItem.verified_quantity.isnot(None),
+        DispatchQueueItem.sent_quantity.isnot(None),
+        DispatchQueueItem.verified_quantity != DispatchQueueItem.sent_quantity,
+        DispatchQueueItem.is_test.is_(False),
+    ).order_by(DispatchQueueItem.verified_at.desc()).limit(DIVERGENCE_SCAN_LIMIT).all()
+    rows = _only_latest_send(db, rows)
+    # Площадка сама уменьшает остаток, когда товар покупают, — и между нашей
+    # отправкой и сверкой проходит полчаса. 20.09 на бою обе «находки» были
+    # ровно этим: отправили 39, площадка держит 38, отправили 29 — держит 28.
+    # Называть продажу «наше число кто-то переписал» значит звать человека
+    # разбирать штатную работу магазина, а отчёт, который зовёт зря, перестают
+    # читать. Поэтому падение, объяснённое принятыми заказами, отбрасываем;
+    # необъяснённое — оставляем, оно и есть расхождение.
+    return [r for r in rows
+            if r.verified_quantity > r.sent_quantity
+            or (r.sent_quantity - r.verified_quantity) > _sales_between(db, r)]
+
+
 def _check_platform_divergence(db: Session) -> Finding | None:
     """Площадка держит не то, что мы ей отправили.
 
@@ -487,24 +540,7 @@ def _check_platform_divergence(db: Session) -> Finding | None:
     отправка каждый раз отвечала успехом. Без такой сверки это видно только
     глазами и только если пойти смотреть.
     """
-    rows = db.query(DispatchQueueItem).filter(
-        DispatchQueueItem.verified_at.isnot(None),
-        DispatchQueueItem.verified_quantity.isnot(None),
-        DispatchQueueItem.sent_quantity.isnot(None),
-        DispatchQueueItem.verified_quantity != DispatchQueueItem.sent_quantity,
-        DispatchQueueItem.is_test.is_(False),
-    ).order_by(DispatchQueueItem.verified_at.desc()).limit(200).all()
-    rows = _only_latest_send(db, rows)
-    # Площадка сама уменьшает остаток, когда товар покупают, — и между нашей
-    # отправкой и сверкой проходит полчаса. 20.09 на бою обе «находки» были
-    # ровно этим: отправили 39, площадка держит 38, отправили 29 — держит 28.
-    # Называть продажу «наше число кто-то переписал» значит звать человека
-    # разбирать штатную работу магазина, а отчёт, который зовёт зря, перестают
-    # читать. Поэтому падение, объяснённое принятыми заказами, отбрасываем;
-    # необъяснённое — оставляем, оно и есть расхождение.
-    rows = [r for r in rows
-            if r.verified_quantity > r.sent_quantity
-            or (r.sent_quantity - r.verified_quantity) > _sales_between(db, r)]
+    rows = _q_platform_divergence(db)
     if not rows:
         return None
 
@@ -523,26 +559,48 @@ def _check_platform_divergence(db: Session) -> Finding | None:
         key="platform_divergence", level=level,
         title=f"Площадка держит не то, что мы отправили: {len(rows)} позиций",
         consequence=consequence,
-        count=len(rows), link="/diagnostics#accounts",
+        count=len(rows), link="/report/rows/platform_divergence",
         details=[f"{r.sent_sku}: отправили {r.sent_quantity}, площадка держит "
                  f"{r.verified_quantity} ({_age(r.verified_at)} назад)" for r in rows[:10]],
     )
 
 
 def _check_tasks_needing_review(db: Session) -> Finding | None:
-    """Задания 1С, исчерпавшие автоповтор, — решение за человеком."""
+    """Задания 1С, исчерпавшие автоповтор, — решение за человеком.
+
+    Следствие зависит от КОМАНДЫ, и одним текстом на всех его описывать нельзя.
+    Открытое `CREATE_MOVEMENT` считается «в пути» со знаком плюс: остаток
+    занижен, наружу уходит меньше, чем есть. Открытое `CANCEL_MOVEMENT` — со
+    знаком минус: остаток ЗАВЫШЕН, наружу уходит БОЛЬШЕ, то есть прямой
+    оверселл, и это противоположный случай. В разбор попадает любая команда,
+    кроме `CREATE_MOVEMENT` (автоповтор берёт только его), так что отмен здесь
+    не «иногда», а по построению.
+
+    Раньше находка давала одно следствие на всех — по созданию, — а `details`
+    команду не называли вовсе, так что отличить было нельзя. Правильный текст
+    при этом уже лежал рядом, в `_stuck_rows` на «Диагностике»: расходились три
+    текста про одну сущность, и человек, читающий их буквально, перестаёт верить
+    всем трём.
+    """
     from app.workers.ftp_channel import tasks_needing_review   # локально: цикл импортов
 
     rows = tasks_needing_review(db)
     if not rows:
         return None
+    cancels = [t for t in rows if t.command == "CANCEL_MOVEMENT"]
+    consequence = ("Пока решение не принято, эти единицы считаются «в пути»: остаток "
+                   "занижен, и наружу уходит меньше товара, чем есть на складе.")
+    if cancels:
+        consequence += (f" Из них отмен: {len(cancels)} — у них знак ОБРАТНЫЙ: "
+                        f"остаток завышен, наружу уходит больше, чем есть, "
+                        f"то есть прямой оверселл.")
     return Finding(
         key="tasks_needing_review", level=CRITICAL,
         title=f"Заданий 1С ждут ручного разбора: {len(rows)}",
-        consequence="Пока решение не принято, эти единицы считаются «в пути»: остаток "
-                    "занижен, и наружу уходит меньше товара, чем есть на складе.",
+        consequence=consequence,
         count=len(rows), link="/diagnostics#stuck-tasks",
-        details=[f"заказ {t.order_id}, {t.barcode}, {t.quantity} шт" for t in rows[:10]],
+        details=[f"{t.command}, заказ {t.order_id}, {t.barcode}, {t.quantity} шт"
+                 for t in rows[:10]],
     )
 
 
@@ -921,33 +979,66 @@ def _check_open_stock_date(db: Session) -> Finding | None:
 
 
 def _check_mapping_conflicts(db: Session) -> Finding | None:
-    """Баркоды с площадок, которых нет в 1С.
+    """Баркоды, по которым ПРИШЁЛ ЗАКАЗ, а разнести его не на что.
 
-    Это НЕ «потенциальная проблема»: строка `MappingConflict` заводится в момент,
-    когда по баркоду пришёл реальный заказ и разнести его не удалось, а
-    `attempts` считает, сколько раз это повторилось. То есть каждая строка здесь
-    — уже случившаяся непроведённая продажа.
+    Строка `MappingConflict` заводится из двух мест, и следствия у них разные.
+    `resolve_barcode` (приём заказа) — это уже случившаяся непроведённая
+    продажа, и `attempts` считает, сколько раз она повторилась. `catalog_sync`
+    (суточная выгрузка каталога) — это карточка площадки, которой нет в 1С:
+    заказов по ней ноль, товара в 1С нет, завышать нечего, и делать с ней надо
+    ровно то же, что со страницей «Есть на складе — нет на площадке», только с
+    другой стороны.
 
-    Поэтому уровень зависит от возраста, как у аномалий: свежий конфликт — это
+    До аудита 22.09 находка брала ВСЕ строки без разбора и печатала их число
+    как «заказов по ним N», обещая «остаток товара завышен ровно на эти
+    продажи». Про каталожные строки это была неправда, а уровень через трое
+    суток становился КРИТИЧНЫМ и не гас: чистит их только появление баркода в
+    1С, а суточная выгрузка заводит новые.
+
+    Различаем по счётчику заказов: `catalog_sync` ставит 0, `resolve_barcode`
+    увеличивает на каждом заказе. Строка, заведённая каталогом, переедет сюда
+    сама, как только по ней придёт первый заказ.
+
+    Уровень зависит от возраста, как у аномалий: свежий конфликт — это
     «сопоставьте на днях», а висящий сутками означает, что продажи по нему идут
-    мимо нас всё это время и остаток по товару завышен ровно на них. Раньше
-    находка всегда была WARNING и обещала, что «заказ уйдёт в аномалии», — он
-    туда не уходит (см. оговорку в `_check_open_anomalies`), и полагаться на тот
-    сигнал было не на что.
+    мимо нас всё это время.
     """
-    rows = db.query(MappingConflict).all()
+    rows = [c for c in db.query(MappingConflict).all() if (c.attempts or 0) > 0]
     if not rows:
         return None
     oldest = min((c.first_seen for c in rows if c.first_seen is not None), default=None)
     level = WARNING if oldest is None or oldest > now_utc() - ANOMALY_OLD else CRITICAL
-    attempts = sum(c.attempts or 1 for c in rows)
+    attempts = sum(c.attempts or 0 for c in rows)
     return Finding(
         key="mapping_conflicts", level=level,
-        title=f"Несопоставленных баркодов: {len(rows)} "
+        title=f"Несопоставленных баркодов с заказами: {len(rows)} "
               f"(заказов по ним {attempts}, старейшему {_age(oldest)})",
         consequence="По этим баркодам уже приходили заказы, и разнести их не на что: "
                     "остаток не списан, документа в 1С нет. Остаток товара завышен "
                     "ровно на эти продажи, и на площадки уходит больше, чем есть.",
+        count=len(rows), link="/mapping",
+    )
+
+
+def _check_catalog_cards_without_1c(db: Session) -> Finding | None:
+    """Карточка на площадке есть, а баркода в 1С нет — заказов по ней не было.
+
+    Ровно те строки `MappingConflict`, что завела суточная выгрузка каталога.
+    Продаж по ним не случилось ни одной, остаток ничем не завышен, оверселла
+    нет — поэтому и уровень свой, и текст свой. Вместе с заказными они давали
+    КРИТИЧНУЮ находку про несписанные продажи, которых не было.
+    """
+    rows = [c for c in db.query(MappingConflict).all() if (c.attempts or 0) == 0]
+    if not rows:
+        return None
+    oldest = min((c.first_seen for c in rows if c.first_seen is not None), default=None)
+    return Finding(
+        key="catalog_cards_without_1c", level=WARNING,
+        title=f"Карточек площадок без баркода в 1С: {len(rows)} "
+              f"(старейшей {_age(oldest)})",
+        consequence="Заказов по ним ещё не было, остаток ничем не завышен. Но как "
+                    "только заказ придёт, разнести его будет не на что — и это "
+                    "уже будет несписанная продажа. Разбирается сопоставлением.",
         count=len(rows), link="/mapping",
     )
 
@@ -1084,6 +1175,100 @@ def _check_backup_missing(db: Session) -> Finding | None:
     )
 
 
+def _check_orders_not_processed(db: Session) -> Finding | None:
+    """Опрос заказов не проводит заказы — и рапортует «ок».
+
+    Приём заказов ловит исключение по КАЖДОМУ заказу отдельно (иначе одна
+    сбойная строка обрывала бы весь проход), делает `db.rollback()` и идёт
+    дальше. Откат — обязателен, но он уносит и `SyncAnomaly`, и
+    `ProcessedOrder`: персистентного следа не остаётся НИГДЕ, кроме строки лога,
+    которая живёт до ротации. Предохранитель при этом сбрасывается намеренно —
+    гасить кабинет из-за одной битой строки хуже.
+
+    Отсюда состояние, в котором зелено всё: `/health` 200, «Диагностика» без
+    бейджей, отчёт молчит, — а заказы не проводятся. Следствие прямое: единица
+    продана на площадке, у нас не списана, перемещения в 1С нет, остаток завышен
+    и уезжает наружу.
+
+    Читаем `last_error` УСПЕШНОГО heartbeat — тот же приём, что у
+    `_check_suspicious_snapshot`. Разовый сбой стирается следующим циклом через
+    45 секунд, и находки не будет: она про устойчивый отказ, а не про мигание.
+    """
+    rows = [r for r in db.query(WorkerHeartbeat).filter(
+        WorkerHeartbeat.worker_name.like("poll_orders_account_%"),
+        WorkerHeartbeat.last_success.is_(True),
+    ).all() if r.last_error]
+    if not rows:
+        return None
+    return Finding(
+        key="orders_not_processed", level=CRITICAL,
+        title=f"Заказы не проводятся, кабинетов: {len(rows)}",
+        consequence="Заказ на площадке есть, у нас он не проведён: остаток не "
+                    "списан, перемещения в 1С нет. Остаток завышен ровно на эти "
+                    "продажи и уезжает на площадки — прямой оверселл. Само не "
+                    "пройдёт: цикл повторяет ту же строку каждые 45 секунд.",
+        count=len(rows), link="/diagnostics#workers",
+        details=[f"{r.worker_name}: {(r.last_error or '')[:200]}" for r in rows[:10]],
+    )
+
+
+def _check_verify_stock_broken(db: Session) -> Finding | None:
+    """Сверка остатков не прошла по кабинету — и прогон выглядел чистым.
+
+    `job_verify_stock` выбирал ветку по `diverged`, а он ноль и когда не
+    проверено НИЧЕГО. Сверка — единственное, что ловит перезапись наших
+    остатков второй системой; её тишина и её чистый результат выглядели
+    одинаково.
+    """
+    row = db.query(WorkerHeartbeat).filter(
+        WorkerHeartbeat.worker_name == "verify_stock",
+        WorkerHeartbeat.last_success.is_(True),
+    ).first()
+    if row is None or not row.last_error:
+        return None
+    return Finding(
+        key="verify_stock_broken", level=WARNING,
+        title=f"Сверка остатков: {row.last_error}",
+        consequence="По этим кабинетам никто не проверяет, осталось ли на "
+                    "площадке наше число. Расхождение с площадкой не будет "
+                    "найдено вовсе — а это единственная проверка, которая ловит "
+                    "перезапись наших остатков второй системой.",
+        count=1, link="/diagnostics#workers",
+    )
+
+
+def _check_truncated_catalog(db: Session) -> Finding | None:
+    """Выгрузку каталога оборвал защитный предел страниц.
+
+    Снимок при этом выглядит свежим: `fetched_at` у попавших обновлён, счётчик
+    показывает «загружено N», `_check_stale_catalog` смотрит `max(fetched_at)` и
+    претензий не имеет. Цена отложенная: по снимку считаются ключи отправки —
+    chrtId у WB, variant_id у Kit, артикул у Ozon, — и позиция, не попавшая в
+    огрызок, ключа не получит. У WB остаток уйдёт баркодом (приём которого WB
+    умеет отключить), у Kit и Ozon не уйдёт вовсе и закроется терминально.
+
+    Признак вычислялся и уезжал в heartbeat, но показать его было некому:
+    «Диагностика» рисует по кабинету только `poll_orders_account_*` и пять общих
+    имён, а `/health` при `last_success=True` текст не отдаёт.
+    """
+    rows = [r for r in db.query(WorkerHeartbeat).filter(
+        WorkerHeartbeat.worker_name.like("catalog_poll_account_%"),
+        WorkerHeartbeat.last_success.is_(True),
+    ).all() if r.last_error]
+    if not rows:
+        return None
+    return Finding(
+        key="truncated_catalog", level=WARNING,
+        title=f"Каталог выгружен не полностью, кабинетов: {len(rows)}",
+        consequence="Снимок каталога неполон, а по нему считаются ключи "
+                    "отправки. По не попавшим в него карточкам остаток уйдёт не "
+                    "тем ключом или не уйдёт вовсе — и выглядеть это будет как "
+                    "«нет карточки», а не как обрыв выгрузки.",
+        count=len(rows), link="/diagnostics#workers",
+        details=[f"{r.worker_name}: {(r.last_error or '')[:200]}" for r in rows[:10]],
+    )
+
+
 def _check_worker_failures(db: Session) -> Finding | None:
     """Воркеры, последний прогон которых закончился ошибкой."""
     rows = db.query(WorkerHeartbeat).filter(
@@ -1118,9 +1303,13 @@ CHECKS = (
     _check_open_anomalies,
     _check_open_stock_date,
     _check_mapping_conflicts,
+    _check_catalog_cards_without_1c,
     _check_negative_stock,
     _check_reconciliation_review,
     _check_backup_missing,
+    _check_orders_not_processed,
+    _check_verify_stock_broken,
+    _check_truncated_catalog,
     _check_worker_failures,
 )
 
@@ -1177,6 +1366,29 @@ def _rows_dispatch_errors(db: Session) -> list[list[str]]:
 
 def _rows_unknown_sku(db: Session) -> list[list[str]]:
     return _queue_rows(db, _q_unknown_sku(db))
+
+
+def _rows_platform_divergence(db: Session) -> list[list[str]]:
+    rows = _q_platform_divergence(db)
+    uids = {r.uid_1c for r in rows}
+    products = {p.uid_1c: p for p in
+                db.query(Product).filter(Product.uid_1c.in_(uids)).all()} if uids else {}
+    names = {a.id: a.name for a in db.query(PlatformAccount).all()}
+    out = []
+    for r in rows:
+        p = products.get(r.uid_1c)
+        out.append([
+            (p.article if p else "") or r.uid_1c,
+            (p.size if p else "") or "",
+            (p.color if p else "") or "",
+            (p.name if p else "") or "",
+            names.get(r.account_id, str(r.account_id)),
+            r.sent_sku or "",
+            str(r.sent_quantity if r.sent_quantity is not None else ""),
+            str(r.verified_quantity if r.verified_quantity is not None else ""),
+            _age(r.verified_at),
+        ])
+    return out
 
 
 def _queue_rows(db: Session, rows: list[DispatchQueueItem]) -> list[list[str]]:
@@ -1259,6 +1471,10 @@ FULL_LISTS = {
                        _rows_negative_stock),
     "stuck_broadcast_requests": ("Просьбы включить трансляцию, не выполненные за сутки",
                                  PRODUCT_COLUMNS, _rows_stuck_broadcast_requests),
+    "platform_divergence": ("Площадка держит не то, что мы отправили",
+                           ["Артикул", "Размер", "Цвет", "Наименование", "Кабинет",
+                            "Чем адресовали", "Отправили", "Площадка держит",
+                            "Когда сверяли"], _rows_platform_divergence),
     "reconciliation_review": ("Крупные расхождения со складом 1С за сутки",
                               ["Артикул", "Размер", "Цвет", "Наименование",
                                "Когда сверяли", "Было у нас", "Стало по 1С",

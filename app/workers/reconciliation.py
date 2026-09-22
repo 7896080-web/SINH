@@ -164,8 +164,25 @@ def import_barcode_dict(db: Session, rows: list[dict], full: bool = False) -> di
     existing_bcs = set(existing_map)
 
     stats = {"products": 0, "barcodes": 0, "conflicts_cleared": 0, "full": full,
-             "repointed_guesses": 0}
+             "repointed_guesses": 0, "recalc_dropped": 0}
     resolved = set()
+    # Товары, которым справочник завёл НОВЫЙ баркод. Отметку «актуализирован» у
+    # них надо снять: расчёт собирал заказы строго по прежнему набору баркодов,
+    # значит продажи по только что привязанному он заведомо не видел, а догнать
+    # их нечем — товар числится актуализированным, `catch_up_product` по нему не
+    # зовут, живой опрос старый заказ не принесёт, и наружу уходит остаток,
+    # завышенный ровно на эти продажи. Правило то же, что у переподвязки,
+    # автопривязки по пулу и импорта «Мэппинга»; здесь его не было.
+    #
+    # Одним запросом в конце, а не `drop_recalc_mark` на строку: полный прогон —
+    # сто пятьдесят четыре тысячи строк, и отдельный SELECT товара на каждую
+    # новую означал бы ту же беду, ради которой тут заведён `existing_map`.
+    # Условие `recalc_done_at IS NOT NULL` несёт обе предосторожности помощника:
+    # у товара без расчёта не трогаем НИЧЕГО (иначе пустая строка в
+    # `recalc_account_ids` включила бы ступень 2 лестницы там, где она обязана
+    # молчать, и на отмеченный кабинет уехал бы ноль), а тем, у кого расчёт был,
+    # ставим пустую СТРОКУ, а не NULL.
+    newly_linked: set[str] = set()
     seen = 0
     for r in rows:
         uid = (r.get("uid_1c") or "").strip()
@@ -187,6 +204,7 @@ def import_barcode_dict(db: Session, rows: list[dict], full: bool = False) -> di
             existing_map[barcode] = (uid, "1c_dict")
             existing_bcs.add(barcode)
             stats["barcodes"] += 1
+            newly_linked.add(uid)
         else:
             known_uid, source = existing_map[barcode]
             if known_uid != uid and source == POOL_GUESS_SOURCE:
@@ -235,6 +253,15 @@ def import_barcode_dict(db: Session, rows: list[dict], full: bool = False) -> di
             db.commit()
 
     db.flush()
+    linked = list(newly_linked)
+    for i in range(0, len(linked), 500):
+        stats["recalc_dropped"] += db.query(Product).filter(
+            Product.uid_1c.in_(linked[i:i + 500]),
+            Product.recalc_done_at.isnot(None),
+        ).update({"recalc_done_at": None, "recalc_account_ids": ""},
+                 synchronize_session=False)
+        db.commit()
+
     resolved = list(resolved)
     for i in range(0, len(resolved), 500):
         stats["conflicts_cleared"] += db.query(MappingConflict).filter(
