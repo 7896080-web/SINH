@@ -50,6 +50,10 @@ EXPECTED_INTERVAL_SECONDS = {
     # часового отчёта, и оба раза лечился здесь же.
     "backup": 86400 * 3,
     "retention": 86400 * 3,
+    # Уведомления наружу — раз в пять минут. Задание, которое зовёт человека,
+    # обязано быть под присмотром само: замолчав, оно молчит ровно так же, как
+    # исправная система, и заметить разницу неоткуда.
+    "alerts": 300 * 3,
 }
 # Per-account воркеры пишут heartbeat с ДИНАМИЧЕСКИМ именем
 # (`poll_orders_account_<id>`, `catalog_poll_account_<id>`) — сопоставляем по
@@ -99,6 +103,10 @@ REQUIRED_WORKERS = {
     "backup": 1800,
     # Чистка истории. Её отсутствие не видно вообще ничем, кроме растущей базы.
     "retention": 1800,
+    # Уведомления. Ждём первого прогона двадцать минут: само задание просит его
+    # через двенадцать после старта, чтобы не будить человека на каждом
+    # перезапуске, пока часть заданий ещё не отчиталась.
+    "alerts": 1200,
 }
 
 ACCOUNT_WORKER_PREFIXES = ("poll_orders_account_", "catalog_poll_account_")
@@ -139,13 +147,15 @@ def account_id_from_worker(worker_name: str) -> int | None:
     return None
 
 
-@router.get("/health")
-def health(db: Session = Depends(get_db)):
-    """Без авторизации — намеренно: предназначен для внешних систем
-    мониторинга (Zabbix, Uptime Kuma и т.п.). Отдаёт только имена воркеров,
-    время последнего запуска и факт ошибки — без текста ошибки и без имён
-    кабинетов."""
+def snapshot(db: Session) -> tuple[dict, int]:
+    """Состояние системы и код ответа. Тело `/health`, вынесенное из обработчика.
 
+    Вынесено ради ВТОРОГО читателя: `app/alerts.py` будит человека, когда
+    система встала, и спрашивать он обязан ровно то же, что показывает
+    страница. Повтори он эту логику у себя — однажды они разойдутся, и
+    уведомление либо замолчит на настоящей поломке, либо начнёт будить на
+    ровном месте. Ни то ни другое не заметно до первого раза.
+    """
     # Порядок ЗАДАН явно. Без `order_by` SQLite отдаёт строки как ему удобно, и
     # список воркеров в ответе мог меняться от запроса к запросу: человек,
     # который смотрит /health два раза подряд, видел бы разный порядок и искал
@@ -159,14 +169,17 @@ def health(db: Session = Depends(get_db)):
     # без воркеров остатки молча не синхронизируются, а мониторинг обязан это
     # увидеть. Поэтому пустой ответ — 503, а не 200.
     if not heartbeats:
-        return JSONResponse(
+        return (
             {
                 "ok": False,
                 "checked_at": now.isoformat(),
                 "workers": [],
+                "missing_workers": [],
+                "ignored_workers": 0,
+                "disabled_accounts": 0,
                 "reason": "Ни один воркер не отчитался — планировщик не запущен или недоступен.",
             },
-            status_code=503,
+            503,
         )
 
     started_at = None
@@ -235,8 +248,7 @@ def health(db: Session = Depends(get_db)):
         if missing:
             overall_ok = False
 
-    status_code = 200 if overall_ok else 503
-    return JSONResponse(
+    return (
         {
             "ok": overall_ok,
             "checked_at": now.isoformat(),
@@ -245,5 +257,15 @@ def health(db: Session = Depends(get_db)):
             "ignored_workers": ignored,
             "disabled_accounts": disabled_accounts,
         },
-        status_code=status_code,
+        200 if overall_ok else 503,
     )
+
+
+@router.get("/health")
+def health(db: Session = Depends(get_db)):
+    """Без авторизации — намеренно: предназначен для внешних систем
+    мониторинга (Zabbix, Uptime Kuma и т.п.). Отдаёт только имена воркеров,
+    время последнего запуска и факт ошибки — без текста ошибки и без имён
+    кабинетов."""
+    body, status_code = snapshot(db)
+    return JSONResponse(body, status_code=status_code)

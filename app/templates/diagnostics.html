@@ -180,6 +180,42 @@
     {% endif %}
 </div>
 
+<div class="card" id="alerts">
+    <h3 style="margin-top:0">
+        Уведомления наружу
+        {% if alert_channels %}
+            <span class="badge badge--good">{{ alert_channels|join(', ') }}</span>
+        {% else %}
+            <span class="badge badge--warn">не настроены</span>
+        {% endif %}
+    </h3>
+    {% if alert_channels %}
+    <p class="help-text" style="margin-top:0">
+        Система сама напишет, когда встанет или разойдётся с реальностью:
+        <b>неработающее задание</b> и <b>критичная находка отчёта</b>. Жёлтые
+        находки не будят никогда — разбудив на жёлтом, мы научим не читать и
+        красное. Одно и то же сообщение не повторяется, пока картина не
+        изменилась; когда всё пройдёт, придёт отбой.
+    </p>
+    <p class="help-text">
+        Проверьте канал сейчас, а не в тот час, когда он понадобится: опечатка в
+        токене или адресе выглядит точно так же, как исправная тишина.
+    </p>
+    {% else %}
+    <p class="help-text" style="margin-top:0">
+        <b>Сейчас система никого не позовёт.</b> Упади службы ночью — узнать об
+        этом можно будет только открыв эту страницу. Каналы включаются в
+        <span class="mono">.env</span>: <span class="mono">TELEGRAM_BOT_TOKEN</span> и
+        <span class="mono">TELEGRAM_CHAT_ID</span>, либо <span class="mono">ALERT_SMTP_HOST</span>
+        и <span class="mono">ALERT_EMAIL_TO</span>. Подробнее — в
+        <span class="mono">deploy/README_WINDOWS.md</span>.
+    </p>
+    {% endif %}
+    <form method="post" action="/diagnostics/alerts/test" style="margin-bottom:0">
+        <button type="submit" class="btn">Отправить пробное уведомление</button>
+    </form>
+</div>
+
 <div class="card" id="workers">
     <h3 style="margin-top:0">Общие фоновые процессы</h3>
     <div class="table-scroll"><table>
