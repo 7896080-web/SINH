@@ -1124,6 +1124,35 @@ def _check_reconciliation_review(db: Session) -> Finding | None:
     )
 
 
+def _check_backup_mirror(db: Session) -> Finding | None:
+    """Копия снимается, но на вторую площадку не доезжает.
+
+    Зеркало (`BACKUP_MIRROR_DIR` — папка облака, сетевая шара, второй диск)
+    заводится ровно против одного случая: отказ диска, на котором лежат И база,
+    И все копии. Пока зеркало молча не работает, этот случай снова не прикрыт —
+    а выглядит всё исправным: копия снимается, проверяется, `/health` зелёный,
+    находки «свежей копии нет» тоже нет.
+
+    Сам бэкап из-за недоступного зеркала неудачным НЕ считается, и правильно:
+    локальная копия снята и прочитана. Поэтому текст живёт в `last_error`
+    успешной отметки, а читатель у него — здесь.
+    """
+    row = db.query(WorkerHeartbeat).filter(
+        WorkerHeartbeat.worker_name == "backup",
+        WorkerHeartbeat.last_success.is_(True),
+    ).first()
+    if row is None or not row.last_error:
+        return None
+    return Finding(
+        key="backup_mirror", level=WARNING,
+        title=f"Копия базы не уходит на вторую площадку: {row.last_error}",
+        consequence="Локальная копия есть, но лежит на том же диске, что и база. "
+                    "Отказ этого диска унесёт разом и базу, и все копии — ровно "
+                    "то, против чего заводилась вторая площадка.",
+        count=1, link="/diagnostics#workers",
+    )
+
+
 def _check_backup_missing(db: Session) -> Finding | None:
     """Свежей копии базы нет.
 
@@ -1307,6 +1336,7 @@ CHECKS = (
     _check_negative_stock,
     _check_reconciliation_review,
     _check_backup_missing,
+    _check_backup_mirror,
     _check_orders_not_processed,
     _check_verify_stock_broken,
     _check_truncated_catalog,
