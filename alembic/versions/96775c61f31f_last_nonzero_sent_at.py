@@ -124,6 +124,17 @@ def upgrade():
     """)
     op.execute("DROP TABLE _backfill_nonzero_sent")
 
+    # Самый долгий шаг миграции и единственный, что оставался без защиты от
+    # собственного обрыва. `batch_alter_table` на SQLite перестраивает таблицу
+    # целиком: CREATE `_alembic_tmp_ftp_tasks` → INSERT ... SELECT (на бою это
+    # десятки тысяч строк заданий 1С при живых службах и `busy_timeout` 30 с) →
+    # DROP → RENAME. Alembic на SQLite ничего не откатывает и версию не двигает,
+    # поэтому обрыв здесь оставлял временную таблицу, и повторный
+    # `alembic upgrade head` падал на «table _alembic_tmp_ftp_tasks already
+    # exists» — НАВСЕГДА. Накат вставал на середине: продолжить нечем, повторить
+    # нечем, службы не перезапущены, бой на старом коде при новых файлах.
+    op.execute("DROP TABLE IF EXISTS _alembic_tmp_ftp_tasks")
+
     with op.batch_alter_table('ftp_tasks', schema=None) as batch_op:
         batch_op.alter_column('status',
                               existing_type=sa.VARCHAR(length=7),

@@ -151,8 +151,14 @@ def test_an_interrupted_migration_can_be_repeated(tmp_path):
     чего угодно — кончилось место, `database is locked` от живых служб, закрытая
     консоль, — поэтому оба шага переживают повтор.
 
-    Тест имитирует остатки оборванного прогона (колонка, временная таблица,
-    индекс уже на месте) и требует, чтобы повтор дошёл до конца.
+    Тест имитирует остатки оборванного прогона (колонка, временная таблица
+    бэкфилла, индекс и временная таблица batch-режима уже на месте) и требует,
+    чтобы повтор дошёл до конца.
+
+    Последняя из них добавлена аудитом 22.09: `batch_alter_table` на SQLite
+    перестраивает таблицу через `_alembic_tmp_ftp_tasks`, это самый долгий шаг
+    миграции, и единственный, что оставался без защиты. Повтор падал на «table
+    _alembic_tmp_ftp_tasks already exists» — навсегда.
     """
     db = tmp_path / "alembic_repeat_test.db"
     url = "sqlite:///" + str(db)
@@ -164,6 +170,7 @@ def test_an_interrupted_migration_can_be_repeated(tmp_path):
                  "account_id INTEGER NOT NULL, sent_at DATETIME NOT NULL, "
                  "PRIMARY KEY (uid_1c, account_id))")
     conn.execute("CREATE INDEX ix_ftp_tasks_barcode ON ftp_tasks (barcode)")
+    conn.execute("CREATE TABLE _alembic_tmp_ftp_tasks (id INTEGER PRIMARY KEY)")
     conn.commit()
     conn.close()
 
@@ -176,3 +183,8 @@ def test_an_interrupted_migration_can_be_repeated(tmp_path):
     conn.close()
     assert leftovers == [], "временная таблица бэкфилла осталась в базе"
     assert "ix_ftp_tasks_barcode" in indexes
+    conn = sqlite3.connect(str(db))
+    tmp = [t[0] for t in conn.execute(
+        "SELECT name FROM sqlite_master WHERE name = '_alembic_tmp_ftp_tasks'")]
+    conn.close()
+    assert tmp == [], "временная таблица batch-режима осталась в базе"

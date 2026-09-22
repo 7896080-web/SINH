@@ -9,7 +9,9 @@ POOL_GUESS_SOURCE = "pool_match"
 
 from sqlalchemy.orm import Session
 
-from app.models import PlatformCatalogItem, Barcode, MappingConflict, PlatformAccount
+from app.broadcast_gate import drop_recalc_mark
+from app.models import (Barcode, MappingConflict, PlatformAccount, PlatformCatalogItem,
+                        Product)
 from app.workers.platform_clients.base import PlatformClient
 
 
@@ -31,6 +33,7 @@ def load_platform_catalog(db: Session, client: PlatformClient, account: Platform
     # (`last_truncated`), а здесь его до сих пор никто не спрашивал.
     truncated = bool(getattr(client, "last_truncated", False))
     stats = {"fetched": len(items), "already_mapped": 0, "pool_matched": 0,
+             "recalc_dropped": 0,
              "new_conflicts": 0, "known_conflicts": 0, "no_barcode": 0,
              "truncated": truncated}
 
@@ -107,6 +110,18 @@ def load_platform_catalog(db: Session, client: PlatformClient, account: Platform
             db.query(MappingConflict).filter(
                 MappingConflict.barcode == item.barcode,
             ).delete(synchronize_session=False)
+            # Набор баркодов товара только что изменился — «актуализирован»
+            # снимаем, как это делают ручная переподвязка и справочник 1С.
+            #
+            # Без этого догадка тихо открывала оверселл: расчёт собирал заказы по
+            # ПРЕЖНЕМУ набору, продажи по новому баркоду он не видел, а догнать
+            # их нечем — товар числится актуализированным, `catch_up_product` по
+            # нему не зовут, живой опрос старый заказ уже не принесёт. Остаток
+            # завышен ровно на эти продажи, ворота открыты, ступень 2 молчит.
+            # Заодно этой же строкой удаляется ЕДИНСТВЕННЫЙ след — конфликт
+            # сопоставления со счётчиком попыток.
+            if drop_recalc_mark(db.query(Product).filter(Product.uid_1c == uid).first()):
+                stats["recalc_dropped"] += 1
             stats["pool_matched"] += 1
             continue
 

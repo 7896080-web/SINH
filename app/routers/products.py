@@ -1313,6 +1313,16 @@ def products_import(
     # По uid, а не списком: один товар может встретиться в файле дважды, и
     # задание получило бы по нему две одинаковые строки.
     needs_recalc: dict[str, Product] = {}
+    # Настройки кабинетов, ЗАВЕДЁННЫЕ этим файлом. Сессия живёт с
+    # `autoflush=False`: второй строке файла с тем же ID_1С запрос ниже первый
+    # `db.add` НЕ ПОКАЖЕТ, и на ту же пару добавился бы второй объект под
+    # `uq_product_account`. Коммит на весь импорт один, обработчика исключений
+    # нет — оператор получал 500 и откат ВСЕГО файла: ни даты расчёта, ни факта,
+    # ни брони, ни отметок кабинетов, по всем двадцати тысячам строк. А повтор
+    # ID_1С в файле — обычное дело: склеили две выгрузки, скопировали строку,
+    # чтобы поправить опечатку. Та же механика с тем же `autoflush=False` уже
+    # закрыта в импорте «Мэппинга» и в загрузке каталога.
+    settings_in_file: dict[tuple[str, int], SyncSetting] = {}
     # Кэш поиска остатка по датам, встретившимся в файле. Обычно дата одна на
     # весь файл, но полагаться на это нельзя. Без кэша импорт пятидесяти тысяч
     # строк — это сто тысяч запросов к базе.
@@ -1444,9 +1454,11 @@ def products_import(
             if sync_col not in row and threshold_col not in row:
                 continue
 
-            setting = db.query(SyncSetting).filter(
-                SyncSetting.uid_1c == uid_1c, SyncSetting.account_id == account.id,
-            ).first()
+            setting = settings_in_file.get((uid_1c, account.id))
+            if setting is None:
+                setting = db.query(SyncSetting).filter(
+                    SyncSetting.uid_1c == uid_1c, SyncSetting.account_id == account.id,
+                ).first()
             current_enabled = setting.enabled if setting else False
             current_threshold = setting.min_threshold if setting else 0
 
@@ -1479,6 +1491,7 @@ def products_import(
             if setting is None:
                 setting = SyncSetting(uid_1c=uid_1c, account_id=account.id)
                 db.add(setting)
+                settings_in_file[(uid_1c, account.id)] = setting
             if desired_enabled and not current_enabled:
                 setting.enabled_at = now_utc()
                 setting.has_proposal = False
