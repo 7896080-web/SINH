@@ -31,8 +31,12 @@ WARNING не будит НИКОГДА, и это осознанно. Жёлты
 НИЧЕГО НЕ ЧИНИТ. Как и отчёт: только читает и рассказывает. Уведомление, которое
 может что-то поменять на площадке или в 1С, начнут бояться включать.
 
-НАСТРАИВАЕТСЯ ОКРУЖЕНИЕМ, и ни один канал не включён по умолчанию — токен бота и
-пароль почты живут в `.env` рядом с ключами площадок. Не настроено ничего —
+НАСТРАИВАЕТСЯ СО СТРАНИЦЫ «Уведомления», и ни один канал не включён по
+умолчанию. Значения читаются через `settings_store`: строка в базе, а если её
+нет — `.env`. Хранить их только в файле было хуже по трём причинам — `.env`
+читается один раз на импорте (правка без перезапуска службы не действует, а про
+перезапуск забывают), токен лежал бы открытым текстом рядом с
+`SECRETS_ENCRYPTION_KEY`, и правку файла никто не видит. Не настроено ничего —
 задание честно говорит об этом в `/health`, а не молчит: канал, про который никто
 не знает, что он выключен, хуже отсутствующего.
 """
@@ -40,7 +44,6 @@ WARNING не будит НИКОГДА, и это осознанно. Жёлты
 from __future__ import annotations
 
 import logging
-import os
 import smtplib
 from email.message import EmailMessage
 from datetime import timedelta
@@ -59,9 +62,9 @@ STATE_KEY = "main"
 
 # Через сколько напомнить о ТОЙ ЖЕ, никуда не девшейся поломке. Шесть часов —
 # компромисс: за смену человек получит напоминание один раз, а не привыкнет к
-# потоку. Меняется переменной окружения, потому что правильное число зависит от
-# того, кто и как дежурит, а не от кода.
-REPEAT_AFTER = timedelta(hours=int(os.environ.get("ALERT_REPEAT_HOURS", "6")))
+# потоку. Настраивается, потому что правильное число зависит от того, кто и как
+# дежурит, а не от кода.
+DEFAULT_REPEAT_HOURS = 6
 
 # Сколько ждём ответа от канала. Задание ходит часто, и залипнуть на минуту на
 # недоступном Telegram нельзя: следующий цикл всё равно повторит.
@@ -70,14 +73,37 @@ TIMEOUT = 10
 # Адрес, по которому человек откроет систему. По умолчанию локальный — веб
 # слушает 127.0.0.1, и снаружи ссылка не откроется; если перед приложением
 # стоит прокси, адрес надо задать.
-BASE_URL = os.environ.get("ALERT_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
+DEFAULT_BASE_URL = "http://127.0.0.1:8000"
 
 
-def _env(name: str) -> str:
-    return (os.environ.get(name) or "").strip()
+def _env(db: Session, name: str) -> str:
+    """Значение настройки: страница «Уведомления», иначе `.env`.
+
+    Вся развилка живёт в `settings_store` — здесь её повторять нельзя: разойдись
+    два места, страница показывала бы одно, а уведомление уходило бы по другому.
+    """
+    from app import settings_store
+
+    return settings_store.get(db, name)
 
 
-def ping_alive() -> str:
+def repeat_after(db: Session) -> timedelta:
+    raw = _env(db, "ALERT_REPEAT_HOURS")
+    try:
+        hours = int(raw)
+    except (TypeError, ValueError):
+        hours = DEFAULT_REPEAT_HOURS
+    # Ноль и отрицательное — это «напоминать каждый цикл», то есть каждые пять
+    # минут: ровно тот поток, от которого дедупликация и защищает. Опечатка в
+    # поле не должна уметь отключить защиту.
+    return timedelta(hours=hours if hours > 0 else DEFAULT_REPEAT_HOURS)
+
+
+def base_url(db: Session) -> str:
+    return (_env(db, "ALERT_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")
+
+
+def ping_alive(db: Session) -> str:
     """Дёрнуть внешнего сторожа: «воркер жив». Пустая строка — всё хорошо.
 
     ЭТО ЗАКРЫВАЕТ ГЛАВНУЮ ДЫРУ ОСТАЛЬНОГО МЕХАНИЗМА. Задание `alerts` живёт
@@ -98,7 +124,7 @@ def ping_alive() -> str:
     неотличимый от падения службы, а о настоящей беде ему и так скажет обычное
     уведомление.
     """
-    url = _env("ALERT_HEARTBEAT_URL")
+    url = _env(db, "ALERT_HEARTBEAT_URL")
     if not url:
         return ""
     try:
@@ -112,29 +138,29 @@ def ping_alive() -> str:
         return f"{type(e).__name__}: {e}"[:200]
 
 
-def telegram_configured() -> bool:
-    return bool(_env("TELEGRAM_BOT_TOKEN") and _env("TELEGRAM_CHAT_ID"))
+def telegram_configured(db: Session) -> bool:
+    return bool(_env(db, "TELEGRAM_BOT_TOKEN") and _env(db, "TELEGRAM_CHAT_ID"))
 
 
-def email_configured() -> bool:
-    return bool(_env("ALERT_SMTP_HOST") and _env("ALERT_EMAIL_TO"))
+def email_configured(db: Session) -> bool:
+    return bool(_env(db, "ALERT_SMTP_HOST") and _env(db, "ALERT_EMAIL_TO"))
 
 
-def configured_channels() -> list[str]:
+def configured_channels(db: Session) -> list[str]:
     channels = []
-    if telegram_configured():
+    if telegram_configured(db):
         channels.append("telegram")
-    if email_configured():
+    if email_configured(db):
         channels.append("email")
     return channels
 
 
-def _send_telegram(subject: str, body: str) -> None:
-    token = _env("TELEGRAM_BOT_TOKEN")
+def _send_telegram(cfg: dict, subject: str, body: str) -> None:
+    token = cfg["TELEGRAM_BOT_TOKEN"]
     resp = requests.post(
         f"https://api.telegram.org/bot{token}/sendMessage",
         json={
-            "chat_id": _env("TELEGRAM_CHAT_ID"),
+            "chat_id": cfg["TELEGRAM_CHAT_ID"],
             "text": f"{subject}\n\n{body}",
             # Без разметки намеренно: в текст попадают артикулы, имена кабинетов
             # и сообщения площадок, где встречается что угодно. Один символ `_`
@@ -152,24 +178,30 @@ def _send_telegram(subject: str, body: str) -> None:
         raise RuntimeError(f"telegram: {payload.get('description') or payload}")
 
 
-def _send_email(subject: str, body: str) -> None:
+def _send_email(cfg: dict, subject: str, body: str) -> None:
     message = EmailMessage()
     message["Subject"] = subject
-    message["From"] = _env("ALERT_EMAIL_FROM") or _env("ALERT_SMTP_USER") or _env("ALERT_EMAIL_TO")
-    message["To"] = _env("ALERT_EMAIL_TO")
+    message["From"] = (cfg["ALERT_EMAIL_FROM"] or cfg["ALERT_SMTP_USER"]
+                       or cfg["ALERT_EMAIL_TO"])
+    message["To"] = cfg["ALERT_EMAIL_TO"]
     message.set_content(body)
 
-    port = int(_env("ALERT_SMTP_PORT") or "587")
-    host = _env("ALERT_SMTP_HOST")
+    # Порт с опечаткой не должен ронять отправку молча: непонятное значение
+    # трактуем как умолчание, а не как повод не отправить ничего.
+    try:
+        port = int(cfg["ALERT_SMTP_PORT"] or "587")
+    except (TypeError, ValueError):
+        port = 587
+    host = cfg["ALERT_SMTP_HOST"]
     if port == 465:
         server = smtplib.SMTP_SSL(host, port, timeout=TIMEOUT)
     else:
         server = smtplib.SMTP(host, port, timeout=TIMEOUT)
     try:
-        if port != 465 and _env("ALERT_SMTP_TLS") != "0":
+        if port != 465 and cfg["ALERT_SMTP_TLS"] != "0":
             server.starttls()
-        if _env("ALERT_SMTP_USER"):
-            server.login(_env("ALERT_SMTP_USER"), _env("ALERT_SMTP_PASSWORD"))
+        if cfg["ALERT_SMTP_USER"]:
+            server.login(cfg["ALERT_SMTP_USER"], cfg["ALERT_SMTP_PASSWORD"])
         server.send_message(message)
     finally:
         try:
@@ -178,20 +210,31 @@ def _send_email(subject: str, body: str) -> None:
             pass
 
 
-def deliver(subject: str, body: str) -> tuple[list[str], list[str]]:
+# Что нужно каждому каналу. Читаем ОДНИМ заходом перед отправкой, а не по полю
+# из недр `_send_*`: иначе правка настройки посреди отправки собрала бы письмо
+# наполовину из старых значений, наполовину из новых.
+CHANNEL_KEYS = [
+    "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
+    "ALERT_SMTP_HOST", "ALERT_SMTP_PORT", "ALERT_SMTP_USER",
+    "ALERT_SMTP_PASSWORD", "ALERT_EMAIL_TO", "ALERT_EMAIL_FROM", "ALERT_SMTP_TLS",
+]
+
+
+def deliver(db: Session, subject: str, body: str) -> tuple[list[str], list[str]]:
     """Разослать по всем настроенным каналам. Возвращает (доехало, не доехало).
 
     Канал, который упал, НЕ роняет остальные и не роняет задание: тревога,
     потерянная из-за недоступного SMTP, — это тревога, которой не было.
     """
+    cfg = {name: _env(db, name) for name in CHANNEL_KEYS}
     sent, failed = [], []
     for name, fn in (("telegram", _send_telegram), ("email", _send_email)):
-        if name == "telegram" and not telegram_configured():
+        if name == "telegram" and not (cfg["TELEGRAM_BOT_TOKEN"] and cfg["TELEGRAM_CHAT_ID"]):
             continue
-        if name == "email" and not email_configured():
+        if name == "email" and not (cfg["ALERT_SMTP_HOST"] and cfg["ALERT_EMAIL_TO"]):
             continue
         try:
-            fn(subject, body)
+            fn(cfg, subject, body)
             sent.append(name)
         except Exception as e:                       # noqa: BLE001 — см. docstring
             failed.append(f"{name}: {type(e).__name__}: {e}"[:200])
@@ -247,9 +290,10 @@ def run_alert_cycle(db: Session) -> dict:
     Возвращает статистику для лога и heartbeat. Ничего не шлёт, если картина не
     изменилась и таймер напоминания не вышел.
     """
-    stats = {"channels": len(configured_channels()), "sent": 0, "failed": 0,
+    channels = configured_channels(db)
+    stats = {"channels": len(channels), "sent": 0, "failed": 0,
              "action": "none"}
-    if not configured_channels():
+    if not channels:
         stats["action"] = "not_configured"
         return stats
 
@@ -273,8 +317,8 @@ def run_alert_cycle(db: Session) -> dict:
             return stats
         subject = "[Sync Admin] Отбой — система в порядке"
         body = ("Проблемы, о которых сообщали раньше, больше не видны.\n\n"
-                f"Проверить: {BASE_URL}/diagnostics")
-        sent, failed = deliver(subject, body)
+                f"Проверить: {base_url(db)}/diagnostics")
+        sent, failed = deliver(db, subject, body)
         stats["sent"], stats["failed"] = len(sent), len(failed)
         stats["action"] = "clear"
         if sent:
@@ -288,7 +332,7 @@ def run_alert_cycle(db: Session) -> dict:
 
     changed = fingerprint != (state.signature or "")
     stale = (state.last_sent_at is None
-             or now - state.last_sent_at >= REPEAT_AFTER)
+             or now - state.last_sent_at >= repeat_after(db))
     if was_alarm and not changed and not stale:
         stats["action"] = "quiet"
         return stats
@@ -296,8 +340,8 @@ def run_alert_cycle(db: Session) -> dict:
     head = "[Sync Admin] Требует внимания"
     if was_alarm and not changed:
         head = "[Sync Admin] Всё ещё требует внимания"
-    body = "\n".join(lines) + f"\n\nРазобрать: {BASE_URL}/report"
-    sent, failed = deliver(head, body)
+    body = "\n".join(lines) + f"\n\nРазобрать: {base_url(db)}/report"
+    sent, failed = deliver(db, head, body)
     stats["sent"], stats["failed"] = len(sent), len(failed)
     stats["action"] = "alarm"
     if sent:
