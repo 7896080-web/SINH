@@ -26,8 +26,10 @@ from __future__ import annotations
 import logging
 import os
 import re
+import json
 import shutil
 import sqlite3
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -63,6 +65,35 @@ MIRROR_DIR_ENV = "BACKUP_MIRROR_DIR"
 # за локальным.
 MIRROR_KEEP_DAILY = 30
 MIRROR_KEEP_WEEKLY = 12
+
+# --- Вторая площадка через rclone -----------------------------------------
+#
+# Нужна там, где папки-зеркала взять неоткуда: на арендованном сервере нет ни
+# второго диска, ни соседней машины, а клиент облачной синхронизации либо не
+# ставится на серверную ОС (Яндекс.Диск), либо требует живой сессии
+# пользователя — то есть молча перестаёт работать после выхода из RDP.
+#
+# rclone решает ровно это: один исполняемый файл, никакой сессии, и — главное —
+# ПОСЛЕ ВЫГРУЗКИ МОЖНО СПРОСИТЬ, ДОЕХАЛО ЛИ. У папки синхронизации этого нет
+# принципиально: мы кладём файл и видим только то, что он лежит в папке.
+#
+# Токен облака живёт в конфиге САМОГО rclone и к нам не попадает: его выдаёт
+# `rclone config` в диалоге с человеком, rclone же его и обновляет. Хранить у
+# себя то, чем умеет управлять он, значит однажды разойтись с ним.
+RCLONE_REMOTE_ENV = "BACKUP_RCLONE_REMOTE"
+RCLONE_EXE_ENV = "BACKUP_RCLONE_EXE"
+RCLONE_CONFIG_ENV = "BACKUP_RCLONE_CONFIG"
+DEFAULT_RCLONE_EXE = r"C:\sync_admin\tools\rclone.exe"
+# Конфиг задаётся ЯВНО, и это не придирка. `rclone config` пишет его в профиль
+# ТОГО, кто запустил, — обычно администратора; служба же работает под своей
+# учётной записью и этого файла не увидит вовсе. Человек настроил, проверил
+# руками, всё сошлось — а суточная выгрузка молчит. Тот же класс отказа, что и
+# «клиенту нужна живая сессия», поэтому путь общий и лежит рядом с приложением.
+DEFAULT_RCLONE_CONFIG = r"C:\sync_admin\rclone.conf"
+# Выгрузка идёт в фоновом задании, и повиснуть на ней нельзя: воркер в это время
+# не принимает заказы. Пятнадцати минут хватает на сотни мегабайт по любому
+# разумному каналу, а всё, что дольше, — это уже не медленная сеть, а зависание.
+RCLONE_TIMEOUT = 900
 
 # Сколько храним. Ежедневных две недели — этого хватает, чтобы заметить порчу
 # данных, которую видно не сразу (перепутанный мэппинг, неверный импорт).
@@ -214,6 +245,57 @@ def _parse_moment(name: str) -> datetime | None:
         return None
 
 
+def names_to_drop(names: list[str], keep_daily: int = KEEP_DAILY,
+                  keep_weekly: int = KEEP_WEEKLY) -> list[str]:
+    """Какие копии лишние. Правило ОДНО на все площадки — и это принципиально.
+
+    Локальная папка и облако чистятся разными механизмами (`unlink` против
+    вызова rclone), но решать, что удалить, обязаны одинаково: разойдись они, в
+    облаке лежало бы не то, что обещано человеку, и узнал бы он об этом ровно в
+    тот день, когда полез восстанавливаться.
+
+    ПО ОДНОЙ НА КАЛЕНДАРНЫЙ ДЕНЬ, а не «первые keep_daily файлов».
+
+    Было второе, и обещание «вернуться на любой из недавних дней» не
+    выполнялось: стоило копиям пойти чаще раза в сутки — а `scripts/backup_db.py`
+    прямо предлагается для планировщика Windows и, в отличие от задания, никакого
+    `BACKUP_MIN_GAP` не проверяет, — и четырнадцать «ежедневных» превращались в
+    четырнадцать ПОСЛЕДНИХ ЧАСОВ. Замер: 24 почасовых копии за сутки плюс 60
+    суточных → после уборки осталось 15 последних часов и провал в неделю сразу
+    за ними. Порчу данных (перепутанный мэппинг, неверный импорт) замечают через
+    день-два, и восстанавливать было бы не из чего.
+
+    Имя, которое не разбирается, НЕ попадает в ответ никогда: и в каталоге, и в
+    облаке может лежать копия, положенная человеком руками.
+    """
+    parsed = []
+    for name in names:
+        moment = _parse_moment(name)
+        if moment is not None:
+            parsed.append((moment, name))
+    parsed.sort(reverse=True)
+
+    keep: set[str] = set()
+    days_seen: set = set()
+    rest: list[tuple] = []
+    for moment, name in parsed:
+        day = moment.date()
+        if day not in days_seen and len(days_seen) < keep_daily:
+            days_seen.add(day)
+            keep.add(name)
+        else:
+            rest.append((moment, name))
+
+    weeks_seen: set[tuple] = set()
+    for moment, name in rest:
+        week = moment.isocalendar()[:2]
+        if week not in weeks_seen and len(weeks_seen) < keep_weekly:
+            weeks_seen.add(week)
+            keep.add(name)
+
+    return [name for _, name in parsed if name not in keep]
+
+
 def prune(directory: Path, keep_daily: int = KEEP_DAILY,
           keep_weekly: int = KEEP_WEEKLY) -> int:
     """Удалить лишние копии. Возвращает сколько удалено.
@@ -234,37 +316,11 @@ def prune(directory: Path, keep_daily: int = KEEP_DAILY,
             files.append((moment, path))
     files.sort(reverse=True)
 
-    # ПО ОДНОЙ НА КАЛЕНДАРНЫЙ ДЕНЬ, а не «первые keep_daily файлов».
-    #
-    # Было второе, и обещание «вернуться на любой из недавних дней» не
-    # выполнялось: стоило копиям пойти чаще раза в сутки — а `scripts/backup_db.py`
-    # прямо предлагается для планировщика Windows и, в отличие от задания, никакого
-    # `BACKUP_MIN_GAP` не проверяет, — и четырнадцать «ежедневных» превращались в
-    # четырнадцать ПОСЛЕДНИХ ЧАСОВ. Замер: 24 почасовых копии за сутки плюс 60
-    # суточных → после уборки осталось 15 последних часов и провал в неделю сразу
-    # за ними. Порчу данных (перепутанный мэппинг, неверный импорт) замечают через
-    # день-два, и восстанавливать было бы не из чего.
-    keep: set[Path] = set()
-    days_seen: set = set()
-    rest: list[tuple] = []
-    for moment, path in files:
-        day = moment.date()
-        if day not in days_seen and len(days_seen) < keep_daily:
-            days_seen.add(day)
-            keep.add(path)
-        else:
-            rest.append((moment, path))
-
-    weeks_seen: set[tuple] = set()
-    for moment, path in rest:
-        week = moment.isocalendar()[:2]
-        if week not in weeks_seen and len(weeks_seen) < keep_weekly:
-            weeks_seen.add(week)
-            keep.add(path)
+    drop = set(names_to_drop([p.name for _, p in files], keep_daily, keep_weekly))
 
     removed = 0
     for _, path in files:
-        if path not in keep:
+        if path.name in drop:
             try:
                 path.unlink()
                 removed += 1
@@ -420,6 +476,114 @@ def mirror_backup(source: Path, directory: Path | None = None, db=None) -> str:
     return ""
 
 
+# ---------------------------------------------------------------------------
+# Вторая площадка через rclone
+# ---------------------------------------------------------------------------
+
+def rclone_settings(db=None) -> tuple[str, str, str] | None:
+    """(исполняемый файл, удалённый путь, конфиг) или None, если не настроено.
+
+    Ключевое здесь — `remote`: строка вида `yandex:sync_admin_backups`, где
+    `yandex` заведён человеком через `rclone config`. Ни токена, ни пароля мы не
+    видим и не храним.
+    """
+    remote = _setting(db, RCLONE_REMOTE_ENV)
+    if not remote:
+        return None
+    exe = _setting(db, RCLONE_EXE_ENV) or DEFAULT_RCLONE_EXE
+    config = _setting(db, RCLONE_CONFIG_ENV) or DEFAULT_RCLONE_CONFIG
+    return exe, remote.rstrip("/"), config
+
+
+def _run_rclone(exe: str, config: str, args: list[str]) -> tuple[bool, str]:
+    """Позвать rclone. (получилось, что сказал).
+
+    Вывод обрезаем: он уезжает в `last_error` успешной отметки, а её читает и
+    «Диагностика», и находка отчёта — простыня там вытеснила бы всё остальное.
+    """
+    command = [exe, "--config", config, "--log-level", "ERROR"] + args
+    try:
+        done = subprocess.run(command, capture_output=True, text=True,
+                              timeout=RCLONE_TIMEOUT)
+    except FileNotFoundError:
+        return False, f"rclone не найден: {exe}"
+    except subprocess.TimeoutExpired:
+        return False, f"rclone не ответил за {RCLONE_TIMEOUT} с"
+    except Exception as e:                           # noqa: BLE001
+        return False, f"{type(e).__name__}: {e}"
+    if done.returncode != 0:
+        said = (done.stderr or done.stdout or "").strip().replace("\n", "; ")
+        return False, f"rclone вернул {done.returncode}: {said[:300]}"
+    return True, (done.stdout or "")
+
+
+def _remote_listing(exe: str, config: str, remote: str) -> tuple[list[dict], str]:
+    ok, said = _run_rclone(exe, config, ["lsjson", remote])
+    if not ok:
+        return [], said
+    try:
+        return json.loads(said or "[]"), ""
+    except ValueError as e:
+        return [], f"ответ rclone не разобран: {e}"
+
+
+def upload_to_remote(source: Path, db=None) -> str:
+    """Выгрузить ГОТОВУЮ копию в облако. Пустая строка — всё хорошо.
+
+    И СРАЗУ СПРОСИТЬ, ДОЕХАЛА ЛИ. Это главное отличие от папки синхронизации и
+    единственная причина возиться с rclone: там мы кладём файл и знаем ровно
+    одно — что он лежит в папке. Доехал ли он в облако, не видно ниоткуда, и
+    отсутствие второй площадки выглядит точно так же, как её наличие. Здесь
+    после выгрузки читается список удалённой папки и сверяется размер: копия,
+    которую мы не прочитали на той стороне, — это надежда, а не копия. Ровно то
+    же правило, по которому локальная копия проверяется `integrity_check` и
+    чтением товаров.
+
+    Ошибку возвращаем, а не бросаем, и складываем её туда же, куда ошибку
+    папки-зеркала: локальная копия к этому моменту снята и проверена, и
+    объявлять бэкап неудачным из-за недоступного облака нельзя. Читатель у этого
+    текста уже есть — `report._check_backup_mirror`.
+    """
+    settings = rclone_settings(db)
+    if settings is None:
+        return ""
+    exe, remote, config = settings
+
+    ok, said = _run_rclone(exe, config,
+                           ["copyto", str(source), f"{remote}/{source.name}"])
+    if not ok:
+        return f"облако: {said}"
+
+    entries, problem = _remote_listing(exe, config, remote)
+    if problem:
+        # Выгрузка прошла, а проверить не вышло. Это НЕ успех: сказать «копия в
+        # облаке», не увидев её там, значит вернуться ровно к тому, от чего
+        # уходили.
+        return f"облако: копия отправлена, но проверить не удалось — {problem}"
+
+    sizes = {e.get("Name"): e.get("Size") for e in entries if isinstance(e, dict)}
+    if source.name not in sizes:
+        return f"облако: копии {source.name} там нет, хотя выгрузка прошла без ошибки"
+    expected = source.stat().st_size
+    if sizes[source.name] != expected:
+        return (f"облако: размер не сошёлся — там {sizes[source.name]} байт, "
+                f"у нас {expected}")
+
+    # Уборка в облаке — тем же правилом, что и локально. Сбой уборки выгрузку НЕ
+    # роняет: копия уже доставлена и проверена, а лишние старые файлы занимают
+    # место, но ничего не ломают.
+    drop = names_to_drop(list(sizes),
+                         keep_daily=_setting_int(db, "BACKUP_MIRROR_KEEP_DAILY",
+                                                 MIRROR_KEEP_DAILY),
+                         keep_weekly=_setting_int(db, "BACKUP_MIRROR_KEEP_WEEKLY",
+                                                  MIRROR_KEEP_WEEKLY))
+    for name in drop:
+        gone, why = _run_rclone(exe, config, ["deletefile", f"{remote}/{name}"])
+        if not gone:
+            logger.warning("облако: не удалось удалить %s: %s", name, why)
+    return ""
+
+
 def make_backup(database_url: str | None = None,
                 directory: Path | None = None, db=None) -> BackupResult:
     """Снять копию, проверить её и подчистить старые.
@@ -477,7 +641,13 @@ def make_backup(database_url: str | None = None,
     # Зеркало — ПОСЛЕ проверки: в облако уезжает только копия, которую мы уже
     # прочитали и признали целой. Непроверенная копия на второй площадке — это
     # две надежды вместо одной.
-    mirror_error = mirror_backup(target, db=db)
+    # Две площадки независимы: папка может быть настроена, облако нет, и
+    # наоборот. Ошибки складываем в ОДНО поле — у него уже есть читатель
+    # (`report._check_backup_mirror`), и заводить второе значило бы завести
+    # находку без читателя, то есть ровно тот дефект, который чинили весь день.
+    problems = [p for p in (mirror_backup(target, db=db),
+                            upload_to_remote(target, db=db)) if p]
+    mirror_error = "; ".join(problems)
     return BackupResult(path=str(target), size_bytes=size, checked=True,
                         removed=removed, mirror_error=mirror_error)
 

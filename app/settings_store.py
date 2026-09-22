@@ -113,10 +113,34 @@ BACKUP_FIELDS = [
           hint="Сколько последних календарных дней держать в зеркале."),
     Field("BACKUP_MIRROR_KEEP_WEEKLY", "Хранить недельных", placeholder="12",
           hint="Плюс по одной копии на неделю — они ловят порчу данных, "
-               "замеченную поздно."),
+               "замеченную поздно. Действует и на папку, и на облако."),
 ]
 
-ALL_FIELDS = TELEGRAM_FIELDS + EMAIL_FIELDS + COMMON_FIELDS + BACKUP_FIELDS
+# Облако через rclone. Нужно там, где папки-зеркала взять неоткуда: на
+# арендованном сервере нет ни второго диска, ни соседней машины, а клиент
+# облачной синхронизации на серверную ОС не ставится.
+#
+# Токена здесь НЕТ и не будет: его выдаёт `rclone config` в диалоге с человеком
+# и сам же обновляет. Хранить у себя то, чем управляет он, значит однажды с ним
+# разойтись — и узнать об этом в день, когда копия понадобится.
+RCLONE_FIELDS = [
+    Field("BACKUP_RCLONE_REMOTE", "Путь в облаке",
+          placeholder="yandex:sync_admin_backups",
+          hint="Имя из <code>rclone config</code>, двоеточие и папка. "
+               "Пусто — в облако ничего не уходит."),
+    Field("BACKUP_RCLONE_EXE", "Файл rclone.exe",
+          placeholder=r"C:\sync_admin\tools\rclone.exe",
+          hint="Пусто — берётся путь из подсказки."),
+    Field("BACKUP_RCLONE_CONFIG", "Файл конфигурации rclone",
+          placeholder=r"C:\sync_admin\rclone.conf",
+          hint="Задавать ОБЯЗАТЕЛЬНО осознанно: <code>rclone config</code> пишет "
+               "конфиг в профиль того, кто его запустил, а служба работает под "
+               "своей учётной записью и этого файла не увидит. Проверили руками — "
+               "сошлось, а суточная выгрузка молчит."),
+]
+
+ALL_FIELDS = (TELEGRAM_FIELDS + EMAIL_FIELDS + COMMON_FIELDS
+              + BACKUP_FIELDS + RCLONE_FIELDS)
 BY_NAME = {f.name: f for f in ALL_FIELDS}
 
 
@@ -194,6 +218,7 @@ def as_cards(db: Session) -> list[dict]:
         ("email", "Почта", EMAIL_FIELDS),
         ("common", "Общие настройки", COMMON_FIELDS),
         ("backup", "Зеркало резервных копий", BACKUP_FIELDS),
+        ("rclone", "Копии в облако (rclone)", RCLONE_FIELDS),
     ]
     cards = []
     for key, title, fields in groups:
