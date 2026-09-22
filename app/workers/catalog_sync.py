@@ -137,7 +137,15 @@ def load_platform_catalog(db: Session, client: PlatformClient, account: Platform
             stats["known_conflicts"] += 1
         elif conflict is None:
             conflicted_here.add(item.barcode)
-            db.add(MappingConflict(barcode=item.barcode, account_id=account.id, attempts=1))
+            # attempts=0, а НЕ 1: счётчик означает «сколько заказов по этому
+            # баркоду мы не смогли разнести», и здесь их ноль — строку завела
+            # выгрузка каталога, чтобы конфликт стало видно ДО первого заказа.
+            # Единица тут была прямой неправдой: отчёт складывает `attempts` и
+            # печатает «заказов по ним N», а следствие обещает «остаток завышен
+            # ровно на эти продажи» — продаж не было ни одной, товара в 1С нет,
+            # завышать нечего. `resolve_barcode` увеличит счётчик, когда заказ
+            # действительно придёт, и строка сама переедет в нужную находку.
+            db.add(MappingConflict(barcode=item.barcode, account_id=account.id, attempts=0))
             stats["new_conflicts"] += 1
         else:
             conflict.last_seen = now_utc()

@@ -184,9 +184,15 @@ def test_a_clean_base_is_not_an_error(db):
 
 
 def test_every_table_is_reported(db):
-    """Отчёт задания обязан называть все таблицы, даже с нулём: пропавшая из
-    словаря таблица — это молча переставшая чиститься таблица."""
+    """Отчёт задания обязан называть всё, что чистится, даже с нулём: пропавшая
+    из словаря строка — это молча переставшая чиститься таблица.
+
+    `exchange_archive` — не таблица, а каталог обмена с 1С на диске; он здесь по
+    той же причине: до аудита 22.09 его не чистил никто, а копии базы лежат на
+    том же диске.
+    """
     stats = apply_retention(db)
 
     assert set(stats) == {"reconciliation_log", "dispatch_queue", "audit_log",
-                          "ftp_tasks", "sync_anomalies", "test_log"}
+                          "ftp_tasks", "sync_anomalies", "test_log",
+                          "exchange_archive"}

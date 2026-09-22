@@ -209,6 +209,7 @@ def _dispatch_one_account(db: Session, client: PlatformClient, account: Platform
             item.next_attempt_at = None
             item.last_error = ("нет карточки в каталоге кабинета — остаток "
                                "отправить не по чему, сначала мэппинг")
+            item.card_missing = True
             continue
         if identifier in keys_in_request:
             # Два товара 1С ведут на одну карточку площадки. Число уедет по
@@ -291,6 +292,10 @@ def _dispatch_one_account(db: Session, client: PlatformClient, account: Platform
     terminal = {str(e.get("sku")): str(e.get("detail") or "")
                 for e in result.get("errors", [])
                 if isinstance(e, dict) and e.get("terminal") and e.get("sku")}
+    # «Карточки нет» — отдельным признаком, а не по тексту: у каждой площадки
+    # свои слова, а у Ozon они ещё и по-английски. См. `DispatchQueueItem.card_missing`.
+    no_card = {str(e.get("sku")) for e in result.get("errors", [])
+               if isinstance(e, dict) and e.get("card_missing") and e.get("sku")}
     retried = 0
     for barcode, item in uid_to_items.items():
         item.attempts += 1
@@ -301,6 +306,7 @@ def _dispatch_one_account(db: Session, client: PlatformClient, account: Platform
             item.status = DispatchStatus.error
             item.next_attempt_at = None
             item.last_error = terminal[barcode]
+            item.card_missing = barcode in no_card
         elif barcode in ok_set:
             item.status = DispatchStatus.sent
             item.sent_at = now_utc()

@@ -188,3 +188,82 @@ def test_an_interrupted_migration_can_be_repeated(tmp_path):
         "SELECT name FROM sqlite_master WHERE name = '_alembic_tmp_ftp_tasks'")]
     conn.close()
     assert tmp == [], "временная таблица batch-режима осталась в базе"
+
+
+# ---------------------------------------------------------------------------
+# Миграция 3af1c62b7d05 — `dispatch_queue.card_missing`
+# ---------------------------------------------------------------------------
+
+CARD_BEFORE = "cfa36a1f1f2f"
+CARD_AFTER = "3af1c62b7d05"
+
+
+def _queue_row(cur, aid, uid, error, card_missing=0):
+    cur.execute("INSERT INTO products (uid_1c, stock_on_hand, reserve, "
+                "broadcast_enabled) VALUES (?,0,0,0)", (uid,))
+    cur.execute(
+        "INSERT INTO dispatch_queue (uid_1c, account_id, quantity, reason, "
+        "status, attempts, last_error, is_test) VALUES (?,?,?,?,?,?,?,0)",
+        (uid, aid, 1, "order", "error", 5, error))
+
+
+def test_the_card_missing_backfill_marks_old_rows(tmp_path):
+    """Записи, лежащие в базе с прежних времён, флага не имеют.
+
+    Без бэкфилла они вернулись бы в «рассылка не доехала» — критичную находку
+    про оверселл, которого по отсутствующей карточке быть не может.
+    """
+    db = tmp_path / "card_missing_test.db"
+    url = "sqlite:///" + str(db)
+    _alembic(url, CARD_BEFORE)
+
+    conn = sqlite3.connect(str(db))
+    cur = conn.cursor()
+    cur.execute("INSERT INTO platform_accounts (name, platform, is_active, "
+                "dispatch_enabled, consecutive_failures) VALUES ('WB','wb',1,1,0)")
+    aid = cur.lastrowid
+    _queue_row(cur, aid, "u-wb",
+               "не отправлено за 5 попыток: площадка не знает этот sku на складе 1")
+    _queue_row(cur, aid, "u-nocard",
+               "нет карточки в каталоге кабинета — остаток отправить не по чему")
+    _queue_row(cur, aid, "u-net", "HTTPSConnectionPool: read timed out")
+    conn.commit()
+    conn.close()
+
+    _alembic(url, CARD_AFTER)
+
+    conn = sqlite3.connect(str(db))
+    marked = dict(conn.execute(
+        "SELECT uid_1c, card_missing FROM dispatch_queue").fetchall())
+    conn.close()
+    assert marked == {"u-wb": 1, "u-nocard": 1, "u-net": 0}
+
+
+def test_the_card_missing_migration_survives_its_own_interruption(tmp_path):
+    """Alembic на SQLite оборванную миграцию НЕ откатывает.
+
+    Колонка осталась, версия не сдвинулась — повторный `upgrade head` без
+    проверки падал бы на «duplicate column name» НАВСЕГДА: продолжить нечем,
+    повторить нечем, службы не перезапущены.
+    """
+    db = tmp_path / "card_missing_broken.db"
+    url = "sqlite:///" + str(db)
+    _alembic(url, CARD_BEFORE)
+
+    conn = sqlite3.connect(str(db))
+    cur = conn.cursor()
+    cur.execute("INSERT INTO platform_accounts (name, platform, is_active, "
+                "dispatch_enabled, consecutive_failures) VALUES ('WB','wb',1,1,0)")
+    aid = cur.lastrowid
+    _queue_row(cur, aid, "u-wb", "площадка не знает этот sku на складе 1")
+    # Остаток оборванного прогона: колонка добавлена, бэкфилл не дошёл.
+    cur.execute("ALTER TABLE dispatch_queue ADD COLUMN card_missing "
+                "BOOLEAN DEFAULT '0' NOT NULL")
+    conn.commit()
+    conn.close()
+
+    _alembic(url, CARD_AFTER)
+
+    conn = sqlite3.connect(str(db))
+    assert conn.execute("SELECT card_missing FROM dispatch_queue").fetchone()[0] == 1
+    conn.close()

@@ -182,15 +182,33 @@ def job_poll_orders(account_id: int):
                     worker_name, account.name, new_stats, confirm_stats, cancel_stats)
         # Сбойные ОТДЕЛЬНЫЕ заказы цикл переживает (см. poll_new_orders), но
         # молчать о них нельзя: пропущенный заказ — это несписанный остаток.
+        stuck = []
         for label, st in (("заказов", new_stats), ("подтверждений", confirm_stats),
                           ("отмен", cancel_stats)):
             if st.get("failed"):
                 logger.warning("%s (%s): %s не проведено из-за ошибок: %d — %s",
                                worker_name, account.name, label, st["failed"],
                                "; ".join(st.get("problems") or [])[:500])
+                stuck.append(f"{label} не проведено: {st['failed']} — "
+                             + "; ".join(st.get("problems") or [])[:300])
+        # Предохранитель сбрасываем ДАЖЕ при сбойных заказах — намеренно: гасить
+        # кабинет целиком из-за одной битой строки хуже, чем оставить его жить.
         record_success(db, account)
         db.commit()
-        _heartbeat(db, worker_name, True)
+        # А вот молчать нельзя. Раньше heartbeat писался безусловно успешным, и
+        # непроведённый заказ не оставлял следа НИГДЕ: `db.rollback()` в
+        # обработчике (`order_poller`) уносит и `SyncAnomaly`, и `ProcessedOrder`,
+        # а в логе строка живёт до ротации. Устойчивый отказ на одном заказе
+        # означает: единица продана, у нас не списана, перемещения в 1С нет,
+        # остаток завышен и уезжает наружу — при зелёном `/health`, пустой
+        # «Диагностике» и молчащем отчёте.
+        #
+        # Отметка остаётся УСПЕШНОЙ, а текст уезжает в `last_error` — тот же
+        # приём, что у `reconciliation_applied`: `/health` про живость, а
+        # расхождение разбирает отчёт (`_check_orders_not_processed`). Разовый
+        # сбой при этом сам себя стирает через 45 секунд следующим циклом, и
+        # находки не будет — она про УСТОЙЧИВЫЙ отказ, а не про мигание.
+        _heartbeat(db, worker_name, True, "; ".join(stuck) if stuck else "")
     except CredentialsMissing as e:
         logger.warning("%s: %s", worker_name, e)
         _heartbeat(db, worker_name, False, str(e))
@@ -560,8 +578,11 @@ def job_catalog_poll(account_id: int):
         # данными или не завелась вовсе. По снимку считаются ключи отправки —
         # chrtId у WB, variant_id у Kit, — и по не попавшим в него позициям
         # остаток либо уйдёт баркодом, либо не уйдёт совсем. Heartbeat, а не
-        # только лог: «Диагностика» показывает именно его, а лог на бою читают,
-        # когда уже что-то случилось.
+        # только лог: лог на бою читают, когда уже что-то случилось. Читателя
+        # этой отметке завела находка отчёта `_check_truncated_catalog` — до неё
+        # признак вычислялся и не показывался НИГДЕ: «Диагностика» рисует по
+        # кабинету только `poll_orders_account_*` и пять общих имён, а `/health`
+        # при `last_success=True` текст не отдаёт.
         if load_stats.get("truncated"):
             logger.warning(
                 "%s (%s): выгрузка каталога ОБОРВАНА защитным пределом страниц — "
@@ -685,13 +706,24 @@ def job_verify_stock():
     try:
         accounts = _active_accounts(db)
         stats = verify_all(db, build_client, accounts)
-        if stats["diverged"]:
+        if stats["diverged"] or stats["errors"] or stats["silent"]:
             # WARNING: площадка держит не то, что мы отправили. Либо кто-то
-            # пишет поверх нас, либо отправка поняла ответ неверно.
+            # пишет поверх нас, либо отправка поняла ответ неверно. Либо — и это
+            # добавлено отдельно — сверка по кабинету вовсе не прошла: раньше
+            # ветка смотрела ТОЛЬКО на `diverged`, а он ноль и когда не проверено
+            # ничего, так что сорванный прогон выглядел как чистый.
             logger.warning("сверка остатков: %s", stats)
         else:
             logger.info("сверка остатков: %s", stats)
-        _heartbeat(db, "verify_stock", True)
+        # «Площадка промолчала» — отдельно от «кабинет упал»: следствие одно
+        # (сверки не было), а причины разные, и человеку разбирать их по-разному.
+        trouble = []
+        if stats["errors"]:
+            trouble.append(f"сверка не прошла по кабинетам: {stats['errors']}")
+        if stats["silent"]:
+            trouble.append(f"площадка не ответила на чтение остатков, позиций: "
+                           f"{stats['silent']}")
+        _heartbeat(db, "verify_stock", True, "; ".join(trouble))
     except Exception as e:
         logger.exception("verify_stock failed")
         _heartbeat(db, "verify_stock", False, str(e))

@@ -29,7 +29,9 @@
 from __future__ import annotations
 
 import logging
+import os
 from datetime import timedelta
+from pathlib import Path
 
 from sqlalchemy.orm import Session
 
@@ -39,6 +41,10 @@ from app.models import (AnomalyStatus, AuditLog, DispatchQueueItem, DispatchStat
 from app.timeutils import now_utc
 
 logger = logging.getLogger("sync_worker")
+
+# Тот же умолчательный путь, что у `scheduler.build_exchange`. Строкой, а не
+# импортом: `retention` не должен тянуть за собой воркеры.
+DEFAULT_ARCHIVE_DIR = r"C:\sync\archive"
 
 # Сколько хранить. Числа не круглые ради красоты, а под конкретный разбор.
 #
@@ -60,6 +66,19 @@ FTP_TASK_KEEP = timedelta(days=180)
 ANOMALY_KEEP = timedelta(days=90)
 # Журнал страницы «Тестирование» — 30 суток. Это отладочные записи.
 TEST_LOG_KEEP = timedelta(days=30)
+
+# Файлы обмена с 1С в каталоге архива — 60 суток. Это ЕДИНСТВЕННОЕ место, где
+# чистка трогает диск, и до аудита 22.09 архив не чистил никто: `archive_result`
+# делает `os.replace` в `dir_archive` и всё. Туда же ложится суточный
+# `barcodes_*.txt` — на бою 154 232 строки, — и просят его ещё и через сорок
+# секунд после КАЖДОГО старта воркера.
+#
+# Следствие отложенное и потому особенно неприятное: копии базы лежат на том же
+# диске, и когда он кончится, разом откажут запись в SQLite, снятие копии и
+# публикация файлов для 1С — последний рубеж исчезнет ровно тогда, когда он
+# нужен. Шестьдесят суток — с запасом на любой разбор «что именно мы отправили
+# в 1С в тот день».
+EXCHANGE_ARCHIVE_KEEP = timedelta(days=60)
 
 # По сколько строк за раз. См. правило про порции в заголовке модуля.
 CHUNK = 500
@@ -140,4 +159,36 @@ def apply_retention(db: Session) -> dict:
         db, TestLogEntry, TestLogEntry.created_at < now - TEST_LOG_KEEP,
         "журнал тестирования")
 
+    stats["exchange_archive"] = prune_exchange_archive()
+
     return stats
+
+
+def prune_exchange_archive(directory: str | None = None,
+                           keep: timedelta = EXCHANGE_ARCHIVE_KEEP) -> int:
+    """Удалить старые файлы из каталога архива обмена с 1С.
+
+    Только ФАЙЛЫ и только по возрасту: каталоги не трогаем вовсе, а ошибку на
+    отдельном файле проглатываем и идём дальше — файл мог быть занят, и ронять
+    из-за него всю чистку незачем. Каталога нет (Linux-разработка, где обмена
+    не бывает) — тихо выходим.
+
+    Возраст берём по времени изменения файла, а не по имени: имена у четырёх
+    каналов разные, и разбирать каждое значило бы завести пятый способ ошибиться.
+    """
+    path = Path(directory or os.environ.get("SYNC_DIR_ARCHIVE", DEFAULT_ARCHIVE_DIR))
+    if not path.is_dir():
+        return 0
+    cutoff = (now_utc() - keep).timestamp()
+    removed = 0
+    for entry in path.iterdir():
+        try:
+            if not entry.is_file() or entry.stat().st_mtime >= cutoff:
+                continue
+            entry.unlink()
+            removed += 1
+        except OSError:
+            continue
+    if removed:
+        logger.info("хранение: архив обмена — удалено файлов %d", removed)
+    return removed

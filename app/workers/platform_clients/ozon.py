@@ -31,6 +31,16 @@ OZON_TERMINAL_ITEM_CODES = frozenset({
     "WAREHOUSE_NOT_FOUND", "INVALID_OFFER_ID",
 })
 
+# Из них — те, что означают именно «карточки этого товара у площадки нет».
+# `WAREHOUSE_NOT_FOUND` сюда НЕ входит: там виновата настройка кабинета, а не
+# мэппинг товара. Признак уезжает наверх отдельным полем: в `detail` у Ozon
+# лежит сообщение площадки ПО-АНГЛИЙСКИ, и отчёт, искавший русские подстроки,
+# не опознал бы его никогда — все такие записи навсегда оставались критичной
+# находкой «рассылка не доехала».
+OZON_CARD_MISSING_CODES = frozenset({
+    "NOT_FOUND_ERROR", "PRODUCT_NOT_FOUND", "OFFER_NOT_FOUND", "INVALID_OFFER_ID",
+})
+
 
 def _error_codes(result: dict) -> set[str]:
     """Коды ошибок из строки ответа Ozon по одной позиции."""
@@ -319,6 +329,7 @@ class OzonClient(PlatformClient):
                     errors.append({
                         "sku": barcode,
                         "terminal": bool(codes & OZON_TERMINAL_ITEM_CODES),
+                        "card_missing": bool(codes & OZON_CARD_MISSING_CODES),
                         "detail": detail,
                     })
             except requests.HTTPError as e:

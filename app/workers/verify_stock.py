@@ -106,7 +106,8 @@ def rows_to_verify(db: Session, account_id: int) -> list[DispatchQueueItem]:
 
 def verify_account(db: Session, client, account: PlatformAccount) -> dict:
     """Спросить площадку по одному кабинету и записать ответ в строки очереди."""
-    stats = {"checked": 0, "match": 0, "diverged": 0, "unknown_sku": 0, "skipped": 0}
+    stats = {"checked": 0, "match": 0, "diverged": 0, "unknown_sku": 0,
+             "skipped": 0, "silent": 0}
 
     rows = rows_to_verify(db, account.id)
     if not rows:
@@ -137,10 +138,22 @@ def verify_account(db: Session, client, account: PlatformAccount) -> dict:
 
     held = client.get_stocks(account.warehouse_id, asked)
     if held is None:
-        # Площадка не умеет отдавать остатки назад или не ответила. Это не
+        # Площадка не умеет отдавать остатки назад ИЛИ не ответила. Это не
         # расхождение и не совпадение — это отсутствие проверки, и пометить
         # строки чем-либо значило бы соврать.
-        stats["skipped"] = len(rows)
+        #
+        # Но два этих случая разные, и считать их одним счётчиком нельзя.
+        # «Не умеет» (Ozon, Kit) — штатно и навсегда. «Не ответила» у клиента,
+        # который читать УМЕЕТ, значит, что сверка по кабинету не прошла: 403 по
+        # снятой области, 404 по переименованной ручке, хронический 429 — всё
+        # это даёт `None`, а не исключение (`with_retry` 4xx кроме 429 не
+        # повторяет). Раньше и то и другое ложилось в `skipped`, прогон писал
+        # зелёный heartbeat, и единственная проверка, которая ловит перезапись
+        # наших остатков второй системой, могла молчать неограниченно долго.
+        if getattr(client, "reads_stocks", False):
+            stats["silent"] = len(rows)
+        else:
+            stats["skipped"] = len(rows)
         return stats
 
     now = now_utc()
@@ -168,12 +181,20 @@ def verify_all(db: Session, build_client, accounts: list[PlatformAccount]) -> di
     """Пройти по кабинетам. Сбой одного не должен уносить остальные: площадки
     независимы, и молчание WB — не повод не проверить Kit."""
     total = {"checked": 0, "match": 0, "diverged": 0, "unknown_sku": 0,
-             "skipped": 0, "errors": 0}
+             "skipped": 0, "silent": 0, "errors": 0}
     for account in accounts:
         try:
             client = build_client(db, account.id)
             stats = verify_account(db, client, account)
         except Exception as e:                       # noqa: BLE001 — см. docstring
+            # Откат обязателен и по той же причине, что в рассылке и приёме
+            # заказов: `verify_account` заканчивается `db.commit()`, а упавший
+            # коммит деактивирует сессию — без отката каждый следующий кабинет
+            # падал бы здесь же с `PendingRollbackError`, то есть один сбойный
+            # кабинет уносил бы сверку по ВСЕМ. Заметить это было неоткуда:
+            # `job_verify_stock` ветку выбирает по `diverged` (ноль, когда не
+            # проверено ничего) и пишет зелёный heartbeat.
+            db.rollback()
             total["errors"] += 1
             logger.warning("сверка остатков, кабинет «%s»: %s: %s",
                            account.name, type(e).__name__, e)

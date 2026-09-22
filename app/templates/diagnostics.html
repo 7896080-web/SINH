@@ -191,7 +191,14 @@
                 {% if item.hb %}
                 <td>{{ item.hb.last_run_at.strftime('%d.%m.%Y %H:%M:%S') }}</td>
                 <td>
-                    {% if item.hb.last_success %}
+                    {% if item.hb.last_success and item.hb.last_error %}
+                        {# Задание отработало, но НЕ всю работу: часть заказов не
+                           проведена, площадка не ответила, выгрузка оборвана.
+                           Раньше здесь стояло зелёное «ок», и текст не показывал
+                           никто — ни эта страница, ни /health. #}
+                        <span class="badge badge--warn">с оговоркой</span>
+                        <div class="help-text">{{ item.hb.last_error }}</div>
+                    {% elif item.hb.last_success %}
                         <span class="badge badge--good">ок</span>
                     {% else %}
                         <span class="badge badge--bad" title="{{ item.hb.last_error }}">ошибка</span>
@@ -231,10 +238,15 @@
             <form method="post" action="/diagnostics/accounts/{{ account.id }}/catalog-now" style="display:inline;">
                 <button type="submit" class="btn" {% if not account.is_active %}disabled{% endif %}>Обновить каталог сейчас</button>
             </form>
-            {% if account.consecutive_failures > 0 %}
+            {% if account.consecutive_failures > 0 and account.is_active %}
             <form method="post" action="/diagnostics/accounts/{{ account.id }}/reset-failures" style="display:inline;">
                 <button type="submit" class="btn">Сбросить счётчик сбоев</button>
             </form>
+            {% elif account.consecutive_failures > 0 %}
+            {# Погашенному предохранителем кабинету сброс счётчика не помогает, а
+               единственную находку отчёта о нём гасит. Включают такой кабинет на
+               «API-ключах», счётчик сбрасывается там же. #}
+            <span class="muted">Отключён предохранителем — включить на «API-ключах»</span>
             {% endif %}
         </div>
     </div>
@@ -257,13 +269,40 @@
                 <td>
                     {% if row.heartbeat %}
                         {{ row.heartbeat.last_run_at.strftime('%d.%m.%Y %H:%M:%S') }}
-                        {% if row.heartbeat.last_success %}
+                        {% if row.heartbeat.last_success and row.heartbeat.last_error %}
+                            {# Цикл дошёл до конца, но часть заказов не проведена.
+                               Сбойный заказ откатывается целиком, вместе с аномалией
+                               и отметкой об обработке, — в базе от него не остаётся
+                               ничего, и до этой правки зелёное «ок» было всем, что
+                               видел человек. А непроведённый заказ означает: единица
+                               продана, у нас не списана, в 1С документа нет. #}
+                            <span class="badge badge--warn">с оговоркой</span>
+                            <div class="help-text">{{ row.heartbeat.last_error }}</div>
+                        {% elif row.heartbeat.last_success %}
                             <span class="badge badge--good">ок</span>
                         {% else %}
                             <span class="badge badge--bad" title="{{ row.heartbeat.last_error }}">ошибка</span>
                         {% endif %}
                     {% else %}
                         <span class="help-text">ещё не запускался</span>
+                    {% endif %}
+                </td>
+            </tr>
+            <tr>
+                <td>Выгрузка каталога — последний запуск</td>
+                <td>
+                    {% if row.catalog_heartbeat %}
+                        {{ row.catalog_heartbeat.last_run_at.strftime('%d.%m.%Y %H:%M:%S') }}
+                        {% if row.catalog_heartbeat.last_success and row.catalog_heartbeat.last_error %}
+                            <span class="badge badge--warn">с оговоркой</span>
+                            <div class="help-text">{{ row.catalog_heartbeat.last_error }}</div>
+                        {% elif row.catalog_heartbeat.last_success %}
+                            <span class="badge badge--good">ок</span>
+                        {% else %}
+                            <span class="badge badge--bad" title="{{ row.catalog_heartbeat.last_error }}">ошибка</span>
+                        {% endif %}
+                    {% else %}
+                        <span class="help-text">ещё не запускалась</span>
                     {% endif %}
                 </td>
             </tr>

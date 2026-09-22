@@ -57,7 +57,7 @@ def test_a_platform_holding_less_than_we_sent_is_recorded(db):
     stats = verify_account(db, FakePlatform({"2004896744404": 0}), account)
 
     assert stats == {"checked": 1, "match": 0, "diverged": 1,
-                     "unknown_sku": 0, "skipped": 0}
+                     "unknown_sku": 0, "skipped": 0, "silent": 0}
     assert item.verified_quantity == 0
     assert item.verified_at is not None
 

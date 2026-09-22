@@ -106,6 +106,10 @@ STOCKS_BATCH_SKUS = 1000
 
 class WbClient(PlatformClient):
     name = "wb"
+    # Единственный клиент, у которого чтение остатков написано и проверено на
+    # живом кабинете. Отсюда и следствие: `None` от `get_stocks` здесь означает
+    # не «не умеем», а «площадка не ответила» — и это повод сказать.
+    reads_stocks = True
     # Остаток WB адресует sku, а sku у него — это баркод.
     stock_key = "barcode"
     # Насколько старую дату расчёта лента ещё способна покрыть (см. константу).
@@ -579,6 +583,7 @@ class WbClient(PlatformClient):
                     for item in unknown:
                         dropped.append({
                             "sku": item.barcode, "terminal": True,
+                            "card_missing": True,
                             "detail": f"площадка не знает этот sku на складе {warehouse_id} "
                                       f"(409 NotFound) — остаток по нему не уедет, пока "
                                       f"карточки там нет",

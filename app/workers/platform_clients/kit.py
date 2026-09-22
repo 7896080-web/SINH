@@ -32,6 +32,14 @@ TERMINAL_ITEM_CODES = {
     "INVALID_QUANTITY": "площадка не приняла количество",
 }
 
+# Из них — те, что означают ровно «карточки этого товара в кабинете нет».
+# Следствие у них своё: продавать нечего, оверселла не будет, и чинить надо
+# мэппинг, а не связь. Признак уезжает наверх ДАННЫМИ (`card_missing`), а не
+# русским текстом: отчёт искал две подстроки и ни с одной из этих не совпадал,
+# так что «нет карточки» у Kit попадало в КРИТИЧНУЮ находку «рассылка не
+# доехала» — и навсегда.
+CARD_MISSING_ITEM_CODES = frozenset({"VARIANT_NOT_FOUND", "VARIANT_ARCHIVED"})
+
 # А эти два кода — про КАБИНЕТ, а не про позицию: склад в его настройках указан
 # неверно или заархивирован. Выкидывать по ним позиции нельзя: они не виноваты,
 # и очередь вымерла бы целиком, хотя чинится это одной правкой настройки.
@@ -379,7 +387,7 @@ class KitClient(PlatformClient):
         # уже не пускает, но клиент обязан защищаться сам: падать на баркод
         # «а вдруг поймёт» здесь нельзя ни при каких обстоятельствах.
         dropped: list[dict] = [
-            {"sku": it.barcode, "terminal": True,
+            {"sku": it.barcode, "terminal": True, "card_missing": True,
              "detail": "нет variant_id: карточки этого товара нет в каталоге кабинета"}
             for it in chunk if not it.external_id
         ]
@@ -432,6 +440,7 @@ class KitClient(PlatformClient):
                 for vid, code in sorted(bad.items()):
                     dropped.append({
                         "sku": by_variant[vid].barcode, "terminal": True,
+                        "card_missing": code in CARD_MISSING_ITEM_CODES,
                         "detail": TERMINAL_ITEM_CODES[code].format(vid=vid),
                     })
                 remaining = [it for it in remaining if it.external_id not in bad]
