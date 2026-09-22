@@ -864,6 +864,20 @@ def testing_offset_calc(
     asked = ensure_snapshot_requested(db, day, user.username) if day is not None else False
     recompute_offset(product)
 
+    # Новое число обязано уехать — рассылка СОБЫТИЙНАЯ и сама к порогу не
+    # вернётся: следующая отправка будет, только когда изменится остаток, а у
+    # медленного размера это месяцы. Близнец на странице «Товары» (`_repropagate`
+    # после правки даты и факта) это делает, а здесь не делал: оператор видел
+    # новый порог в строке и считал, что карточка обновлена, — при том что на
+    # площадке лежало прежнее число.
+    #
+    # Через `enqueue_full_resend`, а не прямым `db.add`: страницу «Тестирование»
+    # открывают ровно в том состоянии, где лестница даёт ноль, и мимо гейтов
+    # такая запись обнулила бы живую карточку.
+    for setting in product.sync_settings:
+        if setting.enabled:
+            enqueue_full_resend(db, uid_1c, setting.account_id, reason="offset_recalc")
+
     log_action(db, user.username, "offset_calc_from_testing",
                f"{uid_1c} -> дата {raw_date or 'снята'}, факт {raw_fact or 'сброшен'}")
     db.commit()
