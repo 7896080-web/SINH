@@ -7,12 +7,16 @@ from app.timeutils import now_utc
 # имеет право перебить (`reconciliation.import_barcode_dict`).
 POOL_GUESS_SOURCE = "pool_match"
 
+import logging
+
 from sqlalchemy.orm import Session
 
 from app.broadcast_gate import drop_recalc_mark
 from app.models import (Barcode, MappingConflict, PlatformAccount, PlatformCatalogItem,
                         Product)
 from app.workers.platform_clients.base import PlatformClient
+
+logger = logging.getLogger("sync_worker")
 
 
 def load_platform_catalog(db: Session, client: PlatformClient, account: PlatformAccount) -> dict:
@@ -35,6 +39,7 @@ def load_platform_catalog(db: Session, client: PlatformClient, account: Platform
     stats = {"fetched": len(items), "already_mapped": 0, "pool_matched": 0,
              "recalc_dropped": 0,
              "new_conflicts": 0, "known_conflicts": 0, "no_barcode": 0,
+             "revived": 0,
              "truncated": truncated}
 
     # Ключ строки каталога — БАРКОД (у WB один external_id/nmID охватывает
@@ -152,4 +157,77 @@ def load_platform_catalog(db: Session, client: PlatformClient, account: Platform
             stats["known_conflicts"] += 1
 
     db.commit()
+
+    stats["revived"] = revive_after_catalog(db, client, account)
     return stats
+
+
+def revive_after_catalog(db: Session, client: PlatformClient,
+                         account: PlatformAccount) -> int:
+    """Поднять пары, закрытые из-за ОТСУТСТВИЯ этого самого каталога.
+
+    Дефект, найденный 22.09 на живом кабинете КИТ. Последовательность вся
+    штатная: завели карточку на площадке, включили трансляцию, расчёт прошёл и
+    поставил пару в очередь — а каталог кабинета выгружается раз в сутки и про
+    новую карточку ещё не знает. `variant_id` нет, рассылка закрывает позицию
+    ТЕРМИНАЛЬНО (иначе Kit забракует весь запрос целиком), и через четыре минуты
+    приходит каталог, в котором ключ уже есть. Дальше — тишина: запись
+    терминальна, повтора не будет, следующая отправка случится, только когда
+    изменится остаток. У зимней куртки это месяцы. Остаток не уедет НИКОГДА,
+    хотя все условия давно выполнены, и заметить это можно только придя смотреть
+    глазами.
+
+    Тот же случай, что `recalc_covered` у расчёта: ворота открыло именно это
+    событие, а запись, справедливо получившая отказ раньше, осталась лежать —
+    значит поднимать её этому событию.
+
+    ЧТО ИМЕННО ПОДНИМАЕМ, и почему не всё подряд. Два разных отказа помечены
+    `card_missing`, и лечатся они разным:
+
+      * НАШ отказ — рассылка не нашла ключа, которым адресует эта площадка, и
+        в запрос позиция не пошла вовсе. `sent_sku` при этом пуст: он пишется
+        только тем позициям, которые реально уехали (`dispatch`). Вот это и
+        лечится каталогом.
+      * Отказ ПЛОЩАДКИ — запрос ушёл, а она ответила «такого sku на складе
+        нет» (у WB это `409 NotFound`). `sent_sku` заполнен. Каталог тут ни при
+        чём: ключ был и есть, а карточки на складе площадки нет. Подними мы
+        такую пару — сожгли бы запрос и закрыли её снова, а находка отчёта
+        «Площадка не знает наш sku» замигала бы на ровном месте.
+
+    Различаем ДАННЫМИ (`sent_sku IS NULL`), а не текстом ошибки: тексты у трёх
+    площадок разные, и на этом уже обожглись — см. историю `card_missing`.
+
+    И поднимаем только те пары, у которых ключ ТЕПЕРЬ действительно есть. Иначе
+    каждая суточная выгрузка гоняла бы по кругу карточки, которых на площадке
+    нет вовсе, — а их, по живому кабинету, под сотню.
+
+    Ставим через `enqueue_full_resend`, то есть со всеми гейтами: товар без
+    трансляции и кабинет вне расчёта не поедут. Обойти их здесь значило бы
+    отправить ноль на живую карточку — ровно то, от чего гейты и стоят.
+    """
+    from app.transmit import enqueue_full_resend
+    from app.workers.dispatch import push_identifier
+    from app.models import DispatchQueueItem, DispatchStatus
+
+    stock_key = getattr(client, "stock_key", "barcode")
+    uids = {row[0] for row in db.query(DispatchQueueItem.uid_1c).filter(
+        DispatchQueueItem.account_id == account.id,
+        DispatchQueueItem.status == DispatchStatus.error,
+        DispatchQueueItem.card_missing.is_(True),
+        DispatchQueueItem.sent_sku.is_(None),
+        DispatchQueueItem.is_test.is_(False),
+    ).distinct().all()}
+    if not uids:
+        return 0
+
+    revived = 0
+    for uid in sorted(uids):
+        if not push_identifier(db, uid, account.id, stock_key):
+            continue                      # ключа как не было, так и нет
+        if enqueue_full_resend(db, uid, account.id, reason="catalog_loaded"):
+            revived += 1
+    if revived:
+        db.commit()
+        logger.info("каталог «%s»: поднято пар, ждавших ключа отправки: %d",
+                    account.name, revived)
+    return revived

@@ -41,6 +41,26 @@ def _resolve_push_target(db: Session, uid_1c: str, account_id: int) -> tuple[str
     return pool[0], "", ""
 
 
+def push_identifier(db: Session, uid_1c: str, account_id: int,
+                    stock_key: str) -> str:
+    """Ключ, КОТОРЫМ эта площадка адресует остаток. Пустая строка — ключа нет.
+
+    Одна функция на всех, и это не вкусовщина. Правило выбора («WB — баркод,
+    Ozon — артикул, Kit — variant_id») живёт здесь, потому что по нему
+    принимаются ДВА разных решения в разных модулях: рассылка решает, идёт ли
+    позиция в запрос вовсе, а загрузка каталога — появился ли у закрытой пары
+    ключ, которого не хватало. Повтори второй эту логику у себя — они однажды
+    разойдутся, и каталог начнёт поднимать пары, по которым отправлять
+    по-прежнему нечем, либо молча не поднимать те, по которым уже можно.
+    """
+    target = _resolve_push_target(db, uid_1c, account_id)
+    if target is None:
+        return ""
+    barcode, external_id, article = target
+    return {"barcode": barcode, "external_id": external_id,
+            "article": article}.get(stock_key, barcode) or ""
+
+
 def _quantity_to_send(db: Session, uid_1c: str, account_id: int, quantity: int) -> int:
     """Сколько уйдёт на площадку. Лестница приоритетов — в app/transmit.py, один
     модуль на рассылку и на интерфейс (раньше копии разошлись, и страница показывала
@@ -204,6 +224,8 @@ def _dispatch_one_account(db: Session, client: PlatformClient, account: Platform
         # каталоге, и каждая пачка падала из-за них.
         identifier = {"barcode": barcode, "external_id": external_id,
                       "article": article}.get(stock_key, barcode)
+        # (то же правило, что в `push_identifier` — общий помощник для того и
+        #  заведён; здесь идентификаторы уже на руках, второй раз их не ищем)
         if not identifier:
             item.status = DispatchStatus.error
             item.next_attempt_at = None
