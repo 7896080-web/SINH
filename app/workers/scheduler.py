@@ -865,10 +865,14 @@ def job_alerts():
     Единственное задание, которое говорит НАРУЖУ. Само ничего не чинит и не
     трогает ни площадки, ни 1С — только читает и рассказывает (см. `app/alerts.py`).
     """
-    from app.alerts import configured_channels, run_alert_cycle
+    from app.alerts import configured_channels, ping_alive, run_alert_cycle
 
     db = SessionLocal()
     try:
+        # Сторож ПЕРВЫМ делом и вне зависимости от остального: он отвечает на
+        # вопрос «жив ли воркер», и ответ не должен зависеть от того, чем
+        # кончился разбор находок.
+        watchdog = ping_alive()
         stats = run_alert_cycle(db)
         db.commit()
         if stats["action"] in ("alarm", "clear"):
@@ -889,6 +893,11 @@ def job_alerts():
             note = f"каналов не ответило: {stats['failed']} — сообщение не доставлено"
         else:
             note = ""
+        if watchdog:
+            # Отдельной строкой, а не вместо: сторож и каналы решают РАЗНЫЕ
+            # задачи. Каналы молчат о поломке, сторож молчит о смерти воркера,
+            # и подменить один другим нельзя.
+            note = (note + "; " if note else "") + f"внешний сторож не ответил: {watchdog}"
         _heartbeat(db, "alerts", True, note)
     except Exception as e:
         logger.exception("alerts failed")
