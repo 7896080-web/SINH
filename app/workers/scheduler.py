@@ -847,6 +847,56 @@ def job_retention():
         db.close()
 
 
+# Как часто смотреть, не пора ли позвать человека. Пять минут — чуть больше
+# самого короткого срока протухания в `/health` (135 с у рассылки): реагируем
+# почти сразу, но не превращаем задание в опрос ради опроса. Само по себе оно
+# ничего не шлёт, пока картина не изменилась.
+ALERT_INTERVAL_MINUTES = 5
+# Первый прогон — не сразу после старта: службы только поднялись, часть заданий
+# ещё не отчиталась ни разу, и `/health` в эти минуты красный законно. Разбудить
+# человека сообщением «всё сломано» на каждом перезапуске — лучший способ
+# добиться, чтобы уведомления выключили в первый же день.
+ALERT_FIRST_RUN_DELAY = timedelta(minutes=12)
+
+
+def job_alerts():
+    """Позвать человека, если система встала или разошлась с реальностью.
+
+    Единственное задание, которое говорит НАРУЖУ. Само ничего не чинит и не
+    трогает ни площадки, ни 1С — только читает и рассказывает (см. `app/alerts.py`).
+    """
+    from app.alerts import configured_channels, run_alert_cycle
+
+    db = SessionLocal()
+    try:
+        stats = run_alert_cycle(db)
+        db.commit()
+        if stats["action"] in ("alarm", "clear"):
+            logger.warning("уведомления: %s", stats)
+        else:
+            # Пишем всегда: тишина обязана означать «задание не отработало», а не
+            # «говорить было нечего».
+            logger.info("уведомления: %s", stats)
+
+        # Ненастроенные каналы и не доехавшее сообщение — РАЗНЫЕ вещи, и обе
+        # обязаны быть видны. Первое штатно на свежей установке, второе значит,
+        # что тревога прямо сейчас не дошла до человека, и он об этом не узнает
+        # ниоткуда — кроме этой строки на «Диагностике».
+        if not configured_channels():
+            note = ("каналы уведомлений не настроены — система никого не позовёт, "
+                    "см. deploy/README_WINDOWS.md")
+        elif stats["failed"]:
+            note = f"каналов не ответило: {stats['failed']} — сообщение не доставлено"
+        else:
+            note = ""
+        _heartbeat(db, "alerts", True, note)
+    except Exception as e:
+        logger.exception("alerts failed")
+        _heartbeat(db, "alerts", False, str(e))
+    finally:
+        db.close()
+
+
 def build_scheduler() -> BlockingScheduler:
     """Статические задания навешиваются один раз, per-account задания —
     через reconcile_account_jobs() (первый прогон при старте плюс
@@ -933,6 +983,9 @@ def build_scheduler() -> BlockingScheduler:
         db.close()
     sched.add_job(job_backup, "interval", hours=BACKUP_INTERVAL_HOURS, id="backup",
                   max_instances=1, next_run_time=start + BACKUP_FIRST_RUN_DELAY)
+    sched.add_job(job_alerts, "interval", minutes=ALERT_INTERVAL_MINUTES,
+                  id="alerts", max_instances=1,
+                  next_run_time=start + ALERT_FIRST_RUN_DELAY)
     sched.add_job(job_retention, "interval", hours=RETENTION_INTERVAL_HOURS,
                   id="retention", max_instances=1,
                   next_run_time=start + RETENTION_FIRST_RUN_DELAY)

@@ -121,8 +121,11 @@ def diagnostics_page(request: Request, db: Session = Depends(get_db), user: User
     # результат отличить было неоткуда.
     shared_workers = ["dispatch", "ftp_send", "ftp_receive", "reconciliation",
                       "reconciliation_applied", "verify_stock", "backup",
-                      "retention"]
+                      "retention", "alerts"]
     shared_heartbeats = [{"name": w, "hb": _heartbeat_for(db, w)} for w in shared_workers]
+
+    from app.alerts import configured_channels
+    alert_channels = configured_channels()
 
     report_findings = collect_findings(db)
 
@@ -148,6 +151,7 @@ def diagnostics_page(request: Request, db: Session = Depends(get_db), user: User
         # показываем: иначе отчёт есть, а узнать о нём неоткуда.
         "report_findings": report_findings,
         "report_critical": sum(1 for f in report_findings if f.level == REPORT_CRITICAL),
+        "alert_channels": alert_channels,
     })
 
 
@@ -374,6 +378,57 @@ def catalog_now(
         set_flash(request, f"«{account.name}»: ошибка при загрузке каталога — {e}", "warn")
 
     return RedirectResponse("/diagnostics", status_code=303)
+
+
+@router.post("/diagnostics/alerts/test")
+def send_test_alert(
+    request: Request,
+    db: Session = Depends(get_db), user: User = Depends(get_current_user),
+):
+    """Отправить пробное уведомление по настроенным каналам.
+
+    Канал, который не проверили, — это надежда, а не канал: ровно то же уже
+    проходили с бэкапом, который снимался, но никогда не проверялся чтением.
+    Токен бота и пароль почты правятся в `.env` руками, опечататься там проще
+    простого, а узнать об ошибке иначе можно было бы только в тот час, когда
+    случилась настоящая поломка, — то есть в худший из возможных.
+
+    Шлёт СРАЗУ и мимо всей дедупликации: это проверка связи, а не тревога, и
+    запоминать её как «последнюю сообщённую картину» нельзя — иначе настоящая
+    тревога следом сочлась бы повтором и не ушла.
+    """
+    from app.alerts import configured_channels, deliver
+
+    channels = configured_channels()
+    if not channels:
+        set_flash(request,
+                  "Каналы уведомлений не настроены: система никого не позовёт. "
+                  "Нужны TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID либо ALERT_SMTP_HOST "
+                  "и ALERT_EMAIL_TO в .env — см. deploy/README_WINDOWS.md.",
+                  "warn")
+        return RedirectResponse("/diagnostics#workers", status_code=303)
+
+    sent, failed = deliver(
+        "[Sync Admin] Проверка связи",
+        "Это пробное сообщение, отправленное со страницы «Диагностика».\n"
+        "Настоящие уведомления приходят, только когда система встала или "
+        "разошлась с реальностью.",
+    )
+    log_action(db, user.username, "alert_test_sent",
+               f"доставлено: {', '.join(sent) or 'никуда'}; "
+               f"отказов: {len(failed)}")
+    db.commit()
+
+    if failed and not sent:
+        set_flash(request, "Уведомление НЕ доставлено ни по одному каналу. "
+                           + "; ".join(failed), "warn")
+    elif failed:
+        set_flash(request, f"Доставлено: {', '.join(sent)}. "
+                           f"Не доставлено — {'; '.join(failed)}", "warn")
+    else:
+        set_flash(request, f"Пробное уведомление отправлено: {', '.join(sent)}. "
+                           f"Если оно не пришло, проверьте адресата в .env.", "good")
+    return RedirectResponse("/diagnostics#workers", status_code=303)
 
 
 @router.post("/diagnostics/accounts/{account_id}/reset-failures")
