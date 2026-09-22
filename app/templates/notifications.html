@@ -1,0 +1,108 @@
+{% extends "base.html" %}
+{% block title %}Уведомления{% endblock %}
+{% block content %}
+
+<div class="page-header">
+    <div>
+        <h1>Уведомления</h1>
+        <p>Куда система пишет, когда встала или разошлась с реальностью. Это единственный путь, которым она зовёт человека сама — во всех остальных случаях узнать о проблеме можно, только открыв страницу.</p>
+    </div>
+</div>
+
+{% if flash %}<div class="flash flash--{{ flash.kind }}">{{ flash.text }}</div>{% endif %}
+
+<div class="card">
+    <h3 style="margin-top:0">Состояние</h3>
+    <p>
+        Telegram —
+        {% if telegram_on %}<span class="badge badge--good">включён</span>
+        {% else %}<span class="badge badge--bad">не настроен</span>{% endif %}
+        &nbsp;·&nbsp; Почта —
+        {% if email_on %}<span class="badge badge--good">включена</span>
+        {% else %}<span class="badge badge--bad">не настроена</span>{% endif %}
+    </p>
+    {% if not telegram_on and not email_on %}
+    <p class="help-text">
+        <b>Сейчас система никого не позовёт.</b> Если ночью встанут службы или начнётся
+        оверселл, об этом не узнает никто до тех пор, пока кто-нибудь не откроет
+        «Диагностику» сам. Достаточно настроить любой один канал — можно оба.
+    </p>
+    {% else %}
+    <p class="help-text">
+        Проверьте канал кнопкой <b>«Отправить пробное уведомление»</b> на
+        <a href="/diagnostics#workers">«Диагностике»</a>. Опечатка в токене выглядит
+        ровно так же, как исправная тишина, и обнаружилась бы в тот час, когда случилась
+        настоящая поломка, — то есть в худший из возможных.
+    </p>
+    {% endif %}
+    <p class="help-text">
+        Будят <b>две</b> вещи: задание перестало работать и КРИТИЧНАЯ находка отчёта
+        о расхождениях. Жёлтые находки не будят никогда и намеренно: их в исправной
+        системе бывает несколько штук постоянно, и, разбудив на жёлтом раз, мы научим
+        не читать и красное. Тихих часов нет — проданный дважды товар до утра не подождёт.
+    </p>
+</div>
+
+{% for card in cards %}
+<div class="card">
+    <h3 style="margin-top:0">{{ card.title }}</h3>
+
+    {% if card.key == 'telegram' %}
+    <p class="help-text">
+        Бот заводится одной командой: в Telegram найдите <b>@BotFather</b> → <code>/newbot</code>
+        → имя и логин (логин обязан кончаться на <code>bot</code>). В ответ придёт токен.
+        Затем напишите своему боту <code>/start</code> — без этого он не сможет писать вам
+        первым — и откройте
+        <code>https://api.telegram.org/bot&lt;ТОКЕН&gt;/getUpdates</code>,
+        чтобы взять оттуда <code>chat.id</code>.
+    </p>
+    {% elif card.key == 'email' %}
+    <p class="help-text">
+        Канал включается парой «SMTP-сервер» + «Кому слать»; остальное — детали соединения,
+        их можно не трогать. Порт <b>465</b> означает SSL, <b>587</b> — STARTTLS.
+    </p>
+    {% endif %}
+
+    {% for f in card.fields %}
+    <form method="post" action="/notifications/save"
+          style="display:flex; align-items:flex-end; gap:12px; margin-bottom:12px;">
+        <input type="hidden" name="name" value="{{ f.name }}">
+        <div class="field" style="flex:1">
+            <label>{{ f.label }}</label>
+            {# Секрет на страницу не возвращаем даже в value: подставить маску в поле
+               значило бы сохранить её вместо токена при первом же нажатии «Сохранить». #}
+            <input type="text" name="value" autocomplete="off"
+                   value="{{ f.value }}"
+                   placeholder="{% if f.secret and f.is_set %}{{ f.masked }}{% else %}{{ f.placeholder }}{% endif %}">
+            <div class="help-text">
+                {{ f.hint | safe }}
+                {% if f.from_env %}
+                <br><b>Значение взято из <code>.env</code></b> — правка здесь его перекроет,
+                но из файла не удалит. Чтобы убрать совсем, сотрите строку и в файле.
+                {% elif f.is_set and f.updated_at %}
+                <br>Обновлено {{ f.updated_at.strftime('%d.%m.%Y %H:%M') }}.
+                {% elif not f.is_set %}
+                <br>Не задано.
+                {% endif %}
+            </div>
+        </div>
+        <button type="submit" class="btn-primary">Сохранить</button>
+    </form>
+    {% endfor %}
+</div>
+{% endfor %}
+
+<div class="card">
+    <h3 style="margin-top:0">Чего эта страница не закрывает</h3>
+    <p class="help-text">
+        Уведомления живут <b>внутри воркера</b>. Умер воркер — умерли и они, то есть самый
+        важный случай («ночью легли обе службы») ими не покрывается в принципе: процесс,
+        которого нет, не сообщит, что его нет. Закрывает это только обратная полярность —
+        поле <b>«Пинг внешнего сторожа»</b> выше. Воркер дёргает этот адрес на каждом
+        прогоне; перестал дёргать — внешний сервис пишет вам сам. Подойдёт любой, кто
+        умеет ждать пинг по URL (healthchecks.io, Better Stack, push-монитор Uptime Kuma):
+        период — 5 минут, запас — 15.
+    </p>
+</div>
+
+{% endblock %}

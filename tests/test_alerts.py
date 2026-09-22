@@ -22,11 +22,11 @@ def channel(monkeypatch):
     """Подставной канал: запоминает отправленное вместо похода в сеть."""
     outbox = []
 
-    def fake_deliver(subject, body):
+    def fake_deliver(db, subject, body):
         outbox.append((subject, body))
         return ["telegram"], []
 
-    monkeypatch.setattr(alerts, "configured_channels", lambda: ["telegram"])
+    monkeypatch.setattr(alerts, "configured_channels", lambda db: ["telegram"])
     monkeypatch.setattr(alerts, "deliver", fake_deliver)
     return outbox
 
@@ -164,7 +164,7 @@ def test_a_standing_trouble_is_repeated_after_the_timer(db, channel):
     db.commit()
 
     state = db.query(AlertState).first()
-    state.last_sent_at = now_utc() - alerts.REPEAT_AFTER - timedelta(minutes=1)
+    state.last_sent_at = now_utc() - alerts.repeat_after(db) - timedelta(minutes=1)
     db.commit()
 
     stats = alerts.run_alert_cycle(db)
@@ -226,9 +226,9 @@ def test_an_undelivered_alarm_is_retried_next_cycle(db, monkeypatch):
     _critical_finding(db)
     attempts = []
 
-    monkeypatch.setattr(alerts, "configured_channels", lambda: ["telegram"])
+    monkeypatch.setattr(alerts, "configured_channels", lambda db: ["telegram"])
     monkeypatch.setattr(alerts, "deliver",
-                        lambda s, b: (attempts.append(s), ([], ["telegram: timeout"]))[1])
+                        lambda db, s, b: (attempts.append(s), ([], ["telegram: timeout"]))[1])
 
     first = alerts.run_alert_cycle(db)
     db.commit()
@@ -247,14 +247,14 @@ def test_one_broken_channel_does_not_stop_the_other(db, monkeypatch):
     monkeypatch.setenv("ALERT_SMTP_HOST", "smtp.example")
     monkeypatch.setenv("ALERT_EMAIL_TO", "a@example")
 
-    def boom(subject, body):
+    def boom(cfg, subject, body):
         raise RuntimeError("сеть недоступна")
 
     calls = []
     monkeypatch.setattr(alerts, "_send_telegram", boom)
-    monkeypatch.setattr(alerts, "_send_email", lambda s, b: calls.append(s))
+    monkeypatch.setattr(alerts, "_send_email", lambda cfg, s, b: calls.append(s))
 
-    sent, failed = alerts.deliver("тема", "текст")
+    sent, failed = alerts.deliver(db, "тема", "текст")
 
     assert sent == ["email"]
     assert len(failed) == 1 and "telegram" in failed[0]
@@ -280,7 +280,7 @@ def test_telegram_ok_false_is_not_a_delivery(db, monkeypatch):
 
     monkeypatch.setattr(alerts.requests, "post", lambda *a, **k: Resp())
 
-    sent, failed = alerts.deliver("тема", "текст")
+    sent, failed = alerts.deliver(db, "тема", "текст")
 
     assert sent == []
     assert "chat not found" in failed[0]
@@ -334,7 +334,7 @@ def test_the_test_button_does_not_eat_the_next_real_alarm(db, channel, monkeypat
     _healthy(db)
     _critical_finding(db)
 
-    alerts.deliver("[Sync Admin] Проверка связи", "пробное")
+    alerts.deliver(db, "[Sync Admin] Проверка связи", "пробное")
     assert db.query(AlertState).count() == 0
 
     assert alerts.run_alert_cycle(db)["action"] == "alarm"
@@ -344,7 +344,7 @@ def test_the_test_button_does_not_eat_the_next_real_alarm(db, channel, monkeypat
 # Внешний сторож: единственное, что переживает смерть воркера
 # --------------------------------------------------------------------------
 
-def test_the_watchdog_is_pinged_on_every_run(monkeypatch):
+def test_the_watchdog_is_pinged_on_every_run(db, monkeypatch):
     """Задание `alerts` живёт ВНУТРИ воркера.
 
     Умер воркер — умерли и уведомления, и главный сценарий («ночью обе службы
@@ -362,17 +362,17 @@ def test_the_watchdog_is_pinged_on_every_run(monkeypatch):
     monkeypatch.setattr(alerts.requests, "get",
                         lambda url, **kw: (called.append(url), Resp())[1])
 
-    assert alerts.ping_alive() == ""
+    assert alerts.ping_alive(db) == ""
     assert called == ["https://hc.example/ping/abc"]
 
 
-def test_no_watchdog_configured_is_not_an_error(monkeypatch):
+def test_no_watchdog_configured_is_not_an_error(db, monkeypatch):
     """Сторож необязателен: без него работают обычные уведомления."""
     monkeypatch.delenv("ALERT_HEARTBEAT_URL", raising=False)
-    assert alerts.ping_alive() == ""
+    assert alerts.ping_alive(db) == ""
 
 
-def test_a_silent_watchdog_is_reported(monkeypatch):
+def test_a_silent_watchdog_is_reported(db, monkeypatch):
     """Сторож, о котором мы думаем, что он сторожит, хуже отсутствующего."""
     monkeypatch.setenv("ALERT_HEARTBEAT_URL", "https://hc.example/ping/abc")
 
@@ -381,7 +381,7 @@ def test_a_silent_watchdog_is_reported(monkeypatch):
 
     monkeypatch.setattr(alerts.requests, "get", boom)
 
-    problem = alerts.ping_alive()
+    problem = alerts.ping_alive(db)
 
     assert "сеть недоступна" in problem
 
@@ -399,9 +399,9 @@ def test_the_watchdog_is_pinged_even_when_the_system_is_broken(db, monkeypatch):
     _critical_finding(db)
     pings = []
 
-    monkeypatch.setattr(alerts, "ping_alive", lambda: (pings.append(1), "")[1])
-    monkeypatch.setattr(alerts, "configured_channels", lambda: ["telegram"])
-    monkeypatch.setattr(alerts, "deliver", lambda s, b: (["telegram"], []))
+    monkeypatch.setattr(alerts, "ping_alive", lambda db: (pings.append(1), "")[1])
+    monkeypatch.setattr(alerts, "configured_channels", lambda db: ["telegram"])
+    monkeypatch.setattr(alerts, "deliver", lambda db, s, b: (["telegram"], []))
     monkeypatch.setattr(scheduler, "SessionLocal", lambda: db)
     monkeypatch.setattr(db, "close", lambda: None)
 

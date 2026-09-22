@@ -204,11 +204,8 @@
     {% else %}
     <p class="help-text" style="margin-top:0">
         <b>Сейчас система никого не позовёт.</b> Упади службы ночью — узнать об
-        этом можно будет только открыв эту страницу. Каналы включаются в
-        <span class="mono">.env</span>: <span class="mono">TELEGRAM_BOT_TOKEN</span> и
-        <span class="mono">TELEGRAM_CHAT_ID</span>, либо <span class="mono">ALERT_SMTP_HOST</span>
-        и <span class="mono">ALERT_EMAIL_TO</span>. Подробнее — в
-        <span class="mono">deploy/README_WINDOWS.md</span>.
+        этом можно будет только открыв эту страницу. Настроить Telegram или почту —
+        на странице <a href="/notifications">«Уведомления»</a>; достаточно одного канала.
     </p>
     {% endif %}
     <form method="post" action="/diagnostics/alerts/test" style="margin-bottom:0">

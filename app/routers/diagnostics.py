@@ -125,7 +125,7 @@ def diagnostics_page(request: Request, db: Session = Depends(get_db), user: User
     shared_heartbeats = [{"name": w, "hb": _heartbeat_for(db, w)} for w in shared_workers]
 
     from app.alerts import configured_channels
-    alert_channels = configured_channels()
+    alert_channels = configured_channels(db)
 
     report_findings = collect_findings(db)
 
@@ -389,9 +389,9 @@ def send_test_alert(
 
     Канал, который не проверили, — это надежда, а не канал: ровно то же уже
     проходили с бэкапом, который снимался, но никогда не проверялся чтением.
-    Токен бота и пароль почты правятся в `.env` руками, опечататься там проще
-    простого, а узнать об ошибке иначе можно было бы только в тот час, когда
-    случилась настоящая поломка, — то есть в худший из возможных.
+    Опечататься в токене бота или пароле почты проще простого, а узнать об
+    ошибке иначе можно было бы только в тот час, когда случилась настоящая
+    поломка, — то есть в худший из возможных.
 
     Шлёт СРАЗУ и мимо всей дедупликации: это проверка связи, а не тревога, и
     запоминать её как «последнюю сообщённую картину» нельзя — иначе настоящая
@@ -399,16 +399,16 @@ def send_test_alert(
     """
     from app.alerts import configured_channels, deliver
 
-    channels = configured_channels()
+    channels = configured_channels(db)
     if not channels:
         set_flash(request,
                   "Каналы уведомлений не настроены: система никого не позовёт. "
-                  "Нужны TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID либо ALERT_SMTP_HOST "
-                  "и ALERT_EMAIL_TO в .env — см. deploy/README_WINDOWS.md.",
+                  "Заполните Telegram или почту на странице «Уведомления».",
                   "warn")
         return RedirectResponse("/diagnostics#workers", status_code=303)
 
     sent, failed = deliver(
+        db,
         "[Sync Admin] Проверка связи",
         "Это пробное сообщение, отправленное со страницы «Диагностика».\n"
         "Настоящие уведомления приходят, только когда система встала или "
@@ -427,7 +427,8 @@ def send_test_alert(
                            f"Не доставлено — {'; '.join(failed)}", "warn")
     else:
         set_flash(request, f"Пробное уведомление отправлено: {', '.join(sent)}. "
-                           f"Если оно не пришло, проверьте адресата в .env.", "good")
+                           f"Если оно не пришло, проверьте адресата на странице "
+                           f"«Уведомления».", "good")
     return RedirectResponse("/diagnostics#workers", status_code=303)
 
 

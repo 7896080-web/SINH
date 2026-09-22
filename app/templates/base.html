@@ -97,6 +97,11 @@
                 <circle cx="5" cy="8" r="3"/>
                 <path d="M8 8h6M11.5 8v2.5M13.5 8v2"/>
             </symbol>
+            <symbol id="i-notifications" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                    stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4 7a4 4 0 0 1 8 0c0 2.5.7 3.6 1.2 4.2.3.3.1.8-.3.8H3.1c-.4 0-.6-.5-.3-.8C3.3 10.6 4 9.5 4 7Z"/>
+                <path d="M6.5 14h3"/>
+            </symbol>
             <symbol id="i-logout" viewBox="0 0 16 16" fill="none" stroke="currentColor"
                     stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M6.5 2.5H3.5v11h3"/>
@@ -128,6 +133,7 @@
                 ('report', '/report', 'Расхождения', 'i-report'),
                 ('testing', '/testing', 'Тестирование', 'i-testing'),
                 ('api-keys', '/api-keys', 'API-ключи', 'i-api-keys'),
+                ('notifications', '/notifications', 'Уведомления', 'i-notifications'),
             ] %}
             {% for key, href, label, icon in items %}
             {# title обязателен: в свёрнутом меню подпись не видна, и без него
