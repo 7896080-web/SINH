@@ -16,7 +16,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.backup import backup_dir, last_backup, make_backup  # noqa: E402
+from app.backup import (backup_dir, last_backup, make_backup,  # noqa: E402
+                        mirror_dir)
 
 
 def main() -> int:
@@ -35,6 +36,15 @@ def main() -> int:
     print(f"размер: {result.size_bytes / 1024 / 1024:.1f} МБ")
     print(f"удалено старых: {result.removed}")
     print(f"всего копий в {backup_dir()}: {total}")
+    if result.mirror_error:
+        # Не возвращаем 1: копия СНЯТА и проверена, и объявлять прогон упавшим
+        # из-за недоступной сетевой папки нельзя — планировщик Windows показал бы
+        # задание сбойным там, где главное сделано. Но сказать обязаны: вторая
+        # площадка заводится против отказа диска, и зеркало, о котором думают,
+        # что оно работает, хуже отсутствующего.
+        print(f"ВНИМАНИЕ: копия не доехала до зеркала — {result.mirror_error}")
+    elif mirror_dir() is not None:
+        print(f"зеркало: {mirror_dir()}")
     return 0
 
 

@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
@@ -40,6 +41,28 @@ logger = logging.getLogger("sync_worker")
 # потери диска или каталога целиком.
 BACKUP_DIR_ENV = "BACKUP_DIR"
 DEFAULT_BACKUP_DIR = r"C:\sync_admin\backups"
+
+# Вторая площадка для копий: папка синхронизации облака (Яндекс.Диск и такие
+# же), сетевая шара, второй физический диск. По умолчанию ПУСТО — зеркала нет.
+#
+# Зачем отдельная папка, а не просто `BACKUP_DIR` внутрь облака. Копия
+# снимается `Connection.backup()` СРАЗУ в целевой файл, без временного имени:
+# клиент синхронизации увидел бы файл растущим и залил недописанную базу, а
+# `_collapse_journal` успел бы ещё и создать рядом `-wal`/`-shm`, которые тут же
+# удаляются. В облаке остался бы мусор, а какое-то время — и битая копия под
+# правильным именем. Плюс клиент держит файлы открытыми, мешая `prune`.
+#
+# Поэтому порядок такой: снять локально, ПРОВЕРИТЬ, и только потом положить в
+# зеркало — целиком и через временное имя с переименованием, чтобы под финальным
+# именем файл появился уже полным.
+MIRROR_DIR_ENV = "BACKUP_MIRROR_DIR"
+# Сколько копий держать в зеркале. Облако обычно просторнее локального диска
+# (1 ТБ против сотни гигабайт), поэтому по умолчанию глубже: 30 ежедневных и 12
+# недельных — квартал. Но это ВТОРАЯ ПЛОЩАДКА, а не глубина хранения: зеркало
+# повторяет то, что есть, и удаление здесь идёт по своему правилу, а не следом
+# за локальным.
+MIRROR_KEEP_DAILY = int(os.environ.get("BACKUP_MIRROR_KEEP_DAILY", "30"))
+MIRROR_KEEP_WEEKLY = int(os.environ.get("BACKUP_MIRROR_KEEP_WEEKLY", "12"))
 
 # Сколько храним. Ежедневных две недели — этого хватает, чтобы заметить порчу
 # данных, которую видно не сразу (перепутанный мэппинг, неверный импорт).
@@ -63,6 +86,11 @@ class BackupResult:
     # для разбора, но под именем, которое уборка и `last_backup` за копию не
     # считают.
     path_kept: str = ""
+    # Что пошло не так при зеркалировании. Пустая строка — либо зеркало не
+    # настроено, либо копия туда доехала. САМ БЭКАП этим не портится: локальная
+    # копия уже снята и проверена, и объявить её неудачной из-за недоступной
+    # сетевой папки значило бы поднять тревогу о том, чего не случилось.
+    mirror_error: str = ""
 
     @property
     def ok(self) -> bool:
@@ -283,6 +311,58 @@ def _copy_database(source: Path, target: Path) -> None:
         src.close()
 
 
+def mirror_dir() -> Path | None:
+    """Папка зеркала, если настроена."""
+    raw = (os.environ.get(MIRROR_DIR_ENV) or "").strip()
+    return Path(raw) if raw else None
+
+
+def mirror_backup(source: Path, directory: Path | None = None) -> str:
+    """Положить ГОТОВУЮ копию на вторую площадку. Пустая строка — всё хорошо.
+
+    Копируем через временное имя и переименовываем: под финальным именем файл
+    обязан появиться уже целым. Клиент облачной синхронизации смотрит за папкой
+    и заливает всё, что в ней меняется, — увидев файл растущим, он отправил бы в
+    облако недописанную базу. Переименование в пределах одной папки атомарно, и
+    клиент видит сразу готовый файл.
+
+    Имя временного файла НЕ похоже на копию (`.part`): уборка ищет
+    `sync_admin-*.db`, и оборванный кусок под правильным именем прошёл бы у неё
+    и у `last_backup` за полноценную копию — ровно тот дефект, из-за которого
+    сорвавшаяся попытка откладывается в `.bad`.
+
+    Ошибку возвращаем, а не бросаем: локальная копия к этому моменту снята и
+    проверена, и объявлять бэкап неудачным из-за недоступной сетевой папки
+    нельзя — это подняло бы тревогу о том, чего не случилось. Но и глотать
+    молча тоже нельзя: зеркало, о котором мы думаем, что оно есть, хуже
+    отсутствующего.
+    """
+    directory = directory or mirror_dir()
+    if directory is None:
+        return ""
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        target = directory / source.name
+        staging = directory / (source.name + ".part")
+        if staging.exists():
+            staging.unlink()
+        shutil.copyfile(source, staging)
+        os.replace(staging, target)
+    except Exception as e:                           # noqa: BLE001 — см. docstring
+        logger.warning("зеркало бэкапа недоступно (%s): %s", directory, e)
+        return f"{type(e).__name__}: {e}"[:200]
+
+    try:
+        prune(directory, keep_daily=MIRROR_KEEP_DAILY,
+              keep_weekly=MIRROR_KEEP_WEEKLY)
+    except Exception as e:                           # noqa: BLE001
+        # Копия УЖЕ в зеркале — это главное. Неубранные старые файлы место
+        # занимают, но ничего не ломают, а уронить из-за них доставленную копию
+        # значило бы потерять важное ради второстепенного.
+        logger.warning("зеркало: старые копии не убраны (%s): %s", directory, e)
+    return ""
+
+
 def make_backup(database_url: str | None = None,
                 directory: Path | None = None) -> BackupResult:
     """Снять копию, проверить её и подчистить старые.
@@ -337,7 +417,12 @@ def make_backup(database_url: str | None = None,
                             path_kept=_set_aside(target))
 
     removed = prune(directory)
-    return BackupResult(path=str(target), size_bytes=size, checked=True, removed=removed)
+    # Зеркало — ПОСЛЕ проверки: в облако уезжает только копия, которую мы уже
+    # прочитали и признали целой. Непроверенная копия на второй площадке — это
+    # две надежды вместо одной.
+    mirror_error = mirror_backup(target)
+    return BackupResult(path=str(target), size_bytes=size, checked=True,
+                        removed=removed, mirror_error=mirror_error)
 
 
 def last_backup(directory: Path | None = None) -> tuple[datetime | None, int]:
