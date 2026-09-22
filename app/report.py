@@ -249,9 +249,14 @@ def _q_unknown_sku(db: Session) -> list[DispatchQueueItem]:
     # переотправки по одному и тому же нерешённому товару лежит две записи, а
     # разбирать человеку нечего дважды — это одна неразрешённая пара.
     latest = latest_queue_ids(db)
+    rows = [r for r in rows if r.id in latest]
+    # Карточку могли завести, и тогда число уехало — а отказ остался лежать и
+    # через тридцать суток снова станет последней записью пары, когда чистка
+    # удалит перекрывшую его `sent`. Та же дыра, что и у «рассылка не доехала».
+    rows = _not_overtaken_by_a_later_send(db, rows)
     # И только по живым парам: по выключенной решать нечего — решение уже
     # принято, товар туда не транслируется.
-    return _only_live_pairs(db, [r for r in rows if r.id in latest])
+    return _only_live_pairs(db, rows)
 
 
 def _check_unknown_sku(db: Session) -> Finding | None:
@@ -294,7 +299,48 @@ def _q_dispatch_errors(db: Session) -> list[DispatchQueueItem]:
     # Только ПОСЛЕДНЯЯ запись пары товар+кабинет: всё, что было до неё,
     # описывает прошлое состояние, а не текущее.
     latest = latest_queue_ids(db)
-    return _only_live_pairs(db, [r for r in rows if r.id in latest])
+    rows = [r for r in rows if r.id in latest]
+    return _only_live_pairs(db, _not_overtaken_by_a_later_send(db, rows))
+
+
+def _not_overtaken_by_a_later_send(db: Session,
+                                  rows: list[DispatchQueueItem]) -> list[DispatchQueueItem]:
+    """Отбросить отказы, по паре которых число уехало ПОЗЖЕ.
+
+    Это уже делает `latest_queue_ids` — но ровно до тех пор, пока перекрывающая
+    запись `sent` жива. Чистка удаляет её через тридцать суток, а отказ не
+    удаляет никогда (намеренно: `error` описывает незаконченное дело). И тогда
+    последней записью пары СНОВА становится старый отказ, и он воскресает
+    КРИТИЧНОЙ находкой «площадка продаёт то, чего нет» — про число, доехавшее
+    месяц назад. Разобрать такую находку нельзя ничем: статуса запись не сменит,
+    удалена не будет, и отчёт остаётся красным навсегда.
+
+    Это не гипотеза и не «когда-нибудь»: на бою лежат сотни отказов от дефекта
+    Kit 14–20.09, по которым остаток потом уехал. Их прикрытие начнёт исчезать
+    ровно через тридцать суток после той отправки.
+
+    Спрашиваем `SyncSetting.last_nonzero_sent_at` — она для того и заведена, что
+    переживает чистку: очередь это недолговечная память, а пара помнит, что мы
+    на неё писали. Сравнение строго ПОЗЖЕ создания отказа: отправка, бывшая
+    раньше него, про него ничего не говорит, и заглушить его ею значило бы
+    потерять настоящее расхождение.
+    """
+    if not rows:
+        return rows
+    sent_at = {
+        (s.uid_1c, s.account_id): s.last_nonzero_sent_at for s in
+        db.query(SyncSetting.uid_1c, SyncSetting.account_id,
+                 SyncSetting.last_nonzero_sent_at).filter(
+            SyncSetting.uid_1c.in_({r.uid_1c for r in rows}),
+            SyncSetting.last_nonzero_sent_at.isnot(None)).all()
+    }
+    out = []
+    for r in rows:
+        later = sent_at.get((r.uid_1c, r.account_id))
+        if later is not None and r.created_at is not None and later > r.created_at:
+            continue
+        out.append(r)
+    return out
 
 
 def _only_live_pairs(db: Session, rows: list[DispatchQueueItem]) -> list[DispatchQueueItem]:

@@ -3,6 +3,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import and_, or_
 
+from app.broadcast_gate import drop_recalc_mark
 from app.database import get_db
 from app.templating import templates as shared_templates
 from app.dependencies import get_current_user
@@ -312,6 +313,11 @@ def mapping_import(
         db.add(Barcode(barcode=barcode, uid_1c=uid_1c, source_platform="excel_import"))
         in_file[barcode] = uid_1c
         added += 1
+        # Набор баркодов товара изменился — снимаем «актуализирован» так же, как
+        # это делает переподвязка выше. Ветка НОВОГО баркода этого не делала, а
+        # разница для остатка та же: расчёт собирал заказы по прежнему набору и
+        # продажи по только что привязанному баркоду не видел.
+        drop_recalc_mark(db.query(Product).filter(Product.uid_1c == uid_1c).first())
 
         # Если этот баркод раньше висел в конфликтах сопоставления (в любом
         # кабинете) — конфликт только что разрешён руками, запись не нужна.

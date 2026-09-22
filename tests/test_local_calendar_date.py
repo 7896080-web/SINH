@@ -19,8 +19,22 @@ from datetime import timedelta
 from app.models import Barcode, Product, StockDateSnapshot
 from app.timeutils import today_local
 
-TODAY = today_local()
-TOMORROW = TODAY + timedelta(days=1)
+# Дата берётся В МОМЕНТ ТЕСТА, а не при импорте модуля, и это не педантизм.
+# Сбор тестов идёт раньше их выполнения, и прогон, пересёкший полночь, сравнивал
+# бы вчерашнее число с сегодняшним: «завтра» становится «сегодня» и начинает
+# приниматься, а календарь предлагает уже не то число. Поймано 22.09 в 00:04 UTC
+# ровно так — два падения на полном прогоне и восемь зелёных при повторе минутой
+# позже.
+#
+# Цена не в путанице: FINISH наката гоняет `pytest` ПЕРЕД перезапуском служб, и
+# накат, начатый под местную полночь, упёрся бы в красные тесты и отказался
+# перезапускать бой. Файл про полуночные дефекты обязан переживать полночь сам.
+def _today():
+    return today_local()
+
+
+def _tomorrow():
+    return today_local() + timedelta(days=1)
 
 # Взятие ДАТЫ из UTC-времени. Имя класса не фиксируем: в клиентах площадок он
 # зовётся `_dt`, а импорт `from datetime import datetime as _dt` — обычное дело.
@@ -47,38 +61,38 @@ def _product(web_db, uid="u1") -> Product:
 def test_products_page_accepts_today(logged_in_client, web_db):
     product = _product(web_db)
 
-    logged_in_client.post("/products/u1/base-date", data={"value": TODAY.isoformat()})
+    logged_in_client.post("/products/u1/base-date", data={"value": _today().isoformat()})
 
     web_db.refresh(product)
-    assert product.offset_base_date == TODAY
+    assert product.offset_base_date == _today()
 
 
 def test_bulk_accepts_today(logged_in_client, web_db):
     product = _product(web_db)
 
     logged_in_client.post("/products/bulk", data={
-        "action": "set_base_date", "uids": ["u1"], "date_value": TODAY.isoformat()})
+        "action": "set_base_date", "uids": ["u1"], "date_value": _today().isoformat()})
 
     web_db.refresh(product)
-    assert product.offset_base_date == TODAY
+    assert product.offset_base_date == _today()
 
 
 def test_testing_page_accepts_today(logged_in_client, web_db):
     _product(web_db)
 
     logged_in_client.post("/testing/offset-calc", data={
-        "uid_1c": "u1", "account_id": "", "base_date": TODAY.isoformat(), "fact": ""})
+        "uid_1c": "u1", "account_id": "", "base_date": _today().isoformat(), "fact": ""})
 
     web_db.expire_all()
-    assert web_db.query(Product).first().offset_base_date == TODAY
+    assert web_db.query(Product).first().offset_base_date == _today()
 
 
 def test_stock_on_date_accepts_today(logged_in_client, web_db):
-    logged_in_client.post("/stock-on-date/request", data={"value": TODAY.isoformat()},
+    logged_in_client.post("/stock-on-date/request", data={"value": _today().isoformat()},
                           follow_redirects=True)
 
     assert web_db.query(StockDateSnapshot).filter(
-        StockDateSnapshot.snapshot_date == TODAY).count() == 1
+        StockDateSnapshot.snapshot_date == _today()).count() == 1
 
 
 def test_the_date_picker_offers_today_as_its_maximum(logged_in_client):
@@ -86,14 +100,14 @@ def test_the_date_picker_offers_today_as_its_maximum(logged_in_client):
     числом — руками сегодняшнее было не ввести."""
     page = logged_in_client.get("/stock-on-date")
 
-    assert f'max="{TODAY.isoformat()}"' in page.text
+    assert f'max="{_today().isoformat()}"' in page.text
 
 
 # --------------------------------------------- завтра не принимает ни одна
 
 def test_no_entry_point_accepts_tomorrow(logged_in_client, web_db):
     product = _product(web_db)
-    t = TOMORROW.isoformat()
+    t = _tomorrow().isoformat()
 
     logged_in_client.post("/products/u1/base-date", data={"value": t})
     logged_in_client.post("/products/bulk", data={
