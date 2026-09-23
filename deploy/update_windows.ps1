@@ -4,8 +4,12 @@
     Делает: зависимости -> миграции -> перезапуск служб -> проверка /health.
 
     Запуск (PowerShell от администратора):
-        powershell -ExecutionPolicy Bypass -File C:\sync_admin\deploy\update_windows.ps1
+        powershell -ExecutionPolicy Bypass -File C:\sync_admin\deploy\update_windows.ps1 -Tag pm114
+
+    -Tag — версия, которую вы СОБИРАЛИСЬ поставить. Скрипт сверит её с той, что
+    реально записал блок наката, и откажется работать при расхождении.
 #>
+param([string]$Tag = "")
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
 Set-Location $root
@@ -14,6 +18,34 @@ $py = Join-Path $root ".venv\Scripts\python.exe"
 if (-not (Test-Path $py)) {
     Write-Host "[X] Не найден .venv — сначала установка (install_windows.ps1)." -ForegroundColor Red
     exit 1
+}
+
+# КАКАЯ ВЕРСИЯ ТУТ ЛЕЖИТ — первым делом, до копии базы и миграций.
+#
+# Блок наката и этот скрипт — два независимых шага, и второй ничего не знал о
+# первом. 23.09 это стоило вечера: APPLY не запускали вовсе, скрипт честно
+# отработал на СТАРОМ коде и закончился зелёным — копия снята, тесты зелёные
+# (код и база друг другу соответствуют), /health 200. Единственным следом было
+# ОТСУТСТВИЕ строки «Running upgrade» в логе миграций, то есть признак, которого
+# никто не ищет. Человек уверен, что поставил новую версию; на деле её нет.
+#
+# Отметку пишет сам блок наката, после того как все файлы записаны и сверены по
+# sha. Сверяем с тем, что назвал человек: без -Tag просто печатаем — тогда это
+# подсказка, с -Tag это отказ.
+$installed = "(отметки нет)"
+$markerPath = Join-Path $PSScriptRoot "INSTALLED_TAG"
+if (Test-Path $markerPath) {
+    $installed = ((Get-Content $markerPath -Encoding UTF8) -join " / ").Trim()
+}
+Write-Host "[*] На диске лежит: $installed" -ForegroundColor Cyan
+if ($Tag) {
+    if ($installed -notmatch "^$([regex]::Escape($Tag))(\s|/|$)") {
+        Write-Host "[X] Вы ставите '$Tag', а блоком наката записано '$installed'." -ForegroundColor Red
+        Write-Host "    Файлы новой версии на сервер НЕ приехали — скорее всего не выполнен" -ForegroundColor Red
+        Write-Host "    БЛОК APPLY из ${Tag}_deploy.ps1. Вставьте блоки 1..N и APPLY, дождитесь" -ForegroundColor Red
+        Write-Host "    'full got' = 'full expect' и строки 'DONE N', и запустите обновление снова." -ForegroundColor Red
+        exit 1
+    }
 }
 
 Write-Host "[*] Зависимости (на случай новых)..." -ForegroundColor Cyan
