@@ -468,7 +468,7 @@ def mirror_backup(source: Path, directory: Path | None = None, db=None) -> str:
     except OSError:                                  # noqa: BLE001
         same = False
     if same:
-        return ("папка зеркала совпадает с каталогом копий "
+        return ("папка: указана на каталог самих копий "
                 f"({directory}) — это не вторая площадка: отказ диска унесёт "
                 "и базу, и обе копии. Укажите другой диск, сетевую папку или "
                 "облако, либо очистите поле")
@@ -482,7 +482,11 @@ def mirror_backup(source: Path, directory: Path | None = None, db=None) -> str:
         os.replace(staging, target)
     except Exception as e:                           # noqa: BLE001 — см. docstring
         logger.warning("зеркало бэкапа недоступно (%s): %s", directory, e)
-        return f"{type(e).__name__}: {e}"[:200]
+        # Площадок ДВЕ, и каждая жалоба обязана называть свою. Иначе одна
+        # строка «копия не доехала до зеркала» читается как «второй площадки
+        # нет вовсе» — при том, что вторая могла сработать. Облако свои
+        # сообщения подписывает так же.
+        return f"папка: {type(e).__name__}: {e}"[:200]
 
     try:
         prune(directory,
