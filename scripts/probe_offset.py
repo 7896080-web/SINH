@@ -1,7 +1,12 @@
 """Что происходило с порогом у одного товара — только чтение.
 
 Запуск:
-    C:\\sync_admin\\.venv\\Scripts\\python.exe C:\\sync_admin\\scripts\\probe_offset.py "27643 LACIVERT/RED L"
+    C:\\sync_admin\\.venv\\Scripts\\python.exe C:\\sync_admin\\scripts\\probe_offset.py 2000932153711
+
+Ищет по ID_1С, БАРКОДУ, артикулу целиком и по куску артикула — в таком
+порядке. Баркод обязателен: артикул оператор видит на площадке, а он может не
+совпасть с тем, что записано у нас (пробелы, регистр, другой разделитель
+цвета), и тогда строка «не найдена» при том, что она есть.
 
 Ничего не меняет и не коммитит. Нужен, когда порог «сам» съехал: по трём
 числам на экране этого не понять — надо видеть, В КАКОМ ПОРЯДКЕ их правили и
@@ -13,7 +18,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.database import SessionLocal                      # noqa: E402
-from app.models import (AuditLog, Product, StockDateSnapshot,  # noqa: E402
+from app.models import (AuditLog, Barcode, Product, StockDateSnapshot,  # noqa: E402
                         SyncSetting)
 from app.transmit import offset_from_base                  # noqa: E402
 
@@ -26,11 +31,26 @@ def main() -> int:
 
     db = SessionLocal()
     try:
-        product = (db.query(Product).filter(Product.uid_1c == needle).first()
-                   or db.query(Product).filter(Product.article == needle).first()
-                   or db.query(Product).filter(Product.article.ilike(f"%{needle}%")).first())
+        product = db.query(Product).filter(Product.uid_1c == needle).first()
         if product is None:
-            print(f"не найден: {needle}")
+            link = db.query(Barcode).filter(Barcode.barcode == needle).first()
+            if link is not None:
+                product = db.query(Product).filter(
+                    Product.uid_1c == link.uid_1c).first()
+                if product is None:
+                    # Баркод есть, а товара нет — привязка висит в пустоту.
+                    # Само по себе находка: заказ по такому баркоду разнести
+                    # не на что.
+                    print(f"баркод {needle} привязан к {link.uid_1c}, "
+                          f"но товара с таким ID_1С в номенклатуре НЕТ")
+                    return 1
+        if product is None:
+            product = db.query(Product).filter(Product.article == needle).first()
+        if product is None:
+            product = db.query(Product).filter(
+                Product.article.ilike(f"%{needle}%")).first()
+        if product is None:
+            print(f"не найден ни по ID_1С, ни по баркоду, ни по артикулу: {needle}")
             return 1
 
         print("=" * 70)
@@ -64,6 +84,11 @@ def main() -> int:
             else:
                 print(f"Срез 1С на {product.offset_base_date}: {snap.status} "
                       f"(строк {snap.rows_count}, заявка {snap.created_at})")
+
+        codes = [b.barcode for b in db.query(Barcode).filter(
+            Barcode.uid_1c == product.uid_1c).order_by(Barcode.id).all()]
+        print("-" * 70)
+        print(f"Баркоды ({len(codes)}): {', '.join(codes) if codes else 'нет'}")
 
         marks = db.query(SyncSetting).filter(
             SyncSetting.uid_1c == product.uid_1c, SyncSetting.enabled.is_(True)).all()
