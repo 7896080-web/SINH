@@ -95,6 +95,34 @@ def test_a_threshold_that_did_not_exist_in_the_copy_goes_to_manual():
     assert plan["to_file"] == []
 
 
+def test_a_zero_threshold_where_there_was_none_raises_what_goes_out_when_a_reserve_exists():
+    """«Порога не было» и «порог 0» — НЕ одно и то же при ненулевой брони.
+
+    Без порога лестница считает `остаток − бронь`, с порогом 0 — весь остаток.
+    23.09 таких строк оказалось 223, и от ответа «а есть ли у них бронь» зависело,
+    беда это или безобидная перемена записи. Корзина обязана называть следствие,
+    а не только себя."""
+    row_with_reserve = _row("u1", 0, stock=10, reserve=3)
+
+    assert outgoing(row_with_reserve, None) == 7      # было: остаток − бронь
+    assert outgoing(row_with_reserve, 0) == 10        # стало: весь остаток
+
+    row_without = _row("u2", 0, stock=10, reserve=0)
+    assert outgoing(row_without, None) == outgoing(row_without, 0)
+
+
+def test_the_script_says_whether_those_rows_changed_anything():
+    """Иначе 223 строки в выводе — просто число, из которого ничего не следует."""
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parent.parent / "scripts"
+              / "restore_offsets_from_backup.py").read_text(encoding="utf-8")
+
+    assert "ПОДНЯЛИ отправку (бронь перестала вычитаться)" in source
+    assert "отправку не изменили" in source, \
+        "безобидный случай тоже надо называть — молчание читается как «не считали»"
+
+
 def test_an_impossible_threshold_is_reported_instead_of_written():
     """Импорт подбирает под порог факт, а склад отрицательным не бывает.
 
