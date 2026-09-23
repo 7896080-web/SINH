@@ -32,7 +32,7 @@ from app.transmit import (explain, sku_quantity, enqueue_full_resend, enqueue_wi
                           offset_from_base, recompute_offset, sku_mode, MODE_AUTO,
                           covered_accounts)
 from app.offset_base import (apply_offset, ensure_snapshot_requested,  # noqa: F401
-                             set_base_date, stock_at_date,
+                             offset_is_established, set_base_date, stock_at_date,
                               stock_lookup)
 from app.recalc import active_job, create_job, last_job
 from app.broadcast_gate import (DEFERRABLE_CALC_STATUSES, enabled_account_ids,
@@ -1060,7 +1060,7 @@ def bulk_edit(
             set_flash(request, "Выберите кабинет в списке рядом с кнопкой.", "warn")
             return back()
 
-    changed = skipped = refused = 0
+    changed = skipped = refused = kept = 0
     for p in products:
         if action in ("cabinet_on", "cabinet_off"):
             # Отметка кабинета сразу по всему отбору. Правила ровно те же, что у
@@ -1156,6 +1156,26 @@ def bulk_edit(
                 # назвать, иначе оператор решит, что обработаны все.
                 skipped += 1
                 continue
+            if offset_is_established(p):
+                # Порог поставил человек — пересчётом склада или руками. Кнопка
+                # ставит факт РАВНЫМ учёту, то есть объявляет «расхождения нет»,
+                # и порог схлопывается до брони: наружу уходит БОЛЬШЕ, чем есть.
+                #
+                # 23.09 на бою это и случилось. В 15:07 механизм удержания
+                # сохранил порог 11 при сдвиге даты назад и подобрал под него
+                # факт 32; в 15:10 эта кнопка поставила факт 43 (учёт), порог
+                # стал 0, и по 27643 на обе площадки уехало 22 вместо 11 — при
+                # реальном складе около 11. Сразу по всему отбору и молча.
+                #
+                # Соседняя ветка (`fact_from_stock`) это правило уже соблюдала и
+                # прямо о нём говорит: затирать введённые руками цифры массовой
+                # кнопкой нельзя. Две соседние ветки утверждали противоположное.
+                # Восстановить затёртое нечем — склад в прошлом не пересчитать.
+                #
+                # Осознанно схлопнуть порог по-прежнему можно, сказав это вслух:
+                # «Сбросить порог», затем эта кнопка.
+                kept += 1
+                continue
             p.fact_at_date = p.offset_base_stock
             recompute_offset(p)
         elif action == "fact_from_stock":
@@ -1183,11 +1203,19 @@ def bulk_edit(
     if skipped:
         message += (f" Пропущено {skipped}: 1С ещё не прислала выгрузку на эту дату — "
                     f"порог у них посчитается сам, когда придёт ответ.")
+    if kept:
+        # Молчание тут было бы тем же дефектом, только с другой стороны: оператор
+        # решил бы, что кнопка прошлась по всем, и не узнал бы, что часть строк
+        # осталась с прежним порогом — то есть ровно наоборот к своему ожиданию.
+        message += (f" Порог сохранён у {kept}: его ставил человек — пересчётом "
+                    f"склада или руками, — а эта кнопка объявила бы, что "
+                    f"расхождения нет, и наружу ушло бы больше, чем есть. Чтобы "
+                    f"всё-таки схлопнуть, сначала «Сбросить порог».")
     if refused:
         message += (f" Не включено {refused}: расчёт по ним не закончен. Трансляция "
                     f"включается только после него — иначе на площадки уйдёт остаток, "
                     f"не сверенный с их продажами.")
-    set_flash(request, message, "good" if not (skipped or refused) else "warn")
+    set_flash(request, message, "good" if not (skipped or refused or kept) else "warn")
     return back()
 
 
