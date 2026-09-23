@@ -18,8 +18,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.database import SessionLocal                      # noqa: E402
-from app.models import (AuditLog, Barcode, Product, StockDateSnapshot,  # noqa: E402
-                        SyncSetting)
+from app.models import (AuditLog, Barcode, DispatchQueueItem,  # noqa: E402
+                        Product, StockDateSnapshot, SyncSetting)
 from app.transmit import offset_from_base                  # noqa: E402
 
 
@@ -104,6 +104,29 @@ def main() -> int:
             print(f"  {r.created_at}  {r.actor:12} {r.action:28} {r.details}")
         if not rows:
             print("  пусто — строку правили только массово или файлом")
+
+        # Очередь рассылки — единственный след ПОРОГА во времени.
+        #
+        # Сам порог нигде не версионируется: страница показывает итог, а журнал
+        # действий записывает только правку руками. Зато `sent_quantity` — это
+        # «сколько ушло на площадку НА САМОМ ДЕЛЕ», посчитанное всей лестницей.
+        # Зная остаток на тот момент (`quantity` — он пишется при постановке),
+        # порог считается обратно: порог = остаток − ушло. Приблизительно —
+        # сверху могли сработать порог кабинета и пауза, — но для вопроса «съехал
+        # ли порог и когда» этого хватает.
+        print("-" * 70)
+        print("ОЧЕРЕДЬ РАССЫЛКИ (последние 25; «порог≈» = остаток − ушло):")
+        queue = db.query(DispatchQueueItem).filter(
+            DispatchQueueItem.uid_1c == product.uid_1c,
+        ).order_by(DispatchQueueItem.id.desc()).limit(25).all()
+        for q in reversed(queue):
+            guess = ("—" if q.sent_quantity is None
+                     else str((q.quantity or 0) - q.sent_quantity))
+            print(f"  {q.created_at}  каб.{q.account_id}  остаток {q.quantity}"
+                  f"  ушло {q.sent_quantity}  порог≈{guess}"
+                  f"  {q.status.value if q.status else ''}  {q.reason}")
+        if not queue:
+            print("  пусто")
 
         print("-" * 70)
         print("МАССОВЫЕ ДЕЙСТВИЯ И РАСЧЁТЫ (последние 30):")

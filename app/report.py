@@ -1124,6 +1124,35 @@ def _check_reconciliation_review(db: Session) -> Finding | None:
     )
 
 
+def _check_offset_not_kept(db: Session) -> Finding | None:
+    """Порог просили удержать при сдвиге даты назад, а удержать не вышло.
+
+    Читатель текста, который пишет `ftp_receive` в `last_error` успешной
+    отметки. Без находки счётчик считался и выбрасывался — человек просил
+    сохранить число, которым управляется отправка, система не смогла и молчала.
+
+    Следствие называем прямо: порог свёлся к броне, то есть на площадки уходит
+    БОЛЬШЕ, чем оператор рассчитывал, — ровно на то расхождение учёта со
+    складом, которое он и замерял пересчётом.
+    """
+    row = db.query(WorkerHeartbeat).filter(
+        WorkerHeartbeat.worker_name == "ftp_receive",
+        WorkerHeartbeat.last_success.is_(True),
+    ).first()
+    if row is None or not row.last_error or "порог не удержан" not in row.last_error:
+        return None
+    return Finding(
+        key="offset_not_kept", level=WARNING,
+        title=f"Порог не удержан при смене даты: {row.last_error}",
+        consequence="На эту дату прежний порог невозможен, и он свёлся к брони. "
+                    "Значит на площадки уходит БОЛЬШЕ, чем рассчитывал оператор, — "
+                    "ровно на то расхождение учёта со складом, которое он замерял "
+                    "пересчётом. Строку надо пересчитать заново: ввести факт на "
+                    "новую дату.",
+        count=1, link="/diagnostics#workers",
+    )
+
+
 def _check_backup_mirror(db: Session) -> Finding | None:
     """Копия снимается, но на вторую площадку не доезжает.
 
@@ -1337,6 +1366,7 @@ CHECKS = (
     _check_reconciliation_review,
     _check_backup_missing,
     _check_backup_mirror,
+    _check_offset_not_kept,
     _check_orders_not_processed,
     _check_verify_stock_broken,
     _check_truncated_catalog,
