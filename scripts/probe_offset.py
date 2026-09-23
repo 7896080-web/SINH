@@ -19,7 +19,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.database import SessionLocal                      # noqa: E402
 from app.models import (AuditLog, Barcode, DispatchQueueItem,  # noqa: E402
-                        Product, StockDateSnapshot, SyncSetting)
+                        Product, StockDateSnapshot, StockDiscrepancyLog,
+                        SyncSetting)
 from app.transmit import offset_from_base                  # noqa: E402
 
 
@@ -66,8 +67,9 @@ def main() -> int:
         print(f"Дата расчёта:     {product.offset_base_date}")
         print(f"Учёт 1С на дату:  {product.offset_base_stock}")
         print(f"Факт на дату:     {product.fact_at_date}")
-        print(f"Порог к удержанию:{product.offset_pinned}")
-        print(f"Порог по формуле: {offset_from_base(product)}")
+        print(f"Расхождение:      {product.stock_discrepancy}")
+        print(f"Порог по формуле: {offset_from_base(product)}"
+              "  (расхождение + бронь)")
         print("-" * 70)
         print(f"Актуализирован:   {product.recalc_done_at}")
         print(f"Покрытые кабинеты:{product.recalc_account_ids!r}")
@@ -94,6 +96,22 @@ def main() -> int:
             SyncSetting.uid_1c == product.uid_1c, SyncSetting.enabled.is_(True)).all()
         print("-" * 70)
         print(f"Отмечено кабинетов: {[m.account_id for m in marks]}")
+
+        print("=" * 70)
+        print("ИСТОРИЯ РАСХОЖДЕНИЯ (время UTC):")
+        # Отдельно от журнала действий намеренно: массовые пути (кнопки отбора,
+        # импорт Excel) в журнал построчно не пишут вовсе, и по конкретной строке
+        # там следа нет — а расхождение уходит в порог и дальше на площадки.
+        gaps = db.query(StockDiscrepancyLog).filter(
+            StockDiscrepancyLog.uid_1c == product.uid_1c,
+        ).order_by(StockDiscrepancyLog.id).all()
+        for g in gaps:
+            print(f"  {g.created_at}  {str(g.old_value):>6} -> {str(g.new_value):>6}  "
+                  f"{g.source.value:9} {g.username or '-':12} "
+                  f"дата {g.base_date} учёт {g.base_stock} факт {g.fact}"
+                  + (f"  {g.note}" if g.note else ""))
+        if not gaps:
+            print("  пусто — расхождение не измеряли ни разу")
 
         print("=" * 70)
         print("ЖУРНАЛ ПО ЭТОЙ СТРОКЕ (последние 40, время UTC):")

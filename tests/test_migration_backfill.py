@@ -267,3 +267,139 @@ def test_the_card_missing_migration_survives_its_own_interruption(tmp_path):
     conn = sqlite3.connect(str(db))
     assert conn.execute("SELECT card_missing FROM dispatch_queue").fetchone()[0] == 1
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Миграция 930c4c4db5e9 — `products.stock_discrepancy`
+# ---------------------------------------------------------------------------
+
+GAP_BEFORE = "b4e9d1c07a52"
+GAP_AFTER = "930c4c4db5e9"
+
+
+def _seed_products(db):
+    conn = sqlite3.connect(str(db))
+    conn.execute("INSERT INTO products (uid_1c, article, name, stock_on_hand, reserve, "
+                 "broadcast_offset, offset_pinned, broadcast_enabled) "
+                 "VALUES ('u1','A','Товар',22,2,13,7,0)")
+    conn.execute("INSERT INTO products (uid_1c, article, name, stock_on_hand, reserve, "
+                 "broadcast_offset, broadcast_enabled) VALUES ('u2','B','Товар',5,0,-7,0)")
+    conn.execute("INSERT INTO products (uid_1c, article, name, stock_on_hand, reserve, "
+                 "broadcast_enabled) VALUES ('u3','C','Товар',5,3,0)")
+    conn.commit()
+    conn.close()
+
+
+def test_the_backfill_keeps_every_number_that_goes_out_today(tmp_path):
+    """Бэкфилл берёт ПОРОГ, а не «учёт минус факт», и это главное про него.
+
+    У части строк факт ПОДОБРАН прежним механизмом удержания (`pin_offset`), и
+    расхождение, посчитанное из учёта и факта, разошлось бы с текущим порогом.
+    Разойдись оно хоть на единицу — на площадки уехало бы другое число, причём
+    сразу по всему каталогу и в тот же час, когда накатили миграцию.
+
+    Знак сохраняется тоже: минус значит «на складе больше, чем знает 1С», и на
+    бою таких товаров 53, до −213.
+    """
+    db = tmp_path / "gap_backfill.db"
+    url = "sqlite:///" + str(db)
+    _alembic(url, GAP_BEFORE)
+    _seed_products(db)
+
+    _alembic(url, GAP_AFTER)
+
+    conn = sqlite3.connect(str(db))
+    rows = dict(conn.execute(
+        "SELECT uid_1c, stock_discrepancy FROM products").fetchall())
+    offsets = dict(conn.execute(
+        "SELECT uid_1c, broadcast_offset FROM products").fetchall())
+    conn.close()
+
+    assert rows["u1"] == 11, "13 − бронь 2"
+    assert rows["u2"] == -7, "знак не потерян"
+    assert rows["u3"] is None, "порога не было — измерять нечего, и ноль тут неправда"
+    assert offsets == {"u1": 13, "u2": -7, "u3": None}, "ни одно число не дрогнуло"
+
+
+def test_the_backfill_writes_the_history_once(tmp_path):
+    """Число появилось не из воздуха — через месяц надо понимать, откуда.
+
+    И повтор после обрыва не должен его удваивать: `INSERT ... SELECT` с
+    проверкой «такой строки ещё нет» идемпотентен по построению.
+    """
+    db = tmp_path / "gap_history.db"
+    url = "sqlite:///" + str(db)
+    _alembic(url, GAP_BEFORE)
+    _seed_products(db)
+    _alembic(url, GAP_AFTER)
+
+    conn = sqlite3.connect(str(db))
+    conn.execute("UPDATE alembic_version SET version_num = ?", (GAP_BEFORE,))
+    conn.commit()
+    conn.close()
+    _alembic(url, GAP_AFTER)         # повтор, как после обрыва
+
+    conn = sqlite3.connect(str(db))
+    rows = conn.execute("SELECT uid_1c, old_value, new_value, source "
+                        "FROM stock_discrepancy_log ORDER BY uid_1c").fetchall()
+    conn.close()
+    assert rows == [("u1", None, 11, "migration"), ("u2", None, -7, "migration")]
+
+
+def test_the_dead_column_is_put_out(tmp_path):
+    """`offset_pinned` осиротел этой правкой и обязан быть погашен.
+
+    Колонку не роняем — `DROP COLUMN` на SQLite перестраивает таблицу в 152
+    тысячи строк при живых службах, — но непустые значения в ней стали бы
+    ловушкой: видно в базе и в `probe_offset`, а не действует ничего.
+    """
+    db = tmp_path / "gap_pinned.db"
+    url = "sqlite:///" + str(db)
+    _alembic(url, GAP_BEFORE)
+    _seed_products(db)
+
+    _alembic(url, GAP_AFTER)
+
+    conn = sqlite3.connect(str(db))
+    left = conn.execute("SELECT count(*) FROM products "
+                        "WHERE offset_pinned IS NOT NULL").fetchone()[0]
+    conn.close()
+    assert left == 0
+
+
+def test_the_discrepancy_migration_survives_its_own_interruption(tmp_path):
+    """Alembic на SQLite оборванную миграцию не откатывает — повтор обязан дойти.
+
+    Имитируем остатки оборванного прогона: колонка уже добавлена, таблица
+    истории и один из её индексов уже созданы, часть бэкфилла применена. Повтор
+    не должен ни упасть на «duplicate column name», ни переписать уже
+    перенесённое расхождение — у него мог быть свой смысл, если после обрыва
+    строку успели поправить руками.
+    """
+    db = tmp_path / "gap_interrupted.db"
+    url = "sqlite:///" + str(db)
+    _alembic(url, GAP_BEFORE)
+    _seed_products(db)
+
+    conn = sqlite3.connect(str(db))
+    conn.execute("ALTER TABLE products ADD COLUMN stock_discrepancy INTEGER")
+    conn.execute("UPDATE products SET stock_discrepancy = 99 WHERE uid_1c = 'u1'")
+    conn.execute("CREATE TABLE stock_discrepancy_log ("
+                 "id INTEGER NOT NULL PRIMARY KEY, uid_1c VARCHAR(36) NOT NULL, "
+                 "old_value INTEGER, new_value INTEGER, source VARCHAR(9) NOT NULL, "
+                 "username VARCHAR(64), base_date DATE, base_stock INTEGER, "
+                 "fact INTEGER, note VARCHAR(255), created_at DATETIME)")
+    conn.execute("CREATE INDEX ix_stock_discrepancy_log_uid_1c "
+                 "ON stock_discrepancy_log (uid_1c)")
+    conn.commit()
+    conn.close()
+
+    _alembic(url, GAP_AFTER)
+
+    conn = sqlite3.connect(str(db))
+    rows = dict(conn.execute("SELECT uid_1c, stock_discrepancy FROM products").fetchall())
+    indexes = [i[1] for i in conn.execute("PRAGMA index_list(stock_discrepancy_log)")]
+    conn.close()
+    assert rows["u1"] == 99, "уже перенесённое не переписано"
+    assert rows["u2"] == -7, "остальное доделано"
+    assert "ix_stock_discrepancy_log_created_at" in indexes

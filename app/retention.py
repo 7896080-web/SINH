@@ -33,11 +33,12 @@ import os
 from datetime import timedelta
 from pathlib import Path
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.models import (AnomalyStatus, AuditLog, DispatchQueueItem, DispatchStatus,
-                        FtpTask, FtpTaskStatus, ReconciliationLog, SyncAnomaly,
-                        TestLogEntry)
+                        FtpTask, FtpTaskStatus, ReconciliationLog,
+                        StockDiscrepancyLog, SyncAnomaly, TestLogEntry)
 from app.timeutils import now_utc
 
 logger = logging.getLogger("sync_worker")
@@ -66,6 +67,12 @@ FTP_TASK_KEEP = timedelta(days=180)
 ANOMALY_KEEP = timedelta(days=90)
 # Журнал страницы «Тестирование» — 30 суток. Это отладочные записи.
 TEST_LOG_KEEP = timedelta(days=30)
+# История расхождений — год, как и журнал действий, и по той же причине: это
+# единственное место, где записано, откуда взялось число, уходящее в порог, а
+# значит и в остаток на площадках. Вопрос «кто и из чего поставил здесь 11»
+# задают редко, но когда задают — отвечать на него больше нечем: массовые пути
+# (кнопки отбора, импорт Excel) в журнал действий построчно не пишут вовсе.
+DISCREPANCY_LOG_KEEP = timedelta(days=365)
 
 # Файлы обмена с 1С в каталоге архива — 60 суток. Это ЕДИНСТВЕННОЕ место, где
 # чистка трогает диск, и до аудита 22.09 архив не чистил никто: `archive_result`
@@ -158,6 +165,20 @@ def apply_retention(db: Session) -> dict:
     stats["test_log"] = _purge(
         db, TestLogEntry, TestLogEntry.created_at < now - TEST_LOG_KEEP,
         "журнал тестирования")
+
+    # ПОСЛЕДНЮЮ запись по товару не удаляем никогда, сколько бы ей ни было лет.
+    # Она и есть происхождение числа, которое прямо сейчас сидит в пороге и
+    # уходит на площадки: снеси её — и на вопрос «откуда здесь 11» ответить будет
+    # нечем, то есть таблица перестанет делать ровно то, ради чего заведена. А
+    # случай этот не редкий, а типовой: расхождение постоянно по смыслу, его
+    # ставят один раз и не трогают годами.
+    newest_per_product = db.query(func.max(StockDiscrepancyLog.id)).group_by(
+        StockDiscrepancyLog.uid_1c).scalar_subquery()
+    stats["stock_discrepancy_log"] = _purge(
+        db, StockDiscrepancyLog,
+        (StockDiscrepancyLog.created_at < now - DISCREPANCY_LOG_KEEP)
+        & StockDiscrepancyLog.id.notin_(newest_per_product),
+        "история расхождений")
 
     stats["exchange_archive"] = prune_exchange_archive()
 

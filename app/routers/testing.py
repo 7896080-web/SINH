@@ -20,7 +20,7 @@ from app.workers.scheduler import PENDING_WAREHOUSE_NAME, SOLD_WAREHOUSE_NAME
 from app.workers.dispatch import _resolve_push_target, _quantity_to_send
 from app.transmit import (explain, offset_from_base, recompute_offset, sku_quantity,
                           enqueue_full_resend, ever_transmitted)
-from app.offset_base import ensure_snapshot_requested, set_base_date
+from app.offset_base import apply_fact, ensure_snapshot_requested, set_base_date
 from app.workers.platform_clients.base import PlatformOrder, StockPushItem
 from app.timeutils import now_utc
 from app.audit import log_action
@@ -860,7 +860,7 @@ def testing_offset_calc(
     # молча теряла бы введённое число.
     if day != product.offset_base_date:
         set_base_date(db, product, day)
-    product.fact_at_date = parsed_fact
+    apply_fact(db, product, parsed_fact, username=user.username)
     asked = ensure_snapshot_requested(db, day, user.username) if day is not None else False
     recompute_offset(product)
 

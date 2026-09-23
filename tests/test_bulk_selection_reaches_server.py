@@ -236,3 +236,127 @@ def test_the_confirmation_says_the_same_number_the_counter_does():
     page = PAGE.read_text(encoding="utf-8")
 
     assert 'var count = document.getElementById("pr-count").textContent;' in page
+
+
+# ----------------------------------- новые пути порога: ни одна строка не молчит
+
+def _seed_with_basis(web_db, count, base=43, reserve=0):
+    """Строки, у которых расчёт уже настроен: дата, учёт 1С и измеренное
+    расхождение. Это состояние, в котором массовые кнопки и нажимают."""
+    from datetime import date
+
+    from app.models import (StockDateRow, StockDateSnapshot, StockDateStatus)
+
+    day = date(2026, 8, 7)
+    snap = StockDateSnapshot(snapshot_date=day, status=StockDateStatus.done,
+                             rows_count=count)
+    web_db.add(snap)
+    web_db.commit()
+    web_db.refresh(snap)
+    for i in range(count):
+        uid = f"u{i:05d}"
+        web_db.add(Product(uid_1c=uid, article=f"A{i:05d}", name="Куртка",
+                           stock_on_hand=50, reserve=reserve,
+                           offset_base_date=day, offset_base_stock=base,
+                           fact_at_date=base - 11, stock_discrepancy=11,
+                           broadcast_offset=11 + reserve))
+        web_db.add(StockDateRow(snapshot_id=snap.id, uid_1c=uid, quantity=base))
+    web_db.commit()
+    return [f"u{i:05d}" for i in range(count)]
+
+
+def test_setting_the_threshold_reaches_every_marked_row(logged_in_client, web_db):
+    """Порог теперь пишется РАСХОЖДЕНИЕМ, а не присваиванием в колонку.
+
+    Путь стал длиннее — а значит появился способ незаметно потерять на нём
+    строки. Проверяем на количестве, заведомо большем `FILTERED_LIMIT` (500):
+    ровно на этом числе 23.09 и оборвалась правка 1739 строк, и «изменено 500»
+    выглядело как успех."""
+    uids = _seed_with_basis(web_db, 700, reserve=2)
+
+    r = logged_in_client.post("/products/bulk", follow_redirects=True,
+                              data={"action": "set_offset", "int_value": "6",
+                                    "uids": uids})
+
+    assert web_db.query(Product).filter(Product.broadcast_offset == 6).count() == 700
+    assert web_db.query(Product).filter(Product.stock_discrepancy == 4).count() == 700
+    assert "изменено строк — 700" in r.text
+
+
+def test_clearing_the_threshold_reaches_every_marked_row(logged_in_client, web_db):
+    """«Сбросить порог» снимает и расхождение — иначе ближайший пересчёт вернул
+    бы порог по формуле. Снять обязано у ВСЕХ отмеченных."""
+    uids = _seed_with_basis(web_db, 700)
+
+    r = logged_in_client.post("/products/bulk", follow_redirects=True,
+                              data={"action": "clear_offset", "uids": uids})
+
+    assert web_db.query(Product).filter(
+        Product.broadcast_offset.is_(None)).count() == 700
+    assert web_db.query(Product).filter(
+        Product.stock_discrepancy.is_(None)).count() == 700
+    assert "изменено строк — 700" in r.text
+
+
+def test_the_whole_filter_gets_the_threshold_too(logged_in_client, web_db):
+    """Тот же путь через «весь отбор», а не через список отметок.
+
+    Их двое, и расходятся они молча: 23.09 предел стоял ровно на одном."""
+    _seed_with_basis(web_db, 700)
+
+    logged_in_client.post("/products/bulk",
+                          data={"action": "set_offset", "int_value": "6",
+                                "all_filtered": "true"})
+
+    assert web_db.query(Product).filter(Product.broadcast_offset == 6).count() == 700
+
+
+def test_the_button_names_the_rows_it_did_not_touch(logged_in_client, web_db):
+    """«Записать остаток ЦС на дату» пропускает строки с измеренным расхождением
+    — и ОБЯЗАНА сказать сколько.
+
+    Молчаливый пропуск был бы тем же дефектом с другой стороны: «изменено 700»
+    выглядит как успех, и оператор не узнал бы, что часть строк осталась
+    прежней. Здесь пропущены все 700, и число названо."""
+    uids = _seed_with_basis(web_db, 700)
+
+    r = logged_in_client.post("/products/bulk", follow_redirects=True,
+                              data={"action": "stock_to_fact", "uids": uids})
+
+    assert web_db.query(Product).filter(Product.stock_discrepancy == 11).count() == 700
+    assert "Порог сохранён у 700" in r.text
+    assert "изменено строк — 0" in r.text
+
+
+def test_the_discrepancy_can_be_set_in_bulk_and_keeps_its_sign(logged_in_client, web_db):
+    """Расхождение правится массово — и знак при этом не теряется.
+
+    «Массовый путь обязан делать то же, что построчный» — правило проекта, и
+    трижды подряд его нарушение стоило оверселла. Минус здесь не редкость: на
+    бою 53 товара, до −213, и `max(0, ...)` по этому числу превратил бы их порог
+    в ноль, вернув на площадки ровно учётный остаток вместо физического."""
+    uids = _seed_with_basis(web_db, 700, reserve=2)
+
+    r = logged_in_client.post("/products/bulk", follow_redirects=True,
+                              data={"action": "set_discrepancy", "int_value": "-7",
+                                    "uids": uids})
+
+    assert web_db.query(Product).filter(Product.stock_discrepancy == -7).count() == 700
+    assert web_db.query(Product).filter(Product.broadcast_offset == -5).count() == 700
+    assert "изменено строк — 700" in r.text
+
+
+def test_setting_the_discrepancy_to_zero_in_bulk_is_possible(logged_in_client, web_db):
+    """Ноль — утверждение «склад сошёлся с учётом», и сказать его надо уметь.
+
+    Это единственный способ схлопнуть порог осознанно: кнопка «Записать остаток
+    ЦС на дату» такие строки пропускает намеренно, а ввод факта, равного учёту,
+    расхождения не трогает."""
+    uids = _seed_with_basis(web_db, 700, reserve=2)
+
+    logged_in_client.post("/products/bulk",
+                          data={"action": "set_discrepancy", "int_value": "0",
+                                "uids": uids})
+
+    assert web_db.query(Product).filter(Product.stock_discrepancy == 0).count() == 700
+    assert web_db.query(Product).filter(Product.broadcast_offset == 2).count() == 700

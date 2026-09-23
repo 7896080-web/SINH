@@ -59,15 +59,21 @@ def test_setting_a_date_pulls_the_stock_and_computes(logged_in_client, web_db):
 
 def test_the_row_shows_the_arithmetic(logged_in_client, web_db):
     """Оператор должен видеть не только число, но и из чего оно вышло — иначе
-    порог выглядит как магия и ему нечем верить."""
+    порог выглядит как магия и ему нечем верить.
+
+    Слагаемыми, а не формулой от даты: только так видно, что изменит правка
+    расхождения и что — правка брони. 23.09 строка показывала «43 − (32 − бронь
+    0)», и это читалось как формула, а не как утверждение о складе: оператор
+    «поправил» подставленный факт на учётный и схлопнул порог."""
     _snapshot(web_db, [("u1", 10)])
     _product(web_db, reserve=2)
     logged_in_client.post("/products/u1/base-date", data={"value": "2026-08-07"})
 
     r = logged_in_client.post("/products/u1/fact", data={"value": "8"})
 
-    assert "10 − (8 − бронь 2)" in r.text
-
+    assert "расхождение" in r.text
+    assert "бронь 2" in r.text
+    assert "порог" in r.text
 
 def test_waiting_for_1c_is_visible_in_the_row(logged_in_client, web_db):
     """Снимка на дату ещё нет. Строка обязана объяснить, что происходит, а не
@@ -103,7 +109,12 @@ def test_changing_the_reserve_moves_the_threshold(logged_in_client, web_db):
     assert product.broadcast_offset == 7
 
 
-def test_clearing_the_fact_falls_back_to_the_1c_number(logged_in_client, web_db):
+def test_clearing_the_fact_does_not_erase_the_discrepancy(logged_in_client, web_db):
+    """Снять факт — не то же самое, что сказать «склад сошёлся с учётом».
+
+    Факт был способом ИЗМЕРИТЬ расхождение; измеренное хранится на товаре и
+    смену даты переживает, значит и очистку поля переживает тоже. Обнулить
+    расхождение можно только вслух — поставив в его собственном поле ноль."""
     _snapshot(web_db, [("u1", 10)])
     product = _product(web_db, reserve=2)
     logged_in_client.post("/products/u1/base-date", data={"value": "2026-08-07"})
@@ -113,8 +124,12 @@ def test_clearing_the_fact_falls_back_to_the_1c_number(logged_in_client, web_db)
 
     web_db.refresh(product)
     assert product.fact_at_date is None
-    assert product.broadcast_offset == 2        # порог сводится к брони
+    assert product.stock_discrepancy == 2
+    assert product.broadcast_offset == 4
 
+    logged_in_client.post("/products/u1/discrepancy", data={"value": "0"})
+    web_db.refresh(product)
+    assert product.broadcast_offset == 2, "сказано вслух — порог свёлся к брони"
 
 def test_clearing_the_threshold_removes_the_whole_calculation(logged_in_client, web_db):
     """«Сбросить порог» должно действительно сбрасывать: если оставить дату,
@@ -297,11 +312,11 @@ def test_import_reads_a_date_cell_as_a_date(logged_in_client, web_db):
 def test_import_sets_the_threshold_and_keeps_the_basis(logged_in_client, web_db):
     """Порог задаётся файлом и у строки С ДАТОЙ — но связка остаётся согласованной.
 
-    Раньше это был отказ, и причина была верной: записанный мимо трёх чисел
-    порог держался бы до первой правки брони, а потом формула молча вернула бы
-    прежний. Теперь под порог подбирается ФАКТ, и круг «выгрузил → поправил →
-    залил» по этой колонке замкнулся, не заводя второго источника правды.
-    """
+    Раньше это был отказ, и причина была верной: записанный напрямую порог
+    держался бы до первой правки брони, а потом формула молча вернула бы
+    прежний. Теперь файл пишет РАСХОЖДЕНИЕ (порог − бронь), и круг «выгрузил →
+    поправил → залил» по этой колонке замкнулся, не заводя второго источника
+    правды."""
     _account(web_db)
     _snapshot(web_db, [("u1", 10)])
     product = _product(web_db, reserve=2)
@@ -315,30 +330,31 @@ def test_import_sets_the_threshold_and_keeps_the_basis(logged_in_client, web_db)
     web_db.expire_all()
     product = web_db.query(Product).first()
     assert product.broadcast_offset == 6
-    # 10 − (6 − 2) = 6: факт подобран так, что формула даёт заданный порог.
-    assert product.fact_at_date == 6
+    assert product.stock_discrepancy == 4        # 6 − бронь 2
+    # Факт — измерение склада, и правка порога его не переписывает: подставленное
+    # под порог число оператор принял бы за собственное измерение.
+    assert product.fact_at_date == 8
 
+def test_a_threshold_above_the_1c_number_is_allowed(logged_in_client, web_db):
+    """Порог больше учётного остатка — законное состояние, и отказывать в нём нельзя.
 
-def test_an_impossible_threshold_is_refused_with_a_reason(logged_in_client, web_db):
-    """Порог, которого на эту дату быть не может, не применяется молча.
-
-    Подобранный факт вышел бы отрицательным — склад в минусе не бывает. Прежнее
-    значение остаётся: наполовину применённая правка хуже отклонённой.
-    """
+    Раньше здесь стоял отказ, и был он следствием механики: под порог
+    подбирался ФАКТ, а склад в минусе не бывает. Подбирать больше нечего —
+    расхождение хранится само, — и запрет вместе с механикой ушёл. На бою такие
+    строки есть: учёт врёт сильнее, чем в 1С вообще числится товара, и наружу по
+    ним не уходит ничего, что и требуется."""
     _account(web_db)
     _snapshot(web_db, [("u1", 10)])
     _product(web_db, reserve=2)
     logged_in_client.post("/products/u1/base-date", data={"value": "2026-08-07"})
     logged_in_client.post("/products/u1/fact", data={"value": "8"})
 
-    # Ответ на загрузку — это уже перерисованная страница: флеш снимается ею,
-    # а не следующим запросом.
-    r = _upload(logged_in_client, _xlsx(["ID_1С", "Порог трансляции"], [["u1", 99]]))
+    _upload(logged_in_client, _xlsx(["ID_1С", "Порог трансляции"], [["u1", 99]]))
 
     web_db.expire_all()
-    assert web_db.query(Product).first().broadcast_offset == 4      # не 99
-    assert "невозможен" in r.text
-
+    product = web_db.query(Product).first()
+    assert product.broadcast_offset == 99
+    assert product.stock_discrepancy == 97
 
 def test_a_plain_round_trip_does_not_complain(logged_in_client, web_db):
     """Обычный случай: выгрузили и залили обратно, ничего не меняя. Порог в файле
@@ -399,8 +415,11 @@ def test_import_recomputes_once_after_all_three_values(logged_in_client, web_db)
 
 def test_moving_the_date_clears_the_fact_on_the_page(logged_in_client, web_db):
     """Со стороны страницы то же правило: факт всегда «на дату». Перенесли дату —
-    старое пересчитанное количество к новому числу отношения не имеет, и молча
-    считать порог по нему нельзя."""
+    старое пересчитанное количество к новому числу отношения не имеет.
+
+    А РАСХОЖДЕНИЕ переносится: оно свойство товара, и порог держится на нём.
+    Новый пересчёт склада его перебьёт, а пока его нет — держим последнее
+    измеренное: порог выше, наружу уходит меньше."""
     _snapshot(web_db, [("u1", 10)])
     _snapshot(web_db, [("u1", 12)], day=date(2026, 9, 1))
     product = _product(web_db, reserve=2)
@@ -412,8 +431,8 @@ def test_moving_the_date_clears_the_fact_on_the_page(logged_in_client, web_db):
     web_db.refresh(product)
     assert product.fact_at_date is None
     assert product.offset_base_stock == 12
-    assert product.broadcast_offset == 2        # сводится к брони, пока факт не введён
-
+    assert product.stock_discrepancy == 2
+    assert product.broadcast_offset == 4
 
 def test_bulk_date_reads_the_snapshot_once(logged_in_client, web_db):
     """Массовая простановка даты не должна ходить в базу за каждым товаром: на
@@ -443,3 +462,156 @@ def test_bulk_date_reads_the_snapshot_once(logged_in_client, web_db):
     web_db.expire_all()
     p = web_db.query(Product).filter(Product.uid_1c == "u005").first()
     assert p.offset_base_stock == 15 and p.broadcast_offset == 1
+
+
+# ---------------------------------------- расхождение: круг «выгрузил → залил»
+
+def test_the_export_carries_the_stored_discrepancy(logged_in_client, web_db):
+    """В файл едет ХРАНИМОЕ расхождение, а не «учёт минус факт».
+
+    Раньше колонка была справкой и считалась из соседних ячеек. У строки, чью
+    дату сдвинули назад, факт пуст — и справка выходила пустой при живом пороге,
+    то есть файл показывал «расхождения нет» там, где оно есть.
+    """
+    _account(web_db)
+    _snapshot(web_db, [("u1", 43)])
+    _product(web_db, reserve=2)
+    logged_in_client.post("/products/u1/base-date", data={"value": "2026-08-07"})
+    logged_in_client.post("/products/u1/fact", data={"value": "32"})
+    logged_in_client.post("/products/u1/base-date", data={"value": "2026-09-01"})
+
+    headers, row = _export_row(logged_in_client)
+
+    assert "Расхождение" in headers
+    assert not row["Факт на дату"], "факт всегда «на дату», новую дату он не описывает"
+    assert row["Расхождение"] == 11
+    assert row["Порог трансляции"] == 13          # 11 + бронь 2
+
+
+def test_the_discrepancy_column_is_writable(logged_in_client, web_db):
+    """Правка колонки применяется — это и есть способ сказать файлом «склад
+    сошёлся» (ноль) или назвать новое число."""
+    _account(web_db)
+    _snapshot(web_db, [("u1", 43)])
+    product = _product(web_db, reserve=2)
+    logged_in_client.post("/products/u1/base-date", data={"value": "2026-08-07"})
+    logged_in_client.post("/products/u1/fact", data={"value": "32"})
+
+    _upload(logged_in_client, _xlsx(["ID_1С", "Расхождение"], [["u1", 6]]))
+
+    web_db.expire_all()
+    product = web_db.query(Product).first()
+    assert product.stock_discrepancy == 6
+    assert product.broadcast_offset == 8          # 6 + бронь 2
+
+
+def test_a_negative_discrepancy_survives_the_file(logged_in_client, web_db):
+    """Минус — «на складе больше, чем знает 1С». На бою таких 53 товара, до −213.
+
+    `max(0, ...)` здесь был бы дефектом: порог стал бы нулём, и наружу уехало бы
+    ровно учётное число вместо того, что физически лежит."""
+    _account(web_db)
+    _snapshot(web_db, [("u1", 43)])
+    _product(web_db)
+
+    logged_in_client.post("/products/u1/base-date", data={"value": "2026-08-07"})
+    _upload(logged_in_client, _xlsx(["ID_1С", "Расхождение"], [["u1", -7]]))
+
+    web_db.expire_all()
+    product = web_db.query(Product).first()
+    assert product.stock_discrepancy == -7
+    assert product.broadcast_offset == -7
+
+
+def test_an_untouched_file_changes_nothing(logged_in_client, web_db):
+    """Круг «выгрузил → поправил ОДНУ колонку → залил» не должен трогать остального.
+
+    Колонок, двигающих порог, теперь две — «Расхождение» и «Порог трансляции», —
+    и обе выгрузка заполняет. Без снимка «как было в файле» вторая откатывала бы
+    правку первой: оператор поправил расхождение, а нетронутая ячейка порога
+    вернула бы старое число. Молча и по всему файлу.
+    """
+    _account(web_db)
+    _snapshot(web_db, [("u1", 43)])
+    _product(web_db, reserve=2)
+    logged_in_client.post("/products/u1/base-date", data={"value": "2026-08-07"})
+    logged_in_client.post("/products/u1/fact", data={"value": "32"})
+
+    _, row = _export_row(logged_in_client)
+    # Правим ОДНУ ячейку, остальные возвращаем как есть — так и выглядит файл,
+    # пришедший от оператора.
+    _upload(logged_in_client, _xlsx(
+        ["ID_1С", "Расхождение", "Порог трансляции", "Факт на дату"],
+        [["u1", 6, row["Порог трансляции"], row["Факт на дату"]]]))
+
+    web_db.expire_all()
+    product = web_db.query(Product).first()
+    assert product.stock_discrepancy == 6, "правку расхождения не откатила колонка порога"
+    assert product.broadcast_offset == 8
+
+
+def test_an_empty_discrepancy_cell_changes_nothing(logged_in_client, web_db):
+    """Пустая ячейка — «не трогать», как и во всех остальных колонках файла.
+
+    Иначе файл, собранный не из нашей выгрузки, снял бы измерения по всему
+    каталогу разом и молча вернул на площадки полный остаток."""
+    _account(web_db)
+    _snapshot(web_db, [("u1", 43)])
+    _product(web_db)
+    logged_in_client.post("/products/u1/base-date", data={"value": "2026-08-07"})
+    logged_in_client.post("/products/u1/fact", data={"value": "32"})
+
+    _upload(logged_in_client, _xlsx(["ID_1С", "Расхождение"], [["u1", ""]]))
+
+    web_db.expire_all()
+    assert web_db.query(Product).first().stock_discrepancy == 11
+
+
+def test_the_row_edits_the_discrepancy_directly(logged_in_client, web_db):
+    """То же и построчно: у поля на странице тот же смысл, что у колонки в файле.
+
+    Массовый путь и построчный обязаны делать одно и то же — на расхождении
+    этого правила больше всего и держится: разойдись они, оператор получил бы
+    разный порог в зависимости от того, каким путём вводил число."""
+    _snapshot(web_db, [("u1", 43)])
+    product = _product(web_db, reserve=2)
+    logged_in_client.post("/products/u1/base-date", data={"value": "2026-08-07"})
+    logged_in_client.post("/products/u1/fact", data={"value": "32"})
+
+    logged_in_client.post("/products/u1/discrepancy", data={"value": "-7"})
+
+    web_db.refresh(product)
+    assert product.stock_discrepancy == -7
+    assert product.broadcast_offset == -5         # −7 + бронь 2
+
+    logged_in_client.post("/products/u1/discrepancy", data={"value": ""})
+    web_db.refresh(product)
+    assert product.stock_discrepancy is None, "пусто в поле строки — «не измеряли»"
+
+
+def test_an_untouched_discrepancy_cell_does_not_undo_a_new_fact(logged_in_client, web_db):
+    """Зеркало предыдущего: оператор поправил ФАКТ, а ячейку расхождения не трогал.
+
+    Выгрузка заполняет обе, и обе двигают порог. Факт с новым числом записывает
+    новое расхождение — а следом нетронутая ячейка расхождения вернула бы
+    прежнее, то есть отменила бы физический пересчёт склада. Молча и по всему
+    файлу. Поэтому каждая из двух колонок спрашивает про СЕБЯ: «человек изменил
+    эту ячейку?», сравнивая со снимком до правок строки."""
+    _account(web_db)
+    _snapshot(web_db, [("u1", 43)])
+    _product(web_db)
+    logged_in_client.post("/products/u1/base-date", data={"value": "2026-08-07"})
+    logged_in_client.post("/products/u1/fact", data={"value": "32"})
+
+    _, row = _export_row(logged_in_client)
+    assert row["Расхождение"] == 11
+
+    _upload(logged_in_client, _xlsx(
+        ["ID_1С", "Факт на дату", "Расхождение"],
+        [["u1", 30, row["Расхождение"]]]))
+
+    web_db.expire_all()
+    product = web_db.query(Product).first()
+    assert product.fact_at_date == 30
+    assert product.stock_discrepancy == 13, "новый пересчёт склада не отменён"
+    assert product.broadcast_offset == 13

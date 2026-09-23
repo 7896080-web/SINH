@@ -140,16 +140,33 @@ def test_resetting_the_threshold_first_lets_the_button_through(logged_in_client,
 
 # ------------------------------------------------- одно правило на двух хозяев
 
-def test_the_date_move_and_the_button_ask_the_same_question():
-    """`offset_is_established` спрашивают ОБА, и разойтись им нельзя.
+def test_the_button_cannot_collapse_a_measured_discrepancy(db):
+    """Второй хозяин условия исчез, и это не ослабление, а исчезновение угрозы.
 
-    Сдвиг даты назад решает по нему, что удерживать; кнопка — чего не затирать.
-    Разойдись они, один механизм сохранял бы порог, а второй тут же схлопывал:
-    ровно то, что и произошло 23.09, когда условие было только у первого."""
-    import inspect
+    Раньше `offset_is_established` спрашивали ДВОЕ: сдвиг даты назад (что
+    удерживать) и эта кнопка (чего не затирать). Удерживать больше не нужно —
+    расхождение хранится на товаре и смену даты переживает само, — так что
+    остался один хозяин. Но сама кнопка стала безопасна ещё и снизу: она ставит
+    факт РАВНЫМ учёту, а такой ввод расхождение не трогает вовсе
+    (`offset_base.apply_fact`). То есть даже проскочив проверку, порог она уже
+    не схлопнет.
 
-    from app import offset_base
-    from app.routers import products
+    Проверяем оба слоя разом: и что кнопка пропускает строку, и что пройди она
+    насквозь — порог остался бы прежним.
+    """
+    from app.offset_base import apply_fact, offset_is_established
+    from app.transmit import recompute_offset
 
-    assert "offset_is_established(product)" in inspect.getsource(offset_base.set_base_date)
-    assert "offset_is_established(p)" in inspect.getsource(products.bulk_edit)
+    product = Product(uid_1c="u9", article="A-9", name="Товар", stock_on_hand=43,
+                      reserve=0, offset_base_date=date(2026, 7, 6), offset_base_stock=43,
+                      fact_at_date=32, stock_discrepancy=11, broadcast_offset=11)
+    db.add(product)
+    db.commit()
+
+    assert offset_is_established(product) is True, "кнопка обязана такую строку пропустить"
+
+    apply_fact(db, product, product.offset_base_stock)     # если бы проскочила
+    recompute_offset(product)
+
+    assert product.broadcast_offset == 11, "порог не схлопнулся даже насквозь"
+    assert product.stock_discrepancy == 11
