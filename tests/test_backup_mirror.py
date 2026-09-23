@@ -170,7 +170,7 @@ def test_a_mirror_pointing_at_the_backup_folder_is_refused(live_db, monkeypatch)
     result = backup.make_backup()
 
     assert result.ok, "сам бэкап этим не портится — копия снята и проверена"
-    assert "совпадает с каталогом копий" in result.mirror_error
+    assert "папка: указана на каталог самих копий" in result.mirror_error
 
 
 def test_the_manual_script_says_when_there_is_no_second_site(live_db, monkeypatch,
@@ -229,3 +229,44 @@ def test_the_manual_script_names_both_second_sites(live_db, monkeypatch, capsys)
     printed = capsys.readouterr().out
     assert "зеркало (облако): yandex:backups" in printed
     assert "доставлена и проверена" in printed
+
+
+def test_one_broken_site_does_not_read_as_no_site_at_all(live_db, monkeypatch, capsys):
+    """Площадок ДВЕ, и отказ одной не значит, что не сработала вторая.
+
+    22.09 на бою это и вышло: папка была задана в каталог самих копий и
+    справедливо отвергнута, а облако приняло копию и подтвердило её чтением.
+    Скрипт при этом печатал «копия не доехала до зеркала» — то есть пугал
+    человека там, где копия на самом деле лежала в облаке. Строка, которая
+    врёт в безопасную сторону, приучает не верить ей и в опасную.
+    """
+    import importlib
+    import json as _json
+    import subprocess
+
+    # Папка зеркала указывает в каталог копий — отказ.
+    monkeypatch.setenv("BACKUP_MIRROR_DIR", str(live_db / "backups"))
+    # Облако настроено и работает.
+    monkeypatch.setenv("BACKUP_RCLONE_REMOTE", "yandex:backups")
+    monkeypatch.setenv("BACKUP_RCLONE_EXE", str(live_db / "rclone.exe"))
+    monkeypatch.setenv("BACKUP_RCLONE_CONFIG", str(live_db / "rclone.conf"))
+
+    def fake_run(command, capture_output=True, text=True, timeout=None):
+        sub = command[command.index("--log-level") + 2]
+        if sub == "lsjson":
+            files = sorted((live_db / "backups").glob("sync_admin-*.db"))
+            return subprocess.CompletedProcess(
+                command, 0,
+                _json.dumps([{"Name": f.name, "Size": f.stat().st_size}
+                             for f in files]), "")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    module = importlib.import_module("scripts.backup_db")
+    assert module.main() == 0
+
+    printed = capsys.readouterr().out
+    assert "папка:" in printed, "жалоба обязана называть свою площадку"
+    assert "не доехала" not in printed
+    assert "при этом доставлено и проверено: облако" in printed
