@@ -20,7 +20,7 @@ import os
 import sys
 import zlib
 
-APPLY_TEMPLATE = r'''import base64, hashlib, io, os, shutil
+APPLY_TEMPLATE = r'''import base64, datetime, hashlib, io, os, shutil
 ROOT = r"C:\sync_admin"
 TAG = {tag!r}
 FILES = {files!r}
@@ -70,6 +70,25 @@ for rel in DELETE:
                     os.remove(os.path.join(cache, f))
     print("del", rel)
     written += 1
+# Отметка «какой блок наката тут реально применялся». Пишем ПОСЛЕ всех файлов,
+# то есть только когда всё записано и сверено по sha.
+#
+# Зачем. Блок наката и `update_windows.ps1` — два независимых шага, и второй
+# ничего не знает о первом. 23.09 это стоило вечера: APPLY не запускали вовсе,
+# `update_windows.ps1` честно отработал на СТАРОМ коде и закончился зелёным —
+# копия снята, тесты зелёные (код и база друг другу соответствуют), `/health`
+# 200. Понять, что новой версии на сервере нет, удалось только по отсутствию
+# строки `Running upgrade` в логе миграций, то есть по косвенному признаку,
+# которого никто не ищет.
+#
+# Теперь версия названа вслух, а `update_windows.ps1 -Tag pm114` сверяет её с
+# той, которую человек собирался ставить, и отказывается работать при
+# расхождении.
+marker = os.path.join(ROOT, "deploy", "INSTALLED_TAG")
+os.makedirs(os.path.dirname(marker), exist_ok=True)
+with io.open(marker, "w", encoding="utf-8") as f:
+    f.write(TAG + "\n" + datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S") + " UTC\n")
+print("tag", TAG)
 print("DONE", written)
 '''
 
