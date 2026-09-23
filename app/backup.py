@@ -31,7 +31,7 @@ import shutil
 import sqlite3
 import subprocess
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from app.timeutils import now_utc
@@ -101,6 +101,27 @@ RCLONE_TIMEOUT = 900
 # поздно, и стоят копейки против цены «восстанавливать нечего».
 KEEP_DAILY = 14
 KEEP_WEEKLY = 8
+# Копию моложе этого срока не удаляем НИКОГДА, сколько бы их за день ни сняли.
+#
+# Правило «одна на календарный день» писалось под копии по расписанию и для них
+# верно. Но копию снимает ещё и накат (`update_windows.ps1` — первым делом,
+# ПЕРЕД миграцией), а накатов за день бывает несколько, и тогда правило работает
+# против своей же цели: оно оставляет САМУЮ СВЕЖУЮ копию дня, то есть снятую
+# ПОСЛЕ того, что человек собрался отменить.
+#
+# 23.09 это стоило ровно того, ради чего бэкап и заводился. Массовая кнопка
+# схлопнула пороги у 62 товаров в 15:10; единственная копия до этого момента
+# была снята в 14:31 — и её удалил накат в 15:32, а следующий накат в 16:10
+# удалил бы и её преемницу. Обе площадки, локальная и облако, потеряли файл
+# одновременно: правило-то у них одно. Восстанавливать пришлось по ВЧЕРАШНЕЙ
+# копии, то есть принимая на веру, что за день до порчи ничего важного не
+# правили.
+#
+# Сутки — потому что именно столько живёт вопрос «отменить то, что только что
+# сделали». Дальше копии дня схлопываются в одну, как и раньше: обещание
+# «вернуться на любой из недавних дней» этим не задевается, а место стоит
+# полутора сотен мегабайт за накат.
+KEEP_ALL_WITHIN_HOURS = 24
 
 NAME_PREFIX = "sync_admin-"
 NAME_RE = re.compile(r"^sync_admin-(\d{8})-(\d{6})\.db$")
@@ -246,7 +267,8 @@ def _parse_moment(name: str) -> datetime | None:
 
 
 def names_to_drop(names: list[str], keep_daily: int = KEEP_DAILY,
-                  keep_weekly: int = KEEP_WEEKLY) -> list[str]:
+                  keep_weekly: int = KEEP_WEEKLY,
+                  now: datetime | None = None) -> list[str]:
     """Какие копии лишние. Правило ОДНО на все площадки — и это принципиально.
 
     Локальная папка и облако чистятся разными механизмами (`unlink` против
@@ -265,9 +287,16 @@ def names_to_drop(names: list[str], keep_daily: int = KEEP_DAILY,
     за ними. Порчу данных (перепутанный мэппинг, неверный импорт) замечают через
     день-два, и восстанавливать было бы не из чего.
 
+    Плюс СВЕЖИЕ КОПИИ СВЕРХ ЭТОГО, моложе `KEEP_ALL_WITHIN_HOURS`. Копию снимает
+    не только расписание, но и каждый накат, а правило дня оставляет самую
+    свежую — то есть снятую уже ПОСЛЕ события, которое человек собрался
+    отменить. См. комментарий у константы: 23.09 так и пропала единственная
+    копия до порчи.
+
     Имя, которое не разбирается, НЕ попадает в ответ никогда: и в каталоге, и в
     облаке может лежать копия, положенная человеком руками.
     """
+    now = now or now_utc()
     parsed = []
     for name in names:
         moment = _parse_moment(name)
@@ -276,6 +305,13 @@ def names_to_drop(names: list[str], keep_daily: int = KEEP_DAILY,
     parsed.sort(reverse=True)
 
     keep: set[str] = set()
+    # Свежие — вне всякой очереди и до подсчёта слотов: слот дня они не
+    # занимают и старшие копии не вытесняют.
+    fresh_after = now - timedelta(hours=KEEP_ALL_WITHIN_HOURS)
+    for moment, name in parsed:
+        if moment >= fresh_after:
+            keep.add(name)
+
     days_seen: set = set()
     rest: list[tuple] = []
     for moment, name in parsed:
@@ -288,6 +324,13 @@ def names_to_drop(names: list[str], keep_daily: int = KEEP_DAILY,
 
     weeks_seen: set[tuple] = set()
     for moment, name in rest:
+        if name in keep:
+            # Свежая копия, не ставшая представителем дня. Слот НЕДЕЛИ она
+            # занимать не должна: её и так не удалят, а вытеснила бы она копию
+            # месячной давности — ту самую, ради которой недельный слой и
+            # заведён. 23.09 это и произошло: копия 15:32 уцелела не как
+            # «сегодняшняя» (то место заняла 16:10), а как недельная.
+            continue
         week = moment.isocalendar()[:2]
         if week not in weeks_seen and len(weeks_seen) < keep_weekly:
             weeks_seen.add(week)
