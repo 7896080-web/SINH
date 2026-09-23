@@ -377,7 +377,17 @@ def job_ftp_receive():
         if stale_dates:
             logger.warning("ftp_receive: %d заявок на остатки на дату без ответа", len(stale_dates))
 
-        _heartbeat(db, "ftp_receive", True)
+        # Удержать порог просили, а не вышло — текст в `last_error` УСПЕШНОЙ
+        # отметки, по общему правилу проекта: задание отработало, а часть работы
+        # не проведена. Читатель обязателен и он есть —
+        # `report._check_offset_not_kept`. Без него счётчик считался и
+        # выбрасывался: человек просил сохранить число, которым управляется
+        # отправка, система не смогла и не сказала никому.
+        note = ""
+        if on_date.get("offsets_lost"):
+            note = (f"порог не удержан при смене даты назад: "
+                    f"{on_date['offsets_lost']} товаров")
+        _heartbeat(db, "ftp_receive", True, note)
     except Exception as e:
         logger.exception("ftp_receive failed")
         _heartbeat(db, "ftp_receive", False, str(e))

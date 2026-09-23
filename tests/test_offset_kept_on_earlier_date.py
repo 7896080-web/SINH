@@ -236,3 +236,72 @@ def test_an_impossible_threshold_is_reported_not_swallowed(db):
     assert stats["offsets_lost"] == 1
     assert stats["offsets_kept"] == 0
     assert product.offset_pinned is None, "не должно звенеть при каждом снимке"
+
+
+# --------------------------------------------------------------------------
+# У счётчика обязан быть читатель
+# --------------------------------------------------------------------------
+
+def test_a_threshold_that_could_not_be_kept_reaches_a_human(db):
+    """Счётчик считался и выбрасывался — ни лога, ни heartbeat, ни находки.
+
+    То есть человек просил сохранить число, которым управляется отправка,
+    система не смогла и не сказала НИКОМУ. Ровно «находка без читателя»,
+    которую в этом проекте чинят везде; она была заведена заново вместе с самим
+    удержанием, и первый же вопрос с боя («почему порог съехал?») уткнулся в то,
+    что ответить по данным нечем.
+    """
+    from app.models import WorkerHeartbeat
+    from app.report import collect_findings
+    from app.timeutils import now_utc
+
+    db.add(WorkerHeartbeat(
+        worker_name="ftp_receive", last_run_at=now_utc(), last_success=True,
+        last_error="порог не удержан при смене даты назад: 3 товаров"))
+    db.commit()
+
+    found = [f for f in collect_findings(db) if f.key == "offset_not_kept"]
+
+    assert len(found) == 1
+    assert "3 товаров" in found[0].title
+    # Следствие называется, а не просто факт: иначе это не расхождение, а число.
+    assert "больше" in found[0].consequence.lower()
+
+
+def test_a_clean_run_says_nothing(db):
+    """Молчание на исправной системе — обязательное свойство отчёта."""
+    from app.models import WorkerHeartbeat
+    from app.report import collect_findings
+    from app.timeutils import now_utc
+
+    db.add(WorkerHeartbeat(worker_name="ftp_receive", last_run_at=now_utc(),
+                           last_success=True, last_error=None))
+    db.commit()
+
+    assert [f for f in collect_findings(db) if f.key == "offset_not_kept"] == []
+
+
+def test_the_counter_actually_reaches_the_heartbeat(db):
+    """Читатель есть, писатель есть — а что они соединены, надо доказать.
+
+    Мутация «убрать `note` из вызова `_heartbeat`» не ловилась ничем: находка
+    продолжала читать `last_error`, которого теперь никто не пишет. Ровно тот
+    разрыв, ради которого весь этот механизм и заводился, только на один слой
+    выше. Поведенческим тестом это стоило бы поднятого обмена с 1С и снимка,
+    поэтому проверяем исходник — тем же приёмом, что и сроки протухания заданий
+    в `/health`.
+    """
+    import re
+    from pathlib import Path
+
+    source = Path("app/workers/scheduler.py").read_text(encoding="utf-8")
+    job = source[source.index("def job_ftp_receive"):]
+    job = job[:job.index("\ndef ")]
+
+    assert 'on_date.get("offsets_lost")' in job, (
+        "счётчик «порог не удержан» должен читаться из статистики")
+    call = re.search(r'_heartbeat\(db,\s*"ftp_receive",\s*True[^)]*\)', job)
+    assert call is not None, "успешная отметка ftp_receive не найдена"
+    assert "note" in call.group(0), (
+        "текст «порог не удержан» обязан уходить в last_error УСПЕШНОЙ отметки — "
+        "иначе находка отчёта читает то, чего никто не пишет")
