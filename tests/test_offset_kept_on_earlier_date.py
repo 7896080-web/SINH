@@ -305,3 +305,65 @@ def test_the_counter_actually_reaches_the_heartbeat(db):
     assert "note" in call.group(0), (
         "текст «порог не удержан» обязан уходить в last_error УСПЕШНОЙ отметки — "
         "иначе находка отчёта читает то, чего никто не пишет")
+
+
+# --------------------------------------------------------------------------
+# Строка обязана объяснить, что обнуляет правка факта
+# --------------------------------------------------------------------------
+
+def test_the_row_names_the_discrepancy_out_loud(logged_in_client, web_db):
+    """23.09 на бою порог удержался, а объяснить это строка не смогла.
+
+    После сдвига даты назад под удержанный порог подобрался факт — 32 при учёте
+    43. Оператор этого числа на новую дату не вводил, и «поправил» факт на
+    учётное 43. Порог честно стал нулём: факт, равный учёту, означает
+    «расхождения нет». Компенсировали бронью, наружу пошло то же число — но
+    собранное из другого, и при следующей правке брони они разойдутся.
+
+    Арифметика «43 − (32 − бронь 0)» это показывала, но читается как формула, а
+    не как утверждение о складе. Названное вслух расхождение говорит прямо, что
+    именно обнуляет правка факта.
+    """
+    from app.models import Product, StockDateRow, StockDateSnapshot, StockDateStatus
+
+    snap = StockDateSnapshot(snapshot_date=date(2026, 7, 6),
+                             status=StockDateStatus.done, rows_count=1)
+    web_db.add(snap)
+    web_db.commit()
+    web_db.refresh(snap)
+    web_db.add(StockDateRow(snapshot_id=snap.id, uid_1c="u1", quantity=43))
+    web_db.add(Product(uid_1c="u1", article="A-1", name="Товар",
+                       stock_on_hand=22, reserve=0, broadcast_enabled=True))
+    web_db.commit()
+
+    logged_in_client.post("/products/u1/base-date", data={"value": "2026-07-06"})
+    page = logged_in_client.post("/products/u1/fact", data={"value": "32"}).text
+
+    assert "расхождение" in page
+    assert "учёт 43 − факт 32" in page
+    assert "<b>11</b>" in page, "само число расхождения обязано быть названо"
+
+
+def test_a_fact_equal_to_the_1c_number_shows_a_zero_discrepancy(logged_in_client, web_db):
+    """Обратная сторона — то самое действие, которое на бою и произошло.
+
+    Поставив факт равным учёту, человек утверждает «склад сходится с 1С». Строка
+    обязана сказать это в лицо, а не оставить вывод на догадку.
+    """
+    from app.models import Product, StockDateRow, StockDateSnapshot, StockDateStatus
+
+    snap = StockDateSnapshot(snapshot_date=date(2026, 7, 6),
+                             status=StockDateStatus.done, rows_count=1)
+    web_db.add(snap)
+    web_db.commit()
+    web_db.refresh(snap)
+    web_db.add(StockDateRow(snapshot_id=snap.id, uid_1c="u1", quantity=43))
+    web_db.add(Product(uid_1c="u1", article="A-1", name="Товар",
+                       stock_on_hand=22, reserve=0, broadcast_enabled=True))
+    web_db.commit()
+
+    logged_in_client.post("/products/u1/base-date", data={"value": "2026-07-06"})
+    page = logged_in_client.post("/products/u1/fact", data={"value": "43"}).text
+
+    assert "учёт 43 − факт 43" in page
+    assert "<b>0</b>" in page
