@@ -186,6 +186,26 @@ def apply_offset(product: Product, value: int) -> bool:
     return True
 
 
+def offset_is_established(product: Product | None) -> bool:
+    """Порог поставил ЧЕЛОВЕК — пересчётом склада (введён факт) или руками
+    (число, не равное броне).
+
+    У строки, где факта не вводили, формула даёт ровно бронь — «расхождения
+    нет», — и такой порог не является ничьей работой: на новой дате он выйдет
+    таким же. Держаться за него не только бессмысленно, но и вредно: пришлось бы
+    подставить выведенный факт и создать видимость пересчёта склада, которого не
+    было.
+
+    Спрашивают отсюда ДВОЕ, и разойтись им нельзя: сдвиг даты назад (что
+    удерживать) и массовая кнопка «Записать остаток ЦС на дату» (что НЕ затирать).
+    Одна из них сохраняла бы то, что другая тут же схлопывала.
+    """
+    if product is None or product.broadcast_offset is None:
+        return False
+    return (product.fact_at_date is not None
+            or product.broadcast_offset != (product.reserve or 0))
+
+
 def set_base_date(db: Session, product: Product, snapshot_date: date | None,
                   lookup=None, keep_offset: bool = True) -> bool:
     """Задать дату расчёта товару. True — порог изменился.
@@ -230,10 +250,7 @@ def set_base_date(db: Session, product: Product, snapshot_date: date | None,
     # удерживать это значение не только бессмысленно (на новой дате оно выйдет
     # таким же), но и вредно: пришлось бы подставить выведенный факт и создать
     # видимость пересчёта склада, которого не было.
-    established = (product.broadcast_offset is not None
-                   and (product.fact_at_date is not None
-                        or product.broadcast_offset != (product.reserve or 0)))
-    wanted = product.broadcast_offset if (moving_back and established) else None
+    wanted = product.broadcast_offset if (moving_back and offset_is_established(product)) else None
     changed_day = snapshot_date != product.offset_base_date
     product.offset_base_date = snapshot_date
     if changed_day:
