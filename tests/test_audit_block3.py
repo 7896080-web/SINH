@@ -162,10 +162,14 @@ def test_changing_the_fact_does_not_fault_the_untouched_threshold(logged_in_clie
 def test_editing_the_threshold_now_applies_and_keeps_the_basis(logged_in_client, web_db):
     """Обратная сторона: изменённая колонка порога ПРИМЕНЯЕТСЯ.
 
-    Раньше это был отказ, и причина была верной: записанный мимо трёх чисел
+    Раньше это был отказ, и причина была верной: записанный мимо расхождения
     порог держался бы до первой правки брони, а потом формула молча вернула бы
-    прежний — второй источник правды. Теперь под порог подбирается ФАКТ, связка
-    остаётся согласованной, и отказ стал не нужен.
+    прежний — второй источник правды. Теперь файл пишет РАСХОЖДЕНИЕ (порог −
+    бронь), связка остаётся согласованной, и отказ стал не нужен.
+
+    Проверяем не запись в колонку, а СВОЙСТВО, ради которого всё делалось: после
+    правки порога правка брони двигает порог ровно на изменение брони, а не
+    возвращает прежний.
     """
     _account(web_db)
     _product(web_db, offset_base_date=DAY, offset_base_stock=10, reserve=2,
@@ -176,8 +180,16 @@ def test_editing_the_threshold_now_applies_and_keeps_the_basis(logged_in_client,
     web_db.expire_all()
     product = web_db.query(Product).filter(Product.uid_1c == "u1").first()
     assert product.broadcast_offset == 6
-    # 10 − (6 − 2) = 6: факт подобран под заданный порог.
-    assert product.fact_at_date == 6
+    assert product.stock_discrepancy == 4        # 6 − бронь 2
+    # Факт — измерение склада, и правка порога его НЕ переписывает: раньше под
+    # порог подбирался факт, и оператор видел в поле число, которого не вводил,
+    # — ровно то, из-за чего 23.09 схлопнулись пороги у 62 товаров.
+    assert product.fact_at_date == 8
+
+    _import(logged_in_client, _file(["ID_1С", "Резерв"], ["u1", 5]))
+    web_db.expire_all()
+    product = web_db.query(Product).filter(Product.uid_1c == "u1").first()
+    assert product.broadcast_offset == 9, "порог сдвинулся ровно на изменение брони"
 
 
 # ---------------------------------------------------------------------------

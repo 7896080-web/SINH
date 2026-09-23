@@ -690,23 +690,10 @@ def apply_stock_on_date_files(db: Session, exchange: "LocalExchange") -> dict:
         filled = fill_waiting_products(db, snapshot)
         if filled["filled"]:
             stats["offset_base_filled"] = stats.get("offset_base_filled", 0) + filled["filled"]
-            logger.info("stock_on_date: порог посчитан для %d товаров (изменился у %d, "
-                        "удержан у %d, удержать не вышло у %d, в очередь рассылки %d)",
+            logger.info("stock_on_date: порог посчитан для %d товаров "
+                        "(изменился у %d, в очередь рассылки %d)",
                         filled["filled"], filled["offsets_changed"],
-                        filled["offsets_kept"], filled["offsets_lost"], filled["queued"])
-        # Удержать порог просили, а не вышло — ЭТО ОБЯЗАНО БЫТЬ ВИДНО.
-        #
-        # Счётчик считался и выбрасывался: ни в лог, ни в heartbeat, ни на
-        # страницу. То есть человек просил сохранить число, которым управляется
-        # отправка, система не смогла — и не сказала никому. Ровно та «находка
-        # без читателя», которую в этом проекте чинят везде; я завёл её заново
-        # вместе с самим удержанием, и первый же вопрос с боя («почему порог
-        # съехал?») уткнулся в то, что ответить по данным нечем.
-        if filled["offsets_lost"]:
-            stats["offsets_lost"] = stats.get("offsets_lost", 0) + filled["offsets_lost"]
-            logger.warning("stock_on_date: порог НЕ УДЕРЖАН у %d товаров — на новую "
-                           "дату он невозможен (подобранный факт вышел бы "
-                           "отрицательным)", filled["offsets_lost"])
+                        filled["queued"])
 
     db.commit()
     # Только теперь — разбор дошёл до базы.

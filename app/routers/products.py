@@ -20,8 +20,8 @@ from sqlalchemy.orm import Session, joinedload
 from app.database import get_db
 from app.templating import templates as shared_templates
 from app.dependencies import get_current_user
-from app.models import (Barcode, Platform, PlatformAccount, PlatformCatalogItem,
-                        Product, SyncSetting, User)
+from app.models import (Barcode, DiscrepancySource, Platform, PlatformAccount,
+                        PlatformCatalogItem, Product, SyncSetting, User)
 from app.flash import set_flash, pop_flash
 from app.audit import log_action
 from app.timeutils import now_utc, today_local
@@ -31,7 +31,8 @@ from app.transmit import (explain, sku_quantity, enqueue_full_resend, enqueue_wi
                           should_withdraw, ever_transmitted,
                           offset_from_base, recompute_offset, sku_mode, MODE_AUTO,
                           covered_accounts)
-from app.offset_base import (apply_offset, ensure_snapshot_requested,  # noqa: F401
+from app.offset_base import (apply_fact, apply_offset, clear_offset,  # noqa: F401
+                             ensure_snapshot_requested, set_discrepancy,
                              offset_is_established, set_base_date, stock_at_date,
                               stock_lookup)
 from app.recalc import active_job, create_job, last_job
@@ -193,6 +194,10 @@ def _row(product: Product, accounts: list[PlatformAccount],
         "base_date": product.offset_base_date,
         "base_stock": product.offset_base_stock,
         "fact_at_date": product.fact_at_date,
+        # РАСХОЖДЕНИЕ — хранимое свойство товара (`учёт 1С − реальный склад`), из
+        # которого и складывается порог. NULL — не измеряли; это не ноль («склад
+        # сошёлся»), и строка обязана различать их вслух.
+        "stock_discrepancy": product.stock_discrepancy,
         "computed_offset": offset_from_base(product),
         "waiting_for_1c": (product.offset_base_date is not None
                            and product.offset_base_stock is None),
@@ -676,13 +681,53 @@ def set_fact(
             return _row_response(request, db, uid_1c,
                                  error="Факт на дату: введите целое число (без запятой).",
                                  error_field="fact")
-        product.fact_at_date = max(0, parsed)
+        apply_fact(db, product, max(0, parsed), username=user.username)
     else:
-        product.fact_at_date = None
+        apply_fact(db, product, None, username=user.username)
 
     recompute_offset(product)
     log_action(db, user.username, "fact_at_date_changed", f"{uid_1c} -> {raw or 'сброшен'}")
     _repropagate(db, product, reason="fact_changed")
+    db.commit()
+    return _row_response(request, db, uid_1c)
+
+
+@router.post("/products/{uid_1c}/discrepancy", response_class=HTMLResponse)
+def set_discrepancy_row(
+    request: Request, uid_1c: str, value: str = Form(""),
+    db: Session = Depends(get_db), user: User = Depends(get_current_user),
+):
+    """Расхождение учёта со складом — напрямую, числом.
+
+    Это ХРАНИМОЕ свойство товара, из которого складывается порог
+    (`порог = расхождение + бронь`), и правка здесь — единственный способ
+    сказать «склад сошёлся с учётом» (расхождение 0) или снять измерение вовсе
+    (пусто). Ввод факта, равного учёту, этого не делает намеренно: он значит
+    «мне нечего возразить цифре 1С», а не «я пересчитал и сошлось».
+
+    Знак значим, и обе стороны законны: плюс — «в 1С числится больше, чем
+    лежит», минус — «на складе больше, чем знает 1С». Минусовых на бою 53 штуки,
+    и отвергать их нельзя.
+    """
+    product = _get_product(db, uid_1c)
+    if product is None:
+        return HTMLResponse("", status_code=404)
+
+    raw = (value or "").strip()
+    if raw:
+        parsed = _as_int(raw)
+        if parsed is None:
+            return _row_response(request, db, uid_1c,
+                                 error="Расхождение: введите целое число (можно со знаком минус).",
+                                 error_field="discrepancy")
+    else:
+        parsed = None
+    set_discrepancy(db, product, parsed, source=DiscrepancySource.manual,
+                    username=user.username)
+    recompute_offset(product)
+    log_action(db, user.username, "stock_discrepancy_changed",
+               f"{uid_1c} -> {raw or 'снято'}")
+    _repropagate(db, product, reason="discrepancy_changed")
     db.commit()
     return _row_response(request, db, uid_1c)
 
@@ -705,13 +750,10 @@ def set_offset(
         return HTMLResponse("", status_code=404)
 
     if clear or (not value.strip() and not available.strip() and not stock_at_date.strip()):
-        product.broadcast_offset = None
-        # Снимаем и исходные три величины. Иначе «сброшен» было бы неправдой:
-        # дата осталась бы на месте, и первая же правка брони вернула бы порог
-        # обратно — оператор решил бы, что кнопка не работает.
-        product.offset_base_date = None
-        product.offset_base_stock = None
-        product.fact_at_date = None
+        # Через `clear_offset`, а не присваиванием: снять надо и РАСХОЖДЕНИЕ,
+        # иначе ближайший пересчёт вернёт порог по формуле, и кнопка будет
+        # выглядеть сломанной.
+        clear_offset(db, product, username=user.username)
         detail = "сброшен (автоматический расчёт от остатка и резерва)"
     else:
         try:
@@ -724,17 +766,11 @@ def set_offset(
                 request, db, uid_1c,
                 error="Порог: введите целое число (без запятой) либо оба числа пересчёта.",
                 error_field="offset")
-        # Через общий механизм, а не присваиванием: у строки с датой под порог
-        # подбирается факт, иначе три исходных числа перестают ему
-        # соответствовать и первая же правка брони вернёт порог к прежнему —
-        # молча. Импорт от этого защищался отказом, страница не защищалась ничем.
-        if not apply_offset(product, offset):
-            return _row_response(
-                request, db, uid_1c,
-                error=(f"Порог {offset} на дату {product.offset_base_date} невозможен: "
-                       f"склад на неё пришлось бы считать отрицательным. "
-                       f"Смените дату или сбросьте расчёт."),
-                error_field="offset")
+        # Через общий механизм, а не присваиванием: у строки с датой пишется
+        # РАСХОЖДЕНИЕ (порог − бронь), иначе записанный напрямую порог продержался
+        # бы до первой правки брони, которая пересчитала бы его по формуле и
+        # вернула прежний — молча и через неделю.
+        apply_offset(db, product, offset, username=user.username)
         detail = f"{offset}"
 
     log_action(db, user.username, "broadcast_offset_changed", f"{uid_1c} -> {detail}")
@@ -944,14 +980,17 @@ def bulk_edit(
         return back()
 
     n = d = None
-    if action in ("set_reserve", "set_offset", "set_fact"):
+    if action in ("set_reserve", "set_offset", "set_fact", "set_discrepancy"):
         try:
             n = int((int_value or "").strip())
         except ValueError:
             set_flash(request, "Введите число для массовой правки.", "warn")
             return back()
         if action in ("set_reserve", "set_fact"):
-            n = max(0, n)          # бронь и факт отрицательными не бывают, порог — бывает
+            n = max(0, n)          # бронь и факт отрицательными не бывают
+        # Порог и расхождение — бывают, и отсекать знак здесь было бы дефектом:
+        # минус значит «на складе больше, чем знает 1С», и по таким товарам
+        # наружу осознанно уходит больше учётного остатка. На бою их 53.
     if action in ("set_active_since", "set_base_date", "stock_to_fact"):
         try:
             d = _parse_date(date_value)
@@ -1106,13 +1145,12 @@ def bulk_edit(
             # кнопкой — сразу по всему отбору.
             recompute_offset(p)
         elif action == "set_offset":
-            p.broadcast_offset = n
-            p.transmit_override = None
+            # Тем же путём, что и одиночная правка строки: у строки с датой
+            # пишется расхождение, иначе первая же правка брони вернула бы
+            # прежний порог — сразу по всему отбору и молча.
+            apply_offset(db, p, n, username=user.username)
         elif action == "clear_offset":
-            p.broadcast_offset = None
-            p.offset_base_date = None       # см. set_offset: сброс снимает расчёт целиком
-            p.offset_base_stock = None
-            p.fact_at_date = None
+            clear_offset(db, p, username=user.username)
         elif action == "broadcast_on":
             p.broadcast_enabled = True
             p.broadcast_requested_at = None
@@ -1138,8 +1176,14 @@ def bulk_edit(
             # Снимок на дату уже есть — порог посчитается сразу; нет — строка
             # встанет в ожидание и доделается при приёме файла от 1С.
             set_base_date(db, p, d, lookup=lookup)
+        elif action == "set_discrepancy":
+            # Тот же смысл, что у поля в строке и у колонки «Расхождение» в
+            # файле: массовый путь обязан делать то же, что построчный.
+            set_discrepancy(db, p, n, source=DiscrepancySource.manual,
+                            username=user.username)
+            recompute_offset(p)
         elif action == "set_fact":
-            p.fact_at_date = n
+            apply_fact(db, p, n, username=user.username)
             recompute_offset(p)
         elif action == "recalc":
             pass          # обрабатывается до цикла: это задание, а не правка строк
@@ -1176,13 +1220,13 @@ def bulk_edit(
                 # «Сбросить порог», затем эта кнопка.
                 kept += 1
                 continue
-            p.fact_at_date = p.offset_base_stock
+            apply_fact(db, p, p.offset_base_stock, username=user.username)
             recompute_offset(p)
         elif action == "fact_from_stock":
             # «Факт = остаток ЦС» — только там, где оператор ничего не вводил:
             # затирать введённые руками цифры массовой кнопкой нельзя.
             if p.fact_at_date is None and p.offset_base_stock is not None:
-                p.fact_at_date = p.offset_base_stock
+                apply_fact(db, p, p.offset_base_stock, username=user.username)
                 recompute_offset(p)
         else:
             set_flash(request, "Неизвестное действие.", "warn")
@@ -1334,18 +1378,19 @@ def products_export(
     # Порядок колонок расчёта — тот же, что в строке на странице: дата, что
     # показала 1С, резерв, факт, и уже из них порог. Оператор правит файл,
     # сверяясь глазами со страницей, и разный порядок стоил бы ему ошибок.
-    # «Расхождение (справочно)» — учёт 1С на дату минус факт, то есть НА СКОЛЬКО
-    # УЧЁТ ВРЁТ против реального склада. Именно эта величина постоянна и
-    # переносима между датами, а порог — нет: порог = расхождение + бронь, и
-    # двигается вместе с бронью. Держа расхождение перед глазами, оператор
-    # считает факт на новую дату в уме: факт = учёт на дату − расхождение.
+    # «Расхождение» — `учёт 1С − сколько лежит на самом деле`, ХРАНИМОЕ свойство
+    # товара, из которого и складывается порог: порог = расхождение + бронь. Дата
+    # к нему отношения не имеет, поэтому в файле оно и стоит отдельной колонкой,
+    # а не выводится из соседних: раньше это была справка «учёт минус факт», и
+    # круг «выгрузил → поправил → залил» по ней не замыкался вовсе.
     #
-    # Колонка ТОЛЬКО для чтения: импорт её не разбирает. Оба числа, из которых
-    # она выведена, стоят в этой же строке и правятся, а заводить третий способ
-    # задать одно и то же значило бы гадать, какой из них главнее.
+    # Колонка ПРАВИТСЯ. Это единственный способ сказать «склад сошёлся с учётом»
+    # (ноль) или снять измерение (`-`): ввод факта, РАВНОГО учёту, расхождение
+    # намеренно не трогает — он значит «мне нечего возразить цифре 1С». Пусто —
+    # как и везде в этом файле, «не трогать».
     headers = ["ID_1С", "Артикул", "Размер", "Цвет", "Наименование", "Остаток ЦС",
                "Дата расчёта", "Остаток ЦС на дату", "Резерв", "Факт на дату",
-               "Расхождение (справочно)",
+               "Расхождение",
                "Порог трансляции", "Трансляция", "Уходит на площадки",
                "Карточка есть в кабинетах"]
     for account in accounts:
@@ -1362,9 +1407,8 @@ def products_export(
                product.offset_base_stock if product.offset_base_stock is not None else "",
                product.reserve,
                product.fact_at_date if product.fact_at_date is not None else "",
-               (product.offset_base_stock - product.fact_at_date
-                if product.offset_base_stock is not None
-                and product.fact_at_date is not None else ""),
+               (product.stock_discrepancy
+                if product.stock_discrepancy is not None else ""),
                product.broadcast_offset if product.broadcast_offset is not None else "",
                _broadcast_cell(product),
                explain(product, None, None).quantity,
@@ -1402,19 +1446,20 @@ def products_import(
     «Уходит на площадки» — итог расчёта;
     «Карточка есть в кабинетах» — подсказка, где карточка товара существует;
     правится она не файлом, а заведением карточки на площадке;
-    «Остаток ЦС на дату» — приходит из 1С, руками не задаётся;
-    «Расхождение (справочно)» — учёт на дату минус факт. Оба числа, из которых
-    оно выведено, стоят в этой же строке и правятся; заводить третий способ
-    задать одно и то же значило бы гадать, какой из них главнее.
+    «Остаток ЦС на дату» — приходит из 1С, руками не задаётся.
 
-    «Порог трансляции» импорт читает, и у строки С ДАТОЙ расчёта под него
-    ПОДБИРАЕТСЯ ФАКТ (`apply_offset`) — ровно так же, как на странице. Раньше
-    здесь стоял отказ («правьте факт, а не порог»), и причина была верной:
-    записанный мимо трёх чисел порог держался бы до первой правки брони, а потом
-    молча вернулся к посчитанному. Подобранный факт эту связку сохраняет, и круг
-    «выгрузил → поправил → залил» по этой колонке замкнулся. Невозможный порог
-    (факт вышел бы отрицательным) отклоняется С УКАЗАНИЕМ СТРОКИ. Снять порог
-    файлом у строки с датой по-прежнему нельзя — это кнопка «Сбросить порог»."""
+    «Расхождение» (`учёт 1С − реальный склад`) импорт ЧИТАЕТ: это хранимое
+    свойство товара, из которого складывается порог, и единственный способ
+    сказать файлом «склад сошёлся» (ноль) или снять измерение (`-`). Ввод факта,
+    равного учёту, расхождения не трогает намеренно — он значит «мне нечего
+    возразить цифре 1С», а не «я пересчитал и сошлось».
+
+    «Порог трансляции» импорт тоже читает, и у строки С ДАТОЙ расчёта он
+    пишется РАСХОЖДЕНИЕМ (`порог − бронь`, функция `apply_offset`) — ровно так
+    же, как на странице. Записанный напрямую порог продержался бы до первой
+    правки брони, которая пересчитала бы его по формуле и вернула прежний,
+    молча и через неделю. Снять порог файлом у строки с датой по-прежнему
+    нельзя — это кнопка «Сбросить порог»."""
     accounts = _active_accounts(db)
     label_to_account = {_account_label(a): a for a in accounts}
     try:
@@ -1462,6 +1507,12 @@ def products_import(
         # разойдётся. То есть ошибку получала КАЖДАЯ строка, где человек сделал
         # ровно то, что велит подсказка на странице.
         offset_as_exported = product.broadcast_offset
+        # То же и для расхождения: колонок, двигающих порог, теперь две —
+        # «Расхождение» и «Порог трансляции», — и обе выгрузка заполняет.
+        # Правка одной из них меняет вторую, и без снимка «как было в файле»
+        # вторая колонка тут же откатывала бы первую: оператор поправил
+        # расхождение, а нетронутая ячейка порога вернула бы старое число.
+        discrepancy_as_exported = product.stock_discrepancy
 
         if "Резерв" in row:
             intent, text = _cell_intent(row.get("Резерв"))
@@ -1534,7 +1585,25 @@ def products_import(
                 # ко всем строкам. Снять — явным «-». Сюда пустота уже не
                 # доходит, её отсекает условие блока.
                 if product.fact_at_date != desired_fact:
-                    product.fact_at_date = desired_fact
+                    apply_fact(db, product, desired_fact, username=user.username)
+                    touched = True
+
+        if "Расхождение" in row and _cell_intent(row.get("Расхождение"))[0] != "skip":
+            # Пустая ячейка ничего не меняет (`_cell_intent`), «-» снимает
+            # измерение вовсе, число — записывает. Знак значим и обе стороны
+            # законны: плюс «в 1С числится больше, чем лежит», минус «на складе
+            # больше, чем знает 1С», поэтому `max(0, ...)` здесь был бы дефектом.
+            intent, text = _cell_intent(row.get("Расхождение"))
+            try:
+                desired_gap = None if intent == "clear" else int(float(text))
+            except ValueError:
+                errors.append(f"строка {i}: некорректное расхождение")
+            else:
+                if desired_gap != discrepancy_as_exported:
+                    set_discrepancy(db, product, desired_gap,
+                                    source=DiscrepancySource.manual,
+                                    username=user.username)
+                    recompute_offset(product)
                     touched = True
 
         if "Порог трансляции" in row and _cell_intent(row.get("Порог трансляции"))[0] != "skip":
@@ -1559,24 +1628,19 @@ def products_import(
                         f"нельзя — используйте кнопку «Сбросить порог»")
                 elif desired_offset is None:
                     if product.broadcast_offset is not None:
-                        product.broadcast_offset = None
+                        clear_offset(db, product, username=user.username)
                         touched = True
-                elif product.broadcast_offset != desired_offset or (
-                        product.offset_base_date is not None
-                        and desired_offset != offset_as_exported):
-                    # Порог задаётся файлом и у строки С ДАТОЙ. Раньше это был
-                    # отказ («правьте факт, а не порог»), и причина была верной:
-                    # записанный мимо трёх чисел порог держался бы до первой
-                    # правки брони. Теперь под него подбирается факт
-                    # (`apply_offset`), связка остаётся согласованной, и круг
-                    # «выгрузил → поправил → залил» по этой колонке замкнулся.
-                    if apply_offset(product, desired_offset):
+                elif desired_offset != offset_as_exported:
+                    # Только «человек изменил ЭТУ ячейку». Сравнение с текущим
+                    # порогом сюда добавлять нельзя: соседние колонки («Факт»,
+                    # «Расхождение») порог уже сдвинули, и нетронутая ячейка
+                    # порога откатила бы их правку — молча и по всему файлу.
+                    # У строки С ДАТОЙ порог пишется РАСХОЖДЕНИЕМ (порог −
+                    # бронь): записанный напрямую, он продержался бы до первой
+                    # правки брони, которая вернула бы прежний — молча.
+                    if apply_offset(db, product, desired_offset,
+                                    username=user.username):
                         touched = True
-                    else:
-                        errors.append(
-                            f"строка {i}: порог {desired_offset} на дату "
-                            f"{product.offset_base_date} невозможен — склад на неё "
-                            f"пришлось бы считать отрицательным")
 
         # Кабинеты разбираются РАНЬШЕ «Трансляции» намеренно. Гейт включения
         # спрашивает, есть ли отмеченный кабинет, покрытый расчётом; разбери мы

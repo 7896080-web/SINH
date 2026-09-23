@@ -195,4 +195,32 @@ def test_every_table_is_reported(db):
 
     assert set(stats) == {"reconciliation_log", "dispatch_queue", "audit_log",
                           "ftp_tasks", "sync_anomalies", "test_log",
-                          "exchange_archive"}
+                          "stock_discrepancy_log", "exchange_archive"}
+
+
+def test_the_last_discrepancy_row_is_never_deleted(db):
+    """Расхождение ставят один раз и не трогают годами — а оно уходит в порог.
+
+    Удали чистка последнюю запись по товару, и на вопрос «откуда здесь 11»
+    отвечать станет нечем: именно она и есть происхождение числа, которое прямо
+    сейчас управляет отправкой. То есть таблица перестала бы делать ровно то,
+    ради чего заведена, причём в самом типовом случае, а не в редком.
+    """
+    from datetime import timedelta
+
+    from app import retention
+    from app.models import DiscrepancySource, Product, StockDiscrepancyLog
+    from app.timeutils import now_utc
+
+    old = now_utc() - retention.DISCREPANCY_LOG_KEEP - timedelta(days=2)
+    db.add(Product(uid_1c="u1", article="A-1", name="Товар", stock_on_hand=10,
+                   stock_discrepancy=11))
+    for value in (5, 11):
+        db.add(StockDiscrepancyLog(uid_1c="u1", old_value=None, new_value=value,
+                                   source=DiscrepancySource.manual, created_at=old))
+    db.commit()
+
+    assert apply_retention(db)["stock_discrepancy_log"] == 1
+
+    rows = db.query(StockDiscrepancyLog).all()
+    assert [r.new_value for r in rows] == [11], "последняя запись осталась"

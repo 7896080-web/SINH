@@ -1,19 +1,27 @@
-"""Сдвиг даты НАЗАД сохраняет уже установленный порог.
+"""Порог переживает ЛЮБУЮ смену даты расчёта, потому что держится не на ней.
 
-Дата расчёта служит двум разным целям сразу: от неё считается порог (дата +
-остаток ЦС на дату + факт) и от неё же расчёт поднимает заказы площадок. Чтобы
-догнать продажи за более ранний период, дату приходится двигать назад — и вместе
-с заказами терялся порог: факт на прежнюю дату справедливо стирается, а без
-факта формула даёт просто бронь. То есть работа, сделанная СВЕЖИМ физическим
-пересчётом склада, пропадала ради того, чтобы поднять старые заказы.
+Дата расчёта служит двум разным целям сразу: от неё расчёт поднимает заказы
+площадок, и от неё же когда-то считался порог. Отсюда и была вся беда: чтобы
+догнать продажи за более ранний период, дату двигают назад, факт на прежнюю
+дату справедливо стирается — и порог схлопывался до брони, то есть работа,
+сделанная физическим пересчётом склада, пропадала ради старых заказов. 23.09 на
+бою так схлопнулись пороги у 62 товаров, и наружу поехало на 418 штук больше,
+чем есть.
+
+Лечили это подбором ФАКТА под сохранённый порог (`pin_offset`), и лекарство
+оказалось частью болезни: подобранное число оператор видит как измерение,
+которого не делал, и «поправляет» на учётное — а факт, равный учёту, означает
+«расхождения нет».
+
+Теперь носитель — не дата, а сам товар: `Product.stock_discrepancy`, `учёт 1С −
+сколько лежит на самом деле`. Порог = расхождение + бронь, дата к нему
+отношения не имеет.
 """
 from datetime import date
 
-import pytest
-
-from app.models import (Product, StockDateRow, StockDateSnapshot, StockDateStatus)
-from app.offset_base import fill_waiting_products, set_base_date
-from app.transmit import offset_from_base
+from app.models import Product, StockDateRow, StockDateSnapshot, StockDateStatus
+from app.offset_base import apply_fact, fill_waiting_products, set_base_date
+from app.transmit import offset_from_base, recompute_offset
 
 
 def _snapshot(db, day, rows):
@@ -36,6 +44,14 @@ def _product(db, **kw):
     return p
 
 
+def _measure(db, product, day, fact):
+    """Штатный путь оператора: задать дату и вписать пересчитанный склад."""
+    set_base_date(db, product, day)
+    apply_fact(db, product, fact)
+    recompute_offset(product)
+    db.commit()
+
+
 # --------------------------------------------------------------------------
 # Случай оператора, ради которого всё и делалось
 # --------------------------------------------------------------------------
@@ -52,22 +68,43 @@ def test_the_threshold_survives_a_step_back_in_time(db):
     _snapshot(db, date(2026, 8, 10), [("u1", 30)])
     product = _product(db)
 
-    set_base_date(db, product, date(2026, 9, 10))
-    product.fact_at_date = 5
-    from app.transmit import recompute_offset
-    recompute_offset(product)
-    db.commit()
+    _measure(db, product, date(2026, 9, 10), 5)
     assert product.broadcast_offset == 5, "порог по пересчёту 10.09"
+    assert product.stock_discrepancy == 5
 
     set_base_date(db, product, date(2026, 8, 10))
     db.commit()
 
     assert product.offset_base_date == date(2026, 8, 10)
     assert product.broadcast_offset == 5, "порог обязан пережить сдвиг назад"
-    # Факт подобран под новую дату: при том же расхождении в 5 единиц на 10.08
-    # при учётных 30 на складе лежало бы 25.
-    assert product.fact_at_date == 25
-    assert offset_from_base(product) == 5, "связка снова согласована"
+    assert product.stock_discrepancy == 5, "расхождение — свойство товара, не даты"
+    # Факт стирается, как и прежде: он всегда «факт НА ДАТУ», и пересчитанное
+    # 10.09 количество ничего не говорит о складе на 10.08. Подставлять сюда
+    # выведенное число нельзя — оператор примет его за измерение.
+    assert product.fact_at_date is None
+    assert offset_from_base(product) == 5
+
+
+def test_moving_the_date_forward_keeps_it_too(db):
+    """Вперёд — то же самое, и это ТРЕБОВАНИЕ, а не побочный эффект.
+
+    «Сохраняется на любую дату расчёта» — дословно. Вперёд дату двигают после
+    нового пересчёта склада, и новое измерение расхождение перебьёт; но пока его
+    не сделали, держать последнее измеренное безопаснее, чем обнулять: порог
+    выше — наружу уходит меньше.
+    """
+    _snapshot(db, date(2026, 8, 10), [("u1", 30)])
+    _snapshot(db, date(2026, 9, 10), [("u1", 10)])
+    product = _product(db)
+
+    _measure(db, product, date(2026, 8, 10), 25)
+    assert product.broadcast_offset == 5
+
+    set_base_date(db, product, date(2026, 9, 10))
+    db.commit()
+
+    assert product.fact_at_date is None
+    assert product.broadcast_offset == 5
 
 
 def test_the_recalc_mark_still_goes_away(db):
@@ -83,8 +120,7 @@ def test_the_recalc_mark_still_goes_away(db):
     _snapshot(db, date(2026, 8, 10), [("u1", 30)])
     product = _product(db, recalc_done_at=now_utc(), recalc_account_ids="1")
 
-    set_base_date(db, product, date(2026, 9, 10))
-    product.fact_at_date = 5
+    _measure(db, product, date(2026, 9, 10), 5)
     product.recalc_done_at = now_utc()
     product.recalc_account_ids = "1"
     db.commit()
@@ -97,21 +133,18 @@ def test_the_recalc_mark_still_goes_away(db):
 
 
 def test_a_reserve_change_still_moves_the_threshold(db):
-    """Главная причина подбирать ФАКТ, а не просто «запретить пересчёт».
+    """Бронь двигает порог ровно на себя — и после смены даты тоже.
 
-    Запрети мы пересчёт — три исходных числа перестали бы соответствовать
-    сохранённому порогу, и первая же правка брони вернула бы его к броне молча.
-    Бронь меняют чаще всего остального, так что ждать пришлось бы недолго.
+    Это и есть смысл формулы `порог = расхождение + бронь`: сначала не отдаём
+    то, чего на складе нет, потом не отдаём то, что держим у себя. Запрети мы
+    пересчёт ради сохранения порога — первая же правка брони вернула бы его к
+    броне молча, а бронь меняют чаще всего остального.
     """
-    from app.transmit import recompute_offset
-
     _snapshot(db, date(2026, 9, 10), [("u1", 10)])
     _snapshot(db, date(2026, 8, 10), [("u1", 30)])
     product = _product(db, reserve=0)
 
-    set_base_date(db, product, date(2026, 9, 10))
-    product.fact_at_date = 5
-    recompute_offset(product)
+    _measure(db, product, date(2026, 9, 10), 5)
     set_base_date(db, product, date(2026, 8, 10))
     db.commit()
     assert product.broadcast_offset == 5
@@ -124,54 +157,74 @@ def test_a_reserve_change_still_moves_the_threshold(db):
 
 
 # --------------------------------------------------------------------------
-# Границы
+# Что именно перезаписывает расхождение
 # --------------------------------------------------------------------------
 
-def test_moving_forward_still_clears_the_fact(db):
-    """Вперёд дату двигают ПОСЛЕ нового пересчёта склада.
+def test_a_fact_equal_to_the_1c_number_does_not_erase_the_discrepancy(db):
+    """Главное правило всего механизма, и стоило оно 62 товаров.
 
-    Там верно прежнее правило: факт всегда «на дату», старое число к новому
-    отношения не имеет. Сохранять порог здесь значило бы отменить работу,
-    которую оператор как раз и пришёл сделать.
+    Оператор сдвинул дату назад, увидел пустое поле факта и вписал туда учётное
+    число — другого он на прошлую дату не знает. Прежним поведением это значило
+    «расхождения нет»: порог схлопывался до брони, и наружу уходил остаток,
+    завышенный ровно на расхождение.
+
+    Факт, РАВНЫЙ учёту, — это «мне нечего возразить цифре 1С», а не «я пересчитал
+    склад и он сошёлся». Второе говорится отдельно и вслух: расхождение 0.
     """
-    from app.transmit import recompute_offset
-
-    _snapshot(db, date(2026, 8, 10), [("u1", 30)])
     _snapshot(db, date(2026, 9, 10), [("u1", 10)])
+    _snapshot(db, date(2026, 8, 10), [("u1", 30)])
     product = _product(db)
 
+    _measure(db, product, date(2026, 9, 10), 5)
     set_base_date(db, product, date(2026, 8, 10))
-    product.fact_at_date = 25
+    db.commit()
+
+    apply_fact(db, product, 30)          # учёт на 10.08 — ровно 30
     recompute_offset(product)
     db.commit()
+
+    assert product.fact_at_date == 30, "факт записан: человек его ввёл"
+    assert product.stock_discrepancy == 5, "а расхождение НЕ тронуто"
     assert product.broadcast_offset == 5
 
-    set_base_date(db, product, date(2026, 9, 10))
-    db.commit()
 
-    assert product.fact_at_date is None
-    assert product.broadcast_offset == 0, "10 − (10 − 0): сводится к брони"
+def test_a_new_measurement_replaces_the_old_one(db):
+    """Новый пересчёт склада перебивает прежнее расхождение — на то он и новый."""
+    _snapshot(db, date(2026, 9, 10), [("u1", 10)])
+    _snapshot(db, date(2026, 9, 12), [("u1", 50)])
+    product = _product(db)
+
+    _measure(db, product, date(2026, 9, 10), 5)
+    assert product.stock_discrepancy == 5
+
+    _measure(db, product, date(2026, 9, 12), 45)
+
+    assert product.stock_discrepancy == 5, "50 − 45 = 5"
+    assert product.broadcast_offset == 5
+
+    _measure(db, product, date(2026, 9, 12), 44)
+    assert product.stock_discrepancy == 6, "новое измерение заменило прежнее"
+    assert product.broadcast_offset == 6
 
 
-def test_nothing_to_keep_when_the_warehouse_was_never_counted(db):
-    """Порог без факта равен просто броне — удерживать нечего.
+def test_the_discrepancy_survives_a_negative_sign(db):
+    """На складе БОЛЬШЕ, чем знает 1С. На бою таких товаров 53, до −213.
 
-    Формально он «установлен», но поставил его не человек, а формула при
-    отсутствии факта. Подставить такой строке выведенный факт значило бы создать
-    видимость физического пересчёта, которого не было, — а на новой дате порог и
-    так выйдет тем же самым.
+    Отвергать знак нельзя: это законное состояние склада, и порог по такому
+    товару отрицательный, то есть наружу уходит больше учётного остатка —
+    осознанно, потому что физически товар есть.
     """
     _snapshot(db, date(2026, 9, 10), [("u1", 10)])
     _snapshot(db, date(2026, 8, 10), [("u1", 30)])
     product = _product(db)
 
-    set_base_date(db, product, date(2026, 9, 10))
-    db.commit()
+    _measure(db, product, date(2026, 9, 10), 14)
+    assert product.stock_discrepancy == -4
+    assert product.broadcast_offset == -4
+
     set_base_date(db, product, date(2026, 8, 10))
     db.commit()
-
-    assert product.fact_at_date is None
-    assert product.offset_pinned is None
+    assert product.broadcast_offset == -4, "знак переживает смену даты"
 
 
 # --------------------------------------------------------------------------
@@ -181,189 +234,94 @@ def test_nothing_to_keep_when_the_warehouse_was_never_counted(db):
 def test_the_threshold_is_kept_even_when_1c_has_not_answered_yet(db):
     """Самый частый случай на бою: срез на старую дату ещё не заказан.
 
-    Порог переживает саму смену даты сам собой (без остатка формула не
-    считается), а вот через час, когда придёт ответ 1С, он тихо сменился бы на
-    бронь — то есть уже после того, как оператор увидел, что всё в порядке.
+    Раньше здесь была отдельная колонка намерения (`offset_pinned`): порог
+    держался до ответа 1С, а в момент ответа под него подбирался факт. Теперь
+    держать нечего — расхождение уже на товаре, и ответ 1С ничего в нём не
+    меняет. Проверяем именно это: и до ответа, и после порог тот же.
     """
-    from app.transmit import recompute_offset
-
     _snapshot(db, date(2026, 9, 10), [("u1", 10)])
     product = _product(db)
-    set_base_date(db, product, date(2026, 9, 10))
-    product.fact_at_date = 5
-    recompute_offset(product)
-    db.commit()
+    _measure(db, product, date(2026, 9, 10), 5)
     assert product.broadcast_offset == 5
 
     # Снимка на 10.08 ещё нет — строка встаёт в ожидание.
     set_base_date(db, product, date(2026, 8, 10))
     db.commit()
     assert product.offset_base_stock is None
-    assert product.offset_pinned == 5, "намерение записано"
     assert product.broadcast_offset == 5
 
     snap = _snapshot(db, date(2026, 8, 10), [("u1", 30)])
     stats = fill_waiting_products(db, snap)
 
-    assert stats["offsets_kept"] == 1
-    assert product.broadcast_offset == 5
-    assert product.fact_at_date == 25
-    assert product.offset_pinned is None, "намерение снято, второй раз не сработает"
+    assert stats["filled"] == 1
+    assert product.offset_base_stock == 30
+    assert product.broadcast_offset == 5, "ответ 1С порог не сдвинул"
+    assert product.stock_discrepancy == 5
 
 
-def test_an_impossible_threshold_is_reported_not_swallowed(db):
-    """Подобранный факт был бы отрицательным — прежний порог на эту дату невозможен.
+def test_nothing_is_invented_when_the_warehouse_was_never_counted(db):
+    """Склад не пересчитывали — расхождения нет, и выдумывать его нечем.
 
-    Молча оставить порог нельзя (он перестал бы соответствовать трём числам), и
-    молча сменить тоже: оператор просил сохранить. Поэтому такие строки
-    считаются отдельно.
+    Это строки, настроенные до появления колонки, и просто строки без факта:
+    порог у них равен броне, и на новой дате он выйдет таким же. Главное, чтобы
+    смена даты не записала им ноль: ноль — утверждение «склад сошёлся», а мы
+    про этот склад не знаем ничего.
     """
-    from app.transmit import recompute_offset
+    _snapshot(db, date(2026, 9, 10), [("u1", 10)])
+    _snapshot(db, date(2026, 8, 10), [("u1", 30)])
+    product = _product(db)
 
-    _snapshot(db, date(2026, 9, 10), [("u1", 100)])
-    product = _product(db, reserve=0)
     set_base_date(db, product, date(2026, 9, 10))
-    product.fact_at_date = 0
-    recompute_offset(product)
     db.commit()
-    assert product.broadcast_offset == 100
-
     set_base_date(db, product, date(2026, 8, 10))
     db.commit()
-    snap = _snapshot(db, date(2026, 8, 10), [("u1", 1)])
-    stats = fill_waiting_products(db, snap)
 
-    assert stats["offsets_lost"] == 1
-    assert stats["offsets_kept"] == 0
-    assert product.offset_pinned is None, "не должно звенеть при каждом снимке"
+    assert product.fact_at_date is None
+    assert product.stock_discrepancy is None, "«не измеряли» — это не ноль"
 
 
 # --------------------------------------------------------------------------
-# У счётчика обязан быть читатель
+# История: число уходит на площадки, и его происхождение обязано быть видно
 # --------------------------------------------------------------------------
 
-def test_a_threshold_that_could_not_be_kept_reaches_a_human(db):
-    """Счётчик считался и выбрасывался — ни лога, ни heartbeat, ни находки.
+def test_every_change_leaves_a_trace(db):
+    """Откуда здесь это число — вопрос, который однажды зададут.
 
-    То есть человек просил сохранить число, которым управляется отправка,
-    система не смогла и не сказала НИКОМУ. Ровно «находка без читателя»,
-    которую в этом проекте чинят везде; она была заведена заново вместе с самим
-    удержанием, и первый же вопрос с боя («почему порог съехал?») уткнулся в то,
-    что ответить по данным нечем.
+    23.09 на него отвечать было нечем: подобранный факт выглядел как измерение,
+    и разобрать, кто его поставил, можно было только по времени в журнале
+    действий — куда массовые пути построчно не пишут вовсе.
     """
-    from app.models import WorkerHeartbeat
-    from app.report import collect_findings
-    from app.timeutils import now_utc
+    from app.models import DiscrepancySource, StockDiscrepancyLog
 
-    db.add(WorkerHeartbeat(
-        worker_name="ftp_receive", last_run_at=now_utc(), last_success=True,
-        last_error="порог не удержан при смене даты назад: 3 товаров"))
+    _snapshot(db, date(2026, 9, 10), [("u1", 10)])
+    product = _product(db)
+    _measure(db, product, date(2026, 9, 10), 5)
+
+    rows = db.query(StockDiscrepancyLog).filter(
+        StockDiscrepancyLog.uid_1c == "u1").all()
+    assert len(rows) == 1
+    assert rows[0].old_value is None and rows[0].new_value == 5
+    assert rows[0].source == DiscrepancySource.fact
+    # Контекст измерения — без него «стало 5» через месяц не перепроверить.
+    assert rows[0].base_date == date(2026, 9, 10)
+    assert rows[0].base_stock == 10
+    assert rows[0].fact == 5
+
+
+def test_an_unchanged_value_writes_no_history(db):
+    """Повторный импорт того же файла и правка брони идут пачками.
+
+    Запись «было 5, стало 5» на каждую из них утопила бы настоящие правки — то
+    есть история перестала бы отвечать на вопрос, ради которого заведена.
+    """
+    from app.models import StockDiscrepancyLog
+
+    _snapshot(db, date(2026, 9, 10), [("u1", 10)])
+    product = _product(db)
+    _measure(db, product, date(2026, 9, 10), 5)
+    _measure(db, product, date(2026, 9, 10), 5)
+    apply_fact(db, product, 5)
     db.commit()
 
-    found = [f for f in collect_findings(db) if f.key == "offset_not_kept"]
-
-    assert len(found) == 1
-    assert "3 товаров" in found[0].title
-    # Следствие называется, а не просто факт: иначе это не расхождение, а число.
-    assert "больше" in found[0].consequence.lower()
-
-
-def test_a_clean_run_says_nothing(db):
-    """Молчание на исправной системе — обязательное свойство отчёта."""
-    from app.models import WorkerHeartbeat
-    from app.report import collect_findings
-    from app.timeutils import now_utc
-
-    db.add(WorkerHeartbeat(worker_name="ftp_receive", last_run_at=now_utc(),
-                           last_success=True, last_error=None))
-    db.commit()
-
-    assert [f for f in collect_findings(db) if f.key == "offset_not_kept"] == []
-
-
-def test_the_counter_actually_reaches_the_heartbeat(db):
-    """Читатель есть, писатель есть — а что они соединены, надо доказать.
-
-    Мутация «убрать `note` из вызова `_heartbeat`» не ловилась ничем: находка
-    продолжала читать `last_error`, которого теперь никто не пишет. Ровно тот
-    разрыв, ради которого весь этот механизм и заводился, только на один слой
-    выше. Поведенческим тестом это стоило бы поднятого обмена с 1С и снимка,
-    поэтому проверяем исходник — тем же приёмом, что и сроки протухания заданий
-    в `/health`.
-    """
-    import re
-    from pathlib import Path
-
-    source = Path("app/workers/scheduler.py").read_text(encoding="utf-8")
-    job = source[source.index("def job_ftp_receive"):]
-    job = job[:job.index("\ndef ")]
-
-    assert 'on_date.get("offsets_lost")' in job, (
-        "счётчик «порог не удержан» должен читаться из статистики")
-    call = re.search(r'_heartbeat\(db,\s*"ftp_receive",\s*True[^)]*\)', job)
-    assert call is not None, "успешная отметка ftp_receive не найдена"
-    assert "note" in call.group(0), (
-        "текст «порог не удержан» обязан уходить в last_error УСПЕШНОЙ отметки — "
-        "иначе находка отчёта читает то, чего никто не пишет")
-
-
-# --------------------------------------------------------------------------
-# Строка обязана объяснить, что обнуляет правка факта
-# --------------------------------------------------------------------------
-
-def test_the_row_names_the_discrepancy_out_loud(logged_in_client, web_db):
-    """23.09 на бою порог удержался, а объяснить это строка не смогла.
-
-    После сдвига даты назад под удержанный порог подобрался факт — 32 при учёте
-    43. Оператор этого числа на новую дату не вводил, и «поправил» факт на
-    учётное 43. Порог честно стал нулём: факт, равный учёту, означает
-    «расхождения нет». Компенсировали бронью, наружу пошло то же число — но
-    собранное из другого, и при следующей правке брони они разойдутся.
-
-    Арифметика «43 − (32 − бронь 0)» это показывала, но читается как формула, а
-    не как утверждение о складе. Названное вслух расхождение говорит прямо, что
-    именно обнуляет правка факта.
-    """
-    from app.models import Product, StockDateRow, StockDateSnapshot, StockDateStatus
-
-    snap = StockDateSnapshot(snapshot_date=date(2026, 7, 6),
-                             status=StockDateStatus.done, rows_count=1)
-    web_db.add(snap)
-    web_db.commit()
-    web_db.refresh(snap)
-    web_db.add(StockDateRow(snapshot_id=snap.id, uid_1c="u1", quantity=43))
-    web_db.add(Product(uid_1c="u1", article="A-1", name="Товар",
-                       stock_on_hand=22, reserve=0, broadcast_enabled=True))
-    web_db.commit()
-
-    logged_in_client.post("/products/u1/base-date", data={"value": "2026-07-06"})
-    page = logged_in_client.post("/products/u1/fact", data={"value": "32"}).text
-
-    assert "расхождение" in page
-    assert "учёт 43 − факт 32" in page
-    assert "<b>11</b>" in page, "само число расхождения обязано быть названо"
-
-
-def test_a_fact_equal_to_the_1c_number_shows_a_zero_discrepancy(logged_in_client, web_db):
-    """Обратная сторона — то самое действие, которое на бою и произошло.
-
-    Поставив факт равным учёту, человек утверждает «склад сходится с 1С». Строка
-    обязана сказать это в лицо, а не оставить вывод на догадку.
-    """
-    from app.models import Product, StockDateRow, StockDateSnapshot, StockDateStatus
-
-    snap = StockDateSnapshot(snapshot_date=date(2026, 7, 6),
-                             status=StockDateStatus.done, rows_count=1)
-    web_db.add(snap)
-    web_db.commit()
-    web_db.refresh(snap)
-    web_db.add(StockDateRow(snapshot_id=snap.id, uid_1c="u1", quantity=43))
-    web_db.add(Product(uid_1c="u1", article="A-1", name="Товар",
-                       stock_on_hand=22, reserve=0, broadcast_enabled=True))
-    web_db.commit()
-
-    logged_in_client.post("/products/u1/base-date", data={"value": "2026-07-06"})
-    page = logged_in_client.post("/products/u1/fact", data={"value": "43"}).text
-
-    assert "учёт 43 − факт 43" in page
-    assert "<b>0</b>" in page
+    assert db.query(StockDiscrepancyLog).filter(
+        StockDiscrepancyLog.uid_1c == "u1").count() == 1
