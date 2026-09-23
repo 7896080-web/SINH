@@ -236,6 +236,16 @@ EXPORT_LIMIT = 50000      # потолок выгрузки: защита от �
 # это же время пишет планировщик. Правка всего каталога разом заняла бы её
 # минутами, и страница висела бы без признаков жизни.
 BULK_LIMIT = 20000
+# По скольку отметок спрашивать товары одним `IN (...)`.
+#
+# `IN` — это по параметру на элемент, а число параметров у SQLite ограничено:
+# 999 в сборках до 3.32 и 32766 после. Отмеченных бывает до `BULK_LIMIT`, то
+# есть двадцать тысяч, и на старой сборке такой список упёрся бы в предел молча —
+# «too many SQL variables» посреди массовой правки, то есть отказ ровно там, где
+# оператор ждёт результата по всему отбору. Проверить это на машине разработки
+# нельзя вовсе: там сборка новая, и запрос пройдёт. Поэтому порция, а не надежда
+# на версию.
+UIDS_CHUNK = 500
 
 
 def _base_query(db: Session, q: str, only_proposals: bool, only_blocked: bool,
@@ -539,7 +549,15 @@ def products_page(
     only_broadcasting: bool = Query(False),
     db: Session = Depends(get_db), user: User = Depends(get_current_user),
 ):
-    if not _active_accounts(db):
+    if not _active_accounts(db) and request.session.get("flash") is None:
+        # Только если рассказывать больше нечего. Это не сообщение о том, что
+        # сейчас произошло, а постоянное состояние установки — а ехало оно в тот
+        # же флеш, то есть затирало ответ на действие, которое человек только что
+        # сделал. Отказ массовой правки, итог импорта, «изменено строк — N»:
+        # редирект приводит сюда, и здесь они молча заменялись на «добавьте
+        # кабинет». Видно это только на свежей установке, где кабинета ещё нет, —
+        # то есть ровно тогда, когда человек настраивает и сообщения ему нужнее
+        # всего.
         set_flash(request, "Пока нет ни одного активного кабинета — добавьте его на странице «API-ключи».", "warn")
     return _render(request, db, user, q, only_proposals, only_blocked, hide_size_u,
                    "products.html", only_unfinished=only_unfinished,
@@ -977,8 +995,23 @@ def bulk_edit(
             return back()
         products = query.options(joinedload(Product.sync_settings)).all()
     else:
-        products = db.query(Product).options(joinedload(Product.sync_settings)) \
-            .filter(Product.uid_1c.in_(uids)).all()
+        # Отмеченных бывает больше, чем показано строк: отбор живёт в браузере и
+        # переживает и смену фильтра, и потолок показа (`FILTERED_LIMIT`).
+        # Поэтому тут тот же предел, что и у правки по всему отбору, — иначе он
+        # стоял бы ровно на одном из двух путей, а второй уходил бы в базу
+        # списком любой длины.
+        if len(uids) > BULK_LIMIT:
+            set_flash(request, f"Отмечено {len(uids)} строк — это больше предела "
+                               f"в {BULK_LIMIT}. Снимите часть отметок и повторите: "
+                               f"правка такого объёма за один раз надолго заняла бы базу.",
+                      "warn")
+            return back()
+        # ПОРЦИЯМИ, см. `UIDS_CHUNK`.
+        products = []
+        for start in range(0, len(uids), UIDS_CHUNK):
+            products.extend(
+                db.query(Product).options(joinedload(Product.sync_settings))
+                  .filter(Product.uid_1c.in_(uids[start:start + UIDS_CHUNK])).all())
 
     # Снимок на дату читаем ОДИН раз на всю пачку, а не по товару: иначе
     # простановка даты трёмстам отмеченным строкам — это шестьсот запросов.
