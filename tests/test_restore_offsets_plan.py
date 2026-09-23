@@ -9,7 +9,8 @@
 недостающая оставит оверселл. Обе ошибки молчаливые — файл выглядит одинаково.
 """
 
-from scripts.restore_offsets_from_backup import outgoing, plan_restore, to_rows
+from scripts.restore_offsets_from_backup import (direction_note, outgoing,
+                                                 plan_restore, to_rows)
 
 
 def _row(uid, offset, *, stock=22, reserve=0, base=43, broadcasting=True):
@@ -116,6 +117,72 @@ def test_a_threshold_cleared_in_the_live_base_is_still_restorable():
 
 
 # --------------------------------------------------------- что уходит в файл
+
+def test_restoring_a_negative_threshold_increases_what_goes_out():
+    """Отрицательный порог значит «на складе больше, чем числится в 1С».
+
+    23.09 на бою такие нашлись у 25 транслируемых товаров, и один вернул бы 227
+    штук при учёте 14: `max(0, 14 − (−213))`. То есть «точное восстановление»
+    по этим строкам ведёт В СТОРОНУ ОВЕРСЕЛЛА, а не от него, — и корзина, куда
+    они падают, раньше называлась «остаток занижен, не срочно».
+    """
+    was = {"u1": _row("u1", -213, stock=14)}
+    now = {"u1": _row("u1", 0, stock=14)}
+
+    plan = plan_restore(was, now, exact=True)
+
+    assert _uids(plan["raised"]) == ["u1"]
+    assert outgoing(now["u1"], 0) == 14
+    assert outgoing(now["u1"], -213) == 227, "возврат отправил бы 227 при учёте 14"
+
+
+def test_the_script_warns_when_the_file_would_raise_what_goes_out():
+    """Направление важнее числа, и сказать о нём надо ДО заливки.
+
+    Скрипт заканчивается словами «залейте на странице», поэтому нейтральное
+    «после восстановления будет 435» читается как отчёт об успехе — а это
+    предложение увеличить отправку на 288 штук."""
+    raises = direction_note(147, 435)
+
+    # «на 288 шт», а не просто «288»: перепутанный знак даёт «на -288 шт», и
+    # проверка на подстроку «288» его пропускает. Поймано мутацией.
+    assert "УВЕЛИЧИТ" in raises and "на 288 шт" in raises
+    assert "оверселл" in raises
+
+
+def test_the_note_names_the_safe_direction_too():
+    """Снижение — это как раз починка, и назвать её надо своими словами."""
+    lowers = direction_note(996, 578)
+
+    assert "СНИЗИТ" in lowers and "на 418 шт" in lowers
+    assert direction_note(100, 100) == "", "на равных числах сказать нечего"
+
+
+def test_the_script_actually_prints_the_note():
+    """Сама функция мало что значит, если её вывод никуда не попадает.
+
+    Читатель у сигнала обязан быть: без этой проверки `main` мог перестать
+    печатать `note`, а поведенческий тест выше остался бы зелёным."""
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parent.parent / "scripts"
+              / "restore_offsets_from_backup.py").read_text(encoding="utf-8")
+
+    assert "note = direction_note(now_total, back_total)" in source
+    assert "print(note)" in source
+
+
+def test_a_negative_threshold_in_the_copy_is_counted_out_loud():
+    """Число таких строк — единственное, по чему видно масштаб опасности."""
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parent.parent / "scripts"
+              / "restore_offsets_from_backup.py").read_text(encoding="utf-8")
+
+    assert "ОТРИЦАТЕЛЬНЫМ порогом в копии" in source
+    assert "порог вырос (остаток занижен)" not in source, \
+        "вернулась формулировка «не срочно» про направление оверселла"
+
 
 def test_the_file_carries_exactly_the_two_columns_the_import_reads():
     """Импорт разбирает «ID_1С» и «Порог трансляции»; остальное — для глаз.
