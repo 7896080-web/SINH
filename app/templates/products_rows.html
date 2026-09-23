@@ -44,6 +44,14 @@
 {% if only_marked %}<input type="hidden" name="only_marked" value="true" form="bulk-form">{% endif %}
 {% if only_broadcasting %}<input type="hidden" name="only_broadcasting" value="true" form="bulk-form">{% endif %}
 
+{# Число строк отбора — отсюда его берёт счётчик «С отмеченными». Он обязан
+   называть ЧИСЛО, а не одно слово «весь отбор»: галочка в шапке переживает
+   смену фильтра, и без числа оператор не видит, что отбор под ней стал другим.
+   Значение приходит уже готовой строкой: при оборванном счёте `total`
+   отрицательный, и складывать этот знак в скрипт значило бы повторить правило
+   в двух местах. #}
+<span id="pr-total" hidden data-total="{% if total is defined %}{% if total < 0 %}{{ -total }}+{% else %}{{ total }}{% endif %}{% endif %}"></span>
+
 <div class="pr-allfilter">
     Галочка в шапке таблицы выбирает <b>весь текущий отбор</b>
     {% if total is defined %}— все {% if total < 0 %}{{ -total }}+{% else %}{{ total }}{% endif %}{% endif %},

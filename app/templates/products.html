@@ -329,6 +329,15 @@
 // /products/rows, поэтому перезагрузка восстанавливает отбор сама.
 (function () {
     var KEY = "pr-selected";
+    // Галочка «весь отбор» живёт В ШАПКЕ ТАБЛИЦЫ, а таблицу htmx подменяет
+    // целиком при каждом изменении фильтра — и приходит она с сервера всегда
+    // снятой. Отметки строк восстанавливались из хранилища, а эта галочка нет:
+    // она молча гасла, счётчик переключался с «весь отбор» на число отметок, и
+    // правка уходила по показанным строкам. На боевом каталоге это ровно тот
+    // случай, на который жаловался оператор: страница обещает «все 1739»,
+    // изменено — 500, то есть потолок показа. Поэтому флаг хранится рядом с
+    // самим отбором и восстанавливается на каждую подмену разметки.
+    var KEY_ALL = "pr-all-filtered";
 
     function load() {
         try { return new Set(JSON.parse(sessionStorage.getItem(KEY) || "[]")); }
@@ -338,18 +347,38 @@
         try { sessionStorage.setItem(KEY, JSON.stringify(Array.from(set))); }
         catch (e) { /* не смогли запомнить — работаем без памяти, но работаем */ }
     }
+    function loadWhole() {
+        try { return sessionStorage.getItem(KEY_ALL) === "1"; }
+        catch (e) { return false; }
+    }
+    function saveWhole(on) {
+        try { sessionStorage.setItem(KEY_ALL, on ? "1" : "0"); }
+        catch (e) { /* без памяти, но работаем */ }
+    }
 
     var selected = load();
+    var whole = loadWhole();
 
     function boxes() { return document.querySelectorAll('input[name="uids"]'); }
 
+    // Сколько строк под текущим фильтром — приходит из фрагмента таблицы, то
+    // есть обновляется вместе с ней.
+    function totalText() {
+        var node = document.getElementById("pr-total");
+        return node ? (node.dataset.total || "") : "";
+    }
+
     function paint() {
         var all = document.getElementById("pr-all");
-        var whole = all && all.checked;
+        if (all) all.checked = whole;
         var count = document.getElementById("pr-count");
         var clear = document.getElementById("pr-clear");
         if (count) {
-            count.textContent = whole ? "весь отбор"
+            // ЧИСЛО обязательно: флаг переживает смену фильтра, и «весь отбор»
+            // без числа не говорит человеку, какой именно отбор он сейчас
+            // значит. С числом смена фильтра видна сразу — оно меняется.
+            count.textContent = whole
+                ? (totalText() ? "весь отбор — " + totalText() + " шт" : "весь отбор")
                 : selected.size ? selected.size + " шт" : "ничего не отмечено";
             count.classList.toggle("pr-count--on", whole || selected.size > 0);
         }
@@ -386,6 +415,7 @@
             // Галочка в шапке — «весь текущий отбор»: она уходит на сервер как
             // all_filtered, и правка применяется ко ВСЕМ подходящим товарам, а не
             // к показанным строкам. Здесь только видимая часть.
+            whole = t.checked; saveWhole(whole);
             boxes().forEach(function (cb) {
                 cb.checked = t.checked;
                 if (t.checked) { selected.add(cb.value); } else { selected.delete(cb.value); }
@@ -394,6 +424,14 @@
         }
         if (t.name === "uids") {
             if (t.checked) { selected.add(t.value); } else { selected.delete(t.value); }
+            // Снятая галочка строки при включённом «весь отбор» — противоречие:
+            // «всё, кроме этой» сервер выразить не умеет, там либо фильтр
+            // целиком, либо перечисленные отметки. Оставить «весь отбор» значило
+            // бы изменить строку, которую человек только что исключил; молча
+            // перейти на отметки — сузить правку с 1739 строк до показанных 499.
+            // Второе и делаем, но НЕ молча: счётчик тут же меняет число, и сужение
+            // видно ровно в тот момент, когда оно происходит.
+            if (!t.checked && whole) { whole = false; saveWhole(whole); }
             save(selected); paint();
         }
     });
@@ -401,6 +439,7 @@
     document.addEventListener("click", function (e) {
         if (e.target.id !== "pr-clear") return;
         selected.clear(); save(selected);
+        whole = false; saveWhole(whole);
         var all = document.getElementById("pr-all");
         if (all) all.checked = false;
         boxes().forEach(function (cb) { cb.checked = false; });
@@ -437,12 +476,34 @@
     document.getElementById("bulk-form").addEventListener("click", function (e) {
         var button = e.target.closest("button[data-confirm]");
         if (!button) { return; }
-        var count = document.getElementById("pr-all").checked
-            ? "весь отбор страницы"
-            : selected.size + " шт";
+        var count = document.getElementById("pr-count").textContent;
         if (!confirm(button.dataset.confirm.replace("%COUNT%", count))) {
             e.preventDefault();
         }
+    });
+
+    // Отмеченная строка, которой НЕТ на экране, тоже обязана уехать на сервер.
+    //
+    // Форма отправляет то, что есть в разметке, а отбор живёт в браузере и
+    // переживает и смену фильтра, и потолок показа: отмеченных бывает 849, а
+    // чекбоксов на странице 500. Счётчик при этом честно показывал 849 — и
+    // расходился с тем, что уходило запросом. Дописываем недостающие отметки
+    // скрытыми полями прямо перед отправкой: они живут ровно один запрос и
+    // снимаются в начале следующего, иначе после «назад» в браузере к новой
+    // отправке приклеился бы прошлый отбор.
+    document.getElementById("bulk-form").addEventListener("submit", function () {
+        var form = this;
+        form.querySelectorAll('input[data-extra-uid]').forEach(function (el) { el.remove(); });
+        if (whole) { return; }      // весь отбор сервер соберёт сам, по фильтру
+        var shown = new Set();
+        boxes().forEach(function (cb) { if (cb.checked) { shown.add(cb.value); } });
+        selected.forEach(function (uid) {
+            if (shown.has(uid)) { return; }
+            var extra = document.createElement("input");
+            extra.type = "hidden"; extra.name = "uids"; extra.value = uid;
+            extra.setAttribute("data-extra-uid", "1");
+            form.appendChild(extra);
+        });
     });
 
     // Щелчок по самому фильтру и по любой галочке строки: список скрытых строк
