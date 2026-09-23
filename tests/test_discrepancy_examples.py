@@ -386,3 +386,76 @@ def test_the_gate_still_demands_a_fact_when_nothing_was_ever_measured(db):
     db.commit()
 
     assert calc_status(product, True, {1})[0] == "need_fact"
+
+
+# ===========================================================================
+# 7. Сдвинули дату назад — заказы за новый период подтягиваются
+# ===========================================================================
+
+def test_orders_are_pulled_after_a_step_back_without_a_new_fact(db):
+    """Прямой вопрос: если факт не вводить (или вписать учётное число), расчёт
+    по новой дате всё равно поднимет заказы?
+
+    Да. Расчёт спрашивает у товара ТОЛЬКО дату (`catch_up_product`: `if
+    product.offset_base_date is None` — и всё), а факт в него не входит вовсе:
+    он про склад, а не про продажи. Раньше факт был нужен по другой причине —
+    без него `calc_status` держал строку в «нужен факт» и ворота трансляции не
+    открывались, — и вписать его на прошлое число было неоткуда. Хранимое
+    расхождение эту дверь открывает: цифру человек уже подтвердил, просто на
+    другую дату.
+
+    Проверяем всю цепочку целиком, потому что вопрос именно про неё: сдвиг даты
+    назад → расчёт → заказ проведён → отметка → ворота открыты → порог прежний.
+    """
+    from app.models import Barcode, DispatchQueueItem, SyncSetting
+    from app.recalc import catch_up_product
+    from app.workers.platform_clients.base import PlatformOrder
+    from app.broadcast_gate import calc_status
+    from tests.factories import make_account
+
+    account = make_account(db, name="ИП ЯВОРСКАЯ")
+    _snapshot(db, SEP, [("u1", 43)])
+    _snapshot(db, AUG, [("u1", 43)])
+    product = _product(db, stock=22)
+    db.add(Barcode(barcode="bc-u1", uid_1c="u1"))
+    db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
+    db.commit()
+
+    _measure(db, product, SEP, 32)
+    assert product.stock_discrepancy == 11
+
+    # Дату двигают назад ИМЕННО ради заказов за более ранний период.
+    set_base_date(db, product, AUG)
+    db.commit()
+    assert calc_status(product, True, {account.id})[0] == "need_recalc", \
+        "не «нужен факт»: цифру человек подтвердил, пусть и на другую дату"
+
+    class Client:
+        last_unresolved = 0
+        last_truncated = False
+
+        def get_orders_since(self, since):
+            assert since == AUG, "лента спрашивается от НОВОЙ даты"
+            return [PlatformOrder(order_id="o-1", barcode="bc-u1", quantity=1,
+                                  raw_status="new", order_date=None)]
+
+    stats = catch_up_product(db, product, lambda platform, aid: Client(),
+                             lambda platform: "Ожидает")
+    db.commit()
+
+    assert stats["problems"] == []
+    assert stats["applied"] == 1, "заказ за добавившийся период проведён"
+    assert product.recalc_done_at is not None, "отметка «актуализирован» стоит"
+    assert calc_status(product, True, {account.id})[0] == "ready"
+
+    # И порог тот же: расчёт двигает ОСТАТОК (списал проданную единицу), а не
+    # расхождение — учёт врёт на те же 11, пока склад не пересчитали заново.
+    assert product.stock_discrepancy == 11
+    assert product.broadcast_offset == 11
+    assert product.stock_on_hand == 21, "единица списана заказом"
+
+    # Трансляцию теперь можно включить, и наружу уйдёт остаток за вычетом порога.
+    product.broadcast_enabled = True
+    db.commit()
+    assert sku_quantity(product) == 10, "21 − 11"
+    assert db.query(DispatchQueueItem).count() > 0, "новое число встало в очередь"
