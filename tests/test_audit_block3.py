@@ -159,17 +159,25 @@ def test_changing_the_fact_does_not_fault_the_untouched_threshold(logged_in_clie
     assert web_db.query(Product).filter(Product.uid_1c == "u1").first().fact_at_date == 6
 
 
-def test_actually_editing_the_threshold_is_still_an_error(logged_in_client, web_db):
-    """Обратная сторона: если человек ИЗМЕНИЛ колонку порога у расчётного
-    товара, это по-прежнему ошибка — иначе завёлся бы второй источник правды."""
+def test_editing_the_threshold_now_applies_and_keeps_the_basis(logged_in_client, web_db):
+    """Обратная сторона: изменённая колонка порога ПРИМЕНЯЕТСЯ.
+
+    Раньше это был отказ, и причина была верной: записанный мимо трёх чисел
+    порог держался бы до первой правки брони, а потом формула молча вернула бы
+    прежний — второй источник правды. Теперь под порог подбирается ФАКТ, связка
+    остаётся согласованной, и отказ стал не нужен.
+    """
     _account(web_db)
     _product(web_db, offset_base_date=DAY, offset_base_stock=10, reserve=2,
              fact_at_date=8, broadcast_offset=4)
 
-    page = _import(logged_in_client, _file(
-        ["ID_1С", "Порог трансляции"], ["u1", 99]))
+    _import(logged_in_client, _file(["ID_1С", "Порог трансляции"], ["u1", 6]))
 
-    assert "порог считается из даты и факта" in page
+    web_db.expire_all()
+    product = web_db.query(Product).filter(Product.uid_1c == "u1").first()
+    assert product.broadcast_offset == 6
+    # 10 − (6 − 2) = 6: факт подобран под заданный порог.
+    assert product.fact_at_date == 6
 
 
 # ---------------------------------------------------------------------------

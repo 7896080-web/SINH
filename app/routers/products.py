@@ -31,7 +31,8 @@ from app.transmit import (explain, sku_quantity, enqueue_full_resend, enqueue_wi
                           should_withdraw, ever_transmitted,
                           offset_from_base, recompute_offset, sku_mode, MODE_AUTO,
                           covered_accounts)
-from app.offset_base import (ensure_snapshot_requested, set_base_date, stock_at_date,
+from app.offset_base import (apply_offset, ensure_snapshot_requested,  # noqa: F401
+                             set_base_date, stock_at_date,
                               stock_lookup)
 from app.recalc import active_job, create_job, last_job
 from app.broadcast_gate import (DEFERRABLE_CALC_STATUSES, enabled_account_ids,
@@ -705,8 +706,17 @@ def set_offset(
                 request, db, uid_1c,
                 error="Порог: введите целое число (без запятой) либо оба числа пересчёта.",
                 error_field="offset")
-        product.broadcast_offset = offset
-        product.transmit_override = None  # порог заменяет устаревшую ручную цифру
+        # Через общий механизм, а не присваиванием: у строки с датой под порог
+        # подбирается факт, иначе три исходных числа перестают ему
+        # соответствовать и первая же правка брони вернёт порог к прежнему —
+        # молча. Импорт от этого защищался отказом, страница не защищалась ничем.
+        if not apply_offset(product, offset):
+            return _row_response(
+                request, db, uid_1c,
+                error=(f"Порог {offset} на дату {product.offset_base_date} невозможен: "
+                       f"склад на неё пришлось бы считать отрицательным. "
+                       f"Смените дату или сбросьте расчёт."),
+                error_field="offset")
         detail = f"{offset}"
 
     log_action(db, user.username, "broadcast_offset_changed", f"{uid_1c} -> {detail}")
@@ -1263,8 +1273,18 @@ def products_export(
     # Порядок колонок расчёта — тот же, что в строке на странице: дата, что
     # показала 1С, резерв, факт, и уже из них порог. Оператор правит файл,
     # сверяясь глазами со страницей, и разный порядок стоил бы ему ошибок.
+    # «Расхождение (справочно)» — учёт 1С на дату минус факт, то есть НА СКОЛЬКО
+    # УЧЁТ ВРЁТ против реального склада. Именно эта величина постоянна и
+    # переносима между датами, а порог — нет: порог = расхождение + бронь, и
+    # двигается вместе с бронью. Держа расхождение перед глазами, оператор
+    # считает факт на новую дату в уме: факт = учёт на дату − расхождение.
+    #
+    # Колонка ТОЛЬКО для чтения: импорт её не разбирает. Оба числа, из которых
+    # она выведена, стоят в этой же строке и правятся, а заводить третий способ
+    # задать одно и то же значило бы гадать, какой из них главнее.
     headers = ["ID_1С", "Артикул", "Размер", "Цвет", "Наименование", "Остаток ЦС",
                "Дата расчёта", "Остаток ЦС на дату", "Резерв", "Факт на дату",
+               "Расхождение (справочно)",
                "Порог трансляции", "Трансляция", "Уходит на площадки",
                "Карточка есть в кабинетах"]
     for account in accounts:
@@ -1281,6 +1301,9 @@ def products_export(
                product.offset_base_stock if product.offset_base_stock is not None else "",
                product.reserve,
                product.fact_at_date if product.fact_at_date is not None else "",
+               (product.offset_base_stock - product.fact_at_date
+                if product.offset_base_stock is not None
+                and product.fact_at_date is not None else ""),
                product.broadcast_offset if product.broadcast_offset is not None else "",
                _broadcast_cell(product),
                explain(product, None, None).quantity,
@@ -1459,19 +1482,35 @@ def products_import(
             except ValueError:
                 errors.append(f"строка {i}: некорректный порог трансляции")
             else:
-                if product.offset_base_date is not None:
-                    # Порог у такого товара расчётный, и файлом его не задают.
-                    # Ругаемся, только если человек ИЗМЕНИЛ колонку: сверяем с
-                    # тем, что стояло в выгрузке, а не с пересчитанным.
-                    if desired_offset != offset_as_exported:
+                if desired_offset is None and product.offset_base_date is not None:
+                    # «-» у строки с датой: снять порог, оставив дату, нельзя —
+                    # формула тут же посчитает его заново, и правка окажется
+                    # пустышкой. Снять расчёт целиком файлом мы не даём: это
+                    # вернуло бы на площадки ПОЛНЫЙ остаток, и сразу по всему
+                    # отбору.
+                    errors.append(
+                        f"строка {i}: снять порог у строки с датой расчёта файлом "
+                        f"нельзя — используйте кнопку «Сбросить порог»")
+                elif desired_offset is None:
+                    if product.broadcast_offset is not None:
+                        product.broadcast_offset = None
+                        touched = True
+                elif product.broadcast_offset != desired_offset or (
+                        product.offset_base_date is not None
+                        and desired_offset != offset_as_exported):
+                    # Порог задаётся файлом и у строки С ДАТОЙ. Раньше это был
+                    # отказ («правьте факт, а не порог»), и причина была верной:
+                    # записанный мимо трёх чисел порог держался бы до первой
+                    # правки брони. Теперь под него подбирается факт
+                    # (`apply_offset`), связка остаётся согласованной, и круг
+                    # «выгрузил → поправил → залил» по этой колонке замкнулся.
+                    if apply_offset(product, desired_offset):
+                        touched = True
+                    else:
                         errors.append(
-                            f"строка {i}: порог считается из даты и факта — "
-                            f"правьте «Факт на дату», а не «Порог трансляции»")
-                elif product.broadcast_offset != desired_offset:
-                    product.broadcast_offset = desired_offset
-                    if desired_offset is not None:
-                        product.transmit_override = None
-                    touched = True
+                            f"строка {i}: порог {desired_offset} на дату "
+                            f"{product.offset_base_date} невозможен — склад на неё "
+                            f"пришлось бы считать отрицательным")
 
         # Кабинеты разбираются РАНЬШЕ «Трансляции» намеренно. Гейт включения
         # спрашивает, есть ли отмеченный кабинет, покрытый расчётом; разбери мы

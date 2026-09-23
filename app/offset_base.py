@@ -146,6 +146,46 @@ def pin_offset(product: Product) -> bool:
     return True
 
 
+def apply_offset(product: Product, value: int) -> bool:
+    """Задать порог НАПРЯМУЮ, сохранив согласованность с датой. False — нельзя.
+
+    У строки без даты расчёта порог всегда был просто числом, и здесь ничего не
+    меняется. А вот у строки С датой он выводится из трёх величин, и записать
+    его мимо них — мина замедленного действия: три числа перестают
+    соответствовать порогу, и первая же правка брони пересчитывает его по
+    формуле, возвращая к прежнему. Молча и через неделю.
+
+    Импорт от этой мины защищался ОТКАЗОМ («правьте факт, а не порог»), а
+    страница — ничем: порог писался напрямую. То есть массовый путь оказался
+    безопаснее построчного, ровно наоборот к правилу проекта. Теперь оба зовут
+    эту функцию: порог ставится, а под него подбирается факт (`pin_offset`), и
+    связка остаётся согласованной — правка брони по-прежнему двигает порог ровно
+    на изменение брони.
+
+    1С ещё не ответила на дату — подбирать факт не от чего, поэтому намерение
+    запоминается тем же `offset_pinned`, которым пользуется сдвиг даты назад.
+    Иначе порог продержался бы до ответа 1С и тихо сменился бы на бронь.
+
+    False — на эту дату такой порог невозможен (подобранный факт вышел бы
+    отрицательным). Прежнее значение при этом восстанавливается: наполовину
+    применённая правка хуже отклонённой.
+    """
+    was = product.broadcast_offset
+    product.broadcast_offset = value
+    if product.offset_base_date is None:
+        product.transmit_override = None
+        return True
+    if product.offset_base_stock is None:
+        product.offset_pinned = value
+        product.transmit_override = None
+        return True
+    if not pin_offset(product):
+        product.broadcast_offset = was
+        return False
+    product.transmit_override = None
+    return True
+
+
 def set_base_date(db: Session, product: Product, snapshot_date: date | None,
                   lookup=None, keep_offset: bool = True) -> bool:
     """Задать дату расчёта товару. True — порог изменился.

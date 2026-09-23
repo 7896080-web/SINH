@@ -294,13 +294,40 @@ def test_import_reads_a_date_cell_as_a_date(logged_in_client, web_db):
     assert web_db.query(Product).first().offset_base_date == DAY
 
 
-def test_import_ignores_the_threshold_but_says_so(logged_in_client, web_db):
-    """Порог у товара с датой — расчётный. Принять его из файла значило бы
-    завести второй источник правды; промолчать — обмануть оператора, он решил
-    бы, что правка применилась."""
+def test_import_sets_the_threshold_and_keeps_the_basis(logged_in_client, web_db):
+    """Порог задаётся файлом и у строки С ДАТОЙ — но связка остаётся согласованной.
+
+    Раньше это был отказ, и причина была верной: записанный мимо трёх чисел
+    порог держался бы до первой правки брони, а потом формула молча вернула бы
+    прежний. Теперь под порог подбирается ФАКТ, и круг «выгрузил → поправил →
+    залил» по этой колонке замкнулся, не заводя второго источника правды.
+    """
     _account(web_db)
     _snapshot(web_db, [("u1", 10)])
     product = _product(web_db, reserve=2)
+    logged_in_client.post("/products/u1/base-date", data={"value": "2026-08-07"})
+    logged_in_client.post("/products/u1/fact", data={"value": "8"})
+    web_db.expire_all()
+    assert web_db.query(Product).first().broadcast_offset == 4
+
+    _upload(logged_in_client, _xlsx(["ID_1С", "Порог трансляции"], [["u1", 6]]))
+
+    web_db.expire_all()
+    product = web_db.query(Product).first()
+    assert product.broadcast_offset == 6
+    # 10 − (6 − 2) = 6: факт подобран так, что формула даёт заданный порог.
+    assert product.fact_at_date == 6
+
+
+def test_an_impossible_threshold_is_refused_with_a_reason(logged_in_client, web_db):
+    """Порог, которого на эту дату быть не может, не применяется молча.
+
+    Подобранный факт вышел бы отрицательным — склад в минусе не бывает. Прежнее
+    значение остаётся: наполовину применённая правка хуже отклонённой.
+    """
+    _account(web_db)
+    _snapshot(web_db, [("u1", 10)])
+    _product(web_db, reserve=2)
     logged_in_client.post("/products/u1/base-date", data={"value": "2026-08-07"})
     logged_in_client.post("/products/u1/fact", data={"value": "8"})
 
@@ -310,7 +337,7 @@ def test_import_ignores_the_threshold_but_says_so(logged_in_client, web_db):
 
     web_db.expire_all()
     assert web_db.query(Product).first().broadcast_offset == 4      # не 99
-    assert "правьте «Факт на дату»" in r.text
+    assert "невозможен" in r.text
 
 
 def test_a_plain_round_trip_does_not_complain(logged_in_client, web_db):
