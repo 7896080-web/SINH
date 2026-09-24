@@ -11,6 +11,7 @@ from app.dependencies import NotAuthenticated
 from app.routers import (
     auth, api_keys, mapping, products, anomalies, health, diagnostics, testing,
     platform_matching, stock_on_date, report, missing_cards, notifications,
+    discrepancies,
 )
 
 
@@ -54,6 +55,7 @@ app.include_router(health.router)
 app.include_router(diagnostics.router)
 app.include_router(report.router)
 app.include_router(missing_cards.router)
+app.include_router(discrepancies.router)
 app.include_router(testing.router)
 app.include_router(stock_on_date.router)
 app.include_router(notifications.router)
