@@ -381,3 +381,62 @@ def test_the_daily_jobs_are_actually_seen_by_this_check():
     assert found.get("backup") == 86400
     assert found.get("retention") == 86400
     assert found.get("dispatch") == 45
+
+
+def _scheduled_job_ids() -> set:
+    """id всех статических заданий расписания — из самого исходника."""
+    import re
+
+    source = open("app/workers/scheduler.py", encoding="utf-8").read()
+    found = set()
+    for call in _add_job_calls(source):
+        job_id = re.search(r'id="([^"]+)"', call)
+        if job_id:
+            found.add(job_id.group(1))
+    return found
+
+
+# Отметки, у которых СВОЕГО задания в расписании нет и быть не может: их пишет
+# другое задание по ходу своей работы. Список нарочно короткий — каждая строка
+# здесь это отказ от проверки, а не мелочь.
+HEARTBEATS_WRITTEN_BY_ANOTHER_JOB = {
+    # Применение снимка остатков 1С: отметку ставит job_ftp_receive, разобрав
+    # файл выгрузки. Отдельного задания у неё нет — файл приходит когда придёт.
+    "reconciliation_applied",
+}
+
+
+def test_every_required_worker_is_actually_scheduled():
+    """Запись в REQUIRED_WORKERS без задания в расписании красит /health
+    НАВСЕГДА: строки heartbeat не появится, потому что писать её некому.
+
+    Обратная сторона той же беды, ради которой REQUIRED_WORKERS и заведён. Там
+    ловилось «задание есть, а отметки нет»; здесь — «отметку требуем, а
+    задания нет». 24.09 это чуть не случилось со сторожем: имя внесли в
+    REQUIRED_WORKERS одной правкой, а `sched.add_job` — другой, и между ними
+    /health покраснел бы через пять минут после первого же перезапуска, причём
+    без единой строки в логе.
+    """
+    from app.routers.health import ACCOUNT_REQUIRED_GRACE, REQUIRED_WORKERS
+
+    scheduled = _scheduled_job_ids()
+    missing = {
+        name for name in REQUIRED_WORKERS
+        if name not in scheduled
+        and name not in HEARTBEATS_WRITTEN_BY_ANOTHER_JOB
+        and not any(name.startswith(p) for p in ACCOUNT_REQUIRED_GRACE)
+    }
+
+    assert missing == set(), (
+        "/health требует отметку, которую некому поставить — задания в "
+        f"расписании нет: {sorted(missing)}")
+
+
+def test_the_excused_heartbeats_are_written_by_someone():
+    """Список исключений выше — дыра в проверке, и он обязан быть честным:
+    имя, которое никто не пишет, через него прошло бы точно так же."""
+    source = open("app/workers/scheduler.py", encoding="utf-8").read()
+
+    for name in HEARTBEATS_WRITTEN_BY_ANOTHER_JOB:
+        assert f'"{name}"' in source, (
+            f"отметку «{name}» не ставит никто, а /health её требует")
