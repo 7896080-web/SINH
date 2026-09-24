@@ -26,8 +26,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.database import SessionLocal                      # noqa: E402
 from app.models import (AuditLog, Barcode, DispatchQueueItem,  # noqa: E402
-                        Product, StockDateSnapshot, StockDiscrepancyLog,
-                        SyncSetting)
+                        ProcessedOrder, Product, StockDateSnapshot,
+                        StockDiscrepancyLog, SyncSetting)
 from app.transmit import offset_from_base                  # noqa: E402
 
 
@@ -133,6 +133,27 @@ def main() -> int:
             SyncSetting.uid_1c == product.uid_1c, SyncSetting.enabled.is_(True)).all()
         print("-" * 70)
         print(f"Отмечено кабинетов: {[m.account_id for m in marks]}")
+
+        print("=" * 70)
+        print("ЗАКАЗЫ И ОТМЕНЫ (последние 25, время UTC):")
+        # Номера заказов не показывает НИ ОДНА страница и ни одна выгрузка:
+        # `ProcessedOrder` читают только отчёт (внутри себя) и «Тестирование» —
+        # и то по одному выбранному товару и кабинету. Поэтому связать строку в
+        # 1С («sync REVERSE sync order_id=…») с тем, что видела система,
+        # приходилось сверкой по часам, да ещё и с пересчётом МСК в UTC.
+        # Очередь рассылки ниже номеров заказов не несёт вовсе — она про то,
+        # какое ЧИСЛО ушло на площадку, а не про то, что его вызвало.
+        orders = db.query(ProcessedOrder).filter(
+            ProcessedOrder.uid_1c == product.uid_1c,
+        ).order_by(ProcessedOrder.processed_at.desc()).limit(25).all()
+        for o in reversed(orders):
+            # Отмена печатается ЗАМЕТНО: по ней остаток вернулся, и именно её
+            # ищут, когда в 1С нашёлся обратный документ.
+            mark = "  <= ОТМЕНА" if o.status.value == "cancelled" else ""
+            print(f"  {o.processed_at}  каб.{o.account_id}  заказ {o.order_id:<24}"
+                  f" {o.quantity:>3} шт  {o.status.value}{mark}")
+        if not orders:
+            print("  пусто — заказов по этому товару система не проводила")
 
         print("=" * 70)
         print("ИСТОРИЯ РАСХОЖДЕНИЯ (время UTC):")

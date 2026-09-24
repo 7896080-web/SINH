@@ -7,6 +7,7 @@
 было вовсе — писатель без читателя.
 """
 import io
+from pathlib import Path
 from datetime import date, timedelta
 
 import pytest
@@ -14,6 +15,8 @@ from openpyxl import load_workbook
 
 from app.models import DiscrepancySource, Product, StockDiscrepancyLog
 from app.timeutils import now_utc
+
+ROOT_FILE = Path(__file__).resolve()
 
 
 @pytest.fixture()
@@ -143,3 +146,95 @@ def test_the_page_is_in_the_menu(logged_in_client, catalog):
     assert 'href="/discrepancies"' in page
     assert 'href="#i-discrepancies"' in page, "пункт меню без иконки — пустое место"
     assert 'id="i-discrepancies"' in page, "иконки нет в спрайте"
+
+
+# ------------------------------------------- правка прямо на странице
+
+def test_the_row_can_be_edited_in_place(logged_in_client, web_db, catalog):
+    """Разбирают этот список ради одного действия — поправить устаревшее число.
+
+    Гонять человека отсюда на «Товары» и искать там ту же строку поиском по
+    каталогу на 152 тысячи позиций значило бы сделать список смотровой
+    площадкой."""
+    answer = logged_in_client.post("/discrepancies/u-плюс/discrepancy",
+                                   data={"value": "4"})
+    assert answer.status_code == 200, answer.text[:300]
+
+    web_db.expire_all()
+    product = web_db.query(Product).filter(Product.uid_1c == "u-плюс").first()
+    assert product.stock_discrepancy == 4
+    # И порог пересчитан тем же правилом: расхождение + бронь.
+    assert product.broadcast_offset == 4 + product.reserve
+
+
+def test_editing_writes_the_history_like_the_catalogue_does(logged_in_client,
+                                                            web_db, catalog):
+    """Правка отсюда обязана оставлять тот же след, что правка из каталога:
+    иначе число, поправленное с этой страницы, назавтра выглядело бы взявшимся
+    ниоткуда — ровно та беда, ради которой страница и заведена."""
+    logged_in_client.post("/discrepancies/u-плюс/discrepancy", data={"value": "4"})
+
+    web_db.expire_all()
+    rows = web_db.query(StockDiscrepancyLog).filter(
+        StockDiscrepancyLog.uid_1c == "u-плюс").all()
+    assert rows, "правка не попала в историю"
+    assert rows[-1].new_value == 4
+    assert rows[-1].source is DiscrepancySource.manual
+    assert rows[-1].username, "правка без автора"
+
+
+def test_an_empty_field_removes_the_measurement(logged_in_client, web_db, catalog):
+    """Пусто — «не измеряли». Это НЕ ноль: ноль значит «измеряли, склад сошёлся»."""
+    logged_in_client.post("/discrepancies/u-плюс/discrepancy", data={"value": ""})
+    web_db.expire_all()
+    assert web_db.query(Product).filter(
+        Product.uid_1c == "u-плюс").first().stock_discrepancy is None
+
+
+def test_a_row_that_left_the_selection_disappears(logged_in_client, web_db, catalog):
+    """Ответ — ВСЯ таблица, а не одна строка.
+
+    Поправленная строка может выйти из отбора (расхождение стало нулём), и
+    оставить её на экране значило бы показать список, которого уже нет."""
+    page = logged_in_client.post("/discrepancies/u-плюс/discrepancy",
+                                 data={"value": "0"}).text
+    assert "u-плюс" not in page, "ноль — не расхождение, строка обязана уйти"
+    assert "u-минус" in page, "остальные строки должны остаться"
+
+
+def test_a_bad_number_says_so_and_changes_nothing(logged_in_client, web_db, catalog):
+    """Фрагмент подменяется на месте, без редиректа, — сообщению больше негде
+    появиться, кроме как в нём самом."""
+    page = logged_in_client.post("/discrepancies/u-плюс/discrepancy",
+                                 data={"value": "три"}).text
+    assert "не целое число" in page
+    web_db.expire_all()
+    assert web_db.query(Product).filter(
+        Product.uid_1c == "u-плюс").first().stock_discrepancy == 12
+
+
+def test_the_edit_does_not_copy_the_catalogue_logic():
+    """Собственная копия однажды разошлась бы с полем в каталоге, и одно и то же
+    число, поправленное с двух страниц, давало бы разный порог."""
+    source = (ROOT_FILE.parent.parent / "app" / "routers"
+              / "discrepancies.py").read_text(encoding="utf-8")
+    for helper in ("set_discrepancy", "recompute_offset", "_repropagate"):
+        assert helper in source, f"страница не зовёт {helper}"
+    assert "broadcast_offset =" not in source, (
+        "порог пишется здесь напрямую, мимо общей формулы")
+
+
+def test_the_page_actually_renders_the_input(logged_in_client, catalog):
+    """Эндпоинт без поля на странице — эндпоинт, до которого никто не дойдёт.
+
+    Тесты выше зовут его напрямую и остались бы зелёными, исчезни поле из
+    разметки совсем. Тот же класс, что уже ловили на «Мэппинге»: запросы верные,
+    ошибка в том, КАК их зовёт страница."""
+    page = _page(logged_in_client)
+    assert 'hx-post="/discrepancies/u-плюс/discrepancy"' in page, (
+        "в строке нет поля правки расхождения")
+    # Обновляем ВСЮ таблицу: поправленная строка может выйти из отбора.
+    assert 'hx-target="#dsc-table"' in page
+    # И отбор уезжает вместе с правкой — иначе после неё таблица вернётся без
+    # фильтров, и оператор увидит не тот список, с которым работал.
+    assert 'hx-include="#dsc-filters"' in page

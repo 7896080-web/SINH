@@ -933,14 +933,10 @@ def job_alerts():
     Единственное задание, которое говорит НАРУЖУ. Само ничего не чинит и не
     трогает ни площадки, ни 1С — только читает и рассказывает (см. `app/alerts.py`).
     """
-    from app.alerts import configured_channels, ping_alive, run_alert_cycle
+    from app.alerts import configured_channels, run_alert_cycle
 
     db = SessionLocal()
     try:
-        # Сторож ПЕРВЫМ делом и вне зависимости от остального: он отвечает на
-        # вопрос «жив ли воркер», и ответ не должен зависеть от того, чем
-        # кончился разбор находок.
-        watchdog = ping_alive(db)
         stats = run_alert_cycle(db)
         db.commit()
         if stats["action"] in ("alarm", "clear"):
@@ -961,15 +957,61 @@ def job_alerts():
             note = f"каналов не ответило: {stats['failed']} — сообщение не доставлено"
         else:
             note = ""
-        if watchdog:
-            # Отдельной строкой, а не вместо: сторож и каналы решают РАЗНЫЕ
-            # задачи. Каналы молчат о поломке, сторож молчит о смерти воркера,
-            # и подменить один другим нельзя.
-            note = (note + "; " if note else "") + f"внешний сторож не ответил: {watchdog}"
         _heartbeat(db, "alerts", True, note)
     except Exception as e:
         logger.exception("alerts failed")
         _heartbeat(db, "alerts", False, str(e))
+    finally:
+        db.close()
+
+
+# Как часто дёргать внешнего сторожа. Совпадает с частотой уведомлений не
+# случайно, а потому что чаще незачем: сторож отвечает на один вопрос, «жив ли
+# воркер», и пять минут — разумная зернистость ответа.
+WATCHDOG_INTERVAL_MINUTES = 5
+# А вот первый прогон — СРАЗУ, и это главное отличие от `job_alerts`.
+# Двенадцатиминутная задержка у уведомлений заведена под КАНАЛЫ: после старта
+# часть заданий ещё не отчиталась, `/health` красный законно, и сообщение «всё
+# сломано» на каждом перезапуске выключило бы уведомления в первый же день.
+# К сторожу это не относится вовсе: он не разбирает находки, а сообщает, что
+# процесс жив, и это верно с первой секунды.
+#
+# Пока сторож жил внутри `job_alerts`, он наследовал чужую задержку, и штатный
+# разрыв пингов при накате выходил около тринадцати минут. Значит на той стороне
+# приходилось держать `period` + `grace` не меньше пятнадцати минут — иначе
+# тревога била бы на каждом перезапуске, и сторожа замьютили бы, как жёлтые
+# находки. То есть чужая задержка покупалась четвертью часа слепоты к настоящей
+# смерти воркера. Теперь разрыв — время перезапуска плюс полминуты.
+WATCHDOG_FIRST_RUN_DELAY = timedelta(seconds=30)
+
+
+def job_watchdog():
+    """Сказать внешнему сторожу, что воркер жив. Больше НИЧЕГО.
+
+    Обратная полярность ко всему остальному механизму уведомлений: те молчат,
+    пока всё хорошо, а этот регулярно подаёт голос — перестал, и о молчании
+    пишет человеку внешний сервис. Только так покрывается случай, ради которого
+    всё и затевалось («ночью легли обе службы»): процесс, которого нет, не
+    сообщит, что его нет.
+
+    Пинг идёт независимо от того, всё ли в порядке ВНУТРИ. Смешай мы сюда второй
+    смысл, сигнал сторожа стал бы неотличим от падения службы, а о беде внутри
+    живой системы и так скажут каналы.
+    """
+    from app.alerts import ping_alive
+
+    db = SessionLocal()
+    try:
+        problem = ping_alive(db)
+        if problem:
+            logger.warning("сторож: пинг не доехал — %s", problem)
+        # Оговорка успешной отметки: не доехавший пинг — это не поломка
+        # задания, а факт, который надо показать. Читатель — «Диагностика».
+        _heartbeat(db, "watchdog", True,
+                   f"внешний сторож не ответил: {problem}" if problem else "")
+    except Exception as e:                           # noqa: BLE001
+        logger.exception("watchdog failed")
+        _heartbeat(db, "watchdog", False, str(e))
     finally:
         db.close()
 
@@ -1060,6 +1102,9 @@ def build_scheduler() -> BlockingScheduler:
         db.close()
     sched.add_job(job_backup, "interval", hours=BACKUP_INTERVAL_HOURS, id="backup",
                   max_instances=1, next_run_time=start + BACKUP_FIRST_RUN_DELAY)
+    sched.add_job(job_watchdog, "interval", minutes=WATCHDOG_INTERVAL_MINUTES,
+                  id="watchdog", max_instances=1,
+                  next_run_time=start + WATCHDOG_FIRST_RUN_DELAY)
     sched.add_job(job_alerts, "interval", minutes=ALERT_INTERVAL_MINUTES,
                   id="alerts", max_instances=1,
                   next_run_time=start + ALERT_FIRST_RUN_DELAY)

@@ -463,3 +463,10 @@ tr:hover td { background: var(--bg); }
     input[type="text"], input[type="search"], input[type="password"], select { min-width: 0; }
     .field { flex: 1 1 140px; }
 }
+
+/* Отрицательное расхождение на «Расхождениях со складом»: по таким строкам
+   наружу уходит БОЛЬШЕ, чем числится в 1С, и устаревшее измерение здесь уже
+   оверселл. Раскрашена ячейка, а не число: поле ввода перекрасить нельзя, не
+   мешая читать его содержимое. */
+.dsc-negative { background: rgba(200, 40, 40, .08); }
+.dsc-negative .pr-input { color: #b02020; font-weight: 600; }

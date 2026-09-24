@@ -121,7 +121,7 @@ def diagnostics_page(request: Request, db: Session = Depends(get_db), user: User
     # результат отличить было неоткуда.
     shared_workers = ["dispatch", "ftp_send", "ftp_receive", "reconciliation",
                       "reconciliation_applied", "verify_stock", "backup",
-                      "retention", "alerts"]
+                      "retention", "alerts", "watchdog"]
     shared_heartbeats = [{"name": w, "hb": _heartbeat_for(db, w)} for w in shared_workers]
 
     from app.alerts import configured_channels
