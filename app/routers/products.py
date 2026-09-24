@@ -256,7 +256,8 @@ UIDS_CHUNK = 500
 def _base_query(db: Session, q: str, only_proposals: bool, only_blocked: bool,
                 hide_size_u: bool = False, only_unfinished: bool = False,
                 only_on_platform: bool = False, only_marked: bool = False,
-                hide_zero_stock: bool = False, only_broadcasting: bool = False):
+                hide_zero_stock: bool = False, only_broadcasting: bool = False,
+                only_silent: bool = False):
     """Отбор в SQL — ДО ограничения по количеству строк.
 
     Раньше сначала брались первые 300 товаров по алфавиту, и лишь потом
@@ -327,6 +328,20 @@ def _base_query(db: Session, q: str, only_proposals: bool, only_blocked: bool,
         # 152 тысячи SKU иначе не посмотреть: включённых строк сотни, и найти их
         # среди остальных нечем.
         query = query.filter(Product.broadcast_enabled.is_(True))
+    if only_silent:
+        # Обратная сторона предыдущего: трансляция ВЫКЛЮЧЕНА, остаток наружу не
+        # уходит. Отбор нужен затем же, зачем и прямой, только спрашивают им
+        # противоположное: не «что сейчас уходит», а «что молчит» — то есть что
+        # ещё предстоит подключить, и что могло замолчать не по чьему-то решению.
+        #
+        # Условие — СТРОГО обратное `only_broadcasting`, по тому же полю и без
+        # оговорок. Соблазн исключить отсюда строки с непогашенной просьбой
+        # включить трансляцию (`broadcast_requested_at`: они включатся сами,
+        # когда закончится расчёт) отвергнут намеренно: тогда два фильтра
+        # перестали бы в сумме давать каталог, и часть строк не показывал бы
+        # НИ ОДИН из них — дыра, которую видно только если специально её искать.
+        # Сейчас же они попадают сюда честно: прямо сейчас эти товары молчат.
+        query = query.filter(Product.broadcast_enabled.is_(False))
     if only_marked:
         # Товар отмечен хотя бы в одном кабинете — то есть оператор УЖЕ решил,
         # что он туда передаётся. Это не то же самое, что «найден на площадке»:
@@ -376,14 +391,15 @@ def _load_products(db: Session, q: str, only_proposals: bool, only_blocked: bool
                    only_on_platform: bool = False,
                    only_marked: bool = False,
                    hide_zero_stock: bool = False,
-                   only_broadcasting: bool = False) -> tuple[list[Product], int]:
+                   only_broadcasting: bool = False,
+                   only_silent: bool = False) -> tuple[list[Product], int]:
     """Возвращает (строки, сколько всего подходит под фильтр). Второе число нужно,
     чтобы честно написать оператору «показано 300 из N», а не делать вид, что это всё.
     Отрицательное значение = счёт оборван на пределе сканирования, в интерфейсе
     показывается как «N+»."""
     query = _base_query(db, q, only_proposals, only_blocked, hide_size_u,
                         only_unfinished, only_on_platform, only_marked,
-                        hide_zero_stock, only_broadcasting)
+                        hide_zero_stock, only_broadcasting, only_silent)
 
     if not only_blocked:
         # `enable_eagerloads(False)`: считаем строки, а не собираем объекты.
@@ -433,7 +449,7 @@ def _render(request: Request, db: Session, user: User, q: str, only_proposals: b
             only_blocked: bool, hide_size_u: bool, template: str,
             only_unfinished: bool = False, only_on_platform: bool = False,
             only_marked: bool = False, hide_zero_stock: bool = False,
-            only_broadcasting: bool = False):
+            only_broadcasting: bool = False, only_silent: bool = False):
     accounts = _active_accounts(db)
     all_accounts = {a.id: a for a in db.query(PlatformAccount).all()}
     # С фильтрами показываем ВЕСЬ отбор: оператор сузил список именно затем,
@@ -441,7 +457,7 @@ def _render(request: Request, db: Session, user: User, q: str, only_proposals: b
     # из 152 тысяч по алфавиту» всё равно ни о чём не говорят.
     filtered = bool(q or only_proposals or only_blocked or hide_size_u
                     or only_unfinished or only_on_platform or only_marked
-                    or hide_zero_stock or only_broadcasting)
+                    or hide_zero_stock or only_broadcasting or only_silent)
     products, total = _load_products(db, q, only_proposals, only_blocked, accounts,
                                      limit=FILTERED_LIMIT if filtered else PAGE_LIMIT,
                                      hide_size_u=hide_size_u,
@@ -449,7 +465,8 @@ def _render(request: Request, db: Session, user: User, q: str, only_proposals: b
                                      only_on_platform=only_on_platform,
                                      only_marked=only_marked,
                                      hide_zero_stock=hide_zero_stock,
-                                     only_broadcasting=only_broadcasting)
+                                     only_broadcasting=only_broadcasting,
+                                     only_silent=only_silent)
     with_barcode = _uids_with_barcode(db, products)
     rows = [_row(p, accounts, all_accounts, with_barcode) for p in products]
     return templates.TemplateResponse(request, template, {
@@ -461,6 +478,13 @@ def _render(request: Request, db: Session, user: User, q: str, only_proposals: b
         "only_on_platform": only_on_platform,
         "only_marked": only_marked,
         "only_broadcasting": only_broadcasting,
+        "only_silent": only_silent,
+        # Два фильтра трансляции спрашивают об одном поле противоположное, и
+        # вместе дают заведомо пустой отбор. Пустая таблица без объяснения
+        # читается как «таких товаров нет» — то есть как ответ, которого мы не
+        # давали. Флаг ставим здесь, а показывает его фрагмент таблицы: он
+        # перерисовывается htmx на каждое изменение фильтров, а шапка — нет.
+        "filters_contradict": only_broadcasting and only_silent,
         "recalc_job": active_job(db) or last_job(db),
         "recalc_running": active_job(db) is not None,
         "accounts": accounts,
@@ -511,7 +535,8 @@ def _filter_query(q: str, only_proposals: bool = False, only_blocked: bool = Fal
                   hide_size_u: bool = False, only_unfinished: bool = False,
                   only_on_platform: bool = False, only_marked: bool = False,
                   hide_zero_stock: bool = False,
-                  only_broadcasting: bool = False) -> str:
+                  only_broadcasting: bool = False,
+                  only_silent: bool = False) -> str:
     """Фильтры страницы в виде строки запроса."""
     from urllib.parse import urlencode
 
@@ -521,7 +546,8 @@ def _filter_query(q: str, only_proposals: bool = False, only_blocked: bool = Fal
                      ("only_on_platform", only_on_platform),
                      ("only_marked", only_marked),
                      ("hide_zero_stock", hide_zero_stock),
-                     ("only_broadcasting", only_broadcasting)):
+                     ("only_broadcasting", only_broadcasting),
+                     ("only_silent", only_silent)):
         if on:
             params[name] = "true"
     return urlencode(params)
@@ -531,7 +557,8 @@ def _back(q: str, only_proposals: bool = False, only_blocked: bool = False,
           hide_size_u: bool = False, only_unfinished: bool = False,
           only_on_platform: bool = False, only_marked: bool = False,
           hide_zero_stock: bool = False,
-          only_broadcasting: bool = False) -> RedirectResponse:
+          only_broadcasting: bool = False,
+          only_silent: bool = False) -> RedirectResponse:
     """Назад на страницу С ТЕМИ ЖЕ ФИЛЬТРАМИ.
 
     Раньше возвращался только поиск: оператор отбирал строки фильтром «только
@@ -539,7 +566,7 @@ def _back(q: str, only_proposals: bool = False, only_blocked: bool = False,
     где отобранных строк уже не найти."""
     query = _filter_query(q, only_proposals, only_blocked, hide_size_u, only_unfinished,
                           only_on_platform, only_marked, hide_zero_stock,
-                          only_broadcasting)
+                          only_broadcasting, only_silent)
     return RedirectResponse(f"/products{'?' + query if query else ''}", status_code=303)
 
 
@@ -551,7 +578,7 @@ def products_page(
     only_blocked: bool = Query(False), hide_size_u: bool = Query(False),
     only_unfinished: bool = Query(False), only_on_platform: bool = Query(False),
     only_marked: bool = Query(False), hide_zero_stock: bool = Query(False),
-    only_broadcasting: bool = Query(False),
+    only_broadcasting: bool = Query(False), only_silent: bool = Query(False),
     db: Session = Depends(get_db), user: User = Depends(get_current_user),
 ):
     if not _active_accounts(db) and request.session.get("flash") is None:
@@ -568,7 +595,7 @@ def products_page(
                    "products.html", only_unfinished=only_unfinished,
                    only_on_platform=only_on_platform, only_marked=only_marked,
                    hide_zero_stock=hide_zero_stock,
-                   only_broadcasting=only_broadcasting)
+                   only_broadcasting=only_broadcasting, only_silent=only_silent)
 
 
 @router.get("/products/rows", response_class=HTMLResponse)
@@ -577,14 +604,14 @@ def products_rows(
     only_blocked: bool = Query(False), hide_size_u: bool = Query(False),
     only_unfinished: bool = Query(False), only_on_platform: bool = Query(False),
     only_marked: bool = Query(False), hide_zero_stock: bool = Query(False),
-    only_broadcasting: bool = Query(False),
+    only_broadcasting: bool = Query(False), only_silent: bool = Query(False),
     db: Session = Depends(get_db), user: User = Depends(get_current_user),
 ):
     return _render(request, db, user, q, only_proposals, only_blocked, hide_size_u,
                    "products_rows.html", only_unfinished=only_unfinished,
                    only_on_platform=only_on_platform, only_marked=only_marked,
                    hide_zero_stock=hide_zero_stock,
-                   only_broadcasting=only_broadcasting)
+                   only_broadcasting=only_broadcasting, only_silent=only_silent)
 
 
 # Старые адреса — на новую страницу (в закладках и в переписке они ещё живут).
@@ -959,6 +986,7 @@ def bulk_edit(
     hide_size_u: bool = Form(False), only_unfinished: bool = Form(False),
     only_on_platform: bool = Form(False), only_marked: bool = Form(False),
     hide_zero_stock: bool = Form(False), only_broadcasting: bool = Form(False),
+    only_silent: bool = Form(False),
     all_filtered: bool = Form(False),
     db: Session = Depends(get_db), user: User = Depends(get_current_user),
 ):
@@ -973,7 +1001,7 @@ def bulk_edit(
     что обработал всё. На каталоге в 152 тысячи SKU это неизбежно."""
     back = lambda: _back(q, only_proposals, only_blocked, hide_size_u, only_unfinished,
                          only_on_platform, only_marked, hide_zero_stock,
-                         only_broadcasting)
+                         only_broadcasting, only_silent)
 
     if not uids and not all_filtered:
         set_flash(request, "Не выбрано ни одной строки.", "warn")
@@ -1016,7 +1044,7 @@ def bulk_edit(
     if all_filtered:
         query = _base_query(db, q, only_proposals, only_blocked, hide_size_u,
                             only_unfinished, only_on_platform, only_marked,
-                            hide_zero_stock, only_broadcasting)
+                            hide_zero_stock, only_broadcasting, only_silent)
         # `only_blocked` — фильтр не SQL-ный: точный расчёт «уходит 0» идёт по
         # лестнице приоритетов уже в Python, и массово применять правку по
         # приблизительному отбору нельзя. Отправляем оператора отметить строки.
@@ -1358,6 +1386,7 @@ def products_export(
     hide_size_u: bool = Query(False), only_unfinished: bool = Query(False),
     only_on_platform: bool = Query(False), only_marked: bool = Query(False),
     hide_zero_stock: bool = Query(False), only_broadcasting: bool = Query(False),
+    only_silent: bool = Query(False),
     db: Session = Depends(get_db), user: User = Depends(get_current_user),
 ):
     """Выгрузка отдаёт РОВНО ТО, что отобрано фильтрами на странице.
@@ -1372,7 +1401,8 @@ def products_export(
                                      only_on_platform=only_on_platform,
                                      only_marked=only_marked,
                                      hide_zero_stock=hide_zero_stock,
-                                     only_broadcasting=only_broadcasting)
+                                     only_broadcasting=only_broadcasting,
+                                     only_silent=only_silent)
     total = abs(total)          # для файла знак «счёт оборван» роли не играет
 
     # Порядок колонок расчёта — тот же, что в строке на странице: дата, что
