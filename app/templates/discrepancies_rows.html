@@ -1,6 +1,12 @@
 {# Фрагмент таблицы, его же страница перезапрашивает сама. Отметка времени живёт
    ЗДЕСЬ, а не в шапке: иначе после автообновления таблица свежая, а время под
    ней — от первой загрузки. #}
+{% if error %}
+{# Ошибка ввода живёт ЗДЕСЬ, а не флешем: фрагмент подменяется на месте, без
+   редиректа, и сообщению больше негде появиться. #}
+<div class="pr-hint pr-hint--warn" style="margin-bottom:8px;">{{ error }}</div>
+{% endif %}
+
 <div class="help-text" style="margin-bottom:8px;">
     Собрано {{ built_at.strftime("%d.%m.%Y %H:%M") }} UTC ·
     обновляется само раз в {{ (refresh_seconds / 60) | round | int }} мин
@@ -39,14 +45,23 @@
             <td>{{ row.size }}</td>
             <td>{{ row.color }}</td>
             <td>{{ row.name }}</td>
-            {# Минус выделяем: по этим строкам наружу уходит больше, чем числится
-               в 1С, и цена устаревшего измерения тут — оверселл. #}
-            <td style="text-align:right">
-                {% if row.discrepancy < 0 %}
-                <span class="badge badge--bad">{{ row.discrepancy }}</span>
-                {% else %}
-                <b>{{ row.discrepancy }}</b>
-                {% endif %}
+            {# Правится ПРЯМО ЗДЕСЬ: разбирают этот список ради одного действия —
+               увидеть устаревшее измерение и поправить его. Гонять человека
+               отсюда на «Товары» искать ту же строку в каталоге на 152 тысячи
+               позиций значило бы сделать список смотровой площадкой.
+               Минус подсвечен: по таким строкам наружу уходит больше, чем
+               числится в 1С, и цена устаревшего измерения тут — оверселл. #}
+            <td style="text-align:right"
+                class="{% if row.discrepancy < 0 %}dsc-negative{% endif %}">
+                <input type="number" class="pr-input" style="width:5.5em"
+                       value="{{ row.discrepancy }}"
+                       placeholder="не измерено"
+                       hx-post="/discrepancies/{{ row.uid_1c }}/discrepancy"
+                       hx-trigger="change"
+                       hx-vals="js:{value: event.target.value}"
+                       hx-target="#dsc-table" hx-swap="innerHTML"
+                       hx-include="#dsc-filters"
+                       title="Учёт 1С минус реальный склад. Плюс — в 1С числится больше, чем лежит; минус — на складе больше, чем знает 1С. Пусто — снять измерение (это НЕ ноль: ноль значит «измеряли, склад сошёлся»). Порог пересчитается сразу, и новое число встанет в очередь на площадки.">
             </td>
             <td style="text-align:right">{{ row.reserve }}</td>
             <td style="text-align:right">{{ row.offset if row.offset is not none else "—" }}</td>

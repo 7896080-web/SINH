@@ -210,7 +210,13 @@ def test_worker_error_text_is_not_exposed_anonymously(client, web_db):
 
     assert r.status_code == 503
     assert "wildberries.ru" not in r.text
-    assert "401" not in r.text
+    # Код ответа ищем В ПОЛЯХ ВОРКЕРА, а не по всему телу. `"401" not in r.text`
+    # ловило ещё и `age_seconds` вроде 401 или 4012 — то есть тест падал от
+    # случайного числа секунд, и тем чаще, чем больше воркеров в ответе. Проверка
+    # про то, что ТЕКСТ ОШИБКИ не виден анониму, а не про отсутствие трёх цифр
+    # где угодно в JSON.
+    leaked = next(w for w in r.json()["workers"] if w["worker"] == "dispatch")
+    assert "401" not in str(leaked.get("last_error") or "")
     # ПО ИМЕНИ, а не по индексу: воркеров в ответе несколько, и «первый» — это
     # не «наш». Раньше тест брал нулевой элемент и падал, стоило списку
     # измениться (порядок строк в базе не задан, добавился новый воркер).

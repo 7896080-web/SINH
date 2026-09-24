@@ -405,6 +405,11 @@ def test_the_watchdog_is_pinged_even_when_the_system_is_broken(db, monkeypatch):
     monkeypatch.setattr(scheduler, "SessionLocal", lambda: db)
     monkeypatch.setattr(db, "close", lambda: None)
 
-    scheduler.job_alerts()
+    # Сторож — ОТДЕЛЬНОЕ задание, а не строчка внутри `job_alerts`: пока он жил
+    # там, он наследовал двенадцатиминутную задержку первого прогона, заведённую
+    # под каналы. Само свойство от переноса не изменилось, и проверяем мы
+    # по-прежнему его: пинг уходит при любом состоянии системы — здесь она
+    # заведомо сломана (критичная находка на месте).
+    scheduler.job_watchdog()
 
     assert pings == [1]

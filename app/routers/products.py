@@ -1008,12 +1008,27 @@ def bulk_edit(
         return back()
 
     n = d = None
+    clear_number = False          # «-» в поле: снять значение, а не задать
     if action in ("set_reserve", "set_offset", "set_fact", "set_discrepancy"):
-        try:
-            n = int((int_value or "").strip())
-        except ValueError:
-            set_flash(request, "Введите число для массовой правки.", "warn")
-            return back()
+        raw_number = (int_value or "").strip()
+        if action == "set_discrepancy" and raw_number in CLEAR_CELL:
+            # Снять ИЗМЕРЕНИЕ целиком (в NULL) — то же, что пустое поле в строке
+            # и «-» в колонке файла. До этого массовый путь единственный из трёх
+            # не умел этого вовсе: `int("")` давал отказ «введите число», и
+            # оператор, снявший измерение у одной строки, не мог снять его у
+            # отбора. Правило общее — массовый путь делает то же, что построчный.
+            #
+            # Именно «-», а не пустое поле: пустота здесь давно и намеренно
+            # означает «числа не ввели» и отвечает отказом, а снять значение
+            # можно, только сказав это вслух (то же `CLEAR_CELL`, что в импорте).
+            clear_number = True
+        else:
+            try:
+                n = int(raw_number)
+            except ValueError:
+                set_flash(request, "Введите число для массовой правки "
+                                   "(«-» в поле «Расхождение =» снимает измерение).", "warn")
+                return back()
         if action in ("set_reserve", "set_fact"):
             n = max(0, n)          # бронь и факт отрицательными не бывают
         # Порог и расхождение — бывают, и отсекать знак здесь было бы дефектом:
@@ -1207,7 +1222,10 @@ def bulk_edit(
         elif action == "set_discrepancy":
             # Тот же смысл, что у поля в строке и у колонки «Расхождение» в
             # файле: массовый путь обязан делать то же, что построчный.
-            set_discrepancy(db, p, n, source=DiscrepancySource.manual,
+            # `None` — снятое измерение («-» в поле), и это НЕ то же, что ноль:
+            # ноль значит «измеряли, склад сошёлся», NULL — «не измеряли».
+            set_discrepancy(db, p, None if clear_number else n,
+                            source=DiscrepancySource.manual,
                             username=user.username)
             recompute_offset(p)
         elif action == "set_fact":

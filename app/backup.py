@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from app.timeutils import now_utc
+from app.timeutils import local_date_of, now_utc
 
 logger = logging.getLogger("sync_worker")
 
@@ -315,7 +315,14 @@ def names_to_drop(names: list[str], keep_daily: int = KEEP_DAILY,
     days_seen: set = set()
     rest: list[tuple] = []
     for moment, name in parsed:
-        day = moment.date()
+        # МЕСТНЫЙ календарный день, а не UTC-шный. Имя копии штампуется
+        # `now_utc()`, и `moment.date()` давал UTC-шное число: у Москвы UTC+3,
+        # значит копия, снятая с полуночи до трёх ночи, попадала в слот
+        # ПРЕДЫДУЩИХ суток. Две копии одного местного дня занимали два из
+        # четырнадцати слотов, и глубина хранения молча становилась тринадцатью
+        # днями вместо четырнадцати. Правило проекта общее: момент времени
+        # хранится в UTC, календарный день — местный.
+        day = local_date_of(moment)
         if day not in days_seen and len(days_seen) < keep_daily:
             days_seen.add(day)
             keep.add(name)
@@ -331,7 +338,10 @@ def names_to_drop(names: list[str], keep_daily: int = KEEP_DAILY,
             # заведён. 23.09 это и произошло: копия 15:32 уцелела не как
             # «сегодняшняя» (то место заняла 16:10), а как недельная.
             continue
-        week = moment.isocalendar()[:2]
+        # Неделя считается от МЕСТНОГО дня по той же причине: копия, снятая в
+        # понедельник до трёх ночи, по UTC приходится на воскресенье и заняла бы
+        # слот прошлой недели.
+        week = local_date_of(moment).isocalendar()[:2]
         if week not in weeks_seen and len(weeks_seen) < keep_weekly:
             weeks_seen.add(week)
             keep.add(name)
