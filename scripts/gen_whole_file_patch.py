@@ -87,7 +87,13 @@ for rel in DELETE:
 marker = os.path.join(ROOT, "deploy", "INSTALLED_TAG")
 os.makedirs(os.path.dirname(marker), exist_ok=True)
 with io.open(marker, "w", encoding="utf-8") as f:
-    f.write(TAG + "\n" + datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S") + " UTC\n")
+    # `now(timezone.utc)`, а не `utcnow()`: второй помечен на удаление и на
+    # боевом Python печатает DeprecationWarning ПЕРВОЙ строкой наката. Строка
+    # выходит та же, а предупреждение в самом начале вывода — это то, что учит
+    # не читать вывод целиком; дальше там «DONE N» и метка версии, ради которых
+    # его и смотрят.
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    f.write(TAG + "\n" + stamp + " UTC\n")
 print("tag", TAG)
 print("DONE", written)
 '''

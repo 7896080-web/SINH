@@ -94,6 +94,12 @@ def test_the_patch_records_which_version_it_installed(tmp_path):
     r = subprocess.run([sys.executable, str(script)], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr[-2000:]
     assert "DONE" in r.stdout
+    # И НИ СЛОВА в stderr. Вывод наката человек читает ради двух строк — «DONE N»
+    # и метки версии, — а первым, что он увидел 24.09, было предупреждение об
+    # устаревшем `utcnow()` из этого же скрипта. Шум в начале вывода учит не
+    # читать вывод целиком, а именно в нём живёт единственный признак того, что
+    # накат прошёл не так.
+    assert r.stderr.strip() == "", f"накат заговорил не по делу: {r.stderr[-500:]}"
 
     marker = target / "deploy" / "INSTALLED_TAG"
     assert marker.exists(), "накат не оставил следа — второй шаг о нём не узнает"
@@ -119,3 +125,28 @@ def test_the_update_script_refuses_a_version_that_never_arrived():
     assert "exit 1" in guard, "расхождение версий обязано останавливать накат"
     # До копии базы и миграций: остановиться надо раньше, чем что-то сделано.
     assert text.index("INSTALLED_TAG") < text.index("Копия базы перед миграцией")
+
+
+def test_the_apply_script_does_not_call_a_deprecated_clock(tmp_path):
+    """Сканер ИСХОДНИКА, а не поведения, — и по той же причине, что у
+    `test_local_calendar_date.py`: увидеть это на машине разработки нельзя.
+
+    `datetime.utcnow()` помечен устаревшим с Python 3.12, а здесь 3.11 — то есть
+    предупреждения тут не будет никогда, сколько ни гоняй apply-скрипт. На бою
+    Python новее, и 24.09 накат начался с четырёх строк DeprecationWarning,
+    после которых шли «DONE 6» и метка версии — единственные две строки, ради
+    которых вывод и читают. Шум в начале учит не дочитывать, а именно в выводе
+    живёт признак того, что накат прошёл не так (23.09 им было ОТСУТСТВИЕ
+    строки «Running upgrade»).
+
+    Проверка стоит на тексте apply-скрипта: он уезжает на сервер целиком, и
+    именно он там исполняется.
+    """
+    source = _apply_source(_generate(tmp_path, ["README.md"]))
+    # Комментарии выкидываем: в самом скрипте про `utcnow()` написано словами —
+    # зачем его тут нет, — и сканер, читающий текст наравне с кодом, падал бы на
+    # собственном объяснении. Проверка про ВЫЗОВ, а не про упоминание.
+    code = "\n".join(line.split("#", 1)[0] for line in source.splitlines())
+    assert "utcnow(" not in code, (
+        "apply-скрипт зовёт `datetime.utcnow()` — на бою это DeprecationWarning "
+        "первой строкой наката; берите `datetime.now(datetime.timezone.utc)`")
