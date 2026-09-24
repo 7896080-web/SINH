@@ -2,11 +2,18 @@
 
 Запуск:
     C:\\sync_admin\\.venv\\Scripts\\python.exe C:\\sync_admin\\scripts\\probe_offset.py 2000932153711
+    ... probe_offset.py "36446 b" 5XL          # артикул + РАЗМЕР
 
 Ищет по ID_1С, БАРКОДУ, артикулу целиком и по куску артикула — в таком
 порядке. Баркод обязателен: артикул оператор видит на площадке, а он может не
 совпасть с тем, что записано у нас (пробелы, регистр, другой разделитель
 цвета), и тогда строка «не найдена» при том, что она есть.
+
+**Артикул один на весь размерный ряд**, и это главное про поиск. Раньше по
+артикулу бралась `.first()` — то есть ПРОИЗВОЛЬНЫЙ размер, а в выводе размера не
+было вовсе: человек спрашивал про 5XL, получал числа по S и не мог этого
+заметить. Ответ выглядел ответом. Теперь неоднозначность — это ОТКАЗ со списком
+строк, а размер печатается всегда, даже когда строка нашлась одна.
 
 Ничего не меняет и не коммитит. Нужен, когда порог «сам» съехал: по трём
 числам на экране этого не понять — надо видеть, В КАКОМ ПОРЯДКЕ их правили и
@@ -29,6 +36,9 @@ def main() -> int:
         print("укажите артикул или ID_1С")
         return 1
     needle = sys.argv[1].strip()
+    # Размер вторым аргументом: артикул один на весь ряд, и без него вопрос
+    # «откуда расхождение на 5XL» не имеет однозначного ответа.
+    wanted_size = sys.argv[2].strip() if len(sys.argv) > 2 else ""
 
     db = SessionLocal()
     try:
@@ -46,10 +56,32 @@ def main() -> int:
                           f"но товара с таким ID_1С в номенклатуре НЕТ")
                     return 1
         if product is None:
-            product = db.query(Product).filter(Product.article == needle).first()
-        if product is None:
-            product = db.query(Product).filter(
-                Product.article.ilike(f"%{needle}%")).first()
+            # По артикулу строк бывает СТОЛЬКО, СКОЛЬКО РАЗМЕРОВ. Берём все и
+            # решаем ниже — молча взять первую значит ответить не про тот товар,
+            # о котором спросили.
+            found = db.query(Product).filter(Product.article == needle).all()
+            if not found:
+                found = db.query(Product).filter(
+                    Product.article.ilike(f"%{needle}%")).all()
+            if wanted_size:
+                exact = [p for p in found
+                         if (p.size or "").strip().upper() == wanted_size.upper()]
+                if not exact:
+                    print(f"артикул нашёлся ({len(found)} строк), "
+                          f"а размера «{wanted_size}» среди них НЕТ. Есть: "
+                          + ", ".join(sorted((p.size or "—") for p in found)))
+                    return 1
+                found = exact
+            if len(found) > 1:
+                # Отказ, а не выбор наугад: числа по чужому размеру выглядят
+                # точно так же, как по нужному, и проверить их нечем.
+                print(f"под «{needle}» подходит {len(found)} строк — "
+                      f"укажите размер вторым аргументом или ID_1С:")
+                for p in sorted(found, key=lambda p: (p.size or "", p.uid_1c)):
+                    print(f"  {p.uid_1c}  размер {p.size or '—':6} "
+                          f"цвет {p.color or '—':20} {p.name}")
+                return 1
+            product = found[0] if found else None
         if product is None:
             print(f"не найден ни по ID_1С, ни по баркоду, ни по артикулу: {needle}")
             return 1
@@ -57,6 +89,11 @@ def main() -> int:
         print("=" * 70)
         print(f"ID_1С:            {product.uid_1c}")
         print(f"Артикул:          {product.article}")
+        # Размер и цвет печатаются ВСЕГДА, даже когда строка нашлась одна: без
+        # них вывод по многоразмерному артикулу нечем проверить, а ошибиться
+        # тут — значит смотреть на числа чужой строки.
+        print(f"Размер:           {product.size or '—'}")
+        print(f"Цвет:             {product.color or '—'}")
         print(f"Название:         {product.name}")
         print("-" * 70)
         print(f"Остаток ЦС:       {product.stock_on_hand}")
