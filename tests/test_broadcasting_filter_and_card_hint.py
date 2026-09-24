@@ -132,9 +132,15 @@ def _with_card(web_db, uid, account, barcode):
     web_db.commit()
 
 
-def _hint(resp, uid):
+def _hint(resp, uid, cabinet):
+    """Есть ли карточка у этого товара В ЭТОМ кабинете, по колонке кабинета.
+
+    Была одна сводная ячейка со списком через запятую: читалась глазами, но не
+    фильтровалась и не сортировалась — чтобы отобрать в Excel строки без
+    карточки в КИТ, приходилось искать подстроку в тексте, где рядом стоят
+    названия других кабинетов. А отбирают в этом файле именно так, пачкой."""
     header, rows = _sheet(resp)
-    col = header.index("Карточка есть в кабинетах")
+    col = header.index(f"{cabinet} — Карточка")
     for row in rows:
         if row[0] == uid:
             return row[col]
@@ -145,24 +151,30 @@ def test_the_hint_names_the_cabinet_that_has_the_card(logged_in_client, web_db):
     account = _account(web_db, name="ИП ЯВОРСКАЯ")
     _with_card(web_db, "u1", account, "111")
 
-    assert _hint(logged_in_client.get("/products/export"), "u1") == "ИП ЯВОРСКАЯ (WB)"
+    assert _hint(logged_in_client.get("/products/export"), "u1",
+                 "ИП ЯВОРСКАЯ (WB)") == "Да"
 
 
-def test_a_product_without_a_card_gets_an_empty_hint(logged_in_client, web_db):
-    """Пусто, а не «нет»: колонка справочная, и любое слово в ней импорт мог бы
-    когда-нибудь принять за значение."""
+def test_a_product_without_a_card_says_no(logged_in_client, web_db):
+    """Теперь «Нет», а не пусто.
+
+    Пустая ячейка была осмысленна, пока колонка была одна: пустой список читался
+    как «нигде». В колонке КАБИНЕТА пустота значила бы «неизвестно», а мы знаем
+    точно — карточки в нём нет. И отбирать в Excel по «Нет» можно, по пустоте —
+    хуже. Импорт колонку по-прежнему не читает, так что за значение он это не
+    примет."""
     _account(web_db)
     _product(web_db, "u1")
     web_db.add(Barcode(barcode="111", uid_1c="u1"))
     web_db.commit()
 
-    # Пустую строку openpyxl кладёт в файл как пустую ячейку и читает как None.
-    assert _hint(logged_in_client.get("/products/export"), "u1") in (None, "")
+    assert _hint(logged_in_client.get("/products/export"), "u1", "WB-1 (WB)") == "Нет"
 
 
-def test_several_cabinets_are_all_named(logged_in_client, web_db):
-    """У товара бывает карточка в нескольких кабинетах — подсказка обязана
-    назвать все: оператор по ней и решает, какой кабинет отметить."""
+def test_every_cabinet_answers_for_itself(logged_in_client, web_db):
+    """У товара бывает карточка в нескольких кабинетах, и по колонке каждого
+    видно его собственный ответ: оператор по нему и решает, какой кабинет
+    отметить, а какой отметить нельзя — отправлять туда будет не по чему."""
     wb = _account(web_db, name="ИП ЯВОРСКАЯ")
     kit = _account(web_db, name="КИТ", platform=Platform.kit)
     _product(web_db, "u1")
@@ -173,24 +185,53 @@ def test_several_cabinets_are_all_named(logged_in_client, web_db):
                                    barcode="111", article="A", name="К"))
     web_db.commit()
 
-    assert _hint(logged_in_client.get("/products/export"), "u1") == "ИП ЯВОРСКАЯ (WB), КИТ (KIT)"
+    dump = logged_in_client.get("/products/export")
+    assert _hint(dump, "u1", "ИП ЯВОРСКАЯ (WB)") == "Да"
+    assert _hint(dump, "u1", "КИТ (KIT)") == "Да"
 
 
-def test_a_disabled_cabinet_still_counts(logged_in_client, web_db):
-    """Каталог остаётся от кабинета, погашенного предохранителем или выключенного
-    руками, и карточка на площадке от этого никуда не делась. Та же логика, что
-    на странице «Есть на складе — нет на площадке»."""
+def test_a_disabled_cabinet_has_no_columns_at_all(logged_in_client, web_db):
+    """Колонки кабинета — по АКТИВНЫМ, и «Карточка» тут не исключение.
+
+    Пока колонка была одна и сводная, в неё шли все кабинеты: список «где
+    карточка есть» ничего не предлагал сделать, он просто сообщал. Колонка
+    кабинета стоит в одном ряду с «Синхронизировать» и «Порогом», то есть отвечает
+    на вопрос «отмечать ли сюда», — а выключенный кабинет отметить нельзя, и
+    столбец «Да» рядом с отсутствующей галочкой звал бы к действию, которого нет.
+
+    Само правило «каталог остаётся от выключенного кабинета, и карточка на
+    площадке никуда не делась» осталось — оно живёт в `_cards_by_uid` и на
+    странице «Есть на складе — нет на площадке», и проверяется тестом ниже."""
     account = _account(web_db, name="СПЯЩИЙ", active=False)
     _with_card(web_db, "u1", account, "111")
 
-    assert _hint(logged_in_client.get("/products/export"), "u1") == "СПЯЩИЙ (WB)"
+    header, _ = _sheet(logged_in_client.get("/products/export"))
+    assert not [h for h in header if h and "СПЯЩИЙ" in h], (
+        "выключенный кабинет получил колонки, которых нечем воспользоваться")
+
+
+def test_the_catalogue_of_a_disabled_cabinet_is_still_counted(web_db):
+    """Ниже уровнем правило прежнее: каталог остаётся от кабинета, погашенного
+    предохранителем или выключенного руками, и карточка на площадке от этого
+    никуда не делась. Та же логика, что на странице «Есть на складе — нет на
+    площадке»."""
+    from app.routers.products import _cards_by_uid
+
+    account = _account(web_db, name="СПЯЩИЙ", active=False)
+    _with_card(web_db, "u1", account, "111")
+
+    assert _cards_by_uid(web_db).get("u1") == {account.id}
 
 
 # ------------------------------- и больше в файле не изменилось ничего
 
-def test_the_export_layout_changed_by_exactly_one_column(logged_in_client, web_db):
-    """Файл правят в Excel и заливают обратно. Сдвинь мы остальные колонки или
-    поменяй их порядок — оператор залил бы данные не в те поля."""
+def test_the_export_layout_is_exactly_this(logged_in_client, web_db):
+    """Файл правят в Excel и заливают обратно. Сдвинь мы колонки или поменяй их
+    порядок — оператор залил бы данные не в те поля.
+
+    «Карточка» стоит ПЕРВОЙ в тройке колонок кабинета: сначала «а есть ли там
+    вообще карточка», потом «передаём ли» и «с каким порогом». Обратный порядок
+    предлагал бы отметить кабинет раньше, чем видно, есть ли куда отправлять."""
     account = _account(web_db, name="ИП ЯВОРСКАЯ")
     _with_card(web_db, "u1", account, "111")
 
@@ -201,7 +242,7 @@ def test_the_export_layout_changed_by_exactly_one_column(logged_in_client, web_d
         "Дата расчёта", "Остаток ЦС на дату", "Резерв", "Факт на дату",
         "Расхождение",
         "Порог трансляции", "Трансляция", "Уходит на площадки",
-        "Карточка есть в кабинетах",
+        "ИП ЯВОРСКАЯ (WB) — Карточка",
         "ИП ЯВОРСКАЯ (WB) — Синхронизировать", "ИП ЯВОРСКАЯ (WB) — Порог",
     ]
 

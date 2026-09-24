@@ -178,3 +178,35 @@ def test_an_empty_list_says_it_is_resolved(logged_in_client, web_db):
     page = logged_in_client.get("/report/rows/negative_stock").text
 
     assert "разобрана" in page
+
+
+def test_every_full_list_says_what_to_do(logged_in_client):
+    """Страница показывала таблицу и подпись «Полный список строк находки».
+
+    Человек видел, ЧТО нашлось, и не видел ни следствия, ни следующего шага. А
+    приходит он сюда как раз за вторым: находка сказала «разобрать →», он нажал
+    — и упёрся в список, по которому непонятно, что делать. Следствие при этом
+    уже сформулировано в самой находке, но до этой страницы не доезжало.
+    """
+    from app.report import FULL_LISTS, FULL_LIST_GUIDANCE
+
+    missing = sorted(set(FULL_LISTS) - set(FULL_LIST_GUIDANCE))
+    assert not missing, f"полный список без «что делать»: {missing}"
+    for key, (consequence, what_to_do) in FULL_LIST_GUIDANCE.items():
+        assert consequence.strip() and what_to_do.strip(), key
+        # Следствие — про ПОСЛЕДСТВИЕ, а не про факт. Формулировка «строк N»
+        # ничего не говорит о том, зачем это трогать.
+        assert len(consequence) > 60, f"{key}: следствие не сформулировано"
+
+
+def test_the_guidance_reaches_the_page(logged_in_client, web_db):
+    """Словарь без читателя — тот же дефект, только с другой стороны."""
+    from app.models import Product
+
+    web_db.add(Product(uid_1c="u1", article="a", name="n", stock_on_hand=-3,
+                       reserve=0))
+    web_db.commit()
+
+    page = logged_in_client.get("/report/rows/negative_stock").text
+    assert "Что делать" in page
+    assert "Разбирается в 1С" in page
