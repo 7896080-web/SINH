@@ -8,7 +8,7 @@
 import sqlite3
 import threading
 import time
-from datetime import timedelta
+from datetime import date, timedelta
 
 import pytest
 import requests
@@ -126,9 +126,15 @@ def test_pruning_keeps_one_copy_per_day_not_the_last_fourteen(tmp_path):
     backup.prune(directory, keep_daily=14, keep_weekly=0)
 
     left = sorted(p.name for p in directory.glob("sync_admin-*.db"))
-    days = {name.split("-")[1] for name in left}
+    # Дни считаем ТЕМ ЖЕ правилом, что и уборка, — по местному календарю.
+    # Раньше здесь стояло `name.split("-")[1]`, то есть UTC-шное число из имени
+    # файла, и тест был верен только там, где местный пояс совпадает с UTC.
+    # Машина разработки и CI стоят в UTC, боевой сервер — в Москве: 24.09 накат
+    # на нём встал именно здесь. Две почасовые копии после 21:00 UTC приходятся
+    # уже на СЛЕДУЮЩИЙ местный день, и по именам файлов они выглядели одним днём.
+    days = {backup.local_date_of(backup._parse_moment(name)) for name in left}
     assert len(days) >= 14, f"дней осталось {len(days)}, а должно быть 14: {left}"
-    assert "20260914" in days, "неделю назад копии не осталось"
+    assert date(2026, 9, 14) in days, "неделю назад копии не осталось"
 
 
 # --------------------------------------------------------------------------

@@ -126,23 +126,47 @@ def test_backup_days_are_counted_in_local_time(monkeypatch):
     По местному это дни 02, 02, 03 — при двух суточных слотах лишняя A.
     По UTC это 01, 02, 02 — лишней оказывается B, то есть удаляется НЕ ТА копия.
 
-    На машине разработки и на CI (обе в UTC) разницы не видно вовсе, поэтому
-    пояс задаётся явно — тем же приёмом, что в `test_local_calendar_date.py`."""
-    import time
+    **Пояс подменяется ФУНКЦИЕЙ, а не переменной окружения.** Первая версия
+    ставила `TZ=Europe/Moscow` и звала `time.tzset()` — и накат на бою упал с
+    `AttributeError: module 'time' has no attribute 'tzset'`: `tzset` есть только
+    на Unix, а боевой сервер — Windows. Машина разработки при этом Linux и в UTC,
+    то есть увидеть это здесь нельзя было ни при каких условиях. Подмена
+    `local_date_of` делает тест независимым и от платформы, и от пояса ОС, а
+    проверяет он ровно то, что нужно: считаются сутки ЭТОЙ функцией, а не
+    `moment.date()`.
+    """
+    def moscow(moment):
+        return (moment + timedelta(hours=3)).date()
 
-    monkeypatch.setenv("TZ", "Europe/Moscow")
-    time.tzset()
-    try:
-        a, b, c = (_name("20260901-220000"), _name("20260902-050000"),
-                   _name("20260902-220000"))
-        drop = backup.names_to_drop([a, b, c], keep_daily=2, keep_weekly=0,
-                                    now=datetime(2026, 9, 20, 12, 0, 0))
-        assert drop == [a], (
-            f"по местным суткам лишняя — {a}, а удалено {drop}: "
-            f"сутки считаются по UTC")
-    finally:
-        monkeypatch.delenv("TZ", raising=False)
-        time.tzset()
+    monkeypatch.setattr(backup, "local_date_of", moscow)
+
+    a, b, c = (_name("20260901-220000"), _name("20260902-050000"),
+               _name("20260902-220000"))
+    drop = backup.names_to_drop([a, b, c], keep_daily=2, keep_weekly=0,
+                                now=datetime(2026, 9, 20, 12, 0, 0))
+    assert drop == [a], (
+        f"по местным суткам лишняя — {a}, а удалено {drop}: сутки считаются по UTC")
+
+
+def test_the_timezone_is_never_taken_from_the_operating_system(monkeypatch):
+    """И ЭТОГО в тестах бэкапа быть не должно вовсе.
+
+    `time.tzset()` отсутствует на Windows, а боевой сервер — Windows: такой тест
+    валит накат всегда, и починить его по месту нельзя — на машине разработки он
+    зелёный. Сканер исходника, потому что поведенчески это здесь не проверяется.
+    """
+    import ast
+
+    # Разбираем ДЕРЕВО, а не текст: слово `tzset` стоит в объяснении выше, и
+    # сканер по подстроке падал на собственном комментарии. Проверка про ВЫЗОВ.
+    for path in sorted((ROOT / "tests").glob("test_*backup*.py")) + \
+            [ROOT / "tests" / "test_audit_findings_3_to_6.py"]:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        called = {node.func.attr for node in ast.walk(tree)
+                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)}
+        assert "tzset" not in called, (
+            f"{path.name} меняет пояс через ОС — на боевом Windows это "
+            f"AttributeError, и накат встанет на тестах")
 
 
 # ------------------------------- 5. массовая правка умеет снять измерение
