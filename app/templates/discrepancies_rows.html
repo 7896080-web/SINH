@@ -1,0 +1,84 @@
+{# Фрагмент таблицы, его же страница перезапрашивает сама. Отметка времени живёт
+   ЗДЕСЬ, а не в шапке: иначе после автообновления таблица свежая, а время под
+   ней — от первой загрузки. #}
+<div class="help-text" style="margin-bottom:8px;">
+    Собрано {{ built_at.strftime("%d.%m.%Y %H:%M") }} UTC ·
+    обновляется само раз в {{ (refresh_seconds / 60) | round | int }} мин
+</div>
+
+{% if not rows %}
+<div class="empty-state">
+    {% if only_negative or only_broadcasting %}
+        Под этот отбор не подходит ни один товар.
+    {% else %}
+        Расхождений нет: склад либо не пересчитывали, либо он сошёлся с учётом 1С.
+    {% endif %}
+</div>
+{% else %}
+<table class="table">
+    <thead>
+        <tr>
+            <th>Артикул</th>
+            <th class="pr-th-narrow">Размер</th>
+            <th class="pr-th-narrow">Цвет</th>
+            <th>Наименование</th>
+            <th style="text-align:right"
+                title="Учёт 1С минус то, что реально лежит на складе. Плюс — придерживаем, минус — отдаём больше учётного.">Расхождение</th>
+            <th style="text-align:right" title="Держим у себя и не отдаём площадкам">Бронь</th>
+            <th style="text-align:right" title="расхождение + бронь">Порог</th>
+            <th style="text-align:right">Остаток ЦС</th>
+            <th style="text-align:right" title="Итог уровня товара, до порогов кабинетов">Уходит</th>
+            <th title="Чем поставлено расхождение, кем и когда. Без этого строка называет число и молчит о том, на каком основании оно принято.">
+                Откуда число</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for row in rows %}
+        <tr>
+            <td><a href="/products?q={{ row.article | urlencode }}">{{ row.article }}</a></td>
+            <td>{{ row.size }}</td>
+            <td>{{ row.color }}</td>
+            <td>{{ row.name }}</td>
+            {# Минус выделяем: по этим строкам наружу уходит больше, чем числится
+               в 1С, и цена устаревшего измерения тут — оверселл. #}
+            <td style="text-align:right">
+                {% if row.discrepancy < 0 %}
+                <span class="badge badge--bad">{{ row.discrepancy }}</span>
+                {% else %}
+                <b>{{ row.discrepancy }}</b>
+                {% endif %}
+            </td>
+            <td style="text-align:right">{{ row.reserve }}</td>
+            <td style="text-align:right">{{ row.offset if row.offset is not none else "—" }}</td>
+            <td style="text-align:right">{{ row.stock }}</td>
+            <td style="text-align:right">
+                {{ row.outgoing }}{% if not row.broadcasting %}
+                <span class="badge" title="Трансляция выключена — наружу не уходит ничего">выкл</span>
+                {% endif %}
+            </td>
+            <td>
+                {% if row.source %}
+                {{ row.source }}{% if row.username %}, {{ row.username }}{% endif %}
+                <div class="pr-hint">
+                    {{ row.measured_at.strftime("%d.%m.%Y %H:%M") if row.measured_at else "" }}
+                    {% if row.base_date %}
+                    · на {{ row.base_date.strftime("%d.%m.%Y") }}: учёт {{ row.base_stock }}{% if row.fact is not none %}, факт {{ row.fact }}{% endif %}
+                    {% endif %}
+                </div>
+                {% else %}
+                {# История заведена 23.09; у чисел, поставленных раньше, её нет —
+                   и сказать об этом честнее, чем оставить пустую ячейку. #}
+                <span class="muted">неизвестно — число старше истории</span>
+                {% endif %}
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+
+{% if total > rows|length %}
+<div class="pr-hint pr-hint--warn">
+    Показано {{ rows|length }} из {{ total }} — выгрузка в Excel отдаёт всё.
+</div>
+{% endif %}
+{% endif %}
