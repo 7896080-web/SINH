@@ -218,6 +218,11 @@
         Только с включённой трансляцией
     </label>
     <label class="checkbox-inline" style="padding-bottom:8px;"
+           title="Трансляция выключена — остаток наружу не уходит, сколько бы кабинетов ни было отмечено. Сюда же попадают строки, попросившие включения из файла: пока расчёт не закончен, они тоже молчат.">
+        <input type="checkbox" name="only_silent" value="true" {% if only_silent %}checked{% endif %}>
+        Только с выключенной трансляцией
+    </label>
+    <label class="checkbox-inline" style="padding-bottom:8px;"
            title="Отмечен хотя бы один кабинет — то есть по этому товару уже принято решение передавать его наружу. Кабинет при этом не обязан быть активным: галочку ставил человек, и выключение кабинета его решения не отменяет.">
         <input type="checkbox" name="only_marked" value="true" {% if only_marked %}checked{% endif %}>
         Только отмеченные кабинеты
@@ -334,6 +339,22 @@
 // Выбор держим в sessionStorage (переживает F5, умирает с вкладкой), фильтры —
 // в адресной строке: /products принимает ровно те же параметры, что и
 // /products/rows, поэтому перезагрузка восстанавливает отбор сама.
+// Два фильтра трансляции спрашивают об одном поле противоположное, и вместе
+// дают заведомо пустой отбор. Сервер про это скажет словами — он тут главный, а
+// в адресной строке параметры можно свести и руками. Но доводить до пустой
+// таблицы незачем: снимаем соседнюю галочку в момент, когда ставят эту.
+// Программная установка `checked` события `change` не порождает, поэтому htmx
+// уйдёт ОДИН раз и уже с правильным набором фильтров.
+(function () {
+    var PAIR = {only_broadcasting: "only_silent", only_silent: "only_broadcasting"};
+    document.addEventListener("change", function (e) {
+        var other = e.target && PAIR[e.target.name];
+        if (!other || !e.target.checked) { return; }
+        var box = document.querySelector('#pr-filters input[name="' + other + '"]');
+        if (box) { box.checked = false; }
+    }, true);       // на этапе перехвата: раньше, чем htmx соберёт параметры
+})();
+
 (function () {
     var KEY = "pr-selected";
     // Галочка «весь отбор» живёт В ШАПКЕ ТАБЛИЦЫ, а таблицу htmx подменяет

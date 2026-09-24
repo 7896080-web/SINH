@@ -17,6 +17,16 @@
         </tr>
     </thead>
     <tbody>
+        {# Два фильтра трансляции спрашивают об одном поле противоположное.
+           Отбор при этом честно пуст, но «Ничего не найдено» здесь — неправда
+           о каталоге: это ответ не про товары, а про сами фильтры. #}
+        {% if filters_contradict %}
+        <tr><td colspan="12">
+            <div class="pr-hint pr-hint--warn">«Только с включённой трансляцией» и
+            «только с выключенной» вместе не дают ничего: товар либо один, либо
+            другой. Снимите одну из галочек.</div>
+        </td></tr>
+        {% endif %}
         {% for row in rows %}
             {% include "products_row.html" %}
         {% else %}
@@ -43,6 +53,7 @@
 {% if only_on_platform %}<input type="hidden" name="only_on_platform" value="true" form="bulk-form">{% endif %}
 {% if only_marked %}<input type="hidden" name="only_marked" value="true" form="bulk-form">{% endif %}
 {% if only_broadcasting %}<input type="hidden" name="only_broadcasting" value="true" form="bulk-form">{% endif %}
+{% if only_silent %}<input type="hidden" name="only_silent" value="true" form="bulk-form">{% endif %}
 
 {# Число строк отбора — отсюда его берёт счётчик «С отмеченными». Он обязан
    называть ЧИСЛО, а не одно слово «весь отбор»: галочка в шапке переживает
