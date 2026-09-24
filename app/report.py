@@ -1267,6 +1267,39 @@ def _check_verify_stock_broken(db: Session) -> Finding | None:
     )
 
 
+def _check_ftp_receive_unmatched(db: Session) -> Finding | None:
+    """1С ответила, а мы не поняли — к чему.
+
+    Ответ, не легший ни на одно задание, УХОДИТ В АРХИВ и не возвращается: из
+    архива их никто не перечитывает, а повторно 1С его не пришлёт. Задание, к
+    которому он относился, доживает до `timeout` и навсегда считается «в пути».
+
+    Найти такое задание можно (`_check_stuck_1c_tasks`, ручной разбор), но в
+    разборе человек отвечает ровно на один вопрос — «создала 1С документ или
+    нет», — и потерянный ответ и есть ответ на него. До сих пор этот факт жил
+    только в логе, то есть был виден тому, кто пришёл его искать.
+
+    Туда же строки выгрузки на дату, не легшие ни на одну заявку: по ним остаток
+    ЦС на дату не проставится, и товары останутся ждать 1С, которая уже
+    ответила."""
+    row = db.query(WorkerHeartbeat).filter(
+        WorkerHeartbeat.worker_name == "ftp_receive",
+        WorkerHeartbeat.last_success.is_(True),
+    ).first()
+    if row is None or not row.last_error:
+        return None
+    return Finding(
+        key="ftp_receive_unmatched", level=WARNING,
+        title=f"Канал 1С: {row.last_error}",
+        consequence="Ответ 1С потерян безвозвратно — он уже в архиве, и повторно "
+                    "его не пришлют. Задание, к которому он относился, уйдёт в "
+                    "«просрочено» и навсегда будет считаться «в пути»: по "
+                    "созданиям остаток занижен и наружу уходит меньше, чем есть, "
+                    "по отменам завышен — и это прямой оверселл.",
+        count=1, link="/diagnostics#workers",
+    )
+
+
 def _check_truncated_catalog(db: Session) -> Finding | None:
     """Выгрузку каталога оборвал защитный предел страниц.
 
@@ -1340,6 +1373,7 @@ CHECKS = (
     _check_backup_mirror,
     _check_orders_not_processed,
     _check_verify_stock_broken,
+    _check_ftp_receive_unmatched,
     _check_truncated_catalog,
     _check_worker_failures,
 )

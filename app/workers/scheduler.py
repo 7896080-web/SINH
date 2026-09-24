@@ -314,6 +314,14 @@ def _job_ftp_send_locked(request_stock_export: bool, request_barcode_export: boo
 
 def job_ftp_receive():
     db = SessionLocal()
+    # Счётчики непроведённой работы. Правило общее: задание, вернувшее
+    # ненулевой такой счётчик, пишет текст в `last_error` УСПЕШНОГО heartbeat, и
+    # у текста обязан быть читатель. У опроса заказов, сверки остатков и
+    # выгрузки каталога это закрыто; канал 1С — где настоящие документы и
+    # настоящий остаток — оставался без него, и всё уходило только в лог. А лог
+    # читают, когда уже что-то случилось.
+    unmatched_results = 0          # ответ 1С не лёг ни на одно задание
+    unmatched_on_date = 0          # строка выгрузки на дату не легла ни на одну заявку
     try:
         exchange = _build_ftp_exchange()
         for filename in exchange.list_result_files():
@@ -334,6 +342,7 @@ def job_ftp_receive():
                                  "на следующий цикл", filename)
                 continue
             exchange.archive_result(filename)
+            unmatched_results += stats.get("unmatched", 0)
             logger.info("ftp_receive: %s -> %s", filename, stats)
 
         # Оперативные изменения остатка ЦС: 1С кладёт их сама, не дожидаясь
@@ -365,6 +374,7 @@ def job_ftp_receive():
         # Выгрузки остатков на дату — отдельный префикс файлов и отдельная
         # таблица: в остаток товара и в сверку они не попадают никогда.
         on_date = apply_stock_on_date_files(db, exchange)
+        unmatched_on_date += on_date["unmatched"]
         if on_date["files"] or on_date["unmatched"]:
             logger.info("ftp_receive: остатки на дату -> %s", on_date)
         prune_stock_date_snapshots(db)
@@ -377,7 +387,17 @@ def job_ftp_receive():
         if stale_dates:
             logger.warning("ftp_receive: %d заявок на остатки на дату без ответа", len(stale_dates))
 
-        _heartbeat(db, "ftp_receive", True)
+        # Отказ 1С (`stats["error"]`) сюда НЕ идёт намеренно: задание уходит в
+        # `failed`, а его уже читают двое — `_check_stuck_1c_tasks` и ручной
+        # разбор на «Диагностике». Второй сигнал о том же не добавил бы знания, а
+        # место в оговорке занял бы. Строки дельты без идентификатора документа —
+        # тоже: их пропуск осознан, и часовая выгрузка принесёт этот остаток.
+        notes = []
+        if unmatched_results:
+            notes.append(f"ответов 1С не сопоставлено: {unmatched_results}")
+        if unmatched_on_date:
+            notes.append(f"строк выгрузки на дату мимо заявок: {unmatched_on_date}")
+        _heartbeat(db, "ftp_receive", True, "; ".join(notes))
     except Exception as e:
         logger.exception("ftp_receive failed")
         _heartbeat(db, "ftp_receive", False, str(e))
@@ -835,6 +855,15 @@ def job_backup():
 # первого запуска не доживает.
 RETENTION_INTERVAL_HOURS = 24
 RETENTION_FIRST_RUN_DELAY = timedelta(minutes=9)
+# Насколько свежей обязана быть копия, чтобы чистка вообще началась.
+# Считается ОТ ИНТЕРВАЛА БЭКАПА, а не числом: разойдись они, условие однажды
+# начало бы отказывать на исправной системе — а отказ чистки виден не сразу.
+# Двухчасовой запас покрывает обычный перезапуск, при котором бэкап выходит по
+# `BACKUP_MIN_GAP` и копия остаётся вчерашней. Смысл предела не в этом случае, а
+# в том, когда бэкап СЛОМАЛСЯ: тогда чистка день за днём удаляла бы историю,
+# имея за спиной копию всё большей давности, и `/health` при этом был бы зелёным
+# — своей работы чистка делает ровно столько, сколько обещала.
+RETENTION_REQUIRES_BACKUP_WITHIN = timedelta(hours=BACKUP_INTERVAL_HOURS + 2)
 
 
 def job_retention():
@@ -846,6 +875,29 @@ def job_retention():
     """
     db = SessionLocal()
     try:
+        # Копия обязана БЫТЬ и быть свежей — это условие, а не совпадение двух
+        # расписаний. До сих пор порядок держался на четырёх минутах между
+        # заданиями, и держался он не всегда: после перезапуска бэкап выходит по
+        # `BACKUP_MIN_GAP` («свежая копия уже есть»), а чистка отрабатывает
+        # полностью. 24.09 это видно в журнале боевого сервера: 08:03 бэкап
+        # пропустил, 08:07 чистка прошла, и единственную свежую копию снял в
+        # 08:07:13 накат — то есть по случайности, за двенадцать секунд до.
+        #
+        # Отказ, а не предупреждение: чистка удаляет безвозвратно, и работать ей
+        # без копии не с чего. Молчать при этом нельзя — оговорка успешной
+        # отметки, её показывает «Диагностика». Отдельной находки отчёта тут нет
+        # намеренно: причина у отказа одна — бэкап не снимается, — и о ней уже
+        # говорит `report._check_backup_missing`. Вторая находка о том же
+        # приучила бы пролистывать обе.
+        moment, _ = last_backup()
+        if moment is None or now_utc() - moment > RETENTION_REQUIRES_BACKUP_WITHIN:
+            age = "копий нет вовсе" if moment is None else \
+                f"последней {(now_utc() - moment).days} сут."
+            logger.warning("хранение: чистка не начата — нет свежей копии (%s)", age)
+            _heartbeat(db, "retention", True,
+                       f"чистка не начата: нет свежей копии базы ({age}) — "
+                       f"удалять историю, не имея чем её вернуть, нельзя")
+            return
         stats = apply_retention(db)
         total = sum(stats.values())
         if total:
