@@ -50,8 +50,8 @@ def _with_cabinet(web_db, uid, covered=True, **kw):
     return product
 
 
-def _account(web_db):
-    a = PlatformAccount(platform=Platform.wb, name="WB-1", warehouse_id="wh")
+def _account(web_db, name="WB-1", platform=Platform.wb):
+    a = PlatformAccount(platform=platform, name=name, warehouse_id="wh")
     web_db.add(a)
     web_db.commit()
     return a
@@ -528,15 +528,85 @@ def test_export_and_import_stand_together(logged_in_client, web_db):
     assert "Импорт из Excel" in toolbar
 
 
-def test_the_export_button_still_follows_the_live_filters(logged_in_client, web_db):
-    """Кнопка стоит ВНЕ формы фильтров, но привязана к ней атрибутом form= —
-    браузер соберёт текущие значения полей, а не те, что были при загрузке."""
+def test_the_export_button_follows_the_live_filters_and_the_selection(
+        logged_in_client, web_db):
+    """Кнопка привязана к форме МАССОВОЙ ПРАВКИ, а не к форме фильтров.
+
+    Свойство, ради которого она когда-то смотрела на `pr-filters`, осталось —
+    фильтры обязаны быть ЖИВЫМИ, а не теми, что были при загрузке, — но теперь
+    оно достигается иначе: фильтры приезжают в форму скрытыми полями ИЗ ФРАГМЕНТА
+    ТАБЛИЦЫ, а его htmx перерисовывает на каждое изменение отбора.
+
+    А заодно до выгрузки наконец доходят ОТМЕТКИ строк. Пока кнопка висела на
+    форме фильтров, они не доходили вовсе: оператор отмечал один товар, жал
+    экспорт и получал весь отбор — файл на тысячи строк вместо одной.
+
+    `name="action"` у кнопки быть не должно: по нему JS спрашивает подтверждение
+    массовой правки, а выгрузка ничего не меняет — лишний вопрос на безопасном
+    действии приучает жать «Да» не читая.
+    """
     _product(web_db, "u1")
 
     body = logged_in_client.get("/products").text
 
-    assert 'form="pr-filters"' in body
-    assert 'id="pr-filters"' in body
+    assert 'id="pr-export"' in body
+    assert 'form="bulk-form"' in body and 'id="bulk-form"' in body
+    assert 'formmethod="post"' in body
+    export = body[body.index('id="pr-export"'):]
+    export = export[:export.index("</button>")]
+    assert 'name="action"' not in export, (
+        "кнопка выгрузки попадёт под подтверждение массовой правки")
+
+
+def test_the_export_takes_the_selected_rows_only(logged_in_client, web_db):
+    """Отмечены строки — уедут они, а не весь отбор.
+
+    Ровно то, чего не хватало: «отобран один товар, в выгрузке все»."""
+    import io
+    from openpyxl import load_workbook
+
+    _product(web_db, "u1")
+    _product(web_db, "u2")
+    _product(web_db, "u3")
+
+    dump = logged_in_client.post("/products/export", data={"uids": ["u2"]})
+    assert dump.status_code == 200
+    sheet = load_workbook(io.BytesIO(dump.content)).active
+    ids = {row[0] for row in sheet.iter_rows(min_row=2, values_only=True) if row[0]}
+    assert ids == {"u2"}, ids
+
+
+def test_the_whole_selection_flag_beats_the_ticks(logged_in_client, web_db):
+    """«Весь отбор» — это осознанное «не только показанные», и он сильнее отметок.
+
+    Правило то же, что у массовой правки: разойдись они, одна и та же пара
+    «галочки + весь отбор» давала бы разный набор строк в правке и в файле."""
+    import io
+    from openpyxl import load_workbook
+
+    _product(web_db, "u1")
+    _product(web_db, "u2")
+
+    dump = logged_in_client.post("/products/export",
+                                 data={"uids": ["u2"], "all_filtered": "true"})
+    sheet = load_workbook(io.BytesIO(dump.content)).active
+    ids = {row[0] for row in sheet.iter_rows(min_row=2, values_only=True) if row[0]}
+    assert ids == {"u1", "u2"}, ids
+
+
+def test_the_link_without_ticks_still_gives_the_whole_selection(logged_in_client,
+                                                                web_db):
+    """GET рядом оставлен намеренно: по нему ходят ссылки и закладки."""
+    import io
+    from openpyxl import load_workbook
+
+    _product(web_db, "u1")
+    _product(web_db, "u2")
+
+    dump = logged_in_client.get("/products/export")
+    sheet = load_workbook(io.BytesIO(dump.content)).active
+    ids = {row[0] for row in sheet.iter_rows(min_row=2, values_only=True) if row[0]}
+    assert ids == {"u1", "u2"}, ids
 
 
 def test_a_finished_job_tells_the_operator_to_refresh(logged_in_client, web_db):
@@ -1052,3 +1122,58 @@ def test_the_page_offers_the_filter(logged_in_client, web_db):
 
     assert 'name="hide_zero_stock"' in page
     assert "нулевым остатком" in page
+
+
+def test_the_card_column_is_split_per_cabinet(logged_in_client, web_db):
+    """«Карточка есть в кабинетах» была ОДНОЙ ячейкой со списком через запятую.
+
+    Читалась глазами, но не фильтровалась и не сортировалась: чтобы отобрать в
+    Excel строки без карточки в КИТ, приходилось искать подстроку в тексте, где
+    рядом стоят названия других кабинетов. А отбирают в этом файле именно так —
+    пачкой, ради того и выгружают."""
+    import io
+    from openpyxl import load_workbook
+    from app.models import Barcode, PlatformCatalogItem
+
+    first = _account(web_db, name="ИП КАРАМАН")
+    second = _account(web_db, name="КИТ", platform=Platform.kit)
+    _product(web_db, "u1")
+    web_db.add(Barcode(barcode="200", uid_1c="u1"))
+    # Карточка есть ТОЛЬКО во втором кабинете.
+    web_db.add(PlatformCatalogItem(account_id=second.id, barcode="200",
+                                   external_id="v-1"))
+    web_db.commit()
+
+    sheet = load_workbook(io.BytesIO(
+        logged_in_client.get("/products/export").content)).active
+    headers = [c.value for c in next(sheet.iter_rows(max_row=1))]
+    row = dict(zip(headers, next(sheet.iter_rows(min_row=2, values_only=True))))
+
+    assert "Карточка есть в кабинетах" not in headers, (
+        "сводная колонка осталась — отбирать по ней в Excel нечем")
+    first_col = next(h for h in headers if h.endswith("— Карточка") and "КАРАМАН" in h)
+    second_col = next(h for h in headers if h.endswith("— Карточка") and "КИТ" in h)
+    assert row[first_col] == "Нет"
+    assert row[second_col] == "Да"
+
+
+def test_the_card_column_is_read_only_for_the_import(logged_in_client, web_db):
+    """Карточка заводится на площадке, файлом её не создать.
+
+    Приняв «Да», импорт соврал бы, что что-то сделал. Поэтому у колонки нет и
+    выпадающего списка Да/Нет: он приглашал бы её править."""
+    import io
+    from openpyxl import load_workbook
+
+    account = _account(web_db, name="КИТ", platform=Platform.kit)
+    _product(web_db, "u1")
+    web_db.commit()
+
+    dump = logged_in_client.get("/products/export").content
+    book = load_workbook(io.BytesIO(dump))
+    headers = [c.value for c in next(book.active.iter_rows(max_row=1))]
+    card_letter = chr(ord("A") + headers.index(
+        next(h for h in headers if h.endswith("— Карточка"))))
+    ranges = " ".join(str(dv.sqref) for dv in book.active.data_validations.dataValidation)
+    assert f"{card_letter}2" not in ranges, (
+        "на справочной колонке стоит выпадающий список — он зовёт её править")

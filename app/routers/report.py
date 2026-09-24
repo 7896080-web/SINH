@@ -16,7 +16,7 @@ from app.templating import templates as shared_templates
 from app.dependencies import get_current_user
 from app.models import User
 from app.excel_utils import build_xlsx_response
-from app.report import (CRITICAL, FULL_LISTS, collect_findings,
+from app.report import (CRITICAL, FULL_LIST_GUIDANCE, FULL_LISTS, collect_findings,
                         summary_line)
 from app.timeutils import now_utc
 
@@ -83,10 +83,16 @@ def finding_rows(key: str, request: Request, db: Session = Depends(get_db),
 
     title, columns, fn = entry
     rows = fn(db)
+    # Следствие и действие. Приходят сюда как раз за вторым: находка сказала
+    # «разобрать →», человек нажал — и упирался в таблицу, по которой непонятно,
+    # что делать. Нет подсказки — страница молчит, как молчала: это видно
+    # глазами, а не оборачивается пустой рамкой.
+    consequence, what_to_do = FULL_LIST_GUIDANCE.get(key, ("", ""))
     return templates.TemplateResponse(request, "report_rows.html", {
         "request": request, "current_user": user, "active_page": "report",
         "title": title, "columns": columns, "rows": rows[:ROWS_LIMIT],
         "total": len(rows), "key": key, "limit": ROWS_LIMIT,
+        "consequence": consequence, "what_to_do": what_to_do,
     })
 
 

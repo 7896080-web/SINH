@@ -1363,8 +1363,8 @@ def _broadcast_cell(product: Product) -> str:
                     or product.broadcast_requested_at is not None) else "Нет"
 
 
-def _cards_by_uid(db: Session) -> dict[str, list[str]]:
-    """uid товара → названия кабинетов, в каталоге которых его баркод нашёлся.
+def _cards_by_uid(db: Session) -> dict[str, set[int]]:
+    """uid товара → id кабинетов, в каталоге которых его баркод нашёлся.
 
     Подсказка оператору: файл говорит, где карточка ЕСТЬ, — значит видно, какой
     кабинет можно отметить, а какой отметить нельзя, потому что отправлять туда
@@ -1383,7 +1383,7 @@ def _cards_by_uid(db: Session) -> dict[str, list[str]]:
     пятьдесят тысяч обращений к базе на одну кнопку — ровно тот анти-паттерн,
     который уже стоил нам неотвечающей страницы товаров.
     """
-    names = {a.id: _account_label(a) for a in db.query(PlatformAccount).all()}
+    known = {a.id for a in db.query(PlatformAccount).all()}
     found: dict[str, set[int]] = {}
     rows = (db.query(Barcode.uid_1c, PlatformCatalogItem.account_id)
             # `select_from` обязателен: без него SQLAlchemy берёт ведущей первую
@@ -1393,34 +1393,45 @@ def _cards_by_uid(db: Session) -> dict[str, list[str]]:
             .distinct()
             .all())
     for uid_1c, account_id in rows:
-        if account_id in names:
+        if account_id in known:
             found.setdefault(uid_1c, set()).add(account_id)
-    return {uid: sorted(names[a] for a in ids) for uid, ids in found.items()}
+    return found
 
 
-@router.get("/products/export")
-def products_export(
-    q: str = Query(""), only_proposals: bool = Query(False), only_blocked: bool = Query(False),
-    hide_size_u: bool = Query(False), only_unfinished: bool = Query(False),
-    only_on_platform: bool = Query(False), only_marked: bool = Query(False),
-    hide_zero_stock: bool = Query(False), only_broadcasting: bool = Query(False),
-    only_silent: bool = Query(False),
-    db: Session = Depends(get_db), user: User = Depends(get_current_user),
-):
-    """Выгрузка отдаёт РОВНО ТО, что отобрано фильтрами на странице.
+def _export_file(db: Session, q: str, only_proposals: bool, only_blocked: bool,
+                 hide_size_u: bool, only_unfinished: bool, only_on_platform: bool,
+                 only_marked: bool, hide_zero_stock: bool, only_broadcasting: bool,
+                 only_silent: bool, uids: list[str] | None = None,
+                 all_filtered: bool = False):
+    """Сборка файла. Правило отбора ОДНО с массовой правкой, и это главное.
 
-    Фильтр `only_unfinished` здесь отсутствовал: ссылка его передавала, а
-    эндпоинт не принимал, и FastAPI молча его отбрасывал — оператор отбирал
-    незавершённые строки, выгружал и получал весь каталог."""
+    Отметки строк живут в браузере, и форма фильтров о них не знает вовсе:
+    оператор отмечал одну строку, жал экспорт и получал весь отбор — файл на
+    тысячи строк вместо одной, а понять по нему, что отметка потерялась, было
+    нечем. Теперь как у кнопок массовой правки рядом: отмечены строки — уедут
+    они; ничего не отмечено или включён «весь отбор» — уедет весь отбор.
+
+    Порциями по `UIDS_CHUNK`: список отметок уходит в базу любой длины, а у
+    SQLite до 3.32 предел в 999 параметров — на машине разработки этого не
+    увидеть.
+    """
     accounts = _active_accounts(db)
-    products, total = _load_products(db, q, only_proposals, only_blocked, accounts,
-                                     limit=EXPORT_LIMIT, hide_size_u=hide_size_u,
-                                     only_unfinished=only_unfinished,
-                                     only_on_platform=only_on_platform,
-                                     only_marked=only_marked,
-                                     hide_zero_stock=hide_zero_stock,
-                                     only_broadcasting=only_broadcasting,
-                                     only_silent=only_silent)
+    if uids and not all_filtered:
+        products = []
+        for start in range(0, len(uids), UIDS_CHUNK):
+            products.extend(
+                db.query(Product).options(joinedload(Product.sync_settings))
+                  .filter(Product.uid_1c.in_(uids[start:start + UIDS_CHUNK])).all())
+        total = len(products)
+    else:
+        products, total = _load_products(db, q, only_proposals, only_blocked, accounts,
+                                         limit=EXPORT_LIMIT, hide_size_u=hide_size_u,
+                                         only_unfinished=only_unfinished,
+                                         only_on_platform=only_on_platform,
+                                         only_marked=only_marked,
+                                         hide_zero_stock=hide_zero_stock,
+                                         only_broadcasting=only_broadcasting,
+                                         only_silent=only_silent)
     total = abs(total)          # для файла знак «счёт оборван» роли не играет
 
     # Порядок колонок расчёта — тот же, что в строке на странице: дата, что
@@ -1439,9 +1450,19 @@ def products_export(
     headers = ["ID_1С", "Артикул", "Размер", "Цвет", "Наименование", "Остаток ЦС",
                "Дата расчёта", "Остаток ЦС на дату", "Резерв", "Факт на дату",
                "Расхождение",
-               "Порог трансляции", "Трансляция", "Уходит на площадки",
-               "Карточка есть в кабинетах"]
+               "Порог трансляции", "Трансляция", "Уходит на площадки"]
+    # «Карточка» — КОЛОНКА НА КАБИНЕТ, рядом с остальными его колонками, а не
+    # одна общая ячейка со списком через запятую. Список читался глазами, но не
+    # фильтровался и не сортировался: чтобы отобрать в Excel строки, у которых
+    # нет карточки в КИТ, приходилось искать подстроку в тексте, где рядом стоят
+    # названия других кабинетов. А отбирают в этом файле именно так — пачкой,
+    # ради того и выгружают.
+    #
+    # Колонка СПРАВОЧНАЯ: импорт её не читает и читать не будет. Карточка
+    # заводится на площадке, файлом её не создать — приняв «Да», мы бы соврали,
+    # что что-то сделали.
     for account in accounts:
+        headers.append(f"{_account_label(account)} — Карточка")
         headers.append(f"{_account_label(account)} — Синхронизировать")
         headers.append(f"{_account_label(account)} — Порог")
 
@@ -1459,10 +1480,11 @@ def products_export(
                 if product.stock_discrepancy is not None else ""),
                product.broadcast_offset if product.broadcast_offset is not None else "",
                _broadcast_cell(product),
-               explain(product, None, None).quantity,
-               ", ".join(cards.get(product.uid_1c, []))]
+               explain(product, None, None).quantity]
+        has_card = cards.get(product.uid_1c, set())
         for account in accounts:
             setting = settings_map.get(account.id)
+            row.append("Да" if account.id in has_card else "Нет")
             row.append("Да" if setting and setting.enabled else "Нет")
             row.append(setting.min_threshold if setting else 0)
         data.append(row)
@@ -1482,6 +1504,46 @@ def products_export(
     return build_xlsx_response(headers, data, "товары_и_остатки.xlsx", choices=choices)
 
 
+@router.post("/products/export")
+def products_export_selected(
+    q: str = Form(""), only_proposals: bool = Form(False), only_blocked: bool = Form(False),
+    hide_size_u: bool = Form(False), only_unfinished: bool = Form(False),
+    only_on_platform: bool = Form(False), only_marked: bool = Form(False),
+    hide_zero_stock: bool = Form(False), only_broadcasting: bool = Form(False),
+    only_silent: bool = Form(False),
+    uids: list[str] = Form(default=[]), all_filtered: bool = Form(False),
+    db: Session = Depends(get_db), user: User = Depends(get_current_user),
+):
+    """Тот же файл, но кнопкой со страницы — с ОТМЕТКАМИ строк.
+
+    Отдельный метод, а не параметр к GET: отмеченных бывают тысячи, и в адресной
+    строке они не помещаются. GET рядом оставлен и отдаёт весь отбор — по нему
+    ходят ссылки и закладки."""
+    return _export_file(db, q, only_proposals, only_blocked, hide_size_u,
+                        only_unfinished, only_on_platform, only_marked,
+                        hide_zero_stock, only_broadcasting, only_silent,
+                        uids=uids, all_filtered=all_filtered)
+
+
+@router.get("/products/export")
+def products_export(
+    q: str = Query(""), only_proposals: bool = Query(False), only_blocked: bool = Query(False),
+    hide_size_u: bool = Query(False), only_unfinished: bool = Query(False),
+    only_on_platform: bool = Query(False), only_marked: bool = Query(False),
+    hide_zero_stock: bool = Query(False), only_broadcasting: bool = Query(False),
+    only_silent: bool = Query(False),
+    db: Session = Depends(get_db), user: User = Depends(get_current_user),
+):
+    """Весь отбор по фильтрам — ссылкой, без отметок.
+
+    Фильтр `only_unfinished` здесь когда-то отсутствовал: ссылка его передавала,
+    а эндпоинт не принимал, и FastAPI молча его отбрасывал — оператор отбирал
+    незавершённые строки, выгружал и получал весь каталог."""
+    return _export_file(db, q, only_proposals, only_blocked, hide_size_u,
+                        only_unfinished, only_on_platform, only_marked,
+                        hide_zero_stock, only_broadcasting, only_silent)
+
+
 @router.post("/products/import")
 def products_import(
     request: Request, file: UploadFile = File(...),
@@ -1492,7 +1554,7 @@ def products_import(
 
     Справочные колонки, которые импорт НЕ читает:
     «Уходит на площадки» — итог расчёта;
-    «Карточка есть в кабинетах» — подсказка, где карточка товара существует;
+    «<кабинет> — Карточка» — подсказка, есть ли карточка товара в ЭТОМ кабинете;
     правится она не файлом, а заведением карточки на площадке;
     «Остаток ЦС на дату» — приходит из 1С, руками не задаётся.
 
