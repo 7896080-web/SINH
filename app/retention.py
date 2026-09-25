@@ -37,8 +37,10 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.models import (AnomalyStatus, AuditLog, DispatchQueueItem, DispatchStatus,
-                        FtpTask, FtpTaskStatus, ReconciliationLog,
-                        StockDiscrepancyLog, SyncAnomaly, TestLogEntry)
+                        FtpTask, FtpTaskStatus, ReconciliationLog, ReturnItem,
+                        ReturnItemLog, ReturnStatus, StockDiscrepancyLog,
+                        SyncAnomaly, TestLogEntry)
+from app.returns import TERMINAL as RETURN_TERMINAL
 from app.timeutils import now_utc
 
 logger = logging.getLogger("sync_worker")
@@ -73,6 +75,13 @@ TEST_LOG_KEEP = timedelta(days=30)
 # задают редко, но когда задают — отвечать на него больше нечем: массовые пути
 # (кнопки отбора, импорт Excel) в журнал действий построчно не пишут вовсе.
 DISCREPANCY_LOG_KEEP = timedelta(days=365)
+
+# Возвраты: год с момента, когда вещь ДОШЛА до терминального статуса. Не с
+# приёмки: вещь, пролежавшая в химчистке полгода, историю потеряла бы посреди
+# разбора. Незавершённые не удаляются НИКОГДА, сколько бы им ни было, — по тому
+# же правилу, что у записи очереди в `pending`: это незаконченное дело, а
+# «ждём 1С» вдобавок прямо сейчас означает вещь, которой нет ни у нас, ни в 1С.
+RETURN_KEEP = timedelta(days=365)
 
 # Файлы обмена с 1С в каталоге архива — 60 суток. Это ЕДИНСТВЕННОЕ место, где
 # чистка трогает диск, и до аудита 22.09 архив не чистил никто: `archive_result`
@@ -179,6 +188,23 @@ def apply_retention(db: Session) -> dict:
         (StockDiscrepancyLog.created_at < now - DISCREPANCY_LOG_KEEP)
         & StockDiscrepancyLog.id.notin_(newest_per_product),
         "история расхождений")
+
+    # Историю вещи удаляем ПЕРЕД самой вещью и СВОИМ запросом: `_purge` делает
+    # массовый `DELETE`, а он не поднимает ни каскад ORM, ни `ON DELETE CASCADE`
+    # — на SQLite внешние ключи по умолчанию вообще не проверяются. Оставь мы
+    # это каскаду, строки истории осиротели бы навсегда и росли бы без предела,
+    # причём молча: удалённых вещей в интерфейсе нет, и заметить их было бы
+    # неоткуда.
+    doomed = db.query(ReturnItem.id).filter(
+        (ReturnItem.status_changed_at < now - RETURN_KEEP)
+        & ReturnItem.status.in_(RETURN_TERMINAL)).scalar_subquery()
+    stats["return_item_log"] = _purge(
+        db, ReturnItemLog, ReturnItemLog.return_id.in_(doomed), "история возвратов")
+    stats["return_items"] = _purge(
+        db, ReturnItem,
+        (ReturnItem.status_changed_at < now - RETURN_KEEP)
+        & ReturnItem.status.in_(RETURN_TERMINAL),
+        "возвраты")
 
     stats["exchange_archive"] = prune_exchange_archive()
 

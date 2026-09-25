@@ -52,6 +52,12 @@
            означала бы меню без подписей и без картинок — то есть девять
            одинаковых пустых квадратов. #}
         <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+            <symbol id="i-returns" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                    stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M2 5.5 8 2.5l6 3v5l-6 3-6-3z"/>
+                <path d="M2 5.5 8 8.5l6-3M8 8.5v5"/>
+                <path d="M6.2 11.4 4.4 9.6l1.8-1.8"/>
+            </symbol>
             <symbol id="i-mapping" viewBox="0 0 16 16" fill="none" stroke="currentColor"
                     stroke-width="1.6" stroke-linecap="round">
                 <path d="M6.5 9.5 9.5 6.5"/>
@@ -136,6 +142,7 @@
                 </button>
             </div>
             {% set items = [
+                ('returns', '/returns', 'Возвраты', 'i-returns'),
                 ('mapping', '/mapping', 'Мэппинг', 'i-mapping'),
                 ('platform-matching', '/platform-matching', 'Сопоставление площадок', 'i-matching'),
                 ('products', '/products', 'Товары и остатки', 'i-products'),
@@ -155,7 +162,9 @@
             {% set titles = {
                 'missing-cards': 'Есть на складе — нет на площадке',
             } %}
-            {% for key, href, label, icon in items %}
+            {# Фильтр — та же функция, что стережёт вход в страницу. Пункт,
+               который всё равно не откроется, показывать незачем. #}
+            {% for key, href, label, icon in items if can_see(current_user, href) %}
             {# title обязателен: в свёрнутом меню подпись не видна, и без него
                иконки становятся ребусом. #}
             <a class="nav__item {% if active_page == key %}active{% endif %}"

@@ -37,6 +37,21 @@ class AnomalyStatus(str, enum.Enum):
 # Пользователи админки (страница входа)
 # ---------------------------------------------------------------------------
 
+class UserRole(str, enum.Enum):
+    """Роль определяет, какие страницы видно. Список — в `app/access.py`.
+
+    `admin` — всё, как было до появления ролей; им и остаются все учётные
+    записи, заведённые раньше (миграция проставляет его явно: молча отнять у
+    живого человека доступ хуже, чем дать лишний).
+
+    `warehouse` — склад: только раздел возвратов. Он принимает вещи и решает их
+    судьбу, и этого ему достаточно; на остальных страницах есть кнопки, которые
+    в один клик двигают боевые остатки по всему каталогу.
+    """
+    admin = "admin"
+    warehouse = "warehouse"
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -48,6 +63,7 @@ class User(Base):
     # Защита от подбора пароля — раздел про ограничение попыток входа.
     failed_login_attempts = Column(Integer, default=0, nullable=False)
     locked_until = Column(DateTime, nullable=True)
+    role = Column(Enum(UserRole), default=UserRole.admin, nullable=False)
 
 
 # ---------------------------------------------------------------------------
@@ -553,7 +569,12 @@ class FtpTask(Base):
     warehouse_to = Column(String(64), nullable=True)
     quantity = Column(Integer, nullable=True)
     order_id = Column(String(128), nullable=False, index=True)
-    account_id = Column(Integer, ForeignKey("platform_accounts.id"), nullable=False)
+    # Кабинет НЕобязателен: у возврата его нет вовсе. Оприходование идёт на ЦС,
+    # ИП к документу отношения не имеет, а на приёмке кабинет и неизвестен.
+    # Площадка при этом нужна — по ней выбирается склад-источник, — поэтому она
+    # своим полем: у заказа берётся из кабинета, у возврата стоит прямо.
+    account_id = Column(Integer, ForeignKey("platform_accounts.id"), nullable=True)
+    platform = Column(Enum(Platform), nullable=True)
     # Дата документа перемещения в 1С (старт задним числом). NULL = текущая дата.
     movement_date = Column(Date, nullable=True)
     # Задания разбирают по статусу: «в пути» для расчёта остатка, `timeout` для
@@ -863,3 +884,130 @@ class RecalcItem(Base):
     error = Column(Text, nullable=True)
 
     job = relationship("RecalcJob", back_populates="items")
+
+
+# ---------------------------------------------------------------------------
+# Возвраты с площадок. Вещь физически приезжает на склад, проходит проверку и
+# либо возвращается в продажу (перемещение склад площадки → ЦС в 1С), либо
+# утилизируется (в 1С не идёт ничего — её там уже нет).
+#
+# Главное про остаток: **пока вещь в разборе, её нет НИГДЕ** — ни в нашем
+# `stock_on_hand`, ни в снимке 1С. Они сходятся, и сверке подстраивать нечего.
+# Остаток растёт ровно в момент, когда 1С ответила по заданию, и растёт он
+# обычным путём — часовым снимком.
+# ---------------------------------------------------------------------------
+
+class ReturnStatus(str, enum.Enum):
+    accepted = "accepted"          # принят сканом, ждёт проверки
+    cleaning = "cleaning"          # в химчистке
+    repack = "repack"              # на переупаковке
+    held = "held"                  # отложен: посмотрели, решение не приняли
+    # Решено вернуть в продажу, задание в 1С в пути. Выйти отсюда РУКАМИ нельзя:
+    # заявить, что остаток вырос, пока 1С этого не сказала, — ровно тот дефект,
+    # ради которого весь этот проект и переписывался.
+    awaiting_1c = "awaiting_1c"
+    back_to_sale = "back_to_sale"  # 1С оприходовала — терминальный
+    rejected_1c = "rejected_1c"    # 1С отказала или задание разобрано как «документа нет»
+    scrapped = "scrapped"          # утилизирован — терминальный
+
+
+class ScrapReason(str, enum.Enum):
+    """Почему утилизировали. ОБЯЗАТЕЛЬНА, и не ради порядка.
+
+    «Утилизировано 40» — число без смысла. «Из них 12 подмена» — повод для
+    претензии площадке, а подмена товара при возврате на маркетплейсах штука
+    обычная и дорогая.
+    """
+    defect = "defect"        # брак
+    worn = "worn"            # износ, следы носки
+    swapped = "swapped"      # подмена: вернули не тот товар
+    illiquid = "illiquid"    # неликвид
+
+
+# Переходы. Таблица — ЕДИНСТВЕННЫЙ источник правды о том, что куда можно:
+# разойдись она с кнопками на странице, страница предлагала бы переход, который
+# не состоится, и человек решил бы, что кнопка не нажимается.
+RETURN_TRANSITIONS = {
+    # Из рабочих статусов — в любой другой рабочий, в отправку и в утиль.
+    ReturnStatus.accepted: (ReturnStatus.cleaning, ReturnStatus.repack,
+                            ReturnStatus.held, ReturnStatus.awaiting_1c,
+                            ReturnStatus.scrapped),
+    ReturnStatus.cleaning: (ReturnStatus.repack, ReturnStatus.held,
+                            ReturnStatus.awaiting_1c, ReturnStatus.scrapped),
+    ReturnStatus.repack: (ReturnStatus.cleaning, ReturnStatus.held,
+                          ReturnStatus.awaiting_1c, ReturnStatus.scrapped),
+    ReturnStatus.held: (ReturnStatus.cleaning, ReturnStatus.repack,
+                        ReturnStatus.awaiting_1c, ReturnStatus.scrapped),
+    # Из «ждём 1С» — НИКУДА руками. Оба выхода ставит ответ 1С, и только он.
+    ReturnStatus.awaiting_1c: (),
+    # Отказ 1С разбирает человек: повторить, отложить или выбросить.
+    ReturnStatus.rejected_1c: (ReturnStatus.awaiting_1c, ReturnStatus.held,
+                               ReturnStatus.scrapped),
+    ReturnStatus.back_to_sale: (),
+    ReturnStatus.scrapped: (),
+}
+
+# Переходы, которые ставит ТОЛЬКО ответ 1С, минуя таблицу выше.
+RETURN_BY_1C = (ReturnStatus.back_to_sale, ReturnStatus.rejected_1c)
+
+
+class ReturnItem(Base):
+    """Одна ФИЗИЧЕСКАЯ вещь. Количество всегда 1, и это не упрощение.
+
+    Баркод опознаёт SKU, а не вещь: три одинаковых свитшота 62 размера дают три
+    записи с одним баркодом. Статусы при этом персональные — одна уехала в
+    химчистку, вторая в утиль, — значит строка обязана быть одна на вещь, а
+    различать их в руках позволяет наклейка с номером `RET-<id>`, которая
+    печатается сразу на приёмке. Без наклейки статус через неделю стоял бы не на
+    той вещи, и страница уверенно показывала бы неправду.
+    """
+    __tablename__ = "return_items"
+
+    id = Column(Integer, primary_key=True)
+    created_at = Column(DateTime, default=now_utc, nullable=False, index=True)
+    # Что отсканировали, КАК ЕСТЬ. Даже если товар в 1С не нашёлся: вещь
+    # физически существует независимо от нашего мэппинга, и отказать в приёмке
+    # значит заставить человека отложить её в сторону и забыть.
+    barcode = Column(String(64), nullable=False, index=True)
+    uid_1c = Column(String(36), nullable=True, index=True)
+    # Площадка ОБЯЗАТЕЛЬНА: она определяет склад-источник перемещения в 1С
+    # (`PENDING_WAREHOUSE_NAME`). Кабинет (ИП) тут ни при чём — карта складов
+    # заведена по площадке. На приёмке площадка известна не по вещи, а по
+    # КОРОБКЕ: кладовщик едет в конкретный ПВЗ и привозит возвраты одной
+    # площадки, поэтому она выбирается сессией приёмки, а не на каждый скан.
+    platform = Column(Enum(Platform), nullable=False, index=True)
+    status = Column(Enum(ReturnStatus), default=ReturnStatus.accepted,
+                    nullable=False, index=True)
+    status_changed_at = Column(DateTime, default=now_utc, nullable=False)
+    scrap_reason = Column(Enum(ScrapReason), nullable=True)
+    note = Column(String(255), nullable=True)
+    ftp_task_id = Column(Integer, ForeignKey("ftp_tasks.id"), nullable=True)
+    # Та же граница безопасности, что у очереди рассылки и заданий 1С. Ставится
+    # с первого дня, а не когда понадобится: дописывать флаг задним числом по
+    # живой таблице — худший момент из возможных.
+    is_test = Column(Boolean, default=False, nullable=False)
+
+    task = relationship("FtpTask")
+    events = relationship("ReturnItemLog", back_populates="item",
+                          cascade="all, delete-orphan", passive_deletes=True)
+
+
+class ReturnItemLog(Base):
+    """История по КОНКРЕТНОЙ вещи.
+
+    Отдельной таблицей, а не записями в общий журнал действий, по той же
+    причине, что и история расхождения: нужна цепочка по одной вещи, а массовые
+    пути (кнопки по отбору) в журнал построчно не пишут вовсе — следа по строке
+    там нет.
+    """
+    __tablename__ = "return_item_log"
+
+    id = Column(Integer, primary_key=True)
+    return_id = Column(Integer, ForeignKey("return_items.id", ondelete="CASCADE"),
+                       nullable=False, index=True)
+    at = Column(DateTime, default=now_utc, nullable=False)
+    from_status = Column(Enum(ReturnStatus), nullable=True)
+    to_status = Column(Enum(ReturnStatus), nullable=False)
+    note = Column(String(255), nullable=True)
+
+    item = relationship("ReturnItem", back_populates="events")

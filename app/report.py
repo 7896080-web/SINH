@@ -587,13 +587,26 @@ def _check_tasks_needing_review(db: Session) -> Finding | None:
     rows = tasks_needing_review(db)
     if not rows:
         return None
+    from app.returns import RETURN_COMMAND
+
     cancels = [t for t in rows if t.command == "CANCEL_MOVEMENT"]
-    consequence = ("Пока решение не принято, эти единицы считаются «в пути»: остаток "
-                   "занижен, и наружу уходит меньше товара, чем есть на складе.")
+    returns_ = [t for t in rows if t.command == RETURN_COMMAND]
+    creates = len(rows) - len(cancels) - len(returns_)
+    parts = []
+    if creates:
+        parts.append(f"созданий: {creates} — пока решение не принято, эти единицы "
+                     f"считаются «в пути»: остаток занижен, и наружу уходит меньше "
+                     f"товара, чем есть на складе")
     if cancels:
-        consequence += (f" Из них отмен: {len(cancels)} — у них знак ОБРАТНЫЙ: "
-                        f"остаток завышен, наружу уходит больше, чем есть, "
-                        f"то есть прямой оверселл.")
+        parts.append(f"отмен: {len(cancels)} — у них знак ОБРАТНЫЙ: остаток завышен, "
+                     f"наружу уходит больше, чем есть, то есть прямой оверселл")
+    if returns_:
+        # Третий случай не похож ни на один из двух: возврат в «в пути» не
+        # участвует вовсе, то есть остаток не занижен и не завышен — он просто
+        # ещё не вырос, и сам не вырастет никогда.
+        parts.append(f"возвратов: {len(returns_)} — вещи приняты на складе, но 1С их "
+                     f"не оприходовала: остаток не вырос, и продавать их нечем")
+    consequence = "; ".join(parts).capitalize() + "."
     return Finding(
         key="tasks_needing_review", level=CRITICAL,
         title=f"Заданий 1С ждут ручного разбора: {len(rows)}",

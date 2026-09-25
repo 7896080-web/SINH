@@ -195,7 +195,8 @@ def test_every_table_is_reported(db):
 
     assert set(stats) == {"reconciliation_log", "dispatch_queue", "audit_log",
                           "ftp_tasks", "sync_anomalies", "test_log",
-                          "stock_discrepancy_log", "exchange_archive"}
+                          "stock_discrepancy_log", "exchange_archive",
+                          "return_items", "return_item_log"}
 
 
 def test_the_last_discrepancy_row_is_never_deleted(db):

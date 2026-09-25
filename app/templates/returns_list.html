@@ -1,0 +1,136 @@
+{% extends "base.html" %}
+{% block title %}Возвраты — список{% endblock %}
+{% block content %}
+
+{% include "returns_tabs.html" %}
+
+<details class="card" style="margin-bottom:14px">
+    <summary style="cursor:pointer;font-weight:600">Что делать на этой странице и что значат статусы</summary>
+    <p style="margin:10px 0 0;line-height:1.7">
+        Это то, что <strong>осталось доделать</strong>. Готовые вещи —
+        возвращённые в продажу и утилизированные — в сводку не идут: по ним
+        решение принято. Найти их можно поиском или отбором по статусу.
+        Разбирают список сверху: клетка сводки открывает свой отбор, строка
+        открывает вещь.
+    </p>
+    <p style="margin:10px 0 0;line-height:1.7">
+        Если вещь у вас в руках — не ищите её в списке, просто
+        <strong>отсканируйте наклейку</strong> в поле на «Приёмке»: оно откроет
+        именно эту вещь. Это надёжнее глаз: наклейка отличает три одинаковых
+        свитшота друг от друга, а артикул с размером — нет.
+    </p>
+    {# Легенда берётся из того же `RETURN_HINTS`, что и подсказка на странице
+       вещи: два списка статусов разошлись бы, и человек, читающий их буквально,
+       перестал бы верить обоим. #}
+    <table style="margin-top:12px">
+        <thead><tr><th>Статус</th><th>Что это значит</th><th>Что делать</th></tr></thead>
+        <tbody>
+        {% for st, hint in hints.items() %}
+        <tr>
+            <td style="white-space:nowrap"><strong>{{ labels[st] }}</strong></td>
+            <td>{{ hint[0] }}</td>
+            <td>{{ hint[1] }}</td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</details>
+
+<div class="card" style="padding:0;overflow:hidden">
+    <div style="padding:10px 16px;border-bottom:1px solid var(--line-soft);font-size:13px;color:var(--ink-soft)">
+        СЕЙЧАС В РАБОТЕ — любая клетка открывает отбор. Готовые вещи сюда не идут:
+        сводка про то, что надо доделать
+    </div>
+    <div class="table-scroll">
+    <table>
+        <thead><tr>
+            <th>Площадка</th>
+            {% for s in in_work %}<th style="text-align:right">{{ labels[s] }}</th>{% endfor %}
+            <th style="text-align:right">Всего</th>
+        </tr></thead>
+        <tbody>
+        {% for p in platforms %}
+        <tr>
+            <td><span class="badge" style="background:{{ platform_colors[p] }};color:#fff">{{ platform_labels[p] }}</span></td>
+            {% set ns = namespace(row=0) %}
+            {% for s in in_work %}
+                {% set n = grid.get((p, s), 0) %}
+                {% set ns.row = ns.row + n %}
+                <td style="text-align:right">{% if n %}<a href="/returns/list?platform={{ p.value }}&status={{ s.value }}">{{ n }}</a>{% else %}0{% endif %}</td>
+            {% endfor %}
+            <td style="text-align:right"><strong>{{ ns.row }}</strong></td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    </div>
+</div>
+
+<form method="get" action="/returns/list" class="card" style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
+    <div>
+        <label for="q">Поиск</label><br>
+        <input id="q" name="q" value="{{ q }}" placeholder="артикул, баркод или RET-номер" style="width:250px">
+    </div>
+    <div>
+        <label for="st">Статус</label><br>
+        <select id="st" name="status">
+            <option value="">все</option>
+            {% for s in labels %}<option value="{{ s.value }}" {% if f_status == s.value %}selected{% endif %}>{{ labels[s] }}</option>{% endfor %}
+        </select>
+    </div>
+    <div>
+        <label for="pl">Площадка</label><br>
+        <select id="pl" name="platform">
+            <option value="">все</option>
+            {% for p in platforms %}<option value="{{ p.value }}" {% if f_platform == p.value %}selected{% endif %}>{{ platform_labels[p] }}</option>{% endfor %}
+        </select>
+    </div>
+    <button type="submit" class="btn">Показать</button>
+    <a class="btn" href="/returns/list">Сбросить</a>
+</form>
+
+<div class="card" style="padding:0;overflow:hidden">
+    <div class="table-scroll">
+    <table>
+        <thead><tr>
+            <th>Номер</th><th>Принят</th><th>Товар</th><th>Площадка</th><th>Статус</th>
+            <th style="text-align:right">В статусе</th>
+        </tr></thead>
+        <tbody>
+        {% for item in rows %}
+        {% set p = products.get(item.uid_1c) %}
+        {% set age = (now - item.status_changed_at).days %}
+        <tr>
+            <td><a href="/returns/item/{{ item.id }}" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-weight:600">{{ label_number(item) }}</a></td>
+            <td style="color:var(--ink-soft)">{{ item.created_at.strftime('%d.%m %H:%M') }}</td>
+            <td>{% if p %}{{ p.article }} · {{ p.size or '' }} · {{ p.color or '' }}
+                {% else %}<span style="color:var(--warn)">баркод {{ item.barcode }} — товар 1С не определён</span>{% endif %}</td>
+            <td><span class="badge" style="background:{{ platform_colors[item.platform] }};color:#fff">{{ platform_labels[item.platform] }}</span>
+                {# Пометка в СТРОКЕ, а не только полоса наверху: после выхода из
+                   режима строк быть не должно вовсе, но если хоть одна уцелела,
+                   список обязан сказать об этом там, где на него смотрят. #}
+                {% if item.is_test %}<span class="badge" style="background:#8a4b00;color:#fff">ТРЕНИРОВКА</span>{% endif %}</td>
+            <td>{{ labels[item.status] }}{% if item.scrap_reason %} · {{ scrap_labels[item.scrap_reason] }}{% endif %}</td>
+            <td style="text-align:right{% if age >= 3 and item.status in in_work %};color:var(--bad);font-weight:600{% endif %}">
+                {% if age %}{{ age }} сут{% else %}сегодня{% endif %}
+            </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6" style="color:var(--ink-soft)">Ничего не нашлось.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    </div>
+    {% if total > rows|length %}
+    <div style="padding:10px 16px;background:var(--warn-soft);color:var(--warn)">
+        Показаны первые {{ rows|length }} из {{ total }} — уточните отбор.
+    </div>
+    {% endif %}
+</div>
+
+<p style="font-size:13px;color:var(--ink-soft)">
+    «Вернуть в продажу» и «Утилизировать» в списке отсутствуют намеренно: оба решения
+    принимаются по одной вещи на её карточке, где видно, что именно держишь в руках.
+</p>
+
+{% endblock %}

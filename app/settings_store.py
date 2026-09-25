@@ -144,8 +144,18 @@ RCLONE_FIELDS = [
                "сошлось, а суточная выгрузка молчит."),
 ]
 
+# Тренировочный режим возвратов. Поле заведено ЗДЕСЬ, потому что `set_value`
+# пишет только известные ему настройки, но на страницу «Уведомления» оно НЕ
+# идёт (его нет в группах `as_cards`): переключают его с самой страницы
+# возвратов, там же, где им пользуются. Настройка, которую ищут не там, где
+# работают, равна отсутствующей.
+RETURNS_FIELDS = [
+    Field("RETURNS_TEST_MODE", "Тренировочный режим возвратов",
+          hint="1 — вещи заводятся тренировочными и наружу не уходят."),
+]
+
 ALL_FIELDS = (TELEGRAM_FIELDS + EMAIL_FIELDS + COMMON_FIELDS
-              + BACKUP_FIELDS + RCLONE_FIELDS)
+              + BACKUP_FIELDS + RCLONE_FIELDS + RETURNS_FIELDS)
 BY_NAME = {f.name: f for f in ALL_FIELDS}
 
 

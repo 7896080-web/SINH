@@ -52,5 +52,23 @@ def static_url(name: str) -> str:
 
 
 templates = Jinja2Templates(directory="app/templates")
+
+
+def can_see(user, href: str) -> bool:
+    """Показывать ли пункт меню. ТА ЖЕ функция, что стережёт вход в страницу.
+
+    Разойдись они — меню предлагало бы то, что не откроется, либо прятало то,
+    что открывается. Прятать пункт при этом не защита, а вежливость: адрес можно
+    набрать руками, и стережёт доступ именно отказ в `get_current_user`.
+    """
+    from app import access
+
+    if user is None:
+        return False
+    role = user.role.value if hasattr(user.role, "value") else str(user.role)
+    return access.allowed(role, href)
+
+
+templates.env.globals["can_see"] = can_see
 templates.env.globals["static_url"] = static_url
 templates.env.globals["static_version"] = STATIC_VERSION

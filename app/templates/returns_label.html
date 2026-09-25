@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>{{ number }}</title>
+<style>
+/* Страница ровно в размер этикетки. Если рулон другой — поменяйте здесь и в
+   настройках драйвера принтера: расходиться им нельзя, иначе печать уедет. */
+@page { size: 58mm 40mm; margin: 0; }
+html, body { margin: 0; padding: 0; }
+body { width: 58mm; height: 40mm; font-family: -apple-system, "Segoe UI", Arial, sans-serif; }
+.wrap { box-sizing: border-box; width: 58mm; height: 40mm; padding: 2mm 3mm; }
+.num { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 20pt; font-weight: 700; letter-spacing: .02em; }
+.small { font-size: 7pt; }
+.muted { font-size: 7pt; color: #333; }
+@media screen { body { margin: 20px auto; border: 1px dashed #888; } }
+</style>
+</head>
+<body onload="window.print()">
+<div class="wrap">
+    <div class="num">{{ number }}</div>
+    {{ barcode|safe }}
+    <div class="small">{% if product %}{{ product.article }} · {{ product.size or '' }} · {{ product.color or '' }}{% else %}{{ item.barcode }}{% endif %}</div>
+    <div class="muted">{{ platform_label }} · {{ accepted_on.strftime('%d.%m.%Y') }}</div>
+</div>
+</body>
+</html>

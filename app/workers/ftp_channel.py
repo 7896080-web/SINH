@@ -7,6 +7,8 @@ from app.timeutils import now_utc
 
 from sqlalchemy.orm import Session
 
+from app.returns import RETURN_COMMAND, apply_1c_result
+
 from app.models import (FtpTask, FtpTaskStatus, OrderProcessStatus, Platform,
                         ProcessedOrder, StockDateRow, StockDateSnapshot,
                         StockDateStatus, StockDeltaDocument)
@@ -349,7 +351,9 @@ def build_task_batch(db: Session, max_lines: int = 500, request_stock_export: bo
         # .epf на старой базе про кабинеты ничего не знает, ей нужен только
         # физический товар и склад. Имя кабинета оседает в комментарии
         # документа, если понадобится аудит "какой именно ИП продал".
-        platform_value = t.account.platform.value
+        # У возврата кабинета нет — площадка стоит на самом задании.
+        platform_value = (t.account.platform.value if t.account is not None
+                          else (t.platform.value if t.platform else ""))
         # Дата документа (старт задним числом), ГГГГММДД; пусто = текущая дата в 1С.
         mdate = t.movement_date.strftime("%Y%m%d") if t.movement_date else ""
         if t.command == "CREATE_MOVEMENT":
@@ -365,6 +369,13 @@ def build_task_batch(db: Session, max_lines: int = 500, request_stock_export: bo
             ]))
         elif t.command == "CANCEL_MOVEMENT":
             lines.append("|".join(["CANCEL_MOVEMENT", t.order_id, platform_value]))
+        elif t.command == RETURN_COMMAND:
+            # Возврат: зеркало приёма заказа, «склад площадки → ЦС». Формат
+            # строки тот же, что у создания, — 1С разбирает их одним циклом.
+            lines.append("|".join([
+                RETURN_COMMAND, t.barcode, t.warehouse_from or "", t.warehouse_to or "ЦС Склад",
+                str(t.quantity or 0), t.order_id, platform_value, mdate,
+            ]))
 
         t.status = FtpTaskStatus.sent
         t.batch_filename = filename
@@ -839,6 +850,12 @@ def apply_result_batch(db: Session, content: str) -> dict:
         task.completed_at = now_utc()
         closed_ids.add(task.id)
 
+        # Возврат: статус вещи двигает ТОЛЬКО ответ 1С — ни одна кнопка на
+        # странице из «ждём 1С» не выводит. Здесь и есть единственный путь в
+        # «возвращён в продажу», то есть в растущий остаток.
+        if task.command == RETURN_COMMAND:
+            apply_1c_result(db, task, ok)
+
         if not ok:
             logger.error("1С отказала по заданию %s %s: %s", task.command, order_id, detail[:255])
         stats["ok" if ok else "error"] += 1
@@ -1007,6 +1024,55 @@ def tasks_needing_review(db: Session) -> list[FtpTask]:
     return out
 
 
+# --------------------------------------------------------------------------- ручной разбор
+
+def review_effect(task: FtpTask) -> dict:
+    """Что зависшее задание делает с остатком СЕЙЧАС и что изменит решение.
+
+    Один текст на четырёх читателей: карточка «Диагностики» (`_stuck_rows`),
+    подтверждение у кнопки «документа нет», сообщение после неё и находка отчёта
+    `_check_tasks_needing_review`. Раньше их было четыре разных, собранных по
+    СОЗДАНИЮ, и они уже расходились между собой: у отмены знак обратный, и
+    человек, читавший предупреждение буквально, отказывался нажимать — оставляя
+    систему ровно в опасном состоянии.
+
+    Направление зависит от команды, и третий случай, возврат, не похож ни на
+    один из двух. `RETURN_TO_STOCK` в «в пути» НЕ участвует вовсе
+    (`reconciliation._in_flight_adjustment` знает только создание и отмену), то
+    есть остаток не занижен и не завышен — он просто ещё не вырос: вещь лежит на
+    складе, 1С её не оприходовала, и на площадки она не уедет. Описать это
+    словами создания («остаток занижен, наружу уходит меньше») значило бы
+    пообещать, что оно рассосётся сверкой само, — а оно не рассосётся никогда.
+    """
+    qty = task.quantity or 0
+    if task.command == "CANCEL_MOVEMENT":
+        return {
+            "effect": f"остаток завышен на {qty} — наружу уходит больше, чем есть "
+                      f"(риск оверселла)",
+            "no_document_effect": f"остаток УМЕНЬШИТСЯ на {qty} после ближайшей сверки: "
+                                  f"1С товар не вернула, и возвращать его нам тоже не за чем",
+            "warning": "Применяйте, если возврата от площадки физически не было.",
+            "oversell": True,
+        }
+    if task.command == RETURN_COMMAND:
+        return {
+            "effect": f"вещь принята на складе, но 1С её не оприходовала: остаток "
+                      f"не вырос на {qty}, и на площадки она не уедет",
+            "no_document_effect": "остаток НЕ изменится: 1С вещь не приходовала. "
+                                  "Возврат вернётся в разбор, и решение придётся "
+                                  "принять заново",
+            "warning": "Вещь останется непринятой: пока возврат не проведут, "
+                       "продавать её нечем.",
+            "oversell": False,
+        }
+    return {
+        "effect": f"остаток занижен на {qty} — наружу уходит меньше, чем есть",
+        "no_document_effect": f"остаток ВЫРАСТЕТ на {qty}: 1С единицу не списала",
+        "warning": "Если товар на самом деле ОТГРУЖЕН, площадки начнут продавать проданное.",
+        "oversell": False,
+    }
+
+
 def resolve_stuck_task(db: Session, task: FtpTask, document_exists: bool,
                        actor: str) -> FtpTask:
     """Закрывает зависшее задание решением человека, посмотревшего в 1С.
@@ -1025,6 +1091,10 @@ def resolve_stuck_task(db: Session, task: FtpTask, document_exists: bool,
     task.result_detail = ("разобрано вручную (%s): документ в 1С %s"
                           % (actor, "найден" if document_exists else "не найден"))[:255]
     task.completed_at = now_utc()
+    # Возврат ждёт ответа так же, как ждал бы ответа 1С: не сдвинь мы его здесь,
+    # вещь осталась бы в «ждём 1С» навсегда — молча, при закрытом задании, и
+    # увидеть это можно было бы только придя смотреть глазами.
+    apply_1c_result(db, task, document_exists)
     db.commit()
     logger.info("resolve_stuck_task: #%s %s -> %s (%s)",
                 task.id, task.order_id, task.status.value, actor)
