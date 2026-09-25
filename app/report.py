@@ -628,6 +628,146 @@ def _check_broadcast_without_recalc(db: Session) -> Finding | None:
     )
 
 
+# Сколько строк расхождения порога забираем за раз. Это не потолок беды, а
+# защита часового отчёта: на исправной системе таких строк НОЛЬ, а на сломанной
+# их может оказаться весь каталог — 23.09 одна кнопка схлопнула 62 штуки, и
+# ничто не мешало ей схлопнуть 152 тысячи.
+OFFSET_DISAGREE_LIMIT = 500
+
+
+@dataclass(frozen=True)
+class OffsetDisagreement:
+    """Строка расхождения порога с формулой — всё, что нужно и находке, и списку."""
+    uid_1c: str
+    article: str
+    size: str
+    color: str
+    name: str
+    stock: int
+    reserve: int
+    discrepancy: int | None
+    offset_now: int
+    offset_by_formula: int
+
+    goes_now: int
+    goes_by_formula: int
+
+
+def _q_offset_disagrees(db: Session) -> list[OffsetDisagreement]:
+    """Товары, у которых порог не равен тому, что даёт формула.
+
+    Сравнение делает САМ `offset_from_base`, а не повторённая здесь
+    арифметика. Повтори мы формулу запросом — она однажды разошлась бы с той,
+    по которой живёт система, и находка обещала бы не то, что произойдёт:
+    молчала бы на настоящей порче либо мигала на исправной. Тем же правилом
+    считается chrtId в `_check_wb_without_chrt` и ключ отправки в каталоге.
+
+    Запрос поэтому отбирает только КАНДИДАТОВ, и отбирает по колонкам, а не по
+    числам. Условий три, и каждое отсекает состояние, у которого следствия нет.
+
+    Трансляция включена: у выключенной строки неверный порог наружу пока не
+    уходит, а находка без следствия приучает пролистывать отчёт целиком.
+
+    Порог ЕСТЬ. Строка без порога под управлением порога и не находится:
+    лестница отдаёт по ней «остаток минус бронь», и формула на такой строке
+    (расхождения нет, дата есть, факта нет) даёт ровно бронь — то есть то же
+    самое число. Объяви мы это расхождением, находка горела бы на каждой
+    настроенной, но ещё не измеренной строке, ничего при этом не означая.
+
+    Порог есть из чего вывести — ровно граница, на которой `offset_from_base`
+    отдаёт None: там живёт число, введённое руками, и спорить с ним не о чем.
+
+    Колонки берём поимённо, а не объектами ORM: строк здесь на боевом каталоге
+    может быть под сотню тысяч, и собирать на каждую полный Product ради семи
+    полей — ровно то, на чём 21.09 встала страница «нет на площадке». Формулу
+    при этом зовём настоящую, подставив ей временный Product: единственный
+    источник правды дороже, чем экономия на семи присваиваниях.
+    """
+    from app.transmit import offset_from_base, sku_quantity
+
+    query = db.query(
+        Product.uid_1c, Product.article, Product.size, Product.color, Product.name,
+        Product.stock_on_hand, Product.reserve, Product.stock_discrepancy,
+        Product.broadcast_offset, Product.offset_base_date, Product.offset_base_stock,
+        Product.fact_at_date,
+    ).filter(
+        Product.broadcast_enabled.is_(True),
+        Product.broadcast_offset.isnot(None),
+        or_(
+            Product.stock_discrepancy.isnot(None),
+            and_(Product.offset_base_date.isnot(None),
+                 Product.offset_base_stock.isnot(None)),
+        ),
+    ).order_by(Product.article)
+
+    found: list[OffsetDisagreement] = []
+    for (uid, article, size, color, name, stock, reserve, discrepancy,
+         offset, base_date, base_stock, fact) in query.yield_per(1000):
+        row = Product(
+            stock_on_hand=stock, stock_discrepancy=discrepancy, reserve=reserve,
+            offset_base_date=base_date, offset_base_stock=base_stock,
+            fact_at_date=fact, broadcast_offset=offset)
+        expected = offset_from_base(row)
+        if expected is None or offset == expected:
+            continue
+        # «Сколько уходит» считает та же лестница, что и рассылка: повтори мы
+        # `max(0, остаток − порог)` здесь, находка однажды назвала бы не то
+        # число, которое площадка получит.
+        goes_now = sku_quantity(row)
+        row.broadcast_offset = expected
+        goes_by_formula = sku_quantity(row)
+        found.append(OffsetDisagreement(
+            uid_1c=uid, article=article or "", size=size or "", color=color or "",
+            name=name or "", stock=stock or 0, reserve=reserve or 0,
+            discrepancy=discrepancy, offset_now=offset, offset_by_formula=expected,
+            goes_now=goes_now, goes_by_formula=goes_by_formula))
+        if len(found) >= OFFSET_DISAGREE_LIMIT:
+            break
+    return found
+
+
+def _check_offset_disagrees(db: Session) -> Finding | None:
+    """Порог не сходится с расхождением и бронью — у транслируемого товара.
+
+    Это главное число всего механизма: `порог = расхождение + бронь`, и наружу
+    уходит «остаток ЦС минус порог». 23.09 его порча стоила 62 товаров и 418
+    лишних штук в продаже, причём каждый шаг по отдельности выглядел верным —
+    механизм удержания подобрал факт под порог, а через три минуты массовая
+    кнопка поставила факт равным учёту и порог честно схлопнулся в ноль.
+    Увидеть это было неоткуда: строка показывала согласованные числа, отчёт
+    молчал, а на площадки уже уехал остаток, завышенный ровно на расхождение.
+
+    Держится инвариант тем, что `recompute_offset` зовут все, кто двигает любое
+    из слагаемых. Находка и проверяет ровно это: разойдись порог с формулой —
+    значит кто-то записал его мимо (новый путь забыл пересчёт, правка в базе,
+    оборванная миграция), и число, уходящее на площадки, больше ничем не
+    подтверждено.
+
+    Молчание на исправной системе обязательно и здесь оно бесплатное:
+    инвариант держится по построению, так что строк ноль — не «повезло», а
+    единственный возможный ответ, пока формулу считает один хозяин.
+    """
+    rows = _q_offset_disagrees(db)
+    if not rows:
+        return None
+    worse = [r for r in rows if r.goes_now > r.goes_by_formula]
+    extra = sum(r.goes_now - r.goes_by_formula for r in worse)
+    tail = (f" Из них {len(worse)} отдают БОЛЬШЕ, чем следует, — "
+            f"суммарно на {extra} шт." if worse else "")
+    return Finding(
+        key="offset_disagrees", level=CRITICAL,
+        title=f"Порог не сходится с расхождением и бронью: {len(rows)} товаров",
+        consequence="Наружу по этим строкам уходит число, которое НЕ следует из "
+                    "измеренного расхождения и брони: порог записан мимо формулы. "
+                    "Больше формулы — прямой оверселл, меньше — товар не продаётся."
+                    + tail,
+        count=len(rows), link="/report/rows/offset_disagrees",
+        details=[f"{r.article or r.uid_1c} {r.size} — порог {r.offset_now}, "
+                 f"а расхождение {r.discrepancy} + бронь {r.reserve} "
+                 f"дают {r.offset_by_formula}"[:120] for r in rows[:10]],
+    )
+
+
 # Сколько просьба «включить трансляцию» может честно ждать своего расчёта.
 # Расчёт идёт минутами, ответ 1С на дату — до десяти минут; сутки означают, что
 # ждать уже нечего.
@@ -1355,6 +1495,7 @@ CHECKS = (
     _check_platform_divergence,
     _check_tasks_needing_review,
     _check_broadcast_without_recalc,
+    _check_offset_disagrees,
     _check_stuck_broadcast_requests,
     _check_wb_without_chrt,
     _check_breaker_disabled,
@@ -1518,6 +1659,14 @@ def _rows_stuck_broadcast_requests(db: Session) -> list[list[str]]:
             for p in _q_stuck_broadcast_requests(db)]
 
 
+def _rows_offset_disagrees(db: Session) -> list[list[str]]:
+    return [[r.article or r.uid_1c, r.size, r.color, r.name,
+             str(r.stock), "—" if r.discrepancy is None else str(r.discrepancy),
+             str(r.reserve), str(r.offset_now), str(r.offset_by_formula),
+             str(r.goes_now), str(r.goes_by_formula)]
+            for r in _q_offset_disagrees(db)]
+
+
 QUEUE_COLUMNS = ["Артикул", "Размер", "Цвет", "Наименование", "Кабинет",
                  "SKU, которым ушло", "Количество", "Что ответила площадка"]
 PRODUCT_COLUMNS = ["Артикул", "Размер", "Цвет", "Наименование", "Остаток ЦС"]
@@ -1577,6 +1726,18 @@ FULL_LIST_GUIDANCE = {
         "Откройте строку на «Товарах» и посмотрите состояние расчёта: чаще "
         "всего это расчёт, закончившийся с проблемами, или кабинет, погашенный "
         "предохранителем. Устраните причину — просьба сработает сама."),
+    "offset_disagrees": (
+        "Порог записан мимо формулы, значит число, уходящее на площадки, ничем "
+        "не подтверждено. Где порог БОЛЬШЕ формулы — наружу уходит меньше, чем "
+        "есть, и товар недопродаётся; где МЕНЬШЕ — уходит больше, и это прямой "
+        "оверселл. Само это не рассосётся: порог пересчитывается только при "
+        "правке одного из слагаемых.",
+        "Сверьте две последние колонки. Если верно число «по формуле» — "
+        "достаточно тронуть бронь или расхождение на «Расхождениях со складом», "
+        "пересчёт вернёт порог сам. Если верен порог, а формула врёт — значит "
+        "расхождение измерено неправильно: поправьте его там же, оно и есть "
+        "первоисточник. И скажите разработчику: строка здесь означает путь, "
+        "который пишет порог, не пересчитывая его."),
     "platform_divergence": (
         "Площадка держит НЕ ТО число, которое мы отправили. Значит в кабинет "
         "пишет кто-то ещё, и выигрывает написавший последним: наш остаток там "
@@ -1606,6 +1767,11 @@ FULL_LISTS = {
                        _rows_negative_stock),
     "stuck_broadcast_requests": ("Просьбы включить трансляцию, не выполненные за сутки",
                                  PRODUCT_COLUMNS, _rows_stuck_broadcast_requests),
+    "offset_disagrees": ("Порог не сходится с расхождением и бронью",
+                        ["Артикул", "Размер", "Цвет", "Наименование", "Остаток ЦС",
+                         "Расхождение", "Бронь", "Порог сейчас", "Порог по формуле",
+                         "Уходит сейчас", "Ушло бы по формуле"],
+                        _rows_offset_disagrees),
     "platform_divergence": ("Площадка держит не то, что мы отправили",
                            ["Артикул", "Размер", "Цвет", "Наименование", "Кабинет",
                             "Чем адресовали", "Отправили", "Площадка держит",
