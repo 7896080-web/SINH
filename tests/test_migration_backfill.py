@@ -403,3 +403,99 @@ def test_the_discrepancy_migration_survives_its_own_interruption(tmp_path):
     assert rows["u1"] == 99, "уже перенесённое не переписано"
     assert rows["u2"] == -7, "остальное доделано"
     assert "ix_stock_discrepancy_log_created_at" in indexes
+
+
+# ---------------------------------------------------------------------------
+# Миграция bd8f521a8957 — возвраты и роли пользователей
+# ---------------------------------------------------------------------------
+
+RETURNS_BEFORE = "930c4c4db5e9"
+
+
+def test_the_returns_migration_survives_its_own_interruption(tmp_path):
+    """Самый долгий шаг здесь — перестройка `ftp_tasks` при живых службах:
+    таблица на бою в десятки тысяч строк. Обрыв на ней оставляет
+    `_alembic_tmp_ftp_tasks`, и повтор падает на «table … already exists»
+    НАВСЕГДА — продолжить нечем, повторить нечем, службы не перезапущены.
+
+    Имитируем остатки прогона, оборвавшегося в РАЗНЫХ местах сразу: таблица
+    возвратов заведена, часть индексов есть, колонка `users.role` уже добавлена,
+    а временная таблица batch-режима осталась.
+    """
+    db = tmp_path / "alembic_returns_test.db"
+    url = "sqlite:///" + str(db)
+    _alembic(url, RETURNS_BEFORE)
+
+    conn = sqlite3.connect(str(db))
+    conn.execute("CREATE TABLE return_items ("
+                 "id INTEGER PRIMARY KEY, created_at DATETIME NOT NULL, "
+                 "barcode VARCHAR(64) NOT NULL, uid_1c VARCHAR(36), "
+                 "platform VARCHAR(10) NOT NULL, status VARCHAR(20) NOT NULL, "
+                 "status_changed_at DATETIME NOT NULL, scrap_reason VARCHAR(20), "
+                 "note VARCHAR(255), ftp_task_id INTEGER, "
+                 "is_test BOOLEAN NOT NULL DEFAULT 0)")
+    conn.execute("CREATE INDEX ix_return_items_barcode ON return_items (barcode)")
+    conn.execute("CREATE TABLE _alembic_tmp_users (id INTEGER PRIMARY KEY)")
+    conn.commit()
+    conn.close()
+
+    _alembic(url, "head")
+
+    conn = sqlite3.connect(str(db))
+    tmp = [t[0] for t in conn.execute(
+        "SELECT name FROM sqlite_master WHERE name LIKE '_alembic_tmp_%'")]
+    indexes = {i[1] for i in conn.execute("PRAGMA index_list(return_items)")}
+    users = {c[1] for c in conn.execute("PRAGMA table_info(users)")}
+    tasks = {c[1] for c in conn.execute("PRAGMA table_info(ftp_tasks)")}
+    conn.close()
+
+    assert tmp == [], "временная таблица batch-режима осталась в базе"
+    assert "ix_return_items_status" in indexes, "миграция не дошла до индексов"
+    assert "role" in users
+    assert "platform" in tasks
+
+
+def test_an_existing_user_keeps_working_after_the_role_appears(tmp_path):
+    """`server_default` здесь не украшение: колонка NOT NULL без умолчания
+    роняет миграцию на первой же существующей строке, а пользователь в базе есть
+    ВСЕГДА — без него в админку не войти. Умолчание `admin` выбрано намеренно:
+    молча отнять доступ у живого человека хуже, чем дать лишний.
+    """
+    db = tmp_path / "alembic_role_default_test.db"
+    url = "sqlite:///" + str(db)
+    _alembic(url, RETURNS_BEFORE)
+
+    conn = sqlite3.connect(str(db))
+    conn.execute("INSERT INTO users (username, password_hash, is_active, "
+                 "failed_login_attempts) VALUES ('старый', 'x', 1, 0)")
+    conn.commit()
+    conn.close()
+
+    _alembic(url, "head")
+
+    conn = sqlite3.connect(str(db))
+    role = conn.execute("SELECT role FROM users WHERE username = 'старый'").fetchone()[0]
+    conn.close()
+    assert role == "admin", "живой человек потерял доступ на миграции"
+
+
+def test_the_return_task_needs_no_account(tmp_path):
+    """У возврата кабинета нет и быть не может: оприходование идёт на ЦС, ИП к
+    документу отношения не имеет, а на приёмке кабинет и неизвестен. Останься
+    `account_id` NOT NULL — задание не создалось бы вовсе, и узналось бы это в
+    руках у кладовщика.
+    """
+    db = tmp_path / "alembic_return_task_test.db"
+    url = "sqlite:///" + str(db)
+    _alembic(url, "head")
+
+    conn = sqlite3.connect(str(db))
+    conn.execute("INSERT INTO ftp_tasks (command, barcode, warehouse_from, "
+                 "warehouse_to, quantity, order_id, status, created_at, is_test, "
+                 "platform) VALUES ('RETURN_TO_STOCK', '111', 'OZON_Склад', "
+                 "'ЦС Склад', 1, 'RET-1', 'pending', '2026-09-25 10:00:00', 0, 'ozon')")
+    conn.commit()
+    row = conn.execute("SELECT account_id, platform FROM ftp_tasks "
+                       "WHERE order_id = 'RET-1'").fetchone()
+    conn.close()
+    assert row == (None, "ozon")

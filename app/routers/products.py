@@ -615,9 +615,14 @@ def products_rows(
 
 
 # Старые адреса — на новую страницу (в закладках и в переписке они ещё живут).
+# Зависимость `get_current_user` здесь не формальность: без неё указатель
+# отвечает КОМУ УГОДНО и отправляет на страницу, которой у пришедшего может не
+# быть вовсе. Кладовщик получал бы 301 и только потом отказ, а не вошедший —
+# 301 и только потом вход: два перехода вместо одного, и на каждом человек
+# успевает решить, что ссылка сломана.
 @router.get("/sync-products")
 @router.get("/stock-control")
-def legacy_redirect(q: str = Query("")):
+def legacy_redirect(q: str = Query(""), user: User = Depends(get_current_user)):
     return RedirectResponse(f"/products{'?q=' + q if q else ''}", status_code=301)
 
 

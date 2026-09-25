@@ -1,0 +1,147 @@
+{% extends "base.html" %}
+{% block title %}Возврат — разбор{% endblock %}
+{% block content %}
+
+{% include "returns_tabs.html" %}
+
+{% if not item %}
+<div class="card"><p>Возврат RET-{{ not_found }} не найден.</p>
+<p><a class="btn" href="/returns">К приёмке</a></p></div>
+{% else %}
+
+<div class="card">
+    <div style="display:flex;align-items:baseline;gap:14px;flex-wrap:wrap">
+        <span style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:28px;font-weight:700">{{ label_number(item) }}</span>
+        <span class="badge" style="background:{{ platform_colors[item.platform] }};color:#fff">{{ platform_labels[item.platform]|upper }}</span>
+        <span class="badge">{{ labels[item.status] }}</span>
+        {# Пометка на САМОЙ вещи, а не только полоса наверху: вещь можно открыть
+           по ссылке из списка уже после выхода из режима, и полоса тогда ничего
+           не скажет. #}
+        {% if item.is_test %}<span class="badge" style="background:#8a4b00;color:#fff">ТРЕНИРОВОЧНАЯ</span>{% endif %}
+        <span style="flex-grow:1"></span>
+        <a class="btn btn--small" href="/returns/item/{{ item.id }}/label" target="_blank">Печать наклейки</a>
+    </div>
+
+    {% if product %}
+    <div style="font-size:19px;font-weight:600;margin-top:8px">{{ product.article }} · {{ product.size or '' }} · {{ product.color or '' }}</div>
+    <div style="color:var(--ink-soft)">{{ product.name or '' }}</div>
+    {% else %}
+    <div style="margin-top:8px;color:var(--warn)">Баркод {{ item.barcode }} не опознан — товара 1С нет. Вернуть в продажу нельзя, пока не сделан мэппинг.</div>
+    {% endif %}
+    <div style="margin-top:8px;font-size:13px;color:var(--ink-soft)">
+        Принят {{ item.created_at.strftime('%d.%m %H:%M') }} · баркод {{ item.barcode }}
+        {% if item.scrap_reason %} · причина: {{ scrap_labels[item.scrap_reason] }}{% endif %}
+    </div>
+</div>
+
+{# Что этот статус значит и что делать — ДВА разных вопроса, поэтому две
+   строки. Подпись «Отложен» не отвечает ни на один, а человек видит её через
+   неделю после того, как сам её поставил, и уже не помнит почему. Текст берётся
+   из `returns.RETURN_HINTS`, рядом с таблицей переходов: подсказка обязана
+   называть те же кнопки, которые страница действительно даст. #}
+{% set hint = hints[item.status] %}
+<div class="card" style="border-left:4px solid {{ platform_colors[item.platform] }}">
+    <div style="font-size:13px;color:var(--ink-soft);margin-bottom:6px">
+        СЕЙЧАС: {{ labels[item.status]|upper }}
+    </div>
+    <div style="font-size:15px;line-height:1.6">{{ hint[0] }}</div>
+    <div style="font-size:15px;line-height:1.6;margin-top:8px">
+        <strong>Что делать:</strong> {{ hint[1] }}
+    </div>
+</div>
+
+{% if item.status.value == 'awaiting_1c' %}
+<div class="card" style="border-color:var(--accent)">
+    <h2 style="margin-top:0;font-size:17px">Задание в 1С</h2>
+    <p>Перемещение <strong>{{ item.task.warehouse_from if item.task else '' }} → {{ item.task.warehouse_to if item.task else '' }}</strong>.
+       Вещь войдёт в остаток, когда 1С ответит, — и только тогда. Руками этот статус не меняется.</p>
+    <form method="post" action="/returns/item/{{ item.id }}/recall">
+        <button type="submit" class="btn btn--danger">Отменить отправку</button>
+        <span style="margin-left:10px;font-size:13px;color:var(--ink-soft)">
+            Возможно, пока задание не ушло в 1С. Ушло — только сторно в самой 1С.
+        </span>
+    </form>
+
+    {% if item.is_test %}
+    {# Без этой кнопки тренировка не доходит до конца: настоящего ответа по
+       тренировочному заданию не будет никогда, и человек не увидел бы ни
+       «возвращён в продажу», ни отказа — то есть ровно тех двух экранов, ради
+       которых тренировка и затевается. Правило «терминальный статус ставит
+       только ответ 1С» цело: статус по-прежнему ставит разбор ответа, просто
+       ответ приносит кнопка. На настоящей вещи она отказывает. #}
+    <div style="margin-top:12px;padding-top:12px;border-top:1px dashed var(--line)">
+        <div style="font-size:13px;color:var(--ink-soft);margin-bottom:8px">
+            ТРЕНИРОВКА: настоящего ответа не будет — ответьте за 1С сами,
+            чтобы увидеть, чем кончается каждый из двух случаев.
+        </div>
+        <form method="post" action="/returns/item/{{ item.id }}/simulate-1c" style="display:inline">
+            <input type="hidden" name="ok" value="1">
+            <button type="submit" class="btn">1С провела документ</button>
+        </form>
+        <form method="post" action="/returns/item/{{ item.id }}/simulate-1c" style="display:inline">
+            <input type="hidden" name="ok" value="0">
+            <button type="submit" class="btn">1С отказала</button>
+        </form>
+    </div>
+    {% endif %}
+</div>
+{% endif %}
+
+{% set moves = [('cleaning','В химчистку'), ('repack','На переупаковку'), ('held','Отложить')] %}
+{% if can[ReturnStatus.cleaning] or can[ReturnStatus.repack] or can[ReturnStatus.held] %}
+<div class="card">
+    <div style="font-size:13px;color:var(--ink-soft);margin-bottom:9px">НУЖНА ОБРАБОТКА</div>
+    <div style="display:flex;gap:12px;flex-wrap:wrap">
+        {% for value, caption in moves %}
+        <form method="post" action="/returns/item/{{ item.id }}/status" style="flex-grow:1">
+            <input type="hidden" name="to" value="{{ value }}">
+            <button type="submit" class="btn" style="width:100%;padding:16px 0;font-size:16px">{{ caption }}</button>
+        </form>
+        {% endfor %}
+    </div>
+</div>
+{% endif %}
+
+{% if can[ReturnStatus.awaiting_1c] or can[ReturnStatus.scrapped] %}
+<div class="card">
+    <div style="font-size:13px;color:var(--ink-soft);margin-bottom:9px">РЕШЕНИЕ — ТОЛЬКО ПОШТУЧНО</div>
+    <div style="display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap">
+        {% if can[ReturnStatus.awaiting_1c] %}
+        <form method="post" action="/returns/item/{{ item.id }}/to-sale" style="flex-grow:1;flex-basis:280px">
+            <button type="submit" class="btn btn-primary" style="width:100%;padding:20px 0;font-size:17px;font-weight:600"
+                    data-confirm="Вернуть {{ label_number(item) }} в продажу? В 1С уйдёт оприходование на ЦС.">
+                Вернуть в продажу
+            </button>
+        </form>
+        {% endif %}
+        {% if can[ReturnStatus.scrapped] %}
+        <form method="post" action="/returns/item/{{ item.id }}/status" style="flex-grow:1;flex-basis:280px">
+            <input type="hidden" name="to" value="scrapped">
+            <label for="why" style="display:block;font-size:13px;color:var(--ink-soft);margin-bottom:4px">Причина утилизации — обязательна</label>
+            <select id="why" name="scrap_reason" required style="width:100%;padding:8px;margin-bottom:8px">
+                <option value="">— выберите —</option>
+                {% for r in scrap_reasons %}<option value="{{ r.value }}">{{ scrap_labels[r] }}</option>{% endfor %}
+            </select>
+            <button type="submit" class="btn btn--danger" style="width:100%;padding:16px 0;font-size:17px;font-weight:600"
+                    data-confirm="Утилизировать {{ label_number(item) }}? Вещь физически выбрасывается, отменить будет нечем.">
+                Утилизировать
+            </button>
+        </form>
+        {% endif %}
+    </div>
+</div>
+{% endif %}
+
+<div class="card">
+    <div style="font-size:13px;color:var(--ink-soft);margin-bottom:2px">ИСТОРИЯ ВЕЩИ</div>
+    <div style="font-size:13px;color:var(--ink-soft);margin-bottom:8px">
+        Кто и когда двигал эту вещь. Сюда же попадает ответ 1С — если она
+        отказала, причина написана здесь.
+    </div>
+    {% for e in events %}
+    <div style="font-size:14px">{{ e.at.strftime('%d.%m %H:%M') }} — {{ labels[e.to_status] }}{% if e.note %} · {{ e.note }}{% endif %}</div>
+    {% endfor %}
+</div>
+
+{% endif %}
+{% endblock %}

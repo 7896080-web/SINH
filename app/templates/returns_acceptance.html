@@ -1,0 +1,123 @@
+{% extends "base.html" %}
+{% block title %}Возвраты — приёмка{% endblock %}
+{% block content %}
+
+<div class="page-header">
+    <div>
+        <h1>Возвраты</h1>
+        <p>Вещь принимается сканом, живёт в статусах и уходит либо обратно в продажу,
+           либо в утиль. В остаток она не входит, пока 1С не оприходует её на ЦС.</p>
+    </div>
+</div>
+
+{% include "returns_tabs.html" %}
+
+{# Инструкция стоит на самой странице, а не в бумажке рядом с монитором:
+   бумажку теряют, а новый человек садится за эту работу без неё. Нумерованные
+   шаги, а не абзац: их читают глазами по диагонали и делают по порядку. #}
+<details class="card" style="margin-bottom:14px" open>
+    <summary style="cursor:pointer;font-weight:600">Что делать на этой странице</summary>
+    <ol style="margin:10px 0 0;padding-left:22px;line-height:1.7">
+        <li>Выберите <strong>площадку коробки</strong> — ту, из чьего ПВЗ привезли.
+            Она запоминается и держится до смены: на каждую вещь выбирать не надо.</li>
+        <li><strong>Сканируйте баркод</strong> вещи. Курсор в поле стоит сам —
+            кликать перед сканом не нужно.</li>
+        <li>Наклейка <strong>печатается сразу</strong>, в отдельном окне.
+            Наклейте её на вещь и положите вещь в разбор.</li>
+        <li>Дальше вещь разбирают на её странице: отсканируйте наклейку
+            <strong>в это же поле</strong> — оно откроет вещь, а не заведёт новую.</li>
+    </ol>
+    <p style="margin:10px 0 0;color:var(--ink-soft)">
+        Баркод <strong>не опознан</strong> — всё равно принимайте: вещь существует
+        независимо от нашей базы, товар 1С к ней привяжут позже.
+        Тот же баркод <strong>второй раз</strong> — страница спросит: две одинаковые
+        вещи подряд бывают, и отбросить вторую молча значит потерять товар.
+        Ошиблись при сканировании — <strong>«Отменить»</strong> в списке ниже,
+        пока вещь не тронута; дальше отменить будет нечем.
+    </p>
+</details>
+
+{# Площадка — свойство КОРОБКИ, а не вещи: кладовщик едет в конкретный ПВЗ и
+   привозит возвраты одной площадки. Спрашивать на каждый скан значит замедлить
+   работу и получить больше ошибок, а не меньше. #}
+<form method="post" action="/returns/platform" style="margin-bottom:14px">
+    <div style="font-size:13px;color:var(--ink-soft);margin-bottom:6px">ПЛОЩАДКА ЭТОЙ КОРОБКИ</div>
+    <div style="display:flex;gap:10px">
+        {% for p in platforms %}
+        <button type="submit" name="platform" value="{{ p.value }}"
+                style="flex-grow:1;padding:13px 0;font-size:16px;border-radius:var(--radius);cursor:pointer;
+                       {% if p == platform %}font-weight:600;color:#fff;background:{{ platform_colors[p] }};border:2px solid {{ platform_colors[p] }}
+                       {% else %}color:var(--ink-soft);background:var(--surface);border:2px solid var(--line){% endif %}">
+            {{ platform_labels[p] }}
+        </button>
+        {% endfor %}
+    </div>
+</form>
+
+{% if ask %}
+<div class="flash flash--warn" style="margin-bottom:14px">
+    Возврат по баркоду <strong>{{ ask.code }}</strong> уже принят
+    <strong>{{ ask.ago }}</strong> мин назад — это {{ ask.twin }}.
+    <form method="post" action="/returns/scan" style="display:inline;margin-left:10px">
+        <input type="hidden" name="code" value="{{ ask.code }}">
+        <input type="hidden" name="confirm_second" value="1">
+        <button type="submit" class="btn btn--small">Это ВТОРАЯ вещь — принять</button>
+    </form>
+    <form method="post" action="/returns/skip-repeat" style="display:inline">
+        <button type="submit" class="btn btn--small">Повторный скан — пропустить</button>
+    </form>
+</div>
+{% endif %}
+
+<div style="border:2px solid {{ platform_colors[platform] }};border-radius:var(--radius);overflow:hidden;background:var(--surface);margin-bottom:16px">
+    <div style="background:{{ platform_colors[platform] }};color:#fff;padding:10px 18px;display:flex;justify-content:space-between;align-items:center">
+        <span style="font-size:17px;font-weight:600">Принимаю: {{ platform_labels[platform]|upper }}</span>
+        <span>принято сегодня: <strong style="font-size:20px">{{ box_count }}</strong></span>
+    </div>
+    <div style="padding:18px">
+        <form method="post" action="/returns/scan">
+            <label for="code" style="display:block;font-size:13px;color:var(--ink-soft);margin-bottom:6px">
+                Товарный баркод — сканер наберёт сам. Номер <strong>RET-…</strong> откроет карточку вещи.
+            </label>
+            <input id="code" name="code" type="text" autofocus autocomplete="off"
+                   placeholder="сканируйте баркод"
+                   style="width:100%;box-sizing:border-box;padding:14px 16px;font-size:20px;
+                          font-family:ui-monospace,Menlo,Consolas,monospace;
+                          border:2px solid var(--accent);border-radius:var(--radius)">
+        </form>
+    </div>
+</div>
+
+<div class="card" style="padding:0;overflow:hidden">
+    <div style="padding:10px 16px;border-bottom:1px solid var(--line-soft);font-size:13px;color:var(--ink-soft)">
+        ПРИНЯТО, ЖДЁТ ПРОВЕРКИ
+    </div>
+    {% for item in recent %}
+    {% set p = products.get(item.uid_1c) %}
+    <div style="display:flex;align-items:center;gap:14px;padding:11px 16px;border-bottom:1px solid var(--line-soft);
+                {% if not item.uid_1c %}background:var(--warn-soft){% endif %}">
+        <a href="/returns/item/{{ item.id }}" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:16px;font-weight:600;width:100px">{{ label_number(item) }}</a>
+        <span style="flex-grow:1;min-width:0">
+            {% if p %}{{ p.article }} · {{ p.size or '' }} · {{ p.color or '' }}
+                <span style="color:var(--ink-soft)">— {{ p.name or '' }}</span>
+            {% else %}<span style="color:var(--warn)">баркод {{ item.barcode }} не опознан — товар 1С определите позже</span>{% endif %}
+        </span>
+        <span class="badge">{{ platform_labels[item.platform] }}</span>
+        {% if item.is_test %}<span class="badge" style="background:#8a4b00;color:#fff">ТРЕНИРОВКА</span>{% endif %}
+        <a class="btn btn--small" href="/returns/item/{{ item.id }}/label" target="_blank">Печать</a>
+        <form method="post" action="/returns/{{ item.id }}/cancel" style="display:inline">
+            <button type="submit" class="btn btn--small">Отменить</button>
+        </form>
+    </div>
+    {% else %}
+    <div style="padding:16px;color:var(--ink-soft)">Пока пусто.</div>
+    {% endfor %}
+</div>
+
+{% if to_print %}
+{# Наклейка печатается сразу после скана, в отдельном окне: страница приёмки
+   остаётся с полем в фокусе, иначе следующий скан уехал бы в никуда. #}
+<script>window.open('/returns/item/{{ to_print }}/label', 'ret_label', 'width=420,height=320');</script>
+{% endif %}
+
+{% endblock %}

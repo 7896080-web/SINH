@@ -1,0 +1,39 @@
+{# Полоса режима — НА КАЖДОЙ странице раздела, а не один раз на входе: через
+   час человек про неё не вспомнит, а неверное представление о том, в каком ты
+   режиме, и есть вся опасность этой затеи. Поэтому она наверху, во всю ширину,
+   и говорит не «тест», а что именно из этого следует. #}
+{% if test_mode %}
+<div style="background:#8a4b00;color:#fff;padding:11px 16px;border-radius:var(--radius);
+            margin-bottom:12px;display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+    <strong style="font-size:17px">ТРЕНИРОВОЧНЫЙ РЕЖИМ</strong>
+    <span style="flex-grow:1">
+        Всё работает как обычно, но наружу не уходит ничего: в 1С задания не
+        поедут, остаток не изменится. Принято здесь: <strong>{{ test_count }}</strong>.
+    </span>
+    <form method="post" action="/returns/test-mode">
+        <input type="hidden" name="on" value="0">
+        <button type="submit" class="btn"
+                data-confirm="Выйти в БОЕВОЙ режим?&#10;&#10;Будет стёрто тренировочных вещей: {{ test_count }} — вместе с их историей и заданиями 1С.&#10;&#10;Если среди них есть НАСТОЯЩИЙ возврат, принятый по ошибке режима, — он тоже исчезнет, и восстановить его будет неоткуда.&#10;&#10;Продолжить?">
+            Выйти в боевой режим
+        </button>
+    </form>
+</div>
+{% endif %}
+
+<div style="display:flex;border-bottom:1px solid var(--line);margin-bottom:16px">
+    <a href="/returns" style="padding:9px 16px;border-bottom:2px solid {% if request.url.path == '/returns' %}var(--accent){% else %}transparent{% endif %}">Приёмка</a>
+    <a href="/returns/list" style="padding:9px 16px;border-bottom:2px solid {% if '/returns/list' in request.url.path %}var(--accent){% else %}transparent{% endif %}">Список</a>
+</div>
+
+{% if not test_mode %}
+{# Вход в тренировку подтверждения НЕ требует: он ничего не разрушает, а лишний
+   вопрос на безопасном действии приучает жать «да» не читая — и тогда вопрос на
+   выходе, где стираются данные, тоже перестанет работать. #}
+<form method="post" action="/returns/test-mode" style="margin:-8px 0 14px">
+    <input type="hidden" name="on" value="1">
+    <button type="submit" class="btn btn--small"
+            title="Принять несколько вещей понарошку: в 1С ничего не уйдёт, а при выходе всё стирается">
+        Потренироваться
+    </button>
+</form>
+{% endif %}

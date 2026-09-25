@@ -163,7 +163,7 @@
                     </form>
                     <form method="post" action="/diagnostics/stuck-tasks/{{ row.task.id }}/resolve"
                           style="display:inline"
-                          onsubmit="return confirm('Документа в 1С нет.\n\nПоследствие: {{ row.no_document_effect }}.\n\n{% if row.is_cancel %}Применяйте, если возврата от площадки физически не было.{% else %}Если товар на самом деле ОТГРУЖЕН, площадки начнут продавать проданное.{% endif %}\n\nПродолжить?')">
+                          onsubmit="return confirm('Документа в 1С нет.\n\nПоследствие: {{ row.no_document_effect }}.\n\n{{ row.warning }}\n\nПродолжить?')">
                         <input type="hidden" name="document_exists" value="no">
                         <button type="submit" class="btn btn--small btn--danger"
                                 title="Документа в 1С нет и не будет. Единица вернётся в остаток — применяйте, только если товар физически на складе.">

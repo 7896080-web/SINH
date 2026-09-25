@@ -16,7 +16,7 @@ from app.models import (
     SyncAnomaly, AnomalyStatus, User,
 )
 from app.workers.ftp_channel import (MAX_REPOSTS, repost_enabled, resolve_stuck_task,
-                                     tasks_needing_review)
+                                     review_effect, tasks_needing_review)
 from app.workers.client_factory import build_client
 from app.workers.credentials import CredentialsMissing
 from app.workers.order_poller import poll_new_orders, poll_cancellations
@@ -167,31 +167,24 @@ def _stuck_rows(db: Session) -> list[dict]:
             if bc is not None:
                 product = db.query(Product).filter(Product.uid_1c == bc.uid_1c).first()
         started = t.sent_at or t.created_at
-        # Направление ошибки у создания и у отмены ПРОТИВОПОЛОЖНОЕ, и карточка
-        # раньше объясняла оба одним текстом — по созданию. Открытое
-        # `CREATE_MOVEMENT` считается «в пути» со знаком плюс: остаток занижен,
-        # наружу уходит меньше, чем есть. Открытое `CANCEL_MOVEMENT` — со знаком
-        # минус: остаток ЗАВЫШЕН, наружу уходит больше, чем есть, то есть риск
-        # оверселла. Соответственно и решение «документа нет» по отмене остаток
-        # не поднимает, а опускает. Оператор, читающий предупреждение буквально,
-        # отказывался нажимать — и оставлял систему ровно в опасном состоянии.
-        cancel = t.command == "CANCEL_MOVEMENT"
+        # Направление ошибки зависит от КОМАНДЫ, и текст живёт в одном месте на
+        # всех читателей (`ftp_channel.review_effect`): четыре текста про одну
+        # сущность уже расходились между собой, и человек, читающий их буквально,
+        # перестаёт верить всем четырём.
+        effect = review_effect(t)
         rows.append({
             "task": t,
             "product": product,
             "age_hours": round((now - started).total_seconds() / 3600, 1) if started else None,
-            "account": t.account.name if t.account else str(t.account_id),
-            "is_cancel": cancel,
-            "effect": ("остаток завышен на {} — наружу уходит больше, чем есть "
-                       "(риск оверселла)".format(t.quantity) if cancel else
-                       "остаток занижен на {} — наружу уходит меньше, чем есть"
-                       .format(t.quantity)),
-            # Что произойдёт по кнопке «документа нет».
-            "no_document_effect": ("остаток УМЕНЬШИТСЯ на {}: 1С товар не вернула, "
-                                   "и возвращать его нам тоже не за чем"
-                                   .format(t.quantity) if cancel else
-                                   "остаток ВЫРАСТЕТ на {}: 1С единицу не списала"
-                                   .format(t.quantity)),
+            # У возврата кабинета НЕТ и быть не может: оприходование идёт на ЦС,
+            # ИП к документу отношения не имеет. Печатать тут «None» значит
+            # показывать человеку сбой там, где всё в порядке.
+            "account": (t.account.name if t.account else
+                        (t.platform.value.upper() if t.platform else "—")),
+            "effect": effect["effect"],
+            # Что произойдёт по кнопке «документа нет» и о чём предупредить.
+            "no_document_effect": effect["no_document_effect"],
+            "warning": effect["warning"],
         })
     return rows
 
@@ -516,12 +509,8 @@ def resolve_stuck(
         # тому, что произошло. Формулировку берём ту же, что печатает карточка
         # «Диагностики» (`_stuck_rows`), чтобы три текста про одно и то же не
         # расходились между собой.
-        qty = task.quantity or 0
-        if task.command == "CANCEL_MOVEMENT":
-            tail = (f"остаток УМЕНЬШИТСЯ на {qty} после ближайшей сверки: 1С товар "
-                    f"не вернула, и возвращать его нам тоже не за чем.")
-        else:
-            tail = f"{qty} шт. вернутся в остаток после ближайшей сверки."
         set_flash(request, f"Задание #{task.id} ({task.command}) закрыто: "
-                           f"документа в 1С нет. {tail}", "warn")
+                           f"документа в 1С нет. "
+                           f"{review_effect(task)['no_document_effect'].capitalize()}.",
+                  "warn")
     return RedirectResponse("/diagnostics", status_code=303)
