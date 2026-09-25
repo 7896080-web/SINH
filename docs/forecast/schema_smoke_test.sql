@@ -1,6 +1,6 @@
 -- Проверка ограничений схемы (AUDIT.md). Запуск на пустой базе после lamoda_forecast_schema.sql:
 --   psql -f lamoda_forecast_schema.sql && psql -f schema_smoke_test.sql
--- Ошибки ожидаемы ровно в строках, помеченных «ожидаем ОШИБКУ».
+-- Ошибка ожидаема ровно на одной вставке после каждой пометки «ожидаем ОШИБКУ» (для дублей — на второй).
 \set ON_ERROR_STOP 0
 insert into suppliers(name,production_days,delivery_days,moq) values('s',30,20,100);
 insert into product_models(article,category) values('A','Куртки');
@@ -28,3 +28,16 @@ insert into shipment_recommendations(product_size_id,qty_to_ship,status,confirme
 -- on_time вычисляется сам
 insert into purchase_orders(supplier_id,ordered_date,expected_ready_date,actual_ready_date) values(1,'2026-09-01','2026-10-01','2026-10-05');
 select 'on_time=' || on_time from purchase_orders;
+-- Продажи из 1С и API (A-51)
+insert into sales_source_config(channel,source_before) values('retail','1c');
+insert into sales_source_config(channel,source_before,cutover_date,source_after) values('wb','1c','2027-03-01','wb_api');
+-- ожидаем ОШИБКУ: дата переключения без источника после неё
+insert into sales_source_config(channel,source_before,cutover_date) values('ozon','1c','2027-03-01');
+insert into channel_sales(channel,source,source_row_id,uid_1c,product_size_id,sale_date,qty) values('retail','1c','РТ-001:1','uid-1',1,'2020-03-01',2);
+-- та же строка из 1С повторно — ожидаем ОШИБКУ (идемпотентность загрузки)
+insert into channel_sales(channel,source,source_row_id,uid_1c,product_size_id,sale_date,qty) values('retail','1c','РТ-001:1','uid-1',1,'2020-03-01',2);
+-- ожидаем ОШИБКУ: ни uid_1c, ни баркода
+insert into channel_sales(channel,source,source_row_id,sale_date,qty) values('wb','wb_api','rrd-1',now(),1);
+-- ожидаем ОШИБКУ: тот же внешний id Lamoda без кабинета повторно
+insert into marketplace_listings(channel,product_size_id,external_id) values('lamoda',1,'MP002XM0WFWSINXL');
+insert into marketplace_listings(channel,product_size_id,external_id) values('lamoda',1,'MP002XM0WFWSINXL');

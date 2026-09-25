@@ -2,7 +2,7 @@
 -- Структура БД: система прогнозирования спроса — Lamoda FBO, WB/Ozon (FBS), собственный сайт, розница
 -- Версия после аудита (AUDIT.md в этой же папке — перечень исправлений с номерами A-xx).
 --
--- СУБД: только PostgreSQL 16+ (JSONB, INT[], BIGSERIAL, частичные индексы). SQLite не поддерживается —
+-- СУБД: только PostgreSQL 16+ (JSONB, INT[], BIGSERIAL, частичные индексы, UNIQUE NULLS NOT DISTINCT — с PG 15). SQLite не поддерживается —
 -- тесты расчётного контура гоняются на PostgreSQL (A-40). Отдельная база, не схема рядом с sync-admin (A-41).
 --
 -- Иерархия: артикул → модель (артикул+цвет, = Lamoda parent SKU) → размер (= Lamoda SKU размера).
@@ -112,7 +112,7 @@ CREATE TABLE marketplace_listings (
     product_size_id     INT NOT NULL REFERENCES product_sizes(product_size_id),
     external_id         TEXT NOT NULL,                  -- nmID / offer_id / Lamoda SKU / KIT variant id
     external_parent_id  TEXT,                           -- nmID карточки WB / Lamoda parent SKU
-    UNIQUE (channel, account_id, external_id, product_size_id)
+    UNIQUE NULLS NOT DISTINCT (channel, account_id, external_id, product_size_id) -- account_id NULL у Lamoda
 );
 
 CREATE TABLE product_analogs (
@@ -173,7 +173,8 @@ CREATE TABLE forecast_correction_settings (
 
 -- Сезонный индекс по группе паттерна (раздел 5.2). Объединяет две таблицы исходной схемы
 -- (seasonal_coefficients + seasonal_index_reference описывали одно и то же, A-38).
--- source: long_history — из 5-7 лет WB/Ozon/розницы; own — из собственной истории канала после 1-2 циклов.
+-- source: long_history — из многолетней истории продаж в 1С (WB/Ozon/розница, channel_sales source='1c');
+--         own — из собственной истории канала после 1-2 циклов (для Lamoda и сайта — новых каналов).
 CREATE TABLE seasonal_index_reference (
     seasonal_group      TEXT NOT NULL,
     month_number        INT NOT NULL CHECK (month_number BETWEEN 1 AND 12),
@@ -207,27 +208,16 @@ CREATE TABLE stock_1c (
 -- Себестоимость из 1С (A-01): новая команда обмена EXPORT_COST → файл cost_*.txt, отдельный от stock_*.txt
 -- (формат остатков не меняем — его разбор в sync-admin фиксирован по числу полей).
 -- Хранится в валюте учёта 1С (USD); переоценка в рубли — на нашей стороне по usd_rate на дату расчёта (5.7).
+-- Подтверждено: логистика от поставщика, пошлина и КИЗ уже входят в себестоимость 1С — отдельной таблицы
+-- доп. составляющих нет (cost_extra_components из первой версии аудита убрана, A-50).
 CREATE TABLE cost_1c (
     product_size_id     INT NOT NULL REFERENCES product_sizes(product_size_id),
     snapshot_date       DATE NOT NULL,
-    cost_unit           NUMERIC(12,4) NOT NULL,         -- себестоимость единицы в валюте currency
+    cost_unit           NUMERIC(12,4) NOT NULL,         -- полная себестоимость единицы в валюте currency
     currency            TEXT NOT NULL DEFAULT 'USD' CHECK (currency IN ('USD', 'RUB')),
     cost_kind           TEXT NOT NULL DEFAULT 'average'
                         CHECK (cost_kind IN ('average', 'last_purchase')), -- открытый вопрос №7
-    includes_extra_costs BOOLEAN NOT NULL DEFAULT FALSE, -- TRUE = логистика/пошлина/КИЗ уже распределены в 1С,
-                                                         -- cost_extra_components не прибавляется
     PRIMARY KEY (product_size_id, snapshot_date)
-);
-
--- Доп. составляющие себестоимости (5.7), если 1С их не распределяет: ручной ввод на модель
-CREATE TABLE cost_extra_components (
-    product_model_id    INT NOT NULL REFERENCES product_models(product_model_id),
-    effective_from      DATE NOT NULL,
-    logistics_rub       NUMERIC(10,2) NOT NULL DEFAULT 0,   -- доля логистики от поставщика на ед.
-    customs_rub         NUMERIC(10,2) NOT NULL DEFAULT 0,   -- пошлина/растаможка на ед.
-    packaging_rub       NUMERIC(10,2) NOT NULL DEFAULT 0,
-    marking_rub         NUMERIC(10,2) NOT NULL DEFAULT 0,   -- КИЗ
-    PRIMARY KEY (product_model_id, effective_from)
 );
 
 CREATE TABLE stock_fbo (
@@ -311,25 +301,48 @@ CREATE TABLE order_items (
     UNIQUE (order_id, lamoda_item_id, status)
 );
 
--- Постоянный поток продаж WB / Ozon / собственного сайта / розницы (раздел 4) — в исходной схеме таблицы не
--- было вовсе, хотя прогноз и маржа по этим каналам ведутся (A-10). Одна строка = одна позиция продажи или
--- возврата из отчёта канала. WB — отчёт о реализации (reportDetailByPeriod), Ozon — FinanceAPI,
--- own_site — KIT API/выгрузка, retail — 1С.
+-- Продажи WB / Ozon / собственного сайта / розницы (раздел 4) — и многолетняя история, и текущий поток
+-- (в исходной схеме таблицы не было вовсе, A-10). Одна строка = одна позиция продажи или возврата.
+-- Источники (A-51):
+--   '1c'       — выгрузка продаж из 1С (EXPORT_SALES → sales_*.txt): вся история WB/Ozon/розницы за годы
+--                + текущий поток розницы; ключ — uid_1c, строка документа 1С
+--   'wb_api'   — отчёт о реализации WB (reportDetailByPeriod, понедельно — достаточно, подтверждено)
+--   'ozon_api' — FinanceAPI Ozon
+--   'kit_api'  — заказы собственного сайта (KIT API, клиент проверен в работе)
+-- Какой источник считается для канала на какую дату — sales_source_config ниже (без двойного счёта).
 CREATE TABLE channel_sales (
     channel_sale_id     BIGSERIAL PRIMARY KEY,
     channel             TEXT NOT NULL CHECK (channel IN ('wb', 'ozon', 'own_site', 'retail')),
+    source              TEXT NOT NULL CHECK (source IN ('1c', 'wb_api', 'ozon_api', 'kit_api')),
     account_id          INT,                            -- кабинет sync-admin (у WB их может быть несколько)
     store_code          TEXT NOT NULL DEFAULT '',       -- для retail: код магазина; иначе ''
-    source_row_id       TEXT NOT NULL,                  -- rrd_id (WB) / operation_id (Ozon) / id строки — идемпотентность
-    barcode             TEXT NOT NULL,
-    product_size_id     INT REFERENCES product_sizes(product_size_id), -- через barcode_pool
+    source_row_id       TEXT NOT NULL,                  -- rrd_id (WB) / operation_id (Ozon) / документ+строка 1С —
+                                                        -- идемпотентность повторной загрузки
+    uid_1c              VARCHAR(36),                    -- из выгрузки 1С; без FK — в истории есть снятые товары
+    barcode             TEXT,                           -- из API площадок; сопоставление через barcode_pool
+    product_size_id     INT REFERENCES product_sizes(product_size_id), -- через uid_1c или barcode_pool
     sale_date           DATE NOT NULL,
     qty                 INT NOT NULL,                   -- > 0 продажа, < 0 возврат
     price_realized      NUMERIC(10,2),                  -- цена реализации, рубли
     commission_amount   NUMERIC(10,2),                  -- если канал отдаёт построчно
     logistics_amount    NUMERIC(10,2),
     ingested_at         TIMESTAMP NOT NULL DEFAULT now(),
-    UNIQUE (channel, account_id, store_code, source_row_id)
+    CHECK (uid_1c IS NOT NULL OR barcode IS NOT NULL),
+    -- NULLS NOT DISTINCT: account_id пуст у строк 1С и розницы — без этого повторная загрузка той же строки
+    -- проходит как новая (NULL ≠ NULL), тот же класс ошибки, что A-06
+    UNIQUE NULLS NOT DISTINCT (source, channel, account_id, store_code, source_row_id)
+);
+
+-- Какой источник продаж канала учитывается в спросе (A-51): до cutover_date — source_before, с неё — source_after.
+-- Исключает двойной счёт, когда одна и та же продажа WB есть и в 1С, и в отчёте WB.
+-- Стартовая настройка: wb/ozon — '1c' (история и текущий поток), при включении API (фаза 3) задаётся
+-- cutover_date и source_after = 'wb_api'/'ozon_api'; retail — всегда '1c'; own_site — 'kit_api'.
+CREATE TABLE sales_source_config (
+    channel             TEXT PRIMARY KEY CHECK (channel IN ('wb', 'ozon', 'own_site', 'retail')),
+    source_before       TEXT NOT NULL CHECK (source_before IN ('1c', 'wb_api', 'ozon_api', 'kit_api')),
+    cutover_date        DATE,                           -- NULL = source_after не используется
+    source_after        TEXT CHECK (source_after IN ('1c', 'wb_api', 'ozon_api', 'kit_api')),
+    CHECK ((cutover_date IS NULL) = (source_after IS NULL))
 );
 
 -- Агрегированные дневные продажи по каналам (из order_items и channel_sales)
@@ -381,34 +394,28 @@ CREATE TABLE size_profile (
     PRIMARY KEY (category, gender, size_label, report_date)
 );
 
--- Историческая выгрузка продаж WB/Ozon/розницы (5-7 лет, разовая загрузка) — помесячно, по баркоду
-CREATE TABLE external_channel_sales_history (
-    channel             TEXT NOT NULL CHECK (channel IN ('wb', 'ozon', 'retail')), -- было 'wildberries'/'retail_1', A-20
-    store_code          TEXT NOT NULL DEFAULT '',       -- для retail: код магазина (было retail_1/retail_2)
-    barcode             TEXT NOT NULL,                  -- join по barcode_pool (любой баркод из пула)
-    month               DATE NOT NULL CHECK (EXTRACT(DAY FROM month) = 1), -- первое число месяца
-    qty_sold            NUMERIC(10,2),
-    revenue             NUMERIC(14,2),
-    loaded_at           TIMESTAMP NOT NULL DEFAULT now(),
-    PRIMARY KEY (channel, store_code, barcode, month)
-);
+-- external_channel_sales_history (помесячная разовая выгрузка истории из API WB/Ozon) убрана (A-51):
+-- многолетняя история продаж есть в 1С и загружается в channel_sales (source = '1c') по дням;
+-- помесячные ряды для сезонного индекса — агрегат запросом.
 
--- Коэффициент пересчёта продаж канала в Lamoda-эквивалент (5.6)
+-- Коэффициент пересчёта продаж канала-источника с долгой историей в новый канал (5.6). Новых каналов два —
+-- Lamoda и собственный сайт (A-52); источники с историей в 1С — wb / ozon / retail.
 CREATE TABLE channel_ratio_calibration (
-    channel             TEXT NOT NULL CHECK (channel IN ('wb', 'ozon', 'own_site', 'retail')),
+    target_channel      TEXT NOT NULL DEFAULT 'lamoda' CHECK (target_channel IN ('lamoda', 'own_site')),
+    channel             TEXT NOT NULL CHECK (channel IN ('wb', 'ozon', 'retail')), -- канал-источник
     category            TEXT NOT NULL,
-    ratio               NUMERIC(8,4) NOT NULL,          -- среднее(Lamoda_продажи / продажи_канала)
+    ratio               NUMERIC(8,4) NOT NULL,          -- среднее(продажи_нового_канала / продажи_источника)
     sample_size         INT,
     computed_at         TIMESTAMP NOT NULL DEFAULT now(),
-    PRIMARY KEY (channel, category)
+    PRIMARY KEY (target_channel, channel, category)
 );
 
--- Недооценённый потенциал (5.6)
+-- Недооценённый потенциал (5.6) — ожидание по истории канала-источника из channel_sales
 CREATE TABLE underperformance_flags (
     product_model_id                INT NOT NULL REFERENCES product_models(product_model_id),
     period_start                    DATE NOT NULL,
     period_end                      DATE NOT NULL,
-    source_channel                  TEXT NOT NULL CHECK (source_channel IN ('wb', 'ozon', 'own_site', 'retail')),
+    source_channel                  TEXT NOT NULL CHECK (source_channel IN ('wb', 'ozon', 'retail')),
     expected_sales_qty              NUMERIC(10,2),
     actual_sales_qty                NUMERIC(10,2),
     shortfall_pct                   NUMERIC(8,2),       -- факт / ожидание × 100
@@ -739,7 +746,7 @@ CREATE TABLE margin_calc (
     price_realized          NUMERIC(10,2) NOT NULL,     -- Lamoda: цена за счёт продавца (promo_report_sku) либо
                                                         -- price_actual из order_items; WB/Ozon — из channel_sales
     cost_unit               NUMERIC(10,2) NOT NULL,     -- рубли: cost_1c × usd_rate.adjusted_rate на calc_date
-                                                        -- (+ cost_extra_components, если не включены в 1С), A-01
+                                                        -- (доп. расходы уже в себестоимости 1С), A-01/A-50
     usd_rate_used           NUMERIC(8,4),               -- курс, по которому пересчитана себестоимость
     commission_amount       NUMERIC(10,2),
     logistics_fbo_amount    NUMERIC(10,2),
