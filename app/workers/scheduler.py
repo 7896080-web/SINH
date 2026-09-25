@@ -998,17 +998,24 @@ def job_watchdog():
     смысл, сигнал сторожа стал бы неотличим от падения службы, а о беде внутри
     живой системы и так скажут каналы.
     """
-    from app.alerts import ping_alive
+    from app.alerts import ping_alive, ping_web_alive
 
     db = SessionLocal()
     try:
+        notes = []
         problem = ping_alive(db)
         if problem:
             logger.warning("сторож: пинг не доехал — %s", problem)
+            notes.append(f"внешний сторож не ответил: {problem}")
+        # Второй сторож — про ВЕБ-СЛУЖБУ, и он здесь же, потому что полярность
+        # та же. Смыслы при этом раздельные: два URL, у каждого один вопрос.
+        # Задание — только носитель, оно ничего не смешивает.
+        web = ping_web_alive(db)
+        if web:
+            notes.append(web)
         # Оговорка успешной отметки: не доехавший пинг — это не поломка
         # задания, а факт, который надо показать. Читатель — «Диагностика».
-        _heartbeat(db, "watchdog", True,
-                   f"внешний сторож не ответил: {problem}" if problem else "")
+        _heartbeat(db, "watchdog", True, "; ".join(notes))
     except Exception as e:                           # noqa: BLE001
         logger.exception("watchdog failed")
         _heartbeat(db, "watchdog", False, str(e))
