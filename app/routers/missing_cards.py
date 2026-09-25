@@ -63,7 +63,8 @@ def missing_cards_page(request: Request, platform: str = Query(""),
                        db: Session = Depends(get_db),
                        user: User = Depends(get_current_user)):
     ctx = _context(db, platform, PAGE_LIMIT)
-    ctx.update({"request": request, "current_user": user, "active_page": "report"})
+    ctx.update({"request": request, "current_user": user,
+                "active_page": "missing-cards"})
     return templates.TemplateResponse(request, "missing_cards.html", ctx)
 
 

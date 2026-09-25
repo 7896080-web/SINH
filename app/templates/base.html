@@ -87,6 +87,13 @@
                 <path d="M3 2.5h7L13 6v7.5H3z"/>
                 <path d="M9.5 2.5V6H13M5.5 9h5M5.5 11.5h3"/>
             </symbol>
+            <symbol id="i-missing-card" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                    stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M1.5 3.5h9v5h-9z"/>
+                <path d="M1.5 6h9"/>
+                <circle cx="11.5" cy="11.5" r="3.2"/>
+                <path d="M9.3 9.3 13.7 13.7"/>
+            </symbol>
             <symbol id="i-discrepancies" viewBox="0 0 16 16" fill="none" stroke="currentColor"
                     stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M8 2v12M4 4.5h8"/>
@@ -136,16 +143,23 @@
                 ('stock-on-date', '/stock-on-date', 'Остатки на дату', 'i-stock-date'),
                 ('diagnostics', '/diagnostics', 'Диагностика', 'i-diagnostics'),
                 ('report', '/report', 'Расхождения', 'i-report'),
+                ('missing-cards', '/report/missing-cards', 'Нет на площадке', 'i-missing-card'),
                 ('discrepancies', '/discrepancies', 'Расхождения со складом', 'i-discrepancies'),
                 ('testing', '/testing', 'Тестирование', 'i-testing'),
                 ('api-keys', '/api-keys', 'API-ключи', 'i-api-keys'),
                 ('notifications', '/notifications', 'Уведомления', 'i-notifications'),
             ] %}
+            {# Полное название там, где подпись пришлось сократить. В свёрнутом
+               меню подписи не видно вовсе, и подсказка остаётся единственным
+               способом узнать пункт — короткое «Нет на площадке» там ребус. #}
+            {% set titles = {
+                'missing-cards': 'Есть на складе — нет на площадке',
+            } %}
             {% for key, href, label, icon in items %}
             {# title обязателен: в свёрнутом меню подпись не видна, и без него
                иконки становятся ребусом. #}
             <a class="nav__item {% if active_page == key %}active{% endif %}"
-               href="{{ href }}" title="{{ label }}">
+               href="{{ href }}" title="{{ titles.get(key, label) }}">
                 <svg class="nav__icon" aria-hidden="true"><use href="#{{ icon }}"/></svg>
                 <span class="nav__label">{{ label }}</span>
             </a>
