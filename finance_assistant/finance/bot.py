@@ -9,7 +9,7 @@ import logging
 import os
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
-from telegram.constants import ChatAction
+from telegram.constants import ChatAction, ChatType
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes,
                           MessageHandler, filters)
 
@@ -22,14 +22,33 @@ log = logging.getLogger(__name__)
 COMMANDS = ["start", "help", "cancel", "cards", "addcard", "delcard", "cats", "addcat",
             "list", "sverka", "done", "itog", "biz", "notbiz", "vypiska", "fix", "svod",
             "rules", "delrule"]
-MAX_TEXT = 4000  # лимит Telegram — 4096 символов на сообщение
+MAX_TEXT = 4000  # лимит Telegram — 4096 единиц UTF-16 на сообщение
 MAX_FILE = 20 * 1024 * 1024  # больше бот скачать не может
+MAX_IMAGE = 5 * 1024 * 1024  # больше Claude API не примет одну картинку
+# Что умеем разбирать, присланное файлом (не фото).
+IMAGE_MIMES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+DOC_MIMES = {"application/pdf", "text/csv", "text/plain",
+             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}
+
+
+def _units(text: str) -> int:
+    """Длина так, как её считает Telegram: в единицах UTF-16 (эмодзи — две)."""
+    return len(text.encode("utf-16-le")) // 2
 
 
 def _split(text: str) -> list[str]:
     parts, chunk = [], ""
     for line in text.split("\n"):
-        if len(chunk) + len(line) + 1 > MAX_TEXT and chunk:
+        while _units(line) > MAX_TEXT:  # одна очень длинная строка — режем её саму
+            cut = MAX_TEXT
+            while _units(line[:cut]) > MAX_TEXT:
+                cut -= 100
+            if chunk:
+                parts.append(chunk)
+                chunk = ""
+            parts.append(line[:cut])
+            line = line[cut:]
+        if _units(chunk) + _units(line) + 1 > MAX_TEXT and chunk:
             parts.append(chunk)
             chunk = ""
         chunk += line + "\n"
@@ -57,6 +76,11 @@ def build_app(token: str, flow: Flow, allowed: set[int]) -> Application:
     app = Application.builder().token(token).build()
 
     async def guard(update: Update) -> bool:
+        chat = update.effective_chat
+        if not chat or chat.type != ChatType.PRIVATE:
+            # В группе ответы с суммами и Excel увидели бы все участники —
+            # работаем только в личном чате и в группах молчим.
+            return False
         user = update.effective_user
         if user and user.id in allowed:
             return True
@@ -67,11 +91,29 @@ def build_app(token: str, flow: Flow, allowed: set[int]) -> Application:
                 f"Доступ закрыт. Ваш Telegram id: {user.id if user else '?'}")
         return False
 
-    async def run(update: Update, fn, *args):
-        await update.effective_chat.send_action(ChatAction.TYPING)
-        # Распознавание — синхронный сетевой вызов на десятки секунд;
-        # в отдельном потоке, чтобы не блокировать цикл событий.
-        replies = await asyncio.to_thread(fn, update.effective_chat.id, *args)
+    async def keep_typing(chat):
+        # «Печатает…» гаснет через ~5 секунд — продлеваем, пока идёт разбор.
+        while True:
+            try:
+                await chat.send_action(ChatAction.TYPING)
+            except Exception:  # сеть моргнула — не повод падать
+                pass
+            await asyncio.sleep(4)
+
+    async def run(update: Update, fn, *args, slow: bool = False):
+        chat = update.effective_chat
+        if slow:
+            await chat.send_message("⏳ Разбираю… Скриншот — до минуты, выписка — "
+                                    "до нескольких минут. Присылать повторно не нужно.")
+        typing = asyncio.create_task(keep_typing(chat))
+        try:
+            # Распознавание — синхронный сетевой вызов на десятки секунд;
+            # в отдельном потоке, чтобы не блокировать цикл событий. Апдейты
+            # обрабатываются по одному (так безопасно для общей базы SQLite),
+            # поэтому другие сообщения дождутся конца разбора.
+            replies = await asyncio.to_thread(fn, chat.id, *args)
+        finally:
+            typing.cancel()
         await send(update, replies)
 
     async def on_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -87,7 +129,7 @@ def build_app(token: str, flow: Flow, allowed: set[int]) -> Application:
         tg_file = await photo.get_file()
         data = bytes(await tg_file.download_as_bytearray())
         await run(update, flow.on_files, [(data, "image/jpeg")], update.message.caption or "",
-                  "", [photo.file_unique_id])
+                  "", [photo.file_unique_id], slow=True)
 
     async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await guard(update):
@@ -103,10 +145,25 @@ def build_app(token: str, flow: Flow, allowed: set[int]) -> Application:
             mime = "text/csv"
         elif name.endswith(".xlsx"):
             mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        elif name.endswith(".pdf"):
+            mime = "application/pdf"
+        if mime not in IMAGE_MIMES | DOC_MIMES:
+            hint = ("Фото в формате HEIC пришлите обычным фото (не файлом)."
+                    if "heic" in mime or name.endswith((".heic", ".heif"))
+                    else "Старый .xls пересохраните в .xlsx или пришлите PDF."
+                    if name.endswith(".xls") else
+                    "Принимаю фото и скриншоты, PDF, Excel (.xlsx) и CSV.")
+            await update.effective_chat.send_message(f"Такой файл не разберу. {hint}")
+            return
+        if mime in IMAGE_MIMES and doc.file_size and doc.file_size > MAX_IMAGE:
+            await update.effective_chat.send_message(
+                "Картинка больше 5 МБ — пришлите её обычным фото (не файлом), "
+                "Telegram сам её уменьшит.")
+            return
         tg_file = await doc.get_file()
         data = bytes(await tg_file.download_as_bytearray())
         await run(update, flow.on_files, [(data, mime)], update.message.caption or "", name,
-                  [doc.file_unique_id])
+                  [doc.file_unique_id], slow=True)
 
     async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await guard(update):
@@ -129,12 +186,16 @@ def build_app(token: str, flow: Flow, allowed: set[int]) -> Application:
         log.exception("Ошибка при обработке апдейта", exc_info=context.error)
         if isinstance(update, Update) and update.effective_chat:
             await update.effective_chat.send_message(
-                "Что-то пошло не так, запись не сохранена. Попробуйте ещё раз.")
+                "Что-то пошло не так, запись не сохранена. Попробуйте ещё раз; "
+                "если ошибка повторяется — /cancel сбросит текущий вопрос.")
 
-    app.add_handler(CommandHandler(COMMANDS, on_command))
-    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
-    app.add_handler(MessageHandler(filters.Document.ALL, on_document))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    # Только новые сообщения: отредактированное сообщение не должно
+    # записываться второй раз (и у него нет update.message).
+    new = filters.UpdateType.MESSAGE
+    app.add_handler(CommandHandler(COMMANDS, on_command, filters=new))
+    app.add_handler(MessageHandler(new & filters.PHOTO, on_photo))
+    app.add_handler(MessageHandler(new & filters.Document.ALL, on_document))
+    app.add_handler(MessageHandler(new & filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_error_handler(on_error)
     return app
@@ -153,4 +214,5 @@ def main():
     storage = Storage(os.path.join(data_dir, "finance.db"))
     recognizer = ClaudeRecognizer(model=os.environ.get("CLAUDE_MODEL", DEFAULT_MODEL))
     flow = Flow(storage, recognizer, os.path.join(data_dir, "receipts"))
-    build_app(token, flow, allowed).run_polling(allowed_updates=Update.ALL_TYPES)
+    build_app(token, flow, allowed).run_polling(
+        allowed_updates=[Update.MESSAGE, Update.CALLBACK_QUERY])

@@ -256,13 +256,18 @@
 
 ```bash
 sudo useradd --system --home /opt/finance-bot finance-bot
-sudo mkdir -p /opt/finance-bot && sudo cp -r finance requirements.txt /opt/finance-bot/
+sudo mkdir -p /opt/finance-bot/data
+sudo cp -r finance deploy requirements.txt /opt/finance-bot/
 cd /opt/finance-bot
 sudo python3 -m venv venv && sudo venv/bin/pip install -r requirements.txt
 sudo cp /путь/к/finance_assistant/.env.example .env && sudo nano .env   # токены
-sudo chown -R finance-bot: /opt/finance-bot && sudo chmod 600 .env
-sudo cp /путь/к/finance_assistant/deploy/finance-bot.service /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now finance-bot
+# Код — root (служба не может его менять), данные — только служба.
+sudo chown root:finance-bot .env && sudo chmod 640 .env
+sudo chown -R finance-bot: data && sudo chmod 700 data
+sudo cp deploy/finance-bot.service deploy/finance-bot-backup.service \
+        deploy/finance-bot-backup.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now finance-bot finance-bot-backup.timer
 journalctl -u finance-bot -f
 ```
 
@@ -279,7 +284,15 @@ journalctl -u finance-bot -f
 Sync Admin.
 
 **Бэкап:** всё хранится в `FINANCE_DATA_DIR`: база `finance.db` и скриншоты
-в `receipts/ГГГГ-ММ/`. Эту папку и нужно копировать.
+в `receipts/ГГГГ-ММ/`. Таймер `finance-bot-backup.timer` каждый день в 03:30
+кладёт копию в `/var/backups/finance-bot` и хранит 30 дней. Базу он копирует
+средствами SQLite: простое копирование файла во время записи может испортить
+копию. Сделать копию вручную: `sudo systemctl start finance-bot-backup`.
+Восстановить: остановить бота, положить копию на место `data/finance.db`
+и запустить бота.
+
+Служба ограничена: писать она может только в `data/`, файлы создаёт с правами
+«только владелец», работает только в личном чате с ботом.
 
 ## Безопасность и данные
 

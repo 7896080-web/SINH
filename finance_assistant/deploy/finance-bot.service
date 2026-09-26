@@ -7,10 +7,21 @@ Wants=network-online.target
 Type=simple
 User=finance-bot
 WorkingDirectory=/opt/finance-bot
+# Часовой пояс по умолчанию («сегодня»/«вчера»); значение из .env его перекрывает.
+Environment=TZ=Europe/Moscow
 EnvironmentFile=/opt/finance-bot/.env
 ExecStart=/opt/finance-bot/venv/bin/python -m finance
 Restart=always
 RestartSec=10
+
+# База и скриншоты — только для пользователя службы (на сервере живут и другие службы).
+UMask=0077
+# Бот может писать только в свою папку данных; код и система — только чтение.
+ProtectSystem=strict
+ReadWritePaths=/opt/finance-bot/data
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target

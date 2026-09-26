@@ -172,3 +172,19 @@ def test_leap_day_without_year():
     assert _parse_date("29.02", date(2028, 3, 5)) == "2028-02-29"
     assert _parse_date("30.12", date(2026, 9, 26)) == "2025-12-30"
     assert _parse_date("31.02", date(2026, 9, 26)) is None
+
+
+def test_forgotten_done_closes_statement_after_two_hours(env):
+    db, rec, flow = env
+    now = [1_000_000.0]
+    flow.clock = lambda: now[0]
+    flow.on_command(CHAT, "sverka", "2026-09")
+    flow.on_button(CHAT, f"s:c:{db.cards()[0].id}")
+    now[0] += 3600                                   # через час — ещё сверка
+    rec.statements.append(statement([op("2026-09-02", "100")]))
+    assert "Принято операций: 1" in flow.on_files(CHAT, [PDF], "")[0].text
+    now[0] += 3 * 3600                               # забыли /done
+    rec.payments.append(payment())
+    closed, saved = flow.on_files(CHAT, [png()], "")
+    assert "закрыл сам" in closed.text and saved.text.startswith("✅")
+    assert "statement" not in db.get_state(CHAT)

@@ -48,3 +48,32 @@ def test_generic_descriptions_never_become_rules(tmp_path):
                  "Оплата товаров и услуг", "ИП", "по выписке"):
         assert not db.set_rule(name, cat), name
     assert db.set_rule("СКБ Контур", cat)
+
+
+import pytest  # noqa: E402
+
+from finance.money import parse_amount  # noqa: E402
+
+
+@pytest.mark.parametrize("text, kopecks", [
+    ("1 234,50", 123450), ("1234.5", 123450), ("1.234,56", 123456), ("1,234.56", 123456),
+    ("1 234,56", 123456), ("−110", -11000), ("1.234.567", 123456700),
+    ("2 950,00 ₽", 295000), ("500 руб.", 50000), ("-0,05", -5),
+])
+def test_parse_amount_bank_formats(text, kopecks):
+    assert parse_amount(text) == kopecks
+
+
+@pytest.mark.parametrize("text", ["1E30", "1e5", "9" * 29, "abc", "1,2,3", "", "nan", "--5", "."])
+def test_parse_amount_rejects(text):
+    with pytest.raises(ValueError):
+        parse_amount(text)
+
+
+def test_huge_amount_in_dialog_does_not_crash(env):
+    from conftest import CHAT, png, payment
+    db, rec, flow = env
+    rec.payments.append(payment(currency="USD"))
+    flow.on_files(CHAT, [png()], "")
+    [r] = flow.on_text(CHAT, "1E30")
+    assert "Не понял сумму" in r.text
