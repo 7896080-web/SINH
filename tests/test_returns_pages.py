@@ -770,3 +770,32 @@ def test_the_page_names_the_business_operation_that_will_be_used(logged_in_clien
     assert R.SCRAP_OPERATION[ScrapReason.swapped] in page
     assert R.SCRAP_OPERATION[ScrapReason.defect] not in page, \
         "страница называет чужую хоз. операцию"
+
+
+def test_the_page_shows_who_is_responsible_in_1c(logged_in_client):
+    """Имя печатается в «Акте списания товаров». Не покажи мы его, человек
+    узнал бы, с кого спросят, только из самого документа в 1С."""
+    page = logged_in_client.get("/returns/scrapped").text
+
+    assert R.DEFAULT_SCRAP_RESPONSIBLE in page
+
+
+def test_the_warehouse_sees_the_responsible_but_cannot_change_it(
+        warehouse_client_for_returns):
+    """Кладовщику достаточно знать, с кого спросят; менять — не его решение:
+    имя уезжает в документ 1С."""
+    page = warehouse_client_for_returns.get("/returns/scrapped").text
+
+    assert R.DEFAULT_SCRAP_RESPONSIBLE in page
+    assert '/returns/scrapped/responsible' not in page
+
+
+def test_clearing_the_field_returns_the_default(logged_in_client, web_db):
+    """Пустой ответственный — отказ проведения на первой же утилизации. Стерев
+    поле, человек сломал бы утилизацию, и узнал бы об этом не сразу."""
+    logged_in_client.post("/returns/scrapped/responsible", data={"name": "Татьяна"})
+    assert "Татьяна" in logged_in_client.get("/returns/scrapped").text
+
+    logged_in_client.post("/returns/scrapped/responsible", data={"name": "  "})
+
+    assert R.DEFAULT_SCRAP_RESPONSIBLE in logged_in_client.get("/returns/scrapped").text

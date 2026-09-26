@@ -451,7 +451,8 @@ def scrapped_page(request: Request, status: str = "", platform: str = "",
                 "platforms": list(Platform), "statuses": SCRAP_VIEW,
                 "f_status": status, "f_platform": platform, "f_reason": reason,
                 "q": q, "total": query.order_by(None).count(), "limit": LIST_LIMIT,
-                "tasks": _scrap_tasks(db, rows)})
+                "tasks": _scrap_tasks(db, rows),
+                "responsible": R.scrap_responsible(db)})
     return templates.TemplateResponse(request, "returns_scrapped.html", ctx)
 
 
@@ -461,6 +462,26 @@ def _scrap_tasks(db: Session, rows) -> dict:
     if not ids:
         return {}
     return {t.id: t for t in db.query(FtpTask).filter(FtpTask.id.in_(ids)).all()}
+
+
+@router.post("/returns/scrapped/responsible")
+def set_responsible(request: Request, name: str = Form(""),
+                    db: Session = Depends(get_db), user=Depends(get_current_user)):
+    """Сменить ответственного в документах списания 1С.
+
+    Пустое поле ВОЗВРАЩАЕТ умолчание, а не оставляет пустоту: пустой
+    ответственный — это отказ проведения на первой же утилизации, то есть
+    человек сломал бы утилизацию, просто стерев поле.
+    """
+    from app import settings_store
+
+    settings_store.set_value(db, R.SCRAP_RESPONSIBLE_SETTING, name.strip())
+    log_action(db, user.username, "returns_scrap_responsible",
+               name.strip() or f"(умолчание: {R.DEFAULT_SCRAP_RESPONSIBLE})")
+    db.commit()
+    set_flash(request, f"Ответственный в документах списания: "
+                       f"{R.scrap_responsible(db)}.", "good")
+    return RedirectResponse("/returns/scrapped", status_code=303)
 
 
 @router.get("/returns/scrapped/export")

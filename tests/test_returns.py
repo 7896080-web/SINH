@@ -805,9 +805,47 @@ def test_the_scrap_line_carries_the_business_operation_to_1c(db, product):
     line = [ln for ln in body.splitlines() if ln.startswith(returns.SCRAP_COMMAND)][0]
     fields = line.split("|")
 
+    # Поля проверяем ПО ПОЗИЦИЯМ, а не «последнее»: обработка разбирает строку
+    # индексами, и сдвиг на одно поле означал бы, что хоз. операция приедет в
+    # ответственного — документ спишет не туда, а `Поля[8]` при этом заполнено.
+    assert len(fields) == 10, f"строка задания сменила формат: {fields}"
     assert fields[5] == returns.label_number(item)
-    assert fields[-1] == returns.SCRAP_OPERATION[ScrapReason.swapped]
-    assert fields[-1] == "Утилизация Подмены", "имя разошлось со справочником 1С"
+    assert fields[8] == returns.SCRAP_OPERATION[ScrapReason.swapped]
+    assert fields[8] == "Утилизация Подмены", "имя разошлось со справочником 1С"
+    assert fields[9] == returns.DEFAULT_SCRAP_RESPONSIBLE
+
+
+def test_the_responsible_can_be_changed_without_a_patch(db, product):
+    """Человек уходит в отпуск и увольняется, а правка модуля 1С требует
+    Конфигуратора и переноса вручную. Поэтому имя — настройка, а не константа
+    в обработке."""
+    from app import settings_store
+    from app.workers.ftp_channel import build_task_batch
+
+    settings_store.set_value(db, returns.SCRAP_RESPONSIBLE_SETTING, "Татьяна")
+    db.commit()
+
+    item = returns.accept(db, "2000000000017", Platform.wb)
+    db.commit()
+    returns.send_scrap_to_1c(db, item, ScrapReason.defect)
+    db.commit()
+
+    line = [ln for ln in build_task_batch(db)[1].splitlines()
+            if ln.startswith(returns.SCRAP_COMMAND)][0]
+    assert line.split("|")[9] == "Татьяна"
+
+
+def test_the_responsible_is_never_empty(db, product):
+    """Пустой ответственный — отказ проведения на первой же утилизации.
+    Свежая установка и установка, где настройку не трогали, обязаны работать
+    одинаково, поэтому умолчание живёт в коде, а не в `.env`."""
+    from app import settings_store
+
+    assert returns.scrap_responsible(db) == returns.DEFAULT_SCRAP_RESPONSIBLE
+
+    settings_store.set_value(db, returns.SCRAP_RESPONSIBLE_SETTING, "   ")
+    db.commit()
+    assert returns.scrap_responsible(db) == returns.DEFAULT_SCRAP_RESPONSIBLE
 
 
 def test_a_scrap_without_a_1c_product_is_refused(db):

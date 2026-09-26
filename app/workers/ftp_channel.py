@@ -341,6 +341,11 @@ def build_task_batch(db: Session, max_lines: int = 500, request_stock_export: bo
     # монопольной блокировки на боевом масштабе.
     scrap_ids = [t.id for t in tasks if t.command == SCRAP_COMMAND]
     scrap_reasons = {}
+    scrap_responsible = ""
+    if scrap_ids:
+        from app.returns import scrap_responsible as _responsible
+
+        scrap_responsible = _responsible(db)
     if scrap_ids:
         from app.returns import SCRAP_OPERATION
         from app.models import ReturnItem
@@ -396,11 +401,16 @@ def build_task_batch(db: Session, max_lines: int = 500, request_stock_export: bo
             if t.command == SCRAP_COMMAND:
                 # Девятое поле — НАИМЕНОВАНИЕ ХОЗ. ОПЕРАЦИИ списания, а не текст
                 # причины: в 1С оно определяет проводки, и искать его там будут
-                # точным совпадением. Разделители в нём невозможны (значение
-                # наше, из `SCRAP_OPERATION`), но чистим на общих основаниях:
-                # значение с «|» разъехалось бы по полям и разобралось как
-                # другая строка.
+                # точным совпадением. Десятое — ответственный: значение одно на
+                # все задания, но едет в каждой строке намеренно, потому что
+                # обработка не должна знать наших людей, а правка модуля 1С
+                # требует Конфигуратора и переноса вручную.
+                #
+                # Разделители в обоих значениях невозможны (оба наши), но чистим
+                # на общих основаниях: значение с «|» разъехалось бы по полям и
+                # разобралось как другая строка.
                 row.append(scrap_reasons.get(t.id, "").replace("|", " ").strip())
+                row.append(scrap_responsible.replace("|", " ").strip())
             lines.append("|".join(row))
 
         t.status = FtpTaskStatus.sent

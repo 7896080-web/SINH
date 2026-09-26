@@ -152,6 +152,10 @@ RCLONE_FIELDS = [
 RETURNS_FIELDS = [
     Field("RETURNS_TEST_MODE", "Тренировочный режим возвратов",
           hint="1 — вещи заводятся тренировочными и наружу не уходят."),
+    Field("SCRAP_RESPONSIBLE", "Ответственный в документах списания 1С",
+          placeholder="Руслан",
+          hint="Имя пользователя 1С, как оно записано в справочнике. "
+               "Пусто — берётся значение по умолчанию."),
 ]
 
 ALL_FIELDS = (TELEGRAM_FIELDS + EMAIL_FIELDS + COMMON_FIELDS
