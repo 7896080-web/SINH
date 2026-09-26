@@ -19,6 +19,8 @@
 import io
 from pathlib import Path
 
+import re
+
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -73,12 +75,25 @@ def test_the_live_module_answers_with_the_command_name():
     заказа, и это уезжало на площадки.
     """
     text = LIVE.read_text(encoding="utf-8-sig")
+    # Имена команд берём ИЗ САМОГО МОДУЛЯ, а не списком рядом: перечисли мы их
+    # здесь, новая команда прошла бы проверку только после того, как кто-то
+    # вспомнит дописать её и сюда, — то есть проверка молчала бы ровно там, где
+    # нужна. Так же и обратное: литерал, не совпадающий ни с одной веткой, —
+    # опечатка, по которой ответ не ляжет ни на одно задание.
+    commands = set(re.findall(r'Команда = "([A-Z_]+)"', text))
+    assert len(commands) >= 4, f"в модуле нашлось мало команд: {commands}"
+
     answers = [ln.strip() for ln in text.splitlines()
                if "СтрокиРезультата.Добавить(" in ln]
     assert answers, "в обработке не нашлось ни одной строки ответа"
     for line in answers:
-        assert ('+ "|" + Команда' in line
-                or '|CANCEL_MOVEMENT"' in line), f"ответ без имени команды: {line}"
+        if '+ "|" + Команда' in line:
+            continue                      # имя подставляется переменной ветки
+        literal = re.search(r'\|([A-Z_]+)"\)', line)
+        assert literal, f"ответ без имени команды: {line}"
+        assert literal.group(1) in commands, (
+            f"ответ называет команду {literal.group(1)!r}, которой обработка не "
+            f"разбирает: {line}")
 
 
 @repository_only
@@ -93,3 +108,72 @@ def test_the_live_module_checks_field_count_before_indexing():
     text = LIVE.read_text(encoding="utf-8-sig")
     assert "Если Поля.Количество() < 7 Тогда" in text
     assert "Если Поля.Количество() < 2 Тогда" in text
+
+
+@repository_only
+def test_the_live_module_is_structurally_whole():
+    """Баланс блоков в модуле 1С. Компилятора здесь нет, и это ему замена.
+
+    Незакрытый `Если` или `Попытка` — синтаксическая ошибка, которую Конфигуратор
+    покажет при `Ctrl+F7`, но только если человек до него дойдёт: правки в
+    репозиторий вносят сюда, а в `.epf` переносят вставкой, и заметить лишний
+    `КонецЕсли` глазами в семистах строках нельзя. Проверка грубая намеренно —
+    она ловит ровно тот класс, который правка модуля и порождает.
+    """
+    text = LIVE.read_text(encoding="utf-8-sig")
+    # Комментарии выкидываем: в них встречаются и «Если», и кавычки.
+    body = "\n".join(ln.split("//")[0] for ln in text.splitlines())
+    words = re.findall(r"[А-Яа-яЁё]+", body)
+
+    pairs = {
+        "Если": "КонецЕсли", "Цикл": "КонецЦикла", "Попытка": "КонецПопытки",
+        "Функция": "КонецФункции", "Процедура": "КонецПроцедуры",
+    }
+    counts = {w: words.count(w) for w in list(pairs) + list(pairs.values())}
+    # «Цикл» стоит и в «Для … Цикл», и в «Пока … Цикл» — считается один раз,
+    # а «КонецЦикла» тоже одно слово, так что пара честная.
+    for start, end in pairs.items():
+        assert counts[start] == counts[end], (
+            f"баланс нарушен: {start} — {counts[start]}, {end} — {counts[end]}")
+
+
+@repository_only
+def test_every_transaction_in_the_live_module_is_closed():
+    """Транзакция без отката — худшее, что можно оставить в обработке 1С.
+
+    `НачатьТранзакцию` без парного `ОтменитьТранзакцию` в `Исключение` означает,
+    что сбой на втором документе оставит первый проведённым: у утилизации это
+    возврат на ЦС без списания, то есть единица, которой физически нет, вернётся
+    в остаток и уедет на площадки — ровно тот оверселл, ради предотвращения
+    которого транзакция и открыта.
+    """
+    text = LIVE.read_text(encoding="utf-8-sig")
+    body = "\n".join(ln.split("//")[0] for ln in text.splitlines())
+
+    begins = body.count("НачатьТранзакцию()")
+    commits = body.count("ЗафиксироватьТранзакцию()")
+    rollbacks = body.count("ОтменитьТранзакцию()")
+
+    assert begins == commits, f"начато транзакций {begins}, зафиксировано {commits}"
+    assert begins == rollbacks, (
+        f"начато транзакций {begins}, откатов {rollbacks}: сбой посреди "
+        f"транзакции оставит первый документ проведённым")
+
+
+@repository_only
+def test_the_live_module_does_not_hardcode_a_business_operation():
+    """Наименование хоз. операции списания в обработке НЕ зашито.
+
+    Оно решает, куда лягут проводки, и приезжает от сайта полем задания:
+    причину знает он. Зашей мы его здесь — вся утилизация уходила бы одной
+    операцией, и подмена считалась бы вместе с обычным браком, то есть
+    претензию площадке писать было бы не по чему. А поймать это расхождением
+    исходников нельзя: правку легко внести в оба файла сразу.
+    """
+    text = LIVE.read_text(encoding="utf-8-sig")
+    code = "\n".join(ln.split("//")[0] for ln in text.splitlines())
+
+    hardcoded = re.findall(r'"(Утилизация[^"]*)"', code)
+    assert hardcoded == [], (
+        f"наименование хоз. операции зашито в обработке: {hardcoded}. "
+        f"Оно живёт в `returns.SCRAP_OPERATION` и уезжает полем задания.")

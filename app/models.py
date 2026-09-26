@@ -906,9 +906,16 @@ class ReturnStatus(str, enum.Enum):
     # заявить, что остаток вырос, пока 1С этого не сказала, — ровно тот дефект,
     # ради которого весь этот проект и переписывался.
     awaiting_1c = "awaiting_1c"
+    # Решено утилизировать, задание в 1С в пути. Ждать приходится и здесь, и
+    # по той же причине: вещь ЧИСЛИТСЯ НА СКЛАДЕ ПЛОЩАДКИ в 1С (туда её увезло
+    # перемещение при приёме заказа), и просто выбросить её физически мало —
+    # пока 1С не провела возврат и списание, единица висит на складе площадки
+    # вечно, а учёт расходится со складом накопительно, по штуке на каждую
+    # утилизацию.
+    awaiting_scrap = "awaiting_scrap"
     back_to_sale = "back_to_sale"  # 1С оприходовала — терминальный
     rejected_1c = "rejected_1c"    # 1С отказала или задание разобрано как «документа нет»
-    scrapped = "scrapped"          # утилизирован — терминальный
+    scrapped = "scrapped"          # 1С провела возврат и списание — терминальный
 
 
 class ScrapReason(str, enum.Enum):
@@ -928,27 +935,34 @@ class ScrapReason(str, enum.Enum):
 # разойдись она с кнопками на странице, страница предлагала бы переход, который
 # не состоится, и человек решил бы, что кнопка не нажимается.
 RETURN_TRANSITIONS = {
-    # Из рабочих статусов — в любой другой рабочий, в отправку и в утиль.
+    # Из рабочих статусов — в любой другой рабочий и в ОБА ожидания ответа 1С.
+    # Утиль здесь наравне с продажей: оба решения меняют учёт, оба идут через 1С.
     ReturnStatus.accepted: (ReturnStatus.cleaning, ReturnStatus.repack,
                             ReturnStatus.held, ReturnStatus.awaiting_1c,
-                            ReturnStatus.scrapped),
+                            ReturnStatus.awaiting_scrap),
     ReturnStatus.cleaning: (ReturnStatus.repack, ReturnStatus.held,
-                            ReturnStatus.awaiting_1c, ReturnStatus.scrapped),
+                            ReturnStatus.awaiting_1c, ReturnStatus.awaiting_scrap),
     ReturnStatus.repack: (ReturnStatus.cleaning, ReturnStatus.held,
-                          ReturnStatus.awaiting_1c, ReturnStatus.scrapped),
+                          ReturnStatus.awaiting_1c, ReturnStatus.awaiting_scrap),
     ReturnStatus.held: (ReturnStatus.cleaning, ReturnStatus.repack,
-                        ReturnStatus.awaiting_1c, ReturnStatus.scrapped),
-    # Из «ждём 1С» — НИКУДА руками. Оба выхода ставит ответ 1С, и только он.
+                        ReturnStatus.awaiting_1c, ReturnStatus.awaiting_scrap),
+    # Из обоих ожиданий — НИКУДА руками. Выходы ставит ответ 1С, и только он.
     ReturnStatus.awaiting_1c: (),
-    # Отказ 1С разбирает человек: повторить, отложить или выбросить.
-    ReturnStatus.rejected_1c: (ReturnStatus.awaiting_1c, ReturnStatus.held,
-                               ReturnStatus.scrapped),
+    ReturnStatus.awaiting_scrap: (),
+    # Отказ 1С разбирает человек: повторить продажу, повторить утиль, отложить.
+    ReturnStatus.rejected_1c: (ReturnStatus.awaiting_1c, ReturnStatus.awaiting_scrap,
+                               ReturnStatus.held),
     ReturnStatus.back_to_sale: (),
     ReturnStatus.scrapped: (),
 }
 
-# Переходы, которые ставит ТОЛЬКО ответ 1С, минуя таблицу выше.
-RETURN_BY_1C = (ReturnStatus.back_to_sale, ReturnStatus.rejected_1c)
+# Переходы, которые ставит ТОЛЬКО ответ 1С, минуя таблицу выше. `scrapped` здесь
+# с 26.09: утилизация перестала быть тем, что ставит кнопка. Вещь числится на
+# складе площадки в 1С, и списать её — это ДВА документа (возврат на ЦС и
+# списание с ЦС), то есть работа 1С, а не отметка у нас. Поставь мы статус
+# кнопкой — он утверждал бы, что учёт сошёлся, когда 1С об этом ещё не знает.
+RETURN_BY_1C = (ReturnStatus.back_to_sale, ReturnStatus.rejected_1c,
+                ReturnStatus.scrapped)
 
 
 class ReturnItem(Base):

@@ -23,6 +23,7 @@
 <div style="display:flex;border-bottom:1px solid var(--line);margin-bottom:16px">
     <a href="/returns" style="padding:9px 16px;border-bottom:2px solid {% if request.url.path == '/returns' %}var(--accent){% else %}transparent{% endif %}">Приёмка</a>
     <a href="/returns/list" style="padding:9px 16px;border-bottom:2px solid {% if '/returns/list' in request.url.path %}var(--accent){% else %}transparent{% endif %}">Список</a>
+    <a href="/returns/scrapped" style="padding:9px 16px;border-bottom:2px solid {% if '/returns/scrapped' in request.url.path %}var(--accent){% else %}transparent{% endif %}">Утилизация</a>
 </div>
 
 {% if not test_mode %}
