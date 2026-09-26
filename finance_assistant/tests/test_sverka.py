@@ -1,7 +1,7 @@
 from openpyxl import load_workbook
 import io
 
-from conftest import CHAT, png, payment
+from conftest import CHAT, png, payment, answer
 from finance.reconcile import match, summarize
 from finance.storage import Expense, StatementLine
 
@@ -91,7 +91,7 @@ def test_biz_from_statement_line(env):
     line_id = db.statement(db.cards()[0].id, "2026-09")[1][0].id
     [question] = flow.on_command(CHAT, "biz", str(line_id))
     assert "статья" in question.text.lower()
-    flow.on_button(CHAT, f"d:cat:{db.category_id('Упаковка и расходники')}")
+    answer(flow, f"d:cat:{db.category_id('Упаковка и расходники')}")
     s = summarize(db, "2026-09")
     cs = s.cards[0]
     assert cs.business == 420000 and cs.personal == 0 and not cs.missing and not cs.unmatched_out
@@ -134,7 +134,7 @@ def test_reset_statement(env):
     flow.on_command(CHAT, "done")
     [r] = start_sverka(flow, db)
     assert "Уже загружено строк: 1" in r.text
-    flow.on_button(CHAT, "s:reset")
+    flow.on_button(CHAT, f"s:reset:{db.cards()[0].id}:2026-09")
     assert db.statement(db.cards()[0].id, "2026-09") is None
 
 

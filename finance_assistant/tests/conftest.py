@@ -56,3 +56,11 @@ _shots = iter(range(1, 10**6))
 def png():
     """Новый «скриншот»: у каждого своё содержимое, как у настоящих."""
     return (b"\x89PNG fake %d" % next(_shots), "image/png")
+
+
+def answer(flow, data: str, chat: int = CHAT):
+    """Нажать кнопку текущего вопроса: как в Telegram, в неё зашит номер операции."""
+    if data.startswith("d:"):
+        draft_id = flow.db.get_state(chat)["drafts"][0]["id"]
+        data = f"d:{draft_id}:{data[2:]}"
+    return flow.on_button(chat, data)

@@ -1,7 +1,7 @@
 """Расчётный счёт ИП с бизнес-картой (образцы ПСБ). Номера счетов вымышленные."""
 import pytest
 
-from conftest import CHAT, png, TODAY, FakeRecognizer, payment
+from conftest import CHAT, png, TODAY, FakeRecognizer, payment, answer
 from finance.flow import Flow
 from finance.reconcile import summarize
 from finance.storage import Storage
@@ -59,7 +59,7 @@ def test_b2c_transfer_to_other_person_is_business_expense(biz):
                                category="Подрядчики и зарплата", category_confident=False))
     [q] = flow.on_files(CHAT, [png()], "")
     assert "статья" in q.text.lower()
-    flow.on_button(CHAT, f"d:cat:{db.category_id('Подрядчики и зарплата')}")
+    answer(flow, f"d:cat:{db.category_id('Подрядчики и зарплата')}")
     [e] = db.expenses("2026-08")
     assert e.card == "ПСБ" and e.category == "Подрядчики и зарплата"
 
@@ -70,7 +70,7 @@ def test_income_to_business_account_not_recorded(biz):
     rec.payments.append(kontur(direction="in", amount="236", merchant="Банк ПСБ"))
     [r] = flow.on_files(CHAT, [png()], "")
     assert "поступление — не записываю" in r.text
-    assert db.expenses("2026-07") == [] and db.get_state(CHAT) == {}
+    assert db.expenses("2026-07") == [] and set(db.get_state(CHAT)) <= {"seq"}
 
 
 def test_transfer_from_business_account_to_owner_card(biz):
@@ -90,7 +90,7 @@ def test_month_totals_business_by_category_and_personal(biz):
     flow.on_files(CHAT, [png()], "")
     rec.payments.append(kontur(amount="500", date="2026-09-11", looks_personal=True))
     flow.on_files(CHAT, [png()], "")
-    [saved] = flow.on_button(CHAT, "d:purpose:personal")
+    [saved] = answer(flow, "d:purpose:personal")
     assert "Личное (с бизнес-счёта)" in saved.text
     rec.payments.append(kontur(amount="2950", date="2026-09-12"))
     flow.on_files(CHAT, [png()], "")
@@ -135,7 +135,7 @@ def test_business_account_sverka(biz):
     [spend] = [r for r in replies if r.text.startswith("📋")]
     assert "Петров" in spend.text and "Контур" not in spend.text  # Контур уже записан
 
-    [done] = flow.on_button(CHAT, "s:acc")
+    [done] = flow.on_button(CHAT, f"s:acc:{db.get_state(CHAT)['review_id']}")
     assert "Прочее: 20 000,00 ₽" in done.text
     s = summarize(db, "2026-09")
     cs = s.business_accounts[0]

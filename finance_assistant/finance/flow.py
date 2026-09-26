@@ -131,11 +131,16 @@ def _parse_date(text: str, today: date) -> str | None:
             return datetime.strptime(text, fmt).date().isoformat()
         except ValueError:
             continue
-    try:  # "05.09" — текущий год, а если дата в будущем — прошлый
-        d = datetime.strptime(text, "%d.%m").date().replace(year=today.year)
-        return (d if d <= today else d.replace(year=today.year - 1)).isoformat()
-    except ValueError:
-        return None
+    # "05.09" — текущий год, а если дата в будущем — прошлый. Год подставляем
+    # до разбора: иначе 29.02 не разбирается (по умолчанию год 1900, не високосный).
+    for year in (today.year, today.year - 1):
+        try:
+            d = datetime.strptime(f"{text}.{year}", "%d.%m.%Y").date()
+        except ValueError:
+            continue
+        if d <= today:
+            return d.isoformat()
+    return None
 
 
 def _last4(text: str) -> str:
@@ -279,8 +284,10 @@ class Flow:
                 files, text, today=self.today().isoformat(), cards=cards, categories=categories
             )
         except RecognitionError as exc:
+            self._discard_receipt({"receipt": receipt})
             return [Reply(f"Не получилось распознать: {exc}.")]
         if not info.get("is_payment"):
+            self._discard_receipt({"receipt": receipt})
             return [Reply("Не вижу здесь одной оплаты или перевода. Пришлите скриншот "
                           "конкретной операции (откройте её в истории банка) или чек, "
                           "либо напишите сумму текстом.\n"
@@ -320,7 +327,7 @@ class Flow:
             # Этому получателю вы уже назначали статью — не угадываем и не спрашиваем.
             draft.update(category_id=rule, category_confident=True, by_rule=True)
         state = self.db.get_state(chat_id)
-        state.setdefault("drafts", []).append(draft)
+        self._enqueue(state, draft)
         self.db.set_state(chat_id, state)
         if len(state["drafts"]) > 1:
             # Сначала доспрашиваем предыдущую операцию, эту — следом.
@@ -356,6 +363,7 @@ class Flow:
             d = state["drafts"][0]
             question = self._next_question(d)
             if question and question[0] == "drop":
+                self._discard_receipt(d)
                 self._pop_draft(state)
                 self.db.set_state(chat_id, state)
                 replies.append(question[1])
@@ -363,14 +371,17 @@ class Flow:
             if question:
                 state["ask"] = question[0]
                 self.db.set_state(chat_id, state)
-                return replies + self._quiet_summary(quiet) + [question[1]]
+                return replies + self._quiet_summary(quiet) + [self._tag_buttons(question[1], d["id"])]
             if d.get("own_transfer"):
                 transfer_id = self.db.add_transfer(
                     op_date=d["date"], amount=d["amount"], from_card_id=d["transfer"]["from"],
                     to_card_id=d["transfer"]["to"],
                     description=" — ".join(x for x in (d["merchant"], d["description"]) if x),
-                    receipt_path=self._file_receipt(d["receipt"], d["date"]),
+                    receipt_path=d["receipt"],
                     seen_side="out" if d["kind"] is not None else "in")
+                # Файл переносим в папку месяца только после успешной записи.
+                self.db.update_transfer(transfer_id,
+                                        receipt_path=self._file_receipt(d["receipt"], d["date"]))
                 self.db.remember_files(d.get("file_keys", []), f"t:{transfer_id}")
                 self._pop_draft(state)
                 self.db.set_state(chat_id, state)
@@ -381,8 +392,11 @@ class Flow:
                 purpose=d["purpose"],
                 category_id=d["category_id"] if d["purpose"] == BUSINESS and d["kind"] == EXPENSE else None,
                 merchant=d["merchant"], description=d["description"],
-                receipt_path=self._file_receipt(d["receipt"], d["date"]),
+                receipt_path=d["receipt"],
             )
+            # Файл переносим в папку месяца только после успешной записи.
+            self.db.update_expense(expense_id,
+                                   receipt_path=self._file_receipt(d["receipt"], d["date"]))
             self.db.remember_files(d.get("file_keys", []), f"e:{expense_id}")
             if d.get("learn_rule") and d["purpose"] == BUSINESS:
                 self.db.set_rule(d["merchant"], d["category_id"])
@@ -406,6 +420,12 @@ class Flow:
         lines += [f"  • {name}: {rub(total)}" for name, total in by_cat.items()]
         lines.append("Поправить отдельную запись: /list месяц, затем /fix номер")
         return [Reply("\n".join(lines))]
+
+    def _discard_receipt(self, d: dict):
+        """Скриншот, из которого не получилось записи, не храним."""
+        path = d.get("receipt")
+        if path and os.path.exists(path) and os.path.dirname(os.path.dirname(path)) == self.receipts_dir:
+            os.remove(path)
 
     def _file_receipt(self, path: str, op_date: str) -> str:
         """Скриншот лежит в папке месяца, когда его прислали; переносим в месяц оплаты."""
@@ -440,6 +460,9 @@ class Flow:
             return "date", Reply(head + "Не вижу даты. Когда была оплата? Можно написать 05.09.",
                                  [[("Сегодня", "d:date:0"), ("Вчера", "d:date:1")],
                                   [("Отмена", "d:skip")]])
+        if d["card_id"] is not None and not self.db.card(d["card_id"]):
+            d["card_id"] = None  # карту удалили, пока висел вопрос, — спросим заново
+            d["transfer"] = None
         if d["card_id"] is None:
             cards = self.db.cards()
             # Карты могли добавить, пока висел вопрос, — пробуем угадать заново.
@@ -571,13 +594,42 @@ class Flow:
         self.db.set_state(chat_id, state)
         return self._advance(chat_id)
 
+    # Какие кнопки допустимы для текущего вопроса. Кнопка от другого вопроса —
+    # даже той же операции — неактуальна.
+    _BUTTONS_FOR_ASK = {"amount": {"skip"}, "date": {"date", "skip"},
+                        "card": {"card", "retry", "skip"}, "purpose": {"purpose"},
+                        "category": {"cat"}, "dup": {"skip", "dup"}, "transfer": {"tr"}}
+
+    @staticmethod
+    def _enqueue(state: dict, draft: dict):
+        """Поставить операцию в очередь с собственным номером: он зашит в её кнопки,
+        чтобы кнопка под старым вопросом не сработала на другую операцию."""
+        state["seq"] = state.get("seq", 0) + 1
+        draft["id"] = state["seq"]
+        state.setdefault("drafts", []).append(draft)
+
+    @staticmethod
+    def _tag_buttons(reply: Reply, draft_id: int) -> Reply:
+        reply.buttons = [[(label, f"d:{draft_id}:{data[2:]}" if data.startswith("d:") else data)
+                          for label, data in row] for row in reply.buttons]
+        return reply
+
     def _answer_button(self, chat_id, rest) -> list[Reply]:
         state = self.db.get_state(chat_id)
-        if not state.get("drafts"):
-            return [Reply("Этот вопрос уже неактуален.")]
+        stale = [Reply("Этот вопрос уже неактуален — ответьте на последний вопрос бота.")]
+        draft_id, _, rest = rest.partition(":")
+        if not state.get("drafts") or not draft_id.isdigit():
+            return stale
         d = state["drafts"][0]
         what, _, value = rest.partition(":")
+        if d.get("id") != int(draft_id) or what not in self._BUTTONS_FOR_ASK.get(state.get("ask"), ()):
+            return stale
+        if what == "card" and not self.db.card(int(value)):
+            return [Reply("Этой карты уже нет. Выберите другую.")] + self._advance(chat_id)
+        if what == "tr" and int(value) and not self.db.card(int(value)):
+            return [Reply("Этой карты уже нет. Выберите другую.")] + self._advance(chat_id)
         if what == "skip":
+            self._discard_receipt(d)
             self._pop_draft(state)
             self.db.set_state(chat_id, state)
             return [Reply("Не записываю.")] + self._advance(chat_id)
@@ -610,7 +662,8 @@ class Flow:
         """Карту выбрали кнопкой, а на скриншоте был незнакомый номер (часто это
         номер счёта, а не карты) — запоминаем, чтобы в следующий раз не спрашивать."""
         number = _last4(d.get("card_hint", ["", ""])[0])
-        if not number or any(number in c.numbers for c in self.db.cards()):
+        card = self.db.card(d["card_id"])
+        if not card or not number or any(number in c.numbers for c in self.db.cards()):
             return None
         self.db.add_card_number(d["card_id"], number)
         card = self.db.card(d["card_id"])
@@ -631,6 +684,7 @@ class Flow:
         if not t:
             return [Reply(f"Перевода П{transfer_id} уже нет.")]
         if action == "del":
+            self._discard_receipt({"receipt": t.receipt_path})
             self.db.delete_transfer(transfer_id)
             return [Reply(f"🗑 Перевод П{transfer_id} удалён.")]
         if len(parts) == 2:
@@ -678,6 +732,7 @@ class Flow:
         if not e:
             return [Reply(f"Записи №{expense_id} уже нет.")]
         if action == "del":
+            self._discard_receipt({"receipt": e.receipt_path})
             self.db.delete_expense(expense_id)
             return [Reply(f"🗑 Запись №{expense_id} удалена.")]
         if action == "cat" and len(parts) == 2:
@@ -685,7 +740,10 @@ class Flow:
         if action == "cat":
             category_id = int(parts[2])
             self.db.update_expense(expense_id, category_id=category_id, purpose=BUSINESS)
-            if self.db.set_rule(e.merchant, category_id):
+            # Запись из выписки: «получатель» — это описание операции банка,
+            # правило по нему не создаём.
+            from_statement = e.description.startswith("по выписке") and not e.receipt_path
+            if not from_statement and self.db.set_rule(e.merchant, category_id):
                 return [self._saved_reply(expense_id)] + self._offer_rule(e.merchant, category_id)
         elif action == "ruleall":
             category_id = int(parts[2])
@@ -712,7 +770,12 @@ class Flow:
         return [Reply(HELP)]
 
     def _cancel(self, chat_id, arg):
-        self.db.set_state(chat_id, {})
+        state = self.db.get_state(chat_id)
+        for d in state.get("drafts", []):
+            self._discard_receipt(d)
+        # Счётчик номеров операций оставляем: иначе кнопки под старыми вопросами
+        # совпали бы с номерами новых операций.
+        self.db.set_state(chat_id, {"seq": state["seq"]} if "seq" in state else {})
         return [Reply("Сбросил текущий вопрос и режим сверки.")]
 
     def _cards(self, chat_id, arg):
@@ -757,6 +820,9 @@ class Flow:
     def _del_card(self, chat_id, arg):
         if not arg.isdigit() or not self.db.card(int(arg)):
             return [Reply("Укажите номер карты из /cards, например /delcard 2")]
+        if self.db.card_in_use_by_dialog(int(arg)):
+            return [Reply("Эта карта сейчас нужна: по ней идёт сверка или вопрос по операции. "
+                          "Закончите (или /cancel) и повторите.")]
         if not self.db.delete_card(int(arg)):
             return [Reply("По этой карте уже есть записи или выписки — удалить нельзя.")]
         return [Reply("Карта удалена.")]
@@ -887,7 +953,7 @@ class Flow:
             buttons = []
             if found:
                 already = f"\nУже загружено строк: {len(found[1])}. Новые добавятся к ним.\n"
-                buttons = [[("Загрузить заново", "s:reset")]]
+                buttons = [[("Загрузить заново", f"s:reset:{card.id}:{month}")]]
             return [Reply(
                 f"Жду выписку по карте {card.label} за {month_name(month)}.{already}\n"
                 "Присылайте PDF, скриншоты или Excel/CSV — можно несколькими сообщениями. "
@@ -896,20 +962,31 @@ class Flow:
         if what == "itog":
             return self._itog(chat_id, value)
         if what == "acc":
+            # Кнопка от другого списка (например, по другой карте) — неактуальна.
+            if not value.isdigit() or int(value) != state.get("review_id"):
+                return [Reply("Этот список уже неактуален — откройте сверку заново: /sverka")]
             return self._biz(chat_id, "все")
-        if what == "reset" and state.get("statement", {}).get("month"):
-            st = state["statement"]
+        st = state.get("statement", {})
+        if what == "reset" and st.get("month") and value == f"{st['card_id']}:{st['month']}":
             self.db.reset_statement(st["card_id"], st["month"])
+            # Номера строк из прошлых списков больше не действуют.
+            state.pop("review", None)
+            state.pop("review_id", None)
+            self.db.set_state(chat_id, state)
             return [Reply("Старые данные выписки удалены, присылайте заново.")]
         return [Reply("Этот вопрос уже неактуален. /sverka — начать сверку.")]
 
     def _statement_input(self, chat_id, state, files, text, keys=()):
         st = state["statement"]
         card = self.db.card(st["card_id"])
+        if not card:
+            state.pop("statement")
+            self.db.set_state(chat_id, state)
+            return [Reply("Карты этой сверки больше нет — сверка сброшена. /sverka — начать заново.")]
         ref = f"s:{card.id}:{st['month'] or 'period'}"
         other_card = ""
         if keys:
-            if self.db.seen_refs(list(keys), f"s:{card.id}:"):
+            if ref in self.db.seen_refs(list(keys), ref):
                 return [Reply(f"Этот файл уже загружен по карте {card.label} — пропускаю. "
                               "Следующую часть выписки — присылайте, всё — /done")]
             seen = self.db.seen_refs(list(keys), "s:")
@@ -982,7 +1059,10 @@ class Flow:
         if totals_month and (total_in is not None or total_out is not None):
             head.append(f"Итоги из документа: пришло {rub(total_in)}, ушло {rub(total_out)}")
         msg = head + msg + ["Ещё части выписки — присылайте, всё — /done"]
-        self.db.remember_files(list(keys), ref)
+        if total_added or (totals_month and (total_in is not None or total_out is not None)):
+            # Файл, из которого ничего не взяли (например, не тот месяц), не
+            # запоминаем — его можно будет прислать для другого месяца.
+            self.db.remember_files(list(keys), ref)
         return [Reply("\n".join(msg) + warn + other_card)]
 
     def _line_category(self, op: dict) -> str:
@@ -1005,6 +1085,9 @@ class Flow:
             return [Reply("Выписка не была загружена.")]
 
         card = self.db.card(st["card_id"])
+        if not card:
+            self.db.set_state(chat_id, state)
+            return [Reply("Карты этой сверки больше нет — сверка сброшена.")]
         replies, suggestions, unmatched = [], [], []
         for month in months:
             cs = next(c for c in summarize(self.db, month).cards if c.card.id == card.id)
@@ -1017,18 +1100,21 @@ class Flow:
                 unmatched += [ln for ln in cs.unmatched_out if not ln.suggested_category]
 
         state["review"] = [ln.id for ln in suggestions]
+        state["seq"] = state.get("seq", 0) + 1
+        state["review_id"] = state["seq"]  # зашит в кнопку «Записать все»
         if not state["review"]:
-            del state["review"]
+            del state["review"], state["review_id"]
         self.db.set_state(chat_id, state)
+        acc = f"s:acc:{state.get('review_id', 0)}"
         if suggestions and card.is_business:
             replies.append(Reply(
                 suggestions_text(suggestions, "📋 Расходы с бизнес-счёта без статьи")
                 + "\n\nВ своде они уже входят в бизнес как «Без статьи». Кнопка разнесёт их "
                   "по предложенным статьям (нераспознанные — в «Прочее»), поправить: /fix номер",
-                [[("✅ Разнести по статьям", "s:acc")]]))
+                [[("✅ Разнести по статьям", acc)]]))
         elif suggestions:
             replies.append(Reply(suggestions_text(suggestions),
-                                 [[("✅ Записать все как бизнес", "s:acc")]]))
+                                 [[("✅ Записать все как бизнес", acc)]]))
         if unmatched and len(months) == 1:
             replies.append(Reply(unmatched_text(unmatched)))
         elif unmatched:
@@ -1099,7 +1185,7 @@ class Flow:
             category_id = self.db.category_id(row["suggested_category"])
             if category_id is None and self.db.card(row["card_id"]).is_business:
                 category_id = self.db.category_id("Прочее")
-            state.setdefault("drafts", []).append({
+            self._enqueue(state, {
                 "amount": row["amount"], "date": row["op_date"], "card_id": row["card_id"],
                 "kind": EXPENSE, "purpose": BUSINESS, "purpose_asked": True,
                 "category_id": category_id, "category_confident": category_id is not None,
@@ -1126,9 +1212,10 @@ class Flow:
         left = [i for i in state.get("review", []) if i not in ids]
         state["review"] = left
         if not left:
-            del state["review"]
+            state.pop("review", None)
+            state.pop("review_id", None)
         self.db.set_state(chat_id, state)
         if not left:
             return [Reply("Убрал. Предложений больше не осталось.")]
         return [Reply(f"Убрал из предложенных: {len(ids)}. Осталось {len(left)}.",
-                      [[("✅ Записать оставшиеся как бизнес", "s:acc")]])]
+                      [[("✅ Записать оставшиеся как бизнес", f"s:acc:{state['review_id']}")]])]

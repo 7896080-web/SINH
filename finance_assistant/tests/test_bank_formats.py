@@ -3,7 +3,7 @@
 Ответы модели здесь заданы вручную так, как их должен вернуть Claude по этим
 скриншотам (по инструкциям из recognize.py). Номера карт/счетов вымышленные.
 """
-from conftest import CHAT, png, FakeRecognizer, payment
+from conftest import CHAT, png, FakeRecognizer, payment, answer
 from finance.flow import Flow, _bank_key
 from finance.reconcile import summarize
 from finance.storage import Storage
@@ -41,10 +41,10 @@ def test_vtb_account_number_learned_after_one_question(banks):
     [q] = flow.on_files(CHAT, [png()], "")
     assert "С какой карты" in q.text  # •7702 незнаком, хотя банк ВТБ понятен
     vtb = next(c for c in db.cards() if c.name == "ВТБ")
-    replies = flow.on_button(CHAT, f"d:card:{vtb.id}")
+    replies = answer(flow, f"d:card:{vtb.id}")
     assert replies[0].text.startswith("Запомнил: …7702")
     assert "статья" in replies[1].text.lower()
-    flow.on_button(CHAT, f"d:cat:{db.category_id('Подрядчики и зарплата')}")
+    answer(flow, f"d:cat:{db.category_id('Подрядчики и зарплата')}")
     assert db.card(vtb.id).numbers == ["5501", "7702"]
 
     # «Яндекс 360 −1 417 ₽ · Карта для жизни •5501» и снова Мастер-счет — без вопроса о карте
@@ -71,7 +71,7 @@ def test_rossiya_card_found_by_bank_then_account_remembered(banks):
     # (по банку угадываем только когда номера не видно); спрашиваем карту.
     assert "С какой карты" in q.text
     rossiya = next(c for c in db.cards() if c.name == "Россия")
-    replies = flow.on_button(CHAT, f"d:card:{rossiya.id}")
+    replies = answer(flow, f"d:card:{rossiya.id}")
     assert "…9012" in replies[0].text
     assert "✓ Реклама и продвижение" in str(replies[1].buttons)
 
