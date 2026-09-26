@@ -29,8 +29,10 @@ def parse_user_ids(raw: str) -> list[int]:
 
 
 class UserSpaces:
-    def __init__(self, data_dir: str, recognizer, user_ids: list[int], **flow_options):
+    def __init__(self, data_dir: str, recognizer, user_ids: list[int], *,
+                 allow_reset: bool = False, **flow_options):
         self.data_dir = data_dir
+        self.allow_reset = allow_reset  # только тестовый режим
         self.recognizer = recognizer
         self.user_ids = list(user_ids)
         self.flow_options = flow_options
@@ -51,6 +53,18 @@ class UserSpaces:
             self._flows[user_id] = Flow(storage, self.recognizer, os.path.join(folder, "receipts"),
                                         **self.flow_options)
         return self._flows[user_id]
+
+    def reset(self, user_id: int):
+        """Стереть все данные пользователя (тестовый режим, команда /reset)."""
+        if not self.allow_reset:
+            raise PermissionError("стирать данные можно только в тестовом режиме")
+        if user_id not in self.user_ids:
+            raise PermissionError(f"пользователь {user_id} не в списке")
+        flow = self._flows.pop(user_id, None)
+        if flow is not None:
+            flow.db.close()
+        shutil.rmtree(self.user_dir(user_id), ignore_errors=True)
+        log.warning("Тестовые данные пользователя %s стёрты", user_id)
 
     def migrate_shared_data(self) -> str | None:
         """Прежняя версия хранила всё в одной базе data/finance.db. Переносим её

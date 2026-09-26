@@ -1,12 +1,15 @@
 """Telegram-обвязка: принимает апдейты, зовёт Flow, отправляет ответы.
 
-Запуск: python -m finance (настройки — переменные окружения, см. README).
+Запуск: python -m finance — боевой бот, python -m finance --test — тестовый
+(настройки — переменные окружения, см. README).
 """
 
+import argparse
 import asyncio
 import io
 import logging
 import os
+import time
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
 from telegram.constants import ChatAction, ChatType
@@ -14,6 +17,7 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, Con
                           MessageHandler, filters)
 
 from .flow import Reply
+from .mode import run_config
 from .recognize import ClaudeRecognizer, DEFAULT_MODEL
 from .users import UserSpaces, parse_user_ids
 
@@ -57,10 +61,15 @@ def _split(text: str) -> list[str]:
     return [p.rstrip("\n") for p in parts if p.strip()]
 
 
-async def send(update: Update, replies: list[Reply]):
+def _marked(text: str, label: str) -> str:
+    return f"{label}\n{text}" if label and text else text
+
+
+async def send(update: Update, replies: list[Reply], label: str = ""):
+    """label — пометка тестового режима перед каждым ответом («🧪 ТЕСТ»)."""
     chat = update.effective_chat
     for r in replies:
-        chunks = _split(r.text) or [""]
+        chunks = _split(_marked(r.text, label)) or [""]
         for i, chunk in enumerate(chunks):
             markup = None
             if r.buttons and i == len(chunks) - 1:
@@ -70,6 +79,8 @@ async def send(update: Update, replies: list[Reply]):
             await chat.send_message(chunk, reply_markup=markup)
         if r.file:
             name, data = r.file
+            if label:
+                name = "ТЕСТ-" + name
             await chat.send_document(InputFile(io.BytesIO(data), filename=name))
 
 
@@ -96,11 +107,20 @@ async def watch_env(app: Application, path: str, interval: float = ENV_CHECK_INT
             return
 
 
-def build_app(token: str, flow_for, allowed: set[int], env_file: str | None = None) -> Application:
+TEST_HELP = ("🧪 Это ТЕСТОВЫЙ бот. Всё, что вы здесь записываете, хранится отдельно "
+             "и в боевой учёт не попадает. Пробуйте смело: скриншоты, выписки, сверку, "
+             "правила.\n/reset — стереть все тестовые данные и начать с чистого листа.")
+RESET_YES, RESET_NO = "reset:yes", "reset:no"
+
+
+def build_app(token: str, flow_for, allowed: set[int], env_file: str | None = None,
+              label: str = "", reset=None) -> Application:
     """flow_for(user_id) → Flow этого пользователя (у каждого своя база).
 
     Можно передать и один Flow (в тестах) — тогда он общий. env_file — следить
     за файлом настроек и перезапускаться при его изменении.
+    Тестовый режим: label — пометка перед каждым ответом, reset(user_id) —
+    стереть данные пользователя (команда /reset есть только тогда).
     """
     builder = Application.builder().token(token)
     if env_file:
@@ -109,6 +129,9 @@ def build_app(token: str, flow_for, allowed: set[int], env_file: str | None = No
         builder = builder.post_init(start_watch)
     app = builder.build()
     resolve = flow_for if callable(flow_for) else (lambda user_id: flow_for)
+
+    async def say(chat, text: str, **kwargs):
+        await chat.send_message(_marked(text, label), **kwargs)
 
     async def guard(update: Update) -> bool:
         chat = update.effective_chat
@@ -122,7 +145,7 @@ def build_app(token: str, flow_for, allowed: set[int], env_file: str | None = No
         # Бот видит финансовые данные — чужим не отвечаем ничем, кроме id,
         # чтобы владелец мог добавить себя в ALLOWED_USER_IDS при настройке.
         if update.effective_chat and update.message:
-            await update.effective_chat.send_message(
+            await say(update.effective_chat, 
                 f"Доступ закрыт. Ваш Telegram id: {user.id if user else '?'}")
         return False
 
@@ -154,7 +177,7 @@ def build_app(token: str, flow_for, allowed: set[int], env_file: str | None = No
         fn = getattr(resolve(user_id), method)
         async with locks.setdefault(user_id, asyncio.Lock()):
             if note:
-                await chat.send_message(note)
+                await say(chat, note)
             typing = asyncio.create_task(keep_typing(chat))
             try:
                 # Распознавание — синхронный сетевой вызов на десятки секунд;
@@ -162,7 +185,7 @@ def build_app(token: str, flow_for, allowed: set[int], env_file: str | None = No
                 replies = await asyncio.to_thread(fn, chat.id, *args)
             finally:
                 typing.cancel()
-            await send(update, replies)
+            await send(update, replies, label)
 
     def batch_note(n: int) -> str:
         if n == 1:
@@ -185,7 +208,7 @@ def build_app(token: str, flow_for, allowed: set[int], env_file: str | None = No
             await run(batch["update"], "on_batch", items, note=batch_note(len(items)))
         except Exception:  # задача вне обработчика PTB — ошибку ловим сами
             log.exception("Ошибка при разборе пачки")
-            await batch["update"].effective_chat.send_message(
+            await say(batch["update"].effective_chat, 
                 "Что-то пошло не так при разборе файлов, ничего из пачки не записано. "
                 "Пришлите их ещё раз; если повторяется — /cancel.")
 
@@ -212,7 +235,31 @@ def build_app(token: str, flow_for, allowed: set[int], env_file: str | None = No
             return
         await flush_first(update)
         command = update.message.text.split()[0].lstrip("/").split("@")[0].lower()
+        if command == "reset":
+            await ask_reset(update)
+            return
         await run(update, "on_command", command, " ".join(context.args or []))
+        if label and command in ("start", "help"):
+            await say(update.effective_chat, TEST_HELP)
+
+    async def ask_reset(update: Update):
+        if reset is None:  # в боевом режиме команды нет вовсе
+            await update.effective_chat.send_message("Не знаю такой команды. /help — что я умею.")
+            return
+        await send(update, [Reply(
+            "Стереть ВСЕ тестовые данные: карты, записи, выписки, правила, скриншоты? "
+            "Боевой учёт это не затронет.",
+            [[("🗑 Да, стереть", RESET_YES), ("Нет", RESET_NO)]])], label)
+
+    async def do_reset(update: Update, data: str):
+        chat = update.effective_chat
+        if data == RESET_NO or reset is None:
+            await say(chat, "Ничего не стёр.")
+            return
+        user_id = update.effective_user.id
+        async with locks.setdefault(user_id, asyncio.Lock()):
+            await asyncio.to_thread(reset, user_id)
+        await say(chat, "🗑 Тестовые данные стёрты. Начинаем с чистого листа: /addcard …")
 
     async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await guard(update):
@@ -229,7 +276,7 @@ def build_app(token: str, flow_for, allowed: set[int], env_file: str | None = No
             return
         doc = update.message.document
         if doc.file_size and doc.file_size > MAX_FILE:
-            await update.effective_chat.send_message("Файл больше 20 МБ — Telegram не даст его скачать. "
+            await say(update.effective_chat, "Файл больше 20 МБ — Telegram не даст его скачать. "
                                                      "Пришлите частями или скриншотами.")
             return
         mime = doc.mime_type or ""
@@ -246,10 +293,10 @@ def build_app(token: str, flow_for, allowed: set[int], env_file: str | None = No
                     else "Старый .xls пересохраните в .xlsx или пришлите PDF."
                     if name.endswith(".xls") else
                     "Принимаю фото и скриншоты, PDF, Excel (.xlsx) и CSV.")
-            await update.effective_chat.send_message(f"Такой файл не разберу. {hint}")
+            await say(update.effective_chat, f"Такой файл не разберу. {hint}")
             return
         if mime in IMAGE_MIMES and doc.file_size and doc.file_size > MAX_IMAGE:
-            await update.effective_chat.send_message(
+            await say(update.effective_chat, 
                 "Картинка больше 5 МБ — пришлите её обычным фото (не файлом), "
                 "Telegram сам её уменьшит.")
             return
@@ -275,19 +322,23 @@ def build_app(token: str, flow_for, allowed: set[int], env_file: str | None = No
         except Exception:  # сообщение могли удалить — не критично
             pass
         await flush_first(update)
+        if query.data in (RESET_YES, RESET_NO):
+            await do_reset(update, query.data)
+            return
         await run(update, "on_button", query.data)
 
     async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("Ошибка при обработке апдейта", exc_info=context.error)
         if isinstance(update, Update) and update.effective_chat:
-            await update.effective_chat.send_message(
+            await say(update.effective_chat, 
                 "Что-то пошло не так, запись не сохранена. Попробуйте ещё раз; "
                 "если ошибка повторяется — /cancel сбросит текущий вопрос.")
 
     # Только новые сообщения: отредактированное сообщение не должно
     # записываться второй раз (и у него нет update.message).
     new = filters.UpdateType.MESSAGE
-    app.add_handler(CommandHandler(COMMANDS, on_command, filters=new))
+    app.add_handler(CommandHandler(COMMANDS + (["reset"] if reset else []), on_command,
+                                   filters=new))
     app.add_handler(MessageHandler(new & filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(new & filters.Document.ALL, on_document))
     app.add_handler(MessageHandler(new & filters.TEXT & ~filters.COMMAND, on_text))
@@ -296,20 +347,47 @@ def build_app(token: str, flow_for, allowed: set[int], env_file: str | None = No
     return app
 
 
-def main():
+def wait_for_settings(env_file: str | None, interval: float | None = None):
+    """Тестовый бот ещё не настроен: ждём, пока впишут его токен, и выходим —
+    systemd запустит заново уже с новыми настройками."""
+    if not env_file:
+        raise SystemExit("Тестовый бот: не задан TELEGRAM_BOT_TOKEN_TEST")
+    log.info("Тестовый бот не настроен (нет TELEGRAM_BOT_TOKEN_TEST) — жду настроек")
+    known = _mtime(env_file)
+    while _mtime(env_file) == known:
+        time.sleep(interval or ENV_CHECK_INTERVAL)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="python -m finance")
+    parser.add_argument("--test", action="store_true",
+                        help="тестовый режим: отдельный бот и отдельные данные")
+    args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)  # иначе каждый опрос Telegram в логе
-    token = os.environ["TELEGRAM_BOT_TOKEN"]
-    user_ids = parse_user_ids(os.environ.get("ALLOWED_USER_IDS", ""))
-    if not user_ids:
+    env_file = os.environ.get("FINANCE_ENV_FILE")
+    try:
+        config = run_config(os.environ, test=args.test)
+    except ValueError as exc:
+        if not args.test:
+            raise SystemExit(f"Ошибка настроек: {exc}")
+        # Тестовый бот неверно настроен — не бьёмся в перезапусках, ждём правки.
+        log.error("Тестовый бот не запущен: %s", exc)
+        wait_for_settings(env_file)
+        return
+    if config.is_test and not config.token:
+        wait_for_settings(env_file)
+        return
+    if not config.user_ids:
         log.warning("ALLOWED_USER_IDS пуст — бот никому не ответит, кроме сообщения с id")
-    data_dir = os.environ.get("FINANCE_DATA_DIR", "data")
-    os.makedirs(data_dir, mode=0o700, exist_ok=True)
+    os.makedirs(config.data_dir, mode=0o700, exist_ok=True)
     recognizer = ClaudeRecognizer(model=os.environ.get("CLAUDE_MODEL", DEFAULT_MODEL))
-    spaces = UserSpaces(data_dir, recognizer, user_ids)
-    spaces.migrate_shared_data()
-    log.info("Пользователей: %d, у каждого своя база в %s/users/<id>/", len(user_ids), data_dir)
-    build_app(token, spaces.flow, set(user_ids),
-              env_file=os.environ.get("FINANCE_ENV_FILE")).run_polling(
+    spaces = UserSpaces(config.data_dir, recognizer, config.user_ids, allow_reset=config.is_test)
+    if not config.is_test:
+        spaces.migrate_shared_data()
+    log.info("Режим: %s. Пользователей: %d, у каждого своя база в %s/users/<id>/",
+             "ТЕСТОВЫЙ" if config.is_test else "боевой", len(config.user_ids), config.data_dir)
+    build_app(config.token, spaces.flow, set(config.user_ids), env_file=env_file,
+              label=config.label, reset=spaces.reset if config.is_test else None).run_polling(
         allowed_updates=[Update.MESSAGE, Update.CALLBACK_QUERY])

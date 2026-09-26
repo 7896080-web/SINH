@@ -134,6 +134,41 @@ def check_telegram(token: str) -> str:
     return "@" + data["result"]["username"]
 
 
+def test_bot_updates(form: dict, env: dict, token: str, checks: bool,
+                     updates: dict, errors: list, notes: list):
+    """Поле «тестовый бот» страницы настроек: проверить и добавить в updates."""
+    from .mode import same_bot
+    test = form.get("TELEGRAM_BOT_TOKEN_TEST", "")
+    if form.get("test_off"):
+        if test:
+            errors.append("тестовый бот: либо новый токен, либо «выключить» — не одновременно")
+        else:
+            updates["TELEGRAM_BOT_TOKEN_TEST"] = ""
+            notes.append("Тестовый бот выключен, его данные сохранены.")
+        return
+    main = token or env.get("TELEGRAM_BOT_TOKEN", "")
+    current_test = test or env.get("TELEGRAM_BOT_TOKEN_TEST", "")
+    if same_bot(current_test, main):
+        errors.append("тестовый бот должен быть отдельным ботом, а не боевым — создайте "
+                      "ещё одного у @BotFather")
+        return
+    if not test:
+        return
+    if checks:
+        try:
+            notes.append("Тестовый бот: " + check_telegram(test))
+        except ValueError as exc:
+            errors.append(f"тестовый бот: {exc}")
+            return
+    updates["TELEGRAM_BOT_TOKEN_TEST"] = test
+
+
+def test_now(env: dict) -> str:
+    value = env.get("TELEGRAM_BOT_TOKEN_TEST", "")
+    return (f"Сейчас: включён, токен {html.escape(mask(value))}" if value
+            else "Сейчас: выключен")
+
+
 def check_anthropic(key: str) -> str:
     """Проверить ключ лёгким запросом к Models API (без расхода токенов)."""
     import anthropic
@@ -229,6 +264,17 @@ button.secondary {{ background:transparent; color:var(--accent); border:1px soli
          spellcheck="false" autocapitalize="off">
   <div class="now">{token_now}</div>
   <div class="hint">У @BotFather: /newbot. Если уже вписан — оставьте пустым.</div>
+</section>
+<section><h2>Тестовый бот — по желанию</h2>
+  <label for="ttok">Токен тестового бота</label>
+  <input id="ttok" name="TELEGRAM_BOT_TOKEN_TEST" type="password" placeholder="123456789:XYZ…"
+         spellcheck="false" autocapitalize="off">
+  <div class="now">{test_now}</div>
+  <div class="hint">Второй бот для проб: отвечает с пометкой «🧪 ТЕСТ», хранит данные отдельно
+  и в боевой учёт ничего не пишет. Создайте у @BotFather ещё одного бота — токен должен быть
+  другого бота, не боевого.</div>
+  <label style="font-weight:400"><input type="checkbox" name="test_off" value="1"
+         style="width:auto"> Выключить тестовый бот (данные останутся)</label>
 </section>
 <section><h2>Пользователи</h2>
   <label for="u1">Пользователь 1 — Telegram id</label>
@@ -376,6 +422,7 @@ class Handler(BaseHTTPRequestHandler):
             topbar="", subtitle=TEMP_SUBTITLE, script_nonce="",
             message=message, action="/" + self.server.secret, csrf=self.server.csrf,
             key_now=now("ANTHROPIC_API_KEY", "ключ"), token_now=now("TELEGRAM_BOT_TOKEN", "токен"),
+            test_now=test_now(env),
             user1=html.escape(form.get("user1", ids[0] if ids else "")),
             user2=html.escape(form.get("user2", ids[1] if len(ids) > 1 else "")))
 
@@ -402,6 +449,7 @@ class Handler(BaseHTTPRequestHandler):
                     notes.append("Бот: " + check_telegram(token))
                 except ValueError as exc:
                     errors.append(str(exc))
+        test_bot_updates(form, env, token, self.server.checks, updates, errors, notes)
         if key:
             updates["ANTHROPIC_API_KEY"] = key
         if token:
