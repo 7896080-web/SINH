@@ -135,6 +135,30 @@
     </div>
 </div>
 
+{# Ответственный виден ВСЕГДА, а меняется только администратором: это имя
+   уезжает в документ 1С и печатается в «Акте списания товаров». Кладовщику
+   достаточно знать, с кого спросят; менять — не его решение. #}
+<div class="card" style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
+    <div style="flex-grow:1">
+        <div style="font-size:13px;color:var(--ink-soft)">ОТВЕТСТВЕННЫЙ В ДОКУМЕНТАХ 1С</div>
+        <div style="font-size:17px;font-weight:600">{{ responsible }}</div>
+        <div style="font-size:13px;color:var(--ink-soft);margin-top:4px">
+            Это имя уезжает в документ списания и печатается в «Акте списания товаров».
+        </div>
+    </div>
+    {% if current_user and current_user.role.value == 'admin' %}
+    <form method="post" action="/returns/scrapped/responsible"
+          style="display:flex;gap:8px;align-items:flex-end">
+        <div>
+            <label for="resp">Сменить</label><br>
+            <input id="resp" name="name" value="{{ responsible }}"
+                   placeholder="имя пользователя 1С" style="width:220px">
+        </div>
+        <button type="submit" class="btn">Сохранить</button>
+    </form>
+    {% endif %}
+</div>
+
 <div class="card" style="padding:0;overflow:hidden">
     <div class="table-scroll">
     <table>
