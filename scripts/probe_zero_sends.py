@@ -44,6 +44,19 @@ from app.models import (AuditLog, DispatchQueueItem, PlatformAccount,  # noqa: E
 from app.database import SessionLocal                                  # noqa: E402
 from app.timeutils import now_utc                                      # noqa: E402
 
+# Консоль боевого сервера пишет в cp1251, и один символ, которого в ней нет,
+# роняет ВЕСЬ вывод скрипта посреди строки — с `UnicodeEncodeError` вместо
+# ответа на вопрос, ради которого скрипт и запускали. Свои строки мы держим в
+# пределах cp1251 (закрыто тестом), но сюда печатаются и ЧУЖИЕ данные: тело
+# ответа площадки из `last_error`, названия товаров, артикулы. Там может
+# оказаться что угодно, и заменить символ на «?» несравнимо лучше, чем не
+# напечатать ничего.
+try:
+    sys.stdout.reconfigure(errors="replace")
+except (AttributeError, ValueError):  # перенаправленный вывод, старый Python
+    pass
+
+
 DEFAULT_HOURS = 48
 SHOW_ROWS = 40
 
@@ -142,7 +155,7 @@ def report(db, account: PlatformAccount, since, products_cache: dict) -> None:
         mark = " [ТЕСТ]" if getattr(r, "is_test", False) else ""
         err = f"  {r.last_error[:70]}" if r.last_error else ""
         print(f"    {r.created_at}  {_label(products_cache, r.uid_1c):38}"
-              f"  ставили {r.quantity:>4} → ушло {r.sent_quantity}"
+              f"  ставили {r.quantity:>4} -> ушло {r.sent_quantity}"
               f"  {r.reason:20} {r.status.value if r.status else ''}"
               f" ключ={r.sent_sku or '—'}{mark}{err}")
     if not zeros:

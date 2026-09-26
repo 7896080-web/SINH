@@ -8,8 +8,8 @@
 витрины/карточек» постфактум ответа не имеет: сравнивать не с чем. Снять копию
 надо ЗАРАНЕЕ, и `save` ровно для этого.
 
-Порядок: «Мэппинг» → загрузить каталог → `save` → сделать правку в кабинете →
-загрузить каталог снова → `diff`.
+Порядок: «Мэппинг» -> загрузить каталог -> `save` -> сделать правку в кабинете ->
+загрузить каталог снова -> `diff`.
 
 Что здесь важно и почему сравниваем именно это.
 
@@ -38,6 +38,19 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.database import SessionLocal                                    # noqa: E402
 from app.models import PlatformAccount, PlatformCatalogItem              # noqa: E402
 
+# Консоль боевого сервера пишет в cp1251, и один символ, которого в ней нет,
+# роняет ВЕСЬ вывод скрипта посреди строки — с `UnicodeEncodeError` вместо
+# ответа на вопрос, ради которого скрипт и запускали. Свои строки мы держим в
+# пределах cp1251 (закрыто тестом), но сюда печатаются и ЧУЖИЕ данные: тело
+# ответа площадки из `last_error`, названия товаров, артикулы. Там может
+# оказаться что угодно, и заменить символ на «?» несравнимо лучше, чем не
+# напечатать ничего.
+try:
+    sys.stdout.reconfigure(errors="replace")
+except (AttributeError, ValueError):  # перенаправленный вывод, старый Python
+    pass
+
+
 SHOW = 25
 
 
@@ -52,7 +65,7 @@ def _account(db, needle: str):
 
 
 def _snapshot(db, account_id: int) -> dict:
-    """Текущий снимок кабинета: баркод → что мы о нём знаем."""
+    """Текущий снимок кабинета: баркод -> что мы о нём знаем."""
     rows = db.query(PlatformCatalogItem).filter(
         PlatformCatalogItem.account_id == account_id).all()
     out = {}
@@ -84,7 +97,7 @@ def save(db, account, path: str) -> int:
         json.dump({"account_id": account.id, "account_name": account.name,
                    "platform": account.platform.value, "items": items},
                   f, ensure_ascii=False)
-    print(f"снимок кабинета «{account.name}»: {len(items)} баркодов → {path}")
+    print(f"снимок кабинета «{account.name}»: {len(items)} баркодов -> {path}")
     if stamps:
         # Снимок в базе обновляет ТОЛЬКО выгрузка каталога. Сохранив старый, мы
         # сравнивали бы правку витрины с позавчерашним состоянием и приписали
@@ -125,7 +138,7 @@ def diff(db, account, path: str) -> int:
         print("  площадка ответит «товара нет», запись закроется терминально, и")
         print("  повтора не будет — следующая отправка только при смене остатка.")
         for b in rekeyed[:SHOW]:
-            print(f"    {b}  {old[b]['external_id']}  →  {new[b]['external_id']}"
+            print(f"    {b}  {old[b]['external_id']}  ->  {new[b]['external_id']}"
                   f"   {new[b]['article']}")
         if len(rekeyed) > SHOW:
             print(f"    … и ещё {len(rekeyed) - SHOW}")
