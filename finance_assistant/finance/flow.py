@@ -19,6 +19,7 @@ from .recognize import RecognitionError
 from .report import (MONTHS, card_text, expense_card, expense_line, month_name, month_text,
                      month_xlsx, period_text, period_xlsx, rub,
                      suggestions_text, unmatched_text)
+from .pivot import business_items, parse_period, svod_text, svod_xlsx
 from .reconcile import summarize
 from .storage import BUSINESS, BUSINESS_ACCOUNT, EXPENSE, PERSONAL, PERSONAL_CARD, Storage
 
@@ -42,6 +43,9 @@ HELP = """\
 /itog — свод за месяц (/itog 2026-03), за год (/itog 2026) или период \
 (/itog 2026-01..2026-06): по картам пришло/ушло, итог «ушло на бизнес» \
 по статьям и итог личных расходов; плюс Excel
+/svod — сводная бизнес-расходов по статьям за неделю, месяц, год или свой \
+период (/svod 01.09.2026-15.09.2026): раскладка по получателям и Excel с фильтром
+/rules — привязка получателей к статьям (запоминается сама, когда вы выбираете статью)
 /vypiska 2026-03 — списания месяца, которые сейчас считаются личными
 
 Прочее:
@@ -190,6 +194,7 @@ class Flow:
             "cats": self._cats, "addcat": self._add_cat, "list": self._list,
             "sverka": self._sverka, "done": self._done, "itog": self._itog, "biz": self._biz,
             "notbiz": self._notbiz, "vypiska": self._vypiska, "fix": self._fix,
+            "rules": self._rules, "delrule": self._del_rule, "svod": self._svod,
         }.get(command)
         if not handler:
             return [Reply("Не знаю такой команды. /help — что я умею.")]
@@ -248,6 +253,8 @@ class Flow:
             return self._edit_saved(chat_id, rest)
         if kind == "t":
             return self._edit_transfer(chat_id, rest)
+        if kind == "v":
+            return self._svod(chat_id, rest)
         if kind == "s":
             return self._sverka_button(chat_id, rest)
         return []
@@ -300,6 +307,7 @@ class Flow:
             "purpose_asked": not info.get("looks_personal"),
             "category_id": self.db.category_id(info.get("category") or ""),
             "category_confident": bool(info.get("category_confident")),
+            "by_rule": False,
             "merchant": (info.get("merchant") or "").strip(),
             "description": (info.get("description") or "").strip(),
             "receipt": receipt,
@@ -307,6 +315,10 @@ class Flow:
             "dup_checked": False,
             "file_keys": list(keys),
         }
+        rule = self.db.rule_for(draft["merchant"])
+        if rule:
+            # Этому получателю вы уже назначали статью — не угадываем и не спрашиваем.
+            draft.update(category_id=rule, category_confident=True, by_rule=True)
         state = self.db.get_state(chat_id)
         state.setdefault("drafts", []).append(draft)
         self.db.set_state(chat_id, state)
@@ -372,6 +384,8 @@ class Flow:
                 receipt_path=self._file_receipt(d["receipt"], d["date"]),
             )
             self.db.remember_files(d.get("file_keys", []), f"e:{expense_id}")
+            if d.get("learn_rule") and d["purpose"] == BUSINESS:
+                self.db.set_rule(d["merchant"], d["category_id"])
             self._pop_draft(state)
             self.db.set_state(chat_id, state)
             if d.get("quiet"):
@@ -581,6 +595,7 @@ class Flow:
         elif what == "cat":
             d["category_id"] = int(value)
             d["category_confident"] = True
+            d["learn_rule"] = not d.get("quiet")  # статья по скриншоту — запомнить для получателя
         elif what == "dup":
             d["dup_checked"] = True
         elif what == "tr":
@@ -631,6 +646,18 @@ class Flow:
         self.db.update_transfer(transfer_id, **{key: value})
         return [self._transfer_reply(transfer_id)]
 
+    def _offer_rule(self, merchant: str, category_id: int) -> list[Reply]:
+        """После смены статьи — предложить поправить прошлые записи того же получателя."""
+        category = next(c["name"] for c in self.db.categories() if c["id"] == category_id)
+        others = [x for x in self.db.expenses_of_merchant(merchant)
+                  if x.purpose == BUSINESS and x.category != category]
+        text = f"Запомнил: «{merchant}» → {category}. Следующие такие расходы запишу сразу в эту статью."
+        if not others:
+            return [Reply(text)]
+        return [Reply(text + f"\nУ прошлых записей этого получателя другая статья: {len(others)} "
+                             f"на {rub(sum(x.amount for x in others))}. Исправить?",
+                      [[(f"Да, все в «{category}»", f"e:ruleall:{others[0].id}:{category_id}")]])]
+
     def _saved_reply(self, expense_id: int) -> Reply:
         e = self.db.expense(expense_id)
         buttons = [[("Статья", f"e:cat:{e.id}"), ("Карта", f"e:card:{e.id}")],
@@ -638,7 +665,11 @@ class Flow:
         if e.kind == EXPENSE:
             other = ("Это личное", PERSONAL) if e.purpose == BUSINESS else ("Это бизнес", BUSINESS)
             buttons[1].insert(0, (other[0], f"e:purpose:{e.id}:{other[1]}"))
-        return Reply(expense_card(e), buttons)
+        text = expense_card(e)
+        rule = self.db.rule_for(e.merchant) if e.purpose == BUSINESS else None
+        if rule and rule == self.db.category_id(e.category or ""):
+            text += "\n📌 Статья по правилу для этого получателя (/rules)"
+        return Reply(text, buttons)
 
     def _edit_saved(self, chat_id, rest) -> list[Reply]:
         parts = rest.split(":")
@@ -652,7 +683,18 @@ class Flow:
         if action == "cat" and len(parts) == 2:
             return [Reply(f"Статья для №{e.id}:", self._category_buttons(f"e:cat:{e.id}:", None))]
         if action == "cat":
-            self.db.update_expense(expense_id, category_id=int(parts[2]), purpose=BUSINESS)
+            category_id = int(parts[2])
+            self.db.update_expense(expense_id, category_id=category_id, purpose=BUSINESS)
+            if self.db.set_rule(e.merchant, category_id):
+                return [self._saved_reply(expense_id)] + self._offer_rule(e.merchant, category_id)
+        elif action == "ruleall":
+            category_id = int(parts[2])
+            changed = 0
+            for other in self.db.expenses_of_merchant(e.merchant):
+                if other.purpose == BUSINESS and self.db.category_id(other.category or "") != category_id:
+                    self.db.update_expense(other.id, category_id=category_id)
+                    changed += 1
+            return [Reply(f"Статья изменена у записей «{e.merchant}»: {changed}.")]
         elif action == "card" and len(parts) == 2:
             return [Reply(f"Карта для №{e.id}:",
                           [[(c.label, f"e:card:{e.id}:{c.id}")] for c in self.db.cards()])]
@@ -728,6 +770,42 @@ class Flow:
             return [Reply("Формат: /addcat Название статьи")]
         self.db.add_category(arg)
         return [Reply(f"Статья «{arg}» есть в списке.")]
+
+    def _svod(self, chat_id, arg):
+        if not arg:
+            return [Reply("Сводная бизнес-расходов по статьям. За какой период?\n"
+                          "Свой период — датами: /svod 01.09.2026-15.09.2026\n"
+                          "Месяц или год: /svod 2026-03, /svod 2026",
+                          [[("Эта неделя", "v:week"), ("Прошлая неделя", "v:prevweek")],
+                           [("Этот месяц", "v:month"), ("Прошлый месяц", "v:prevmonth")],
+                           [("Этот год", "v:year")]])]
+        period = parse_period(arg, self.today())
+        if not period:
+            return [Reply("Не понял период. Примеры: /svod 01.09.2026-15.09.2026, "
+                          "/svod 2026-03, /svod 2026")]
+        items = business_items(self.db, period)
+        name = f"сводная-{period.start:%Y%m%d}-{period.end:%Y%m%d}.xlsx"
+        return [Reply(svod_text(period, items, rub), file=(name, svod_xlsx(period, items)))]
+
+    def _rules(self, chat_id, arg):
+        rules = self.db.rules()
+        if not rules:
+            return [Reply("Правил пока нет. Они появляются сами, когда вы выбираете или "
+                          "меняете статью у расхода: получатель запоминается за статьёй.")]
+        lines, current = [], None
+        for r in rules:
+            if r["category"] != current:
+                current = r["category"]
+                lines.append(f"\n{current}:")
+            lines.append(f"  {r['id']}. {r['merchant']}")
+        return [Reply("Привязка получателей к статьям:" + "\n".join(lines)
+                      + "\n\nУдалить правило: /delrule номер. Изменить — поменяйте статью "
+                        "у любой записи этого получателя.")]
+
+    def _del_rule(self, chat_id, arg):
+        if not arg.isdigit() or not self.db.delete_rule(int(arg)):
+            return [Reply("Укажите номер правила из /rules, например /delrule 3")]
+        return [Reply("Правило удалено.")]
 
     def _fix(self, chat_id, arg):
         arg = arg.strip().lower()
@@ -869,7 +947,7 @@ class Flow:
                 "op_date": op_date, "op_time": _hhmm(op.get("time", "")), "amount": amount, "direction": op["direction"],
                 "description": op.get("description", "").strip(),
                 "own_transfer": op.get("own_transfer", False),
-                "suggested_category": op.get("business_category", "")
+                "suggested_category": self._line_category(op)
                 if op["direction"] == "out" and not op.get("own_transfer") else "",
             })
 
@@ -906,6 +984,13 @@ class Flow:
         msg = head + msg + ["Ещё части выписки — присылайте, всё — /done"]
         self.db.remember_files(list(keys), ref)
         return [Reply("\n".join(msg) + warn + other_card)]
+
+    def _line_category(self, op: dict) -> str:
+        """Статья для строки выписки: ваше правило для получателя важнее догадки модели."""
+        rule = self.db.rule_for(op.get("description", ""))
+        if rule:
+            return next(c["name"] for c in self.db.categories() if c["id"] == rule)
+        return op.get("business_category", "")
 
     def _done(self, chat_id, arg):
         state = self.db.get_state(chat_id)
