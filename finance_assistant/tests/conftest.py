@@ -1,3 +1,4 @@
+import threading
 from datetime import date
 
 import pytest
@@ -16,14 +17,30 @@ class FakeRecognizer:
         self.payments: list[dict] = []
         self.statements: list[dict] = []
         self.calls: list[tuple] = []
+        # Для пачек (разбор параллельный, порядок вызовов не определён):
+        # ответ по содержимому файла; значение-исключение — «ошибка распознавания».
+        self.by_file: dict[bytes, object] = {}
+        self._lock = threading.Lock()
+
+    def _answer(self, files, queue):
+        with self._lock:
+            if files and files[0][0] in self.by_file:
+                answer = self.by_file[files[0][0]]
+            else:
+                answer = queue.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
 
     def recognize_payment(self, files, text, **kw):
-        self.calls.append(("payment", files, text, kw))
-        return self.payments.pop(0)
+        with self._lock:
+            self.calls.append(("payment", files, text, kw))
+        return self._answer(files, self.payments)
 
     def parse_statement(self, files, text, **kw):
-        self.calls.append(("statement", files, text, kw))
-        return self.statements.pop(0)
+        with self._lock:
+            self.calls.append(("statement", files, text, kw))
+        return self._answer(files, self.statements)
 
 
 def payment(**over):

@@ -22,6 +22,7 @@ log = logging.getLogger(__name__)
 COMMANDS = ["start", "help", "cancel", "cards", "addcard", "delcard", "cats", "addcat",
             "list", "sverka", "done", "itog", "biz", "notbiz", "vypiska", "fix", "svod",
             "rules", "delrule"]
+BATCH_WAIT = 2.5  # сек тишины после последнего файла — пачка собрана
 MAX_TEXT = 4000  # лимит Telegram — 4096 единиц UTF-16 на сообщение
 MAX_FILE = 20 * 1024 * 1024  # больше бот скачать не может
 MAX_IMAGE = 5 * 1024 * 1024  # больше Claude API не примет одну картинку
@@ -100,25 +101,73 @@ def build_app(token: str, flow: Flow, allowed: set[int]) -> Application:
                 pass
             await asyncio.sleep(4)
 
-    async def run(update: Update, fn, *args, slow: bool = False):
+    # Все обращения к Flow — строго по одному: у него одно соединение SQLite
+    # и состояние чата, которое читается и пишется целиком.
+    lock = asyncio.Lock()
+    # Файлы, которые ещё собираются в пачку: chat_id → {items, update, timer}.
+    pending: dict[int, dict] = {}
+
+    async def run(update: Update, fn, *args, note: str | None = None):
         chat = update.effective_chat
-        if slow:
-            await chat.send_message("⏳ Разбираю… Скриншот — до минуты, выписка — "
-                                    "до нескольких минут. Присылать повторно не нужно.")
-        typing = asyncio.create_task(keep_typing(chat))
+        async with lock:
+            if note:
+                await chat.send_message(note)
+            typing = asyncio.create_task(keep_typing(chat))
+            try:
+                # Распознавание — синхронный сетевой вызов на десятки секунд;
+                # в отдельном потоке, чтобы не блокировать цикл событий.
+                replies = await asyncio.to_thread(fn, chat.id, *args)
+            finally:
+                typing.cancel()
+            await send(update, replies)
+
+    def batch_note(n: int) -> str:
+        if n == 1:
+            return ("⏳ Разбираю… Скриншот — до минуты, выписка — до нескольких минут. "
+                    "Присылать повторно не нужно.")
+        minutes = max(1, round(n / 4 * 25 / 60))  # по 4 файла одновременно, ~25 с на файл
+        return (f"⏳ Принял {n} файлов, разбираю — примерно {minutes} мин. "
+                "Присылать повторно не нужно; по итогу пришлю сводку.")
+
+    async def process_batch(chat_id: int):
+        """Разобрать собранную пачку (или ничего, если её нет)."""
+        batch = pending.pop(chat_id, None)  # сразу, без await: новая пачка начнётся заново
+        if not batch:
+            return
+        timer = batch["timer"]
+        if timer is not asyncio.current_task() and not timer.done():
+            timer.cancel()
+        items = batch["items"]
         try:
-            # Распознавание — синхронный сетевой вызов на десятки секунд;
-            # в отдельном потоке, чтобы не блокировать цикл событий. Апдейты
-            # обрабатываются по одному (так безопасно для общей базы SQLite),
-            # поэтому другие сообщения дождутся конца разбора.
-            replies = await asyncio.to_thread(fn, chat.id, *args)
-        finally:
-            typing.cancel()
-        await send(update, replies)
+            await run(batch["update"], flow.on_batch, items, note=batch_note(len(items)))
+        except Exception:  # задача вне обработчика PTB — ошибку ловим сами
+            log.exception("Ошибка при разборе пачки")
+            await batch["update"].effective_chat.send_message(
+                "Что-то пошло не так при разборе файлов, ничего из пачки не записано. "
+                "Пришлите их ещё раз; если повторяется — /cancel.")
+
+    async def batch_timer(chat_id: int):
+        await asyncio.sleep(BATCH_WAIT)
+        await process_batch(chat_id)
+
+    async def add_to_batch(update: Update, item: dict):
+        """Альбом приходит отдельными сообщениями — ждём тишины и разбираем разом."""
+        chat_id = update.effective_chat.id
+        batch = pending.setdefault(chat_id, {"items": []})
+        batch["items"].append(item)
+        batch["update"] = update
+        if batch.get("timer"):
+            batch["timer"].cancel()
+        batch["timer"] = asyncio.create_task(batch_timer(chat_id))
+
+    async def flush_first(update: Update):
+        """Команда или кнопка после файлов: сначала разбираем присланное до неё."""
+        await process_batch(update.effective_chat.id)
 
     async def on_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await guard(update):
             return
+        await flush_first(update)
         command = update.message.text.split()[0].lstrip("/").split("@")[0].lower()
         await run(update, flow.on_command, command, " ".join(context.args or []))
 
@@ -128,8 +177,9 @@ def build_app(token: str, flow: Flow, allowed: set[int]) -> Application:
         photo = update.message.photo[-1]  # самый крупный вариант
         tg_file = await photo.get_file()
         data = bytes(await tg_file.download_as_bytearray())
-        await run(update, flow.on_files, [(data, "image/jpeg")], update.message.caption or "",
-                  "", [photo.file_unique_id], slow=True)
+        await add_to_batch(update, dict(files=[(data, "image/jpeg")],
+                                        caption=update.message.caption or "",
+                                        filename="", file_ids=[photo.file_unique_id]))
 
     async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await guard(update):
@@ -162,12 +212,13 @@ def build_app(token: str, flow: Flow, allowed: set[int]) -> Application:
             return
         tg_file = await doc.get_file()
         data = bytes(await tg_file.download_as_bytearray())
-        await run(update, flow.on_files, [(data, mime)], update.message.caption or "", name,
-                  [doc.file_unique_id], slow=True)
+        await add_to_batch(update, dict(files=[(data, mime)], caption=update.message.caption or "",
+                                        filename=name, file_ids=[doc.file_unique_id]))
 
     async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await guard(update):
             return
+        await flush_first(update)
         await run(update, flow.on_text, update.message.text)
 
     async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -180,6 +231,7 @@ def build_app(token: str, flow: Flow, allowed: set[int]) -> Application:
             await query.edit_message_reply_markup(None)
         except Exception:  # сообщение могли удалить — не критично
             pass
+        await flush_first(update)
         await run(update, flow.on_button, query.data)
 
     async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
