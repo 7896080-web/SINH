@@ -262,3 +262,54 @@ def test_a_threshold_that_ate_the_stock_is_not_called_a_problem(tmp_path):
     assert "законный ноль: порог 6 при остатке 5" in out, out
     assert "Ни одного нуля от выключателя: разбирать нечего" in out, out
     assert "ВЫКЛЮЧАТЕЛЬ" not in out, "исправная строка попала в «разбирать»"
+
+
+def test_a_model_filter_narrows_the_counts_too(cabinet):
+    """Вопрос «кто ставил ноль по этой модели» — про строки, а не про кабинет.
+
+    Сужать надо ДО счётчиков: посчитай сводку по кабинету целиком и покажи
+    отфильтрованный список — числа перестанут относиться к строкам под ними,
+    а решают по ним.
+    """
+    out = _run(cabinet, "КИТ", "48", "3030-3033")
+
+    assert "отбор по «3030-3033»" in out, out
+    # У 3030-3033 ноль один и от выключения трансляции.
+    assert "broadcast_off" in out
+    # А продажи и столкновение ключей — у других моделей, их быть не должно.
+    assert "V-777" not in out, "в отбор попали чужие строки"
+    assert "3030-9001" not in out
+
+
+def test_an_empty_filter_says_so_instead_of_looking_broken(cabinet):
+    """Пустой ответ читается как «нулей не было», а это разные вещи."""
+    out = _run(cabinet, "КИТ", "48", "такого-артикула-нет")
+    assert "отбор по «такого-артикула-нет»: 0 записей" in out, out
+    assert "по этому отбору" in out
+
+
+def test_a_truncated_list_says_it_was_truncated(tmp_path):
+    """Молчаливая обрезка — человек считает, что видит всё.
+
+    Отдельный класс дефектов этого проекта: так уже было с выгрузкой конфликтов
+    сопоставления, где отдавались первые триста и ни слова об остальных.
+    """
+    path = tmp_path / "many.db"
+    url = f"sqlite:///{path}"
+    engine = create_engine(url, connect_args={"check_same_thread": False})
+    Base.metadata.create_all(bind=engine)
+    s = sessionmaker(bind=engine, autoflush=False)()
+    s.add(PlatformAccount(id=1, platform=Platform.kit, name="КИТ"))
+    when = now_utc() - timedelta(hours=1)
+    for i in range(45):
+        uid = f"u-{i:03d}"
+        _product(s, uid, "3030-0001", "L", False)
+        s.add(SyncSetting(uid_1c=uid, account_id=1, enabled=False))
+        _queue(s, uid, 1, 3, 0, "broadcast_off", when, sku=f"V-{i}")
+    s.commit(); s.close(); engine.dispose()
+
+    out = _run(url, "КИТ", "48")
+
+    assert "ушло НОЛЕЙ: 45" in out, out
+    assert "показаны последние 40 из 45" in out, out
+    assert "сузьте отбор" in out

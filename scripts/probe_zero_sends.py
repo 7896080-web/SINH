@@ -5,6 +5,7 @@
     C:\\sync_admin\\.venv\\Scripts\\python.exe C:\\sync_admin\\scripts\\probe_zero_sends.py КИТ
     ... probe_zero_sends.py КИТ 6          # только за последние 6 часов
     ... probe_zero_sends.py все 24         # по всем кабинетам сразу
+    ... probe_zero_sends.py КИТ 24 3030    # только по модели 3030
 
 Зачем отдельный скрипт, когда есть `probe_offset.py`. Тот отвечает про ОДНУ
 строку: «что было с этим товаром». А вопрос «на площадке были остатки, потом
@@ -102,7 +103,8 @@ def _label(products: dict, uid: str) -> str:
     return f"{p.article or '—'} {p.size or '—'} {p.color or '—'}"
 
 
-def report(db, account: PlatformAccount, since, products_cache: dict) -> None:
+def report(db, account: PlatformAccount, since, products_cache: dict,
+           needle: str = "") -> None:
     rows = db.query(DispatchQueueItem).filter(
         DispatchQueueItem.account_id == account.id,
         DispatchQueueItem.created_at >= since,
@@ -114,11 +116,24 @@ def report(db, account: PlatformAccount, since, products_cache: dict) -> None:
         for p in db.query(Product).filter(Product.uid_1c.in_(list(missing))).all():
             products_cache[p.uid_1c] = p
 
+    # Отбор по модели. Сужаем ЗДЕСЬ, до всех счётчиков: посчитай мы сводку по
+    # кабинету целиком и покажи отфильтрованный список, числа перестали бы
+    # относиться к строкам под ними — а по ним и решают.
+    total_rows = len(rows)
+    if needle:
+        low = needle.lower()
+        rows = [r for r in rows
+                if low in f"{(products_cache.get(r.uid_1c).article or '') if products_cache.get(r.uid_1c) else ''} "
+                          f"{(products_cache.get(r.uid_1c).name or '') if products_cache.get(r.uid_1c) else ''}".lower()]
+
     print("=" * 78)
     print(f"КАБИНЕТ {account.id}: {account.name} ({account.platform.value})"
           f"  активен={account.is_active}  рассылка={account.dispatch_enabled}")
+    if needle:
+        print(f"  отбор по «{needle}»: {len(rows)} записей из {total_rows}")
     if not rows:
-        print("  за окно в очередь не попало НИ ОДНОЙ записи")
+        print("  за окно в очередь не попало НИ ОДНОЙ записи"
+              + (" по этому отбору" if needle else ""))
         return
 
     # Ноль считаем по тому, что УШЛО, а не по тому, что поставили в очередь:
@@ -179,6 +194,11 @@ def report(db, account: PlatformAccount, since, products_cache: dict) -> None:
               f"  ставили {r.quantity:>4} -> ушло {r.sent_quantity}"
               f"  {r.reason:20} {r.status.value if r.status else ''}"
               f" ключ={r.sent_sku or '—'}{mark}{err}")
+    if len(zeros) > SHOW_ROWS:
+        # Молчаливая обрезка — отдельный класс дефектов этого проекта: человек
+        # считает, что видит всё, и не узнаёт про остальные.
+        print(f"    (показаны последние {SHOW_ROWS} из {len(zeros)};"
+              f" сузьте отбор третьим аргументом — артикулом или названием)")
     if not zeros:
         print("    нулей не было вовсе")
 
@@ -235,27 +255,35 @@ def report(db, account: PlatformAccount, since, products_cache: dict) -> None:
 
 
 def main() -> int:
-    needle = sys.argv[1].strip() if len(sys.argv) > 1 else "все"
+    # Имена РАЗНЫЕ намеренно: кабинет и модель — два разных отбора, и общее имя
+    # на оба уже стоило дефекта. Вторая присвойка затирала первую, `_accounts`
+    # получал пустую строку, ilike '%%' находил ВСЕ кабинеты — и скрипт молча
+    # отвечал не про тот кабинет, о котором спросили.
+    cabinet = sys.argv[1].strip() if len(sys.argv) > 1 else "все"
     try:
         hours = int(sys.argv[2]) if len(sys.argv) > 2 else DEFAULT_HOURS
     except ValueError:
         print("второй аргумент — число часов")
         return 1
+    # Третий аргумент — модель: артикул или кусок названия. Вопрос «кто ставил
+    # ноль по 3030» без него требует глазами вычитывать список по всему
+    # кабинету, где таких записей тысячи.
+    needle = sys.argv[3].strip() if len(sys.argv) > 3 else ""
     since = now_utc() - timedelta(hours=hours)
 
     db = SessionLocal()
     try:
-        accounts = _accounts(db, needle)
+        accounts = _accounts(db, cabinet)
         if not accounts:
             have = db.query(PlatformAccount).order_by(PlatformAccount.id).all()
-            print(f"кабинет «{needle}» не найден. Есть: "
+            print(f"кабинет «{cabinet}» не найден. Есть: "
                   + ", ".join(f"{a.id}:{a.name}" for a in have))
             return 1
 
         print(f"окно: последние {hours} ч (с {since} UTC)")
         cache: dict = {}
         for account in accounts:
-            report(db, account, since, cache)
+            report(db, account, since, cache, needle)
 
         # Массовые действия печатаем ОДИН раз в конце и без привязки к кабинету:
         # кнопка отбора и залитый файл трогают сразу много пар и много кабинетов,
