@@ -106,3 +106,20 @@ def test_bot_module_builds():
     assert [len(p) for p in _split("x" * 3000 + "\n" + "y" * 3000)] == [3000, 3000]
     app = build_app("123:ABC", flow=None, allowed={1})
     assert len(app.handlers[0]) == 5
+
+
+def test_recognizer_fallback_continuation_kept():
+    # Резервная модель продолжила начатый JSON — склеиваем, а не выбрасываем начало.
+    client, _ = fake_client([text('{"is_payment": '), SimpleNamespace(type="fallback"),
+                             text('true}')])
+    out = ClaudeRecognizer(client=client).recognize_payment(
+        [], "такси", today="2026-09-26", cards=[], categories=["Прочее"])
+    assert out == {"is_payment": True}
+
+
+def test_rub_spelled_out_is_rubles(env):
+    from conftest import png, payment
+    db, rec, flow = env
+    rec.payments.append(payment(currency="руб."))
+    [r] = flow.on_files(CHAT, [png()], "")
+    assert r.text.startswith("✅")

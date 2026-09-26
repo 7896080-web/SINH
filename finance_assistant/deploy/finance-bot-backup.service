@@ -1,0 +1,6 @@
+[Unit]
+Description=Finance assistant backup
+
+[Service]
+Type=oneshot
+ExecStart=/opt/finance-bot/deploy/finance-bot-backup.sh

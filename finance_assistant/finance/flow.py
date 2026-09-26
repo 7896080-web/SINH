@@ -11,6 +11,7 @@
 import hashlib
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
@@ -57,6 +58,7 @@ HELP = """\
 /cancel — сбросить текущий вопрос"""
 
 MONTH_ARG_HELP = "Месяц указывайте как 2026-09"
+STATEMENT_IDLE = 2 * 3600  # через сколько секунд без выписок сверка закрывается сама
 PICKER_MONTHS = 12   # сколько месяцев назад можно выбрать кнопкой в /sverka
 PERIOD = "period"    # «выписка за несколько месяцев»
 
@@ -184,11 +186,25 @@ def _amount_or_none(text: str) -> int | None:
 
 
 class Flow:
-    def __init__(self, storage: Storage, recognizer, receipts_dir: str, today=date.today):
+    def __init__(self, storage: Storage, recognizer, receipts_dir: str, today=date.today,
+                 clock=time.time):
         self.db = storage
         self.recognizer = recognizer
         self.receipts_dir = receipts_dir
         self.today = today
+        self.clock = clock
+
+    def _close_idle_statement(self, chat_id: int, state: dict) -> list[Reply]:
+        """Забытый /done: если сверку давно не трогали, закрываем её, чтобы
+        следующие скриншоты оплат не уходили в выписку."""
+        st = state.get("statement")
+        if not st or self.clock() - st.get("touched", self.clock()) <= STATEMENT_IDLE:
+            return []
+        state.pop("statement")
+        self.db.set_state(chat_id, state)
+        card = self.db.card(st["card_id"])
+        return [Reply(f"Сверку по карте {card.label if card else ''} закрыл сам — больше двух "
+                      "часов не было выписок. Итог: /itog, продолжить: /sverka.")]
 
     # --- входящие сообщения --------------------------------------------
 
@@ -214,8 +230,11 @@ class Flow:
         """
         keys = _file_keys(files, file_ids)
         state = self.db.get_state(chat_id)
+        closed = self._close_idle_statement(chat_id, state)
         if "statement" in state:
             return self._statement_input(chat_id, state, files, caption, keys)
+        if closed:
+            return closed + self.on_files(chat_id, files, caption, filename, file_ids)
         if any(mime not in ("image/jpeg", "image/png", "image/webp") for _, mime in files):
             return [Reply("Похоже на выписку. Чтобы загрузить её для сверки, "
                           "сначала отправьте /sverka.")]
@@ -243,6 +262,9 @@ class Flow:
         ask = state.get("ask")
         if state.get("drafts") and ask in ("amount", "date"):
             return self._answer_text(chat_id, state, ask, text)
+        closed = self._close_idle_statement(chat_id, state)
+        if closed:
+            return closed + self.on_text(chat_id, text)
         if "statement" in state:
             return self._statement_input(chat_id, state, [], text)
         if not any(ch.isdigit() for ch in text):
@@ -294,10 +316,10 @@ class Flow:
                           "Если это экран истории с итогами месяца или выписка — "
                           "их принимаю в сверке: /sverka")]
 
-        currency = (info.get("currency") or "RUB").upper()
+        currency = (info.get("currency") or "RUB").strip().upper().rstrip(".")
         amount = _amount_or_none(info.get("amount", ""))
         note = ""
-        if currency not in ("RUB", "RUR", "₽"):
+        if currency not in ("RUB", "RUR", "₽", "РУБ", "Р", "РУБЛЬ", "РУБЛЕЙ", ""):
             note = f"Операция в {currency} {info.get('amount')}. "
             amount = None  # спросим, сколько списали в рублях
         draft = {
@@ -939,8 +961,11 @@ class Flow:
         if what == "c" and "sverka" in state:
             month = state.pop("sverka")["month"]
             card = self.db.card(int(value))
+            if not card:
+                self.db.set_state(chat_id, state)
+                return [Reply("Этой карты уже нет. /sverka — начать заново.")]
             state["statement"] = {"card_id": card.id, "month": None if month == PERIOD else month,
-                                  "months": []}
+                                  "months": [], "touched": self.clock()}
             self.db.set_state(chat_id, state)
             if month == PERIOD:
                 return [Reply(
@@ -984,6 +1009,8 @@ class Flow:
             self.db.set_state(chat_id, state)
             return [Reply("Карты этой сверки больше нет — сверка сброшена. /sverka — начать заново.")]
         ref = f"s:{card.id}:{st['month'] or 'period'}"
+        st["touched"] = self.clock()
+        self.db.set_state(chat_id, state)
         other_card = ""
         if keys:
             if ref in self.db.seen_refs(list(keys), ref):
