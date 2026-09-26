@@ -5,7 +5,7 @@ import sqlite3
 
 from openpyxl import load_workbook
 
-from conftest import CHAT, png, TODAY, payment
+from conftest import CHAT, png, TODAY, payment, answer
 from finance.flow import _parse_period_arg
 from finance.storage import Storage
 from test_sverka import PDF, op, statement
@@ -95,7 +95,7 @@ def test_suggestions_accept_all_and_notbiz(env):
     [left] = flow.on_command(CHAT, "notbiz", str(ozon.id))
     assert "Осталось 2" in left.text
 
-    [done] = flow.on_button(CHAT, "s:acc")
+    [done] = flow.on_button(CHAT, f"s:acc:{db.get_state(CHAT)['review_id']}")
     assert done.text.startswith("✅ Записано как бизнес: 2 на 9 500,00 ₽")
     assert "Реклама и продвижение: 7 000,00 ₽" in done.text
     assert "review" not in db.get_state(CHAT)
@@ -116,7 +116,7 @@ def test_accept_asks_category_only_when_not_suggested(env):
     lines = db.statement(db.cards()[0].id, "2026-03")[1]
     replies = flow.on_command(CHAT, "biz", " ".join(str(ln.id) for ln in lines))
     assert "статья" in replies[-1].text.lower()  # первая без статьи — спрашиваем
-    replies = flow.on_button(CHAT, f"d:cat:{db.category_id('Подрядчики и зарплата')}")
+    replies = answer(flow, f"d:cat:{db.category_id('Подрядчики и зарплата')}")
     [summary] = replies
     assert summary.text.startswith("✅ Записано как бизнес: 2 на 300,00 ₽")
     assert "Подрядчики и зарплата: 100,00 ₽" in summary.text

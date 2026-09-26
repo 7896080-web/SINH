@@ -6,6 +6,7 @@
 """
 
 import json
+import re
 import sqlite3
 from dataclasses import dataclass
 
@@ -33,18 +34,18 @@ DEFAULT_CATEGORIES = [
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS cards (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL UNIQUE,
     last4 TEXT NOT NULL DEFAULT '',  -- последние 4 цифры карт и счетов через пробел
     bank TEXT NOT NULL DEFAULT '',
     kind TEXT NOT NULL DEFAULT 'personal' CHECK (kind IN ('personal', 'business'))
 );
 CREATE TABLE IF NOT EXISTS categories (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL UNIQUE
 );
 CREATE TABLE IF NOT EXISTS expenses (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     op_date TEXT NOT NULL,
     amount INTEGER NOT NULL CHECK (amount > 0),
@@ -58,7 +59,7 @@ CREATE TABLE IF NOT EXISTS expenses (
 );
 CREATE INDEX IF NOT EXISTS ix_expenses_date ON expenses(op_date);
 CREATE TABLE IF NOT EXISTS statements (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     card_id INTEGER NOT NULL REFERENCES cards(id),
     month TEXT NOT NULL,
     total_in INTEGER,
@@ -66,7 +67,7 @@ CREATE TABLE IF NOT EXISTS statements (
     UNIQUE (card_id, month)
 );
 CREATE TABLE IF NOT EXISTS statement_lines (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     statement_id INTEGER NOT NULL REFERENCES statements(id) ON DELETE CASCADE,
     op_date TEXT NOT NULL,
     op_time TEXT NOT NULL DEFAULT '',
@@ -82,7 +83,7 @@ CREATE INDEX IF NOT EXISTS ix_statement_lines_key
 -- вычесть из «пришло»/«ушло» по картам, иначе личные траты посчитаются неверно.
 -- to_card_id / from_card_id пусты, если второй счёт не ведётся в боте.
 CREATE TABLE IF NOT EXISTS transfers (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     op_date TEXT NOT NULL,
     amount INTEGER NOT NULL CHECK (amount > 0),
@@ -110,7 +111,7 @@ CREATE TABLE IF NOT EXISTS seen_files (
 -- получателя получают её без вопроса. merchant_key — имя без «ООО», кавычек
 -- и регистра (см. _merchant_key).
 CREATE TABLE IF NOT EXISTS category_rules (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     merchant_key TEXT NOT NULL UNIQUE,
     merchant TEXT NOT NULL,
     category_id INTEGER NOT NULL REFERENCES categories(id)
@@ -120,6 +121,15 @@ CREATE TABLE IF NOT EXISTS chat_state (
     state TEXT NOT NULL
 );
 """
+
+
+# Безликие описания операций, а не получатели: правило по ним поймало бы
+# все оплаты подряд (в выписке банка «Россия» у всех оплат описание
+# «Оплата по QR-коду через СБП»).
+GENERIC_MERCHANTS = ("оплатапоqr", "черезсбп", "переводпономеру", "переводсбп",
+                     "оплататоваров", "оплатауслуг", "переводсредств", "переводсебе",
+                     "переводнакарту", "переводскарты", "пополнение", "снятие", "покупка",
+                     "повыписке", "платёжпо", "платежпо")
 
 
 def _merchant_key(name: str) -> str:
@@ -207,6 +217,7 @@ class Storage:
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(SCHEMA)
         self._add_missing_columns()
+        self._ensure_autoincrement()
         if not self.conn.execute("SELECT 1 FROM categories").fetchone():
             with self.conn:
                 self.conn.executemany(
@@ -215,6 +226,41 @@ class Storage:
 
     def close(self):
         self.conn.close()
+
+    # Номера записей не должны переиспользоваться: на них ссылаются кнопки под
+    # старыми сообщениями, отпечатки файлов и списки к /biz. Без AUTOINCREMENT
+    # SQLite после удаления последней записи выдаёт её номер новой — и старая
+    # кнопка «Удалить» сработала бы на другую запись.
+    _AUTOINCREMENT_TABLES = ("cards", "categories", "expenses", "statements", "statement_lines",
+                             "transfers", "category_rules")
+
+    def _ensure_autoincrement(self):
+        """Базы прежних версий: пересобрать таблицы с AUTOINCREMENT (данные сохраняются)."""
+        wanted = {m.group(1): m.group(0) for m in re.finditer(
+            r"CREATE TABLE IF NOT EXISTS (\w+) \(.*?\n\)", SCHEMA, re.S)}
+        todo = [t for t in self._AUTOINCREMENT_TABLES
+                if "AUTOINCREMENT" not in (self.conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (t,)
+                ).fetchone()["sql"] or "")]
+        if not todo:
+            return
+        self.conn.commit()
+        self.conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            with self.conn:
+                for table in todo:
+                    columns = [r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")]
+                    create = wanted[table].replace(f"IF NOT EXISTS {table} (", f"{table}__new (", 1)
+                    self.conn.execute(create)
+                    new_cols = {r["name"] for r in self.conn.execute(
+                        f"PRAGMA table_info({table}__new)")}
+                    cols = ", ".join(c for c in columns if c in new_cols)
+                    self.conn.execute(f"INSERT INTO {table}__new ({cols}) SELECT {cols} FROM {table}")
+                    self.conn.execute(f"DROP TABLE {table}")
+                    self.conn.execute(f"ALTER TABLE {table}__new RENAME TO {table}")
+            self.conn.executescript(SCHEMA)  # вернуть индексы удалённых таблиц
+        finally:
+            self.conn.execute("PRAGMA foreign_keys = ON")
 
     def _add_missing_columns(self):
         """Базы, созданные прошлыми версиями, дополняем новыми колонками."""
@@ -253,6 +299,18 @@ class Storage:
     def card(self, card_id: int) -> Card | None:
         row = self.conn.execute("SELECT * FROM cards WHERE id = ?", (card_id,)).fetchone()
         return Card(**dict(row)) if row else None
+
+    def card_in_use_by_dialog(self, card_id: int) -> bool:
+        """Карта нужна незаконченному вопросу или идущей сверке."""
+        for (raw,) in self.conn.execute("SELECT state FROM chat_state"):
+            state = json.loads(raw)
+            if state.get("statement", {}).get("card_id") == card_id:
+                return True
+            for d in state.get("drafts", []):
+                sides = (d.get("transfer") or {})
+                if card_id in (d.get("card_id"), sides.get("from"), sides.get("to")):
+                    return True
+        return False
 
     def delete_card(self, card_id: int) -> bool:
         """Удаляет только карту без записей — иначе потеряется история."""
@@ -295,7 +353,7 @@ class Storage:
         return cur.lastrowid
 
     def update_expense(self, expense_id: int, **fields):
-        allowed = {"purpose", "category_id", "card_id", "op_date", "amount", "kind"}
+        allowed = {"purpose", "category_id", "card_id", "op_date", "amount", "kind", "receipt_path"}
         assert set(fields) <= allowed, fields
         sets = ", ".join(f"{k} = ?" for k in fields)
         with self.conn:
@@ -367,7 +425,7 @@ class Storage:
     def set_rule(self, merchant: str, category_id: int) -> bool:
         """Запомнить статью для получателя. False — имя слишком общее для правила."""
         key = _merchant_key(merchant)
-        if len(key) < 3:
+        if len(key) < 3 or any(marker in key for marker in GENERIC_MERCHANTS):
             return False
         with self.conn:
             self.conn.execute(
@@ -475,7 +533,7 @@ class Storage:
         return None
 
     def update_transfer(self, transfer_id: int, **fields):
-        assert set(fields) <= {"from_card_id", "to_card_id"}, fields
+        assert set(fields) <= {"from_card_id", "to_card_id", "receipt_path"}, fields
         sets = ", ".join(f"{k} = ?" for k in fields)
         with self.conn:
             self.conn.execute(f"UPDATE transfers SET {sets} WHERE id = ?",
@@ -500,6 +558,7 @@ class Storage:
 
     def reset_statement(self, card_id: int, month: str):
         self.forget_ref(f"s:{card_id}:{month}")
+        self.forget_ref(f"s:{card_id}:period")  # файл за несколько месяцев тоже можно прислать снова
         with self.conn:
             self.conn.execute(
                 "DELETE FROM statements WHERE card_id = ? AND month = ?", (card_id, month)

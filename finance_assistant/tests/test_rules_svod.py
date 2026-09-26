@@ -4,7 +4,7 @@ from datetime import date
 
 from openpyxl import load_workbook
 
-from conftest import CHAT, TODAY, payment, png
+from conftest import CHAT, TODAY, payment, png, answer
 from finance.pivot import buckets, parse_period
 from test_business_account import biz, card, kontur  # noqa: F401 — фикстура biz
 from test_sverka import statement
@@ -24,7 +24,7 @@ def test_chosen_category_remembered_for_merchant(env):
                                 "category": "Прочее"})]
     [q] = flow.on_files(CHAT, [png()], "")
     assert "статья" in q.text.lower()
-    flow.on_button(CHAT, f"d:cat:{cat(db, 'Маркетплейсы: комиссии и услуги')}")
+    answer(flow, f"d:cat:{cat(db, 'Маркетплейсы: комиссии и услуги')}")
     # Второй такой же получатель (другое написание) — без вопроса, по правилу,
     # хотя модель предложила другую статью.
     [saved] = flow.on_files(CHAT, [png()], "")
@@ -58,7 +58,7 @@ def test_rules_not_learned_from_bulk_or_generic_names(env):
     db, rec, flow = env
     rec.payments.append(payment(merchant="ИП", category="Прочее", category_confident=False))
     flow.on_files(CHAT, [png()], "")
-    flow.on_button(CHAT, f"d:cat:{cat(db, 'Прочее')}")
+    answer(flow, f"d:cat:{cat(db, 'Прочее')}")
     assert db.rules() == []  # «ИП» без имени — слишком общее
     [r] = flow.on_command(CHAT, "rules")
     assert "Правил пока нет" in r.text
@@ -124,7 +124,7 @@ def test_svod_month_layout_and_excel(biz):
     rec.payments.append(payment(card_last4="5501", bank="ВТБ", date="2026-09-03", amount="800",
                                 looks_personal=True))
     flow.on_files(CHAT, [png()], "")
-    flow.on_button(CHAT, "d:purpose:personal")  # личное — в сводную не попадает
+    answer(flow, "d:purpose:personal")  # личное — в сводную не попадает
     # Бизнес-счёт: списание по выписке без записи → «Без статьи».
     flow.on_command(CHAT, "sverka", "2026-09")
     flow.on_button(CHAT, f"s:c:{card(db, 'ПСБ').id}")

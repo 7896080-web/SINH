@@ -1,5 +1,5 @@
 """Защита от повторов: тот же файл, похожая запись, перевод с той же стороны."""
-from conftest import CHAT, png, payment
+from conftest import CHAT, png, payment, answer
 from test_sverka import PDF, op, statement
 from test_transfers import cid, move, own  # noqa: F401 — фикстура own
 
@@ -52,7 +52,7 @@ def test_similar_expense_date_shifted_by_a_day(env):
     flow.on_files(CHAT, [png()], "")
     [q] = flow.on_files(CHAT, [png()], "")  # другой скриншот той же оплаты, дата на день позже
     assert "Похожая операция уже записана" in q.text and "№1" in q.text
-    flow.on_button(CHAT, "d:skip")
+    answer(flow, "d:skip")
     [r] = flow.on_files(CHAT, [png()], "")  # через 3 дня — это уже другая оплата
     assert r.text.startswith("✅")
     assert len(db.expenses("2026-09")) == 2
@@ -66,7 +66,7 @@ def test_similar_expense_same_merchant_other_card(env):
     flow.on_files(CHAT, [png()], "")
     [q] = flow.on_files(CHAT, [png()], "")
     assert "Похожая операция" in q.text
-    flow.on_button(CHAT, "d:dup:ok")  # это правда другая оплата
+    answer(flow, "d:dup:ok")  # это правда другая оплата
     [r] = flow.on_files(CHAT, [png()], "")  # другой получатель и карта — не спрашиваем
     assert r.text.startswith("✅")
     assert len(db.expenses("2026-09")) == 3
@@ -79,10 +79,10 @@ def test_same_transfer_same_side_asks_instead_of_dropping(own):
     flow.on_files(CHAT, [png()], "")
     [q] = flow.on_files(CHAT, [png()], "")
     assert "Похожий перевод уже записан: П1" in q.text
-    [saved] = flow.on_button(CHAT, "d:dup:ok")
+    [saved] = answer(flow, "d:dup:ok")
     assert saved.text.startswith("🔁 Перевод между своими счетами П2")
     [q] = flow.on_files(CHAT, [png()], "")
-    flow.on_button(CHAT, "d:skip")
+    answer(flow, "d:skip")
     assert len(db.transfers("2026-09")) == 2
 
 
@@ -124,7 +124,7 @@ def test_same_statement_file_skipped_without_claude(env):
     flow.on_command(CHAT, "done")
     flow.on_command(CHAT, "sverka", "2026-09")
     flow.on_button(CHAT, f"s:c:{db.cards()[0].id}")
-    flow.on_button(CHAT, "s:reset")
+    flow.on_button(CHAT, f"s:reset:{db.cards()[0].id}:2026-09")
     rec.statements.append(statement([op("2026-09-02", "100")]))
     [r] = flow.on_files(CHAT, [PDF], "")
     assert "Принято операций: 1" in r.text

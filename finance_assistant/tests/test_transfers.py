@@ -1,7 +1,7 @@
 """Перемещения денег между своими счетами: не расход, исключаются из «пришло»/«ушло»."""
 import pytest
 
-from conftest import CHAT, png, TODAY, FakeRecognizer, payment
+from conftest import CHAT, png, TODAY, FakeRecognizer, payment, answer
 from finance.flow import Flow
 from finance.reconcile import summarize
 from finance.storage import Storage
@@ -47,8 +47,8 @@ def test_same_transfer_from_other_side_not_doubled(own):
     db, rec, flow = own
     rec.payments.append(move(counterparty_last4="", counterparty_bank=""))
     [q] = flow.on_files(CHAT, [png()], "")
-    assert "Куда переведены деньги?" in q.text and "d:tr:0" in str(q.buttons)
-    [saved] = flow.on_button(CHAT, "d:tr:0")
+    assert "Куда переведены деньги?" in q.text and ":tr:0" in str(q.buttons)
+    [saved] = answer(flow, "d:tr:0")
     assert "Россия → другой ваш счёт" in saved.text
     # Скриншот зачисления на ВТБ того же перевода, на день позже.
     rec.payments.append(move(direction="in", date="2026-09-11", card_last4="2222", bank="ВТБ",
@@ -64,7 +64,7 @@ def test_incoming_transfer_asks_where_from(own):
                              counterparty_last4="", counterparty_bank=""))
     [q] = flow.on_files(CHAT, [png()], "")
     assert "Откуда пришли деньги?" in q.text
-    [saved] = flow.on_button(CHAT, f"d:tr:{cid(db, 'Россия')}")
+    [saved] = answer(flow, f"d:tr:{cid(db, 'Россия')}")
     assert "Россия → ВТБ" in saved.text
 
 
@@ -136,7 +136,7 @@ def test_statement_line_not_subtracted_twice(own):
     rec.payments.append(move(amount="30000", date="2026-09-11", counterparty_last4="",
                              counterparty_bank=""))
     flow.on_files(CHAT, [png()], "")
-    flow.on_button(CHAT, "d:tr:0")
+    answer(flow, "d:tr:0")
     cs = next(c for c in summarize(db, "2026-09").cards if c.card.name == "Россия")
     assert (cs.total_out, cs.own_out, cs.personal) == (13400000, 13000000, 400000)
     assert [ln.description for ln in cs.unmatched_out] == ["Магазин"]

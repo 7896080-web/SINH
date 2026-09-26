@@ -1,6 +1,6 @@
 import os
 
-from conftest import CHAT, png, payment
+from conftest import CHAT, png, payment, answer
 from finance.storage import BUSINESS, PERSONAL
 
 
@@ -17,7 +17,7 @@ def test_clear_screenshot_saved_without_questions(env):
     assert (e.amount, e.card, e.purpose, e.category) == (150000, "Сбер", BUSINESS, "Логистика и доставка")
     assert os.path.exists(e.receipt_path)
     assert "e:del:%d" % e.id in buttons(reply)
-    assert db.get_state(CHAT) == {}
+    assert set(db.get_state(CHAT)) <= {"seq"}
 
 
 def test_caption_and_cards_passed_to_model(env):
@@ -36,11 +36,11 @@ def test_unknown_card_and_unsure_category_are_asked(env):
     [q1] = flow.on_files(CHAT, [png()], "")
     assert "С какой карты" in q1.text
     card_id = db.cards()[1].id
-    [q2] = flow.on_button(CHAT, f"d:card:{card_id}")
+    [q2] = answer(flow, f"d:card:{card_id}")
     assert "статья" in q2.text.lower()
     assert any(label.startswith("✓ Логистика") for row in q2.buttons for label, _ in row)
     cat = db.category_id("Реклама и продвижение")
-    [saved] = flow.on_button(CHAT, f"d:cat:{cat}")
+    [saved] = answer(flow, f"d:cat:{cat}")
     assert "Тинькофф" in saved.text
     assert db.expenses("2026-09")[0].category == "Реклама и продвижение"
 
@@ -56,8 +56,8 @@ def test_looks_personal_asks_purpose(env):
     db, rec, flow = env
     rec.payments.append(payment(looks_personal=True, category="", category_confident=False))
     [q] = flow.on_files(CHAT, [png()], "")
-    assert "d:purpose:personal" in buttons(q)
-    [saved] = flow.on_button(CHAT, "d:purpose:personal")
+    assert any(b.endswith(":purpose:personal") for b in buttons(q))
+    [saved] = answer(flow, "d:purpose:personal")
     e = db.expenses("2026-09")[0]
     assert e.purpose == PERSONAL and e.category is None
     assert "Личное" in saved.text
@@ -68,7 +68,7 @@ def test_incoming_is_not_recorded(env):
     rec.payments.append(payment(direction="in"))
     [r] = flow.on_files(CHAT, [png()], "")
     assert "поступление — не записываю" in r.text
-    assert db.expenses("2026-09") == [] and db.get_state(CHAT) == {}
+    assert db.expenses("2026-09") == [] and set(db.get_state(CHAT)) <= {"seq"}
 
 
 def test_foreign_currency_asks_rubles(env):
@@ -86,7 +86,7 @@ def test_missing_date_accepts_text(env):
     db, rec, flow = env
     rec.payments.append(payment(date=""))
     [q] = flow.on_files(CHAT, [png()], "")
-    assert "d:date:1" in buttons(q)
+    assert any(b.endswith(":date:1") for b in buttons(q))
     flow.on_text(CHAT, "05.09")
     assert db.expenses("2026-09")[0].op_date == "2026-09-05"
 
@@ -97,9 +97,9 @@ def test_duplicate_detected(env):
     flow.on_files(CHAT, [png()], "")
     [q] = flow.on_files(CHAT, [png()], "")
     assert "уже записана" in q.text
-    flow.on_button(CHAT, "d:skip")
+    answer(flow, "d:skip")
     flow.on_files(CHAT, [png()], "")
-    flow.on_button(CHAT, "d:dup:ok")
+    answer(flow, "d:dup:ok")
     assert len(db.expenses("2026-09")) == 2
 
 
@@ -109,7 +109,7 @@ def test_screenshots_queue_while_question_open(env):
     flow.on_files(CHAT, [png()], "")
     [queued] = flow.on_files(CHAT, [png()], "")
     assert "в очереди: 1" in queued.text
-    replies = flow.on_button(CHAT, f"d:card:{db.cards()[0].id}")
+    replies = answer(flow, f"d:card:{db.cards()[0].id}")
     assert [r.text.startswith("✅") for r in replies] == [True, True]
     assert sorted(e.amount for e in db.expenses("2026-09")) == [70000, 150000]
 
@@ -155,7 +155,7 @@ def test_no_cards_yet(tmp_path):
     [r] = flow.on_files(CHAT, [png()], "")
     assert "/addcard" in r.text
     flow.on_command(CHAT, "addcard", "Сбер 1111 Сбер")
-    [saved] = flow.on_button(CHAT, "d:retry")
+    [saved] = answer(flow, "d:retry")
     assert saved.text.startswith("✅")
 
 
@@ -170,6 +170,6 @@ def test_cancel_clears_queue(env):
     rec.payments.append(payment(card_last4="", bank=""))
     flow.on_files(CHAT, [png()], "")
     flow.on_command(CHAT, "cancel")
-    assert db.get_state(CHAT) == {}
-    [r] = flow.on_button(CHAT, "d:card:1")
+    assert set(db.get_state(CHAT)) <= {"seq"}
+    [r] = flow.on_button(CHAT, "d:1:card:1")  # кнопка под вопросом, который сбросили
     assert "неактуален" in r.text
