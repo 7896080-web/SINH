@@ -88,11 +88,13 @@ def test_recognizer_errors(content, stop):
 
 def test_cards_commands(env):
     db, rec, flow = env
-    assert "уже есть" in flow.on_command(CHAT, "addcard", "Сбер 9999")[0].text
+    assert "уже есть" in flow.on_command(CHAT, "addcard", "Сбер")[0].text
+    assert "Добавил номера" in flow.on_command(CHAT, "addcard", "Сбер 9999")[0].text
+    assert db.cards()[0].numbers == ["1111", "9999"]
     flow.on_command(CHAT, "addcard", "Озон 4444 Озон Банк")
     card = db.cards()[-1]
     assert (card.last4, card.bank) == ("4444", "Озон Банк")
-    assert "Озон ·4444" in flow.on_command(CHAT, "cards")[0].text
+    assert "Озон · 4444" in flow.on_command(CHAT, "cards")[0].text
     assert flow.on_command(CHAT, "delcard", str(card.id))[0].text == "Карта удалена."
     flow.on_command(CHAT, "addcat", "Обучение")
     assert "Обучение" in flow.on_command(CHAT, "cats")[0].text

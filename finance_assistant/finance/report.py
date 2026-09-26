@@ -75,7 +75,10 @@ def card_text(cs: CardSummary, month: str) -> str:
 
 
 def _line(ln: StatementLine) -> str:
-    return f"#{ln.id}  {short_date(ln.op_date)}  {rub(ln.amount)}  {ln.description}"
+    # Время важно: в выписке банка «Россия» у всех оплат одно описание
+    # («Оплата по QR-коду через СБП»), различить их можно только так.
+    when = short_date(ln.op_date) + (f" {ln.op_time}" if ln.op_time else "")
+    return f"#{ln.id}  {when}  {rub(ln.amount)}  {ln.description}"
 
 
 def unmatched_text(lines: list[StatementLine]) -> str:
