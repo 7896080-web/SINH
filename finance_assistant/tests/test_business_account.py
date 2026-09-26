@@ -31,7 +31,7 @@ def kontur(**over):
                   bank="ПСБ", merchant="АО «ПФ «СКБ Контур»",
                   description="оплата по счёту (сервис Контур)",
                   category="Связь, сервисы, подписки", category_confident=True,
-                  from_business_account=True, to_owner=False)
+                  from_business_account=True, own_transfer=False)
     return payment(**{**fields, **over})
 
 
@@ -64,11 +64,8 @@ def test_b2c_transfer_to_other_person_is_business_expense(biz):
     assert e.card == "ПСБ" and e.category == "Подрядчики и зарплата"
 
 
-def test_transfer_to_owner_and_income_not_recorded(biz):
+def test_income_to_business_account_not_recorded(biz):
     db, rec, flow = biz
-    rec.payments.append(kontur(amount="3000", merchant="Иванов И. И.", to_owner=True))
-    [r] = flow.on_files(CHAT, [PNG], "")
-    assert "перевод между вашими счетами" in r.text
     # «ЮЖНЫЙ Ф-Л ПАО "Банк ПСБ" +236 ₽ · Начисление кэшбэка по бизнес-карте»
     rec.payments.append(kontur(direction="in", amount="236", merchant="Банк ПСБ"))
     [r] = flow.on_files(CHAT, [PNG], "")
@@ -76,11 +73,14 @@ def test_transfer_to_owner_and_income_not_recorded(biz):
     assert db.expenses("2026-07") == [] and db.get_state(CHAT) == {}
 
 
-def test_transfer_between_own_personal_accounts_not_recorded(biz):
+def test_transfer_from_business_account_to_owner_card(biz):
     db, rec, flow = biz
-    rec.payments.append(payment(card_last4="5501", to_owner=True))
+    rec.payments.append(kontur(amount="3000", merchant="Иванов И. И.", own_transfer=True,
+                               counterparty_last4="5501", counterparty_bank="ВТБ"))
     [r] = flow.on_files(CHAT, [PNG], "")
-    assert "между вашими счетами" in r.text and db.expenses("2026-09") == []
+    assert r.text.startswith("🔁 Перевод между своими счетами П1")
+    assert "ПСБ → ВТБ" in r.text
+    assert db.expenses("2026-07") == []
 
 
 def test_month_totals_business_by_category_and_personal(biz):

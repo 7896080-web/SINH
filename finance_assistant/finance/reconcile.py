@@ -8,27 +8,31 @@
 from dataclasses import dataclass, field
 from datetime import date
 
-from .storage import BUSINESS, EXPENSE, PERSONAL, Card, Expense, StatementLine, Storage
+from .storage import (BUSINESS, EXPENSE, PERSONAL, Card, Expense, StatementLine, Storage,
+                      Transfer)
 
 # Банк может провести оплату на пару дней позже, чем она видна на скриншоте.
 MATCH_DAYS = 3
 NO_CATEGORY = "Без статьи"
 
 
-def match(expenses: list[Expense], lines: list[StatementLine]) -> tuple[dict[int, int], list[Expense]]:
-    """Сопоставить записи-расходы списаниям выписки: сумма точно, дата ±MATCH_DAYS.
+def match(expenses: list, lines: list[StatementLine], direction: str = "out",
+          used: set[int] | None = None) -> tuple[dict[int, int], list]:
+    """Сопоставить записи строкам выписки: сумма точно, дата ±MATCH_DAYS.
 
-    Возвращает {expense_id: line_id} и список записей, не найденных в выписке.
-    Каждая строка выписки используется не больше одного раза.
+    Годится и для расходов, и для переводов (у тех и других есть id, op_date,
+    amount). Возвращает {id записи: id строки} и записи, не найденные в выписке.
+    Каждая строка используется не больше одного раза — в том числе между
+    вызовами, если передан общий `used`.
     """
-    used: set[int] = set()
+    used = set() if used is None else used
     pairs: dict[int, int] = {}
-    missing: list[Expense] = []
+    missing: list = []
     for e in sorted(expenses, key=lambda x: (x.op_date, x.id)):
         e_date = date.fromisoformat(e.op_date)
         best = None
         for ln in lines:
-            if ln.id in used or ln.direction != "out" or ln.amount != e.amount:
+            if ln.id in used or ln.direction != direction or ln.amount != e.amount:
                 continue
             gap = abs((date.fromisoformat(ln.op_date) - e_date).days)
             if gap <= MATCH_DAYS and (best is None or gap < best[0]):
@@ -50,11 +54,23 @@ class CardSummary:
     total_out: int | None = None
     own_in: int = 0                  # переводы со своих счетов
     own_out: int = 0                 # переводы на свои счета (с бизнес-счёта — вам)
+    transfers: list[Transfer] = field(default_factory=list)          # записанные вами
+    missing_transfers: list[Transfer] = field(default_factory=list)  # не найдены в выписке
     business_recorded: int = 0       # записанные бизнес-расходы
     personal_marked: int = 0         # записи, которые вы пометили как личные
     by_category: dict[str, int] = field(default_factory=dict)
     missing: list[Expense] = field(default_factory=list)
     unmatched_out: list[StatementLine] = field(default_factory=list)
+
+    @property
+    def net_in(self) -> int | None:
+        """Пришло без переводов со своих счетов."""
+        return None if self.total_in is None else self.total_in - self.own_in
+
+    @property
+    def net_out(self) -> int | None:
+        """Ушло без переводов на свои счета — то, что реально потрачено."""
+        return None if self.total_out is None else self.total_out - self.own_out
 
     @property
     def business(self) -> int:
@@ -65,7 +81,7 @@ class CardSummary:
         это деньги бизнеса, даже если статья ещё не проставлена.
         """
         if self.card.is_business and self.total_out is not None:
-            return max(self.total_out - self.own_out - self.personal_marked, self.business_recorded)
+            return max(self.net_out - self.personal_marked, self.business_recorded)
         return self.business_recorded
 
     @property
@@ -75,7 +91,7 @@ class CardSummary:
             return self.personal_marked
         if self.total_out is None:
             return None
-        return self.total_out - self.own_out - self.business
+        return self.net_out - self.business
 
     @property
     def categories(self) -> dict[str, int]:
@@ -96,6 +112,16 @@ class MonthSummary:
     @property
     def business(self) -> int:
         return sum(c.business for c in self.cards)
+
+    @property
+    def net_in(self) -> int | None:
+        """Приход по картам с выпиской без переводов между своими счетами.
+
+        Перевод с одного своего счёта на другой уходит из итога: он не
+        появляется ни в приходе, ни в расходе.
+        """
+        values = [c.net_in for c in self.cards if c.net_in is not None]
+        return sum(values) if values else None
 
     @property
     def personal(self) -> int:
@@ -141,7 +167,15 @@ def summarize(storage: Storage, month: str) -> MonthSummary:
             elif e.purpose == PERSONAL:
                 cs.personal_marked += e.amount
 
+        cs.transfers = storage.transfers(month, card.id)
+        sent = [t for t in cs.transfers if t.from_card_id == card.id]
+        received = [t for t in cs.transfers if t.to_card_id == card.id]
+
         found = storage.statement(card.id, month)
+        if not found:
+            # Без выписки считать нечего, но записанные переводы видны в карточке.
+            cs.own_out = sum(t.amount for t in sent)
+            cs.own_in = sum(t.amount for t in received)
         if found:
             head, lines = found
             cs.has_statement = True
@@ -152,11 +186,24 @@ def summarize(storage: Storage, month: str) -> MonthSummary:
             # (строку модель может пропустить, итог — вряд ли).
             cs.total_in = head["total_in"] if head["total_in"] is not None else sum_in
             cs.total_out = head["total_out"] if head["total_out"] is not None else sum_out
-            cs.own_in = sum(ln.amount for ln in lines if ln.own_transfer and ln.direction == "in")
-            cs.own_out = sum(ln.amount for ln in lines if ln.own_transfer and ln.direction == "out")
+            used: set[int] = set()
+            pairs, cs.missing = match(expenses, lines, "out", used) if lines else ({}, [])
+            # Записанные вами переводы находим в выписке, чтобы не вычесть их
+            # дважды — если модель тоже пометила строку как перевод между своими.
+            out_pairs, miss_out = match(sent, lines, "out", used) if lines else ({}, [])
+            in_pairs, miss_in = match(received, lines, "in", used) if lines else ({}, [])
             if lines:
-                pairs, cs.missing = match(expenses, lines)
-                matched = set(pairs.values())
+                cs.missing_transfers = miss_out + miss_in
+            as_transfer = set(out_pairs.values()) | set(in_pairs.values())
+            flagged = [ln for ln in lines if ln.own_transfer and ln.id not in as_transfer]
+            # Записанные переводы вычитаем всегда: по выписке с одними итогами
+            # (экран «История» ВТБ) их иначе не увидеть.
+            cs.own_in = (sum(ln.amount for ln in flagged if ln.direction == "in")
+                         + sum(t.amount for t in received))
+            cs.own_out = (sum(ln.amount for ln in flagged if ln.direction == "out")
+                          + sum(t.amount for t in sent))
+            if lines:
+                matched = set(pairs.values()) | as_transfer
                 cs.unmatched_out = [
                     ln for ln in lines
                     if ln.direction == "out" and not ln.own_transfer and ln.id not in matched

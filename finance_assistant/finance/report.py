@@ -64,12 +64,17 @@ def card_text(cs: CardSummary, month: str) -> str:
     out = [f"{icon} {cs.card.label} — {month_name(month)}"]
     if cs.has_statement:
         out.append(f"Пришло: {rub(cs.total_in)}")
+        if cs.own_in:
+            out.append(f"  − переводы со своих счетов: {rub(cs.own_in)}")
+            out.append(f"  = приход без переводов: {rub(cs.net_in)}")
         out.append(f"Ушло:   {rub(cs.total_out)}")
         if cs.own_out:
             label = "переведено вам" if cs.card.is_business else "переводы на свои счета"
-            out.append(f"  {label}: {rub(cs.own_out)}")
+            out.append(f"  − {label}: {rub(cs.own_out)}")
     else:
         out.append("Выписка не загружена — есть только записанное вами:")
+        if cs.own_in or cs.own_out:
+            out.append(f"  переводы между своими счетами: +{rub(cs.own_in)} / −{rub(cs.own_out)}")
     out.append(f"  на бизнес: {rub(cs.business)}")
     _categories(out, cs.categories, "    ")
     if cs.card.is_business:
@@ -83,6 +88,11 @@ def card_text(cs: CardSummary, month: str) -> str:
         out.append("")
         out.append("⚠️ Записано, но не найдено в выписке (проверьте карту или дату):")
         out += [f"  №{e.id} {expense_line(e)}" for e in cs.missing]
+    if cs.missing_transfers:
+        out.append("")
+        out.append("⚠️ Перевод записан, но в выписке не найден (всё равно вычтен):")
+        out += [f"  П{t.id} {short_date(t.op_date)}  {rub(t.amount)}  {t.route}"
+                for t in cs.missing_transfers]
     return "\n".join(out)
 
 
@@ -124,10 +134,15 @@ def month_text(s: MonthSummary) -> str:
         out.append(f"{icon} {cs.card.label}{state}")
         if cs.has_statement:
             out.append(f"  пришло {rub(cs.total_in)} · ушло {rub(cs.total_out)}")
+            if cs.own_in or cs.own_out:
+                out.append(f"  без переводов между своими: пришло {rub(cs.net_in)}"
+                           f" · ушло {rub(cs.net_out)}")
         out.append(f"  бизнес {rub(cs.business)} · личное {rub(cs.personal)}")
-        if cs.missing:
-            out.append(f"  ⚠️ не найдено в выписке: {len(cs.missing)}")
+        if cs.missing or cs.missing_transfers:
+            out.append(f"  ⚠️ не найдено в выписке: {len(cs.missing) + len(cs.missing_transfers)}")
     out.append("")
+    if s.net_in is not None:
+        out.append(f"📥 Пришло без переводов между своими счетами: {rub(s.net_in)}")
     _totals(out, s.business, s.by_category, s.personal,
             [c.label for c in s.personal_incomplete])
     return "\n".join(out)
@@ -162,13 +177,16 @@ def period_text(summaries: list[MonthSummary]) -> str:
         line = (f"  {icon} {cs0.card.label}: бизнес {rub(sum(c.business for c in per))}"
                 f" · личное {rub(sum(c.personal or 0 for c in per))}")
         if with_stmt:
-            line += (f" · пришло {rub(sum(c.total_in or 0 for c in with_stmt))}"
-                     f" · ушло {rub(sum(c.total_out or 0 for c in with_stmt))}")
+            line += (f" · пришло без переводов {rub(sum(c.net_in or 0 for c in with_stmt))}"
+                     f" · ушло без переводов {rub(sum(c.net_out or 0 for c in with_stmt))}")
         missing = sum(len(c.missing) for c in per)
         if missing:
             line += f" · ⚠️ не найдено в выписках: {missing}"
         out.append(line)
     out.append("")
+    net_in = [s.net_in for s in summaries if s.net_in is not None]
+    if net_in:
+        out.append(f"📥 Пришло без переводов между своими счетами: {rub(sum(net_in))}")
     incomplete = sorted({c.label for s in summaries for c in s.personal_incomplete})
     _totals(out, sum(s.business for s in summaries), _merge_categories(summaries),
             sum(s.personal for s in summaries), incomplete)
@@ -215,13 +233,15 @@ def _missing_sheet(wb, missing: list[Expense]):
             m.append([e.id, e.op_date, _num(e.amount), e.card, e.merchant])
 
 
-CARD_HEADER = ["Карта", "Пришло", "Ушло", "Переводы на свои счета", "На бизнес", "На личное",
+CARD_HEADER = ["Карта", "Пришло", "Переводы со своих счетов", "Пришло без переводов",
+               "Ушло", "Переводы на свои счета", "На бизнес", "На личное",
                "Не найдено в выписке"]
 
 
 def _card_row(cs: CardSummary) -> list:
-    return [cs.card.label, _num(cs.total_in), _num(cs.total_out), _num(cs.own_out),
-            _num(cs.business), _num(cs.personal), len(cs.missing)]
+    return [cs.card.label, _num(cs.total_in), _num(cs.own_in), _num(cs.net_in),
+            _num(cs.total_out), _num(cs.own_out), _num(cs.business), _num(cs.personal),
+            len(cs.missing) + len(cs.missing_transfers)]
 
 
 def month_xlsx(s: MonthSummary) -> bytes:
@@ -245,7 +265,7 @@ def month_xlsx(s: MonthSummary) -> bytes:
     ws.append(["Личные расходы", _num(s.personal)])
     _bold_row(ws, ws.max_row)
     ws.column_dimensions["A"].width = 34
-    for col in "BCDEFG":
+    for col in "BCDEFGHI":
         ws.column_dimensions[col].width = 16
     _expenses_sheet(wb, s.business_expenses)
     _missing_sheet(wb, [e for cs in s.cards for e in cs.missing])
@@ -267,9 +287,9 @@ def period_xlsx(summaries: list[MonthSummary]) -> bytes:
         for cs in s.cards:
             ws.append([s.month] + _card_row(cs))
     ws.append([])
-    ws.append(["Ушло на бизнес", "", "", "", "", _num(sum(s.business for s in summaries))])
-    ws.append(["Личные расходы", "", "", "", "", "", _num(sum(s.personal for s in summaries))])
-    for col, width in zip("ABCDEFGH", (14, 30, 14, 14, 16, 14, 14, 12)):
+    ws.append(["Ушло на бизнес", _num(sum(s.business for s in summaries))])
+    ws.append(["Личные расходы", _num(sum(s.personal for s in summaries))])
+    for col, width in zip("ABCDEFGHIJ", (14, 30, 14, 16, 16, 14, 16, 14, 14, 12)):
         ws.column_dimensions[col].width = width
 
     cats = wb.create_sheet("По статьям")

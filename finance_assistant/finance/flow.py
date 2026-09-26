@@ -29,6 +29,8 @@ HELP = """\
 📸 Сделали оплату — пришлите скриншот (можно с подписью, что это). \
 Я распознаю сумму, дату, карту и статью, при необходимости переспрошу и запишу.
 ✍️ Можно и текстом: «3500 доставка СДЭК с Т-Банка вчера».
+🔁 Перевели деньги между своими счетами — тоже пришлите скриншот: запишу \
+«откуда → куда», и при сверке эта сумма не попадёт ни в приход, ни в расход.
 
 В конце месяца:
 /sverka — загрузить выписку по карте (PDF, скриншоты, Excel/CSV или просто \
@@ -217,6 +219,8 @@ class Flow:
             return self._answer_button(chat_id, rest)
         if kind == "e":
             return self._edit_saved(chat_id, rest)
+        if kind == "t":
+            return self._edit_transfer(chat_id, rest)
         if kind == "s":
             return self._sverka_button(chat_id, rest)
         return []
@@ -262,7 +266,9 @@ class Flow:
             "card_hint": (info.get("card_last4") or "", info.get("bank") or ""),
             "kind": EXPENSE if info.get("direction") != "in" else None,
             "from_business": bool(info.get("from_business_account")),
-            "to_owner": bool(info.get("to_owner")),
+            "own_transfer": bool(info.get("own_transfer")),
+            "counterparty_hint": (info.get("counterparty_last4") or "",
+                                  info.get("counterparty_bank") or ""),
             "purpose": BUSINESS,
             "purpose_asked": not info.get("looks_personal"),
             "category_id": self.db.category_id(info.get("category") or ""),
@@ -318,6 +324,16 @@ class Flow:
                 state["ask"] = question[0]
                 self.db.set_state(chat_id, state)
                 return replies + self._quiet_summary(quiet) + [question[1]]
+            if d.get("own_transfer"):
+                transfer_id = self.db.add_transfer(
+                    op_date=d["date"], amount=d["amount"], from_card_id=d["transfer"]["from"],
+                    to_card_id=d["transfer"]["to"],
+                    description=" — ".join(x for x in (d["merchant"], d["description"]) if x),
+                    receipt_path=self._file_receipt(d["receipt"], d["date"]))
+                self._pop_draft(state)
+                self.db.set_state(chat_id, state)
+                replies.append(self._transfer_reply(transfer_id))
+                continue
             expense_id = self.db.add_expense(
                 op_date=d["date"], amount=d["amount"], card_id=d["card_id"], kind=d["kind"],
                 purpose=d["purpose"],
@@ -395,16 +411,17 @@ class Flow:
                     "/addcard Сбер 1234 Сбер\n/addcard Тинькофф 5678 Т-Банк\n"
                     "После этого нажмите «Продолжить».",
                     [[("Продолжить", "d:retry"), ("Отмена", "d:skip")]])
-            return "card", Reply(head + "С какой карты оплачено?",
+            ask = ("На какую карту пришли деньги?" if d.get("own_transfer") and d["kind"] is None
+                   else "С какой карты оплачено?")
+            return "card", Reply(head + ask,
                                  [[(c.label, f"d:card:{c.id}")] for c in cards]
                                  + [[("Отмена", "d:skip")]])
         card = self.db.card(d["card_id"])
+        if d.get("own_transfer"):
+            return self._transfer_question(d, head)
         if d["kind"] is None:
             return "drop", Reply(head + "Это поступление — не записываю: учитываю только "
                                         "расходы, а поступления видны в выписке при сверке.")
-        if d.get("to_owner"):
-            return "drop", Reply(head + "Это перевод между вашими счетами — не расход, "
-                                        "не записываю.")
         if not d["purpose_asked"]:
             where = " с бизнес-счёта" if card.is_business else ""
             return "purpose", Reply(head + f"Похоже на личную покупку{where}. Это расход бизнеса?",
@@ -421,6 +438,39 @@ class Flow:
                     head + f"Такая операция уже записана:\n№{dup.id} {expense_line(dup)}\nЭто повтор?",
                     [[("Повтор, не записывать", "d:skip")],
                      [("Нет, это другая оплата", "d:dup:ok")]])
+        return None
+
+    def _transfer_question(self, d: dict, head: str):
+        """Перевод между своими счетами: выяснить вторую сторону и не задвоить."""
+        outgoing = d["kind"] is not None
+        t = d.setdefault("transfer", None)
+        if t is None:
+            other = self._guess_card(self.db.cards(), *d.get("counterparty_hint", ("", "")))
+            if other == d["card_id"]:
+                other = None
+            t = d["transfer"] = {
+                "from": d["card_id"] if outgoing else other,
+                "to": other if outgoing else d["card_id"],
+                "other_asked": False,
+            }
+        side = "to" if outgoing else "from"
+        if t[side] is None and not t["other_asked"]:
+            question = "Куда переведены деньги?" if outgoing else "Откуда пришли деньги?"
+            rows = [[(c.label, f"d:tr:{c.id}")] for c in self.db.cards() if c.id != d["card_id"]]
+            rows.append([("Другой мой счёт (не веду в боте)", "d:tr:0")])
+            return "transfer", Reply(head + "Перевод между вашими счетами. " + question, rows)
+        if not d["dup_checked"]:
+            same = self.db.find_same_transfer(op_date=d["date"], amount=d["amount"],
+                                              from_card_id=t["from"], to_card_id=t["to"])
+            if same:
+                # Тот же перевод прислали со второй стороны — дополняем, не задваиваем.
+                fill = {k: v for k, v in (("from_card_id", t["from"]), ("to_card_id", t["to"]))
+                        if v is not None and getattr(same, k) is None}
+                if fill:
+                    self.db.update_transfer(same.id, **fill)
+                same = self.db.transfer(same.id)
+                return "drop", Reply(head + f"Этот перевод уже записан (П{same.id}: {same.route}), "
+                                            "повторно не записываю.")
         return None
 
     def _draft_head(self, d: dict) -> str:
@@ -488,6 +538,10 @@ class Flow:
             d["category_confident"] = True
         elif what == "dup":
             d["dup_checked"] = True
+        elif what == "tr":
+            side = "to" if d["kind"] is not None else "from"
+            d["transfer"][side] = int(value) or None
+            d["transfer"]["other_asked"] = True
         # "retry" — просто переспросить (например, после /addcard)
         self.db.set_state(chat_id, state)
         return self._advance(chat_id)
@@ -501,6 +555,36 @@ class Flow:
         self.db.add_card_number(d["card_id"], number)
         card = self.db.card(d["card_id"])
         return f"Запомнил: …{number} — это карта «{card.name}». В следующий раз не спрошу."
+
+    def _transfer_reply(self, transfer_id: int) -> Reply:
+        t = self.db.transfer(transfer_id)
+        text = (f"🔁 Перевод между своими счетами П{t.id}\n"
+                f"{rub(t.amount)} · {date.fromisoformat(t.op_date).strftime('%d.%m')} · {t.route}\n"
+                "Не расход: при сверке исключается из «пришло» и «ушло».")
+        return Reply(text, [[("Откуда", f"t:from:{t.id}"), ("Куда", f"t:to:{t.id}")],
+                            [("Удалить", f"t:del:{t.id}")]])
+
+    def _edit_transfer(self, chat_id, rest) -> list[Reply]:
+        parts = rest.split(":")
+        action, transfer_id = parts[0], int(parts[1])
+        t = self.db.transfer(transfer_id)
+        if not t:
+            return [Reply(f"Перевода П{transfer_id} уже нет.")]
+        if action == "del":
+            self.db.delete_transfer(transfer_id)
+            return [Reply(f"🗑 Перевод П{transfer_id} удалён.")]
+        if len(parts) == 2:
+            rows = [[(c.label, f"t:{action}:{t.id}:{c.id}")] for c in self.db.cards()]
+            rows.append([("Другой мой счёт (не веду в боте)", f"t:{action}:{t.id}:0")])
+            return [Reply(("Откуда" if action == "from" else "Куда") + f" перевод П{t.id}?", rows)]
+        value = int(parts[2]) or None
+        key, other = ("from_card_id", t.to_card_id) if action == "from" else ("to_card_id", t.from_card_id)
+        if value is None and other is None:
+            return [Reply("Хотя бы одна сторона перевода должна быть вашей картой из списка.")]
+        if value is not None and value == other:
+            return [Reply("Откуда и куда — одна и та же карта. Выберите другую.")]
+        self.db.update_transfer(transfer_id, **{key: value})
+        return [self._transfer_reply(transfer_id)]
 
     def _saved_reply(self, expense_id: int) -> Reply:
         e = self.db.expense(expense_id)
@@ -601,6 +685,11 @@ class Flow:
         return [Reply(f"Статья «{arg}» есть в списке.")]
 
     def _fix(self, chat_id, arg):
+        arg = arg.strip().lower()
+        if arg[:1] in ("п", "p") and arg[1:].isdigit():
+            if not self.db.transfer(int(arg[1:])):
+                return [Reply(f"Перевода {arg.upper()} нет.")]
+            return [self._transfer_reply(int(arg[1:]))]
         if not arg.isdigit() or not self.db.expense(int(arg)):
             return [Reply("Укажите номер записи из /list, например /fix 42")]
         return [self._saved_reply(int(arg))]
@@ -610,12 +699,17 @@ class Flow:
         if not month:
             return [Reply(MONTH_ARG_HELP)]
         items = self.db.expenses(month)
-        if not items:
+        moves = self.db.transfers(month)
+        if not items and not moves:
             return [Reply(f"За {month_name(month)} записей нет.")]
         total = sum(e.amount for e in items if e.kind == EXPENSE and e.purpose == BUSINESS)
         lines = [f"№{e.id} {expense_line(e)}" for e in items]
+        if moves:
+            lines += ["", "Переводы между своими счетами:"]
+            lines += [f"П{t.id} {date.fromisoformat(t.op_date).strftime('%d.%m')}  {rub(t.amount)}"
+                      f"  {t.route}" for t in moves]
         return [Reply(f"Записи за {month_name(month)}:\n" + "\n".join(lines)
-                      + f"\n\nБизнес итого: {rub(total)}")]
+                      + f"\n\nБизнес итого: {rub(total)}\nИсправить: /fix 12 или /fix П3")]
 
     # --- сверка --------------------------------------------------------
 
