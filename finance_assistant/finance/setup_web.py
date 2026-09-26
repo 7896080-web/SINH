@@ -33,6 +33,8 @@ from urllib.parse import parse_qs, urlparse
 LIFETIME = 15 * 60
 MAX_BAD_ATTEMPTS = 20
 FIELDS = ("TELEGRAM_BOT_TOKEN", "ANTHROPIC_API_KEY", "ALLOWED_USER_IDS")
+TEMP_SUBTITLE = ("Страница временная: закроется после сохранения или через 15 минут. "
+                 "Пустое поле — оставить текущее значение.")
 
 
 # --- .env ------------------------------------------------------------------
@@ -63,15 +65,29 @@ def write_env(path: str, updates: dict[str, str], group: str | None = None):
             lines[i] = f"{key}={updates[key]}"
             done.add(key)
     lines += [f"{k}={v}" for k, v in updates.items() if k not in done]
+    content = "\n".join(lines) + "\n"
+    if not os.access(os.path.dirname(os.path.abspath(path)), os.W_OK):
+        # Служба постоянной страницы может менять только сам файл, не папку:
+        # пишем на месте (владелец и права файла сохраняются).
+        with open(path, "r+", encoding="utf-8") as fh:
+            fh.seek(0)
+            fh.write(content)
+            fh.truncate()
+            fh.flush()
+            os.fsync(fh.fileno())
+        return
     tmp = path + ".tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o640)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write("\n".join(lines) + "\n")
+        fh.write(content)
     os.chmod(tmp, 0o640)
+    if os.path.exists(path) and os.geteuid() == 0:
+        st = os.stat(path)  # сохранить владельца прежнего файла
+        os.chown(tmp, st.st_uid, st.st_gid)
     if group and os.geteuid() == 0:
         import grp
         try:
-            os.chown(tmp, 0, grp.getgrnam(group).gr_gid)
+            os.chown(tmp, os.stat(tmp).st_uid, grp.getgrnam(group).gr_gid)
         except KeyError:
             pass
     os.replace(tmp, path)
@@ -196,8 +212,7 @@ button.secondary {{ background:transparent; color:var(--accent); border:1px soli
 .small {{ font-size:13px; color:var(--muted); }}
 </style></head><body><main>
 <h1>Настройка финансового помощника</h1>
-<p class="sub">Страница временная: закроется после сохранения или через 15 минут.
-Пустое поле — оставить текущее значение.</p>
+{topbar}<p class="sub">{subtitle}</p>
 {message}
 <form method="post" action="{action}" autocomplete="off">
 <input type="hidden" name="csrf" value="{csrf}">
@@ -231,7 +246,7 @@ button.secondary {{ background:transparent; color:var(--accent); border:1px soli
   <span class="small">Токен и ключ проверяются живым запросом.</span>
 </div>
 </form>
-<script>
+<script{script_nonce}>
 const who = document.getElementById("who");
 document.getElementById("whoBtn").onclick = async () => {{
   who.textContent = "Ищу…";
@@ -358,6 +373,7 @@ class Handler(BaseHTTPRequestHandler):
         now = lambda key, what: (f"Сейчас: {html.escape(mask(env[key]))}" if env.get(key)
                                  else f"Сейчас: {what} не задан")
         return PAGE.format(
+            topbar="", subtitle=TEMP_SUBTITLE, script_nonce="",
             message=message, action="/" + self.server.secret, csrf=self.server.csrf,
             key_now=now("ANTHROPIC_API_KEY", "ключ"), token_now=now("TELEGRAM_BOT_TOKEN", "токен"),
             user1=html.escape(form.get("user1", ids[0] if ids else "")),

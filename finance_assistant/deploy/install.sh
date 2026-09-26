@@ -76,7 +76,12 @@ fi
 if [ "$SKIP_USER" != 1 ]; then
     # Код и настройки — root (служба их не меняет), данные — только служба.
     chown -R root:root "$APP/finance" "$APP/deploy" "$APP/venv" "$APP/requirements.txt"
-    chown root:"$SERVICE_USER" "$APP/.env"
+    if id finance-settings >/dev/null 2>&1; then
+        # Включена страница настроек — .env меняет она (см. deploy/settings.sh).
+        chown finance-settings:"$SERVICE_USER" "$APP/.env"
+    else
+        chown root:"$SERVICE_USER" "$APP/.env"
+    fi
     chown -R "$SERVICE_USER": "$APP/data"
 fi
 chmod 640 "$APP/.env"
@@ -100,6 +105,13 @@ if [ "$SKIP_SYSTEMD" != 1 ]; then
        "$APP/deploy/finance-bot-backup.timer" "$SYSTEMD_DIR/"
     systemctl daemon-reload
     systemctl enable --now finance-bot-backup.timer >/dev/null
+    if systemctl is-enabled --quiet finance-bot-settings 2>/dev/null; then
+        # Страница настроек включена — обновить и её.
+        cp "$APP/deploy/finance-bot-settings.service" "$SYSTEMD_DIR/"
+        systemctl daemon-reload
+        systemctl restart finance-bot-settings
+        echo "   страница настроек обновлена"
+    fi
     systemctl enable finance-bot >/dev/null
     if [ "$READY" = 1 ]; then
         systemctl restart finance-bot
