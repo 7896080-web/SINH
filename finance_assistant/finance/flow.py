@@ -12,6 +12,7 @@ import hashlib
 import logging
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
@@ -31,6 +32,8 @@ HELP = """\
 
 📸 Сделали оплату — пришлите скриншот (можно с подписью, что это). \
 Я распознаю сумму, дату, карту и статью, при необходимости переспрошу и запишу.
+📚 Можно сразу пачкой — выделите в галерее хоть 50 скриншотов: разберу \
+параллельно, понятное запишу сразу одной сводкой, а вопросы задам по одному.
 ✍️ Можно и текстом: «3500 доставка СДЭК с Т-Банка вчера».
 🔁 Перевели деньги между своими счетами — тоже пришлите скриншот: запишу \
 «откуда → куда», и при сверке эта сумма не попадёт ни в приход, ни в расход.
@@ -58,6 +61,13 @@ HELP = """\
 /cancel — сбросить текущий вопрос"""
 
 MONTH_ARG_HELP = "Месяц указывайте как 2026-09"
+NOT_A_PAYMENT = ("Не вижу здесь одной оплаты или перевода. Пришлите скриншот "
+                 "конкретной операции (откройте её в истории банка) или чек, "
+                 "либо напишите сумму текстом.\n"
+                 "Если это экран истории с итогами месяца или выписка — "
+                 "их принимаю в сверке: /sverka")
+QUIET_LIST_LIMIT = 40   # до скольки записей пачки перечислять поимённо
+BATCH_WORKERS = 4       # сколько файлов пачки распознавать одновременно
 STATEMENT_IDLE = 2 * 3600  # через сколько секунд без выписок сверка закрывается сама
 PICKER_MONTHS = 12   # сколько месяцев назад можно выбрать кнопкой в /sverka
 PERIOD = "period"    # «выписка за несколько месяцев»
@@ -187,12 +197,13 @@ def _amount_or_none(text: str) -> int | None:
 
 class Flow:
     def __init__(self, storage: Storage, recognizer, receipts_dir: str, today=date.today,
-                 clock=time.time):
+                 clock=time.time, workers: int = BATCH_WORKERS):
         self.db = storage
         self.recognizer = recognizer
         self.receipts_dir = receipts_dir
         self.today = today
         self.clock = clock
+        self.workers = workers
 
     def _close_idle_statement(self, chat_id: int, state: dict) -> list[Reply]:
         """Забытый /done: если сверку давно не трогали, закрываем её, чтобы
@@ -243,6 +254,132 @@ class Flow:
             return repeat
         receipt = self._save_receipt(files[0][0], files[0][1])
         return self._recognize_payment(chat_id, files, caption, receipt, keys)
+
+    # --- пачка файлов ------------------------------------------------
+
+    def on_batch(self, chat_id: int, items: list[dict]) -> list[Reply]:
+        """Несколько файлов разом (альбом или подряд). items — dict(files, caption,
+        filename, file_ids), как аргументы on_files.
+
+        Распознавание — параллельно (до self.workers запросов к Claude сразу),
+        запись — последовательно, в порядке отправки. Итог — одна сводка,
+        вопросы — по одному и только там, где без ответа не записать.
+        """
+        if len(items) == 1:
+            return self.on_files(chat_id, **items[0])
+        state = self.db.get_state(chat_id)
+        closed = self._close_idle_statement(chat_id, state)
+        if "statement" in state:
+            return self._statement_batch(chat_id, state, items)
+
+        head: list[str] = []
+        repeats, statements_sent, jobs = 0, 0, []
+        seen_in_batch: set[str] = set()
+        for item in items:
+            keys = _file_keys(item["files"], item.get("file_ids"))
+            if any(mime not in ("image/jpeg", "image/png", "image/webp") for _, mime in item["files"]):
+                statements_sent += 1
+                continue
+            if (set(keys) & seen_in_batch or self._seen_payment(state, keys)):
+                repeats += 1
+                continue
+            seen_in_batch.update(keys)
+            data, mime = item["files"][0]
+            jobs.append((item, keys, self._save_receipt(data, mime)))
+
+        # В потоках — только запросы к Claude. База (одно соединение SQLite)
+        # трогается до и после, из этого потока.
+        cards = self.db.cards()
+        categories = [c["name"] for c in self.db.categories()]
+        today = self.today().isoformat()
+        results = self._run_parallel(
+            lambda job: self.recognizer.recognize_payment(
+                job[0]["files"], job[0].get("caption", ""), today=today, cards=cards,
+                categories=categories),
+            jobs)
+        failed, not_payment, queued = [], 0, 0
+        state = self.db.get_state(chat_id)
+        for (item, keys, receipt), result in zip(jobs, results):
+            if isinstance(result, RecognitionError):
+                self._discard_receipt({"receipt": receipt})
+                failed.append(str(result))
+                continue
+            draft = self._draft_from_info(result, receipt, keys)
+            if draft is None:
+                self._discard_receipt({"receipt": receipt})
+                not_payment += 1
+                continue
+            draft["quiet"] = True
+            self._enqueue(state, draft)
+            queued += 1
+        self.db.set_state(chat_id, state)
+
+        head.append(f"📥 Разобрал {len(items)} файлов.")
+        if repeats:
+            head.append(f"🔁 Повторы (уже записаны или в этой же пачке): {repeats}")
+        if not_payment:
+            head.append(f"🚫 Не похоже на оплату: {not_payment} — пришлите экран конкретной "
+                        "операции; итоги месяца и выписки — в /sverka")
+        if statements_sent:
+            head.append(f"📄 Документы (похоже на выписку): {statements_sent} — для сверки "
+                        "сначала /sverka")
+        if failed:
+            head.append(f"⚠️ Не распознано: {len(failed)} ({failed[0]}) — пришлите их ещё раз")
+        replies = closed + [Reply("\n".join(head))]
+        return replies + (self._advance(chat_id) if queued else [])
+
+    def _run_parallel(self, fn, jobs: list) -> list:
+        """fn для каждого задания в несколько потоков; результат или RecognitionError —
+        в том же порядке, что задания. Любая другая ошибка превращается в
+        RecognitionError, чтобы один сбойный файл не ронял всю пачку."""
+        def safe(job):
+            try:
+                return fn(job)
+            except RecognitionError as exc:
+                return exc
+            except Exception as exc:  # noqa: BLE001 — сбой одного файла не должен ронять пачку
+                log.exception("Ошибка распознавания файла из пачки")
+                return RecognitionError(f"внутренняя ошибка ({type(exc).__name__})")
+        if not jobs:
+            return []
+        with ThreadPoolExecutor(max_workers=max(1, min(self.workers, len(jobs)))) as pool:
+            return list(pool.map(safe, jobs))
+
+    def _statement_batch(self, chat_id: int, state: dict, items: list[dict]) -> list[Reply]:
+        """Пачка страниц выписки / скриншотов истории: разбор параллельно, итог один."""
+        st = state["statement"]
+        card = self.db.card(st["card_id"])
+        if not card:
+            return self._statement_input(chat_id, state, [], "", ())  # сбросит сверку
+        ref = f"s:{card.id}:{st['month'] or 'period'}"
+        jobs, already = [], 0
+        for item in items:
+            keys = _file_keys(item["files"], item.get("file_ids"))
+            if ref in self.db.seen_refs(keys, ref):
+                already += 1
+            else:
+                jobs.append((item, keys))
+        period = month_name(st["month"]) if st["month"] else "несколько месяцев"
+        cards = self.db.cards()
+        categories = [c["name"] for c in self.db.categories()]
+        parsed = self._run_parallel(
+            lambda job: self.recognizer.parse_statement(
+                job[0]["files"], job[0].get("caption", ""), period=period, cards=cards,
+                categories=categories),
+            jobs)
+        lines = [f"📥 Пачка выписки по карте {card.label}: {len(items)} файлов"]
+        if already:
+            lines.append(f"🔁 Уже загружены раньше: {already}")
+        for n, ((item, keys), data) in enumerate(zip(jobs, parsed), start=1):
+            state = self.db.get_state(chat_id)
+            [reply] = self._statement_input(chat_id, state, item["files"], item.get("caption", ""),
+                                            keys, parsed=data)
+            body = [ln for ln in reply.text.split("\n")
+                    if ln and not ln.startswith("Ещё части выписки")]
+            lines.append(f"• {n}: " + body[0])
+            lines += [f"    {ln}" for ln in body[1:]]
+        lines.append("Ещё части выписки — присылайте, всё — /done")
+        return [Reply("\n".join(lines))]
 
     def _seen_payment(self, state: dict, keys: list[str]) -> list[Reply] | None:
         """Этот же скриншот уже записан или ждёт в очереди — не распознаём заново."""
@@ -308,14 +445,22 @@ class Flow:
         except RecognitionError as exc:
             self._discard_receipt({"receipt": receipt})
             return [Reply(f"Не получилось распознать: {exc}.")]
-        if not info.get("is_payment"):
+        draft = self._draft_from_info(info, receipt, keys)
+        if draft is None:
             self._discard_receipt({"receipt": receipt})
-            return [Reply("Не вижу здесь одной оплаты или перевода. Пришлите скриншот "
-                          "конкретной операции (откройте её в истории банка) или чек, "
-                          "либо напишите сумму текстом.\n"
-                          "Если это экран истории с итогами месяца или выписка — "
-                          "их принимаю в сверке: /sverka")]
+            return [Reply(NOT_A_PAYMENT)]
+        state = self.db.get_state(chat_id)
+        self._enqueue(state, draft)
+        self.db.set_state(chat_id, state)
+        if len(state["drafts"]) > 1:
+            # Сначала доспрашиваем предыдущую операцию, эту — следом.
+            return [Reply(f"Принял, разберу после текущей (в очереди: {len(state['drafts']) - 1}).")]
+        return self._advance(chat_id)
 
+    def _draft_from_info(self, info: dict, receipt: str, keys) -> dict | None:
+        """Ответ Claude → операция для очереди; None — это не платёж."""
+        if not info.get("is_payment"):
+            return None
         currency = (info.get("currency") or "RUB").strip().upper().rstrip(".")
         amount = _amount_or_none(info.get("amount", ""))
         note = ""
@@ -348,13 +493,7 @@ class Flow:
         if rule:
             # Этому получателю вы уже назначали статью — не угадываем и не спрашиваем.
             draft.update(category_id=rule, category_confident=True, by_rule=True)
-        state = self.db.get_state(chat_id)
-        self._enqueue(state, draft)
-        self.db.set_state(chat_id, state)
-        if len(state["drafts"]) > 1:
-            # Сначала доспрашиваем предыдущую операцию, эту — следом.
-            return [Reply(f"Принял, разберу после текущей (в очереди: {len(state['drafts']) - 1}).")]
-        return self._advance(chat_id)
+        return draft
 
     @staticmethod
     def _guess_card(cards, last4: str, bank: str) -> int | None:
@@ -379,7 +518,11 @@ class Flow:
     def _advance(self, chat_id: int) -> list[Reply]:
         """Задать следующий нужный вопрос про первую операцию в очереди или сохранить её."""
         replies: list[Reply] = []
-        quiet: list[int] = []  # записи из выписки пачкой — одна сводка вместо карточек
+        # Операции пачки (скриншоты разом, строки выписки) — одна сводка вместо
+        # карточки на каждую.
+        quiet: list[int] = []
+        quiet_moves: list[int] = []
+        dropped: list[str] = []
         state = self.db.get_state(chat_id)
         while state.get("drafts"):
             d = state["drafts"][0]
@@ -388,12 +531,28 @@ class Flow:
                 self._discard_receipt(d)
                 self._pop_draft(state)
                 self.db.set_state(chat_id, state)
-                replies.append(question[1])
+                if d.get("quiet"):
+                    dropped.append(question[1].text.replace("\n", " — "))
+                else:
+                    replies.append(question[1])
+                continue
+            if question and d.get("quiet") and not d.get("deferred") and any(
+                    x.get("quiet") and not x.get("deferred") for x in state["drafts"][1:]):
+                # Пачка: сначала записываем всё, что понятно без вопросов, а
+                # вопросы — в конце. Каждая операция откладывается один раз.
+                d["deferred"] = True
+                state["drafts"].append(state["drafts"].pop(0))
+                state.pop("ask", None)
+                self.db.set_state(chat_id, state)
                 continue
             if question:
                 state["ask"] = question[0]
                 self.db.set_state(chat_id, state)
-                return replies + self._quiet_summary(quiet) + [self._tag_buttons(question[1], d["id"])]
+                left = len(state["drafts"])
+                ask = self._tag_buttons(question[1], d["id"])
+                if left > 1:
+                    ask.text = f"❓ Вопрос 1 из {left}\n" + ask.text
+                return (replies + self._quiet_summary(quiet, quiet_moves, dropped) + [ask])
             if d.get("own_transfer"):
                 transfer_id = self.db.add_transfer(
                     op_date=d["date"], amount=d["amount"], from_card_id=d["transfer"]["from"],
@@ -407,7 +566,10 @@ class Flow:
                 self.db.remember_files(d.get("file_keys", []), f"t:{transfer_id}")
                 self._pop_draft(state)
                 self.db.set_state(chat_id, state)
-                replies.append(self._transfer_reply(transfer_id))
+                if d.get("quiet"):
+                    quiet_moves.append(transfer_id)
+                else:
+                    replies.append(self._transfer_reply(transfer_id))
                 continue
             expense_id = self.db.add_expense(
                 op_date=d["date"], amount=d["amount"], card_id=d["card_id"], kind=d["kind"],
@@ -428,20 +590,43 @@ class Flow:
                 quiet.append(expense_id)
             else:
                 replies.append(self._saved_reply(expense_id))
-        return replies + self._quiet_summary(quiet)
+        return replies + self._quiet_summary(quiet, quiet_moves, dropped)
 
-    def _quiet_summary(self, ids: list[int]) -> list[Reply]:
-        if not ids:
+    def _quiet_summary(self, ids: list[int], moves: list[int] = (),
+                       dropped: list[str] = ()) -> list[Reply]:
+        """Сводка по пачке: итог, по статьям и каждая запись с номером для /fix."""
+        if not ids and not moves and not dropped:
             return []
         items = [self.db.expense(i) for i in ids]
         lines = []
-        by_cat: dict[str, int] = {}
-        for e in items:
-            by_cat[e.category or "Без статьи"] = by_cat.get(e.category or "Без статьи", 0) + e.amount
-        lines.append(f"✅ Записано как бизнес: {len(items)} на {rub(sum(e.amount for e in items))}")
-        lines += [f"  • {name}: {rub(total)}" for name, total in by_cat.items()]
-        lines.append("Поправить отдельную запись: /list месяц, затем /fix номер")
-        return [Reply("\n".join(lines))]
+        if items:
+            business = [e for e in items if e.purpose == BUSINESS]
+            total = rub(sum(e.amount for e in items))
+            lines.append(f"✅ Записано как бизнес: {len(items)} на {total}"
+                         if len(business) == len(items) else f"✅ Записано: {len(items)} на {total}")
+            by_cat: dict[str, int] = {}
+            for e in business:
+                by_cat[e.category or "Без статьи"] = by_cat.get(e.category or "Без статьи", 0) + e.amount
+            lines += [f"  • {name}: {rub(amount)}" for name, amount in by_cat.items()]
+            if len(items) <= QUIET_LIST_LIMIT:
+                lines.append("")
+                lines += [f"№{e.id} {expense_line(e)}" for e in items]
+            else:
+                lines.append(f"Каждая запись: /list (номера №{min(ids)}–№{max(ids)})")
+        if moves:
+            lines.append("")
+            lines.append(f"🔁 Переводы между своими счетами: {len(moves)}")
+            for t in (self.db.transfer(i) for i in moves):
+                lines.append(f"П{t.id} {date.fromisoformat(t.op_date).strftime('%d.%m')}  "
+                             f"{rub(t.amount)}  {t.route}")
+        if dropped:
+            lines.append("")
+            lines.append(f"↩️ Не записано: {len(dropped)}")
+            lines += [f"  • {text}" for text in dropped]
+        if items or moves:
+            lines.append("")
+            lines.append("Поправить запись: /fix номер (например /fix 12 или /fix П3)")
+        return [Reply("\n".join(lines).strip())]
 
     def _discard_receipt(self, d: dict):
         """Скриншот, из которого не получилось записи, не храним."""
@@ -669,7 +854,9 @@ class Flow:
         elif what == "cat":
             d["category_id"] = int(value)
             d["category_confident"] = True
-            d["learn_rule"] = not d.get("quiet")  # статья по скриншоту — запомнить для получателя
+            # Статья по скриншоту — запомнить для получателя; по строке выписки — нет
+            # (там «получатель» — описание операции банка).
+            d["learn_rule"] = not d.get("from_statement")
         elif what == "dup":
             d["dup_checked"] = True
         elif what == "tr":
@@ -1001,7 +1188,8 @@ class Flow:
             return [Reply("Старые данные выписки удалены, присылайте заново.")]
         return [Reply("Этот вопрос уже неактуален. /sverka — начать сверку.")]
 
-    def _statement_input(self, chat_id, state, files, text, keys=()):
+    def _statement_input(self, chat_id, state, files, text, keys=(), parsed=None):
+        """Часть выписки. parsed — уже готовый ответ Claude (из пачки) или ошибка."""
         st = state["statement"]
         card = self.db.card(st["card_id"])
         if not card:
@@ -1023,7 +1211,9 @@ class Flow:
                               f"{was.label if was else '(удалена)'} — проверьте, та ли карта выбрана.")
         period = month_name(st["month"]) if st["month"] else "несколько месяцев"
         try:
-            data = self.recognizer.parse_statement(
+            if isinstance(parsed, RecognitionError):
+                raise parsed
+            data = parsed if parsed is not None else self.recognizer.parse_statement(
                 files, text, period=period, cards=self.db.cards(),
                 categories=[c["name"] for c in self.db.categories()])
         except RecognitionError as exc:
@@ -1218,6 +1408,7 @@ class Flow:
                 "category_id": category_id, "category_confident": category_id is not None,
                 "merchant": row["description"], "description": "по выписке",
                 "receipt": "", "note": "", "dup_checked": False, "quiet": True,
+                "from_statement": True,
             })
             added += 1
         state["review"] = [i for i in state.get("review", []) if i not in ids]

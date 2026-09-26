@@ -114,11 +114,12 @@ def test_accept_asks_category_only_when_not_suggested(env):
     flow.on_files(CHAT, [PDF], "")
     flow.on_command(CHAT, "done")
     lines = db.statement(db.cards()[0].id, "2026-03")[1]
-    replies = flow.on_command(CHAT, "biz", " ".join(str(ln.id) for ln in lines))
-    assert "статья" in replies[-1].text.lower()  # первая без статьи — спрашиваем
-    replies = answer(flow, f"d:cat:{db.category_id('Подрядчики и зарплата')}")
-    [summary] = replies
-    assert summary.text.startswith("✅ Записано как бизнес: 2 на 300,00 ₽")
+    first, question = flow.on_command(CHAT, "biz", " ".join(str(ln.id) for ln in lines))
+    # Понятное (CDEK со статьёй) записывается сразу, вопрос — только по «ИП Иванов».
+    assert first.text.startswith("✅ Записано как бизнес: 1 на 200,00 ₽")
+    assert "статья" in question.text.lower() and "ИП Иванов" in question.text
+    [summary] = answer(flow, f"d:cat:{db.category_id('Подрядчики и зарплата')}")
+    assert summary.text.startswith("✅ Записано как бизнес: 1 на 100,00 ₽")
     assert "Подрядчики и зарплата: 100,00 ₽" in summary.text
 
 
