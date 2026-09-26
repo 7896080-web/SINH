@@ -499,3 +499,88 @@ def test_the_return_task_needs_no_account(tmp_path):
                        "WHERE order_id = 'RET-1'").fetchone()
     conn.close()
     assert row == (None, "ozon")
+
+
+# ---------------------------------------------------------------------------
+# Миграция c4a17e9b2f33 — утилизация через 1С
+# ---------------------------------------------------------------------------
+
+SCRAP_BEFORE = "bd8f521a8957"
+
+
+def test_the_status_column_fits_the_new_value(tmp_path):
+    """`awaiting_scrap` длиннее прежнего самого длинного статуса на два символа.
+
+    SQLite объявленную длину не проверяет и записал бы значение целиком — то
+    есть на бою всё работало бы и так, а схема молча разошлась бы с моделью.
+    Выстрелит это в день, когда базу переносят туда, где длина значит ровно то,
+    что написана: статус обрежется до «awaiting_scr», и вещь, ждущая списания,
+    перестанет читаться как ждущая чего-либо вовсе.
+    """
+    db = tmp_path / "alembic_scrap_test.db"
+    url = "sqlite:///" + str(db)
+    _alembic(url, "head")
+
+    conn = sqlite3.connect(str(db))
+    widths = {}
+    for table in ("return_items", "return_item_log"):
+        for col in conn.execute(f"PRAGMA table_info({table})"):
+            if col[1] in ("status", "from_status", "to_status"):
+                widths[f"{table}.{col[1]}"] = col[2]
+    conn.close()
+
+    assert widths, "колонок статуса не нашлось вовсе"
+    for name, decl in widths.items():
+        assert decl == "VARCHAR(14)", f"{name} объявлена как {decl}"
+
+
+def test_the_widening_survives_an_interruption_after_the_rebuild(tmp_path):
+    """Обрыв бывает и ПОСЛЕ перестройки таблицы, но до сдвига версии.
+
+    Тогда длина уже новая, шаг честно пропускается — и `_alembic_tmp_…`
+    остаётся в базе НАВСЕГДА, мешая следующей batch-правке этой же таблицы.
+    Поймано на живом прогоне: уборка остатка стояла ПОСЛЕ проверки «сделано ли
+    уже», и повтор её не выполнял.
+    """
+    db = tmp_path / "alembic_scrap_repeat.db"
+    url = "sqlite:///" + str(db)
+    _alembic(url, "head")
+
+    conn = sqlite3.connect(str(db))
+    conn.execute("UPDATE alembic_version SET version_num = ?", (SCRAP_BEFORE,))
+    conn.execute("CREATE TABLE _alembic_tmp_return_items (id INTEGER PRIMARY KEY)")
+    conn.execute("CREATE TABLE _alembic_tmp_return_item_log (id INTEGER PRIMARY KEY)")
+    conn.commit()
+    conn.close()
+
+    _alembic(url, "head")
+
+    conn = sqlite3.connect(str(db))
+    leftovers = [r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE name LIKE '_alembic_tmp_%'")]
+    conn.close()
+    assert leftovers == [], f"остатки batch-прогона в базе: {leftovers}"
+
+
+def test_an_old_scrapped_row_is_left_alone(tmp_path):
+    """Старые «утилизирован» в ожидание НЕ переводим: документов по ним в 1С нет
+    и не будет, и разбирать это надо руками, а не миграцией — иначе вещи,
+    выброшенные месяц назад, встали бы в очередь на списание."""
+    db = tmp_path / "alembic_scrap_keep.db"
+    url = "sqlite:///" + str(db)
+    _alembic(url, SCRAP_BEFORE)
+
+    conn = sqlite3.connect(str(db))
+    conn.execute("INSERT INTO return_items (created_at, barcode, platform, status, "
+                 "status_changed_at, is_test) VALUES "
+                 "('2026-09-01 10:00:00', '111', 'wb', 'scrapped', "
+                 "'2026-09-01 10:00:00', 0)")
+    conn.commit()
+    conn.close()
+
+    _alembic(url, "head")
+
+    conn = sqlite3.connect(str(db))
+    status = conn.execute("SELECT status FROM return_items").fetchone()[0]
+    conn.close()
+    assert status == "scrapped"

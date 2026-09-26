@@ -7,7 +7,8 @@ from app.timeutils import now_utc
 
 from sqlalchemy.orm import Session
 
-from app.returns import RETURN_COMMAND, apply_1c_result
+from app.returns import (RETURN_COMMAND, RETURN_COMMANDS, SCRAP_COMMAND,
+                         apply_1c_result)
 
 from app.models import (FtpTask, FtpTaskStatus, OrderProcessStatus, Platform,
                         ProcessedOrder, StockDateRow, StockDateSnapshot,
@@ -335,6 +336,19 @@ def build_task_batch(db: Session, max_lines: int = 500, request_stock_export: bo
     if request_barcode_export:
         lines.append("EXPORT_BARCODES")
 
+    # Причины утилизации — ОДНИМ запросом на пачку, а не по строке. Их в файле
+    # единицы, но правило общее: подзапрос на строку у нас уже стоил 134,9 с
+    # монопольной блокировки на боевом масштабе.
+    scrap_ids = [t.id for t in tasks if t.command == SCRAP_COMMAND]
+    scrap_reasons = {}
+    if scrap_ids:
+        from app.returns import SCRAP_OPERATION
+        from app.models import ReturnItem
+
+        for rid, reason in db.query(ReturnItem.ftp_task_id, ReturnItem.scrap_reason).filter(
+                ReturnItem.ftp_task_id.in_(scrap_ids)).all():
+            scrap_reasons[rid] = SCRAP_OPERATION.get(reason, "")
+
     sent_dates = set()
     for snapshot in date_requests:
         # Две заявки на одну дату дают ОДНУ строку: 1С назовёт файл по дате, и
@@ -369,13 +383,25 @@ def build_task_batch(db: Session, max_lines: int = 500, request_stock_export: bo
             ]))
         elif t.command == "CANCEL_MOVEMENT":
             lines.append("|".join(["CANCEL_MOVEMENT", t.order_id, platform_value]))
-        elif t.command == RETURN_COMMAND:
+        elif t.command in RETURN_COMMANDS:
             # Возврат: зеркало приёма заказа, «склад площадки → ЦС». Формат
             # строки тот же, что у создания, — 1С разбирает их одним циклом.
-            lines.append("|".join([
-                RETURN_COMMAND, t.barcode, t.warehouse_from or "", t.warehouse_to or "ЦС Склад",
-                str(t.quantity or 0), t.order_id, platform_value, mdate,
-            ]))
+            # У утилизации к тому же перемещению добавляется списание с ЦС, и
+            # делает их 1С ОДНОЙ транзакцией: между документами остаток ЦС
+            # вырос бы на единицу, и часовая выгрузка, попав в промежуток,
+            # увезла бы на площадки вещь, которая уже в мусоре.
+            row = [t.command, t.barcode, t.warehouse_from or "",
+                   t.warehouse_to or "ЦС Склад", str(t.quantity or 0),
+                   t.order_id, platform_value, mdate]
+            if t.command == SCRAP_COMMAND:
+                # Девятое поле — НАИМЕНОВАНИЕ ХОЗ. ОПЕРАЦИИ списания, а не текст
+                # причины: в 1С оно определяет проводки, и искать его там будут
+                # точным совпадением. Разделители в нём невозможны (значение
+                # наше, из `SCRAP_OPERATION`), но чистим на общих основаниях:
+                # значение с «|» разъехалось бы по полям и разобралось как
+                # другая строка.
+                row.append(scrap_reasons.get(t.id, "").replace("|", " ").strip())
+            lines.append("|".join(row))
 
         t.status = FtpTaskStatus.sent
         t.batch_filename = filename
@@ -850,10 +876,11 @@ def apply_result_batch(db: Session, content: str) -> dict:
         task.completed_at = now_utc()
         closed_ids.add(task.id)
 
-        # Возврат: статус вещи двигает ТОЛЬКО ответ 1С — ни одна кнопка на
-        # странице из «ждём 1С» не выводит. Здесь и есть единственный путь в
-        # «возвращён в продажу», то есть в растущий остаток.
-        if task.command == RETURN_COMMAND:
+        # Возврат и утилизация: статус вещи двигает ТОЛЬКО ответ 1С — ни одна
+        # кнопка на странице из ожидания не выводит. Здесь и есть единственный
+        # путь в оба терминальных статуса: «возвращён в продажу» (растущий
+        # остаток) и «утилизирован» (учёт сошёлся со складом).
+        if task.command in RETURN_COMMANDS:
             apply_1c_result(db, task, ok)
 
         if not ok:
@@ -1053,6 +1080,18 @@ def review_effect(task: FtpTask) -> dict:
                                   f"1С товар не вернула, и возвращать его нам тоже не за чем",
             "warning": "Применяйте, если возврата от площадки физически не было.",
             "oversell": True,
+        }
+    if task.command == SCRAP_COMMAND:
+        return {
+            "effect": f"вещь выброшена, но 1С об этом не знает: единица {qty} шт "
+                      f"числится на складе площадки и будет числиться там, пока "
+                      f"документы не проведены",
+            "no_document_effect": "остаток НЕ изменится: 1С ни возврата, ни "
+                                  "списания не провела. Вещь вернётся в разбор, и "
+                                  "решение придётся принять заново",
+            "warning": "Вещь физически выброшена, а по учёту так и останется на "
+                       "складе площадки — расхождение придётся закрывать в 1С руками.",
+            "oversell": False,
         }
     if task.command == RETURN_COMMAND:
         return {

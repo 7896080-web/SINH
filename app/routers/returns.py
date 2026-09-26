@@ -10,7 +10,7 @@
 время: забыть, под какой площадкой принимаешь, должно быть трудно.
 """
 
-from fastapi import APIRouter, Depends, Form, Request
+from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -21,8 +21,10 @@ from app.barcode128 import svg as barcode_svg
 from app.database import get_db
 from app.dependencies import get_current_user
 from app.flash import pop_flash, set_flash
-from app.models import (Platform, Product, ReturnItem, ReturnItemLog, ReturnStatus,
-                        ScrapReason)
+from app.excel_utils import (ExcelReadError, MAX_IMPORT_ROWS, build_xlsx_response,
+                             format_dt, read_upload, read_xlsx_rows)
+from app.models import (FtpTask, Platform, Product, ReturnItem, ReturnItemLog,
+                        ReturnStatus, ScrapReason)
 from app.templating import templates
 from app.timeutils import (local_date_of, local_day_start_utc, now_utc,
                            today_local)
@@ -61,7 +63,7 @@ def _base(request: Request, user, db: Session) -> dict:
     return {"request": request, "current_user": user, "active_page": "returns",
             "flash": pop_flash(request),
             "labels": R.RETURN_LABELS, "scrap_labels": R.SCRAP_LABELS,
-            "hints": R.RETURN_HINTS,
+            "hints": R.RETURN_HINTS, "scrap_operations": R.SCRAP_OPERATION,
             # Режим спрашивается на КАЖДОЙ странице раздела, а не только на
             # приёмке: полоса обязана висеть всюду, где человек что-то решает.
             # Увидь он её один раз на входе, через час он про неё не вспомнит.
@@ -277,6 +279,31 @@ def to_sale(request: Request, item_id: int, db: Session = Depends(get_db),
     return RedirectResponse(f"/returns/item/{item_id}", status_code=303)
 
 
+@router.post("/returns/item/{item_id}/scrap")
+def scrap(request: Request, item_id: int, scrap_reason: str = Form(""),
+          db: Session = Depends(get_db), user=Depends(get_current_user)):
+    """Решение «утилизировать» — теперь это ОТПРАВКА В 1С, а не отметка.
+
+    Вещь числится на складе площадки в 1С (туда её увезло перемещение при приёме
+    заказа), поэтому списать её — два документа: вернуть на ЦС и списать с него.
+    Поставь мы статус кнопкой, вещь была бы выброшена физически и вечно числилась
+    бы на складе площадки по учёту.
+    """
+    item = db.query(ReturnItem).filter(ReturnItem.id == item_id).first()
+    if item is None:
+        return RedirectResponse("/returns", status_code=303)
+    try:
+        reason = ScrapReason(scrap_reason) if scrap_reason else None
+        R.send_scrap_to_1c(db, item, reason)
+    except (ValueError, R.ReturnError) as e:
+        set_flash(request, str(e), "warn")
+        return RedirectResponse(f"/returns/item/{item_id}", status_code=303)
+    log_action(db, user.username, "return_scrapped",
+               f"{R.label_number(item)} {scrap_reason}")
+    db.commit()
+    return RedirectResponse(f"/returns/item/{item_id}", status_code=303)
+
+
 @router.post("/returns/item/{item_id}/recall")
 def recall(request: Request, item_id: int, db: Session = Depends(get_db),
            user=Depends(get_current_user)):
@@ -354,6 +381,234 @@ def listing(request: Request, status: str = "", platform: str = "", q: str = "",
                 "total": query.order_by(None).count(), "limit": LIST_LIMIT,
                 "now": now_utc()})
     return templates.TemplateResponse(request, "returns_list.html", ctx)
+
+
+# ------------------------------------------------------------------ утилизация
+
+# Что показывает страница утилизации. ОБА статуса, и это важно: «утилизирован»
+# ставит только ответ 1С, а решение принято раньше — вещь уже выброшена
+# физически. Покажи мы одни проведённые, список за сегодня был бы почти пуст и
+# человек решил бы, что утилизация не работает.
+SCRAP_VIEW = (ReturnStatus.awaiting_scrap, ReturnStatus.scrapped)
+
+SCRAP_EXPORT_HEADERS = ["Номер", "Статус", "Площадка", "Причина", "Баркод",
+                        "Артикул", "Размер", "Цвет", "Наименование",
+                        "Принят", "Решение принято", "Документ 1С"]
+
+
+def _scrap_query(db: Session, status: str, platform: str, reason: str, q: str):
+    """Отбор страницы. ОДИН на список, выгрузку и счётчик — разойдись они,
+    файл содержал бы не то, что человек видел на экране, и узнать об этом было
+    бы неоткуда."""
+    query = db.query(ReturnItem).filter(ReturnItem.status.in_(SCRAP_VIEW))
+    if status:
+        try:
+            query = query.filter(ReturnItem.status == ReturnStatus(status))
+        except ValueError:
+            pass
+    if platform:
+        try:
+            query = query.filter(ReturnItem.platform == Platform(platform))
+        except ValueError:
+            pass
+    if reason:
+        try:
+            query = query.filter(ReturnItem.scrap_reason == ScrapReason(reason))
+        except ValueError:
+            pass
+    if q.strip():
+        number = R.parse_label(q)
+        if number is not None:
+            query = query.filter(ReturnItem.id == number)
+        else:
+            like = f"%{q.strip()}%"
+            uids = [p.uid_1c for p in db.query(Product).filter(
+                Product.article.ilike(like)).all()]
+            query = query.filter((ReturnItem.barcode.ilike(like))
+                                 | (ReturnItem.uid_1c.in_(uids) if uids else False))
+    return query.order_by(ReturnItem.status_changed_at.desc())
+
+
+@router.get("/returns/scrapped", response_class=HTMLResponse)
+def scrapped_page(request: Request, status: str = "", platform: str = "",
+                  reason: str = "", q: str = "",
+                  db: Session = Depends(get_db), user=Depends(get_current_user)):
+    query = _scrap_query(db, status, platform, reason, q)
+    rows = query.limit(LIST_LIMIT).all()
+
+    # Сводка по причинам — ради неё страница и нужна. «Утилизировано 40» ничего
+    # не решает, «из них 12 подмена» — повод для претензии площадке.
+    by_reason = {}
+    for pl, rs, n in (db.query(ReturnItem.platform, ReturnItem.scrap_reason,
+                               func.count(ReturnItem.id))
+                      .filter(ReturnItem.status.in_(SCRAP_VIEW))
+                      .group_by(ReturnItem.platform, ReturnItem.scrap_reason).all()):
+        by_reason[(pl, rs)] = n
+
+    ctx = _base(request, user, db)
+    ctx.update({"rows": rows, "products": _products(db, rows),
+                "by_reason": by_reason, "reasons": list(ScrapReason),
+                "platforms": list(Platform), "statuses": SCRAP_VIEW,
+                "f_status": status, "f_platform": platform, "f_reason": reason,
+                "q": q, "total": query.order_by(None).count(), "limit": LIST_LIMIT,
+                "tasks": _scrap_tasks(db, rows)})
+    return templates.TemplateResponse(request, "returns_scrapped.html", ctx)
+
+
+def _scrap_tasks(db: Session, rows) -> dict:
+    """Номера документов 1С — ОДНИМ запросом на страницу, а не по строке."""
+    ids = [r.ftp_task_id for r in rows if r.ftp_task_id]
+    if not ids:
+        return {}
+    return {t.id: t for t in db.query(FtpTask).filter(FtpTask.id.in_(ids)).all()}
+
+
+@router.get("/returns/scrapped/export")
+def scrapped_export(request: Request, status: str = "", platform: str = "",
+                    reason: str = "", q: str = "",
+                    db: Session = Depends(get_db), user=Depends(get_current_user)):
+    """Выгрузка берёт ВЕСЬ отбор, а не показанную страницу.
+
+    Файл для того и выгружают, чтобы разобрать пачкой — претензию площадке за
+    подмену пишут по списку, а не по первым тремстам строкам. Отдай он страницу
+    и промолчи об этом, претензия ушла бы неполной, и узнать об этом было бы
+    неоткуда.
+    """
+    rows = _scrap_query(db, status, platform, reason, q).all()
+    products = _products(db, rows)
+    tasks = _scrap_tasks(db, rows)
+
+    out = []
+    for item in rows:
+        product = products.get(item.uid_1c)
+        task = tasks.get(item.ftp_task_id)
+        out.append([
+            R.label_number(item), R.RETURN_LABELS[item.status],
+            PLATFORM_LABELS.get(item.platform, ""),
+            R.SCRAP_LABELS.get(item.scrap_reason, ""),
+            item.barcode,
+            product.article if product else "", product.size if product else "",
+            product.color if product else "", product.name if product else "",
+            format_dt(item.created_at), format_dt(item.status_changed_at),
+            (task.result_detail or "") if task and task.result_status == "OK" else "",
+        ])
+    return build_xlsx_response(SCRAP_EXPORT_HEADERS, out,
+                               f"Утилизация_{today_local():%Y-%m-%d}.xlsx")
+
+
+# Колонки файла утилизации. Номер опознаёт ВЕЩЬ, и только он: баркод опознаёт
+# SKU, а три одинаковых свитшота дают три записи с одним баркодом — по нему
+# нельзя понять, какую из них выбросили.
+IMPORT_NUMBER = "Номер"
+IMPORT_REASON = "Причина"
+
+SCRAP_TEMPLATE_HEADERS = [IMPORT_NUMBER, IMPORT_REASON, "Баркод (справочно)",
+                          "Артикул (справочно)", "Размер (справочно)",
+                          "Статус (справочно)"]
+
+
+@router.get("/returns/scrapped/template")
+def scrap_template(request: Request, platform: str = "", q: str = "",
+                   db: Session = Depends(get_db), user=Depends(get_current_user)):
+    """Заготовка для массовой утилизации: вещи, ПО КОТОРЫМ РЕШЕНИЕ ЕЩЁ НЕ
+    ПРИНЯТО, с пустой колонкой причины и выпадающим списком в ней.
+
+    Заготовку выгружаем именно отсюда, а не заставляем человека собирать файл
+    руками: номер RET он иначе перепишет с наклейки с опечаткой, а строка с
+    неверным номером — это либо отказ, либо, хуже, утилизация чужой вещи.
+    """
+    query = db.query(ReturnItem).filter(
+        ReturnItem.status.in_((ReturnStatus.accepted, ReturnStatus.cleaning,
+                               ReturnStatus.repack, ReturnStatus.held,
+                               ReturnStatus.rejected_1c)))
+    if platform:
+        try:
+            query = query.filter(ReturnItem.platform == Platform(platform))
+        except ValueError:
+            pass
+    if q.strip():
+        like = f"%{q.strip()}%"
+        query = query.filter(ReturnItem.barcode.ilike(like))
+    rows = query.order_by(ReturnItem.created_at.desc()).limit(MAX_IMPORT_ROWS).all()
+    products = _products(db, rows)
+
+    out = []
+    for item in rows:
+        product = products.get(item.uid_1c)
+        out.append([R.label_number(item), "", item.barcode,
+                    product.article if product else "",
+                    product.size if product else "",
+                    R.RETURN_LABELS[item.status]])
+    # Причина — ВЫПАДАЮЩИМ списком, а не набором руками: разбор идёт по точному
+    # совпадению, и «Брак.» с точкой стал бы ошибкой строки, а «брак» в чужой
+    # раскладке — ошибкой, которую человек не увидит глазами.
+    choices = {IMPORT_REASON: [R.SCRAP_LABELS[r] for r in ScrapReason]}
+    return build_xlsx_response(SCRAP_TEMPLATE_HEADERS, out,
+                               f"Утилизация_заготовка_{today_local():%Y-%m-%d}.xlsx",
+                               choices=choices)
+
+
+@router.post("/returns/scrapped/import")
+def scrap_import(request: Request, file: UploadFile = File(...),
+                 db: Session = Depends(get_db), user=Depends(get_current_user)):
+    """Массовая утилизация файлом — ТЕМ ЖЕ путём, что и кнопка в строке.
+
+    Каждая строка идёт через `send_scrap_to_1c`, то есть через все проверки:
+    статус, причину, наличие товара 1С. Массовый путь, делающий не то же самое,
+    что построчный, — отдельный класс дефектов этого проекта, и стоил он уже
+    дорого: там оверселл случался сразу по всему отбору.
+
+    Пустая ячейка причины НИЧЕГО НЕ МЕНЯЕТ. Заготовка выгружает её пустой у
+    КАЖДОЙ строки, то есть файл почти целиком состоит из пустых причин, и
+    понимай мы пустоту как «утилизировать без причины» — один залитый файл
+    отправил бы в 1С весь список.
+    """
+    by_reason = {R.SCRAP_LABELS[r].lower(): r for r in ScrapReason}
+    try:
+        raw = read_upload(file.file)
+        rows = read_xlsx_rows(raw)
+    except ExcelReadError as e:
+        set_flash(request, str(e), "warn")
+        return RedirectResponse("/returns/scrapped", status_code=303)
+
+    sent, skipped, errors = 0, 0, []
+    for line, row in enumerate(rows, start=2):
+        number = R.parse_label(str(row.get(IMPORT_NUMBER) or ""))
+        reason_cell = str(row.get(IMPORT_REASON) or "").strip()
+        if number is None:
+            if reason_cell:
+                errors.append(f"строка {line}: номер не похож на RET-…")
+            continue
+        if not reason_cell:
+            skipped += 1                       # пустая причина — не трогаем
+            continue
+        reason = by_reason.get(reason_cell.lower())
+        if reason is None:
+            errors.append(f"строка {line}: причина «{reason_cell}» не из списка")
+            continue
+        item = db.query(ReturnItem).filter(ReturnItem.id == number).first()
+        if item is None:
+            errors.append(f"строка {line}: {number} — такого возврата нет")
+            continue
+        try:
+            R.send_scrap_to_1c(db, item, reason)
+            sent += 1
+        except R.ReturnError as e:
+            errors.append(f"строка {line}: {R.label_number(item)} — {e}")
+
+    log_action(db, user.username, "returns_scrap_import",
+               f"отправлено {sent}, пропущено {skipped}, ошибок {len(errors)}")
+    db.commit()
+
+    # Итоги В НАЧАЛЕ: сообщение режется по `MAX_FLASH_CHARS` с конца, и потерять
+    # примеры ошибок неприятно, а потерять итоги — значит оставить человека в
+    # уверенности, что файл применился целиком.
+    message = (f"Отправлено на утилизацию: {sent}. "
+               f"Строк без причины пропущено: {skipped}.")
+    if errors:
+        message += f" Ошибок: {len(errors)}. " + "; ".join(errors[:5])
+    set_flash(request, message, "warn" if errors else "good")
+    return RedirectResponse("/returns/scrapped", status_code=303)
 
 
 # ------------------------------------------------------------------ наклейка

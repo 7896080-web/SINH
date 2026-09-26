@@ -10,7 +10,7 @@ from datetime import timedelta
 import pytest
 
 from app.models import (Barcode, FtpTask, FtpTaskStatus, Platform, Product,
-                        ReturnItem, ReturnStatus)
+                        ReturnItem, ReturnStatus, ScrapReason)
 from app import returns as R
 from app.timeutils import now_utc
 
@@ -482,3 +482,291 @@ def test_a_refusal_in_this_section_actually_reaches_the_screen(logged_in_client,
     page = logged_in_client.post(f"/returns/item/{item.id}/recall").text
 
     assert "Отменять нечего" in page
+
+
+def test_scrapping_from_the_page_sends_two_documents_to_1c(logged_in_client,
+                                                           web_db, goods):
+    """Кнопка «Утилизировать» больше не ставит статус, а отправляет в 1С: вещь
+    числится на складе площадки, и просто выбросить её физически мало."""
+    from app.models import FtpTask, ScrapReason
+
+    _scan(logged_in_client, "2000000000017")
+    item = web_db.query(ReturnItem).one()
+
+    logged_in_client.post(f"/returns/item/{item.id}/scrap",
+                          data={"scrap_reason": "defect"})
+
+    task = web_db.query(FtpTask).one()
+    assert task.command == R.SCRAP_COMMAND
+    web_db.refresh(item)
+    assert item.status is ReturnStatus.awaiting_scrap
+    assert item.scrap_reason is ScrapReason.defect
+
+
+def test_the_page_refuses_to_scrap_without_a_reason(logged_in_client, web_db, goods):
+    """«Утилизировано 40» — число без смысла. Отказ обязан сказать это словами:
+    молчаливая кнопка читается как сломанная."""
+    from app.models import FtpTask
+
+    _scan(logged_in_client, "2000000000017")
+    item = web_db.query(ReturnItem).one()
+
+    page = logged_in_client.post(f"/returns/item/{item.id}/scrap",
+                                 data={"scrap_reason": ""}).text
+
+    assert web_db.query(FtpTask).count() == 0
+    assert "У утилизации обязательна причина" in page
+    web_db.refresh(item)
+    assert item.status is ReturnStatus.accepted
+
+
+def test_the_waiting_scrap_page_does_not_offer_to_undo_by_hand(logged_in_client,
+                                                               web_db, goods):
+    """Из ожидания руками не выйти, и страница обязана сказать это словами, а
+    не просто убрать кнопки: пустой экран читается как сбой."""
+    _scan(logged_in_client, "2000000000017")
+    item = web_db.query(ReturnItem).one()
+    logged_in_client.post(f"/returns/item/{item.id}/scrap",
+                          data={"scrap_reason": "worn"})
+
+    page = logged_in_client.get(f"/returns/item/{item.id}").text
+
+    assert R.RETURN_HINTS[ReturnStatus.awaiting_scrap][1] in page
+    assert "Два документа" in page, "страница не объясняет, что уходит в 1С"
+
+
+def test_the_two_waitings_are_named_apart_in_the_list(logged_in_client):
+    """Одна подпись на два ожидания не говорит человеку, чего именно ждут, —
+    а последствия у них разные: одна вещь вернётся в продажу, другая списана."""
+    page = logged_in_client.get("/returns/list").text
+
+    assert R.RETURN_LABELS[ReturnStatus.awaiting_1c] in page
+    assert R.RETURN_LABELS[ReturnStatus.awaiting_scrap] in page
+    assert (R.RETURN_LABELS[ReturnStatus.awaiting_1c]
+            != R.RETURN_LABELS[ReturnStatus.awaiting_scrap])
+
+
+# --------------------------------------------------------------- утилизация
+
+import io
+from openpyxl import Workbook, load_workbook
+
+
+def _xlsx(headers, rows):
+    wb = Workbook()
+    ws = wb.active
+    ws.append(headers)
+    for r in rows:
+        ws.append(r)
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def _scrap_it(client, web_db, reason="defect"):
+    item = web_db.query(ReturnItem).order_by(ReturnItem.id.desc()).first()
+    client.post(f"/returns/item/{item.id}/scrap", data={"scrap_reason": reason})
+    return item
+
+
+def test_the_scrap_page_shows_both_the_waiting_and_the_done(logged_in_client,
+                                                            web_db, goods):
+    """Покажи мы одни проведённые — список за сегодня был бы почти пуст, и
+    человек решил бы, что утилизация не работает: «утилизирован» ставит только
+    ответ 1С, а решение принято раньше и вещь уже выброшена."""
+    _scan(logged_in_client, "2000000000017")
+    item = _scrap_it(logged_in_client, web_db)
+
+    page = logged_in_client.get("/returns/scrapped").text
+
+    assert R.label_number(item) in page
+    assert R.RETURN_LABELS[ReturnStatus.awaiting_scrap] in page
+
+
+def test_the_export_takes_the_whole_selection_and_not_the_page(logged_in_client,
+                                                               web_db, goods):
+    """Файл для того и выгружают, чтобы разобрать пачкой: по нему пишут
+    претензию площадке за подмену. Отдай он показанную страницу и промолчи об
+    этом — претензия ушла бы неполной, и узнать об этом было бы неоткуда."""
+    from app.routers import returns as page
+
+    for _ in range(4):
+        web_db.add(ReturnItem(barcode="2000000000017", uid_1c="uid-1",
+                              platform=Platform.wb, status=ReturnStatus.scrapped,
+                              scrap_reason=ScrapReason.swapped,
+                              status_changed_at=now_utc()))
+    web_db.commit()
+
+    page.LIST_LIMIT = 2
+    try:
+        html = logged_in_client.get("/returns/scrapped").text
+        data = logged_in_client.get("/returns/scrapped/export").content
+    finally:
+        page.LIST_LIMIT = 300
+
+    assert "Показаны первые 2 из 4" in html, "страница молчит об обрезке"
+    rows = list(load_workbook(io.BytesIO(data)).active.iter_rows(values_only=True))
+    assert len(rows) - 1 == 4, f"в файле {len(rows) - 1} строк вместо 4"
+
+
+def test_the_export_honours_the_filter(logged_in_client, web_db, goods):
+    """Файл обязан содержать ровно то, что человек видел на экране: разойдись
+    они, он этого не заметит."""
+    web_db.add(ReturnItem(barcode="111", platform=Platform.wb,
+                          status=ReturnStatus.scrapped,
+                          scrap_reason=ScrapReason.defect,
+                          status_changed_at=now_utc()))
+    web_db.add(ReturnItem(barcode="222", platform=Platform.ozon,
+                          status=ReturnStatus.scrapped,
+                          scrap_reason=ScrapReason.swapped,
+                          status_changed_at=now_utc()))
+    web_db.commit()
+
+    data = logged_in_client.get("/returns/scrapped/export?reason=swapped").content
+    rows = list(load_workbook(io.BytesIO(data)).active.iter_rows(values_only=True))
+
+    assert len(rows) - 1 == 1
+    assert R.SCRAP_LABELS[ScrapReason.swapped] in rows[1]
+
+
+def test_the_template_offers_the_reason_as_a_list(logged_in_client, web_db, goods):
+    """Причина выпадающим списком, а не набором руками: разбор идёт по точному
+    совпадению, и «Брак.» с точкой стала бы ошибкой строки, а «брак» в чужой
+    раскладке — ошибкой, которую человек не увидит глазами."""
+    _scan(logged_in_client, "2000000000017")
+
+    data = logged_in_client.get("/returns/scrapped/template").content
+    ws = load_workbook(io.BytesIO(data)).active
+
+    assert [c.value for c in ws[1]][:2] == ["Номер", "Причина"]
+    assert ws.data_validations.dataValidation, "в заготовке нет проверки значений"
+
+
+def test_the_template_offers_only_undecided_things(logged_in_client, web_db, goods):
+    """Уже утилизированную вещь в заготовку класть незачем: строка по ней
+    получила бы отказ, а отказы вытесняют из сообщения настоящие ошибки."""
+    _scan(logged_in_client, "2000000000017")
+    done = _scrap_it(logged_in_client, web_db)
+    _scan(logged_in_client, "2000000000017", confirm_second="1")
+
+    ws = load_workbook(io.BytesIO(
+        logged_in_client.get("/returns/scrapped/template").content)).active
+    numbers = {row[0] for row in ws.iter_rows(min_row=2, values_only=True)}
+
+    assert R.label_number(done) not in numbers
+
+
+def test_the_import_sends_each_filled_row_to_1c(logged_in_client, web_db, goods):
+    from app.models import FtpTask
+
+    _scan(logged_in_client, "2000000000017")
+    _scan(logged_in_client, "2000000000017", confirm_second="1")
+    items = web_db.query(ReturnItem).order_by(ReturnItem.id).all()
+
+    data = _xlsx(["Номер", "Причина"],
+                 [[R.label_number(i), R.SCRAP_LABELS[ScrapReason.worn]] for i in items])
+    logged_in_client.post("/returns/scrapped/import",
+                          files={"file": ("f.xlsx", data)})
+
+    assert web_db.query(FtpTask).filter(
+        FtpTask.command == R.SCRAP_COMMAND).count() == 2
+    for item in items:
+        web_db.refresh(item)
+        assert item.status is ReturnStatus.awaiting_scrap
+        assert item.scrap_reason is ScrapReason.worn
+
+
+def test_an_empty_reason_changes_nothing(logged_in_client, web_db, goods):
+    """ГЛАВНОЕ про этот импорт. Заготовка выгружает причину ПУСТОЙ у каждой
+    строки, то есть файл почти целиком состоит из пустых причин. Понимай мы
+    пустоту как «утилизировать» — один залитый файл отправил бы в 1С весь
+    список, по всем площадкам сразу."""
+    from app.models import FtpTask
+
+    _scan(logged_in_client, "2000000000017")
+    item = web_db.query(ReturnItem).one()
+
+    data = _xlsx(["Номер", "Причина"], [[R.label_number(item), ""]])
+    page = logged_in_client.post("/returns/scrapped/import",
+                                 files={"file": ("f.xlsx", data)}).text
+
+    assert web_db.query(FtpTask).count() == 0
+    web_db.refresh(item)
+    assert item.status is ReturnStatus.accepted
+    assert "пропущено: 1" in page
+
+
+def test_the_import_goes_through_the_same_checks_as_the_button(logged_in_client,
+                                                               web_db):
+    """Массовый путь обязан делать то же, что построчный. Отдельный класс
+    дефектов этого проекта, и стоил он дорого: там оверселл случался сразу по
+    всему отбору."""
+    from app.models import FtpTask
+
+    _scan(logged_in_client, "9999999999999")          # баркод 1С не знает
+    item = web_db.query(ReturnItem).one()
+
+    data = _xlsx(["Номер", "Причина"],
+                 [[R.label_number(item), R.SCRAP_LABELS[ScrapReason.defect]]])
+    page = logged_in_client.post("/returns/scrapped/import",
+                                 files={"file": ("f.xlsx", data)}).text
+
+    assert web_db.query(FtpTask).count() == 0
+    assert "мэппинг" in page, "отказ не доехал до человека"
+
+
+def test_an_unknown_reason_is_an_error_and_not_a_guess(logged_in_client, web_db,
+                                                       goods):
+    """Угадай мы «брак!» как «Брак» — однажды угадали бы неверно, и вещь ушла
+    бы в 1С с чужой причиной. Претензию площадке пишут по этому полю."""
+    from app.models import FtpTask
+
+    _scan(logged_in_client, "2000000000017")
+    item = web_db.query(ReturnItem).one()
+
+    data = _xlsx(["Номер", "Причина"], [[R.label_number(item), "испортился"]])
+    page = logged_in_client.post("/returns/scrapped/import",
+                                 files={"file": ("f.xlsx", data)}).text
+
+    assert web_db.query(FtpTask).count() == 0
+    assert "не из списка" in page
+
+
+def test_a_wrong_number_does_not_scrap_someone_elses_thing(logged_in_client,
+                                                           web_db, goods):
+    """Опечатка в номере — это либо отказ строки, либо утилизация ЧУЖОЙ вещи.
+    Второе недопустимо, поэтому номера, которого нет, достаточно для отказа."""
+    from app.models import FtpTask
+
+    _scan(logged_in_client, "2000000000017")
+
+    data = _xlsx(["Номер", "Причина"],
+                 [["RET-999999", R.SCRAP_LABELS[ScrapReason.defect]]])
+    page = logged_in_client.post("/returns/scrapped/import",
+                                 files={"file": ("f.xlsx", data)}).text
+
+    assert web_db.query(FtpTask).count() == 0
+    assert "такого возврата нет" in page
+
+
+def test_the_scrap_page_is_open_to_the_warehouse(warehouse_client_for_returns):
+    """Разбирает брак кладовщик. Закрой мы страницу — он звал бы администратора
+    ради каждой коробки."""
+    assert warehouse_client_for_returns.get("/returns/scrapped").status_code == 200
+
+
+def test_the_page_names_the_business_operation_that_will_be_used(logged_in_client,
+                                                                 web_db, goods):
+    """Страница показывала «Утилизация Брака» при любой причине — то есть
+    утверждала неправду про подмену и неликвид. Операция решает проводки, и
+    человек обязан видеть ту, что реально уедет."""
+    _scan(logged_in_client, "2000000000017")
+    item = web_db.query(ReturnItem).one()
+    logged_in_client.post(f"/returns/item/{item.id}/scrap",
+                          data={"scrap_reason": "swapped"})
+
+    page = logged_in_client.get(f"/returns/item/{item.id}").text
+
+    assert R.SCRAP_OPERATION[ScrapReason.swapped] in page
+    assert R.SCRAP_OPERATION[ScrapReason.defect] not in page, \
+        "страница называет чужую хоз. операцию"

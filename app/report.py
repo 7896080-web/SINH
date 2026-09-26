@@ -587,11 +587,12 @@ def _check_tasks_needing_review(db: Session) -> Finding | None:
     rows = tasks_needing_review(db)
     if not rows:
         return None
-    from app.returns import RETURN_COMMAND
+    from app.returns import RETURN_COMMAND, SCRAP_COMMAND
 
     cancels = [t for t in rows if t.command == "CANCEL_MOVEMENT"]
     returns_ = [t for t in rows if t.command == RETURN_COMMAND]
-    creates = len(rows) - len(cancels) - len(returns_)
+    scraps = [t for t in rows if t.command == SCRAP_COMMAND]
+    creates = len(rows) - len(cancels) - len(returns_) - len(scraps)
     parts = []
     if creates:
         parts.append(f"созданий: {creates} — пока решение не принято, эти единицы "
@@ -606,6 +607,15 @@ def _check_tasks_needing_review(db: Session) -> Finding | None:
         # ещё не вырос, и сам не вырастет никогда.
         parts.append(f"возвратов: {len(returns_)} — вещи приняты на складе, но 1С их "
                      f"не оприходовала: остаток не вырос, и продавать их нечем")
+    if scraps:
+        # Четвёртый, и он единственный про РАСХОЖДЕНИЕ, а не про недопродажу:
+        # вещь физически выброшена, а в 1С числится на складе площадки, потому
+        # что туда её увезло перемещение при приёме заказа. Само это не
+        # рассосётся ни сверкой, ни выгрузкой — склад площадки наш остаток не
+        # описывает вовсе.
+        parts.append(f"утилизаций: {len(scraps)} — вещи выброшены, но по учёту "
+                     f"числятся на складе площадки: 1С ни возврата, ни списания "
+                     f"не провела, и само это не сойдётся")
     consequence = "; ".join(parts).capitalize() + "."
     return Finding(
         key="tasks_needing_review", level=CRITICAL,

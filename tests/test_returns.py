@@ -123,19 +123,48 @@ def test_the_transition_table_is_the_only_truth(db):
         returns.change_status(db, item, ReturnStatus.accepted)
 
 
-def test_scrapping_demands_a_reason(db):
+def test_scrapping_demands_a_reason(db, product):
     """«Утилизировано 40» — число без смысла. «Из них 12 подмена» — повод для
-    претензии площадке."""
-    item = returns.accept(db, "111", Platform.wb)
+    претензии площадке, штука на маркетплейсах обычная и дорогая."""
+    item = returns.accept(db, "2000000000017", Platform.wb)
     db.commit()
 
     with pytest.raises(returns.ReturnError):
-        returns.change_status(db, item, ReturnStatus.scrapped)
+        returns.send_scrap_to_1c(db, item, scrap_reason=None)
+    assert item.status is ReturnStatus.accepted
 
-    returns.change_status(db, item, ReturnStatus.scrapped,
-                          scrap_reason=ScrapReason.swapped)
+    returns.send_scrap_to_1c(db, item, scrap_reason=ScrapReason.swapped)
     db.commit()
     assert item.scrap_reason is ScrapReason.swapped
+
+
+def test_the_reason_is_kept_even_if_1c_refuses(db, product):
+    """Причину ставим ПРИ ОТПРАВКЕ, а не в терминальном статусе: жди мы до
+    него, отказ 1С вернул бы вещь в разбор без причины — человек выбирал её,
+    а она исчезла."""
+    item = returns.accept(db, "2000000000017", Platform.wb)
+    db.commit()
+    task = returns.send_scrap_to_1c(db, item, scrap_reason=ScrapReason.defect)
+    db.commit()
+
+    returns.apply_1c_result(db, task, ok=False)
+    db.commit()
+
+    assert item.status is ReturnStatus.rejected_1c
+    assert item.scrap_reason is ScrapReason.defect
+
+
+def test_scrapping_by_hand_is_refused(db, product):
+    """Утилизация перестала быть тем, что ставит кнопка. Поставь её мы сами —
+    статус утверждал бы, что учёт сошёлся, когда 1С об этом ещё не знает: вещь
+    числится на складе площадки, и висеть там будет вечно."""
+    item = returns.accept(db, "2000000000017", Platform.wb)
+    db.commit()
+
+    with pytest.raises(returns.ReturnError):
+        returns.change_status(db, item, ReturnStatus.scrapped,
+                              scrap_reason=ScrapReason.defect)
+    assert item.status is ReturnStatus.accepted
 
 
 @pytest.mark.parametrize("status", RETURN_BY_1C)
@@ -427,8 +456,9 @@ def test_retention_removes_finished_returns_with_their_history(db, product):
 
     old = returns.accept(db, "2000000000017", Platform.wb)
     db.commit()
-    returns.change_status(db, old, ReturnStatus.scrapped,
-                          scrap_reason=ScrapReason.defect)
+    task = returns.send_scrap_to_1c(db, old, scrap_reason=ScrapReason.defect)
+    db.commit()
+    returns.apply_1c_result(db, task, ok=True)
     db.commit()
     old.status_changed_at = _now() - retention.RETURN_KEEP * 2
     db.commit()
@@ -660,3 +690,141 @@ def test_clearing_an_empty_installation_is_harmless(db, product):
 
     assert returns.clear_test_data(db) == 0
     assert db.query(ReturnItem).count() == 1
+
+
+# --------------------------------------------------------------- утилизация
+
+def test_a_scrap_task_goes_from_the_platform_warehouse(db, product):
+    """Списывать вещь надо С ЦС, а числится она на складе площадки — значит
+    сначала вернуть. Задание несёт оба склада, 1С делает из них два документа."""
+    from app.workers.scheduler import PENDING_WAREHOUSE_NAME
+
+    item = returns.accept(db, "2000000000017", Platform.kit)
+    db.commit()
+    task = returns.send_scrap_to_1c(db, item, ScrapReason.defect)
+    db.commit()
+
+    assert task.command == returns.SCRAP_COMMAND
+    assert task.warehouse_from == PENDING_WAREHOUSE_NAME[Platform.kit]
+    assert task.warehouse_to == returns.TARGET_WAREHOUSE
+    assert item.status is ReturnStatus.awaiting_scrap
+
+
+def test_a_scrap_task_is_not_counted_as_in_flight_either(db, product):
+    """Ноль, и по своей причине: два документа гасят друг друга на ЦС (+1 и −1),
+    а уходит единица со склада ПЛОЩАДКИ, которого наш остаток не описывает.
+
+    Считай сверка утилизацию как `CREATE_MOVEMENT`, остаток оказался бы занижен;
+    как `CANCEL_MOVEMENT` — завышен, а это прямой оверселл по вещи, которой
+    физически уже нет.
+    """
+    item = returns.accept(db, "2000000000017", Platform.wb)
+    db.commit()
+    returns.send_scrap_to_1c(db, item, ScrapReason.worn)
+    db.commit()
+
+    assert _in_flight_adjustment(db, "uid-1") == 0
+
+
+def test_only_the_1c_answer_marks_a_thing_scrapped(db, product):
+    item = returns.accept(db, "2000000000017", Platform.wb)
+    db.commit()
+    task = returns.send_scrap_to_1c(db, item, ScrapReason.illiquid)
+    db.commit()
+    assert item.status is ReturnStatus.awaiting_scrap
+
+    returns.apply_1c_result(db, task, ok=True)
+    db.commit()
+
+    assert item.status is ReturnStatus.scrapped
+
+
+def test_the_answer_lands_by_the_command_and_not_by_the_waiting(db, product):
+    """ГЛАВНОЕ про два ожидания. Ответ по УТИЛИЗАЦИИ, поставивший «возвращён в
+    продажу», объявил бы выброшенную вещь снова продающейся: она уехала бы на
+    площадки, и купил бы её живой человек.
+    """
+    scrapped = returns.accept(db, "2000000000017", Platform.wb)
+    sold = returns.accept(db, "2000000000017", Platform.wb)
+    db.commit()
+    scrap_task = returns.send_scrap_to_1c(db, scrapped, ScrapReason.defect)
+    sale_task = returns.send_to_1c(db, sold)
+    db.commit()
+
+    returns.apply_1c_result(db, scrap_task, ok=True)
+    returns.apply_1c_result(db, sale_task, ok=True)
+    db.commit()
+
+    assert scrapped.status is ReturnStatus.scrapped
+    assert sold.status is ReturnStatus.back_to_sale
+
+
+def test_a_scrap_can_be_recalled_before_it_leaves(db, product):
+    """Отзыв обязан работать для ОБОИХ ожиданий: спроси он только про возврат,
+    утилизацию нельзя было бы отменить даже за секунду до отправки файла."""
+    item = returns.accept(db, "2000000000017", Platform.wb)
+    db.commit()
+    task = returns.send_scrap_to_1c(db, item, ScrapReason.defect)
+    db.commit()
+
+    returns.recall_before_send(db, item)
+    db.commit()
+
+    assert item.status is ReturnStatus.accepted
+    assert db.query(FtpTask).filter(FtpTask.id == task.id).first() is None
+
+
+def test_every_reason_has_its_own_business_operation():
+    """Причина определяет ХОЗ. ОПЕРАЦИЮ списания, а та — проводки. Все четыре
+    заведены в 1С («Утилизация Брака», «Износ», «Нелеквид», «Подмены»).
+
+    Заведи кто-нибудь пятую причину, забыв про 1С, — задание уехало бы с пустой
+    хоз. операцией. Обработка на это отвечает отказом, то есть вещь встала бы в
+    ручной разбор, и хорошо; но узнать об этом лучше здесь.
+    """
+    assert set(returns.SCRAP_OPERATION) == set(ScrapReason)
+    for reason, operation in returns.SCRAP_OPERATION.items():
+        assert operation.startswith("Утилизация "), \
+            f"у {reason.value} хоз. операция не похожа на утилизацию: {operation!r}"
+    # Разные причины — разные операции: слейся две, претензия площадке за
+    # подмену считалась бы вместе с обычным браком.
+    assert len(set(returns.SCRAP_OPERATION.values())) == len(ScrapReason)
+
+
+def test_the_scrap_line_carries_the_business_operation_to_1c(db, product):
+    """В 1С уезжает НАИМЕНОВАНИЕ хоз. операции, а не подпись причины: искать его
+    там будут точным совпадением. Проверяем по САМОМУ файлу, который уедет."""
+    from app.workers.ftp_channel import build_task_batch
+
+    item = returns.accept(db, "2000000000017", Platform.wb)
+    db.commit()
+    returns.send_scrap_to_1c(db, item, ScrapReason.swapped)
+    db.commit()
+
+    name, body = build_task_batch(db)
+    line = [ln for ln in body.splitlines() if ln.startswith(returns.SCRAP_COMMAND)][0]
+    fields = line.split("|")
+
+    assert fields[5] == returns.label_number(item)
+    assert fields[-1] == returns.SCRAP_OPERATION[ScrapReason.swapped]
+    assert fields[-1] == "Утилизация Подмены", "имя разошлось со справочником 1С"
+
+
+def test_a_scrap_without_a_1c_product_is_refused(db):
+    """Без товара 1С не провести ни возврат, ни списание: оба документа
+    опознают строку по баркоду, а этого баркода она не знает."""
+    item = returns.accept(db, "9999999999999", Platform.wb)
+    db.commit()
+
+    with pytest.raises(returns.ReturnError):
+        returns.send_scrap_to_1c(db, item, ScrapReason.defect)
+    assert item.status is ReturnStatus.accepted
+
+
+def test_both_waitings_are_in_work_and_neither_is_terminal():
+    """Утилизация ждёт ответа так же, как возврат. Попади `awaiting_scrap` в
+    терминальные, чистка удалила бы вещь, по которой 1С ещё не ответила."""
+    for status in (ReturnStatus.awaiting_1c, ReturnStatus.awaiting_scrap):
+        assert status in returns.IN_WORK
+        assert status not in returns.TERMINAL
+        assert RETURN_TRANSITIONS[status] == (), "из ожидания руками не выйти"

@@ -50,11 +50,22 @@
     </div>
 </div>
 
-{% if item.status.value == 'awaiting_1c' %}
+{% if item.status.value in ('awaiting_1c', 'awaiting_scrap') %}
 <div class="card" style="border-color:var(--accent)">
     <h2 style="margin-top:0;font-size:17px">Задание в 1С</h2>
+    {% if item.status.value == 'awaiting_scrap' %}
+    <p>Два документа ОДНОЙ транзакцией: возврат
+       <strong>{{ item.task.warehouse_from if item.task else '' }} → {{ item.task.warehouse_to if item.task else '' }}</strong>
+       и списание с ЦС{% if item.scrap_reason %}, хоз. операция «{{ scrap_operations[item.scrap_reason] }}»{% endif %}.
+       Вещь числится на складе площадки — туда её увезло перемещение при приёме
+       заказа, — поэтому выбросить её физически мало. Порознь документы слать
+       нельзя: между ними остаток ЦС вырос бы на единицу, и выгрузка, попав в
+       промежуток, увезла бы на площадки вещь, которой уже нет. Руками этот
+       статус не меняется.</p>
+    {% else %}
     <p>Перемещение <strong>{{ item.task.warehouse_from if item.task else '' }} → {{ item.task.warehouse_to if item.task else '' }}</strong>.
        Вещь войдёт в остаток, когда 1С ответит, — и только тогда. Руками этот статус не меняется.</p>
+    {% endif %}
     <form method="post" action="/returns/item/{{ item.id }}/recall">
         <button type="submit" class="btn btn--danger">Отменить отправку</button>
         <span style="margin-left:10px;font-size:13px;color:var(--ink-soft)">
@@ -90,7 +101,11 @@
 {% set moves = [('cleaning','В химчистку'), ('repack','На переупаковку'), ('held','Отложить')] %}
 {% if can[ReturnStatus.cleaning] or can[ReturnStatus.repack] or can[ReturnStatus.held] %}
 <div class="card">
-    <div style="font-size:13px;color:var(--ink-soft);margin-bottom:9px">НУЖНА ОБРАБОТКА</div>
+    <div style="font-size:13px;color:var(--ink-soft);margin-bottom:4px">НУЖНА ОБРАБОТКА</div>
+    <div style="font-size:13px;color:var(--ink-soft);margin-bottom:9px">
+        Решение ещё не принято: вещь просто меняет место. Вернуть обратно можно
+        в любой момент, в остаток и в 1С ничего не уходит.
+    </div>
     <div style="display:flex;gap:12px;flex-wrap:wrap">
         {% for value, caption in moves %}
         <form method="post" action="/returns/item/{{ item.id }}/status" style="flex-grow:1">
@@ -102,9 +117,16 @@
 </div>
 {% endif %}
 
-{% if can[ReturnStatus.awaiting_1c] or can[ReturnStatus.scrapped] %}
+{% if can[ReturnStatus.awaiting_1c] or can[ReturnStatus.awaiting_scrap] %}
 <div class="card">
-    <div style="font-size:13px;color:var(--ink-soft);margin-bottom:9px">РЕШЕНИЕ — ТОЛЬКО ПОШТУЧНО</div>
+    <div style="font-size:13px;color:var(--ink-soft);margin-bottom:4px">РЕШЕНИЕ — ТОЛЬКО ПОШТУЧНО</div>
+    <div style="font-size:13px;color:var(--ink-soft);margin-bottom:9px">
+        Отсюда назад ходу нет, и оба решения идут В 1С. «Вернуть в продажу» —
+        оприходование на ЦС, вещь снова поедет на площадки. «Утилизировать» —
+        ДВА документа: вещь числится на складе площадки в 1С, и выбросить её
+        физически мало, иначе единица висит там вечно. Массовой кнопки тут нет
+        намеренно: каждую вещь смотрят руками.
+    </div>
     <div style="display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap">
         {% if can[ReturnStatus.awaiting_1c] %}
         <form method="post" action="/returns/item/{{ item.id }}/to-sale" style="flex-grow:1;flex-basis:280px">
@@ -114,16 +136,15 @@
             </button>
         </form>
         {% endif %}
-        {% if can[ReturnStatus.scrapped] %}
-        <form method="post" action="/returns/item/{{ item.id }}/status" style="flex-grow:1;flex-basis:280px">
-            <input type="hidden" name="to" value="scrapped">
+        {% if can[ReturnStatus.awaiting_scrap] %}
+        <form method="post" action="/returns/item/{{ item.id }}/scrap" style="flex-grow:1;flex-basis:280px">
             <label for="why" style="display:block;font-size:13px;color:var(--ink-soft);margin-bottom:4px">Причина утилизации — обязательна</label>
             <select id="why" name="scrap_reason" required style="width:100%;padding:8px;margin-bottom:8px">
                 <option value="">— выберите —</option>
                 {% for r in scrap_reasons %}<option value="{{ r.value }}">{{ scrap_labels[r] }}</option>{% endfor %}
             </select>
             <button type="submit" class="btn btn--danger" style="width:100%;padding:16px 0;font-size:17px;font-weight:600"
-                    data-confirm="Утилизировать {{ label_number(item) }}? Вещь физически выбрасывается, отменить будет нечем.">
+                    data-confirm="Утилизировать {{ label_number(item) }}?&#10;&#10;В 1С уйдут ДВА документа: возврат со склада площадки на ЦС и списание с ЦС.&#10;&#10;Вещь физически выбрасывается, отменить потом можно будет только сторно в самой 1С.">
                 Утилизировать
             </button>
         </form>

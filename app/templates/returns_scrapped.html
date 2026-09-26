@@ -1,0 +1,183 @@
+{% extends "base.html" %}
+{% block title %}Возвраты — утилизация{% endblock %}
+{% block content %}
+
+{% include "returns_tabs.html" %}
+
+<details class="card" style="margin-bottom:14px">
+    <summary style="cursor:pointer;font-weight:600">Что делать на этой странице</summary>
+    <p style="margin:10px 0 0;line-height:1.7">
+        Здесь то, что решено выбросить. Две строки статуса различаются
+        последствием, а не словом: <strong>«Ждём 1С: утилизация»</strong> — решение
+        принято, вещь можно выбрасывать, но по учёту она ещё числится на складе
+        площадки; <strong>«Утилизирован»</strong> — 1С провела оба документа
+        (вернула вещь со склада площадки на ЦС и списала оттуда), и учёт сошёлся
+        со складом.
+    </p>
+    <p style="margin:10px 0 0;line-height:1.7">
+        <strong>Выгрузка в Excel</strong> берёт весь текущий отбор, а не
+        показанные строки: по этому файлу пишут претензию площадке за подмену, и
+        неполный список сделал бы претензию неполной.
+    </p>
+    <p style="margin:10px 0 0;line-height:1.7">
+        <strong>Утилизировать пачкой</strong> — когда из коробки в брак идёт не
+        одна вещь, а десяток. Порядок: скачать заготовку, проставить в ней
+        причины, залить обратно. Номер RET в заготовке уже подставлен — переписывать
+        его с наклейки руками не надо и не нужно: опечатка в номере означает либо
+        отказ строки, либо, что хуже, утилизацию чужой вещи.
+        <strong>Пустая причина ничего не меняет</strong> — строка просто
+        пропускается, так что заливать можно и файл, заполненный наполовину.
+    </p>
+</details>
+
+{# Сводка по причинам — ради неё страница и нужна. «Утилизировано 40» ничего не
+   решает, «из них 12 подмена» — повод для претензии площадке. #}
+<div class="card" style="padding:0;overflow:hidden">
+    <div style="padding:10px 16px;border-bottom:1px solid var(--line-soft);font-size:13px;color:var(--ink-soft)">
+        ПРИЧИНЫ — любая клетка открывает отбор
+    </div>
+    <div class="table-scroll">
+    <table>
+        <thead><tr>
+            <th>Площадка</th>
+            {% for r in reasons %}<th style="text-align:right">{{ scrap_labels[r] }}</th>{% endfor %}
+            <th style="text-align:right">Всего</th>
+        </tr></thead>
+        <tbody>
+        {% for p in platforms %}
+        <tr>
+            <td><span class="badge" style="background:{{ platform_colors[p] }};color:#fff">{{ platform_labels[p] }}</span></td>
+            {% set ns = namespace(row=0) %}
+            {% for r in reasons %}
+                {% set n = by_reason.get((p, r), 0) %}
+                {% set ns.row = ns.row + n %}
+                <td style="text-align:right">{% if n %}<a href="/returns/scrapped?platform={{ p.value }}&reason={{ r.value }}">{{ n }}</a>{% else %}0{% endif %}</td>
+            {% endfor %}
+            <td style="text-align:right"><strong>{{ ns.row }}</strong></td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    </div>
+</div>
+
+<form method="get" action="/returns/scrapped" class="card" style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
+    <div>
+        <label for="q">Поиск</label><br>
+        <input id="q" name="q" value="{{ q }}" placeholder="артикул, баркод или RET-номер" style="width:240px">
+    </div>
+    <div>
+        <label for="f_status">Статус</label><br>
+        <select id="f_status" name="status">
+            <option value="">— любой —</option>
+            {% for s in statuses %}
+            <option value="{{ s.value }}" {% if f_status == s.value %}selected{% endif %}>{{ labels[s] }}</option>
+            {% endfor %}
+        </select>
+    </div>
+    <div>
+        <label for="f_platform">Площадка</label><br>
+        <select id="f_platform" name="platform">
+            <option value="">— любая —</option>
+            {% for p in platforms %}
+            <option value="{{ p.value }}" {% if f_platform == p.value %}selected{% endif %}>{{ platform_labels[p] }}</option>
+            {% endfor %}
+        </select>
+    </div>
+    <div>
+        <label for="f_reason">Причина</label><br>
+        <select id="f_reason" name="reason">
+            <option value="">— любая —</option>
+            {% for r in reasons %}
+            <option value="{{ r.value }}" {% if f_reason == r.value %}selected{% endif %}>{{ scrap_labels[r] }}</option>
+            {% endfor %}
+        </select>
+    </div>
+    <div>
+        <button type="submit" class="btn btn-primary">Показать</button>
+        <a class="btn" href="/returns/scrapped">Сбросить</a>
+    </div>
+    <div style="flex-grow:1"></div>
+    {# Выгрузка несёт ТЕ ЖЕ параметры отбора: файл обязан содержать ровно то,
+       что человек видит на экране, иначе он этого не заметит. #}
+    <div>
+        <a class="btn" href="/returns/scrapped/export?status={{ f_status }}&platform={{ f_platform }}&reason={{ f_reason }}&q={{ q|urlencode }}">
+            Выгрузить в Excel
+        </a>
+    </div>
+</form>
+
+<div class="card">
+    <div style="font-size:13px;color:var(--ink-soft);margin-bottom:9px">УТИЛИЗИРОВАТЬ ПАЧКОЙ</div>
+    <div style="display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap">
+        <div>
+            <a class="btn" href="/returns/scrapped/template?platform={{ f_platform }}">
+                1. Скачать заготовку
+            </a>
+            <div style="font-size:13px;color:var(--ink-soft);margin-top:4px">
+                Вещи, по которым решение ещё не принято
+            </div>
+        </div>
+        <form method="post" action="/returns/scrapped/import" enctype="multipart/form-data"
+              style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap">
+            <div>
+                <label for="file">2. Залить заполненный файл</label><br>
+                <input id="file" type="file" name="file" accept=".xlsx" required>
+            </div>
+            {# Подтверждение обязательно и называет, ЧТО произойдёт: по каждой
+               заполненной строке в 1С уедут два документа, и отменить их потом
+               можно будет только сторно в самой 1С. #}
+            <button type="submit" class="btn btn--danger"
+                    data-confirm="Отправить на утилизацию всё, у чего в файле проставлена причина?&#10;&#10;По каждой такой строке в 1С уйдут ДВА документа: возврат со склада площадки на ЦС и списание с ЦС.&#10;&#10;Отменить потом можно будет только сторно в самой 1С.&#10;&#10;Продолжить?">
+                Отправить на утилизацию
+            </button>
+        </form>
+    </div>
+</div>
+
+<div class="card" style="padding:0;overflow:hidden">
+    <div class="table-scroll">
+    <table>
+        <thead><tr>
+            <th>Номер</th><th>Товар</th><th>Площадка</th><th>Причина</th>
+            <th>Статус</th><th>Решение</th><th>Документ 1С</th>
+        </tr></thead>
+        <tbody>
+        {% for item in rows %}
+        {% set p = products.get(item.uid_1c) %}
+        {% set task = tasks.get(item.ftp_task_id) %}
+        <tr>
+            <td style="white-space:nowrap">
+                <a href="/returns/item/{{ item.id }}"
+                   style="font-family:ui-monospace,Menlo,Consolas,monospace;font-weight:600">{{ label_number(item) }}</a>
+            </td>
+            <td>
+                {% if p %}{{ p.article }} · {{ p.size or '' }} · {{ p.color or '' }}
+                    <span style="color:var(--ink-soft)">— {{ p.name or '' }}</span>
+                {% else %}<span style="color:var(--warn)">баркод {{ item.barcode }} не опознан</span>{% endif %}
+            </td>
+            <td><span class="badge" style="background:{{ platform_colors[item.platform] }};color:#fff">{{ platform_labels[item.platform] }}</span>
+                {% if item.is_test %}<span class="badge" style="background:#8a4b00;color:#fff">ТРЕНИРОВКА</span>{% endif %}</td>
+            <td>{{ scrap_labels.get(item.scrap_reason, '') }}</td>
+            <td>{{ labels[item.status] }}</td>
+            <td style="white-space:nowrap">{{ item.status_changed_at.strftime('%d.%m %H:%M') }}</td>
+            <td>{% if task and task.result_status == 'OK' %}{{ task.result_detail or '' }}{% endif %}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="7" style="padding:16px;color:var(--ink-soft)">Пока пусто.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    </div>
+    {# Счётчик берёт ВЕСЬ отбор, а не длину показанного: «300» при любом числе
+       строк — дефект, который в этом проекте уже случался, и человек не узнавал,
+       что список обрезан. #}
+    {% if total > rows|length %}
+    <div style="padding:10px 16px;border-top:1px solid var(--line-soft);font-size:13px;color:var(--ink-soft)">
+        Показаны первые {{ rows|length }} из {{ total }} — уточните отбор.
+        Выгрузка в Excel берёт все {{ total }}.
+    </div>
+    {% endif %}
+</div>
+
+{% endblock %}
