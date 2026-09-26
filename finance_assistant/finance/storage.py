@@ -31,7 +31,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS cards (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
-    last4 TEXT NOT NULL DEFAULT '',
+    last4 TEXT NOT NULL DEFAULT '',  -- последние 4 цифры карт и счетов через пробел
     bank TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS categories (
@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS statement_lines (
     id INTEGER PRIMARY KEY,
     statement_id INTEGER NOT NULL REFERENCES statements(id) ON DELETE CASCADE,
     op_date TEXT NOT NULL,
+    op_time TEXT NOT NULL DEFAULT '',
     amount INTEGER NOT NULL CHECK (amount > 0),
     direction TEXT NOT NULL CHECK (direction IN ('in', 'out')),
     description TEXT NOT NULL DEFAULT '',
@@ -87,8 +88,14 @@ class Card:
     bank: str
 
     @property
+    def numbers(self) -> list[str]:
+        """У одной «карты» бывает несколько номеров: сама карта и её счёт
+        (ВТБ: «Карта для жизни •8445» и «Мастер-счет •2928» — одни деньги)."""
+        return self.last4.split()
+
+    @property
     def label(self) -> str:
-        return f"{self.name} ·{self.last4}" if self.last4 else self.name
+        return f"{self.name} ·{self.numbers[0]}" if self.numbers else self.name
 
 
 @dataclass
@@ -115,6 +122,7 @@ class StatementLine:
     description: str
     own_transfer: bool
     suggested_category: str = ""
+    op_time: str = ""
 
 
 class Storage:
@@ -137,7 +145,8 @@ class Storage:
 
     def _add_missing_columns(self):
         """Базы, созданные прошлыми версиями, дополняем новыми колонками."""
-        added = {("statement_lines", "suggested_category"): "TEXT NOT NULL DEFAULT ''"}
+        added = {("statement_lines", "suggested_category"): "TEXT NOT NULL DEFAULT ''",
+                 ("statement_lines", "op_time"): "TEXT NOT NULL DEFAULT ''"}
         for (table, column), ddl in added.items():
             have = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
             if column not in have:
@@ -152,6 +161,13 @@ class Storage:
                 "INSERT INTO cards (name, last4, bank) VALUES (?, ?, ?)", (name, last4, bank)
             )
         return self.card(cur.lastrowid)
+
+    def add_card_number(self, card_id: int, number: str):
+        card = self.card(card_id)
+        if card and number not in card.numbers:
+            with self.conn:
+                self.conn.execute("UPDATE cards SET last4 = ? WHERE id = ?",
+                                  (" ".join(card.numbers + [number]), card_id))
 
     def cards(self) -> list[Card]:
         return [Card(**dict(r)) for r in self.conn.execute("SELECT * FROM cards ORDER BY id")]
@@ -266,22 +282,23 @@ class Storage:
         """
         groups: dict[tuple, list[dict]] = {}
         for ln in lines:
-            key = (ln["op_date"], ln["amount"], ln["direction"], ln.get("description", ""))
+            key = (ln["op_date"], ln.get("op_time", ""), ln["amount"], ln["direction"],
+                   ln.get("description", ""))
             groups.setdefault(key, []).append(ln)
         added = 0
         with self.conn:
-            for (op_date, amount, direction, description), group in groups.items():
+            for (op_date, op_time, amount, direction, description), group in groups.items():
                 have = self.conn.execute(
                     "SELECT COUNT(*) FROM statement_lines WHERE statement_id = ? AND op_date = ?"
-                    " AND amount = ? AND direction = ? AND description = ?",
-                    (statement_id, op_date, amount, direction, description),
+                    " AND op_time = ? AND amount = ? AND direction = ? AND description = ?",
+                    (statement_id, op_date, op_time, amount, direction, description),
                 ).fetchone()[0]
                 for ln in group[have:]:
                     self.conn.execute(
-                        "INSERT INTO statement_lines (statement_id, op_date, amount,"
+                        "INSERT INTO statement_lines (statement_id, op_date, op_time, amount,"
                         " direction, description, own_transfer, suggested_category)"
-                        " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        (statement_id, op_date, amount, direction, description,
+                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (statement_id, op_date, op_time, amount, direction, description,
                          int(ln.get("own_transfer", False)), ln.get("suggested_category", "")),
                     )
                     added += 1
@@ -304,9 +321,9 @@ class Storage:
             return None
         lines = [
             StatementLine(r["id"], r["op_date"], r["amount"], r["direction"], r["description"],
-                          bool(r["own_transfer"]), r["suggested_category"])
+                          bool(r["own_transfer"]), r["suggested_category"], r["op_time"])
             for r in self.conn.execute(
-                "SELECT * FROM statement_lines WHERE statement_id = ? ORDER BY op_date, id",
+                "SELECT * FROM statement_lines WHERE statement_id = ? ORDER BY op_date, op_time, id",
                 (head["id"],),
             )
         ]

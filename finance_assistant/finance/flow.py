@@ -99,6 +99,13 @@ def _parse_period_arg(arg: str, today: date) -> tuple[str, str] | None:
     return (month, month) if month else None
 
 
+def _hhmm(text: str) -> str:
+    try:
+        return datetime.strptime((text or "").strip()[:5], "%H:%M").strftime("%H:%M")
+    except ValueError:
+        return ""
+
+
 def _parse_date(text: str, today: date) -> str | None:
     text = text.strip().lower()
     if text == "сегодня":
@@ -115,6 +122,38 @@ def _parse_date(text: str, today: date) -> str | None:
         return (d if d <= today else d.replace(year=today.year - 1)).isoformat()
     except ValueError:
         return None
+
+
+def _last4(text: str) -> str:
+    digits = "".join(ch for ch in text or "" if ch.isdigit())
+    return digits[-4:] if len(digits) >= 4 else ""
+
+
+# Как банк могут назвать на скриншоте, в выписке или в /addcard.
+BANK_ALIASES = {
+    "сбер": ("сбер", "sber"),
+    "тбанк": ("тбанк", "тинькофф", "tbank", "tinkoff"),
+    "втб": ("втб", "vtb"),
+    "россия": ("россия", "abr", "абр"),
+    "альфа": ("альфа", "alfa"),
+    "озон": ("озон", "ozon"),
+    "яндекс": ("яндекс", "yandex"),
+    "газпром": ("газпром", "gazprom"),
+    "райффайзен": ("райф", "raif"),
+    "открытие": ("открытие",),
+    "псб": ("псб", "промсвязь"),
+    "почта": ("почта",),
+    "совкомбанк": ("совком", "халва"),
+    "мтс": ("мтс",),
+}
+
+
+def _bank_key(name: str) -> str:
+    text = "".join(ch for ch in (name or "").lower() if ch.isalnum())
+    for key, aliases in BANK_ALIASES.items():
+        if any(a in text for a in aliases):
+            return key
+    return text
 
 
 def _amount_or_none(text: str) -> int | None:
@@ -202,8 +241,11 @@ class Flow:
         except RecognitionError as exc:
             return [Reply(f"Не получилось распознать: {exc}.")]
         if not info.get("is_payment"):
-            return [Reply("Не вижу здесь оплаты или перевода. Пришлите скриншот операции "
-                          "из банка или чек, либо напишите сумму текстом.")]
+            return [Reply("Не вижу здесь одной оплаты или перевода. Пришлите скриншот "
+                          "конкретной операции (откройте её в истории банка) или чек, "
+                          "либо напишите сумму текстом.\n"
+                          "Если это экран истории с итогами месяца или выписка — "
+                          "их принимаю в сверке: /sverka")]
 
         currency = (info.get("currency") or "RUB").upper()
         amount = _amount_or_none(info.get("amount", ""))
@@ -237,16 +279,18 @@ class Flow:
 
     @staticmethod
     def _guess_card(cards, last4: str, bank: str) -> int | None:
-        last4 = "".join(ch for ch in last4 if ch.isdigit())[-4:]
+        last4 = _last4(last4)
         if last4:
-            hits = [c for c in cards if c.last4 == last4]
+            hits = [c for c in cards if last4 in c.numbers]
             if len(hits) == 1:
                 return hits[0].id
-        if bank:
-            b = bank.lower().replace("-", "").replace(" ", "")
-            hits = [c for c in cards if c.bank and (
-                c.bank.lower().replace("-", "").replace(" ", "") in b
-                or b in c.bank.lower().replace("-", "").replace(" ", ""))]
+            if not hits and any(c.numbers for c in cards):
+                # Номер виден, но незнаком: по банку не угадываем — у человека
+                # может быть две карты одного банка. Спросим и запомним номер.
+                return None
+        key = _bank_key(bank)
+        if key:
+            hits = [c for c in cards if _bank_key(c.bank or c.name) == key]
             if len(hits) == 1:
                 return hits[0].id
         if len(cards) == 1:
@@ -411,6 +455,10 @@ class Flow:
             d["date"] = (self.today() - timedelta(days=int(value))).isoformat()
         elif what == "card":
             d["card_id"] = int(value)
+            note = self._learn_number(d)
+            if note:
+                self.db.set_state(chat_id, state)
+                return [Reply(note)] + self._advance(chat_id)
         elif what == "purpose":
             d["purpose"] = value
             d["purpose_asked"] = True
@@ -422,6 +470,16 @@ class Flow:
         # "retry" — просто переспросить (например, после /addcard)
         self.db.set_state(chat_id, state)
         return self._advance(chat_id)
+
+    def _learn_number(self, d: dict) -> str | None:
+        """Карту выбрали кнопкой, а на скриншоте был незнакомый номер (часто это
+        номер счёта, а не карты) — запоминаем, чтобы в следующий раз не спрашивать."""
+        number = _last4(d.get("card_hint", ["", ""])[0])
+        if not number or any(number in c.numbers for c in self.db.cards()):
+            return None
+        self.db.add_card_number(d["card_id"], number)
+        card = self.db.card(d["card_id"])
+        return f"Запомнил: …{number} — это карта «{card.name}». В следующий раз не спрошу."
 
     def _saved_reply(self, expense_id: int) -> Reply:
         e = self.db.expense(expense_id)
@@ -470,20 +528,27 @@ class Flow:
         if not cards:
             return [Reply("Карт пока нет. Добавьте: /addcard Название 1234 Банк\n"
                           "Например: /addcard Сбер 1234 Сбер")]
-        lines = [f"{c.id}. {c.label}" + (f" ({c.bank})" if c.bank else "") for c in cards]
+        lines = [f"{c.id}. {c.name}" + (f" · {', '.join(c.numbers)}" if c.numbers else "")
+                 + (f" ({c.bank})" if c.bank else "") for c in cards]
         return [Reply("Ваши карты:\n" + "\n".join(lines))]
 
     def _add_card(self, chat_id, arg):
         words = arg.split()
         if not words:
-            return [Reply("Формат: /addcard Название 1234 Банк — например /addcard Сбер 1234 Сбер")]
-        last4 = next((w for w in words if w.isdigit() and len(w) == 4), "")
-        rest = [w for w in words if w != last4]
-        name = rest[0] if rest else f"Карта {last4}"
+            return [Reply("Формат: /addcard Название 1234 Банк — например /addcard ВТБ 8445 2928 ВТБ\n"
+                          "Номеров можно несколько: карта и счёт (последние 4 цифры).")]
+        numbers = [_last4(w) for w in words if w.isdigit() and len(w) >= 4]
+        rest = [w for w in words if not (w.isdigit() and len(w) >= 4)]
+        name = rest[0] if rest else f"Карта {numbers[0]}"
         bank = " ".join(rest[1:]) or name
-        if any(c.name == name for c in self.db.cards()):
-            return [Reply(f"Карта «{name}» уже есть.")]
-        card = self.db.add_card(name, last4, bank)
+        existing = next((c for c in self.db.cards() if c.name == name), None)
+        if existing:
+            if not numbers:
+                return [Reply(f"Карта «{name}» уже есть.")]
+            for n in numbers:
+                self.db.add_card_number(existing.id, n)
+            return [Reply(f"Добавил номера к карте «{name}»: {', '.join(numbers)}.")]
+        card = self.db.add_card(name, " ".join(dict.fromkeys(numbers)), bank)
         return [Reply(f"Добавил карту {card.label}.")]
 
     def _del_card(self, chat_id, arg):
@@ -603,8 +668,8 @@ class Flow:
             return [Reply("Это не похоже на выписку. Пришлите выписку по карте "
                           f"{card.label} или /done, чтобы закончить.")]
         warn = ""
-        last4 = "".join(ch for ch in data.get("card_last4", "") if ch.isdigit())[-4:]
-        if last4 and card.last4 and last4 != card.last4:
+        last4 = _last4(data.get("card_last4", ""))
+        if last4 and card.numbers and last4 not in card.numbers:
             warn = f"\n⚠️ В документе карта …{last4}, а сверяем {card.label}. Проверьте."
 
         by_month: dict[str, list[dict]] = {}
@@ -619,7 +684,7 @@ class Flow:
                 skipped += 1  # операции соседнего месяца в выписку этого месяца не берём
                 continue
             by_month.setdefault(op_date[:7], []).append({
-                "op_date": op_date, "amount": amount, "direction": op["direction"],
+                "op_date": op_date, "op_time": _hhmm(op.get("time", "")), "amount": amount, "direction": op["direction"],
                 "description": op.get("description", "").strip(),
                 "own_transfer": op.get("own_transfer", False),
                 "suggested_category": op.get("business_category", "")
