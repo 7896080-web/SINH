@@ -13,9 +13,9 @@ from telegram.constants import ChatAction, ChatType
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes,
                           MessageHandler, filters)
 
-from .flow import Flow, Reply
+from .flow import Reply
 from .recognize import ClaudeRecognizer, DEFAULT_MODEL
-from .storage import Storage
+from .users import UserSpaces, parse_user_ids
 
 log = logging.getLogger(__name__)
 
@@ -73,8 +73,13 @@ async def send(update: Update, replies: list[Reply]):
             await chat.send_document(InputFile(io.BytesIO(data), filename=name))
 
 
-def build_app(token: str, flow: Flow, allowed: set[int]) -> Application:
+def build_app(token: str, flow_for, allowed: set[int]) -> Application:
+    """flow_for(user_id) → Flow этого пользователя (у каждого своя база).
+
+    Можно передать и один Flow (в тестах) — тогда он общий.
+    """
     app = Application.builder().token(token).build()
+    resolve = flow_for if callable(flow_for) else (lambda user_id: flow_for)
 
     async def guard(update: Update) -> bool:
         chat = update.effective_chat
@@ -103,13 +108,22 @@ def build_app(token: str, flow: Flow, allowed: set[int]) -> Application:
 
     # Все обращения к Flow — строго по одному: у него одно соединение SQLite
     # и состояние чата, которое читается и пишется целиком.
-    lock = asyncio.Lock()
+    # Своя очередь у каждого пользователя: у него своя база, а разбор пачки
+    # у одного не должен задерживать другого.
+    locks: dict[int, asyncio.Lock] = {}
     # Файлы, которые ещё собираются в пачку: chat_id → {items, update, timer}.
     pending: dict[int, dict] = {}
 
-    async def run(update: Update, fn, *args, note: str | None = None):
+    async def run(update: Update, method: str, *args, note: str | None = None):
+        """Вызвать метод Flow того, кто прислал сообщение или нажал кнопку.
+
+        Данные выбираются только по Telegram id отправителя — чужие недоступны
+        даже через кнопку из пересланного сообщения.
+        """
         chat = update.effective_chat
-        async with lock:
+        user_id = update.effective_user.id
+        fn = getattr(resolve(user_id), method)
+        async with locks.setdefault(user_id, asyncio.Lock()):
             if note:
                 await chat.send_message(note)
             typing = asyncio.create_task(keep_typing(chat))
@@ -139,7 +153,7 @@ def build_app(token: str, flow: Flow, allowed: set[int]) -> Application:
             timer.cancel()
         items = batch["items"]
         try:
-            await run(batch["update"], flow.on_batch, items, note=batch_note(len(items)))
+            await run(batch["update"], "on_batch", items, note=batch_note(len(items)))
         except Exception:  # задача вне обработчика PTB — ошибку ловим сами
             log.exception("Ошибка при разборе пачки")
             await batch["update"].effective_chat.send_message(
@@ -169,7 +183,7 @@ def build_app(token: str, flow: Flow, allowed: set[int]) -> Application:
             return
         await flush_first(update)
         command = update.message.text.split()[0].lstrip("/").split("@")[0].lower()
-        await run(update, flow.on_command, command, " ".join(context.args or []))
+        await run(update, "on_command", command, " ".join(context.args or []))
 
     async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await guard(update):
@@ -219,7 +233,7 @@ def build_app(token: str, flow: Flow, allowed: set[int]) -> Application:
         if not await guard(update):
             return
         await flush_first(update)
-        await run(update, flow.on_text, update.message.text)
+        await run(update, "on_text", update.message.text)
 
     async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
@@ -232,7 +246,7 @@ def build_app(token: str, flow: Flow, allowed: set[int]) -> Application:
         except Exception:  # сообщение могли удалить — не критично
             pass
         await flush_first(update)
-        await run(update, flow.on_button, query.data)
+        await run(update, "on_button", query.data)
 
     async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("Ошибка при обработке апдейта", exc_info=context.error)
@@ -258,13 +272,14 @@ def main():
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)  # иначе каждый опрос Telegram в логе
     token = os.environ["TELEGRAM_BOT_TOKEN"]
-    allowed = {int(x) for x in os.environ.get("ALLOWED_USER_IDS", "").replace(",", " ").split()}
-    if not allowed:
+    user_ids = parse_user_ids(os.environ.get("ALLOWED_USER_IDS", ""))
+    if not user_ids:
         log.warning("ALLOWED_USER_IDS пуст — бот никому не ответит, кроме сообщения с id")
     data_dir = os.environ.get("FINANCE_DATA_DIR", "data")
-    os.makedirs(data_dir, exist_ok=True)
-    storage = Storage(os.path.join(data_dir, "finance.db"))
+    os.makedirs(data_dir, mode=0o700, exist_ok=True)
     recognizer = ClaudeRecognizer(model=os.environ.get("CLAUDE_MODEL", DEFAULT_MODEL))
-    flow = Flow(storage, recognizer, os.path.join(data_dir, "receipts"))
-    build_app(token, flow, allowed).run_polling(
+    spaces = UserSpaces(data_dir, recognizer, user_ids)
+    spaces.migrate_shared_data()
+    log.info("Пользователей: %d, у каждого своя база в %s/users/<id>/", len(user_ids), data_dir)
+    build_app(token, spaces.flow, set(user_ids)).run_polling(
         allowed_updates=[Update.MESSAGE, Update.CALLBACK_QUERY])
