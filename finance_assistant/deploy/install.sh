@@ -118,9 +118,9 @@ if [ "$READY" = 1 ] && [ "$NO_USERS" = 1 ]; then
     cat <<EOF
    1. Каждый из двух пользователей пишет боту в Telegram что угодно —
       бот ответит «Доступ закрыт. Ваш Telegram id: …».
-   2. sudo nano $APP/.env → ALLOWED_USER_IDS=id1,id2
+   2. Впишите оба id на странице настройки:
+        sudo bash $APP/deploy/setup.sh --public
       (первым — тот, кому достанутся данные прежней общей базы, если она была)
-   3. sudo systemctl restart finance-bot
 EOF
 elif [ "$READY" = 1 ]; then
     say "Готово"
@@ -133,11 +133,13 @@ EOF
 else
     say "Осталось вписать настройки"
     cat <<EOF
-   1. sudo nano $APP/.env
-        TELEGRAM_BOT_TOKEN — у @BotFather в Telegram: /newbot
-        ANTHROPIC_API_KEY  — https://platform.claude.com → API Keys
-        ALLOWED_USER_IDS   — можно пока оставить пустым: бот запустится
-                             и каждому ответит его Telegram id.
-   2. Повторите: sudo bash deploy/install.sh
+   Откройте страницу настройки — на ней ключ Claude API, токен бота и
+   Telegram id обоих пользователей (с кнопкой «Кто писал боту»):
+
+      sudo bash $APP/deploy/setup.sh            — через SSH-туннель (надёжнее)
+      sudo bash $APP/deploy/setup.sh --public   — с телефона, по HTTPS
+
+   После сохранения бот запустится сам.
+   (Или вручную: sudo nano $APP/.env и снова sudo bash deploy/install.sh)
 EOF
 fi
