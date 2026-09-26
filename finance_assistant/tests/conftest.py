@@ -31,7 +31,8 @@ def payment(**over):
             "date": "2026-09-20", "card_last4": "1111", "bank": "Сбер", "merchant": "СДЭК",
             "description": "доставка", "category": "Логистика и доставка",
             "category_confident": True, "looks_personal": False,
-            "from_business_account": False, "to_owner": False}
+            "from_business_account": False, "own_transfer": False,
+            "counterparty_last4": "", "counterparty_bank": ""}
     base.update(over)
     return base
 

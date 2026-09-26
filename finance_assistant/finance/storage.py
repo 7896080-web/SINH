@@ -78,6 +78,21 @@ CREATE TABLE IF NOT EXISTS statement_lines (
 );
 CREATE INDEX IF NOT EXISTS ix_statement_lines_key
     ON statement_lines(statement_id, op_date, amount, direction);
+-- Перемещения денег между своими счетами: не расход и не доход, но их нужно
+-- вычесть из «пришло»/«ушло» по картам, иначе личные траты посчитаются неверно.
+-- to_card_id / from_card_id пусты, если второй счёт не ведётся в боте.
+CREATE TABLE IF NOT EXISTS transfers (
+    id INTEGER PRIMARY KEY,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    op_date TEXT NOT NULL,
+    amount INTEGER NOT NULL CHECK (amount > 0),
+    from_card_id INTEGER REFERENCES cards(id),
+    to_card_id INTEGER REFERENCES cards(id),
+    description TEXT NOT NULL DEFAULT '',
+    receipt_path TEXT NOT NULL DEFAULT '',
+    CHECK (from_card_id IS NOT NULL OR to_card_id IS NOT NULL)
+);
+CREATE INDEX IF NOT EXISTS ix_transfers_date ON transfers(op_date);
 CREATE TABLE IF NOT EXISTS chat_state (
     chat_id INTEGER PRIMARY KEY,
     state TEXT NOT NULL
@@ -123,6 +138,23 @@ class Expense:
     description: str
     receipt_path: str
     card_kind: str = PERSONAL_CARD
+
+
+@dataclass
+class Transfer:
+    id: int
+    op_date: str
+    amount: int
+    from_card_id: int | None
+    to_card_id: int | None
+    from_card: str | None
+    to_card: str | None
+    description: str
+    receipt_path: str
+
+    @property
+    def route(self) -> str:
+        return f"{self.from_card or 'другой ваш счёт'} → {self.to_card or 'другой ваш счёт'}"
 
 
 @dataclass
@@ -194,8 +226,9 @@ class Storage:
     def delete_card(self, card_id: int) -> bool:
         """Удаляет только карту без записей — иначе потеряется история."""
         used = self.conn.execute(
-            "SELECT 1 FROM expenses WHERE card_id = ? UNION SELECT 1 FROM statements WHERE card_id = ?",
-            (card_id, card_id),
+            "SELECT 1 FROM expenses WHERE card_id = ? UNION SELECT 1 FROM statements WHERE card_id = ?"
+            " UNION SELECT 1 FROM transfers WHERE from_card_id = ? OR to_card_id = ?",
+            (card_id, card_id, card_id, card_id),
         ).fetchone()
         if used:
             return False
@@ -269,6 +302,62 @@ class Storage:
             (op_date, amount, card_id),
         ).fetchone()
         return Expense(**dict(row)) if row else None
+
+    # --- переводы между своими счетами --------------------------------
+
+    _TRANSFER_SELECT = (
+        "SELECT t.id, t.op_date, t.amount, t.from_card_id, t.to_card_id,"
+        " a.name AS from_card, b.name AS to_card, t.description, t.receipt_path"
+        " FROM transfers t LEFT JOIN cards a ON a.id = t.from_card_id"
+        " LEFT JOIN cards b ON b.id = t.to_card_id"
+    )
+
+    def add_transfer(self, *, op_date, amount, from_card_id, to_card_id, description="",
+                     receipt_path="") -> int:
+        with self.conn:
+            cur = self.conn.execute(
+                "INSERT INTO transfers (op_date, amount, from_card_id, to_card_id, description,"
+                " receipt_path) VALUES (?, ?, ?, ?, ?, ?)",
+                (op_date, amount, from_card_id, to_card_id, description, receipt_path),
+            )
+        return cur.lastrowid
+
+    def transfer(self, transfer_id: int) -> Transfer | None:
+        row = self.conn.execute(self._TRANSFER_SELECT + " WHERE t.id = ?", (transfer_id,)).fetchone()
+        return Transfer(**dict(row)) if row else None
+
+    def transfers(self, month: str, card_id: int | None = None) -> list[Transfer]:
+        sql = self._TRANSFER_SELECT + " WHERE substr(t.op_date, 1, 7) = ?"
+        params: list = [month]
+        if card_id is not None:
+            sql += " AND (t.from_card_id = ? OR t.to_card_id = ?)"
+            params += [card_id, card_id]
+        sql += " ORDER BY t.op_date, t.id"
+        return [Transfer(**dict(r)) for r in self.conn.execute(sql, params)]
+
+    def find_same_transfer(self, *, op_date, amount, from_card_id, to_card_id) -> Transfer | None:
+        """Тот же перевод, присланный со второй стороны (списание и зачисление)."""
+        for t in self.conn.execute(
+            self._TRANSFER_SELECT + " WHERE t.amount = ?"
+            " AND abs(julianday(t.op_date) - julianday(?)) <= 1", (amount, op_date)
+        ).fetchall():
+            t = Transfer(**dict(t))
+            if ((from_card_id is None or t.from_card_id in (None, from_card_id))
+                    and (to_card_id is None or t.to_card_id in (None, to_card_id))):
+                return t
+        return None
+
+    def update_transfer(self, transfer_id: int, **fields):
+        assert set(fields) <= {"from_card_id", "to_card_id"}, fields
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        with self.conn:
+            self.conn.execute(f"UPDATE transfers SET {sets} WHERE id = ?",
+                              (*fields.values(), transfer_id))
+
+    def delete_transfer(self, transfer_id: int) -> bool:
+        with self.conn:
+            return self.conn.execute("DELETE FROM transfers WHERE id = ?",
+                                     (transfer_id,)).rowcount > 0
 
     # --- выписки -------------------------------------------------------
 
