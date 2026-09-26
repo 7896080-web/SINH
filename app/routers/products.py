@@ -27,6 +27,7 @@ from app.audit import log_action
 from app.timeutils import now_utc, today_local
 from app.excel_utils import (build_xlsx_response, read_xlsx_rows, read_upload, parse_bool_ru,
                              ExcelReadError, YES_NO)
+from app.stock_cell import shared_cells, shares
 from app.transmit import (explain, sku_quantity, enqueue_full_resend, enqueue_withdrawal,
                           should_withdraw, ever_transmitted,
                           offset_from_base, recompute_offset, sku_mode, MODE_AUTO,
@@ -129,9 +130,37 @@ def _uids_with_barcode(db: Session, products: list[Product]) -> set[str]:
             db.query(Barcode.uid_1c).filter(Barcode.uid_1c.in_(uids)).distinct().all()}
 
 
+def _shared_cards(db: Session, products: list[Product],
+                  accounts: list[PlatformAccount]):
+    """Соседи по карточке площадки для показанных строк: кто и сколько уедет.
+
+    Считается пакетно на страницу (см. `stock_cell.shared_cells`), а суммы —
+    только по тем парам, где сосед действительно есть: таких на живом каталоге
+    единицы, а обращение на каждую строку уже однажды оставило страницу без
+    ответа вовсе.
+    """
+    if not products or not accounts:
+        return {}, {}, {}
+    shared = shared_cells(db, [p.uid_1c for p in products], [a.id for a in accounts])
+    if not shared:
+        return {}, {}, {}
+    neighbours = {u for group in shared.values() for u in group}
+    labels = {p.uid_1c: (p.article or p.uid_1c) for p in products}
+    for p in db.query(Product).filter(Product.uid_1c.in_(list(neighbours))).all():
+        labels.setdefault(p.uid_1c, p.article or p.uid_1c)
+    totals: dict[tuple[str, int], int] = {}
+    for (uid, account_id), others in shared.items():
+        totals[(uid, account_id)] = sum(
+            q for _, q in shares(db, account_id, sorted({uid, *others})))
+    return shared, labels, totals
+
+
 def _row(product: Product, accounts: list[PlatformAccount],
          all_accounts: dict[int, PlatformAccount] | None = None,
-         with_barcode: set[str] | None = None) -> dict:
+         with_barcode: set[str] | None = None,
+         shared: dict[tuple[str, int], list[str]] | None = None,
+         labels: dict[str, str] | None = None,
+         cell_totals: dict[tuple[str, int], int] | None = None) -> dict:
     """Строка таблицы. По каждому кабинету — реальное число и причина нуля."""
     settings_map = {s.account_id: s for s in product.sync_settings}
     all_accounts = all_accounts or {a.id: a for a in accounts}
@@ -156,6 +185,13 @@ def _row(product: Product, accounts: list[PlatformAccount],
             "blocked": result.blocked,
             "reason": result.reason,
             "fix_hint": result.fix_hint,
+            # Один физический товар бывает заведён в 1С двумя строками, а на
+            # площадке это одна карточка: рассылка отправляет туда СУММУ. Число
+            # в ячейке — вклад этой строки, и молчать про остальное нельзя —
+            # человек сверяет строку с витриной и не сходится.
+            "shares_with": [(labels or {}).get(u, u)
+                            for u in (shared or {}).get((product.uid_1c, account.id), [])],
+            "cell_total": (cell_totals or {}).get((product.uid_1c, account.id)),
         }
 
     # Предложения ⚡ рядом с наименованием: колонки кабинетов уезжают вправо за край
@@ -468,7 +504,9 @@ def _render(request: Request, db: Session, user: User, q: str, only_proposals: b
                                      only_broadcasting=only_broadcasting,
                                      only_silent=only_silent)
     with_barcode = _uids_with_barcode(db, products)
-    rows = [_row(p, accounts, all_accounts, with_barcode) for p in products]
+    shared, labels, cell_totals = _shared_cards(db, products, accounts)
+    rows = [_row(p, accounts, all_accounts, with_barcode, shared, labels, cell_totals)
+            for p in products]
     return templates.TemplateResponse(request, template, {
         "request": request, "current_user": user, "active_page": "products",
         "rows": rows, "total": total, "page_limit": PAGE_LIMIT,

@@ -28,8 +28,9 @@ from cryptography.fernet import Fernet
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.models import (AuditLog, Base, DispatchQueueItem, DispatchStatus,
-                        Platform, PlatformAccount, Product, SyncSetting)
+from app.models import (AuditLog, Barcode, Base, DispatchQueueItem,
+                        DispatchStatus, Platform, PlatformAccount,
+                        PlatformCatalogItem, Product, SyncSetting)
 from app.timeutils import now_utc
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -90,6 +91,24 @@ def cabinet(tmp_path):
     _product(s, "u-E", "3030-9003", "XL", True)
     s.add(SyncSetting(uid_1c="u-E", account_id=1, enabled=False))
     _queue(s, "u-E", 1, 8, 0, "broadcast_toggled", recent, sku="V-E")
+
+    # F и G — тот же случай на WB, и по `sent_sku` он НЕ ВИДЕН. Баркоды
+    # разные, значит и `sent_sku` разные, а в теле запроса уезжает chrtId из
+    # каталога — он у обоих один, то есть пишут они в одну ячейку и затирают
+    # друг друга. Раздел, считающий по `sent_sku`, здесь молчит — и молчание
+    # это хуже отсутствия раздела: по нему решают, что дело не в мэппинге.
+    s.add(PlatformAccount(id=3, platform=Platform.wb, name="ИП ПРОБА",
+                          warehouse_id="1"))
+    _product(s, "u-F", "4033", "3XL", True)
+    _product(s, "u-G", "4052", "3XL", True)
+    for uid, bc in (("u-F", "2000000000011"), ("u-G", "2000000000022")):
+        s.add(Barcode(barcode=bc, uid_1c=uid))
+        s.add(PlatformCatalogItem(account_id=3, external_id="177:4242",
+                                  barcode=bc, article="WB-4033"))
+        s.add(SyncSetting(uid_1c=uid, account_id=3, enabled=True))
+    _queue(s, "u-F", 3, 10, 10, "order", recent - timedelta(minutes=5),
+           sku="2000000000011")
+    _queue(s, "u-G", 3, 18, 18, "order", recent, sku="2000000000022")
 
     # Чужой кабинет и запись за пределами окна — в ответ попасть не должны.
     _queue(s, "u-A", 2, 9, 0, "reconciliation", recent, sku="OZ-A")
@@ -163,6 +182,29 @@ def test_two_products_on_one_platform_card_are_shown(cabinet):
     # И ключ, по которому товар ОДИН, сюда попасть не должен — иначе раздел
     # перечислял бы весь кабинет и ничего не значил.
     assert "ключ V-A" not in out
+
+
+def test_wb_products_that_share_a_chrt_id_are_shown_too(cabinet):
+    """У WB `sent_sku` — баркод, а в теле уезжает chrtId.
+
+    Два разных баркода, ведущие на один размер карточки, по `sent_sku`
+    выглядят как разные ключи: раздел молчал бы ровно там, где он нужен, и
+    по этому молчанию человек решил бы, что мэппинг ни при чём, и пошёл бы
+    искать беду в площадке — «отправили 18, держит 10».
+    """
+    out = _run(cabinet, "ПРОБА", "48")
+    assert "ОДИН КЛЮЧ — НЕСКОЛЬКО ТОВАРОВ" in out, out
+    assert "ключ chrtId 4242" in out, out
+    assert "4033" in out and "4052" in out, out
+    # Баркод при этом не теряется: им адресовали, и по нему ищут строку.
+    assert "адресовали 2000000000011" in out, out
+    assert "адресовали 2000000000022" in out, out
+
+
+def test_a_wb_key_with_a_single_product_is_not_called_a_clash(cabinet):
+    """Иначе раздел перечислял бы весь кабинет и не значил бы ничего."""
+    out = _run(cabinet, "КИТ", "48")
+    assert "ключ V-A" not in out, out
 
 
 def test_nonzero_sends_are_shown_next_to_the_zeros(cabinet):

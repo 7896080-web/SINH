@@ -6,6 +6,7 @@ from app.timeutils import now_utc
 from sqlalchemy.orm import Session
 
 from app.transmit import quantity_for_account, ever_transmitted, blocked_by_switch
+from app.stock_cell import cell_of, explain_sum, members, shares
 from app.models import (
     AuditLog, DispatchQueueItem, DispatchStatus, SyncSetting, PlatformAccount, Barcode,
     PlatformCatalogItem, Product,
@@ -203,7 +204,18 @@ def _dispatch_one_account(db: Session, client: PlatformClient, account: Platform
     # Ключи отправки, уже занятые в этом цикле. У Kit пара товар+склад не
     # может повторяться в одном запросе (`DUPLICATE_ITEM`), и повтор ронял
     # бы ВЕСЬ запрос, а не лишнюю строку.
-    keys_in_request: dict[str, str] = {}
+    keys_in_request: dict[str, DispatchQueueItem] = {}
+    # Записи, уехавшие ВМЕСТЕ с ведущей записью своей ячейки: итог им
+    # проставляется после ответа площадки, а не здесь, — до ответа его ещё нет.
+    absorbed: dict[int, list[DispatchQueueItem]] = {}
+    # Состав ячейки на ведущей записи: по нему после удачной отправки метятся
+    # ВСЕ пары, чей остаток уехал внутри суммы, — включая соседа, записи
+    # которого в очереди не было вовсе. Без этого система не помнит, что писала
+    # на его карточку, и снятие галочки по нему потом ничего не отзовёт.
+    cell_shares: dict[int, list[tuple[str, int]]] = {}
+    products: dict[str, Product] = {
+        p.uid_1c: p for p in db.query(Product).filter(
+            Product.uid_1c.in_([i.uid_1c for i in pending])).all()}
     # Чем площадка адресует остаток: WB — баркодом, Ozon — артикулом,
     # Kit — variant_id. Спрашиваем у клиента, а не угадываем здесь.
     stock_key = getattr(client, "stock_key", "barcode")
@@ -233,17 +245,26 @@ def _dispatch_one_account(db: Session, client: PlatformClient, account: Platform
                                "отправить не по чему, сначала мэппинг")
             item.card_missing = True
             continue
-        if identifier in keys_in_request:
-            # Два товара 1С ведут на одну карточку площадки. Число уедет по
-            # первому, но молчать нельзя: это дефект мэппинга, и решать его
-            # человеку — списывать продажи будут на разные товары.
-            item.status = DispatchStatus.error
-            item.next_attempt_at = None
-            item.last_error = ("на одну карточку площадки ведут два товара 1С "
-                               f"({keys_in_request[identifier]} и {uid_1c}) — "
-                               "отправлен первый, мэппинг надо поправить")
+        cell = cell_of(external_id, identifier)
+        if cell in keys_in_request:
+            # Второй товар ТОЙ ЖЕ ячейки в этом же цикле. Число по ячейке уже
+            # посчитано суммой и уже уехало с первой записью — второй раз его
+            # слать нельзя (у Kit пара товар+склад в одном запросе повторяться
+            # не может вовсе). Запись закрываем как отправленную и говорим, с
+            # кем она уехала: иначе она выглядела бы потерянной.
+            absorbed.setdefault(id(keys_in_request[cell]), []).append(item)
             continue
-        quantity = _quantity_to_send(db, uid_1c, account.id, item.quantity)
+        # Сколько уедет в ячейку. Слагаемые — по всем товарам 1С, чей остаток
+        # в ней лежит, и берутся они из БАЗЫ: сосед мог не меняться месяцами,
+        # и в очереди его записи нет вовсе. Одиночный товар (а это почти все)
+        # идёт прежним путём байт в байт — здесь ничего не считается заново.
+        cell_uids = members(db, account.id, cell, uid_1c) if external_id else [uid_1c]
+        if len(cell_uids) > 1:
+            parts = shares(db, account.id, cell_uids, {uid_1c: item.quantity})
+            quantity = sum(q for _, q in parts)
+        else:
+            parts = []
+            quantity = _quantity_to_send(db, uid_1c, account.id, item.quantity)
         # Ноль на карточку, которой мы НИ РАЗУ не касались, не отправляем вовсе.
         #
         # Инцидент 18.09 закрыли на ВХОДЕ в очередь: автоматические пути больше не
@@ -261,8 +282,12 @@ def _dispatch_one_account(db: Session, client: PlatformClient, account: Platform
         # сообщением тоже: трансляция включена и кабинет отмечен — карточку мы
         # сознательно взяли под управление, и промолчать значит оставить её
         # торговать по чужому числу. См. `transmit.blocked_by_switch`.
-        if (quantity == 0 and blocked_by_switch(db, uid_1c, account.id)
-                and not ever_transmitted(db, uid_1c, account.id)):
+        # Ноль по ячейке спрашивается про ВСЕХ её жильцов: сосед мог быть тем,
+        # кому мы уже писали непустой остаток, и тогда ноль — законный отзыв,
+        # а не обнуление нетронутой чужой карточки.
+        if (quantity == 0
+                and all(blocked_by_switch(db, u, account.id) for u in cell_uids)
+                and not any(ever_transmitted(db, u, account.id) for u in cell_uids)):
             item.status = DispatchStatus.sent
             item.sent_at = None            # на площадку не уходило — не отправка
             item.sent_quantity = None
@@ -270,7 +295,7 @@ def _dispatch_one_account(db: Session, client: PlatformClient, account: Platform
             item.last_error = ("ноль не отправлен: на этот кабинет мы ни разу не "
                                "посылали непустой остаток, отзывать нечего")
             continue
-        keys_in_request[identifier] = uid_1c
+        keys_in_request[cell] = item
         # Фиксируем ИМЕННО ТО число, которое уходит на площадку. `item.quantity`
         # для этого не годится: там исходный остаток, а не итог лестницы.
         item.sent_quantity = quantity
@@ -279,6 +304,11 @@ def _dispatch_one_account(db: Session, client: PlatformClient, account: Platform
         # записи восстановить ключ по базе потом невозможно. 19.09 разбор
         # «почему на WB ноль» из-за этого занял час: число знали, sku нет.
         item.sent_sku = identifier
+        if parts:
+            cell_shares[id(item)] = parts
+            item.last_error = explain_sum(parts, {
+                u: (products[u].article or u) if products.get(u) else u
+                for u, _ in parts})
         push_items.append(StockPushItem(
             barcode=barcode, quantity=quantity, external_id=external_id, article=article,
         ))
@@ -333,17 +363,22 @@ def _dispatch_one_account(db: Session, client: PlatformClient, account: Platform
             item.status = DispatchStatus.sent
             item.sent_at = now_utc()
             item.next_attempt_at = None
-            if (item.sent_quantity or 0) > 0:
-                # Память о том, что на эту пару уходил непустой остаток, живёт на
-                # самой паре, а не в очереди: очередь чистится по сроку, и вместе
-                # с ней исчезала бы возможность отозвать остаток. См.
-                # `SyncSetting.last_nonzero_sent_at` и `transmit.ever_transmitted`.
-                setting = db.query(SyncSetting).filter(
-                    SyncSetting.uid_1c == item.uid_1c,
+            # Память о том, что на эту пару уходил непустой остаток, живёт на
+            # самой паре, а не в очереди: очередь чистится по сроку, и вместе с
+            # ней исчезала бы возможность отозвать остаток. См.
+            # `SyncSetting.last_nonzero_sent_at` и `transmit.ever_transmitted`.
+            # Метим ВСЕ пары ячейки, чей вклад был непустым. У одиночки это
+            # он сам; у делённой карточки — и сосед, которого в очереди нет.
+            marked = [(u, q) for u, q in cell_shares.get(id(item), []) if q > 0]
+            if not marked and (item.sent_quantity or 0) > 0:
+                marked = [(item.uid_1c, item.sent_quantity)]
+            for uid, _q in marked:
+                pair = db.query(SyncSetting).filter(
+                    SyncSetting.uid_1c == uid,
                     SyncSetting.account_id == account.id,
                 ).first()
-                if setting is not None:
-                    setting.last_nonzero_sent_at = item.sent_at
+                if pair is not None:
+                    pair.last_nonzero_sent_at = item.sent_at
         elif item.attempts < MAX_ATTEMPTS:
             # Сбой не окончательный: пробуем ещё, с паузой. Остаток уже списан
             # у нас — если не дослать его на площадку, она продаст то, чего нет.
@@ -354,6 +389,21 @@ def _dispatch_one_account(db: Session, client: PlatformClient, account: Platform
         else:
             item.status = DispatchStatus.error
             item.last_error = f"не отправлено за {item.attempts} попыток: {errors_text}"
+
+    # Соседи по ячейке: их число уехало внутри суммы ведущей записи, значит и
+    # итог у них тот же. Копируем ПОСЛЕ ответа площадки — раньше его просто не
+    # существует, а запись, закрытая «успешно» до отказа, соврала бы про то,
+    # что лежит на карточке.
+    for lead in list(uid_to_items.values()):
+        for item in absorbed.get(id(lead), []):
+            item.status = lead.status
+            item.attempts = lead.attempts
+            item.sent_at = lead.sent_at
+            item.sent_quantity = lead.sent_quantity
+            item.sent_sku = lead.sent_sku
+            item.next_attempt_at = lead.next_attempt_at
+            item.card_missing = lead.card_missing
+            item.last_error = lead.last_error
 
     # Все элементы очереди по товару, кроме самого свежего — считаем
     # поглощёнными (не отправляем устаревшие промежуточные значения)
