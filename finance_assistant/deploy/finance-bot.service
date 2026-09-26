@@ -1,0 +1,16 @@
+[Unit]
+Description=Finance assistant Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=finance-bot
+WorkingDirectory=/opt/finance-bot
+EnvironmentFile=/opt/finance-bot/.env
+ExecStart=/opt/finance-bot/venv/bin/python -m finance
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
