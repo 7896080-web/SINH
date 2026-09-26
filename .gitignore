@@ -37,5 +37,7 @@ deploy/INSTALLED_TAG
 # собираются из `scripts/gen_whole_file_patch.py` по тегу и содержат те же
 # файлы, что и коммит рядом, — только в base64. В истории их нет ни одного.
 pm*_deploy.ps1
+# то же самое, отданное в чат копией: расширение правило выше обходило
+pm*_deploy.ps1.txt
 pm*_apply.py
 pm*.b64
