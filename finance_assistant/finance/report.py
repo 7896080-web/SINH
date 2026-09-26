@@ -84,6 +84,9 @@ def card_text(cs: CardSummary, month: str) -> str:
         out.append(f"  на личное: {rub(cs.personal)}")
     if cs.has_statement and not cs.lines_checked:
         out.append("(по строкам не сверялось — в выписке были только итоги)")
+    if cs.overbooked:
+        out.append(f"⚠️ Записано на {rub(cs.overbooked)} больше, чем по выписке ушло с карты — "
+                   "проверьте карту и даты у записей (/list)")
     if cs.missing:
         out.append("")
         out.append("⚠️ Записано, но не найдено в выписке (проверьте карту или дату):")
@@ -140,6 +143,8 @@ def month_text(s: MonthSummary) -> str:
         out.append(f"  бизнес {rub(cs.business)} · личное {rub(cs.personal)}")
         if cs.missing or cs.missing_transfers:
             out.append(f"  ⚠️ не найдено в выписке: {len(cs.missing) + len(cs.missing_transfers)}")
+        if cs.overbooked:
+            out.append(f"  ⚠️ записано на {rub(cs.overbooked)} больше, чем ушло по выписке")
     out.append("")
     if s.net_in is not None:
         out.append(f"📥 Пришло без переводов между своими счетами: {rub(s.net_in)}")
@@ -179,7 +184,9 @@ def period_text(summaries: list[MonthSummary]) -> str:
         if with_stmt:
             line += (f" · пришло без переводов {rub(sum(c.net_in or 0 for c in with_stmt))}"
                      f" · ушло без переводов {rub(sum(c.net_out or 0 for c in with_stmt))}")
-        missing = sum(len(c.missing) for c in per)
+        if not cs0.card.is_business and len(with_stmt) < len(per):
+            line += f" (личное без {len(per) - len(with_stmt)} мес. без выписки)"
+        missing = sum(len(c.missing) + len(c.missing_transfers) for c in per)
         if missing:
             line += f" · ⚠️ не найдено в выписках: {missing}"
         out.append(line)

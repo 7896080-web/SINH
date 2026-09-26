@@ -465,6 +465,10 @@ class Storage:
             " AND abs(julianday(t.op_date) - julianday(?)) <= 1", (amount, op_date)
         ).fetchall():
             t = Transfer(**dict(t))
+            merged_from = from_card_id or t.from_card_id
+            merged_to = to_card_id or t.to_card_id
+            if merged_from is not None and merged_from == merged_to:
+                continue  # склейка дала бы перевод «с карты на ту же карту» — это другой перевод
             if ((from_card_id is None or t.from_card_id in (None, from_card_id))
                     and (to_card_id is None or t.to_card_id in (None, to_card_id))):
                 return t
@@ -557,6 +561,25 @@ class Storage:
             )
         ]
         return head, lines
+
+    def card_lines(self, card_id: int) -> list[StatementLine]:
+        """Все строки всех выписок карты — для сопоставления через границу месяца."""
+        return [
+            StatementLine(r["id"], r["op_date"], r["amount"], r["direction"], r["description"],
+                          bool(r["own_transfer"]), r["suggested_category"], r["op_time"])
+            for r in self.conn.execute(
+                "SELECT l.* FROM statement_lines l JOIN statements s ON s.id = l.statement_id"
+                " WHERE s.card_id = ? ORDER BY l.op_date, l.op_time, l.id", (card_id,))
+        ]
+
+    def card_expenses(self, card_id: int) -> list[Expense]:
+        return [Expense(**dict(r)) for r in self.conn.execute(
+            self._EXPENSE_SELECT + " WHERE e.card_id = ? ORDER BY e.op_date, e.id", (card_id,))]
+
+    def card_transfers(self, card_id: int) -> list[Transfer]:
+        return [Transfer(**dict(r)) for r in self.conn.execute(
+            self._TRANSFER_SELECT + " WHERE t.from_card_id = ? OR t.to_card_id = ?"
+            " ORDER BY t.op_date, t.id", (card_id, card_id))]
 
     def statement_line(self, line_id: int) -> sqlite3.Row | None:
         return self.conn.execute(
