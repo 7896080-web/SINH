@@ -301,36 +301,23 @@
 
 ## Установка на сервер
 
-Нужны:
-- **токен бота** — в Telegram у @BotFather: `/newbot`;
-- **ключ Claude API** — на https://platform.claude.com в разделе API Keys.
-  Распознавание оплачивается по тарифу API.
+Пошагово, для первой установки и обновления: **[УСТАНОВКА.md](УСТАНОВКА.md)**.
+Коротко:
 
 ```bash
-sudo useradd --system --home /opt/finance-bot finance-bot
-sudo mkdir -p /opt/finance-bot/data
-sudo cp -r finance deploy requirements.txt /opt/finance-bot/
-cd /opt/finance-bot
-sudo python3 -m venv venv && sudo venv/bin/pip install -r requirements.txt
-sudo cp /путь/к/finance_assistant/.env.example .env && sudo nano .env   # токены
-# Код — root (служба не может его менять), данные — только служба.
-sudo chown root:finance-bot .env && sudo chmod 640 .env
-sudo chown -R finance-bot: data && sudo chmod 700 data
-sudo cp deploy/finance-bot.service deploy/finance-bot-backup.service \
-        deploy/finance-bot-backup.timer /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now finance-bot finance-bot-backup.timer
-journalctl -u finance-bot -f
+unzip finance-bot.zip && cd finance_assistant
+sudo bash deploy/install.sh     # установка и обновление; данные и .env не трогает
+sudo nano /opt/finance-bot/.env # токен бота, ключ Claude API, id пользователей
+sudo bash deploy/install.sh     # после заполнения .env — запустит бота
 ```
 
-Первый запуск:
-1. Каждый из двух пользователей пишет боту что угодно со своего Telegram.
-   Бот отвечает «Доступ закрыт. Ваш Telegram id: …».
-2. Впишите оба id через запятую в `ALLOWED_USER_IDS` в `.env` и выполните
-   `sudo systemctl restart finance-bot`.
-3. Добавьте карты: `/addcard Сбер 1234 Сбер`, `/addcard Тинькофф 5678 Т-Банк`,
-   `/addcard Альфа 9012 Альфа-Банк`. Последние 4 цифры помогают боту узнавать
-   карту по скриншоту.
+Скрипт `deploy/install.sh` делает всё сам:
+- создаёт пользователя службы и ставит код в `/opt/finance-bot`;
+- создаёт виртуальное окружение с зависимостями;
+- кладёт шаблон `.env`, выставляет права (код — root, данные — только служба);
+- ставит службу `finance-bot` и ежедневный бэкап `finance-bot-backup.timer`;
+- при обновлении перед заменой кода делает бэкап баз;
+- после запуска проверяет, что служба жива, а если нет — показывает журнал.
 
 Бот сам опрашивает Telegram, поэтому ни домен, ни открытый порт ему не нужны.
 Запустить его можно на любой машине с интернетом, в том числе на VPS
