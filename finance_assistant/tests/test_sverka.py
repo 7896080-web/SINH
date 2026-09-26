@@ -1,7 +1,7 @@
 from openpyxl import load_workbook
 import io
 
-from conftest import CHAT, PNG, payment
+from conftest import CHAT, png, payment
 from finance.reconcile import match, summarize
 from finance.storage import Expense, StatementLine
 
@@ -28,7 +28,7 @@ def start_sverka(flow, db, card_index=0, month="2026-09"):
 
 def record(db, rec, flow, **kw):
     rec.payments.append(payment(**kw))
-    flow.on_files(CHAT, [PNG], "")
+    flow.on_files(CHAT, [png()], "")
 
 
 def test_full_month(env):
@@ -38,7 +38,7 @@ def test_full_month(env):
            category="Реклама и продвижение")                                        # найдётся (+2 дня)
     record(db, rec, flow, amount="999", date="2026-09-11", merchant="Где-то")      # не найдётся
     rec.payments.append(payment(direction="in", amount="2000", date="2026-09-25"))
-    [skip] = flow.on_files(CHAT, [PNG], "")
+    [skip] = flow.on_files(CHAT, [png()], "")
     assert "поступление — не записываю" in skip.text
 
     start_sverka(flow, db)
@@ -54,7 +54,7 @@ def test_full_month(env):
     [got] = flow.on_files(CHAT, [PDF], "")
     assert "Принято операций: 6" in got.text and "Пропущено" in got.text
     rec.statements.append(statement([op("2026-09-18", "4200", desc="Пятёрочка")]))
-    [again] = flow.on_files(CHAT, [PNG], "")
+    [again] = flow.on_files(CHAT, [png()], "")
     assert "повторы пропущены: 1" in again.text
 
     card_reply, unmatched, nxt = flow.on_command(CHAT, "done")
@@ -120,7 +120,7 @@ def test_wrong_card_warning_and_not_statement(env):
     [r] = flow.on_files(CHAT, [PDF], "")
     assert "…9999" in r.text
     rec.statements.append({**statement([]), "is_statement": False})
-    [r] = flow.on_files(CHAT, [PNG], "")
+    [r] = flow.on_files(CHAT, [png()], "")
     assert "не похоже на выписку" in r.text
 
 

@@ -1,7 +1,7 @@
 """Перемещения денег между своими счетами: не расход, исключаются из «пришло»/«ушло»."""
 import pytest
 
-from conftest import CHAT, PNG, TODAY, FakeRecognizer, payment
+from conftest import CHAT, png, TODAY, FakeRecognizer, payment
 from finance.flow import Flow
 from finance.reconcile import summarize
 from finance.storage import Storage
@@ -34,7 +34,7 @@ def move(**over):
 def test_outgoing_transfer_recorded_with_both_sides(own):
     db, rec, flow = own
     rec.payments.append(move())
-    [r] = flow.on_files(CHAT, [PNG], "")
+    [r] = flow.on_files(CHAT, [png()], "")
     assert r.text.startswith("🔁 Перевод между своими счетами П1")
     assert "100 000,00 ₽ · 10.09 · Россия → ВТБ" in r.text
     assert "t:del:1" in str(r.buttons)
@@ -46,15 +46,15 @@ def test_outgoing_transfer_recorded_with_both_sides(own):
 def test_same_transfer_from_other_side_not_doubled(own):
     db, rec, flow = own
     rec.payments.append(move(counterparty_last4="", counterparty_bank=""))
-    [q] = flow.on_files(CHAT, [PNG], "")
+    [q] = flow.on_files(CHAT, [png()], "")
     assert "Куда переведены деньги?" in q.text and "d:tr:0" in str(q.buttons)
     [saved] = flow.on_button(CHAT, "d:tr:0")
     assert "Россия → другой ваш счёт" in saved.text
     # Скриншот зачисления на ВТБ того же перевода, на день позже.
     rec.payments.append(move(direction="in", date="2026-09-11", card_last4="2222", bank="ВТБ",
                              counterparty_last4="1111", counterparty_bank="Россия"))
-    [r] = flow.on_files(CHAT, [PNG], "")
-    assert "уже записан (П1: Россия → ВТБ)" in r.text
+    [r] = flow.on_files(CHAT, [png()], "")
+    assert "вторая сторона перевода П1 (Россия → ВТБ)" in r.text
     assert len(db.transfers("2026-09")) == 1
 
 
@@ -62,7 +62,7 @@ def test_incoming_transfer_asks_where_from(own):
     db, rec, flow = own
     rec.payments.append(move(direction="in", card_last4="2222", bank="ВТБ",
                              counterparty_last4="", counterparty_bank=""))
-    [q] = flow.on_files(CHAT, [PNG], "")
+    [q] = flow.on_files(CHAT, [png()], "")
     assert "Откуда пришли деньги?" in q.text
     [saved] = flow.on_button(CHAT, f"d:tr:{cid(db, 'Россия')}")
     assert "Россия → ВТБ" in saved.text
@@ -71,7 +71,7 @@ def test_incoming_transfer_asks_where_from(own):
 def test_edit_and_delete_transfer(own):
     db, rec, flow = own
     rec.payments.append(move())
-    flow.on_files(CHAT, [PNG], "")
+    flow.on_files(CHAT, [png()], "")
     [ask] = flow.on_button(CHAT, "t:to:1")
     assert "Куда перевод П1?" in ask.text
     [same] = flow.on_button(CHAT, f"t:to:1:{cid(db, 'Россия')}")
@@ -95,16 +95,16 @@ def test_transfers_excluded_from_vtb_totals(own):
     rec.payments += [move(),                                         # Россия → ВТБ 100 000
                      move(amount="50000", date="2026-09-20", card_last4="2222", bank="ВТБ",
                           counterparty_last4="1111", counterparty_bank="Россия")]  # ВТБ → Россия
-    flow.on_files(CHAT, [PNG], "")
-    flow.on_files(CHAT, [PNG], "")
+    flow.on_files(CHAT, [png()], "")
+    flow.on_files(CHAT, [png()], "")
     rec.payments.append(payment(amount="15417", date="2026-09-17", card_last4="2222", bank="ВТБ",
                                 category="Подрядчики и зарплата"))
-    flow.on_files(CHAT, [PNG], "")
+    flow.on_files(CHAT, [png()], "")
 
     flow.on_command(CHAT, "sverka", "2026-09")
     flow.on_button(CHAT, f"s:c:{cid(db, 'ВТБ')}")
     rec.statements.append(statement([], total_in="439000", total_out="615736.05", last4=""))
-    flow.on_files(CHAT, [PNG], "")
+    flow.on_files(CHAT, [png()], "")
     card_reply, *_ = flow.on_command(CHAT, "done")
     assert "Пришло: 439 000,00 ₽" in card_reply.text
     assert "− переводы со своих счетов: 100 000,00 ₽" in card_reply.text
@@ -122,7 +122,7 @@ def test_statement_line_not_subtracted_twice(own):
     """Модель пометила строку как перевод, и он же записан вами — вычитаем один раз."""
     db, rec, flow = own
     rec.payments.append(move())
-    flow.on_files(CHAT, [PNG], "")
+    flow.on_files(CHAT, [png()], "")
     flow.on_command(CHAT, "sverka", "2026-09")
     flow.on_button(CHAT, f"s:c:{cid(db, 'Россия')}")
     rec.statements.append(statement([
@@ -135,7 +135,7 @@ def test_statement_line_not_subtracted_twice(own):
     # Второй перевод модель не распознала — записываем его скриншотом.
     rec.payments.append(move(amount="30000", date="2026-09-11", counterparty_last4="",
                              counterparty_bank=""))
-    flow.on_files(CHAT, [PNG], "")
+    flow.on_files(CHAT, [png()], "")
     flow.on_button(CHAT, "d:tr:0")
     cs = next(c for c in summarize(db, "2026-09").cards if c.card.name == "Россия")
     assert (cs.total_out, cs.own_out, cs.personal) == (13400000, 13000000, 400000)
@@ -146,7 +146,7 @@ def test_statement_line_not_subtracted_twice(own):
 def test_transfer_missing_in_statement_warned(own):
     db, rec, flow = own
     rec.payments.append(move(date="2026-09-25"))
-    flow.on_files(CHAT, [PNG], "")
+    flow.on_files(CHAT, [png()], "")
     flow.on_command(CHAT, "sverka", "2026-09")
     flow.on_button(CHAT, f"s:c:{cid(db, 'Россия')}")
     rec.statements.append(statement([op("2026-09-02", "500", desc="Кафе")], last4=""))

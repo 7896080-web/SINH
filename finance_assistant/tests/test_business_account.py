@@ -1,7 +1,7 @@
 """Расчётный счёт ИП с бизнес-картой (образцы ПСБ). Номера счетов вымышленные."""
 import pytest
 
-from conftest import CHAT, PNG, TODAY, FakeRecognizer, payment
+from conftest import CHAT, png, TODAY, FakeRecognizer, payment
 from finance.flow import Flow
 from finance.reconcile import summarize
 from finance.storage import Storage
@@ -45,7 +45,7 @@ def test_addcard_business_and_cards_list(biz):
 def test_payment_order_goes_to_business_account(biz):
     db, rec, flow = biz
     rec.payments.append(kontur())
-    [saved] = flow.on_files(CHAT, [PNG], "")
+    [saved] = flow.on_files(CHAT, [png()], "")
     assert saved.text.startswith("✅ Записано") and "ПСБ" in saved.text
     assert "Бизнес · Связь, сервисы, подписки" in saved.text
     assert card(db, "ПСБ").numbers == ["0000"]  # номер счёта запомнен
@@ -57,7 +57,7 @@ def test_b2c_transfer_to_other_person_is_business_expense(biz):
     rec.payments.append(kontur(amount="20000", date="2026-08-07", merchant="Петров П. П.",
                                description="перевод по номеру телефона",
                                category="Подрядчики и зарплата", category_confident=False))
-    [q] = flow.on_files(CHAT, [PNG], "")
+    [q] = flow.on_files(CHAT, [png()], "")
     assert "статья" in q.text.lower()
     flow.on_button(CHAT, f"d:cat:{db.category_id('Подрядчики и зарплата')}")
     [e] = db.expenses("2026-08")
@@ -68,7 +68,7 @@ def test_income_to_business_account_not_recorded(biz):
     db, rec, flow = biz
     # «ЮЖНЫЙ Ф-Л ПАО "Банк ПСБ" +236 ₽ · Начисление кэшбэка по бизнес-карте»
     rec.payments.append(kontur(direction="in", amount="236", merchant="Банк ПСБ"))
-    [r] = flow.on_files(CHAT, [PNG], "")
+    [r] = flow.on_files(CHAT, [png()], "")
     assert "поступление — не записываю" in r.text
     assert db.expenses("2026-07") == [] and db.get_state(CHAT) == {}
 
@@ -77,7 +77,7 @@ def test_transfer_from_business_account_to_owner_card(biz):
     db, rec, flow = biz
     rec.payments.append(kontur(amount="3000", merchant="Иванов И. И.", own_transfer=True,
                                counterparty_last4="5501", counterparty_bank="ВТБ"))
-    [r] = flow.on_files(CHAT, [PNG], "")
+    [r] = flow.on_files(CHAT, [png()], "")
     assert r.text.startswith("🔁 Перевод между своими счетами П1")
     assert "ПСБ → ВТБ" in r.text
     assert db.expenses("2026-07") == []
@@ -87,13 +87,13 @@ def test_month_totals_business_by_category_and_personal(biz):
     db, rec, flow = biz
     rec.payments.append(payment(card_last4="5501", bank="ВТБ", amount="10000",
                                 date="2026-09-03", category="Реклама и продвижение"))
-    flow.on_files(CHAT, [PNG], "")
+    flow.on_files(CHAT, [png()], "")
     rec.payments.append(kontur(amount="500", date="2026-09-11", looks_personal=True))
-    flow.on_files(CHAT, [PNG], "")
+    flow.on_files(CHAT, [png()], "")
     [saved] = flow.on_button(CHAT, "d:purpose:personal")
     assert "Личное (с бизнес-счёта)" in saved.text
     rec.payments.append(kontur(amount="2950", date="2026-09-12"))
-    flow.on_files(CHAT, [PNG], "")
+    flow.on_files(CHAT, [png()], "")
 
     s = summarize(db, "2026-09")
     assert (s.business, s.personal) == (1295000, 50000)
@@ -109,7 +109,7 @@ def test_month_totals_business_by_category_and_personal(biz):
 def test_business_account_sverka(biz):
     db, rec, flow = biz
     rec.payments.append(kontur(date="2026-09-05"))
-    flow.on_files(CHAT, [PNG], "")
+    flow.on_files(CHAT, [png()], "")
     psb = card(db, "ПСБ")
     flow.on_command(CHAT, "sverka", "2026-09")
     flow.on_button(CHAT, f"s:c:{psb.id}")
@@ -124,7 +124,7 @@ def test_business_account_sverka(biz):
         line("2026-09-07", "20000", "out", "Петров П. П., перевод СБП B2C"),
         line("2026-09-15", "5000", "out", "Иванов И. И., перевод себе", own=True),
     ], total_in="236", total_out="27950", last4=""))
-    flow.on_files(CHAT, [PNG], "")
+    flow.on_files(CHAT, [png()], "")
     replies = flow.on_command(CHAT, "done")
     text = "\n".join(r.text for r in replies)
     assert "🏦 ПСБ ·0000 (бизнес-счёт) — сентябрь 2026" in text

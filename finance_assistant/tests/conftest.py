@@ -50,3 +50,9 @@ def env(tmp_path):
 
 
 PNG = (b"\x89PNG fake", "image/png")
+_shots = iter(range(1, 10**6))
+
+
+def png():
+    """Новый «скриншот»: у каждого своё содержимое, как у настоящих."""
+    return (b"\x89PNG fake %d" % next(_shots), "image/png")

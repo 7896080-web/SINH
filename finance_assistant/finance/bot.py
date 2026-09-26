@@ -85,7 +85,8 @@ def build_app(token: str, flow: Flow, allowed: set[int]) -> Application:
         photo = update.message.photo[-1]  # самый крупный вариант
         tg_file = await photo.get_file()
         data = bytes(await tg_file.download_as_bytearray())
-        await run(update, flow.on_files, [(data, "image/jpeg")], update.message.caption or "")
+        await run(update, flow.on_files, [(data, "image/jpeg")], update.message.caption or "",
+                  "", [photo.file_unique_id])
 
     async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await guard(update):
@@ -103,7 +104,8 @@ def build_app(token: str, flow: Flow, allowed: set[int]) -> Application:
             mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         tg_file = await doc.get_file()
         data = bytes(await tg_file.download_as_bytearray())
-        await run(update, flow.on_files, [(data, mime)], update.message.caption or "", name)
+        await run(update, flow.on_files, [(data, mime)], update.message.caption or "", name,
+                  [doc.file_unique_id])
 
     async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await guard(update):

@@ -3,7 +3,7 @@
 Ответы модели здесь заданы вручную так, как их должен вернуть Claude по этим
 скриншотам (по инструкциям из recognize.py). Номера карт/счетов вымышленные.
 """
-from conftest import CHAT, PNG, FakeRecognizer, payment
+from conftest import CHAT, png, FakeRecognizer, payment
 from finance.flow import Flow, _bank_key
 from finance.reconcile import summarize
 from finance.storage import Storage
@@ -38,7 +38,7 @@ def vtb_receipt(**over):
 def test_vtb_account_number_learned_after_one_question(banks):
     db, rec, flow = banks
     rec.payments.append(vtb_receipt())
-    [q] = flow.on_files(CHAT, [PNG], "")
+    [q] = flow.on_files(CHAT, [png()], "")
     assert "С какой карты" in q.text  # •7702 незнаком, хотя банк ВТБ понятен
     vtb = next(c for c in db.cards() if c.name == "ВТБ")
     replies = flow.on_button(CHAT, f"d:card:{vtb.id}")
@@ -51,8 +51,8 @@ def test_vtb_account_number_learned_after_one_question(banks):
     rec.payments += [payment(amount="1417", date="2026-09-15", card_last4="5501", bank="ВТБ",
                              merchant="Яндекс 360", category="Связь, сервисы, подписки"),
                      vtb_receipt(amount="500", category_confident=True)]
-    [a] = flow.on_files(CHAT, [PNG], "")
-    [b] = flow.on_files(CHAT, [PNG], "")
+    [a] = flow.on_files(CHAT, [png()], "")
+    [b] = flow.on_files(CHAT, [png()], "")
     assert a.text.startswith("✅") and b.text.startswith("✅")
     assert {e.card for e in db.expenses("2026-09")} == {"ВТБ"}
 
@@ -66,7 +66,7 @@ def test_rossiya_card_found_by_bank_then_account_remembered(banks):
                                 merchant="Сервисы Яндекса (АО Яндекс Банк)",
                                 description="оплата по QR-коду", category="Реклама и продвижение",
                                 category_confident=False))
-    [q] = flow.on_files(CHAT, [PNG], "")
+    [q] = flow.on_files(CHAT, [png()], "")
     # Номер незнаком, но у «России» номеров нет вовсе — всё равно спрашиваем
     # (по банку угадываем только когда номера не видно); спрашиваем карту.
     assert "С какой карты" in q.text
@@ -79,7 +79,7 @@ def test_rossiya_card_found_by_bank_then_account_remembered(banks):
 def test_card_by_bank_when_no_number_visible(banks):
     db, rec, flow = banks
     rec.payments.append(payment(card_last4="", bank="АБ РОССИЯ"))
-    flow.on_files(CHAT, [PNG], "")
+    flow.on_files(CHAT, [png()], "")
     assert db.expenses("2026-09")[0].card == "Россия"
 
 
@@ -133,7 +133,7 @@ def test_vtb_history_screen_gives_month_totals(banks):
         {"date": "2026-09-25", "time": "", "amount": "199", "direction": "out",
          "description": "Яндекс Музыка", "own_transfer": False, "business_category": ""},
     ], total_in="439000", total_out="615736.05", last4=""))
-    [got] = flow.on_files(CHAT, [PNG], "")
+    [got] = flow.on_files(CHAT, [png()], "")
     assert "Итоги из документа: пришло 439 000,00 ₽, ушло 615 736,05 ₽" in got.text
     cs = next(c for c in summarize(db, "2026-09").cards if c.card.id == vtb.id)
     assert (cs.total_in, cs.total_out) == (43900000, 61573605)
@@ -142,5 +142,5 @@ def test_vtb_history_screen_gives_month_totals(banks):
 def test_history_screen_outside_sverka_points_to_it(banks):
     db, rec, flow = banks
     rec.payments.append({**payment(), "is_payment": False})
-    [r] = flow.on_files(CHAT, [PNG], "")
+    [r] = flow.on_files(CHAT, [png()], "")
     assert "/sverka" in r.text and "истории" in r.text

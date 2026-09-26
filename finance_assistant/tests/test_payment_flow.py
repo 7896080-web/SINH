@@ -1,6 +1,6 @@
 import os
 
-from conftest import CHAT, PNG, payment
+from conftest import CHAT, png, payment
 from finance.storage import BUSINESS, PERSONAL
 
 
@@ -11,7 +11,7 @@ def buttons(reply):
 def test_clear_screenshot_saved_without_questions(env):
     db, rec, flow = env
     rec.payments.append(payment())
-    [reply] = flow.on_files(CHAT, [PNG], "")
+    [reply] = flow.on_files(CHAT, [png()], "")
     assert reply.text.startswith("✅ Записано")
     [e] = db.expenses("2026-09")
     assert (e.amount, e.card, e.purpose, e.category) == (150000, "Сбер", BUSINESS, "Логистика и доставка")
@@ -23,16 +23,17 @@ def test_clear_screenshot_saved_without_questions(env):
 def test_caption_and_cards_passed_to_model(env):
     db, rec, flow = env
     rec.payments.append(payment())
-    flow.on_files(CHAT, [PNG], "реклама вк")
+    shot = png()
+    flow.on_files(CHAT, [shot], "реклама вк")
     _, files, text, kw = rec.calls[0]
-    assert text == "реклама вк" and files == [PNG]
+    assert text == "реклама вк" and files == [shot]
     assert len(kw["cards"]) == 3 and "Прочее" in kw["categories"]
 
 
 def test_unknown_card_and_unsure_category_are_asked(env):
     db, rec, flow = env
     rec.payments.append(payment(card_last4="", bank="", category_confident=False))
-    [q1] = flow.on_files(CHAT, [PNG], "")
+    [q1] = flow.on_files(CHAT, [png()], "")
     assert "С какой карты" in q1.text
     card_id = db.cards()[1].id
     [q2] = flow.on_button(CHAT, f"d:card:{card_id}")
@@ -47,14 +48,14 @@ def test_unknown_card_and_unsure_category_are_asked(env):
 def test_card_guessed_by_bank_name(env):
     db, rec, flow = env
     rec.payments.append(payment(card_last4="", bank="Т-банк"))
-    flow.on_files(CHAT, [PNG], "")
+    flow.on_files(CHAT, [png()], "")
     assert db.expenses("2026-09")[0].card == "Тинькофф"
 
 
 def test_looks_personal_asks_purpose(env):
     db, rec, flow = env
     rec.payments.append(payment(looks_personal=True, category="", category_confident=False))
-    [q] = flow.on_files(CHAT, [PNG], "")
+    [q] = flow.on_files(CHAT, [png()], "")
     assert "d:purpose:personal" in buttons(q)
     [saved] = flow.on_button(CHAT, "d:purpose:personal")
     e = db.expenses("2026-09")[0]
@@ -65,7 +66,7 @@ def test_looks_personal_asks_purpose(env):
 def test_incoming_is_not_recorded(env):
     db, rec, flow = env
     rec.payments.append(payment(direction="in"))
-    [r] = flow.on_files(CHAT, [PNG], "")
+    [r] = flow.on_files(CHAT, [png()], "")
     assert "поступление — не записываю" in r.text
     assert db.expenses("2026-09") == [] and db.get_state(CHAT) == {}
 
@@ -73,7 +74,7 @@ def test_incoming_is_not_recorded(env):
 def test_foreign_currency_asks_rubles(env):
     db, rec, flow = env
     rec.payments.append(payment(currency="USD", amount="20"))
-    [q] = flow.on_files(CHAT, [PNG], "")
+    [q] = flow.on_files(CHAT, [png()], "")
     assert "USD" in q.text
     [again] = flow.on_text(CHAT, "двадцать")
     assert "Не понял" in again.text
@@ -84,7 +85,7 @@ def test_foreign_currency_asks_rubles(env):
 def test_missing_date_accepts_text(env):
     db, rec, flow = env
     rec.payments.append(payment(date=""))
-    [q] = flow.on_files(CHAT, [PNG], "")
+    [q] = flow.on_files(CHAT, [png()], "")
     assert "d:date:1" in buttons(q)
     flow.on_text(CHAT, "05.09")
     assert db.expenses("2026-09")[0].op_date == "2026-09-05"
@@ -93,11 +94,11 @@ def test_missing_date_accepts_text(env):
 def test_duplicate_detected(env):
     db, rec, flow = env
     rec.payments += [payment(), payment(), payment()]
-    flow.on_files(CHAT, [PNG], "")
-    [q] = flow.on_files(CHAT, [PNG], "")
+    flow.on_files(CHAT, [png()], "")
+    [q] = flow.on_files(CHAT, [png()], "")
     assert "уже записана" in q.text
     flow.on_button(CHAT, "d:skip")
-    flow.on_files(CHAT, [PNG], "")
+    flow.on_files(CHAT, [png()], "")
     flow.on_button(CHAT, "d:dup:ok")
     assert len(db.expenses("2026-09")) == 2
 
@@ -105,8 +106,8 @@ def test_duplicate_detected(env):
 def test_screenshots_queue_while_question_open(env):
     db, rec, flow = env
     rec.payments += [payment(card_last4="", bank=""), payment(amount="700", merchant="Ozon")]
-    flow.on_files(CHAT, [PNG], "")
-    [queued] = flow.on_files(CHAT, [PNG], "")
+    flow.on_files(CHAT, [png()], "")
+    [queued] = flow.on_files(CHAT, [png()], "")
     assert "в очереди: 1" in queued.text
     replies = flow.on_button(CHAT, f"d:card:{db.cards()[0].id}")
     assert [r.text.startswith("✅") for r in replies] == [True, True]
@@ -120,14 +121,14 @@ def test_text_expense_and_non_payment(env):
     rec.payments += [payment(), {**payment(), "is_payment": False}]
     flow.on_text(CHAT, "1500 сдэк вчера со сбера")
     assert rec.calls[0][1] == [] and len(db.expenses("2026-09")) == 1
-    [r] = flow.on_files(CHAT, [PNG], "")
+    [r] = flow.on_files(CHAT, [png()], "")
     assert "Не вижу" in r.text
 
 
 def test_edit_saved_expense(env):
     db, rec, flow = env
     rec.payments.append(payment())
-    flow.on_files(CHAT, [PNG], "")
+    flow.on_files(CHAT, [png()], "")
     eid = db.expenses("2026-09")[0].id
     [r] = flow.on_button(CHAT, f"e:purpose:{eid}:personal")
     assert db.expense(eid).purpose == PERSONAL and "Это бизнес" in str(r.buttons)
@@ -151,7 +152,7 @@ def test_no_cards_yet(tmp_path):
     rec = FakeRecognizer()
     flow = Flow(db, rec, str(tmp_path / "r"))
     rec.payments.append(payment())
-    [r] = flow.on_files(CHAT, [PNG], "")
+    [r] = flow.on_files(CHAT, [png()], "")
     assert "/addcard" in r.text
     flow.on_command(CHAT, "addcard", "Сбер 1111 Сбер")
     [saved] = flow.on_button(CHAT, "d:retry")
@@ -167,7 +168,7 @@ def test_pdf_outside_sverka_is_not_a_payment(env):
 def test_cancel_clears_queue(env):
     db, rec, flow = env
     rec.payments.append(payment(card_last4="", bank=""))
-    flow.on_files(CHAT, [PNG], "")
+    flow.on_files(CHAT, [png()], "")
     flow.on_command(CHAT, "cancel")
     assert db.get_state(CHAT) == {}
     [r] = flow.on_button(CHAT, "d:card:1")
