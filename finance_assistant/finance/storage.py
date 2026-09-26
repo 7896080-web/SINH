@@ -10,6 +10,8 @@ import sqlite3
 from dataclasses import dataclass
 
 BUSINESS, PERSONAL = "business", "personal"
+# Тип карты/счёта: личная карта владельца или расчётный счёт ИП (с бизнес-картой).
+PERSONAL_CARD, BUSINESS_ACCOUNT = "personal", "business"
 EXPENSE, REIMBURSEMENT = "expense", "reimbursement"
 
 DEFAULT_CATEGORIES = [
@@ -32,7 +34,8 @@ CREATE TABLE IF NOT EXISTS cards (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
     last4 TEXT NOT NULL DEFAULT '',  -- последние 4 цифры карт и счетов через пробел
-    bank TEXT NOT NULL DEFAULT ''
+    bank TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL DEFAULT 'personal' CHECK (kind IN ('personal', 'business'))
 );
 CREATE TABLE IF NOT EXISTS categories (
     id INTEGER PRIMARY KEY,
@@ -86,16 +89,22 @@ class Card:
     name: str
     last4: str
     bank: str
+    kind: str = PERSONAL_CARD
+
+    @property
+    def is_business(self) -> bool:
+        return self.kind == BUSINESS_ACCOUNT
 
     @property
     def numbers(self) -> list[str]:
         """У одной «карты» бывает несколько номеров: сама карта и её счёт
-        (ВТБ: «Карта для жизни •8445» и «Мастер-счет •2928» — одни деньги)."""
+        (ВТБ: «Карта для жизни •1234» и «Мастер-счет •5678» — одни деньги)."""
         return self.last4.split()
 
     @property
     def label(self) -> str:
-        return f"{self.name} ·{self.numbers[0]}" if self.numbers else self.name
+        base = f"{self.name} ·{self.numbers[0]}" if self.numbers else self.name
+        return base + (" (бизнес-счёт)" if self.is_business else "")
 
 
 @dataclass
@@ -111,6 +120,21 @@ class Expense:
     merchant: str
     description: str
     receipt_path: str
+    card_kind: str = PERSONAL_CARD
+
+    @property
+    def owed_effect(self) -> int:
+        """Насколько запись меняет долг бизнеса перед владельцем.
+
+        Бизнес-расход с личной карты — бизнес должен вернуть; возмещение и
+        личная трата с бизнес-счёта — владелец уже получил деньги бизнеса.
+        Бизнес-расход с бизнес-счёта долга не создаёт.
+        """
+        if self.kind == REIMBURSEMENT:
+            return -self.amount
+        if self.card_kind == BUSINESS_ACCOUNT:
+            return -self.amount if self.purpose == PERSONAL else 0
+        return self.amount if self.purpose == BUSINESS else 0
 
 
 @dataclass
@@ -145,7 +169,8 @@ class Storage:
 
     def _add_missing_columns(self):
         """Базы, созданные прошлыми версиями, дополняем новыми колонками."""
-        added = {("statement_lines", "suggested_category"): "TEXT NOT NULL DEFAULT ''",
+        added = {("cards", "kind"): "TEXT NOT NULL DEFAULT 'personal'",
+                 ("statement_lines", "suggested_category"): "TEXT NOT NULL DEFAULT ''",
                  ("statement_lines", "op_time"): "TEXT NOT NULL DEFAULT ''"}
         for (table, column), ddl in added.items():
             have = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
@@ -155,10 +180,12 @@ class Storage:
 
     # --- карты ---------------------------------------------------------
 
-    def add_card(self, name: str, last4: str = "", bank: str = "") -> Card:
+    def add_card(self, name: str, last4: str = "", bank: str = "",
+                 kind: str = PERSONAL_CARD) -> Card:
         with self.conn:
             cur = self.conn.execute(
-                "INSERT INTO cards (name, last4, bank) VALUES (?, ?, ?)", (name, last4, bank)
+                "INSERT INTO cards (name, last4, bank, kind) VALUES (?, ?, ?, ?)",
+                (name, last4, bank, kind),
             )
         return self.card(cur.lastrowid)
 
@@ -230,7 +257,7 @@ class Storage:
 
     _EXPENSE_SELECT = (
         "SELECT e.id, e.op_date, e.amount, e.kind, e.purpose, e.card_id, c.name AS card,"
-        " g.name AS category, e.merchant, e.description, e.receipt_path"
+        " g.name AS category, e.merchant, e.description, e.receipt_path, c.kind AS card_kind"
         " FROM expenses e JOIN cards c ON c.id = e.card_id"
         " LEFT JOIN categories g ON g.id = e.category_id"
     )
@@ -349,13 +376,10 @@ class Storage:
 
     def owed_until(self, month: str) -> int:
         """Долг бизнеса перед владельцем нарастающим итогом по конец месяца."""
-        row = self.conn.execute(
-            "SELECT COALESCE(SUM(CASE"
-            " WHEN kind = 'expense' AND purpose = 'business' THEN amount"
-            " WHEN kind = 'reimbursement' THEN -amount END), 0) AS owed"
-            " FROM expenses WHERE substr(op_date, 1, 7) <= ?", (month,)
-        ).fetchone()
-        return row["owed"]
+        rows = self.conn.execute(
+            self._EXPENSE_SELECT + " WHERE substr(e.op_date, 1, 7) <= ?", (month,)
+        ).fetchall()
+        return sum(Expense(**dict(r)).owed_effect for r in rows)
 
     # --- состояние диалога ---------------------------------------------
 

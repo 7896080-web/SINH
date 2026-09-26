@@ -60,9 +60,9 @@ def test_vtb_account_number_learned_after_one_question(banks):
 def test_rossiya_card_found_by_bank_then_account_remembered(banks):
     db, rec, flow = banks
     # «ABR Direct · Оплата по QR-коду через СБП · Сервисы Яндекса · −122 000,00 ₽ ·
-    #  Счет списания 40817…0723 · 24.09.2026, 17:58»
+    #  Счет списания 40817…9012 · 24.09.2026, 17:58»
     rec.payments.append(payment(amount="122000", date="2026-09-24",
-                                card_last4="40817810000000000723", bank="банк «Россия»",
+                                card_last4="40817810000000009012", bank="банк «Россия»",
                                 merchant="Сервисы Яндекса (АО Яндекс Банк)",
                                 description="оплата по QR-коду", category="Реклама и продвижение",
                                 category_confident=False))
@@ -72,7 +72,7 @@ def test_rossiya_card_found_by_bank_then_account_remembered(banks):
     assert "С какой карты" in q.text
     rossiya = next(c for c in db.cards() if c.name == "Россия")
     replies = flow.on_button(CHAT, f"d:card:{rossiya.id}")
-    assert "…0723" in replies[0].text
+    assert "…9012" in replies[0].text
     assert "✓ Реклама и продвижение" in str(replies[1].buttons)
 
 

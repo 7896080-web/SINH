@@ -30,7 +30,8 @@ def payment(**over):
     base = {"is_payment": True, "direction": "out", "amount": "1500.00", "currency": "RUB",
             "date": "2026-09-20", "card_last4": "1111", "bank": "Сбер", "merchant": "СДЭК",
             "description": "доставка", "category": "Логистика и доставка",
-            "category_confident": True, "looks_personal": False}
+            "category_confident": True, "looks_personal": False,
+            "from_business_account": False, "to_owner": False}
     base.update(over)
     return base
 
