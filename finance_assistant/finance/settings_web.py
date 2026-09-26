@@ -355,6 +355,7 @@ class SettingsHandler(BaseHTTPRequestHandler):
             topbar=TOPBAR.format(csrf=session["csrf"]), subtitle=SUBTITLE,
             script_nonce=f' nonce="{nonce}"', message=message, action="", csrf=session["csrf"],
             key_now=now("ANTHROPIC_API_KEY", "ключ"), token_now=now("TELEGRAM_BOT_TOKEN", "токен"),
+            test_now=setup_web.test_now(env),
             user1=html.escape(form.get("user1", ids[0] if ids else "")),
             user2=html.escape(form.get("user2", ids[1] if len(ids) > 1 else "")))
         # Форма шлёт на «/», проверка «кто писал» — на «/whois» (action="" → "/whois").
@@ -379,6 +380,7 @@ class SettingsHandler(BaseHTTPRequestHandler):
                         notes.append(f"{label}: {check(value)}")
                     except ValueError as exc:
                         errors.append(str(exc))
+        setup_web.test_bot_updates(form, env, token, self.server.checks, updates, errors, notes)
         if key:
             updates["ANTHROPIC_API_KEY"] = key
         if token:
@@ -393,7 +395,7 @@ class SettingsHandler(BaseHTTPRequestHandler):
             return
         write_env(self.server.env_path, updates)
         log.info("Настройки изменены (%s): %s", self.ip, ", ".join(sorted(updates)))
-        notes.append("Сохранено. Бот перезапустится сам примерно через 20 секунд.")
+        notes.append("Сохранено. Боты перезапустятся сами примерно через 20 секунд.")
         msg = "<div class='msg ok'>" + "<br>".join(html.escape(n) for n in notes) + "</div>"
         self._settings_page(session, msg)
 

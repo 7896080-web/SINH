@@ -1,0 +1,35 @@
+[Unit]
+Description=Finance assistant Telegram bot — TEST mode (separate bot and data)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=finance-bot
+WorkingDirectory=/opt/finance-bot
+# Часовой пояс по умолчанию («сегодня»/«вчера»); значение из .env его перекрывает.
+Environment=TZ=Europe/Moscow
+EnvironmentFile=/opt/finance-bot/.env
+# Бот следит за этим файлом: изменили на странице настроек — перезапустится сам.
+Environment=FINANCE_ENV_FILE=/opt/finance-bot/.env
+# Папка тестовых данных. Бот при запуске сверяет, что она не совпадает с боевой.
+Environment=FINANCE_TEST_DATA_DIR=/opt/finance-bot/data-test
+# Режим — аргументом, а не переменной в .env: правкой настроек его не переключить.
+# Пока токен тестового бота не вписан, служба просто ждёт настроек.
+ExecStart=/opt/finance-bot/venv/bin/python -m finance --test
+Restart=always
+RestartSec=10
+
+# База и скриншоты — только для пользователя службы (на сервере живут и другие службы).
+UMask=0077
+# Тестовый бот может писать только в папку тестовых данных: боевые базы ему недоступны.
+ProtectSystem=strict
+ReadWritePaths=/opt/finance-bot/data-test
+# Боевые базы для тестового бота не существуют вовсе — ни на запись, ни на чтение.
+InaccessiblePaths=-/opt/finance-bot/data
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

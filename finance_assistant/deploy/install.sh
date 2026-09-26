@@ -7,8 +7,8 @@
 # виртуальное окружение, службы systemd и ежедневный бэкап, кладёт .env-шаблон.
 # Пока в .env не вписаны токены, бот не запускается — скрипт скажет, что сделать.
 # Повторный запуск = обновление: код и зависимости заменяются, .env и данные
-# (data/ — базы и скриншоты пользователей) не трогаются. Перед обновлением
-# делается бэкап баз.
+# (data/ — базы и скриншоты пользователей, data-test/ — тестового бота)
+# не трогаются. Перед обновлением делается бэкап баз.
 set -euo pipefail
 
 APP=${APP:-/opt/finance-bot}
@@ -68,7 +68,7 @@ say "Ставлю зависимости (виртуальное окружен�
     || fail "код не импортируется — см. ошибку выше"
 
 say "Папка данных и настройки"
-mkdir -p "$APP/data"
+mkdir -p "$APP/data" "$APP/data-test"
 if [ ! -f "$APP/.env" ]; then
     cp "$SRC/.env.example" "$APP/.env"
     echo "   создан $APP/.env из шаблона — впишите токены (см. ниже)"
@@ -82,10 +82,10 @@ if [ "$SKIP_USER" != 1 ]; then
     else
         chown root:"$SERVICE_USER" "$APP/.env"
     fi
-    chown -R "$SERVICE_USER": "$APP/data"
+    chown -R "$SERVICE_USER": "$APP/data" "$APP/data-test"
 fi
 chmod 640 "$APP/.env"
-chmod 700 "$APP/data"
+chmod 700 "$APP/data" "$APP/data-test"
 
 env_value() { sed -n "s/^$1=//p" "$APP/.env" | tail -1 | tr -d '[:space:]"'"'"; }
 READY=1
@@ -101,8 +101,9 @@ NO_USERS=0
 
 if [ "$SKIP_SYSTEMD" != 1 ]; then
     say "Службы systemd"
-    cp "$APP/deploy/finance-bot.service" "$APP/deploy/finance-bot-backup.service" \
-       "$APP/deploy/finance-bot-backup.timer" "$SYSTEMD_DIR/"
+    cp "$APP/deploy/finance-bot.service" "$APP/deploy/finance-bot-test.service" \
+       "$APP/deploy/finance-bot-backup.service" "$APP/deploy/finance-bot-backup.timer" \
+       "$SYSTEMD_DIR/"
     systemctl daemon-reload
     systemctl enable --now finance-bot-backup.timer >/dev/null
     if systemctl is-enabled --quiet finance-bot-settings 2>/dev/null; then
@@ -112,6 +113,9 @@ if [ "$SKIP_SYSTEMD" != 1 ]; then
         systemctl restart finance-bot-settings
         echo "   страница настроек обновлена"
     fi
+    # Тестовый бот: пока его токен не вписан, служба просто ждёт настроек.
+    systemctl enable finance-bot-test >/dev/null
+    systemctl restart finance-bot-test
     systemctl enable finance-bot >/dev/null
     if [ "$READY" = 1 ]; then
         systemctl restart finance-bot
