@@ -236,12 +236,16 @@ def test_dispatch_closes_a_rejected_variant_at_once(db):
     assert bad.next_attempt_at is None
 
 
-def test_two_products_on_one_platform_card_do_not_kill_the_request(db):
-    """Пара товар+склад не может повторяться в одном запросе (`DUPLICATE_ITEM`),
-    а повтор уронил бы ВЕСЬ запрос. Дедупликация по uid_1c этого не ловит: два
-    разных товара 1С могут вести на одну карточку площадки. Число уезжает по
-    первому, второй закрывается внятным текстом — это дефект мэппинга, и решать
-    его человеку: продажи спишутся не на тот товар."""
+def test_two_products_on_one_platform_card_are_summed(db):
+    """Один и тот же физический товар бывает заведён в 1С двумя строками.
+
+    Пара товар+склад не может повторяться в одном запросе (`DUPLICATE_ITEM`), и
+    повтор уронил бы ВЕСЬ запрос, — значит карточка уходит ровно один раз. А
+    число по ней — СУММА: на складе лежит столько, сколько дают обе строки
+    вместе, и покупателю всё равно, какой из наших артикулов ему отгрузят.
+    Прежнее поведение (уезжает первый, второй в `error`) оставляло на витрине
+    половину остатка и называло это дефектом мэппинга.
+    """
     account = make_account(db, Platform.kit, name="КИТ", warehouse_id="wh-1")
     _catalogued(db, account, "u1", "111", variant_id="v-общий")
     _catalogued(db, account, "u2", "222")
@@ -253,11 +257,62 @@ def test_two_products_on_one_platform_card_do_not_kill_the_request(db):
     run_dispatch_cycle(db, {account.id: client}, [account])
 
     assert client.sent == [["v-общий"]], "карточка ушла ровно один раз"
-    statuses = {r.uid_1c: r.status for r in db.query(DispatchQueueItem).all()}
-    assert statuses["u1"] == DispatchStatus.sent
-    assert statuses["u2"] == DispatchStatus.error
-    second = db.query(DispatchQueueItem).filter(DispatchQueueItem.uid_1c == "u2").one()
-    assert "мэппинг" in second.last_error
+    rows = {r.uid_1c: r for r in db.query(DispatchQueueItem).all()}
+    assert rows["u1"].status == DispatchStatus.sent
+    assert rows["u2"].status == DispatchStatus.sent, "сосед уехал внутри суммы"
+    # По пять у каждого — на карточке десять.
+    assert rows["u1"].sent_quantity == 10
+    assert rows["u2"].sent_quantity == 10
+    # И из чего сложилось — сказано вслух: иначе сумма выглядит ошибкой расчёта
+    # по одной строке, и разобраться в ней потом нечем.
+    assert "ушла сумма 10" in rows["u1"].last_error
+    assert "u1 5" in rows["u1"].last_error and "u2 5" in rows["u1"].last_error
+
+
+def test_a_neighbour_that_is_not_in_the_queue_still_counts(db):
+    """Рассылка событийная: у соседа остаток мог не меняться месяцами.
+
+    Сложи мы только то, что лежит в очереди, — карточка получила бы вклад одной
+    строки вместо двух, то есть остаток соседа молча исчез бы с витрины. Это
+    ровно тот случай, ради которого слагаемые берутся из БАЗЫ.
+    """
+    account = make_account(db, Platform.kit, name="КИТ", warehouse_id="wh-1")
+    _catalogued(db, account, "u1", "111", variant_id="v-общий")
+    # Сосед настроен так же, но записи в очереди у него нет.
+    db.add(Product(uid_1c="u2", article="u2", name="Товар", stock_on_hand=7,
+                   broadcast_enabled=True, recalc_account_ids=str(account.id)))
+    db.add(Barcode(barcode="222", uid_1c="u2"))
+    db.add(SyncSetting(uid_1c="u2", account_id=account.id, enabled=True))
+    db.add(PlatformCatalogItem(account_id=account.id, external_id="v-общий",
+                               barcode="222", article="A", name="Та же карточка"))
+    db.commit()
+    client = _rejecting({})
+
+    run_dispatch_cycle(db, {account.id: client}, [account])
+
+    assert db.query(DispatchQueueItem).one().sent_quantity == 12   # 5 + 7
+
+
+def test_a_neighbour_behind_a_switch_adds_nothing(db):
+    """У соседа снята галочка кабинета — этой половиной мы не управляем.
+
+    Ошибка здесь обязана быть в безопасную сторону: на площадке окажется
+    меньше, чем лежит на складе (недопродажа), а не больше (оверселл).
+    """
+    account = make_account(db, Platform.kit, name="КИТ", warehouse_id="wh-1")
+    _catalogued(db, account, "u1", "111", variant_id="v-общий")
+    db.add(Product(uid_1c="u2", article="u2", name="Товар", stock_on_hand=7,
+                   broadcast_enabled=True, recalc_account_ids=str(account.id)))
+    db.add(Barcode(barcode="222", uid_1c="u2"))
+    db.add(SyncSetting(uid_1c="u2", account_id=account.id, enabled=False))
+    db.add(PlatformCatalogItem(account_id=account.id, external_id="v-общий",
+                               barcode="222", article="A", name="Та же карточка"))
+    db.commit()
+    client = _rejecting({})
+
+    run_dispatch_cycle(db, {account.id: client}, [account])
+
+    assert db.query(DispatchQueueItem).one().sent_quantity == 5
 
 
 def test_wb_still_sends_a_product_without_a_catalogue_row(db):

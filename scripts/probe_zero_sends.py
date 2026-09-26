@@ -30,7 +30,10 @@
 карточку площадки: тогда они пишут по очереди, и последний выигрывает — у
 одного остаток 20, у второго 0, на витрине 0. Снаружи это выглядит как «сами
 обнулились», и по одной строке не находится НИКОГДА: каждая из них про свой
-товар, и каждая по-своему права.
+товар, и каждая по-своему права. Считается раздел по ключу ТЕЛА ЗАПРОСА, а не
+по `sent_sku`: у WB там лежит баркод, а уезжает chrtId, и два РАЗНЫХ баркода,
+ведущие на один размер карточки, по `sent_sku` выглядят как разные ключи —
+раздел молчал бы ровно там, где он и нужен.
 
 Ничего не меняет и не коммитит.
 """
@@ -40,8 +43,11 @@ from datetime import timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.models import (AuditLog, DispatchQueueItem, PlatformAccount,  # noqa: E402
-                        Product, SyncSetting)
+from app.models import (AuditLog, DispatchQueueItem, Platform,  # noqa: E402
+                        PlatformAccount, Product, SyncSetting)
+from app.workers.dispatch import _resolve_push_target                  # noqa: E402
+from app.workers.platform_clients.base import StockPushItem            # noqa: E402
+from app.workers.platform_clients.wb import WbClient                   # noqa: E402
 from app.transmit import explain, sku_mode, MODE_OFFSET, MODE_OVERRIDE  # noqa: E402
 from app.database import SessionLocal                                  # noqa: E402
 from app.timeutils import now_utc                                      # noqa: E402
@@ -101,6 +107,37 @@ def _label(products: dict, uid: str) -> str:
     if p is None:
         return f"{uid} (товара в номенклатуре НЕТ)"
     return f"{p.article or '—'} {p.size or '—'} {p.color or '—'}"
+
+
+def _wire_key(db, account: PlatformAccount, uid: str, sent_sku: str,
+              cache: dict) -> str:
+    """Чем остаток РЕАЛЬНО адресован в теле запроса — не всегда `sent_sku`.
+
+    У Kit и Ozon это одно и то же: `sent_sku` и есть ключ тела (variant_id,
+    артикул). У WB — нет. Там `sent_sku` хранит БАРКОД, то есть то, чем
+    рассылка адресовала позицию, а в теле уезжает chrtId, и окончательный
+    выбор делает сам клиент, никому о нём не отчитываясь (см. `wb._chrt_id`).
+
+    Отсюда весь смысл этой функции. Два товара 1С с РАЗНЫМИ баркодами могут
+    вести на ОДИН размер карточки WB — тогда они пишут в одну и ту же ячейку
+    и затирают друг друга, а по `sent_sku` столкновения не видно вовсе: ключи
+    разные, раздел молчит. Молчащий раздел здесь хуже отсутствующего: по нему
+    делают вывод «два товара на одну карточку ни при чём» и начинают искать
+    беду в площадке.
+
+    Правило выбора берём У КЛИЕНТА, а не повторяем здесь. Повтори мы его,
+    раздел однажды обещал бы не то, что произойдёт при отправке.
+    """
+    if account.platform != Platform.wb:
+        return sent_sku
+    if uid not in cache:
+        target = _resolve_push_target(db, uid, account.id)
+        chrt = ""
+        if target is not None:
+            chrt = WbClient._chrt_id(StockPushItem(
+                barcode=target[0], quantity=0, external_id=target[1]))
+        cache[uid] = f"chrtId {chrt}" if chrt else ""
+    return cache[uid] or sent_sku
 
 
 def report(db, account: PlatformAccount, since, products_cache: dict,
@@ -168,11 +205,14 @@ def report(db, account: PlatformAccount, since, products_cache: dict,
               + ", ".join(f"{k}={v}" for k, v in sorted(nz_reason.items())))
 
     # Два товара на один ключ отправки. Ищем только среди УЖЕ отправленного:
-    # `sent_sku` пишется только уехавшим, и по нему видно, чем адресовали.
+    # `sent_sku` пишется только уехавшим.
     keys = {}
+    wire_cache: dict[str, str] = {}
     for r in rows:
-        if r.sent_sku:
-            keys.setdefault(r.sent_sku, set()).add(r.uid_1c)
+        if not r.sent_sku:
+            continue
+        keys.setdefault(_wire_key(db, account, r.uid_1c, r.sent_sku, wire_cache),
+                        set()).add(r.uid_1c)
     clashes = {k: v for k, v in keys.items() if len(v) > 1}
     if clashes:
         print("-" * 78)
@@ -181,9 +221,12 @@ def report(db, account: PlatformAccount, since, products_cache: dict,
         for key, group in sorted(clashes.items()):
             print(f"    ключ {key}:")
             for uid in sorted(group):
-                last = [r for r in rows if r.uid_1c == uid and r.sent_sku == key][-1]
+                last = [r for r in rows if r.uid_1c == uid
+                        and _wire_key(db, account, r.uid_1c, r.sent_sku or "",
+                                      wire_cache) == key][-1]
                 print(f"      {_label(products_cache, uid):40} "
-                      f"последнее ушло {last.sent_quantity} в {last.created_at}")
+                      f"последнее ушло {last.sent_quantity} в {last.created_at}"
+                      f"  (адресовали {last.sent_sku})")
 
     print("-" * 78)
     print(f"  ПОСЛЕДНИЕ НУЛИ (до {SHOW_ROWS}, время UTC):")

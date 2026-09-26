@@ -228,6 +228,15 @@
             {% else %}
                 <span class="pr-hint pr-hint--good">→ {{ state.quantity }}</span>
             {% endif %}
+            {# Один физический товар под двумя артикулами 1С — на площадке это
+               ОДНА карточка, и рассылка отправляет туда сумму. Без этой строки
+               число выше выглядит тем, что лежит на витрине, а там другое:
+               человек сверяет строку с кабинетом и не сходится. #}
+            {% if state.shares_with %}
+                <span class="pr-hint pr-hint--warn"
+                      title="На эту карточку площадки ведут несколько товаров 1С: {{ state.shares_with|join(', ') }}. Остаток на витрине — их сумма.">
+                    на карточке ещё {{ state.shares_with|join(', ') }}{% if state.cell_total is not none %} — уходит {{ state.cell_total }}{% endif %}</span>
+            {% endif %}
         </div>
         {% endfor %}
     </td>
