@@ -348,11 +348,11 @@ def build_app(token: str, flow_for, allowed: set[int], env_file: str | None = No
 
 
 def wait_for_settings(env_file: str | None, interval: float | None = None):
-    """Тестовый бот ещё не настроен: ждём, пока впишут его токен, и выходим —
-    systemd запустит заново уже с новыми настройками."""
+    """Бот ещё не настроен (нет токена) или настроен с ошибкой: ждём, пока
+    поменяют .env (например, на странице настроек), и выходим — systemd
+    запустит заново уже с новыми настройками. Без .env ждать нечего."""
     if not env_file:
-        raise SystemExit("Тестовый бот: не задан TELEGRAM_BOT_TOKEN_TEST")
-    log.info("Тестовый бот не настроен (нет TELEGRAM_BOT_TOKEN_TEST) — жду настроек")
+        raise SystemExit("Бот не настроен — см. ошибку выше")
     known = _mtime(env_file)
     while _mtime(env_file) == known:
         time.sleep(interval or ENV_CHECK_INTERVAL)
@@ -370,13 +370,13 @@ def main(argv=None):
     try:
         config = run_config(os.environ, test=args.test)
     except ValueError as exc:
-        if not args.test:
-            raise SystemExit(f"Ошибка настроек: {exc}")
-        # Тестовый бот неверно настроен — не бьёмся в перезапусках, ждём правки.
-        log.error("Тестовый бот не запущен: %s", exc)
+        # Не бьёмся в перезапусках: ждём, пока настройки поправят.
+        log.error("%s бот не запущен: %s — жду правки настроек",
+                  "Тестовый" if args.test else "Боевой", exc)
         wait_for_settings(env_file)
         return
     if config.is_test and not config.token:
+        log.info("Тестовый бот не настроен (нет TELEGRAM_BOT_TOKEN_TEST) — жду настроек")
         wait_for_settings(env_file)
         return
     if not config.user_ids:

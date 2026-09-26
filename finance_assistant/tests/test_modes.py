@@ -21,6 +21,7 @@ from test_settings_web import csrf_of, login, request, site  # noqa: F401 — ф
 PROD_TOKEN = "111:PROD-SECRET"
 TEST_TOKEN = "222:TEST-SECRET"
 ANNA, BORIS = 1001, 1002
+_real_wait = bot.wait_for_settings
 DEPLOY = Path(__file__).resolve().parent.parent / "deploy"
 
 
@@ -231,8 +232,14 @@ def test_misconfigured_test_bot_does_not_crash_loop(tmp_path, monkeypatch):
     monkeypatch.setattr(bot, "wait_for_settings", waited.append)
     bot.main(["--test"])
     assert waited == [str(env_file)]
-    with pytest.raises(SystemExit):                      # боевой с ошибкой — падает громко
-        monkeypatch.delenv("TELEGRAM_BOT_TOKEN")
+    # Боевой без токена (первая установка) тоже ждёт, пока его впишут на
+    # странице настроек, а не падает: иначе после сохранения его некому запустить.
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN")
+    bot.main([])
+    assert waited == [str(env_file)] * 2
+    monkeypatch.delenv("FINANCE_ENV_FILE")               # без .env ждать нечего
+    monkeypatch.setattr(bot, "wait_for_settings", _real_wait)
+    with pytest.raises(SystemExit):
         bot.main([])
 
 

@@ -117,8 +117,10 @@ if [ "$SKIP_SYSTEMD" != 1 ]; then
     systemctl enable finance-bot-test >/dev/null
     systemctl restart finance-bot-test
     systemctl enable finance-bot >/dev/null
+    # Без токена бот запускается и ждёт настроек: после сохранения на странице
+    # настроек он подхватит их сам.
+    systemctl restart finance-bot
     if [ "$READY" = 1 ]; then
-        systemctl restart finance-bot
         sleep 3
         if systemctl is-active --quiet finance-bot; then
             echo "   finance-bot запущен"
@@ -134,8 +136,8 @@ if [ "$READY" = 1 ] && [ "$NO_USERS" = 1 ]; then
     cat <<EOF
    1. Каждый из двух пользователей пишет боту в Telegram что угодно —
       бот ответит «Доступ закрыт. Ваш Telegram id: …».
-   2. Впишите оба id на странице настройки:
-        sudo bash $APP/deploy/setup.sh --public
+   2. Впишите оба id на странице настроек:
+        sudo bash $APP/deploy/settings.sh
       (первым — тот, кому достанутся данные прежней общей базы, если она была)
 EOF
 elif [ "$READY" = 1 ]; then
@@ -149,11 +151,11 @@ EOF
 else
     say "Осталось вписать настройки"
     cat <<EOF
-   Откройте страницу настройки — на ней ключ Claude API, токен бота и
-   Telegram id обоих пользователей (с кнопкой «Кто писал боту»):
+   Включите страницу настроек (спросит пароль и покажет адрес) — на ней
+   ключ Claude API, токен бота, токен тестового бота и Telegram id обоих
+   пользователей (с кнопкой «Кто писал боту»):
 
-      sudo bash $APP/deploy/setup.sh            — через SSH-туннель (надёжнее)
-      sudo bash $APP/deploy/setup.sh --public   — с телефона, по HTTPS
+      sudo bash $APP/deploy/settings.sh
 
    После сохранения бот запустится сам.
    (Или вручную: sudo nano $APP/.env и снова sudo bash deploy/install.sh)
