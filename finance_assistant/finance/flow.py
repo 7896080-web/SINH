@@ -16,11 +16,10 @@ from datetime import date, datetime, timedelta
 from .money import parse_amount
 from .recognize import RecognitionError
 from .report import (MONTHS, card_text, expense_card, expense_line, month_name, month_text,
-                     month_xlsx, owner_transfers_text, period_text, period_xlsx, rub,
+                     month_xlsx, period_text, period_xlsx, rub,
                      suggestions_text, unmatched_text)
 from .reconcile import summarize
-from .storage import (BUSINESS, BUSINESS_ACCOUNT, EXPENSE, PERSONAL, PERSONAL_CARD,
-                      REIMBURSEMENT, Storage)
+from .storage import BUSINESS, BUSINESS_ACCOUNT, EXPENSE, PERSONAL, PERSONAL_CARD, Storage
 
 log = logging.getLogger(__name__)
 
@@ -38,15 +37,15 @@ HELP = """\
 После выписки бот предложит списания, похожие на бизнес: записать все одной \
 кнопкой, лишние убрать /notbiz 12 15, недостающие добавить /biz 7 9.
 /itog — свод за месяц (/itog 2026-03), за год (/itog 2026) или период \
-(/itog 2026-01..2026-06): пришло/ушло, бизнес/личное, по статьям, \
-сколько бизнес должен вернуть; плюс Excel
+(/itog 2026-01..2026-06): по картам пришло/ушло, итог «ушло на бизнес» \
+по статьям и итог личных расходов; плюс Excel
 /vypiska 2026-03 — списания месяца, которые сейчас считаются личными
 
 Прочее:
 /list — записи за месяц (/list 2026-02) · /fix 42 — исправить запись
 /cards — мои карты · /addcard Название 1234 Банк · /delcard N
-/addcard ПСБ 4987 ПСБ бизнес — расчётный счёт ИП с бизнес-картой: траты с него \
-не добавляются к возмещению, а переводы с него вам его уменьшают
+/addcard ПСБ 4987 ПСБ бизнес — расчётный счёт ИП с бизнес-картой: всё, что \
+с него ушло (кроме переводов вам), — расходы бизнеса
 /cats — статьи · /addcat Название
 /cancel — сбросить текущий вопрос"""
 
@@ -337,18 +336,13 @@ class Flow:
     def _quiet_summary(self, ids: list[int]) -> list[Reply]:
         if not ids:
             return []
-        all_items = [self.db.expense(i) for i in ids]
-        items = [e for e in all_items if e.kind == EXPENSE]
-        back = [e for e in all_items if e.kind == REIMBURSEMENT]
+        items = [self.db.expense(i) for i in ids]
         lines = []
-        if back:
-            lines.append(f"✅ Учтено переводов вам: {len(back)} на {rub(sum(e.amount for e in back))}")
         by_cat: dict[str, int] = {}
         for e in items:
             by_cat[e.category or "Без статьи"] = by_cat.get(e.category or "Без статьи", 0) + e.amount
-        if items:
-            lines.append(f"✅ Записано как бизнес: {len(items)} на {rub(sum(e.amount for e in items))}")
-            lines += [f"  • {name}: {rub(total)}" for name, total in by_cat.items()]
+        lines.append(f"✅ Записано как бизнес: {len(items)} на {rub(sum(e.amount for e in items))}")
+        lines += [f"  • {name}: {rub(total)}" for name, total in by_cat.items()]
         lines.append("Поправить отдельную запись: /list месяц, затем /fix номер")
         return [Reply("\n".join(lines))]
 
@@ -405,24 +399,18 @@ class Flow:
                                  [[(c.label, f"d:card:{c.id}")] for c in cards]
                                  + [[("Отмена", "d:skip")]])
         card = self.db.card(d["card_id"])
-        if card.is_business and d["kind"] is None:
-            return "drop", Reply(head + "Это поступление на бизнес-счёт — такие не записываю: "
-                                        "учитываю только траты и переводы вам.")
-        if d.get("to_owner") and d["kind"] == EXPENSE:
-            if not card.is_business:
-                return "drop", Reply(head + "Это перевод между вашими счетами — не записываю.")
-            d["kind"] = REIMBURSEMENT  # с бизнес-счёта себе — бизнес вернул вам деньги
         if d["kind"] is None:
-            return "kind", Reply(
-                head + "Это поступление на карту. Что это?",
-                [[("Возмещение от бизнеса", "d:kind:reimb")],
-                 [("Не записывать", "d:skip")]])
-        if d["kind"] == EXPENSE and not d["purpose_asked"]:
+            return "drop", Reply(head + "Это поступление — не записываю: учитываю только "
+                                        "расходы, а поступления видны в выписке при сверке.")
+        if d.get("to_owner"):
+            return "drop", Reply(head + "Это перевод между вашими счетами — не расход, "
+                                        "не записываю.")
+        if not d["purpose_asked"]:
             where = " с бизнес-счёта" if card.is_business else ""
             return "purpose", Reply(head + f"Похоже на личную покупку{where}. Это расход бизнеса?",
                                     [[("Бизнес", "d:purpose:business"),
                                       ("Личное", "d:purpose:personal")]])
-        if (d["kind"] == EXPENSE and d["purpose"] == BUSINESS
+        if (d["purpose"] == BUSINESS
                 and (d["category_id"] is None or not d["category_confident"])):
             return "category", Reply(head + "Какая статья расходов?",
                                      self._category_buttons("d:cat:", d["category_id"]))
@@ -484,9 +472,7 @@ class Flow:
             self._pop_draft(state)
             self.db.set_state(chat_id, state)
             return [Reply("Не записываю.")] + self._advance(chat_id)
-        if what == "kind":
-            d["kind"] = REIMBURSEMENT
-        elif what == "date":
+        if what == "date":
             d["date"] = (self.today() - timedelta(days=int(value))).isoformat()
         elif what == "card":
             d["card_id"] = int(value)
@@ -593,9 +579,8 @@ class Flow:
             return [Reply(f"Добавил номера к карте «{name}»: {', '.join(numbers)}.")]
         card = self.db.add_card(name, " ".join(dict.fromkeys(numbers)), bank, kind)
         if card.is_business:
-            return [Reply(f"Добавил бизнес-счёт {card.label}. Расходы с него — деньги бизнеса: "
-                          "к возмещению не добавляются, а переводы с него вам уменьшают "
-                          "то, что бизнес вам должен.")]
+            return [Reply(f"Добавил бизнес-счёт {card.label}. Всё, что с него уходит "
+                          "(кроме переводов вам), считаю расходами бизнеса.")]
         return [Reply(f"Добавил карту {card.label}.")]
 
     def _del_card(self, chat_id, arg):
@@ -695,8 +680,6 @@ class Flow:
             return self._itog(chat_id, value)
         if what == "acc":
             return self._biz(chat_id, "все")
-        if what == "reimb":
-            return self._owner_transfers(chat_id)
         if what == "reset" and state.get("statement", {}).get("month"):
             st = state["statement"]
             self.db.reset_statement(st["card_id"], st["month"])
@@ -786,32 +769,27 @@ class Flow:
             return [Reply("Выписка не была загружена.")]
 
         card = self.db.card(st["card_id"])
-        replies, suggestions, unmatched, to_owner = [], [], [], []
+        replies, suggestions, unmatched = [], [], []
         for month in months:
             cs = next(c for c in summarize(self.db, month).cards if c.card.id == card.id)
             replies.append(Reply(card_text(cs, month)))
             if card.is_business:
-                # С бизнес-счёта всё — расходы бизнеса; предлагаем записать их все.
+                # С бизнес-счёта всё — расходы бизнеса; предлагаем разнести по статьям.
                 suggestions += cs.unmatched_out
-                to_owner += cs.unmatched_own_out
             else:
                 suggestions += [ln for ln in cs.unmatched_out if ln.suggested_category]
                 unmatched += [ln for ln in cs.unmatched_out if not ln.suggested_category]
 
         state["review"] = [ln.id for ln in suggestions]
-        state["review_owner"] = [ln.id for ln in to_owner]
-        for key in ("review", "review_owner"):
-            if not state[key]:
-                del state[key]
+        if not state["review"]:
+            del state["review"]
         self.db.set_state(chat_id, state)
-        if to_owner:
-            replies.append(Reply(owner_transfers_text(to_owner),
-                                 [[("✅ Учесть как возмещение", "s:reimb")]]))
         if suggestions and card.is_business:
             replies.append(Reply(
-                suggestions_text(suggestions, "📋 Расходы с бизнес-счёта без записи")
-                + "\n\nБез статьи — запишу в «Прочее», поправить потом: /fix номер",
-                [[("✅ Записать по статьям", "s:acc")]]))
+                suggestions_text(suggestions, "📋 Расходы с бизнес-счёта без статьи")
+                + "\n\nВ своде они уже входят в бизнес как «Без статьи». Кнопка разнесёт их "
+                  "по предложенным статьям (нераспознанные — в «Прочее»), поправить: /fix номер",
+                [[("✅ Разнести по статьям", "s:acc")]]))
         elif suggestions:
             replies.append(Reply(suggestions_text(suggestions),
                                  [[("✅ Записать все как бизнес", "s:acc")]]))
@@ -855,13 +833,12 @@ class Flow:
         first, last = period
         if first == last:
             summary = summarize(self.db, first)
-            return [Reply(month_text(summary, self.db.owed_until(first)),
+            return [Reply(month_text(summary),
                           file=(f"свод-{first}.xlsx", month_xlsx(summary)))]
         months = _months_between(first, last)
         summaries = [summarize(self.db, m) for m in months]
-        owed = self.db.owed_until(last)
-        return [Reply(period_text(summaries, owed),
-                      file=(f"свод-{first}--{last}.xlsx", period_xlsx(summaries, owed)))]
+        return [Reply(period_text(summaries),
+                      file=(f"свод-{first}--{last}.xlsx", period_xlsx(summaries)))]
 
     def _biz(self, chat_id, arg):
         """Отметить строки выписки как бизнес-расходы.
@@ -903,26 +880,6 @@ class Flow:
         self.db.set_state(chat_id, state)
         return self._advance(chat_id)
 
-    def _owner_transfers(self, chat_id):
-        """Переводы с бизнес-счёта владельцу из выписки → записи-возмещения."""
-        state = self.db.get_state(chat_id)
-        ids = state.pop("review_owner", [])
-        for line_id in ids:
-            row = self.db.statement_line(line_id)
-            if not row:
-                continue
-            state.setdefault("drafts", []).append({
-                "amount": row["amount"], "date": row["op_date"], "card_id": row["card_id"],
-                "kind": REIMBURSEMENT, "purpose": BUSINESS, "purpose_asked": True,
-                "category_id": None, "category_confident": True,
-                "merchant": row["description"], "description": "перевод вам, по выписке",
-                "receipt": "", "note": "", "dup_checked": False, "quiet": True,
-            })
-        self.db.set_state(chat_id, state)
-        if not ids:
-            return [Reply("Нет переводов для учёта. Сначала загрузите выписку: /sverka")]
-        return self._advance(chat_id)
-
     def _notbiz(self, chat_id, arg):
         ids = [int(x) for x in arg.replace(",", " ").split() if x.isdigit()]
         if not ids:
@@ -930,10 +887,6 @@ class Flow:
         state = self.db.get_state(chat_id)
         for line_id in ids:
             self.db.clear_suggestion(line_id)
-        if "review_owner" in state:
-            state["review_owner"] = [i for i in state["review_owner"] if i not in ids]
-            if not state["review_owner"]:
-                del state["review_owner"]
         left = [i for i in state.get("review", []) if i not in ids]
         state["review"] = left
         if not left:

@@ -38,8 +38,8 @@ def test_full_month(env):
            category="Реклама и продвижение")                                        # найдётся (+2 дня)
     record(db, rec, flow, amount="999", date="2026-09-11", merchant="Где-то")      # не найдётся
     rec.payments.append(payment(direction="in", amount="2000", date="2026-09-25"))
-    flow.on_files(CHAT, [PNG], "")
-    flow.on_button(CHAT, "d:kind:reimb")
+    [skip] = flow.on_files(CHAT, [PNG], "")
+    assert "поступление — не записываю" in skip.text
 
     start_sverka(flow, db)
     rec.statements.append(statement([
@@ -67,8 +67,13 @@ def test_full_month(env):
     assert "Тинькофф" in nxt.text
 
     [itog] = flow.on_command(CHAT, "itog", "2026-09")
-    assert "Бизнес должен вам за месяц: 3 499,00 ₽" in itog.text
-    assert "Реклама и продвижение: 3 000,00 ₽" in itog.text
+    assert "💼 Ушло на бизнес: 5 499,00 ₽" in itog.text
+    assert "• Реклама и продвижение: 3 000,00 ₽" in itog.text
+    assert "• Логистика и доставка: 2 499,00 ₽" in itog.text
+    # Личное: Сбер 3 201 по выписке; у Тинькофф и Альфа выписок нет.
+    assert "🏠 Личные расходы: 3 201,00 ₽" in itog.text
+    assert "без выписки, личное не посчитано: Тинькофф ·2222, Альфа ·3333" in itog.text
+    assert "должен" not in itog.text
     name, data = itog.file
     wb = load_workbook(io.BytesIO(data))
     assert wb.sheetnames == ["Свод", "Бизнес-расходы", "Не найдено в выписке"]
@@ -136,7 +141,7 @@ def test_itog_without_statements_and_default_month(env):
     record(db, rec, flow)
     [r] = flow.on_command(CHAT, "itog")
     assert "сентябрь 2026" in r.text and "(нет выписки)" in r.text
-    assert "Бизнес должен вам за месяц: 1 500,00 ₽" in r.text
+    assert "💼 Ушло на бизнес: 1 500,00 ₽" in r.text and "🏠 Личные расходы: 0,00 ₽" in r.text
 
 
 def _e(i, d, amount, kind="expense"):
@@ -149,12 +154,12 @@ def _l(i, d, amount, direction="out"):
 
 def test_match_rules():
     exps = [_e(1, "2026-09-10", 100), _e(2, "2026-09-10", 100), _e(3, "2026-09-10", 100),
-            _e(4, "2026-09-10", 500, "reimbursement")]
+            _e(4, "2026-09-10", 500)]
     lines = [_l(10, "2026-09-14", 100), _l(11, "2026-09-11", 100), _l(12, "2026-09-09", 100),
              _l(13, "2026-09-10", 500, "in")]
     pairs, missing = match(exps, lines)
-    assert pairs == {1: 11, 2: 12, 4: 13}  # 14-е — дальше 3 дней
-    assert [e.id for e in missing] == [3]
+    assert pairs == {1: 11, 2: 12}  # 14-е — дальше 3 дней; зачисление расходу не пара
+    assert [e.id for e in missing] == [3, 4]
 
 
 def test_bad_command_args(env):

@@ -42,19 +42,18 @@ def test_addcard_business_and_cards_list(biz):
     assert "🏦 ПСБ (ПСБ) — бизнес-счёт" in r.text and "💳 ВТБ" in r.text
 
 
-def test_payment_order_goes_to_business_account_and_not_owed(biz):
+def test_payment_order_goes_to_business_account(biz):
     db, rec, flow = biz
     rec.payments.append(kontur())
     [saved] = flow.on_files(CHAT, [PNG], "")
-    assert saved.text.startswith("✅ Записано")
-    assert "к возмещению не добавляется" in saved.text
+    assert saved.text.startswith("✅ Записано") and "ПСБ" in saved.text
+    assert "Бизнес · Связь, сервисы, подписки" in saved.text
     assert card(db, "ПСБ").numbers == ["0000"]  # номер счёта запомнен
-    assert db.owed_until("2026-07") == 0
 
 
 def test_b2c_transfer_to_other_person_is_business_expense(biz):
     db, rec, flow = biz
-    # «Перевод через СБП (B2C) по номеру телефона · Получатель ПЕТРОВ П. П. · 20 000,00 ₽»
+    # «Перевод через СБП (B2C) по номеру телефона · Получатель — другой человек · 20 000,00 ₽»
     rec.payments.append(kontur(amount="20000", date="2026-08-07", merchant="Петров П. П.",
                                description="перевод по номеру телефона",
                                category="Подрядчики и зарплата", category_confident=False))
@@ -62,42 +61,19 @@ def test_b2c_transfer_to_other_person_is_business_expense(biz):
     assert "статья" in q.text.lower()
     flow.on_button(CHAT, f"d:cat:{db.category_id('Подрядчики и зарплата')}")
     [e] = db.expenses("2026-08")
-    assert e.card == "ПСБ" and e.category == "Подрядчики и зарплата" and e.owed_effect == 0
+    assert e.card == "ПСБ" and e.category == "Подрядчики и зарплата"
 
 
-def test_transfer_to_owner_from_business_is_reimbursement(biz):
+def test_transfer_to_owner_and_income_not_recorded(biz):
     db, rec, flow = biz
-    rec.payments.append(payment(card_last4="5501", bank="ВТБ", amount="10000",
-                                date="2026-09-03", category="Реклама и продвижение"))
-    flow.on_files(CHAT, [PNG], "")
-    rec.payments.append(kontur(amount="3000", date="2026-09-10", merchant="Иванов И. И.",
-                               to_owner=True, category="", category_confident=False))
-    [saved] = flow.on_files(CHAT, [PNG], "")
-    assert "Перевод вам с бизнес-счёта" in saved.text
-    rec.payments.append(kontur(amount="500", date="2026-09-11", looks_personal=True))
-    flow.on_files(CHAT, [PNG], "")
-    [q_reply] = flow.on_button(CHAT, "d:purpose:personal")
-    assert "Личное из денег бизнеса" in q_reply.text
-    rec.payments.append(kontur(amount="2950", date="2026-09-12"))
-    flow.on_files(CHAT, [PNG], "")
-
-    s = summarize(db, "2026-09")
-    assert (s.business, s.business_account_spent, s.reimbursed, s.owed) == (
-        1000000, 295000, 350000, 650000)
-    [itog] = flow.on_command(CHAT, "itog", "2026-09")
-    assert "🏦 ПСБ" in itog.text and "Расходы с бизнес-счёта (записанные): 2 950,00 ₽" in itog.text
-    assert "Бизнес должен вам за месяц: 6 500,00 ₽" in itog.text
-    assert db.owed_until("2026-09") == 650000
-
-
-def test_income_to_business_account_not_recorded(biz):
-    db, rec, flow = biz
-    # «ЮЖНЫЙ Ф-Л ПАО "Банк ПСБ" +236 ₽ · Начисление кэшбэка по бизнес-карте»
-    rec.payments.append(kontur(direction="in", amount="236", merchant="Банк ПСБ",
-                               description="кэшбэк по бизнес-карте"))
+    rec.payments.append(kontur(amount="3000", merchant="Иванов И. И.", to_owner=True))
     [r] = flow.on_files(CHAT, [PNG], "")
-    assert "поступление на бизнес-счёт" in r.text and db.expenses("2026-07") == []
-    assert db.get_state(CHAT) == {}
+    assert "перевод между вашими счетами" in r.text
+    # «ЮЖНЫЙ Ф-Л ПАО "Банк ПСБ" +236 ₽ · Начисление кэшбэка по бизнес-карте»
+    rec.payments.append(kontur(direction="in", amount="236", merchant="Банк ПСБ"))
+    [r] = flow.on_files(CHAT, [PNG], "")
+    assert "поступление — не записываю" in r.text
+    assert db.expenses("2026-07") == [] and db.get_state(CHAT) == {}
 
 
 def test_transfer_between_own_personal_accounts_not_recorded(biz):
@@ -105,6 +81,29 @@ def test_transfer_between_own_personal_accounts_not_recorded(biz):
     rec.payments.append(payment(card_last4="5501", to_owner=True))
     [r] = flow.on_files(CHAT, [PNG], "")
     assert "между вашими счетами" in r.text and db.expenses("2026-09") == []
+
+
+def test_month_totals_business_by_category_and_personal(biz):
+    db, rec, flow = biz
+    rec.payments.append(payment(card_last4="5501", bank="ВТБ", amount="10000",
+                                date="2026-09-03", category="Реклама и продвижение"))
+    flow.on_files(CHAT, [PNG], "")
+    rec.payments.append(kontur(amount="500", date="2026-09-11", looks_personal=True))
+    flow.on_files(CHAT, [PNG], "")
+    [saved] = flow.on_button(CHAT, "d:purpose:personal")
+    assert "Личное (с бизнес-счёта)" in saved.text
+    rec.payments.append(kontur(amount="2950", date="2026-09-12"))
+    flow.on_files(CHAT, [PNG], "")
+
+    s = summarize(db, "2026-09")
+    assert (s.business, s.personal) == (1295000, 50000)
+    assert s.by_category == {"Реклама и продвижение": 1000000, "Связь, сервисы, подписки": 295000}
+    [itog] = flow.on_command(CHAT, "itog", "2026-09")
+    assert "💼 Ушло на бизнес: 12 950,00 ₽" in itog.text
+    assert "• Реклама и продвижение: 10 000,00 ₽" in itog.text
+    assert "🏠 Личные расходы: 500,00 ₽" in itog.text
+    assert "без выписки, личное не посчитано: ВТБ ·5501" in itog.text
+    assert "должен" not in itog.text
 
 
 def test_business_account_sverka(biz):
@@ -129,21 +128,16 @@ def test_business_account_sverka(biz):
     replies = flow.on_command(CHAT, "done")
     text = "\n".join(r.text for r in replies)
     assert "🏦 ПСБ ·0000 (бизнес-счёт) — сентябрь 2026" in text
-    assert "переведено вам: 5 000,00 ₽" in text and "расходы бизнеса: 22 950,00 ₽" in text
-    assert "на личное" not in text
-    [owner] = [r for r in replies if r.text.startswith("💸")]
+    assert "переведено вам: 5 000,00 ₽" in text
+    # Всё, что ушло, кроме перевода себе, — бизнес, даже без статьи.
+    assert "на бизнес: 22 950,00 ₽" in text and "• Без статьи: 20 000,00 ₽" in text
+    assert "возмещ" not in text.lower()
     [spend] = [r for r in replies if r.text.startswith("📋")]
     assert "Петров" in spend.text and "Контур" not in spend.text  # Контур уже записан
-    assert "→ Прочее" in spend.text
 
-    [back] = flow.on_button(CHAT, "s:reimb")
-    assert back.text.startswith("✅ Учтено переводов вам: 1 на 5 000,00 ₽")
-    [rec_spend] = flow.on_button(CHAT, "s:acc")
-    assert "Прочее: 20 000,00 ₽" in rec_spend.text
-
+    [done] = flow.on_button(CHAT, "s:acc")
+    assert "Прочее: 20 000,00 ₽" in done.text
     s = summarize(db, "2026-09")
     cs = s.business_accounts[0]
-    assert (cs.business, cs.reimbursed, cs.missing, cs.unmatched_out, cs.unmatched_own_out) == (
-        2295000, 500000, [], [], [])
-    assert s.total("total_out") is None  # бизнес-счёт не входит в итоги по личным картам
-    assert db.owed_until("2026-09") == -500000  # бизнес перевёл вам больше, чем вы потратили за него
+    assert (cs.business, cs.personal, cs.missing, cs.unmatched_out) == (2295000, 0, [], [])
+    assert s.by_category == {"Прочее": 2000000, "Связь, сервисы, подписки": 295000}

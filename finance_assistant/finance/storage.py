@@ -1,8 +1,8 @@
 """SQLite-хранилище: карты, статьи, расходы, выписки, состояние диалога.
 
-Суммы — положительные копейки (int). Направление задаёт kind:
-  expense        — оплата с личной карты (purpose: business | personal);
-  reimbursement  — бизнес вернул деньги на личную карту.
+Суммы — положительные копейки (int). Записываются только расходы
+(kind = expense, purpose: business | personal). Поступления и переводы между
+своими счетами не записываются — они видны в выписке.
 """
 
 import json
@@ -12,6 +12,8 @@ from dataclasses import dataclass
 BUSINESS, PERSONAL = "business", "personal"
 # Тип карты/счёта: личная карта владельца или расчётный счёт ИП (с бизнес-картой).
 PERSONAL_CARD, BUSINESS_ACCOUNT = "personal", "business"
+# reimbursement — записи прежней версии («возмещение от бизнеса»); новые не создаются,
+# в итоги не входят.
 EXPENSE, REIMBURSEMENT = "expense", "reimbursement"
 
 DEFAULT_CATEGORIES = [
@@ -121,20 +123,6 @@ class Expense:
     description: str
     receipt_path: str
     card_kind: str = PERSONAL_CARD
-
-    @property
-    def owed_effect(self) -> int:
-        """Насколько запись меняет долг бизнеса перед владельцем.
-
-        Бизнес-расход с личной карты — бизнес должен вернуть; возмещение и
-        личная трата с бизнес-счёта — владелец уже получил деньги бизнеса.
-        Бизнес-расход с бизнес-счёта долга не создаёт.
-        """
-        if self.kind == REIMBURSEMENT:
-            return -self.amount
-        if self.card_kind == BUSINESS_ACCOUNT:
-            return -self.amount if self.purpose == PERSONAL else 0
-        return self.amount if self.purpose == BUSINESS else 0
 
 
 @dataclass
@@ -373,13 +361,6 @@ class Storage:
             " UNION SELECT month FROM statements ORDER BY m"
         ).fetchall()
         return [r["m"] for r in rows]
-
-    def owed_until(self, month: str) -> int:
-        """Долг бизнеса перед владельцем нарастающим итогом по конец месяца."""
-        rows = self.conn.execute(
-            self._EXPENSE_SELECT + " WHERE substr(e.op_date, 1, 7) <= ?", (month,)
-        ).fetchall()
-        return sum(Expense(**dict(r)).owed_effect for r in rows)
 
     # --- состояние диалога ---------------------------------------------
 
