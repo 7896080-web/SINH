@@ -90,14 +90,33 @@ CREATE TABLE IF NOT EXISTS transfers (
     to_card_id INTEGER REFERENCES cards(id),
     description TEXT NOT NULL DEFAULT '',
     receipt_path TEXT NOT NULL DEFAULT '',
+    seen_out INTEGER NOT NULL DEFAULT 0,  -- присылали скриншот списания
+    seen_in INTEGER NOT NULL DEFAULT 0,   -- присылали скриншот зачисления
     CHECK (from_card_id IS NOT NULL OR to_card_id IS NOT NULL)
 );
 CREATE INDEX IF NOT EXISTS ix_transfers_date ON transfers(op_date);
+-- Отпечатки уже обработанных файлов: тот же скриншот или выписку узнаём до
+-- обращения к Claude. key — sha256 содержимого или id файла в Telegram;
+-- ref — что из него получилось: "e:12" (расход), "t:3" (перевод),
+-- "s:<карта>:<месяц|period>" (выписка).
+CREATE TABLE IF NOT EXISTS seen_files (
+    key TEXT NOT NULL,
+    ref TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (key, ref)
+);
 CREATE TABLE IF NOT EXISTS chat_state (
     chat_id INTEGER PRIMARY KEY,
     state TEXT NOT NULL
 );
 """
+
+
+def _merchant_key(name: str) -> str:
+    """«ООО „СДЭК-Глобал“» и «сдэк глобал» — один получатель."""
+    text = "".join(ch for ch in (name or "").lower() if ch.isalnum() or ch == " ")
+    words = [w for w in text.split() if w not in ("ооо", "ао", "пао", "ип", "зао", "оао")]
+    return "".join(words)
 
 
 @dataclass
@@ -191,7 +210,9 @@ class Storage:
         """Базы, созданные прошлыми версиями, дополняем новыми колонками."""
         added = {("cards", "kind"): "TEXT NOT NULL DEFAULT 'personal'",
                  ("statement_lines", "suggested_category"): "TEXT NOT NULL DEFAULT ''",
-                 ("statement_lines", "op_time"): "TEXT NOT NULL DEFAULT ''"}
+                 ("statement_lines", "op_time"): "TEXT NOT NULL DEFAULT ''",
+                 ("transfers", "seen_out"): "INTEGER NOT NULL DEFAULT 0",
+                 ("transfers", "seen_in"): "INTEGER NOT NULL DEFAULT 0"}
         for (table, column), ddl in added.items():
             have = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
             if column not in have:
@@ -273,6 +294,8 @@ class Storage:
             )
 
     def delete_expense(self, expense_id: int) -> bool:
+        # Удалили запись — тот же скриншот снова можно прислать и записать.
+        self.forget_ref(f"e:{expense_id}")
         with self.conn:
             return self.conn.execute("DELETE FROM expenses WHERE id = ?", (expense_id,)).rowcount > 0
 
@@ -296,12 +319,46 @@ class Storage:
         sql += " ORDER BY e.op_date, e.id"
         return [Expense(**dict(r)) for r in self.conn.execute(sql, params)]
 
-    def find_duplicate(self, *, op_date, amount, card_id) -> Expense | None:
-        row = self.conn.execute(
-            self._EXPENSE_SELECT + " WHERE e.op_date = ? AND e.amount = ? AND e.card_id = ?",
-            (op_date, amount, card_id),
-        ).fetchone()
-        return Expense(**dict(row)) if row else None
+    def find_duplicates(self, *, op_date, amount, card_id, merchant="") -> list[Expense]:
+        """Похожие записи: та же сумма, дата ±1 день (банк может провести оплату
+        на следующий день) и та же карта — или тот же получатель, если карту
+        при первой записи выбрали другую."""
+        rows = self.conn.execute(
+            self._EXPENSE_SELECT + " WHERE e.amount = ?"
+            " AND abs(julianday(e.op_date) - julianday(?)) <= 1 ORDER BY e.id",
+            (amount, op_date),
+        ).fetchall()
+        key = _merchant_key(merchant)
+        return [Expense(**dict(r)) for r in rows
+                if r["card_id"] == card_id or (key and _merchant_key(r["merchant"]) == key)]
+
+    # --- отпечатки файлов ----------------------------------------------
+
+    def remember_files(self, keys: list[str], ref: str):
+        with self.conn:
+            self.conn.executemany("INSERT OR IGNORE INTO seen_files (key, ref) VALUES (?, ?)",
+                                  [(k, ref) for k in keys])
+
+    def seen_refs(self, keys: list[str], prefix: str) -> list[str]:
+        """Во что уже превращался файл с любым из этих отпечатков (только живые ссылки)."""
+        if not keys:
+            return []
+        rows = self.conn.execute(
+            f"SELECT DISTINCT ref FROM seen_files WHERE key IN ({','.join('?' * len(keys))})"
+            " AND ref LIKE ? ORDER BY created_at, ref", (*keys, prefix + "%"),
+        ).fetchall()
+        refs = []
+        for (ref,) in rows:
+            kind, _, rest = ref.partition(":")
+            alive = (kind == "e" and self.expense(int(rest))) or \
+                    (kind == "t" and self.transfer(int(rest))) or kind == "s"
+            if alive:
+                refs.append(ref)
+        return refs
+
+    def forget_ref(self, ref: str):
+        with self.conn:
+            self.conn.execute("DELETE FROM seen_files WHERE ref = ?", (ref,))
 
     # --- переводы между своими счетами --------------------------------
 
@@ -313,14 +370,25 @@ class Storage:
     )
 
     def add_transfer(self, *, op_date, amount, from_card_id, to_card_id, description="",
-                     receipt_path="") -> int:
+                     receipt_path="", seen_side: str = "") -> int:
         with self.conn:
             cur = self.conn.execute(
                 "INSERT INTO transfers (op_date, amount, from_card_id, to_card_id, description,"
-                " receipt_path) VALUES (?, ?, ?, ?, ?, ?)",
-                (op_date, amount, from_card_id, to_card_id, description, receipt_path),
+                " receipt_path, seen_out, seen_in) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (op_date, amount, from_card_id, to_card_id, description, receipt_path,
+                 int(seen_side == "out"), int(seen_side == "in")),
             )
         return cur.lastrowid
+
+    def transfer_seen_sides(self, transfer_id: int) -> set[str]:
+        row = self.conn.execute("SELECT seen_out, seen_in FROM transfers WHERE id = ?",
+                                (transfer_id,)).fetchone()
+        return {s for s, flag in (("out", row["seen_out"]), ("in", row["seen_in"])) if flag}
+
+    def mark_transfer_seen(self, transfer_id: int, side: str):
+        column = {"out": "seen_out", "in": "seen_in"}[side]
+        with self.conn:
+            self.conn.execute(f"UPDATE transfers SET {column} = 1 WHERE id = ?", (transfer_id,))
 
     def transfer(self, transfer_id: int) -> Transfer | None:
         row = self.conn.execute(self._TRANSFER_SELECT + " WHERE t.id = ?", (transfer_id,)).fetchone()
@@ -355,6 +423,7 @@ class Storage:
                               (*fields.values(), transfer_id))
 
     def delete_transfer(self, transfer_id: int) -> bool:
+        self.forget_ref(f"t:{transfer_id}")
         with self.conn:
             return self.conn.execute("DELETE FROM transfers WHERE id = ?",
                                      (transfer_id,)).rowcount > 0
@@ -371,6 +440,7 @@ class Storage:
         ).fetchone()["id"]
 
     def reset_statement(self, card_id: int, month: str):
+        self.forget_ref(f"s:{card_id}:{month}")
         with self.conn:
             self.conn.execute(
                 "DELETE FROM statements WHERE card_id = ? AND month = ?", (card_id, month)

@@ -8,6 +8,7 @@
   sverka     — {"month"} между выбором месяца и выбором карты.
 """
 
+import hashlib
 import logging
 import os
 from dataclasses import dataclass, field
@@ -103,6 +104,11 @@ def _parse_period_arg(arg: str, today: date) -> tuple[str, str] | None:
     return (month, month) if month else None
 
 
+def _file_keys(files: list[tuple[bytes, str]], file_ids: list[str] | None) -> list[str]:
+    keys = [f"sha:{hashlib.sha256(data).hexdigest()}" for data, _ in files]
+    return keys + [f"tg:{fid}" for fid in file_ids or [] if fid]
+
+
 def _hhmm(text: str) -> str:
     try:
         return datetime.strptime((text or "").strip()[:5], "%H:%M").strftime("%H:%M")
@@ -190,16 +196,37 @@ class Flow:
         return handler(chat_id, arg.strip())
 
     def on_files(self, chat_id: int, files: list[tuple[bytes, str]], caption: str = "",
-                 filename: str = "") -> list[Reply]:
-        """Фото или документ. В режиме сверки — часть выписки, иначе — платёж."""
+                 filename: str = "", file_ids: list[str] | None = None) -> list[Reply]:
+        """Фото или документ. В режиме сверки — часть выписки, иначе — платёж.
+
+        file_ids — постоянные id файлов в Telegram (file_unique_id): по ним
+        узнаём пересланный повторно файл, даже если Telegram пережал картинку.
+        """
+        keys = _file_keys(files, file_ids)
         state = self.db.get_state(chat_id)
         if "statement" in state:
-            return self._statement_input(chat_id, state, files, caption)
+            return self._statement_input(chat_id, state, files, caption, keys)
         if any(mime not in ("image/jpeg", "image/png", "image/webp") for _, mime in files):
             return [Reply("Похоже на выписку. Чтобы загрузить её для сверки, "
                           "сначала отправьте /sverka.")]
+        repeat = self._seen_payment(state, keys)
+        if repeat:
+            return repeat
         receipt = self._save_receipt(files[0][0], files[0][1])
-        return self._recognize_payment(chat_id, files, caption, receipt)
+        return self._recognize_payment(chat_id, files, caption, receipt, keys)
+
+    def _seen_payment(self, state: dict, keys: list[str]) -> list[Reply] | None:
+        """Этот же скриншот уже записан или ждёт в очереди — не распознаём заново."""
+        if any(set(keys) & set(d.get("file_keys", [])) for d in state.get("drafts", [])):
+            return [Reply("Этот скриншот уже в работе — ответьте на вопрос по нему выше.")]
+        refs = self.db.seen_refs(keys, "e:") + self.db.seen_refs(keys, "t:")
+        if not refs:
+            return None
+        kind, _, ref_id = refs[0].partition(":")
+        saved = (self._saved_reply(int(ref_id)) if kind == "e"
+                 else self._transfer_reply(int(ref_id)))
+        return [Reply("🔁 Этот скриншот уже присылали — повторно не записываю. Вот запись:"),
+                saved]
 
     def on_text(self, chat_id: int, text: str) -> list[Reply]:
         state = self.db.get_state(chat_id)
@@ -237,7 +264,7 @@ class Flow:
             fh.write(data)
         return path
 
-    def _recognize_payment(self, chat_id, files, text, receipt) -> list[Reply]:
+    def _recognize_payment(self, chat_id, files, text, receipt, keys=()) -> list[Reply]:
         cards = self.db.cards()
         categories = [c["name"] for c in self.db.categories()]
         try:
@@ -278,6 +305,7 @@ class Flow:
             "receipt": receipt,
             "note": note,
             "dup_checked": False,
+            "file_keys": list(keys),
         }
         state = self.db.get_state(chat_id)
         state.setdefault("drafts", []).append(draft)
@@ -329,7 +357,9 @@ class Flow:
                     op_date=d["date"], amount=d["amount"], from_card_id=d["transfer"]["from"],
                     to_card_id=d["transfer"]["to"],
                     description=" — ".join(x for x in (d["merchant"], d["description"]) if x),
-                    receipt_path=self._file_receipt(d["receipt"], d["date"]))
+                    receipt_path=self._file_receipt(d["receipt"], d["date"]),
+                    seen_side="out" if d["kind"] is not None else "in")
+                self.db.remember_files(d.get("file_keys", []), f"t:{transfer_id}")
                 self._pop_draft(state)
                 self.db.set_state(chat_id, state)
                 replies.append(self._transfer_reply(transfer_id))
@@ -341,6 +371,7 @@ class Flow:
                 merchant=d["merchant"], description=d["description"],
                 receipt_path=self._file_receipt(d["receipt"], d["date"]),
             )
+            self.db.remember_files(d.get("file_keys", []), f"e:{expense_id}")
             self._pop_draft(state)
             self.db.set_state(chat_id, state)
             if d.get("quiet"):
@@ -432,10 +463,13 @@ class Flow:
             return "category", Reply(head + "Какая статья расходов?",
                                      self._category_buttons("d:cat:", d["category_id"]))
         if not d["dup_checked"]:
-            dup = self.db.find_duplicate(op_date=d["date"], amount=d["amount"], card_id=d["card_id"])
-            if dup:
+            dups = self.db.find_duplicates(op_date=d["date"], amount=d["amount"],
+                                           card_id=d["card_id"], merchant=d["merchant"])
+            if dups:
+                listed = "\n".join(f"№{e.id} {expense_line(e)}" for e in dups[:5])
                 return "dup", Reply(
-                    head + f"Такая операция уже записана:\n№{dup.id} {expense_line(dup)}\nЭто повтор?",
+                    head + f"Похожая операция уже записана (та же сумма, дата ±1 день):\n"
+                           f"{listed}\nЭто повтор?",
                     [[("Повтор, не записывать", "d:skip")],
                      [("Нет, это другая оплата", "d:dup:ok")]])
         return None
@@ -463,14 +497,25 @@ class Flow:
             same = self.db.find_same_transfer(op_date=d["date"], amount=d["amount"],
                                               from_card_id=t["from"], to_card_id=t["to"])
             if same:
-                # Тот же перевод прислали со второй стороны — дополняем, не задваиваем.
-                fill = {k: v for k, v in (("from_card_id", t["from"]), ("to_card_id", t["to"]))
-                        if v is not None and getattr(same, k) is None}
-                if fill:
-                    self.db.update_transfer(same.id, **fill)
-                same = self.db.transfer(same.id)
-                return "drop", Reply(head + f"Этот перевод уже записан (П{same.id}: {same.route}), "
-                                            "повторно не записываю.")
+                my_side = "out" if outgoing else "in"
+                if my_side not in self.db.transfer_seen_sides(same.id):
+                    # Прислали вторую сторону того же перевода (списание уже было,
+                    # теперь зачисление) — дополняем запись, а не создаём новую.
+                    fill = {k: v for k, v in (("from_card_id", t["from"]), ("to_card_id", t["to"]))
+                            if v is not None and getattr(same, k) is None}
+                    if fill:
+                        self.db.update_transfer(same.id, **fill)
+                    self.db.mark_transfer_seen(same.id, my_side)
+                    self.db.remember_files(d.get("file_keys", []), f"t:{same.id}")
+                    same = self.db.transfer(same.id)
+                    return "drop", Reply(head + f"Это вторая сторона перевода П{same.id} "
+                                                f"({same.route}) — уже записан, дополнил.")
+                # С той же стороны — это либо повтор, либо второй такой же перевод.
+                return "dup", Reply(
+                    head + f"Похожий перевод уже записан: П{same.id} {same.route}, "
+                           f"{rub(same.amount)}. Это повтор?",
+                    [[("Повтор, не записывать", "d:skip")],
+                     [("Нет, это другой перевод", "d:dup:ok")]])
         return None
 
     def _draft_head(self, d: dict) -> str:
@@ -780,9 +825,20 @@ class Flow:
             return [Reply("Старые данные выписки удалены, присылайте заново.")]
         return [Reply("Этот вопрос уже неактуален. /sverka — начать сверку.")]
 
-    def _statement_input(self, chat_id, state, files, text):
+    def _statement_input(self, chat_id, state, files, text, keys=()):
         st = state["statement"]
         card = self.db.card(st["card_id"])
+        ref = f"s:{card.id}:{st['month'] or 'period'}"
+        other_card = ""
+        if keys:
+            if self.db.seen_refs(list(keys), f"s:{card.id}:"):
+                return [Reply(f"Этот файл уже загружен по карте {card.label} — пропускаю. "
+                              "Следующую часть выписки — присылайте, всё — /done")]
+            seen = self.db.seen_refs(list(keys), "s:")
+            if seen:
+                was = self.db.card(int(seen[0].split(":")[1]))
+                other_card = (f"\n⚠️ Этот же файл раньше загружали по карте "
+                              f"{was.label if was else '(удалена)'} — проверьте, та ли карта выбрана.")
         period = month_name(st["month"]) if st["month"] else "несколько месяцев"
         try:
             data = self.recognizer.parse_statement(
@@ -848,7 +904,8 @@ class Flow:
         if totals_month and (total_in is not None or total_out is not None):
             head.append(f"Итоги из документа: пришло {rub(total_in)}, ушло {rub(total_out)}")
         msg = head + msg + ["Ещё части выписки — присылайте, всё — /done"]
-        return [Reply("\n".join(msg) + warn)]
+        self.db.remember_files(list(keys), ref)
+        return [Reply("\n".join(msg) + warn + other_card)]
 
     def _done(self, chat_id, arg):
         state = self.db.get_state(chat_id)

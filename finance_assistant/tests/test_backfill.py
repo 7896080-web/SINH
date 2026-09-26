@@ -5,7 +5,7 @@ import sqlite3
 
 from openpyxl import load_workbook
 
-from conftest import CHAT, PNG, TODAY, payment
+from conftest import CHAT, png, TODAY, payment
 from finance.flow import _parse_period_arg
 from finance.storage import Storage
 from test_sverka import PDF, op, statement
@@ -125,7 +125,7 @@ def test_accept_asks_category_only_when_not_suggested(env):
 def test_old_screenshot_filed_by_payment_month(env, tmp_path):
     db, rec, flow = env
     rec.payments.append(payment(date="2026-01-17"))
-    flow.on_files(CHAT, [PNG], "")
+    flow.on_files(CHAT, [png()], "")
     e = db.expenses("2026-01")[0]
     assert os.path.basename(os.path.dirname(e.receipt_path)) == "2026-01"
     assert os.path.exists(e.receipt_path)
@@ -138,7 +138,7 @@ def test_period_itog_business_by_category_and_personal(env):
                            ("2026-02-10", "2000", "Логистика и доставка"),
                            ("2026-05-10", "500", "Реклама и продвижение")):
         rec.payments.append(payment(date=d, amount=amount, category=cat))
-        flow.on_files(CHAT, [PNG], "")
+        flow.on_files(CHAT, [png()], "")
     # Выписка по Сберу за февраль: ушло 10 000, из них 2 000 записано как бизнес.
     flow.on_command(CHAT, "sverka", "2026-02")
     flow.on_button(CHAT, f"s:c:{db.cards()[0].id}")
@@ -178,7 +178,7 @@ def test_parse_period_arg():
 def test_fix_command(env):
     db, rec, flow = env
     rec.payments.append(payment())
-    flow.on_files(CHAT, [PNG], "")
+    flow.on_files(CHAT, [png()], "")
     eid = db.expenses("2026-09")[0].id
     assert flow.on_command(CHAT, "fix", str(eid))[0].text.startswith("✅ Записано")
     assert "/fix 42" in flow.on_command(CHAT, "fix", "999")[0].text
@@ -205,9 +205,11 @@ def test_identical_purchases_kept_but_resent_file_not_doubled(env):
     start_period(flow, db)
     coffee = [op("2026-02-02", "300", desc="Кофейня"), op("2026-02-02", "300", desc="Кофейня")]
     rec.statements += [statement(coffee), statement(coffee), statement(coffee + [coffee[0]])]
-    [first] = flow.on_files(CHAT, [PDF], "")
+    [first] = flow.on_files(CHAT, [(b"%PDF part 1", "application/pdf")], "")
     assert "Принято операций: 2" in first.text
-    [again] = flow.on_files(CHAT, [PDF], "")
+    # Другой файл (скриншот той же страницы) с теми же строками — строки не задвоятся.
+    [again] = flow.on_files(CHAT, [(b"%PDF screenshot", "application/pdf")], "")
     assert "Принято операций: 0 (повторы пропущены: 2)" in again.text
-    flow.on_files(CHAT, [PDF], "")  # в новом файле их уже три — добавится одна
+    # в новом файле их уже три — добавится одна
+    flow.on_files(CHAT, [(b"%PDF part 2", "application/pdf")], "")
     assert len(db.statement(db.cards()[0].id, "2026-02")[1]) == 3
