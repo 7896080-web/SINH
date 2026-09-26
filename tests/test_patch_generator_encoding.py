@@ -150,3 +150,43 @@ def test_the_apply_script_does_not_call_a_deprecated_clock(tmp_path):
     assert "utcnow(" not in code, (
         "apply-скрипт зовёт `datetime.utcnow()` — на бою это DeprecationWarning "
         "первой строкой наката; берите `datetime.now(datetime.timezone.utc)`")
+
+
+# ---------------------------------------------------------------------------
+# То же правило — для скриптов, лежащих в `deploy/`
+# ---------------------------------------------------------------------------
+
+def test_every_russian_ps1_in_deploy_has_a_bom():
+    """BOM обязателен КАЖДОМУ `.ps1` с кириллицей, а не только патчу.
+
+    Правило записано и закрыто тестом для генератора, но сами скрипты `deploy/`
+    под него не проверялись — и `enable_log_rotation.ps1` лежал без BOM. При
+    запуске ФАЙЛОМ PowerShell 5.1 читает такой скрипт как cp1251: кириллица
+    превращается в мусор, а длинное тире (три байта в UTF-8) разбирается как
+    три случайных символа — и однажды один из них закроет строковый литерал
+    раньше времени, уронив разбор до первой команды.
+
+    Вставка в консоль это не ловит: там кодировка уже верная. То есть дефект
+    виден только при том способе запуска, которым скрипты и запускают.
+    """
+    import io
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    offenders = []
+    for path in sorted((root / "deploy").glob("*.ps1")):
+        raw = path.read_bytes()
+        if not raw:
+            continue
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            offenders.append(f"{path.name}: не читается как UTF-8")
+            continue
+        has_cyrillic = any("А" <= ch <= "я" or ch == "ё" or ch == "Ё" for ch in text)
+        if has_cyrillic and not raw.startswith(b"\xef\xbb\xbf"):
+            offenders.append(f"{path.name}: кириллица без BOM")
+
+    assert offenders == [], (
+        "скрипты запускают файлом, а PowerShell 5.1 без BOM читает их как "
+        f"cp1251: {offenders}")
