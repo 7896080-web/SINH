@@ -59,7 +59,7 @@ def test_looks_personal_asks_purpose(env):
     [saved] = flow.on_button(CHAT, "d:purpose:personal")
     e = db.expenses("2026-09")[0]
     assert e.purpose == PERSONAL and e.category is None
-    assert "Личный" in saved.text
+    assert "Личное" in saved.text
 
 
 def test_incoming_is_reimbursement_or_skipped(env):

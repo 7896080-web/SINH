@@ -5,7 +5,7 @@ from datetime import date
 
 from .money import format_amount
 from .reconcile import CardSummary, MonthSummary
-from .storage import BUSINESS, REIMBURSEMENT, Expense, StatementLine
+from .storage import BUSINESS, BUSINESS_ACCOUNT, REIMBURSEMENT, Expense, StatementLine
 
 MONTHS = ["январь", "февраль", "март", "апрель", "май", "июнь", "июль", "август",
           "сентябрь", "октябрь", "ноябрь", "декабрь"]
@@ -25,31 +25,37 @@ def short_date(iso: str) -> str:
     return f"{d.day:02d}.{d.month:02d}"
 
 
-def expense_line(e: Expense) -> str:
+def _what(e: Expense) -> str:
+    on_business = e.card_kind == BUSINESS_ACCOUNT
     if e.kind == REIMBURSEMENT:
-        what = "возмещение от бизнеса"
-    elif e.purpose == BUSINESS:
-        what = f"бизнес · {e.category or 'без статьи'}"
-    else:
-        what = "личное"
+        return "перевод вам с бизнес-счёта" if on_business else "возмещение от бизнеса"
+    if e.purpose == BUSINESS:
+        return f"бизнес · {e.category or 'без статьи'}"
+    return "личное из денег бизнеса" if on_business else "личное"
+
+
+def expense_line(e: Expense) -> str:
+    what = _what(e)
     who = f" · {e.merchant}" if e.merchant else ""
     return f"{short_date(e.op_date)}  {rub(e.amount)}  {e.card}  {what}{who}"
 
 
 def expense_card(e: Expense) -> str:
     lines = [f"✅ Записано №{e.id}", f"{rub(e.amount)} · {short_date(e.op_date)} · {e.card}"]
-    if e.kind == REIMBURSEMENT:
-        lines.append("Возмещение от бизнеса")
-    elif e.purpose == BUSINESS:
-        lines.append(f"Бизнес · {e.category or 'без статьи'}")
-    else:
-        lines.append("Личный расход")
+    what = _what(e)
+    lines.append(what[0].upper() + what[1:])
+    if e.card_kind == BUSINESS_ACCOUNT and e.kind != REIMBURSEMENT and e.purpose == BUSINESS:
+        lines.append("Оплачено деньгами бизнеса — к возмещению не добавляется")
+    elif e.card_kind == BUSINESS_ACCOUNT:
+        lines.append("Уменьшает то, что бизнес должен вам")
     if e.merchant or e.description:
         lines.append(" — ".join(x for x in (e.merchant, e.description) if x))
     return "\n".join(lines)
 
 
 def card_text(cs: CardSummary, month: str) -> str:
+    if cs.card.is_business:
+        return _business_account_text(cs, month)
     out = [f"💳 {cs.card.label} — {month_name(month)}"]
     if cs.has_statement:
         out.append(f"Пришло: {rub(cs.total_in)}")
@@ -74,6 +80,34 @@ def card_text(cs: CardSummary, month: str) -> str:
     return "\n".join(out)
 
 
+def _business_account_text(cs: CardSummary, month: str) -> str:
+    out = [f"🏦 {cs.card.label} — {month_name(month)}"]
+    if cs.has_statement:
+        out.append(f"Пришло: {rub(cs.total_in)}")
+        out.append(f"Ушло:   {rub(cs.total_out)}")
+        out.append(f"  переведено вам: {rub(cs.own_out)}")
+        out.append(f"  расходы бизнеса: {rub(cs.total_out - cs.own_out)}")
+    else:
+        out.append("Выписка не загружена — есть только записанное вами.")
+    out.append(f"Записано: расходы по статьям {rub(cs.business)}, "
+               f"переводы вам {rub(cs.reimbursed)}"
+               + (f", личное из денег бизнеса {rub(cs.personal_marked)}" if cs.personal_marked else ""))
+    if cs.has_statement and not cs.lines_checked:
+        out.append("(по строкам не сверялось — в выписке были только итоги)")
+    if cs.missing:
+        out.append("")
+        out.append("⚠️ Записано, но не найдено в выписке (проверьте счёт или дату):")
+        out += [f"  №{e.id} {expense_line(e)}" for e in cs.missing]
+    return "\n".join(out)
+
+
+def owner_transfers_text(lines: list[StatementLine]) -> str:
+    out = [f"💸 Переводы вам с бизнес-счёта: {len(lines)} на {rub(sum(ln.amount for ln in lines))}",
+           "Учесть их как возмещение? Это уменьшит то, что бизнес должен вам. "
+           "Лишние сначала уберите: /notbiz 12", ""]
+    return "\n".join(out + [_line(ln) for ln in lines])
+
+
 def _line(ln: StatementLine) -> str:
     # Время важно: в выписке банка «Россия» у всех оплат одно описание
     # («Оплата по QR-коду через СБП»), различить их можно только так.
@@ -87,17 +121,24 @@ def unmatched_text(lines: list[StatementLine]) -> str:
     return "\n".join(out + [_line(ln) for ln in lines])
 
 
-def suggestions_text(lines: list[StatementLine]) -> str:
-    out = [f"🔎 Похоже на бизнес-расходы: {len(lines)} на {rub(sum(ln.amount for ln in lines))}",
+def suggestions_text(lines: list[StatementLine], title: str = "🔎 Похоже на бизнес-расходы") -> str:
+    out = [f"{title}: {len(lines)} на {rub(sum(ln.amount for ln in lines))}",
            "Проверьте список. Лишние уберите: /notbiz 12 15, недостающие добавьте: /biz 7",
            ""]
-    out += [f"{_line(ln)} → {ln.suggested_category}" for ln in lines]
+    out += [f"{_line(ln)} → {ln.suggested_category or 'Прочее'}" for ln in lines]
     return "\n".join(out)
 
 
 def month_text(s: MonthSummary, owed_total: int | None = None) -> str:
     out = [f"📊 Свод за {month_name(s.month)}", ""]
-    for cs in s.cards:
+    for cs in s.business_accounts:
+        state = "" if cs.has_statement else "  (нет выписки)"
+        out.append(f"🏦 {cs.card.label}{state}")
+        if cs.has_statement:
+            out.append(f"  пришло {rub(cs.total_in)} · ушло {rub(cs.total_out)}"
+                       f" · из них вам {rub(cs.own_out)}")
+        out.append(f"  записано расходов {rub(cs.business)} · переводов вам {rub(cs.reimbursed)}")
+    for cs in s.personal_cards:
         state = "" if cs.has_statement else "  (нет выписки)"
         out.append(f"💳 {cs.card.label}{state}")
         if cs.has_statement:
@@ -110,13 +151,16 @@ def month_text(s: MonthSummary, owed_total: int | None = None) -> str:
     out.append("")
     total_in, total_out, personal = s.total("total_in"), s.total("total_out"), s.total("personal")
     if total_out is not None:
-        out.append(f"Всего по картам с выпиской: пришло {rub(total_in)}, ушло {rub(total_out)}")
+        out.append(f"Всего по личным картам с выпиской: пришло {rub(total_in)}, ушло {rub(total_out)}")
         out.append(f"  из них личное: {rub(personal)}")
     out.append(f"Бизнес-расходы с личных карт: {rub(s.business)}")
+    if s.business_accounts:
+        out.append(f"Расходы с бизнес-счёта (записанные): {rub(s.business_account_spent)}")
+        out.append("Все бизнес-расходы по статьям:")
     for name, amount in s.by_category.items():
         out.append(f"  • {name}: {rub(amount)}")
     if s.reimbursed:
-        out.append(f"Бизнес уже вернул: {rub(s.reimbursed)}")
+        out.append(f"Бизнес уже вернул вам: {rub(s.reimbursed)}")
     out.append(f"💰 Бизнес должен вам за месяц: {rub(s.owed)}")
     if owed_total is not None and owed_total != s.owed:
         out.append(f"💰 С начала учёта по конец месяца: {rub(owed_total)}")
@@ -142,6 +186,14 @@ def period_text(summaries: list[MonthSummary], owed_total: int) -> str:
     for i, cs0 in enumerate(summaries[0].cards):
         per = [s.cards[i] for s in summaries]
         with_stmt = [c for c in per if c.has_statement]
+        if cs0.card.is_business:
+            line = (f"  🏦 {cs0.card.label}: расходы {rub(sum(c.business for c in per))}"
+                    f" · переводы вам {rub(sum(c.reimbursed for c in per))}")
+            if with_stmt:
+                line += (f" · по выпискам ушло {rub(sum(c.total_out or 0 for c in with_stmt))}"
+                         f", из них вам {rub(sum(c.own_out for c in with_stmt))}")
+            out.append(line)
+            continue
         line = f"  💳 {cs0.card.label}: бизнес {rub(sum(c.business for c in per))}"
         if with_stmt:
             line += (f" · пришло {rub(sum(c.total_in or 0 for c in with_stmt))}"
@@ -155,6 +207,10 @@ def period_text(summaries: list[MonthSummary], owed_total: int) -> str:
     business = sum(s.business for s in summaries)
     reimbursed = sum(s.reimbursed for s in summaries)
     out.append(f"Бизнес-расходы с личных карт за период: {rub(business)}")
+    if any(s.business_accounts for s in summaries):
+        out.append("Расходы с бизнес-счёта (записанные): "
+                   f"{rub(sum(s.business_account_spent for s in summaries))}")
+        out.append("Все бизнес-расходы по статьям:")
     for name, amount in _merge_categories(summaries).items():
         out.append(f"  • {name}: {rub(amount)}")
     if reimbursed:
