@@ -1137,17 +1137,23 @@ def bulk_edit(
         return back()
 
     target_account = None
-    if action in ("cabinet_on", "cabinet_off"):
+    if action in ("cabinet_on", "cabinet_off", "resend"):
         try:
             target_account = db.query(PlatformAccount).filter(
                 PlatformAccount.id == int(account_id)).first()
         except (TypeError, ValueError):
             target_account = None
-        if target_account is None:
+        # У переотправки кабинет НЕ обязателен, и это не послабление: без него
+        # она шлёт на все отмеченные кабинеты товара, то есть делает ровно то
+        # же, что доотправка после любой правки строки. Требуй мы выбор всегда,
+        # обычный случай «верни числа везде» пришлось бы делать по кабинету за
+        # раз — а между заходами часть карточек стояла бы с чужой картиной.
+        if target_account is None and action != "resend":
             set_flash(request, "Выберите кабинет в списке рядом с кнопкой.", "warn")
             return back()
 
     changed = skipped = refused = kept = 0
+    queued = unmarked = blocked = 0
     for p in products:
         if action in ("cabinet_on", "cabinet_off"):
             # Отметка кабинета сразу по всему отбору. Правила ровно те же, что у
@@ -1273,6 +1279,50 @@ def bulk_edit(
                 continue
             apply_fact(db, p, p.offset_base_stock, username=user.username)
             recompute_offset(p)
+        elif action == "resend":
+            # Переотправка текущего остатка БЕЗ правки самой строки.
+            #
+            # Нужна, когда числа на площадке стёрли мимо нас: правкой карточек
+            # в кабинете, публикацией витрины, второй системой. Рассылка
+            # событийная — отправив число, она считает его доставленным и сама
+            # к нему не возвращается, а остаток у нас не менялся, значит
+            # события не будет вовсе. На витрине навсегда остаётся чужая
+            # картина, и сдвинуть её нечем.
+            #
+            # До этой кнопки способ был один: выключить трансляцию и включить
+            # обратно. Он работает, и именно так и делали. Но выключение
+            # ОТЗЫВАЕТ остаток — то есть отправляет ноль на живую карточку, — и
+            # между двумя нажатиями площадка держит 0 и не продаёт. Человек
+            # своими руками делает ровно то, что чинит, да ещё и по всему
+            # отбору сразу.
+            #
+            # Кабинет спрашиваем у САМОЙ ПАРЫ, а не у `enqueue_full_resend`: он
+            # проверяет трансляцию и покрытие расчётом, но про галочку кабинета
+            # не знает ничего — её фильтруют вызывающие (`_repropagate`,
+            # `enqueue_resend_all`). Поставь мы запись по неотмеченной паре,
+            # лестница дала бы ноль ступенью 1, и он уехал бы отзывом на живую
+            # карточку — то есть кнопка «верни числа» их бы и стёрла.
+            if target_account is not None:
+                setting = next((x for x in p.sync_settings
+                                if x.account_id == target_account.id), None)
+                if setting is None or not setting.enabled:
+                    unmarked += 1
+                    continue
+                accounts = [target_account.id]
+            else:
+                accounts = [x.account_id for x in p.sync_settings if x.enabled]
+            if not accounts:
+                unmarked += 1
+                continue
+            put = sum(1 for aid in accounts
+                      if enqueue_full_resend(db, p.uid_1c, aid, reason="manual_resend"))
+            if not put:
+                # Гейты отсекли всё: трансляция выключена или расчёт не покрыл
+                # эти кабинеты. Молчать нельзя — оператор решил бы, что числа
+                # поехали, и узнал бы обратное, только придя смотреть витрину.
+                blocked += 1
+                continue
+            queued += put
         elif action == "fact_from_stock":
             # «Факт = остаток ЦС» — только там, где оператор ничего не вводил:
             # затирать введённые руками цифры массовой кнопкой нельзя.
@@ -1282,7 +1332,7 @@ def bulk_edit(
         else:
             set_flash(request, "Неизвестное действие.", "warn")
             return back()
-        if action not in ("set_active_since", "cabinet_on", "cabinet_off"):
+        if action not in ("set_active_since", "cabinet_on", "cabinet_off", "resend"):
             # У действий с кабинетом своя отправка — по тому кабинету, которого
             # они касаются. Общая доотправка добавила бы к ней записи по всем
             # остальным, ничего не изменив по сути.
@@ -1294,6 +1344,23 @@ def bulk_edit(
         scope += f", кабинет «{target_account.name}»"
     log_action(db, user.username, "products_bulk", f"{action} {scope} x{changed}")
     db.commit()
+    if action == "resend":
+        # У переотправки свой отчёт: «изменено строк» тут было бы неправдой —
+        # ни одна строка не изменилась, изменится только то, что лежит на
+        # площадке. Число записей важнее числа товаров: у товара бывает
+        # несколько отмеченных кабинетов, и уедет он в каждый.
+        message = (f"Переотправка ({scope}): в очередь поставлено {queued} записей "
+                   f"по {changed} товарам — уйдут ближайшими циклами рассылки.")
+        if unmarked:
+            message += (f" Пропущено {unmarked}: у них не отмечен этот кабинет "
+                        f"(или не отмечен ни один) — отправлять туда нечего.")
+        if blocked:
+            message += (f" Не поставлено {blocked}: выключена трансляция либо расчёт "
+                        f"не покрыл эти кабинеты. По ним ушёл бы ноль, а не остаток.")
+        set_flash(request, message,
+                  "good" if queued and not (unmarked or blocked) else "warn")
+        return back()
+
     message = f"Массовая правка ({scope}): изменено строк — {changed}."
     if skipped:
         message += (f" Пропущено {skipped}: 1С ещё не прислала выгрузку на эту дату — "
