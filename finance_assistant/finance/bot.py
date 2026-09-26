@@ -20,7 +20,8 @@ from .storage import Storage
 log = logging.getLogger(__name__)
 
 COMMANDS = ["start", "help", "cancel", "cards", "addcard", "delcard", "cats", "addcat",
-            "list", "sverka", "done", "itog", "biz", "notbiz", "vypiska", "fix"]
+            "list", "sverka", "done", "itog", "biz", "notbiz", "vypiska", "fix", "svod",
+            "rules", "delrule"]
 MAX_TEXT = 4000  # лимит Telegram — 4096 символов на сообщение
 MAX_FILE = 20 * 1024 * 1024  # больше бот скачать не может
 

@@ -105,6 +105,16 @@ CREATE TABLE IF NOT EXISTS seen_files (
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (key, ref)
 );
+-- Привязка однотипных расходов к статьям: получатель → статья. Запоминается,
+-- когда вы сами выбираете или меняете статью; следующие расходы этого
+-- получателя получают её без вопроса. merchant_key — имя без «ООО», кавычек
+-- и регистра (см. _merchant_key).
+CREATE TABLE IF NOT EXISTS category_rules (
+    id INTEGER PRIMARY KEY,
+    merchant_key TEXT NOT NULL UNIQUE,
+    merchant TEXT NOT NULL,
+    category_id INTEGER NOT NULL REFERENCES categories(id)
+);
 CREATE TABLE IF NOT EXISTS chat_state (
     chat_id INTEGER PRIMARY KEY,
     state TEXT NOT NULL
@@ -331,6 +341,51 @@ class Storage:
         key = _merchant_key(merchant)
         return [Expense(**dict(r)) for r in rows
                 if r["card_id"] == card_id or (key and _merchant_key(r["merchant"]) == key)]
+
+    def expenses_between(self, start: str, end: str) -> list[Expense]:
+        return [Expense(**dict(r)) for r in self.conn.execute(
+            self._EXPENSE_SELECT + " WHERE e.op_date BETWEEN ? AND ? ORDER BY e.op_date, e.id",
+            (start, end))]
+
+    def expenses_of_merchant(self, merchant: str) -> list[Expense]:
+        key = _merchant_key(merchant)
+        if not key:
+            return []
+        rows = self.conn.execute(self._EXPENSE_SELECT + " WHERE e.merchant != '' ORDER BY e.id")
+        return [Expense(**dict(r)) for r in rows if _merchant_key(r["merchant"]) == key]
+
+    # --- правила «получатель → статья» ---------------------------------
+
+    def rule_for(self, merchant: str) -> int | None:
+        key = _merchant_key(merchant)
+        if not key:
+            return None
+        row = self.conn.execute("SELECT category_id FROM category_rules WHERE merchant_key = ?",
+                                (key,)).fetchone()
+        return row["category_id"] if row else None
+
+    def set_rule(self, merchant: str, category_id: int) -> bool:
+        """Запомнить статью для получателя. False — имя слишком общее для правила."""
+        key = _merchant_key(merchant)
+        if len(key) < 3:
+            return False
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO category_rules (merchant_key, merchant, category_id) VALUES (?, ?, ?)"
+                " ON CONFLICT (merchant_key) DO UPDATE SET category_id = excluded.category_id,"
+                " merchant = excluded.merchant",
+                (key, merchant.strip(), category_id))
+        return True
+
+    def rules(self) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT r.id, r.merchant, c.name AS category FROM category_rules r"
+            " JOIN categories c ON c.id = r.category_id ORDER BY c.name, r.merchant").fetchall()
+
+    def delete_rule(self, rule_id: int) -> bool:
+        with self.conn:
+            return self.conn.execute("DELETE FROM category_rules WHERE id = ?",
+                                     (rule_id,)).rowcount > 0
 
     # --- отпечатки файлов ----------------------------------------------
 
