@@ -68,8 +68,10 @@ CREATE TABLE IF NOT EXISTS statement_lines (
     direction TEXT NOT NULL CHECK (direction IN ('in', 'out')),
     description TEXT NOT NULL DEFAULT '',
     own_transfer INTEGER NOT NULL DEFAULT 0,
-    UNIQUE (statement_id, op_date, amount, direction, description)
+    suggested_category TEXT NOT NULL DEFAULT ''
 );
+CREATE INDEX IF NOT EXISTS ix_statement_lines_key
+    ON statement_lines(statement_id, op_date, amount, direction);
 CREATE TABLE IF NOT EXISTS chat_state (
     chat_id INTEGER PRIMARY KEY,
     state TEXT NOT NULL
@@ -112,6 +114,7 @@ class StatementLine:
     direction: str
     description: str
     own_transfer: bool
+    suggested_category: str = ""
 
 
 class Storage:
@@ -122,6 +125,7 @@ class Storage:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(SCHEMA)
+        self._add_missing_columns()
         if not self.conn.execute("SELECT 1 FROM categories").fetchone():
             with self.conn:
                 self.conn.executemany(
@@ -130,6 +134,15 @@ class Storage:
 
     def close(self):
         self.conn.close()
+
+    def _add_missing_columns(self):
+        """Базы, созданные прошлыми версиями, дополняем новыми колонками."""
+        added = {("statement_lines", "suggested_category"): "TEXT NOT NULL DEFAULT ''"}
+        for (table, column), ddl in added.items():
+            have = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+            if column not in have:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+        self.conn.commit()
 
     # --- карты ---------------------------------------------------------
 
@@ -244,18 +257,34 @@ class Storage:
             )
 
     def add_statement_lines(self, statement_id: int, lines: list[dict]) -> int:
-        """Повторно присланный тот же скриншот выписки не задвоит строки."""
+        """Добавить строки выписки, не задваивая уже загруженные.
+
+        Две одинаковые покупки в один день — это две строки, поэтому сравниваем
+        количество: если в новом файле таких строк N, а в базе уже M, добавляем
+        только N − M. Так повторно присланный скриншот ничего не задвоит, а
+        настоящие одинаковые операции не потеряются.
+        """
+        groups: dict[tuple, list[dict]] = {}
+        for ln in lines:
+            key = (ln["op_date"], ln["amount"], ln["direction"], ln.get("description", ""))
+            groups.setdefault(key, []).append(ln)
         added = 0
         with self.conn:
-            for ln in lines:
-                cur = self.conn.execute(
-                    "INSERT OR IGNORE INTO statement_lines"
-                    " (statement_id, op_date, amount, direction, description, own_transfer)"
-                    " VALUES (?, ?, ?, ?, ?, ?)",
-                    (statement_id, ln["op_date"], ln["amount"], ln["direction"],
-                     ln.get("description", ""), int(ln.get("own_transfer", False))),
-                )
-                added += cur.rowcount
+            for (op_date, amount, direction, description), group in groups.items():
+                have = self.conn.execute(
+                    "SELECT COUNT(*) FROM statement_lines WHERE statement_id = ? AND op_date = ?"
+                    " AND amount = ? AND direction = ? AND description = ?",
+                    (statement_id, op_date, amount, direction, description),
+                ).fetchone()[0]
+                for ln in group[have:]:
+                    self.conn.execute(
+                        "INSERT INTO statement_lines (statement_id, op_date, amount,"
+                        " direction, description, own_transfer, suggested_category)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (statement_id, op_date, amount, direction, description,
+                         int(ln.get("own_transfer", False)), ln.get("suggested_category", "")),
+                    )
+                    added += 1
         return added
 
     def set_statement_totals(self, statement_id: int, total_in=None, total_out=None):
@@ -275,13 +304,41 @@ class Storage:
             return None
         lines = [
             StatementLine(r["id"], r["op_date"], r["amount"], r["direction"], r["description"],
-                          bool(r["own_transfer"]))
+                          bool(r["own_transfer"]), r["suggested_category"])
             for r in self.conn.execute(
                 "SELECT * FROM statement_lines WHERE statement_id = ? ORDER BY op_date, id",
                 (head["id"],),
             )
         ]
         return head, lines
+
+    def statement_line(self, line_id: int) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT l.*, s.card_id, s.month FROM statement_lines l"
+            " JOIN statements s ON s.id = l.statement_id WHERE l.id = ?", (line_id,)
+        ).fetchone()
+
+    def clear_suggestion(self, line_id: int):
+        with self.conn:
+            self.conn.execute(
+                "UPDATE statement_lines SET suggested_category = '' WHERE id = ?", (line_id,))
+
+    def months_with_data(self) -> list[str]:
+        rows = self.conn.execute(
+            "SELECT substr(op_date, 1, 7) AS m FROM expenses"
+            " UNION SELECT month FROM statements ORDER BY m"
+        ).fetchall()
+        return [r["m"] for r in rows]
+
+    def owed_until(self, month: str) -> int:
+        """Долг бизнеса перед владельцем нарастающим итогом по конец месяца."""
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(CASE"
+            " WHEN kind = 'expense' AND purpose = 'business' THEN amount"
+            " WHEN kind = 'reimbursement' THEN -amount END), 0) AS owed"
+            " FROM expenses WHERE substr(op_date, 1, 7) <= ?", (month,)
+        ).fetchone()
+        return row["owed"]
 
     # --- состояние диалога ---------------------------------------------
 

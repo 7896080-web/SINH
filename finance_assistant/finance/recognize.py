@@ -52,32 +52,35 @@ def _payment_schema(categories: list[str]) -> dict:
     }
 
 
-STATEMENT_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "is_statement": {"type": "boolean"},
-        "card_last4": {"type": "string"},
-        "total_in": {"type": "string"},
-        "total_out": {"type": "string"},
-        "operations": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "date": {"type": "string"},
-                    "amount": {"type": "string"},
-                    "direction": {"type": "string", "enum": ["out", "in"]},
-                    "description": {"type": "string"},
-                    "own_transfer": {"type": "boolean"},
+def _statement_schema(categories: list[str]) -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "is_statement": {"type": "boolean"},
+            "card_last4": {"type": "string"},
+            "total_in": {"type": "string"},
+            "total_out": {"type": "string"},
+            "operations": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "date": {"type": "string"},
+                        "amount": {"type": "string"},
+                        "direction": {"type": "string", "enum": ["out", "in"]},
+                        "description": {"type": "string"},
+                        "own_transfer": {"type": "boolean"},
+                        "business_category": {"type": "string", "enum": categories + [""]},
+                    },
+                    "required": ["date", "amount", "direction", "description", "own_transfer",
+                                 "business_category"],
+                    "additionalProperties": False,
                 },
-                "required": ["date", "amount", "direction", "description", "own_transfer"],
-                "additionalProperties": False,
             },
         },
-    },
-    "required": ["is_statement", "card_last4", "total_in", "total_out", "operations"],
-    "additionalProperties": False,
-}
+        "required": ["is_statement", "card_last4", "total_in", "total_out", "operations"],
+        "additionalProperties": False,
+    }
 
 PAYMENT_PROMPT = """\
 Это скриншот (или текстовое описание) операции по личной банковской карте \
@@ -100,17 +103,25 @@ PAYMENT_PROMPT = """\
 Ничего не выдумывай: если поля не видно — пустая строка."""
 
 STATEMENT_PROMPT = """\
-Это выписка (или её часть/скриншот) по личной банковской карте за {month}. \
-Карты владельца: {cards}.
+Это выписка (или её часть/скриншот) по личной банковской карте за {period}. \
+Выписка может охватывать несколько месяцев. Карты владельца: {cards}.
+Владелец — предприниматель (продажи на маркетплейсах) и иногда оплачивает \
+расходы бизнеса с этой личной карты.
 Извлеки ВСЕ операции, ни одной не пропуская:
 - date ГГГГ-ММ-ДД, amount — положительное число с точкой ("1234.50"),
 - direction: "out" — списание, "in" — зачисление,
 - description — как в выписке, коротко,
 - own_transfer: true, если это перевод между картами владельца \
-(в описании видны последние цифры другой его карты, или "перевод между своими счетами").
+(в описании видны последние цифры другой его карты, или "перевод между своими счетами"),
+- business_category — только для списаний, которые по описанию явно похожи на \
+расход бизнеса (сервисы маркетплейсов для продавцов, транспортные компании и \
+доставка, рекламные кабинеты, оптовые поставщики, упаковка, сервисы для бизнеса): \
+статья из списка. Для обычных бытовых покупок, кафе, переводов людям, снятия \
+наличных и поступлений — "". Лучше пропустить, чем угадать.
 Отложенные/заблокированные суммы (холды), если они помечены отдельно, не включай.
 total_in / total_out — итоговые "поступления"/"расходы" за период, если они \
-прямо напечатаны в документе; иначе "".
+прямо напечатаны в документе; иначе "". Если выписка за несколько месяцев \
+и итоги не разбиты по месяцам — "".
 Если прислан просто текст вида "пришло 100000, ушло 80000" — заполни только \
 total_in / total_out, operations пустой.
 card_last4 — последние 4 цифры карты из документа, если есть.
@@ -178,12 +189,13 @@ class ClaudeRecognizer:
         return self._ask(file_blocks(files), prompt, _payment_schema(categories),
                          effort="medium", max_tokens=16000)
 
-    def parse_statement(self, files, text, *, month, cards) -> dict:
-        prompt = STATEMENT_PROMPT.format(month=month, cards=_cards_text(cards))
+    def parse_statement(self, files, text, *, period, cards, categories) -> dict:
+        prompt = STATEMENT_PROMPT.format(period=period, cards=_cards_text(cards))
         if text:
             prompt += f'\n\nТекст от владельца: "{text}"'
-        return self._ask(file_blocks(files), prompt, STATEMENT_SCHEMA,
-                         effort="high", max_tokens=64000)
+        # Выписка за полгода — сотни строк; даём модели максимум вывода.
+        return self._ask(file_blocks(files), prompt, _statement_schema(categories),
+                         effort="high", max_tokens=128000)
 
     def _ask(self, blocks, prompt, schema, *, effort, max_tokens) -> dict:
         content = blocks + [{"type": "text", "text": prompt}]
