@@ -105,11 +105,23 @@ def cabinet(tmp_path):
     return url
 
 
-def _run(url, *args):
+def _run(url, *args, console=None):
     env = dict(os.environ)
+    if console:
+        # Так пишет stdout Python на боевом Windows. Воспроизводим здесь:
+        # иначе этот класс дефектов виден только на сервере, в накате, уже
+        # после копии базы и тринадцати минут тестов.
+        env["PYTHONIOENCODING"] = console
     env["DATABASE_URL"] = url
     env["SESSION_SECRET"] = "x" * 32
     env["SECRETS_ENCRYPTION_KEY"] = Fernet.generate_key().decode()
+    if console:
+        # Читаем БАЙТАМИ и раскодируем той же кодировкой, что писал скрипт:
+        # с `text=True` их разбирал бы UTF-8, и падал бы уже сам тест — на
+        # выводе, который на сервере читается прекрасно.
+        done = subprocess.run([sys.executable, str(SCRIPT), *args],
+                              capture_output=True, env=env, cwd=str(ROOT))
+        return (done.stdout + done.stderr).decode(console, "replace")
     done = subprocess.run([sys.executable, str(SCRIPT), *args],
                           capture_output=True, text=True, env=env, cwd=str(ROOT))
     return done.stdout + done.stderr
@@ -179,3 +191,38 @@ def test_an_unknown_cabinet_is_refused_with_the_list(cabinet):
     out = _run(cabinet, "ВБ", "48")
     assert "не найден" in out, out
     assert "1:КИТ" in out and "2:ОЗОН" in out
+
+
+def test_the_server_console_does_not_kill_the_output(tmp_path):
+    """Тело ответа площадки печатается как есть — и может содержать что угодно.
+
+    26.09 накат встал ровно на этом, только символ был наш собственный. Здесь
+    он приходит ИЗ БАЗЫ, то есть сканером исходников не ловится вовсе: держать
+    чужие данные в пределах cp1251 мы не можем, поэтому вывод их переживает.
+
+    `PYTHONIOENCODING=cp1251` — и есть боевая консоль, принесённая сюда.
+    """
+    path = tmp_path / "console.db"
+    url = f"sqlite:///{path}"
+    engine = create_engine(url, connect_args={"check_same_thread": False})
+    Base.metadata.create_all(bind=engine)
+    s = sessionmaker(bind=engine, autoflush=False)()
+    s.add(PlatformAccount(id=1, platform=Platform.kit, name="КИТ"))
+    _product(s, "u-X", "3030-7777", "L", True)
+    s.add(SyncSetting(uid_1c="u-X", account_id=1, enabled=True))
+    _queue(s, "u-X", 1, 5, 0, "order", now_utc() - timedelta(hours=1), sku="V-X")
+    # Ответ площадки с символом, которого в cp1251 нет. `flush` обязателен:
+    # сессии живут с `autoflush=False`, и запрос НЕ УВИДИТ только что
+    # добавленную запись — та же ловушка, на которой в этом проекте уже
+    # проезжал расчёт порога.
+    s.flush()
+    row = s.query(DispatchQueueItem).first()
+    row.last_error = 'VALIDATION_ERROR: товар ✱ не найден \u2192 проверьте'
+    s.commit(); s.close(); engine.dispose()
+
+    out = _run(url, "КИТ", "48", console="cp1251")
+
+    assert "UnicodeEncodeError" not in out, out
+    assert "Traceback" not in out, out
+    assert "ПОСЛЕДНИЕ НУЛИ" in out, out
+    assert "3030-7777" in out, "строка с чужим символом до вывода не дошла"

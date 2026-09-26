@@ -1,4 +1,4 @@
-"""Сквозной прогон живого приложения: цепочка «заказ → 1С → сверка → площадка».
+"""Сквозной прогон живого приложения: цепочка «заказ -> 1С -> сверка -> площадка».
 
 Проверяются не отдельные функции, а причинно-следственные связи между блоками:
 что реально уходит на площадку, что попадает в файл задания для 1С, как ответ 1С
@@ -109,7 +109,7 @@ exchange = LocalExchange(f"{SYNC}/tasks", f"{SYNC}/results", f"{SYNC}/archive")
 exchange._ensure_dirs()
 
 print("=" * 78)
-print("СКВОЗНОЙ ПРОГОН: заказ → списание → площадка → 1С → сверка → отмена")
+print("СКВОЗНОЙ ПРОГОН: заказ -> списание -> площадка -> 1С -> сверка -> отмена")
 print("=" * 78)
 
 # --------------------------------------------------------------- подготовка
@@ -145,7 +145,7 @@ client_wb = FakeClient(new_orders=[order])
 stats = poll_new_orders(db, client_wb, wb, "Wildberries_Склад_FBO")
 db.expire_all()
 product = db.query(Product).filter(Product.uid_1c == UID).first()
-check("заказ списал остаток ЦС", product.stock_on_hand == 40, f"43 − 3 = {product.stock_on_hand}")
+check("заказ списал остаток ЦС", product.stock_on_hand == 40, f"43 - 3 = {product.stock_on_hand}")
 check("заказ отмечен обработанным (идемпотентность)",
       db.query(ProcessedOrder).filter(ProcessedOrder.order_id == "WB-1001").count() == 1)
 
@@ -183,7 +183,7 @@ fields = move[0].split("|")
 check("строка перемещения имеет 8 полей (8-е — дата документа)", len(fields) == 8, f"полей: {len(fields)}: {fields}")
 check("склад-источник ЦС, склад-приёмник площадки, количество заказа",
       fields[2] == "ЦС Склад" and fields[3] == "Wildberries_Склад_FBO" and fields[4] == "3",
-      f"{fields[2]} → {fields[3]}, кол-во {fields[4]}")
+      f"{fields[2]} -> {fields[3]}, кол-во {fields[4]}")
 check("запрос выгрузки остатков попал в то же задание", "EXPORT_STOCK_ON_HAND" in lines)
 
 exchange.upload_task_file(fname, content)
@@ -249,7 +249,7 @@ o2 = PlatformOrder(order_id="WB-1002", barcode="2000932153735", quantity=2, raw_
 poll_new_orders(db, FakeClient(new_orders=[o2]), wb, "Wildberries_Склад_FBO")
 db.expire_all()
 product = db.query(Product).filter(Product.uid_1c == UID).first()
-check("новый заказ списал локально", product.stock_on_hand == before - 2, f"{before} → {product.stock_on_hand}")
+check("новый заказ списал локально", product.stock_on_hand == before - 2, f"{before} -> {product.stock_on_hand}")
 # 1С ещё НЕ провела это перемещение: отдаёт прежние 35
 stats_rec3 = run_reconciliation(db, {"2000932153735": 35, "2000932153742": 35})
 db.expire_all()

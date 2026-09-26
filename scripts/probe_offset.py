@@ -31,6 +31,19 @@ from app.models import (AuditLog, Barcode, DispatchQueueItem,  # noqa: E402
 from app.transmit import offset_from_base                  # noqa: E402
 
 
+# Консоль боевого сервера пишет в cp1251, и один символ, которого в ней нет,
+# роняет ВЕСЬ вывод скрипта посреди строки — с `UnicodeEncodeError` вместо
+# ответа на вопрос, ради которого скрипт и запускали. Свои строки мы держим в
+# пределах cp1251 (закрыто тестом), но сюда печатаются и ЧУЖИЕ данные: тело
+# ответа площадки из `last_error`, названия товаров, артикулы. Там может
+# оказаться что угодно, и заменить символ на «?» несравнимо лучше, чем не
+# напечатать ничего.
+try:
+    sys.stdout.reconfigure(errors="replace")
+except (AttributeError, ValueError):  # перенаправленный вывод, старый Python
+    pass
+
+
 def main() -> int:
     if len(sys.argv) < 2:
         print("укажите артикул или ID_1С")
@@ -191,7 +204,7 @@ def main() -> int:
         # сверху могли сработать порог кабинета и пауза, — но для вопроса «съехал
         # ли порог и когда» этого хватает.
         print("-" * 70)
-        print("ОЧЕРЕДЬ РАССЫЛКИ (последние 25; «порог≈» = остаток − ушло):")
+        print("ОЧЕРЕДЬ РАССЫЛКИ (последние 25; «порог~» = остаток - ушло):")
         queue = db.query(DispatchQueueItem).filter(
             DispatchQueueItem.uid_1c == product.uid_1c,
         ).order_by(DispatchQueueItem.id.desc()).limit(25).all()
@@ -199,7 +212,7 @@ def main() -> int:
             guess = ("—" if q.sent_quantity is None
                      else str((q.quantity or 0) - q.sent_quantity))
             print(f"  {q.created_at}  каб.{q.account_id}  остаток {q.quantity}"
-                  f"  ушло {q.sent_quantity}  порог≈{guess}"
+                  f"  ушло {q.sent_quantity}  порог~{guess}"
                   f"  {q.status.value if q.status else ''}  {q.reason}")
         if not queue:
             print("  пусто")

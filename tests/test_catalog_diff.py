@@ -61,11 +61,22 @@ def cabinet(tmp_path):
     return url, tmp_path
 
 
-def _run(url, *args):
+def _run(url, *args, console=None):
     env = dict(os.environ)
+    if console:
+        # Боевая консоль Windows, принесённая сюда: без этого весь класс
+        # виден только на сервере и только в накате.
+        env["PYTHONIOENCODING"] = console
     env["DATABASE_URL"] = url
     env["SESSION_SECRET"] = "x" * 32
     env["SECRETS_ENCRYPTION_KEY"] = Fernet.generate_key().decode()
+    if console:
+        # Читаем БАЙТАМИ и раскодируем той же кодировкой, что писал скрипт:
+        # с `text=True` их разбирал бы UTF-8, и падал бы уже сам тест — на
+        # выводе, который на сервере читается прекрасно.
+        done = subprocess.run([sys.executable, str(SCRIPT), *args],
+                              capture_output=True, env=env, cwd=str(ROOT))
+        return (done.stdout + done.stderr).decode(console, "replace")
     done = subprocess.run([sys.executable, str(SCRIPT), *args],
                           capture_output=True, text=True, env=env, cwd=str(ROOT))
     return done.stdout + done.stderr
@@ -90,7 +101,7 @@ def test_a_changed_key_is_the_first_thing_reported(cabinet):
 
     out = _run(url, "diff", "КИТ", str(snap))
     assert "СМЕНИЛИ КЛЮЧ ОТПРАВКИ: 1" in out, out
-    assert "V-2  →  V-999" in out
+    assert "V-2  ->  V-999" in out
     assert "терминально" in out, "не сказано, чем это кончится"
 
 
@@ -187,3 +198,18 @@ def test_the_saved_snapshot_says_how_fresh_it_is(cabinet):
     saved = json.loads((tmp / "before.json").read_text(encoding="utf-8"))
     assert saved["account_id"] == 1
     assert len(saved["items"]) == 3
+
+
+def test_the_server_console_does_not_kill_the_output(cabinet):
+    """Ровно тот прогон, что встал в накате 26.09, — теперь здесь."""
+    url, tmp = cabinet
+    snap = tmp / "before.json"
+
+    saved = _run(url, "save", "КИТ", str(snap), console="cp1251")
+    assert "UnicodeEncodeError" not in saved, saved
+    assert "Traceback" not in saved, saved
+    assert "баркодов" in saved, saved
+
+    out = _run(url, "diff", "КИТ", str(snap), console="cp1251")
+    assert "UnicodeEncodeError" not in out, out
+    assert "СМЕНИЛИ КЛЮЧ ОТПРАВКИ" in out, out

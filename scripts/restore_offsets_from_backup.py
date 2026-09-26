@@ -13,7 +13,7 @@
 сегодняшним днём дату расчёта могли сдвинуть (так и было 23.09 — и не раз), и
 факт «на дату» из копии относился бы к другой дате. Порог же описывает
 ПОСТОЯННОЕ расхождение учёта со складом и от даты не зависит — импорт запишет
-его как расхождение (`offset_base.apply_offset`: `расхождение = порог − бронь`).
+его как расхождение (`offset_base.apply_offset`: `расхождение = порог - бронь`).
 
 Порогом, а не колонкой «Расхождение», намеренно: сверяем мы то, что УХОДИТ НА
 ПЛОЩАДКИ, а бронь между копией и сегодня могли изменить — тогда прежнее
@@ -223,8 +223,8 @@ def main() -> int:
 
     for uid, row, old_offset, new_offset in plan["to_file"][:args.limit_print]:
         print(f"  {row['article']} {row['size'] or ''} {row['color'] or ''}: "
-              f"порог {old_offset} → {new_offset}, "
-              f"уходит {outgoing(row, new_offset)} → станет {outgoing(row, old_offset)}")
+              f"порог {old_offset} -> {new_offset}, "
+              f"уходит {outgoing(row, new_offset)} -> станет {outgoing(row, old_offset)}")
     if len(plan["to_file"]) > args.limit_print:
         print(f"  … и ещё {len(plan['to_file']) - args.limit_print}")
 
@@ -254,7 +254,7 @@ def main() -> int:
     with open(out, "wb") as fh:
         fh.write(build_xlsx_bytes(HEADERS, to_rows(plan["to_file"])))
     print(f"файл для импорта: {out}")
-    print("Проверьте его глазами и залейте на странице «Товары» → «Импорт из Excel».")
+    print("Проверьте его глазами и залейте на странице «Товары» -> «Импорт из Excel».")
     return 0
 
 
