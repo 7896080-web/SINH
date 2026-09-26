@@ -61,7 +61,9 @@ def test_full_month(env):
     assert "Пришло: 102 000,00 ₽" in card_reply.text
     assert "Ушло:   13 700,00 ₽" in card_reply.text
     assert "на бизнес: 5 499,00 ₽" in card_reply.text
-    assert "на личное: 3 201,00 ₽" in card_reply.text  # 13700 - 5000 своих - 5499 бизнес
+    # 13700 − 5000 своих − 4500 бизнеса, найденного в выписке (запись на 999
+    # в выписке не найдена — из личного её не вычитаем, но предупреждаем).
+    assert "на личное: 4 200,00 ₽" in card_reply.text
     assert "не найдено в выписке" in card_reply.text and "999" in card_reply.text
     assert "Пятёрочка" in unmatched.text and "CDEK" not in unmatched.text
     assert "Тинькофф" in nxt.text
@@ -70,8 +72,8 @@ def test_full_month(env):
     assert "💼 Ушло на бизнес: 5 499,00 ₽" in itog.text
     assert "• Реклама и продвижение: 3 000,00 ₽" in itog.text
     assert "• Логистика и доставка: 2 499,00 ₽" in itog.text
-    # Личное: Сбер 3 201 по выписке; у Тинькофф и Альфа выписок нет.
-    assert "🏠 Личные расходы: 3 201,00 ₽" in itog.text
+    # Личное: Сбер 4 200 по выписке; у Тинькофф и Альфа выписок нет.
+    assert "🏠 Личные расходы: 4 200,00 ₽" in itog.text
     assert "без выписки, личное не посчитано: Тинькофф ·2222, Альфа ·3333" in itog.text
     assert "должен" not in itog.text
     name, data = itog.file
@@ -158,7 +160,9 @@ def test_match_rules():
     lines = [_l(10, "2026-09-14", 100), _l(11, "2026-09-11", 100), _l(12, "2026-09-09", 100),
              _l(13, "2026-09-10", 500, "in")]
     pairs, missing = match(exps, lines)
-    assert pairs == {1: 11, 2: 12}  # 14-е — дальше 3 дней; зачисление расходу не пара
+    # 14-е — дальше 3 дней; зачисление расходу не пара. Строки 11 и 12 для
+    # записей 1 и 2 равноценны (разрыв по дню) — важно лишь, что заняты обе.
+    assert set(pairs) == {1, 2} and set(pairs.values()) == {11, 12}
     assert [e.id for e in missing] == [3, 4]
 
 

@@ -12,7 +12,7 @@ from datetime import date, datetime, timedelta
 
 from .reconcile import NO_CATEGORY, summarize
 from .report import month_name
-from .storage import BUSINESS, EXPENSE, Storage
+from .storage import Storage
 
 MONTHS_SHORT = ["янв", "фев", "мар", "апр", "май", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"]
 MONTHS_GEN = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа",
@@ -97,28 +97,45 @@ def parse_period(arg: str, today: date) -> Period | None:
 
 
 def business_items(storage: Storage, period: Period) -> list[Item]:
+    """Бизнес-операции периода — из тех же месячных сводов, что и /itog.
+
+    Дата операции — «дата банка»: если запись нашлась в выписке, берётся дата
+    строки (оплата 30.09, проведённая банком 01.10, — октябрь). Поэтому сумма
+    по месяцу в /svod всегда равна «Ушло на бизнес» в /itog.
+    """
     start, end = period.start.isoformat(), period.end.isoformat()
-    items = [
-        Item(e.op_date, e.amount, e.category or NO_CATEGORY, e.merchant, e.card,
-             "скриншот" if e.receipt_path else "запись")
-        for e in storage.expenses_between(start, end)
-        if e.kind == EXPENSE and e.purpose == BUSINESS
-    ]
-    # Бизнес-счёт: списания по выписке, которые ещё не разнесены по статьям.
+    items: list[Item] = []
+    cache: dict = {}
     month = period.start.replace(day=1)
     while month <= period.end:
-        m = f"{month:%Y-%m}"
-        for cs in summarize(storage, m).business_accounts:
-            lines = [ln for ln in cs.unmatched_out if start <= ln.op_date <= end]
-            items += [Item(ln.op_date, ln.amount, NO_CATEGORY, ln.description, cs.card.name,
-                           "выписка") for ln in lines]
-            # Выписка только с итогами: остаток без дат — относим на конец месяца.
-            rest = cs.business - cs.business_recorded - sum(ln.amount for ln in cs.unmatched_out)
-            month_end = _month_end(month).isoformat()
-            if rest > 0 and start <= month_end <= end:
-                items.append(Item(month_end, rest, NO_CATEGORY, "по итогам выписки",
+        summary = summarize(storage, f"{month:%Y-%m}", cache)
+        by_id = {e.id: e for e in summary.business_expenses}
+        for cs in summary.cards:
+            for exp_id, when in cs.effective_dates.items():
+                e = by_id.get(exp_id)
+                if e:
+                    items.append(Item(when, e.amount, e.category or NO_CATEGORY, e.merchant,
+                                      e.card, "скриншот" if e.receipt_path else "запись"))
+            # Бизнес-счёт: то, что ушло, но не разнесено по статьям. Строки
+            # выписки берём ровно на эту сумму — не больше, иначе /svod
+            # разойдётся с /itog (часть строк может соответствовать записям,
+            # не найденным в выписке, или личным покупкам).
+            extra = cs.business - cs.business_recorded
+            if not cs.card.is_business or extra <= 0:
+                continue
+            taken = 0
+            for ln in sorted(cs.unmatched_out, key=lambda x: (x.op_date, x.id)):
+                if taken + ln.amount > extra:
+                    continue
+                items.append(Item(ln.op_date, ln.amount, NO_CATEGORY, ln.description,
                                   cs.card.name, "выписка"))
+                taken += ln.amount
+            if extra > taken:
+                # Выписка только с итогами (или остаток без строк) — на конец месяца.
+                items.append(Item(_month_end(month).isoformat(), extra - taken, NO_CATEGORY,
+                                  "по итогам выписки", cs.card.name, "выписка"))
         month = _month_end(month) + timedelta(days=1)
+    items = [i for i in items if start <= i.date <= end]
     return sorted(items, key=lambda i: (i.date, -i.amount))
 
 
