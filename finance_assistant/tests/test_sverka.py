@@ -82,7 +82,7 @@ def test_biz_from_statement_line(env):
     flow.on_files(CHAT, [PDF], "")
     flow.on_command(CHAT, "done")
     line_id = db.statement(db.cards()[0].id, "2026-09")[1][0].id
-    added, question = flow.on_command(CHAT, "biz", str(line_id))
+    [question] = flow.on_command(CHAT, "biz", str(line_id))
     assert "статья" in question.text.lower()
     flow.on_button(CHAT, f"d:cat:{db.category_id('Упаковка и расходники')}")
     s = summarize(db, "2026-09")

@@ -15,8 +15,9 @@ from datetime import date, datetime, timedelta
 
 from .money import parse_amount
 from .recognize import RecognitionError
-from .report import (card_text, expense_card, expense_line, month_name, month_text,
-                     month_xlsx, rub, unmatched_text)
+from .report import (MONTHS, card_text, expense_card, expense_line, month_name, month_text,
+                     month_xlsx, period_text, period_xlsx, rub, suggestions_text,
+                     unmatched_text)
 from .reconcile import summarize
 from .storage import BUSINESS, EXPENSE, PERSONAL, REIMBURSEMENT, Storage
 
@@ -31,17 +32,24 @@ HELP = """\
 
 В конце месяца:
 /sverka — загрузить выписку по карте (PDF, скриншоты, Excel/CSV или просто \
-«пришло 120000, ушло 95000»)
-/itog — свод за месяц: по каждой карте пришло/ушло, бизнес/личное, \
-по статьям, сколько бизнес должен вернуть; плюс Excel
+«пришло 120000, ушло 95000»). Можно за любой из последних 12 месяцев \
+или одну выписку сразу за несколько месяцев — так удобно начать учёт задним числом.
+После выписки бот предложит списания, похожие на бизнес: записать все одной \
+кнопкой, лишние убрать /notbiz 12 15, недостающие добавить /biz 7 9.
+/itog — свод за месяц (/itog 2026-03), за год (/itog 2026) или период \
+(/itog 2026-01..2026-06): пришло/ушло, бизнес/личное, по статьям, \
+сколько бизнес должен вернуть; плюс Excel
+/vypiska 2026-03 — списания месяца, которые сейчас считаются личными
 
 Прочее:
-/list — записи за месяц
+/list — записи за месяц (/list 2026-02) · /fix 42 — исправить запись
 /cards — мои карты · /addcard Название 1234 Банк · /delcard N
 /cats — статьи · /addcat Название
 /cancel — сбросить текущий вопрос"""
 
 MONTH_ARG_HELP = "Месяц указывайте как 2026-09"
+PICKER_MONTHS = 12   # сколько месяцев назад можно выбрать кнопкой в /sverka
+PERIOD = "period"    # «выписка за несколько месяцев»
 
 
 @dataclass
@@ -61,6 +69,34 @@ def _parse_month_arg(arg: str) -> str | None:
         return datetime.strptime(arg.strip(), "%Y-%m").strftime("%Y-%m")
     except ValueError:
         return None
+
+
+def _short_month(month: str) -> str:
+    year, mon = month.split("-")
+    return f"{MONTHS[int(mon) - 1][:3].capitalize()} {year[2:]}"
+
+
+def _months_between(first: str, last: str) -> list[str]:
+    months, m = [], first
+    while m <= last:
+        months.append(m)
+        y, mo = (int(x) for x in m.split("-"))
+        m = f"{y + mo // 12:04d}-{mo % 12 + 1:02d}"
+    return months
+
+
+def _parse_period_arg(arg: str, today: date) -> tuple[str, str] | None:
+    """'2026-09' | '2026' (год, но не дальше текущего месяца) | '2026-01..2026-09'."""
+    arg = arg.strip().replace(" ", "")
+    if ".." in arg:
+        first, _, last = arg.partition("..")
+        first, last = _parse_month_arg(first), _parse_month_arg(last)
+        return (first, last) if first and last and first <= last else None
+    if arg.isdigit() and len(arg) == 4:
+        first, last = f"{arg}-01", min(f"{arg}-12", _month(today))
+        return (first, last) if first <= last else None
+    month = _parse_month_arg(arg)
+    return (month, month) if month else None
 
 
 def _parse_date(text: str, today: date) -> str | None:
@@ -104,6 +140,7 @@ class Flow:
             "cards": self._cards, "addcard": self._add_card, "delcard": self._del_card,
             "cats": self._cats, "addcat": self._add_cat, "list": self._list,
             "sverka": self._sverka, "done": self._done, "itog": self._itog, "biz": self._biz,
+            "notbiz": self._notbiz, "vypiska": self._vypiska, "fix": self._fix,
         }.get(command)
         if not handler:
             return [Reply("Не знаю такой команды. /help — что я умею.")]
@@ -219,6 +256,7 @@ class Flow:
     def _advance(self, chat_id: int) -> list[Reply]:
         """Задать следующий нужный вопрос про первую операцию в очереди или сохранить её."""
         replies: list[Reply] = []
+        quiet: list[int] = []  # записи из выписки пачкой — одна сводка вместо карточек
         state = self.db.get_state(chat_id)
         while state.get("drafts"):
             d = state["drafts"][0]
@@ -226,18 +264,45 @@ class Flow:
             if question:
                 state["ask"] = question[0]
                 self.db.set_state(chat_id, state)
-                replies.append(question[1])
-                return replies
+                return replies + self._quiet_summary(quiet) + [question[1]]
             expense_id = self.db.add_expense(
                 op_date=d["date"], amount=d["amount"], card_id=d["card_id"], kind=d["kind"],
                 purpose=d["purpose"],
                 category_id=d["category_id"] if d["purpose"] == BUSINESS and d["kind"] == EXPENSE else None,
-                merchant=d["merchant"], description=d["description"], receipt_path=d["receipt"],
+                merchant=d["merchant"], description=d["description"],
+                receipt_path=self._file_receipt(d["receipt"], d["date"]),
             )
             self._pop_draft(state)
             self.db.set_state(chat_id, state)
-            replies.append(self._saved_reply(expense_id))
-        return replies
+            if d.get("quiet"):
+                quiet.append(expense_id)
+            else:
+                replies.append(self._saved_reply(expense_id))
+        return replies + self._quiet_summary(quiet)
+
+    def _quiet_summary(self, ids: list[int]) -> list[Reply]:
+        if not ids:
+            return []
+        items = [self.db.expense(i) for i in ids]
+        by_cat: dict[str, int] = {}
+        for e in items:
+            by_cat[e.category or "Без статьи"] = by_cat.get(e.category or "Без статьи", 0) + e.amount
+        lines = [f"✅ Записано как бизнес: {len(items)} на {rub(sum(e.amount for e in items))}"]
+        lines += [f"  • {name}: {rub(total)}" for name, total in by_cat.items()]
+        lines.append("Поправить отдельную запись: /list месяц, затем /fix номер")
+        return [Reply("\n".join(lines))]
+
+    def _file_receipt(self, path: str, op_date: str) -> str:
+        """Скриншот лежит в папке месяца, когда его прислали; переносим в месяц оплаты."""
+        if not path or not os.path.exists(path):
+            return path
+        folder = os.path.join(self.receipts_dir, op_date[:7])
+        if os.path.dirname(path) == folder:
+            return path
+        os.makedirs(folder, exist_ok=True)
+        target = os.path.join(folder, os.path.basename(path))
+        os.replace(path, target)
+        return target
 
     @staticmethod
     def _pop_draft(state: dict):
@@ -438,6 +503,11 @@ class Flow:
         self.db.add_category(arg)
         return [Reply(f"Статья «{arg}» есть в списке.")]
 
+    def _fix(self, chat_id, arg):
+        if not arg.isdigit() or not self.db.expense(int(arg)):
+            return [Reply("Укажите номер записи из /list, например /fix 42")]
+        return [self._saved_reply(int(arg))]
+
     def _list(self, chat_id, arg):
         month = _parse_month_arg(arg) if arg else _month(self.today())
         if not month:
@@ -460,10 +530,14 @@ class Flow:
             if not month:
                 return [Reply(MONTH_ARG_HELP)]
             return self._ask_card_for_statement(chat_id, month)
-        prev, cur = _month(self.today(), -1), _month(self.today())
-        return [Reply("За какой месяц сверка?",
-                      [[(month_name(prev).capitalize(), f"s:m:{prev}"),
-                        (month_name(cur).capitalize(), f"s:m:{cur}")]])]
+        # Последние 12 месяцев — чтобы можно было начать учёт задним числом.
+        months = [_month(self.today(), -i) for i in range(PICKER_MONTHS - 1, -1, -1)]
+        rows = [[(_short_month(m), f"s:m:{m}") for m in months[i:i + 3]]
+                for i in range(0, len(months), 3)]
+        rows.append([("📚 Выписка за несколько месяцев", f"s:m:{PERIOD}")])
+        return [Reply("За какой месяц сверка?\n"
+                      "Если у вас одна выписка сразу за несколько месяцев "
+                      "(например, с 1 января), выберите нижнюю кнопку.", rows)]
 
     def _ask_card_for_statement(self, chat_id, month):
         state = self.db.get_state(chat_id)
@@ -472,10 +546,10 @@ class Flow:
         self.db.set_state(chat_id, state)
         rows = []
         for c in self.db.cards():
-            found = self.db.statement(c.id, month)
-            mark = " ✓" if found else ""
+            mark = " ✓" if month != PERIOD and self.db.statement(c.id, month) else ""
             rows.append([(c.label + mark, f"s:c:{c.id}")])
-        return [Reply(f"Сверка за {month_name(month)}. По какой карте выписка?", rows)]
+        what = "за несколько месяцев" if month == PERIOD else f"за {month_name(month)}"
+        return [Reply(f"Сверка {what}. По какой карте выписка?", rows)]
 
     def _sverka_button(self, chat_id, rest):
         what, _, value = rest.partition(":")
@@ -485,8 +559,15 @@ class Flow:
         if what == "c" and "sverka" in state:
             month = state.pop("sverka")["month"]
             card = self.db.card(int(value))
-            state["statement"] = {"card_id": card.id, "month": month}
+            state["statement"] = {"card_id": card.id, "month": None if month == PERIOD else month,
+                                  "months": []}
             self.db.set_state(chat_id, state)
+            if month == PERIOD:
+                return [Reply(
+                    f"Жду выписку по карте {card.label} за весь период, например с 1 января "
+                    "по сегодня. Присылайте PDF или Excel/CSV из банка, можно несколькими "
+                    "файлами. Операции сами разложатся по месяцам.\n"
+                    "Когда всё — /done")]
             found = self.db.statement(card.id, month)
             already = ""
             buttons = []
@@ -500,7 +581,9 @@ class Flow:
                 "Когда всё — /done", buttons)]
         if what == "itog":
             return self._itog(chat_id, value)
-        if what == "reset" and "statement" in state:
+        if what == "acc":
+            return self._biz(chat_id, "все")
+        if what == "reset" and state.get("statement", {}).get("month"):
             st = state["statement"]
             self.db.reset_statement(st["card_id"], st["month"])
             return [Reply("Старые данные выписки удалены, присылайте заново.")]
@@ -509,8 +592,11 @@ class Flow:
     def _statement_input(self, chat_id, state, files, text):
         st = state["statement"]
         card = self.db.card(st["card_id"])
+        period = month_name(st["month"]) if st["month"] else "несколько месяцев"
         try:
-            data = self.recognizer.parse_statement(files, text, month=st["month"], cards=self.db.cards())
+            data = self.recognizer.parse_statement(
+                files, text, period=period, cards=self.db.cards(),
+                categories=[c["name"] for c in self.db.categories()])
         except RecognitionError as exc:
             return [Reply(f"Не получилось разобрать: {exc}.")]
         if not data.get("is_statement"):
@@ -520,90 +606,182 @@ class Flow:
         last4 = "".join(ch for ch in data.get("card_last4", "") if ch.isdigit())[-4:]
         if last4 and card.last4 and last4 != card.last4:
             warn = f"\n⚠️ В документе карта …{last4}, а сверяем {card.label}. Проверьте."
-        lines, skipped = [], 0
+
+        by_month: dict[str, list[dict]] = {}
+        skipped = 0
         for op in data.get("operations", []):
             amount = _amount_or_none(op.get("amount", "").lstrip("-+"))
             op_date = _parse_date(op.get("date", ""), self.today())
             if amount is None or op_date is None:
                 skipped += 1
                 continue
-            if op_date[:7] != st["month"]:
+            if st["month"] and op_date[:7] != st["month"]:
                 skipped += 1  # операции соседнего месяца в выписку этого месяца не берём
                 continue
-            lines.append({"op_date": op_date, "amount": amount, "direction": op["direction"],
-                          "description": op.get("description", "").strip(),
-                          "own_transfer": op.get("own_transfer", False)})
-        statement_id = self.db.statement_id(card.id, st["month"])
-        added = self.db.add_statement_lines(statement_id, lines)
+            by_month.setdefault(op_date[:7], []).append({
+                "op_date": op_date, "amount": amount, "direction": op["direction"],
+                "description": op.get("description", "").strip(),
+                "own_transfer": op.get("own_transfer", False),
+                "suggested_category": op.get("business_category", "")
+                if op["direction"] == "out" and not op.get("own_transfer") else "",
+            })
+
         total_in = _amount_or_none(data.get("total_in", ""))
         total_out = _amount_or_none(data.get("total_out", ""))
-        self.db.set_statement_totals(statement_id, total_in, total_out)
-        msg = [f"Принято операций: {added}" + (f" (повторы пропущены: {len(lines) - added})"
-                                             if len(lines) > added else "")]
+        # Напечатанные итоги относим к месяцу, только если документ ровно за один месяц.
+        totals_month = st["month"] or (next(iter(by_month)) if len(by_month) == 1 else None)
+        if totals_month is None and (total_in is not None or total_out is not None) and not by_month:
+            return [Reply("Итоги без выписки можно вносить только за конкретный месяц: "
+                          "/done, затем /sverka и выберите месяц.")]
+        if totals_month:
+            by_month.setdefault(totals_month, [])
+
+        msg, total_added, total_lines = [], 0, 0
+        for month in sorted(by_month):
+            statement_id = self.db.statement_id(card.id, month)
+            added = self.db.add_statement_lines(statement_id, by_month[month])
+            if month == totals_month:
+                self.db.set_statement_totals(statement_id, total_in, total_out)
+            total_added += added
+            total_lines += len(by_month[month])
+            if month not in st["months"]:
+                st["months"].append(month)
+            if not st["month"]:
+                msg.append(f"  {month_name(month)}: {added}")
+        self.db.set_state(chat_id, state)
+
+        repeat = f" (повторы пропущены: {total_lines - total_added})" if total_lines > total_added else ""
+        head = [f"Принято операций: {total_added}{repeat}"]
         if skipped:
-            msg.append(f"Пропущено строк (другой месяц или нечитаемые): {skipped}")
-        if total_in is not None or total_out is not None:
-            msg.append(f"Итоги из документа: пришло {rub(total_in)}, ушло {rub(total_out)}")
-        msg.append("Ещё части выписки — присылайте, всё — /done")
+            head.append(f"Пропущено строк (другой месяц или нечитаемые): {skipped}")
+        if totals_month and (total_in is not None or total_out is not None):
+            head.append(f"Итоги из документа: пришло {rub(total_in)}, ушло {rub(total_out)}")
+        msg = head + msg + ["Ещё части выписки — присылайте, всё — /done"]
         return [Reply("\n".join(msg) + warn)]
 
     def _done(self, chat_id, arg):
         state = self.db.get_state(chat_id)
         st = state.pop("statement", None)
         state.pop("sverka", None)
-        self.db.set_state(chat_id, state)
         if not st:
+            self.db.set_state(chat_id, state)
             return [Reply("Сейчас не идёт загрузка выписки. /sverka — начать.")]
-        summary = summarize(self.db, st["month"])
-        cs = next(c for c in summary.cards if c.card.id == st["card_id"])
-        replies = [Reply(card_text(cs, st["month"]))]
-        extra = unmatched_text(cs)
-        if extra:
-            replies.append(Reply(extra))
-        rest = [c for c in summary.cards if not c.has_statement]
-        next_btn = [[("Следующая карта", f"s:m:{st['month']}")], [("Итог месяца", f"s:itog:{st['month']}")]]
+        months = [st["month"]] if st["month"] else sorted(st["months"])
+        if not months:
+            self.db.set_state(chat_id, state)
+            return [Reply("Выписка не была загружена.")]
+
+        replies, suggestions, unmatched = [], [], []
+        for month in months:
+            cs = next(c for c in summarize(self.db, month).cards if c.card.id == st["card_id"])
+            replies.append(Reply(card_text(cs, month)))
+            suggestions += [ln for ln in cs.unmatched_out if ln.suggested_category]
+            unmatched += [ln for ln in cs.unmatched_out if not ln.suggested_category]
+
+        state["review"] = [ln.id for ln in suggestions]
+        self.db.set_state(chat_id, state)
+        if suggestions:
+            replies.append(Reply(suggestions_text(suggestions),
+                                 [[("✅ Записать все как бизнес", "s:acc")]]))
+        if unmatched and len(months) == 1:
+            replies.append(Reply(unmatched_text(unmatched)))
+        elif unmatched:
+            replies.append(Reply(
+                "Остальные списания считаются личными. Посмотреть их по месяцу "
+                "и отметить бизнес: /vypiska 2026-03"))
+
+        month = months[-1]
+        rest = [c for c in summarize(self.db, month).cards if not c.has_statement]
+        picker = f"s:m:{st['month'] or PERIOD}"
+        itog = (f"s:itog:{month}" if len(months) == 1
+                else f"s:itog:{months[0]}..{months[-1]}")
+        next_btn = [[("Следующая карта", picker)], [("Итог", itog)]]
         if rest:
             replies.append(Reply("Без выписки пока: " + ", ".join(c.card.label for c in rest), next_btn))
         else:
             replies.append(Reply("Выписки по всем картам загружены.", next_btn[1:]))
         return replies
 
+    def _vypiska(self, chat_id, arg):
+        month = _parse_month_arg(arg) if arg else _month(self.today())
+        if not month:
+            return [Reply(MONTH_ARG_HELP)]
+        lines = [ln for cs in summarize(self.db, month).cards for ln in cs.unmatched_out]
+        if not lines:
+            return [Reply(f"За {month_name(month)} нет списаний по выпискам, "
+                          "которые считаются личными.")]
+        return [Reply(f"{month_name(month).capitalize()}:\n" + unmatched_text(lines))]
+
     def _itog(self, chat_id, arg):
-        if arg:
-            month = _parse_month_arg(arg)
-            if not month:
-                return [Reply(MONTH_ARG_HELP)]
-        else:
+        today = self.today()
+        if not arg:
             # В начале месяца обычно подводят итог прошлого.
-            today = self.today()
-            month = _month(today, -1) if today.day <= 10 else _month(today)
-        summary = summarize(self.db, month)
-        return [Reply(month_text(summary),
-                      file=(f"свод-{month}.xlsx", month_xlsx(summary)))]
+            arg = _month(today, -1) if today.day <= 10 else _month(today)
+        period = _parse_period_arg(arg, today)
+        if not period:
+            return [Reply("Укажите месяц (2026-09), год (2026) или период (2026-01..2026-09).")]
+        first, last = period
+        if first == last:
+            summary = summarize(self.db, first)
+            return [Reply(month_text(summary, self.db.owed_until(first)),
+                          file=(f"свод-{first}.xlsx", month_xlsx(summary)))]
+        months = _months_between(first, last)
+        summaries = [summarize(self.db, m) for m in months]
+        owed = self.db.owed_until(last)
+        return [Reply(period_text(summaries, owed),
+                      file=(f"свод-{first}--{last}.xlsx", period_xlsx(summaries, owed)))]
 
     def _biz(self, chat_id, arg):
-        """Отметить строки выписки как бизнес-расходы (забыли прислать скриншот)."""
-        ids = [int(x) for x in arg.replace(",", " ").split() if x.isdigit()]
-        if not ids:
-            return [Reply("Укажите номера строк из сверки, например: /biz 12 15")]
+        """Отметить строки выписки как бизнес-расходы.
+
+        /biz 12 15 — выбранные строки; /biz все — все предложенные после /done.
+        Строки с предложенной статьёй записываются без вопросов и одной сводкой.
+        """
         state = self.db.get_state(chat_id)
+        if arg.strip().lower() in ("все", "всё", "all"):
+            ids = state.get("review", [])
+            if not ids:
+                return [Reply("Нет предложенных списаний. Сначала загрузите выписку: /sverka")]
+        else:
+            ids = [int(x) for x in arg.replace(",", " ").split() if x.isdigit()]
+            if not ids:
+                return [Reply("Укажите номера строк из сверки, например: /biz 12 15")]
         added = 0
         for line_id in ids:
-            row = self.db.conn.execute(
-                "SELECT l.*, s.card_id FROM statement_lines l"
-                " JOIN statements s ON s.id = l.statement_id WHERE l.id = ?", (line_id,)
-            ).fetchone()
+            row = self.db.statement_line(line_id)
             if not row or row["direction"] != "out":
                 continue
+            category_id = self.db.category_id(row["suggested_category"])
             state.setdefault("drafts", []).append({
                 "amount": row["amount"], "date": row["op_date"], "card_id": row["card_id"],
                 "kind": EXPENSE, "purpose": BUSINESS, "purpose_asked": True,
-                "category_id": None, "category_confident": False,
+                "category_id": category_id, "category_confident": category_id is not None,
                 "merchant": row["description"], "description": "по выписке",
-                "receipt": "", "note": "", "dup_checked": False,
+                "receipt": "", "note": "", "dup_checked": False, "quiet": True,
             })
             added += 1
+        state["review"] = [i for i in state.get("review", []) if i not in ids]
+        if not state["review"]:
+            del state["review"]
         if not added:
+            self.db.set_state(chat_id, state)
             return [Reply("Не нашёл таких списаний в выписках.")]
         self.db.set_state(chat_id, state)
-        return [Reply(f"Добавляю как бизнес: {added}.")] + self._advance(chat_id)
+        return self._advance(chat_id)
+
+    def _notbiz(self, chat_id, arg):
+        ids = [int(x) for x in arg.replace(",", " ").split() if x.isdigit()]
+        if not ids:
+            return [Reply("Укажите номера, которые не бизнес, например: /notbiz 12 15")]
+        state = self.db.get_state(chat_id)
+        for line_id in ids:
+            self.db.clear_suggestion(line_id)
+        left = [i for i in state.get("review", []) if i not in ids]
+        state["review"] = left
+        if not left:
+            del state["review"]
+        self.db.set_state(chat_id, state)
+        if not left:
+            return [Reply("Убрал. Предложений больше не осталось.")]
+        return [Reply(f"Убрал из предложенных: {len(ids)}. Осталось {len(left)}.",
+                      [[("✅ Записать оставшиеся как бизнес", "s:acc")]])]

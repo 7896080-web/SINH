@@ -82,7 +82,8 @@ def test_recognizer_request_and_fallback_block():
 def test_recognizer_errors(content, stop):
     client, _ = fake_client(content, stop)
     with pytest.raises(RecognitionError):
-        ClaudeRecognizer(client=client).parse_statement([], "итоги", month="2026-09", cards=[])
+        ClaudeRecognizer(client=client).parse_statement([], "итоги", period="сентябрь 2026",
+                                                       cards=[], categories=["Прочее"])
 
 
 def test_cards_commands(env):
