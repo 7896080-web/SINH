@@ -73,12 +73,41 @@ async def send(update: Update, replies: list[Reply]):
             await chat.send_document(InputFile(io.BytesIO(data), filename=name))
 
 
-def build_app(token: str, flow_for, allowed: set[int]) -> Application:
+ENV_CHECK_INTERVAL = 10  # сек: как часто смотреть, не поменялись ли настройки
+
+
+def _mtime(path: str) -> float | None:
+    try:
+        return os.stat(path).st_mtime_ns
+    except OSError:
+        return None
+
+
+async def watch_env(app: Application, path: str, interval: float = ENV_CHECK_INTERVAL):
+    """Настройки поменяли на странице настроек — завершаемся, systemd запустит
+    бота заново уже с новым .env (Restart=always)."""
+    known = _mtime(path)
+    while True:
+        await asyncio.sleep(interval)
+        current = _mtime(path)
+        if current != known:
+            log.warning("Файл настроек %s изменился — перезапускаюсь с новыми настройками", path)
+            app.stop_running()
+            return
+
+
+def build_app(token: str, flow_for, allowed: set[int], env_file: str | None = None) -> Application:
     """flow_for(user_id) → Flow этого пользователя (у каждого своя база).
 
-    Можно передать и один Flow (в тестах) — тогда он общий.
+    Можно передать и один Flow (в тестах) — тогда он общий. env_file — следить
+    за файлом настроек и перезапускаться при его изменении.
     """
-    app = Application.builder().token(token).build()
+    builder = Application.builder().token(token)
+    if env_file:
+        async def start_watch(application: Application):
+            application.create_task(watch_env(application, env_file))
+        builder = builder.post_init(start_watch)
+    app = builder.build()
     resolve = flow_for if callable(flow_for) else (lambda user_id: flow_for)
 
     async def guard(update: Update) -> bool:
@@ -281,5 +310,6 @@ def main():
     spaces = UserSpaces(data_dir, recognizer, user_ids)
     spaces.migrate_shared_data()
     log.info("Пользователей: %d, у каждого своя база в %s/users/<id>/", len(user_ids), data_dir)
-    build_app(token, spaces.flow, set(user_ids)).run_polling(
+    build_app(token, spaces.flow, set(user_ids),
+              env_file=os.environ.get("FINANCE_ENV_FILE")).run_polling(
         allowed_updates=[Update.MESSAGE, Update.CALLBACK_QUERY])

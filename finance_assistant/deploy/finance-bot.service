@@ -10,6 +10,8 @@ WorkingDirectory=/opt/finance-bot
 # Часовой пояс по умолчанию («сегодня»/«вчера»); значение из .env его перекрывает.
 Environment=TZ=Europe/Moscow
 EnvironmentFile=/opt/finance-bot/.env
+# Бот следит за этим файлом: изменили на странице настроек — перезапустится сам.
+Environment=FINANCE_ENV_FILE=/opt/finance-bot/.env
 ExecStart=/opt/finance-bot/venv/bin/python -m finance
 Restart=always
 RestartSec=10

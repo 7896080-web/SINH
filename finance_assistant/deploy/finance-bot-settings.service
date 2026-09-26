@@ -1,0 +1,36 @@
+[Unit]
+Description=Finance assistant settings page (password-protected, HTTPS)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Отдельный пользователь без прав root: может менять только файл настроек .env
+# и читать свою папку с паролем и сертификатом.
+User=finance-settings
+Group=finance-settings
+WorkingDirectory=/opt/finance-bot
+Environment=PORT=8765
+EnvironmentFile=-/opt/finance-bot/settings/port.env
+ExecStart=/opt/finance-bot/venv/bin/python -m finance.settings_web serve \
+    --env /opt/finance-bot/.env --dir /opt/finance-bot/settings --port ${PORT}
+Restart=on-failure
+RestartSec=5
+
+UMask=0077
+ProtectSystem=strict
+ReadWritePaths=/opt/finance-bot/.env
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target
