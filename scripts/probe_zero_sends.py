@@ -41,6 +41,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.models import (AuditLog, DispatchQueueItem, PlatformAccount,  # noqa: E402
                         Product, SyncSetting)
+from app.transmit import explain, sku_mode, MODE_OFFSET, MODE_OVERRIDE  # noqa: E402
 from app.database import SessionLocal                                  # noqa: E402
 from app.timeutils import now_utc                                      # noqa: E402
 
@@ -72,6 +73,26 @@ def _accounts(db, needle: str) -> list[PlatformAccount]:
             return found
     return db.query(PlatformAccount).filter(
         PlatformAccount.name.ilike(f"%{needle}%")).order_by(PlatformAccount.id).all()
+
+
+def _why_empty(product) -> str:
+    """Отчего лестница отдала ноль, когда выключатели ни при чём.
+
+    Числами, а не словом: «порог 6 при остатке 5» человек проверяет сам и
+    сразу, а «порог» без чисел заставляет лезть в строку товара.
+    """
+    if product is None:
+        return "товара нет в номенклатуре"
+    stock = product.stock_on_hand or 0
+    mode = sku_mode(product)
+    if mode == MODE_OVERRIDE:
+        return f"ручной остаток {product.transmit_override}"
+    if mode == MODE_OFFSET:
+        return (f"порог {product.broadcast_offset} при остатке {stock}"
+                f" (расхождение {product.stock_discrepancy} + бронь {product.reserve or 0})")
+    if stock <= 0:
+        return f"остаток {stock} — распродано"
+    return f"остаток {stock} минус бронь {product.reserve or 0}"
 
 
 def _label(products: dict, uid: str) -> str:
@@ -161,26 +182,56 @@ def report(db, account: PlatformAccount, since, products_cache: dict) -> None:
     if not zeros:
         print("    нулей не было вовсе")
 
-    # Отмечена ли пара СЕЙЧАС — разный ответ меняет разбор целиком. Ноль по
-    # снятой паре это отзыв, то есть работа человека; ноль по ОТМЕЧЕННОЙ и
-    # включённой — расчёт или сбой, и вот это надо разбирать.
+    # ПОЧЕМУ ноль, а не «отмечена ли пара». Это главный вопрос разбора, и
+    # различие здесь ровно то же, что описано в `transmit`: ноль бывает двух
+    # сортов, и путать их нельзя.
+    #
+    # Ноль от РАСЧЁТА — распродано, бронь или порог съели остаток — законное
+    # сообщение площадке «не продавать». 26.09 на бою это стоило ложной тревоги
+    # на 517 товаров: порог 6 при остатке 5 даёт ноль по построению, всё
+    # работало правильно, а скрипт объявил «надо разбирать». Находка,
+    # срабатывающая на норме, приучает пролистывать вывод целиком — и тогда
+    # настоящую она уже не покажет.
+    #
+    # Ноль от ВЫКЛЮЧАТЕЛЯ (ступени 0-3) значит обратное: этой карточкой мы не
+    # управляем. Вот его и разбирают.
+    #
+    # Причину спрашиваем у САМОЙ системы (`transmit.explain`), а не считаем
+    # здесь: повтори мы лестницу у себя, она однажды разошлась бы с боевой, и
+    # разбор объяснял бы не то, что произошло.
     zero_uids = {r.uid_1c for r in zeros}
     if zero_uids:
-        marked = {s.uid_1c for s in db.query(SyncSetting).filter(
+        settings = {s.uid_1c: s for s in db.query(SyncSetting).filter(
             SyncSetting.account_id == account.id,
-            SyncSetting.uid_1c.in_(list(zero_uids)),
-            SyncSetting.enabled.is_(True)).all()}
-        on = {u for u in zero_uids
-              if products_cache.get(u) is not None
-              and products_cache[u].broadcast_enabled}
-        both = marked & on
+            SyncSetting.uid_1c.in_(list(zero_uids))).all()}
+        by_cause: dict = {}
+        for uid in zero_uids:
+            product = products_cache.get(uid)
+            verdict = explain(product, settings.get(uid), account)
+            if verdict.blocked:
+                cause = f"ВЫКЛЮЧАТЕЛЬ: {verdict.reason}"
+            elif verdict.quantity == 0:
+                cause = f"законный ноль: {_why_empty(product)}"
+            else:
+                # Тогда ушёл ноль, а сегодня ушло бы число: состояние пары
+                # изменилось ПОСЛЕ записи. Это не ошибка и не норма — это
+                # сообщение о том, что смотреть надо не на сегодняшний день.
+                cause = f"сейчас ушло бы {verdict.quantity} — состояние изменилось"
+            by_cause.setdefault(cause, []).append(uid)
+
         print("-" * 78)
-        print(f"  из {len(zero_uids)} обнулённых товаров ПРЯМО СЕЙЧАС: "
-              f"кабинет отмечен у {len(marked)}, трансляция включена у {len(on)}, "
-              f"и то и другое — у {len(both)}")
-        if both:
-            print("    (по ним ноль ушёл не отзывом — это и есть то, "
-                  "что надо разбирать)")
+        print(f"  ПОЧЕМУ УШЁЛ НОЛЬ (по СЕГОДНЯШНЕМУ состоянию пары, "
+              f"всего товаров {len(zero_uids)}):")
+        for cause, uids in sorted(by_cause.items(), key=lambda kv: -len(kv[1])):
+            print(f"    {len(uids):>5}  {cause}")
+        blocked_n = sum(len(v) for c, v in by_cause.items()
+                        if c.startswith("ВЫКЛЮЧАТЕЛЬ"))
+        if blocked_n:
+            print(f"\n    Разбирают только ВЫКЛЮЧАТЕЛЬ — здесь таких {blocked_n}.")
+        else:
+            print("\n    Ни одного нуля от выключателя: разбирать нечего.")
+        print("    Законный ноль — это распродано, бронь или порог съели остаток;")
+        print("    такой ноль площадке уходить ОБЯЗАН.")
 
 
 def main() -> int:

@@ -136,15 +136,22 @@ def test_it_names_who_put_the_zeros_there(cabinet):
     assert "order" in out, "не названа продажа\n" + out
 
 
-def test_a_zero_on_a_live_pair_is_told_apart_from_a_withdrawal(cabinet):
-    """Главное различие всего разбора, и оба случая выглядят одинаково."""
+def test_a_zero_from_the_ladder_is_told_apart_from_a_switch(cabinet):
+    """Главное различие всего разбора, и оба нуля выглядят одинаково.
+
+    26.09 на бою это стоило ложной тревоги на 517 товаров: порог 6 при остатке
+    5 даёт ноль по построению — всё работало правильно, а разбор объявил «надо
+    разбирать». Находка, срабатывающая на норме, приучает пролистывать вывод
+    целиком, и тогда настоящую она уже не покажет.
+    """
     out = _run(cabinet, "КИТ", "48")
-    # Живых (отмечен И транслируется) среди обнулённых ровно два: A и D.
-    # E сюда не входит намеренно: трансляция у него включена, но галочку
-    # кабинета сняли — это отзыв, и разбирать там нечего.
-    assert "и то и другое — у 2" in out, out
-    assert "трансляция включена у 3" in out, out
-    assert "ноль ушёл не отзывом" in out
+    assert "ПОЧЕМУ УШЁЛ НОЛЬ" in out, out
+    # B и E: трансляция выключена / кабинет снят — это выключатели.
+    assert "ВЫКЛЮЧАТЕЛЬ" in out, out
+    assert "Разбирают только ВЫКЛЮЧАТЕЛЬ" in out, out
+    # И обязательно сказано, что законный ноль разбирать не надо: без этой
+    # строки человек считает тревогой весь список.
+    assert "уходить ОБЯЗАН" in out, out
 
 
 def test_two_products_on_one_platform_card_are_shown(cabinet):
@@ -226,3 +233,32 @@ def test_the_server_console_does_not_kill_the_output(tmp_path):
     assert "Traceback" not in out, out
     assert "ПОСЛЕДНИЕ НУЛИ" in out, out
     assert "3030-7777" in out, "строка с чужим символом до вывода не дошла"
+
+
+def test_a_threshold_that_ate_the_stock_is_not_called_a_problem(tmp_path):
+    """Ровно боевой случай 26.09: порог 6 при остатке 5.
+
+    Ноль тут законный — площадке так и надо сказать «не продавать». Назови мы
+    это проблемой, в списке «разбирать» оказались бы сотни исправных строк.
+    """
+    path = tmp_path / "threshold.db"
+    url = f"sqlite:///{path}"
+    engine = create_engine(url, connect_args={"check_same_thread": False})
+    Base.metadata.create_all(bind=engine)
+    s = sessionmaker(bind=engine, autoflush=False)()
+    s.add(PlatformAccount(id=1, platform=Platform.kit, name="КИТ"))
+    s.add(Product(uid_1c="u-T", article="36080", name="Футболка", size="L",
+                  color="LACIVERT", stock_on_hand=5, reserve=0,
+                  broadcast_enabled=True, broadcast_offset=6,
+                  stock_discrepancy=6,
+                  recalc_done_at=now_utc(), recalc_account_ids="1"))
+    s.add(SyncSetting(uid_1c="u-T", account_id=1, enabled=True))
+    _queue(s, "u-T", 1, 5, 0, "manual_resend_all", now_utc() - timedelta(hours=1),
+           sku="V-T")
+    s.commit(); s.close(); engine.dispose()
+
+    out = _run(url, "КИТ", "48")
+
+    assert "законный ноль: порог 6 при остатке 5" in out, out
+    assert "Ни одного нуля от выключателя: разбирать нечего" in out, out
+    assert "ВЫКЛЮЧАТЕЛЬ" not in out, "исправная строка попала в «разбирать»"
