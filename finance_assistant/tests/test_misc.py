@@ -104,7 +104,7 @@ def test_cards_commands(env):
 def test_bot_module_builds():
     from finance.bot import _split, build_app
     assert [len(p) for p in _split("x" * 3000 + "\n" + "y" * 3000)] == [3000, 3000]
-    app = build_app("123:ABC", flow=None, allowed={1})
+    app = build_app("123:ABC", None, {1})
     assert len(app.handlers[0]) == 5
 
 
