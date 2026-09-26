@@ -1,7 +1,7 @@
 import os
 
 from conftest import CHAT, PNG, payment
-from finance.storage import BUSINESS, PERSONAL, REIMBURSEMENT
+from finance.storage import BUSINESS, PERSONAL
 
 
 def buttons(reply):
@@ -62,16 +62,12 @@ def test_looks_personal_asks_purpose(env):
     assert "Личное" in saved.text
 
 
-def test_incoming_is_reimbursement_or_skipped(env):
+def test_incoming_is_not_recorded(env):
     db, rec, flow = env
-    rec.payments += [payment(direction="in"), payment(direction="in", amount="99")]
-    [q] = flow.on_files(CHAT, [PNG], "")
-    assert "поступление" in q.text
-    flow.on_button(CHAT, "d:kind:reimb")
-    flow.on_files(CHAT, [PNG], "")
-    flow.on_button(CHAT, "d:skip")
-    [e] = db.expenses("2026-09")
-    assert e.kind == REIMBURSEMENT and e.category is None
+    rec.payments.append(payment(direction="in"))
+    [r] = flow.on_files(CHAT, [PNG], "")
+    assert "поступление — не записываю" in r.text
+    assert db.expenses("2026-09") == [] and db.get_state(CHAT) == {}
 
 
 def test_foreign_currency_asks_rubles(env):

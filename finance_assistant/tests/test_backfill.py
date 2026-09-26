@@ -132,30 +132,38 @@ def test_old_screenshot_filed_by_payment_month(env, tmp_path):
     assert not os.listdir(os.path.join(flow.receipts_dir, "2026-09"))
 
 
-def test_period_itog_and_cumulative_owed(env):
+def test_period_itog_business_by_category_and_personal(env):
     db, rec, flow = env
-    for d, amount in (("2026-01-10", "1000"), ("2026-02-10", "2000"), ("2026-05-10", "500")):
-        rec.payments.append(payment(date=d, amount=amount))
+    for d, amount, cat in (("2026-01-10", "1000", "Реклама и продвижение"),
+                           ("2026-02-10", "2000", "Логистика и доставка"),
+                           ("2026-05-10", "500", "Реклама и продвижение")):
+        rec.payments.append(payment(date=d, amount=amount, category=cat))
         flow.on_files(CHAT, [PNG], "")
-    rec.payments.append(payment(direction="in", date="2026-03-01", amount="2500"))
-    flow.on_files(CHAT, [PNG], "")
-    flow.on_button(CHAT, "d:kind:reimb")
+    # Выписка по Сберу за февраль: ушло 10 000, из них 2 000 записано как бизнес.
+    flow.on_command(CHAT, "sverka", "2026-02")
+    flow.on_button(CHAT, f"s:c:{db.cards()[0].id}")
+    rec.statements.append(statement([op("2026-02-10", "2000"), op("2026-02-11", "8000")]))
+    flow.on_files(CHAT, [PDF], "")
+    flow.on_command(CHAT, "done")
 
     [r] = flow.on_command(CHAT, "itog", "2026")
     assert "январь 2026 — сентябрь 2026" in r.text
-    assert "янв 26: 1 000,00 ₽" in r.text and "(выписок нет)" in r.text
-    assert "Бизнес-расходы с личных карт за период: 3 500,00 ₽" in r.text
-    assert "Бизнес вернул за период: 2 500,00 ₽" in r.text
-    assert "Бизнес должен вам на конец периода: 1 000,00 ₽" in r.text
+    assert "янв 26: 1 000,00 ₽ · 0,00 ₽  (выписок нет)" in r.text
+    assert "фев 26: 2 000,00 ₽ · 8 000,00 ₽  (нет выписки: Тинькофф, Альфа)" in r.text
+    assert "💼 Ушло на бизнес: 3 500,00 ₽" in r.text
+    assert "• Логистика и доставка: 2 000,00 ₽" in r.text
+    assert "• Реклама и продвижение: 1 500,00 ₽" in r.text
+    assert "🏠 Личные расходы: 8 000,00 ₽" in r.text
+    assert "должен" not in r.text and "вернул" not in r.text
     wb = load_workbook(io.BytesIO(r.file[1]))
     assert wb.sheetnames == ["По месяцам", "По статьям", "Бизнес-расходы"]
-    assert wb["По месяцам"].max_row == 3 + 9 * 3 + 4
-    assert wb["Бизнес-расходы"].max_row == 4
+    assert wb["По месяцам"].max_row == 3 + 9 * 3 + 3
+    cats = wb["По статьям"]
+    assert cats.cell(cats.max_row, 1).value == "Итого бизнес"
+    assert cats.cell(cats.max_row, 11).value == 3500
 
     [feb] = flow.on_command(CHAT, "itog", "2026-02")
-    assert "за месяц: 2 000,00 ₽" in feb.text and "С начала учёта по конец месяца: 3 000,00 ₽" in feb.text
-    [q2] = flow.on_command(CHAT, "itog", "2026-01..2026-03")
-    assert "на конец периода: 500,00 ₽" in q2.text
+    assert "💼 Ушло на бизнес: 2 000,00 ₽" in feb.text and "🏠 Личные расходы: 8 000,00 ₽" in feb.text
 
 
 def test_parse_period_arg():
