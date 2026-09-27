@@ -82,6 +82,8 @@ BATCH_WORKERS = 4       # сколько файлов пачки распозн�
 STATEMENT_IDLE = 2 * 3600  # через сколько секунд без выписок сверка закрывается сама
 PICKER_MONTHS = 12   # сколько месяцев назад можно выбрать кнопкой в /sverka
 PERIOD = "period"    # «выписка за несколько месяцев»
+MENU_INPUT_TTL = 600  # сек: сколько ждать название карты/статьи после кнопки «Добавить»
+STALE_BUTTON = "Эта кнопка неактуальна — действие уже закрыто. Главное меню — кнопками внизу."
 
 
 @dataclass
@@ -108,6 +110,30 @@ def _month_shift(month: str, shift: int) -> str:
     year, mon = map(int, month.split("-"))
     index = year * 12 + mon - 1 + shift
     return f"{index // 12:04d}-{index % 12 + 1:02d}"
+
+
+def _parse_card_arg(arg: str):
+    """«ВТБ 1234 5678 ВТБ [бизнес]» → (название, номера, банк, вид) или текст ошибки."""
+    words = arg.split()
+    kind = PERSONAL_CARD
+    if words and words[-1].lower() in ("бизнес", "business", "рс", "расчётный", "расчетный"):
+        kind = BUSINESS_ACCOUNT  # расчётный счёт ИП и привязанная к нему бизнес-карта
+        words = words[:-1]
+    numbers = [_last4(w) for w in words if w.isdigit() and len(w) >= 4]
+    rest = [w for w in words if not (w.isdigit() and len(w) >= 4)]
+    if not rest and not numbers:
+        return "Не вижу названия карты."
+    name = rest[0] if rest else f"Карта {numbers[0]}"
+    return name, list(dict.fromkeys(numbers)), " ".join(rest[1:]) or name, kind
+
+
+def _plural(n: int, one: str, few: str, many: str) -> str:
+    """1 файл, 2 файла, 5 файлов."""
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return few
+    return many
 
 
 def _short_month(month: str) -> str:
@@ -249,7 +275,11 @@ class Flow:
         if not handler:
             return [Reply("Не знаю такой команды. /help — что я умею.")]
         self._forget_menu_input(chat_id)
-        return handler(chat_id, arg.strip())
+        replies = handler(chat_id, arg.strip())
+        if command in ("addcard", "addcat"):
+            # Карту/статью добавили, пока висел вопрос по операции, — продолжаем его.
+            replies += self._reask(chat_id)
+        return replies
 
     def on_files(self, chat_id: int, files: list[tuple[bytes, str]], caption: str = "",
                  filename: str = "", file_ids: list[str] | None = None) -> list[Reply]:
@@ -335,7 +365,7 @@ class Flow:
             queued += 1
         self.db.set_state(chat_id, state)
 
-        head.append(f"📥 Разобрал {len(items)} файлов.")
+        head.append(f"📥 Разобрал {len(items)} {_plural(len(items), 'файл', 'файла', 'файлов')}.")
         if repeats:
             head.append(f"🔁 Повторы (уже записаны или в этой же пачке): {repeats}")
         if not_payment:
@@ -419,13 +449,19 @@ class Flow:
         if text.strip() in MENU_LABELS:
             return self._menu(chat_id, text.strip())
         state = self.db.get_state(chat_id)
-        pending = state.pop("menu_input", None)
+        pending = state.get("menu_input")
         if pending:
-            # Нажали «➕ Добавить карту/статью» — это сообщение и есть ответ.
-            self.db.set_state(chat_id, state)
-            return self.on_command(chat_id, pending, text)
+            if self.clock() - pending.get("at", 0) <= MENU_INPUT_TTL:
+                # Нажали «➕ Добавить карту/статью» — это сообщение и есть ответ.
+                return self._menu_input_text(chat_id, pending["what"], text.strip())
+            self._forget_menu_input(chat_id)
+            state = self.db.get_state(chat_id)
         ask = state.get("ask")
-        if state.get("drafts") and ask in ("amount", "date"):
+        in_statement = "statement" in state
+        if state.get("drafts") and ask in ("amount", "date") and not (
+                in_statement and any(ch.isalpha() for ch in text)):
+            # Идёт и вопрос по операции, и загрузка выписки: число или дата —
+            # ответ на вопрос, текст со словами («пришло 120000…») — выписке.
             return self._answer_text(chat_id, state, ask, text)
         closed = self._close_idle_statement(chat_id, state)
         if closed:
@@ -438,7 +474,14 @@ class Flow:
         return self._recognize_payment(chat_id, [], text, "")
 
     def on_button(self, chat_id: int, data: str) -> list[Reply]:
+        replies = self._route_button(chat_id, data)
+        # Кнопку нажали — её сообщение осталось без кнопок; молчать нельзя.
+        return replies or [Reply(STALE_BUTTON, menu=True)]
+
+    def _route_button(self, chat_id: int, data: str) -> list[Reply]:
         kind, _, rest = data.partition(":")
+        if kind != "m":
+            self._forget_menu_input(chat_id)
         if kind == "d":
             return self._answer_button(chat_id, rest)
         if kind == "e":
@@ -450,7 +493,6 @@ class Flow:
         if kind == "s":
             return self._sverka_button(chat_id, rest)
         if kind == "m":
-            self._forget_menu_input(chat_id)
             return self._menu_button(chat_id, rest)
         return []
 
@@ -485,7 +527,8 @@ class Flow:
         self.db.set_state(chat_id, state)
         if len(state["drafts"]) > 1:
             # Сначала доспрашиваем предыдущую операцию, эту — следом.
-            return [Reply(f"Принял, разберу после текущей (в очереди: {len(state['drafts']) - 1}).")]
+            return ([Reply(f"Принял, разберу после текущей (в очереди: {len(state['drafts']) - 1}). "
+                           "Сейчас — вопрос по предыдущей:")] + self._advance(chat_id))
         return self._advance(chat_id)
 
     def _draft_from_info(self, info: dict, receipt: str, keys) -> dict | None:
@@ -732,11 +775,13 @@ class Flow:
             where = " с бизнес-счёта" if card.is_business else ""
             return "purpose", Reply(head + f"Похоже на личную покупку{where}. Это расход бизнеса?",
                                     [[("Бизнес", "d:purpose:business"),
-                                      ("Личное", "d:purpose:personal")]])
+                                      ("Личное", "d:purpose:personal")],
+                                     [("Не записывать", "d:skip")]])
         if (d["purpose"] == BUSINESS
                 and (d["category_id"] is None or not d["category_confident"])):
             return "category", Reply(head + "Какая статья расходов?",
-                                     self._category_buttons("d:cat:", d["category_id"]))
+                                     self._category_buttons("d:cat:", d["category_id"])
+                                     + [[("Не записывать", "d:skip")]])
         if not d["dup_checked"]:
             dups = self.db.find_duplicates(op_date=d["date"], amount=d["amount"],
                                            card_id=d["card_id"], merchant=d["merchant"])
@@ -767,6 +812,7 @@ class Flow:
             question = "Куда переведены деньги?" if outgoing else "Откуда пришли деньги?"
             rows = [[(c.label, f"d:tr:{c.id}")] for c in self.db.cards() if c.id != d["card_id"]]
             rows.append([("Другой мой счёт (не веду в боте)", "d:tr:0")])
+            rows.append([("Не записывать", "d:skip")])
             return "transfer", Reply(head + "Перевод между вашими счетами. " + question, rows)
         if not d["dup_checked"]:
             same = self.db.find_same_transfer(op_date=d["date"], amount=d["amount"],
@@ -822,12 +868,12 @@ class Flow:
         if ask == "amount":
             amount = _amount_or_none(text)
             if amount is None:
-                return [Reply("Не понял сумму. Напишите числом, например 1250,50.")]
+                return [Reply("Не понял сумму. Напишите числом, например 1250,50.")] + self._advance(chat_id)
             d["amount"] = amount
         else:
             parsed = _parse_date(text, self.today())
             if parsed is None:
-                return [Reply("Не понял дату. Например: 05.09 или 05.09.2026.")]
+                return [Reply("Не понял дату. Например: 05.09 или 05.09.2026.")] + self._advance(chat_id)
             d["date"] = parsed
         self.db.set_state(chat_id, state)
         return self._advance(chat_id)
@@ -835,8 +881,9 @@ class Flow:
     # Какие кнопки допустимы для текущего вопроса. Кнопка от другого вопроса —
     # даже той же операции — неактуальна.
     _BUTTONS_FOR_ASK = {"amount": {"skip"}, "date": {"date", "skip"},
-                        "card": {"card", "retry", "skip"}, "purpose": {"purpose"},
-                        "category": {"cat"}, "dup": {"skip", "dup"}, "transfer": {"tr"}}
+                        "card": {"card", "retry", "skip"}, "purpose": {"purpose", "skip"},
+                        "category": {"cat", "skip"}, "dup": {"skip", "dup"},
+                        "transfer": {"tr", "skip"}}
 
     @staticmethod
     def _enqueue(state: dict, draft: dict):
@@ -854,7 +901,11 @@ class Flow:
 
     def _answer_button(self, chat_id, rest) -> list[Reply]:
         state = self.db.get_state(chat_id)
-        stale = [Reply("Этот вопрос уже неактуален — ответьте на последний вопрос бота.")]
+        if state.get("drafts") and state.get("ask"):
+            stale = [Reply("Этот вопрос уже неактуален. Текущий вопрос:")] + self._advance(chat_id)
+        else:
+            stale = [Reply("Этот вопрос уже неактуален — операция уже записана или отменена.",
+                           menu=True)]
         draft_id, _, rest = rest.partition(":")
         if not state.get("drafts") or not draft_id.isdigit():
             return stale
@@ -938,6 +989,9 @@ class Flow:
         if not t:
             return [Reply(f"Перевода П{transfer_id} уже нет.")]
         if action == "del":
+            return [Reply(f"Удалить перевод П{t.id}?\n{rub(t.amount)} · {t.route}",
+                          [[("🗑 Да, удалить", f"t:delok:{t.id}"), ("Нет", f"t:keep:{t.id}")]])]
+        if action == "delok":
             self._discard_receipt({"receipt": t.receipt_path})
             self.db.delete_transfer(transfer_id)
             return [Reply(f"🗑 Перевод П{transfer_id} удалён.", menu=True)]
@@ -950,6 +1004,8 @@ class Flow:
         if len(parts) == 2:
             return [self._transfer_side_question(t, action)]
         value = int(parts[2]) or None
+        if value is not None and not self.db.card(value):
+            return [self._transfer_side_question(t, action, "Этой карты уже нет. Выберите другую.")]
         key, current, other = (("from_card_id", t.from_card_id, t.to_card_id) if action == "from"
                                else ("to_card_id", t.to_card_id, t.from_card_id))
         # Ошибка — снова тот же вопрос с кнопками, чтобы не остаться без выхода.
@@ -995,14 +1051,25 @@ class Flow:
         e = self.db.expense(expense_id)
         if not e:
             return [Reply(f"Записи №{expense_id} уже нет.")]
+        keep = [("↩ Оставить как есть", f"e:keep:{e.id}")]
         if action == "del":
+            return [Reply(f"Удалить запись №{e.id}?\n{expense_line(e)}",
+                          [[("🗑 Да, удалить", f"e:delok:{e.id}"), ("Нет", f"e:keep:{e.id}")]])]
+        if action == "delok":
             self._discard_receipt({"receipt": e.receipt_path})
             self.db.delete_expense(expense_id)
-            return [Reply(f"🗑 Запись №{expense_id} удалена.")]
+            return [Reply(f"🗑 Запись №{expense_id} удалена.", menu=True)]
+        if action == "keep":
+            return [self._saved_reply(expense_id)]
+        current_cat = self.db.category_id(e.category or "") if e.category else None
         if action == "cat" and len(parts) == 2:
-            return [Reply(f"Статья для №{e.id}:", self._category_buttons(f"e:cat:{e.id}:", None))]
+            return [Reply(f"Статья для №{e.id}:",
+                          self._category_buttons(f"e:cat:{e.id}:", current_cat) + [keep])]
         if action == "cat":
             category_id = int(parts[2])
+            if not any(c["id"] == category_id for c in self.db.categories()):
+                return [Reply(f"Такой статьи нет. Статья для №{e.id}:",
+                              self._category_buttons(f"e:cat:{e.id}:", current_cat) + [keep])]
             self.db.update_expense(expense_id, category_id=category_id, purpose=BUSINESS)
             # Запись из выписки: «получатель» — это описание операции банка,
             # правило по нему не создаём.
@@ -1017,15 +1084,20 @@ class Flow:
                     self.db.update_expense(other.id, category_id=category_id)
                     changed += 1
             return [Reply(f"Статья изменена у записей «{e.merchant}»: {changed}.")]
-        elif action == "card" and len(parts) == 2:
-            return [Reply(f"Карта для №{e.id}:",
-                          [[(c.label, f"e:card:{e.id}:{c.id}")] for c in self.db.cards()])]
         elif action == "card":
+            picker = ([[(("✓ " if c.id == e.card_id else "") + c.label, f"e:card:{e.id}:{c.id}")]
+                       for c in self.db.cards()] + [keep])
+            if len(parts) == 2:
+                return [Reply(f"Карта для №{e.id}:", picker)]
+            if not self.db.card(int(parts[2])):
+                return [Reply(f"Этой карты уже нет. Карта для №{e.id}:", picker)]
             self.db.update_expense(expense_id, card_id=int(parts[2]))
         elif action == "purpose":
             self.db.update_expense(expense_id, purpose=parts[2])
             if parts[2] == BUSINESS and not e.category:
                 return [Reply(f"Статья для №{e.id}:", self._category_buttons(f"e:cat:{e.id}:", None))]
+        else:
+            return []
         return [self._saved_reply(expense_id)]
 
     # --- справочники ---------------------------------------------------
@@ -1037,8 +1109,37 @@ class Flow:
 
     def _forget_menu_input(self, chat_id):
         state = self.db.get_state(chat_id)
-        if state.pop("menu_input", None):
+        if state.pop("menu_input", None) is not None or state.pop("menu_confirm", None) is not None:
+            state.pop("menu_confirm", None)
             self.db.set_state(chat_id, state)
+
+    def _reask(self, chat_id) -> list[Reply]:
+        """Снова показать текущий вопрос по операции, если он есть."""
+        state = self.db.get_state(chat_id)
+        return self._advance(chat_id) if state.get("drafts") and state.get("ask") else []
+
+    def _menu_input_text(self, chat_id, what, text) -> list[Reply]:
+        """Ответ на «➕ Добавить карту/статью»: проверить и переспросить «Добавить …?»."""
+        cancel = [("Отмена", "m:no")]
+        if what == "addcard":
+            parsed = _parse_card_arg(text)
+            if isinstance(parsed, str):
+                return [Reply(parsed + "\nНапишите ещё раз, например: Сбер 1234 Сбер", [cancel])]
+            name, numbers, bank, kind = parsed
+            preview = (f"{'🏦' if kind == BUSINESS_ACCOUNT else '💳'} {name}"
+                       + (f" · {', '.join(numbers)}" if numbers else "") + f" ({bank})"
+                       + (" — бизнес-счёт" if kind == BUSINESS_ACCOUNT else ""))
+            question, other = f"Добавить карту: {preview}?", "Нет — это не карта"
+        else:
+            if len(text) > 40 or not any(ch.isalpha() for ch in text):
+                return [Reply("Название статьи — словами, до 40 символов. Напишите ещё раз.",
+                              [cancel])]
+            question, other = f"Добавить статью «{text}»?", "Нет — это не статья"
+        state = self.db.get_state(chat_id)
+        state.pop("menu_input", None)
+        state["menu_confirm"] = {"what": what, "text": text}
+        self.db.set_state(chat_id, state)
+        return [Reply(question, [[("✅ Да, добавить", "m:yes")], [(other, "m:notit")], [cancel[0]]])]
 
     def _menu(self, chat_id, label):
         """Кнопка главного меню. Работает в любой момент, как команда."""
@@ -1085,6 +1186,14 @@ class Flow:
 
     def _menu_button(self, chat_id, rest):
         what, _, value = rest.partition(":")
+        confirm = self.db.get_state(chat_id).get("menu_confirm")
+        self._forget_menu_input(chat_id)
+        if what in ("yes", "notit"):
+            if not confirm:
+                return []
+            if what == "yes":
+                return self.on_command(chat_id, confirm["what"], confirm["text"])
+            return self.on_text(chat_id, confirm["text"])  # обычное сообщение (например, расход)
         if what == "list" and _parse_month_arg(value):
             return self._menu_list(chat_id, value)
         if what == "itog":
@@ -1093,13 +1202,15 @@ class Flow:
             return self.on_command(chat_id, what)
         if what in ("addcard", "addcat"):
             state = self.db.get_state(chat_id)
-            state["menu_input"] = what
+            state["menu_input"] = {"what": what, "at": self.clock()}
             self.db.set_state(chat_id, state)
             if what == "addcard":
                 return [Reply("Напишите карту одним сообщением: название, последние 4 цифры, "
                               "банк. Например:\nСбер 1234 Сбер\n"
-                              "Бизнес-счёт ИП — со словом «бизнес» в конце:\nПСБ 4987 ПСБ бизнес")]
-            return [Reply("Напишите название новой статьи расходов одним сообщением.")]
+                              "Бизнес-счёт ИП — со словом «бизнес» в конце:\nПСБ 4987 ПСБ бизнес",
+                              [[("Отмена", "m:no")]])]
+            return [Reply("Напишите название новой статьи расходов одним сообщением.",
+                          [[("Отмена", "m:no")]])]
         if what == "delpick":
             cards = self.db.cards()
             if not cards:
@@ -1113,7 +1224,7 @@ class Flow:
         if what == "delok" and value.isdigit():
             return self._del_card(chat_id, value)
         if what == "no":
-            return [Reply("Хорошо, ничего не удаляю.")]
+            return [Reply("Хорошо, ничего не меняю.", menu=True)] + self._reask(chat_id)
         return []
 
     def _cancel(self, chat_id, arg):
@@ -1137,20 +1248,13 @@ class Flow:
         return [Reply("Ваши карты:\n" + "\n".join(lines))]
 
     def _add_card(self, chat_id, arg):
-        words = arg.split()
-        if not words:
+        if not arg.split():
             return [Reply("Формат: /addcard Название 1234 Банк — например /addcard ВТБ 1234 5678 ВТБ\n"
                           "Номеров можно несколько: карта и счёт (последние 4 цифры).")]
-        kind = PERSONAL_CARD
-        if words[-1].lower() in ("бизнес", "business", "рс", "расчётный", "расчетный"):
-            kind = BUSINESS_ACCOUNT  # расчётный счёт ИП и привязанная к нему бизнес-карта
-            words = words[:-1]
-        numbers = [_last4(w) for w in words if w.isdigit() and len(w) >= 4]
-        rest = [w for w in words if not (w.isdigit() and len(w) >= 4)]
-        if not rest and not numbers:
-            return [Reply("Укажите название: /addcard ПСБ 4987 ПСБ бизнес")]
-        name = rest[0] if rest else f"Карта {numbers[0]}"
-        bank = " ".join(rest[1:]) or name
+        parsed = _parse_card_arg(arg)
+        if isinstance(parsed, str):
+            return [Reply(parsed + " Например: /addcard ПСБ 4987 ПСБ бизнес")]
+        name, numbers, bank, kind = parsed
         existing = next((c for c in self.db.cards() if c.name == name), None)
         if existing:
             if not numbers:
@@ -1158,7 +1262,7 @@ class Flow:
             for n in numbers:
                 self.db.add_card_number(existing.id, n)
             return [Reply(f"Добавил номера к карте «{name}»: {', '.join(numbers)}.")]
-        card = self.db.add_card(name, " ".join(dict.fromkeys(numbers)), bank, kind)
+        card = self.db.add_card(name, " ".join(numbers), bank, kind)
         if card.is_business:
             return [Reply(f"Добавил бизнес-счёт {card.label}. Всё, что с него уходит "
                           "(кроме переводов вам), считаю расходами бизнеса.")]
@@ -1181,8 +1285,9 @@ class Flow:
     def _add_cat(self, chat_id, arg):
         if not arg:
             return [Reply("Формат: /addcat Название статьи")]
+        existed = self.db.category_id(arg) is not None
         self.db.add_category(arg)
-        return [Reply(f"Статья «{arg}» есть в списке.")]
+        return [Reply(f"Статья «{arg}» уже есть." if existed else f"Добавил статью «{arg}».")]
 
     def _svod(self, chat_id, arg):
         if not arg:

@@ -85,7 +85,9 @@ def test_edit_and_delete_transfer(own):
     [lst] = flow.on_command(CHAT, "list")
     assert "Переводы между своими счетами:" in lst.text and "П1 10.09" in lst.text
     assert "удалить нельзя" in flow.on_command(CHAT, "delcard", str(cid(db, "Россия")))[0].text
-    flow.on_button(CHAT, "t:del:1")
+    [confirm] = flow.on_button(CHAT, "t:del:1")
+    assert "t:delok:1" in str(confirm.buttons) and db.transfers("2026-09")
+    flow.on_button(CHAT, "t:delok:1")
     assert db.transfers("2026-09") == []
     assert "уже нет" in flow.on_button(CHAT, "t:del:1")[0].text
 

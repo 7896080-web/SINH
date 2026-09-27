@@ -19,8 +19,8 @@ def test_old_date_button_does_not_touch_next_draft(env):
     old_yesterday = next(b for b in buttons(qa) if b.endswith(":date:1"))
     flow.on_files(CHAT, [png()], "")          # B встаёт в очередь
     flow.on_text(CHAT, "05.09")               # A сохранена, B спрашивает статью
-    [r] = flow.on_button(CHAT, old_yesterday)
-    assert "неактуален" in r.text
+    r, current = flow.on_button(CHAT, old_yesterday)
+    assert "неактуален" in r.text and "Какая статья" in current.text   # и сразу текущий вопрос
     assert db.get_state(CHAT)["drafts"][0]["date"] == "2026-09-20"
 
 
@@ -164,7 +164,7 @@ def test_receipts_not_kept_for_skipped_or_non_payments(env):
     flow.on_files(CHAT, [png()], "")
     files = [f for _, _, fs in os.walk(flow.receipts_dir) for f in fs]
     assert len(files) == 1 and os.path.exists(db.expenses("2026-09")[0].receipt_path)
-    flow.on_button(CHAT, f"e:del:{db.expenses('2026-09')[0].id}")
+    flow.on_button(CHAT, f"e:delok:{db.expenses('2026-09')[0].id}")
     assert [f for _, _, fs in os.walk(flow.receipts_dir) for f in fs] == []
 
 
