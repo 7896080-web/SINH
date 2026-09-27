@@ -151,7 +151,10 @@ def build_app(token: str, flow_for, allowed: set[int], env_file: str | None = No
         except Exception as exc:  # не критично: команды и так работают
             log.warning("Не удалось задать список команд: %s", exc)
         if env_file:
-            application.create_task(watch_env(application, env_file))
+            # Не application.create_task: до запуска он предупреждает, что задачу
+            # «не дождётся», — а она и не должна завершаться, пока бот работает.
+            application.bot_data["watch_env"] = asyncio.get_running_loop().create_task(
+                watch_env(application, env_file))
     app = Application.builder().token(token).post_init(on_start).build()
     resolve = flow_for if callable(flow_for) else (lambda user_id: flow_for)
     keyboard = menu_keyboard(test=reset is not None)
@@ -413,7 +416,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    logging.getLogger("httpx").setLevel(logging.WARNING)  # иначе каждый опрос Telegram в логе
+    for name in ("httpx", "httpx2"):  # иначе каждый запрос к Telegram и Claude в журнале
+        logging.getLogger(name).setLevel(logging.WARNING)
     install_secret_filter()
     env_file = os.environ.get("FINANCE_ENV_FILE")
     try:
