@@ -10,6 +10,7 @@ data/users/<id>/ со своей базой SQLite и своими скринш�
 import logging
 import os
 import shutil
+import time
 
 from .flow import Flow
 from .storage import Storage
@@ -63,7 +64,18 @@ class UserSpaces:
         flow = self._flows.pop(user_id, None)
         if flow is not None:
             flow.db.close()
-        shutil.rmtree(self.user_dir(user_id), ignore_errors=True)
+        folder = self.user_dir(user_id)
+        for attempt in range(5):
+            try:
+                shutil.rmtree(folder)
+                break
+            except FileNotFoundError:
+                break
+            except OSError:
+                # Windows: файл держит антивирус или индексатор — подождать.
+                if attempt == 4:
+                    raise
+                time.sleep(1)
         log.warning("Тестовые данные пользователя %s стёрты", user_id)
 
     def migrate_shared_data(self) -> str | None:

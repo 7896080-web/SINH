@@ -228,3 +228,39 @@ def test_windows_scripts_are_utf8_with_bom():
         raw = open(os.path.join(folder, name), "rb").read()
         assert raw.startswith(b"\xef\xbb\xbf"), name
         raw.decode("utf-8")
+
+
+def test_read_env_tolerates_notepad(tmp_path):
+    """Блокнот сохраняет с BOM или в кодировке Windows — настройки читаются."""
+    p = tmp_path / ".env"
+    p.write_bytes("﻿TELEGRAM_BOT_TOKEN=1:A\r\n# коммент\r\nTZ=Europe/Moscow\r\n".encode("utf-8"))
+    assert read_env(str(p)) == {"TELEGRAM_BOT_TOKEN": "1:A", "TZ": "Europe/Moscow"}
+    p.write_bytes("# русский комментарий\r\nTELEGRAM_BOT_TOKEN=1:A\r\n".encode("cp1251"))
+    assert read_env(str(p)) == {"TELEGRAM_BOT_TOKEN": "1:A"}
+    write_env(str(p), {"ANTHROPIC_API_KEY": "sk-ant-x"})
+    assert read_env(str(p))["ANTHROPIC_API_KEY"] == "sk-ant-x"
+
+
+def test_supervisor_survives_errors_and_filters_env(app, monkeypatch):
+    (app / ".env").write_text("TELEGRAM_BOT_TOKEN=1:A\nLD_PRELOAD=/tmp/evil.so\nPYTHONPATH=/x\n",
+                              encoding="utf-8")
+    monkeypatch.delenv("LD_PRELOAD", raising=False)
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    sup = supervise.Supervisor(str(app))
+    env = sup.child_env("bot")
+    assert env["TELEGRAM_BOT_TOKEN"] == "1:A" and "LD_PRELOAD" not in env
+    assert "PYTHONPATH" not in env
+    assert "TELEGRAM_BOT_TOKEN" not in sup.child_env("settings")   # странице токены не нужны
+    calls = []
+
+    def boom():
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("сбой")
+        sup.stopping = True
+    monkeypatch.setattr(sup, "tick", boom)
+    monkeypatch.setattr(supervise, "RESTART_DELAY", 0)
+    monkeypatch.setattr(supervise, "TICK", 0)
+    monkeypatch.setattr(supervise, "kill_leftovers", lambda app: None)
+    sup.run()                                                # не упал на первом сбое
+    assert len(calls) == 2

@@ -19,6 +19,7 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, Con
 
 from .clock import local_today
 from .flow import MENU_ROWS, Reply
+from .logfilter import install_secret_filter
 from .mode import run_config
 from .recognize import ClaudeRecognizer, DEFAULT_MODEL
 from .users import UserSpaces, parse_user_ids
@@ -413,6 +414,7 @@ def main(argv=None):
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)  # иначе каждый опрос Telegram в логе
+    install_secret_filter()
     env_file = os.environ.get("FINANCE_ENV_FILE")
     try:
         config = run_config(os.environ, test=args.test)

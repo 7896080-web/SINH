@@ -46,6 +46,7 @@ log = logging.getLogger("finance.settings")
 MIN_PASSWORD = 10
 IP_FAILS, IP_LOCK = 5, 15 * 60          # 5 ошибок с адреса → 15 минут блокировки
 GLOBAL_FAILS, GLOBAL_WINDOW = 20, 3600  # 20 ошибок за час → вход закрыт на час
+TRUST_DAYS = 30 * 86400                  # адрес с верным входом не попадает под общую блокировку
 IDLE, ABSOLUTE = 30 * 60, 12 * 3600     # сессия: без действий / всего
 COOKIE = "fb_session"
 PASSWORD_FILE = "password"
@@ -99,11 +100,41 @@ class Guard:
         self.global_fails: list[float] = []
         self.global_locked_until = 0.0
         self.sessions: dict[str, dict] = {}
+        self.inflight: set[str] = set()      # адреса, чей пароль проверяется прямо сейчас
+        self.trusted: dict[str, float] = {}  # адрес → когда с него входили верно
+
+    def begin_attempt(self, ip: str) -> str | None:
+        """Занять попытку входа ДО проверки пароля. Попытка сразу считается
+        неверной (снимается при успехе): параллельные запросы не обходят лимит.
+        Проверка пароля (scrypt, ~32 МБ памяти) — не больше двух одновременно."""
+        blocked = self.blocked(ip)
+        if blocked:
+            return blocked
+        with self.lock:
+            if ip in self.inflight or len(self.inflight) >= 2:
+                return "Подождите пару секунд и попробуйте снова."
+            self.inflight.add(ip)
+        self.failed(ip)
+        return None
+
+    def end_attempt(self, ip: str, ok: bool):
+        with self.lock:
+            self.inflight.discard(ip)
+            if ok:
+                if self.global_fails:
+                    self.global_fails.pop()  # снимаем занятую заранее попытку
+                self.trusted[ip] = self.clock()
+                self.ip_locked.pop(ip, None)  # верный пароль пятой попыткой — не блокируем
+        if ok:
+            self.succeeded(ip)
 
     def blocked(self, ip: str) -> str | None:
         now = self.clock()
         with self.lock:
-            if now < self.global_locked_until:
+            trusted = now - self.trusted.get(ip, -TRUST_DAYS) < TRUST_DAYS
+            if now < self.global_locked_until and not trusted:
+                # Адрес, с которого уже входили верно, общая блокировка не касается:
+                # иначе любой мог бы держать владельца снаружи бесконечно.
                 return "Слишком много неверных паролей — вход закрыт на час."
             if now < self.ip_locked.get(ip, 0):
                 return "Слишком много неверных паролей с этого адреса — попробуйте через 15 минут."
@@ -194,6 +225,9 @@ SUBTITLE = ("Изменения вступают в силу сами: бот п
 
 class SettingsServer(ThreadingHTTPServer):
     daemon_threads = True
+    # На Windows SO_REUSEADDR позволяет занять уже занятый порт — тогда страница
+    # «запустилась бы» поверх чужой программы. Там порт должен быть свободен.
+    allow_reuse_address = os.name != "nt"
 
     def __init__(self, addr, env_path: str, password_hash: str, *, checks=True, guard=None,
                  secure_cookie=True):
@@ -274,10 +308,8 @@ class SettingsHandler(BaseHTTPRequestHandler):
             return None
         return jar[COOKIE].value if COOKIE in jar else None
 
-    def _form(self) -> dict[str, str]:
-        length = min(int(self.headers.get("Content-Length") or 0), 64 * 1024)
-        raw = self.rfile.read(length).decode("utf-8", "replace")
-        return {k: v[0].strip() for k, v in parse_qs(raw).items()}
+    def _form(self) -> dict[str, str] | None:
+        return setup_web.read_form(self)
 
     # --- маршруты ---
 
@@ -298,6 +330,8 @@ class SettingsHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
         form = self._form()
+        if form is None:
+            return
         if path == "/login":
             self._login(form)
             return
@@ -329,17 +363,21 @@ class SettingsHandler(BaseHTTPRequestHandler):
             self._send(404, "Not found", "text/plain")
 
     def _login(self, form: dict):
-        blocked = self.server.guard.blocked(self.ip)
+        guard = self.server.guard
+        blocked = guard.begin_attempt(self.ip)
         if blocked:
             self._send(429, login_page(f"<p class='err'>{html.escape(blocked)}</p>"))
             return
-        if verify_password(form.get("password", ""), self.server.password_hash):
-            self.server.guard.succeeded(self.ip)
-            token, _ = self.server.guard.new_session()
+        ok = False
+        try:
+            ok = verify_password(form.get("password", ""), self.server.password_hash)
+        finally:
+            guard.end_attempt(self.ip, ok)
+        if ok:
+            token, _ = guard.new_session()
             log.info("Вход в настройки (%s)", self.ip)
             self._redirect("/", self._cookie(token, ABSOLUTE))
             return
-        self.server.guard.failed(self.ip)
         log.warning("Неверный пароль (%s)", self.ip)
         time.sleep(1)  # замедляем подбор
         self._send(401, login_page("<p class='err'>Неверный пароль.</p>"))
@@ -367,6 +405,10 @@ class SettingsHandler(BaseHTTPRequestHandler):
         updates, errors, notes = {}, [], []
         key = form.get("ANTHROPIC_API_KEY", "")
         token = form.get("TELEGRAM_BOT_TOKEN", "")
+        errors += setup_web.format_errors(form)
+        if errors:
+            key = token = ""
+            form = {k: v for k, v in form.items() if not k.startswith(("TELEGRAM", "ANTHROPIC"))}
         try:
             ids = parse_ids(" ".join(x for x in (form.get("user1", ""), form.get("user2", "")) if x))
             updates["ALLOWED_USER_IDS"] = ",".join(map(str, ids))
@@ -410,6 +452,8 @@ def _read_password_hash(folder: str) -> str:
 
 def main(argv=None):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    from .logfilter import install_secret_filter
+    install_secret_filter()
     p = argparse.ArgumentParser(description="Постоянная страница настроек под паролем")
     sub = p.add_subparsers(dest="cmd", required=True)
     sp = sub.add_parser("set-password")

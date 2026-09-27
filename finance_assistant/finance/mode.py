@@ -65,8 +65,15 @@ def test_data_dir(env: dict) -> str:
 
 
 def _overlap(a: str, b: str) -> bool:
-    a, b = os.path.realpath(a), os.path.realpath(b)
-    return a == b or a.startswith(b + os.sep) or b.startswith(a + os.sep)
+    """Одна папка внутри другой (или совпадают). normcase — на Windows регистр
+    букв в путях не важен; commonpath — корень диска тоже «содержит» всё."""
+    a = os.path.normcase(os.path.realpath(os.path.abspath(a)))
+    b = os.path.normcase(os.path.realpath(os.path.abspath(b)))
+    try:
+        common = os.path.commonpath([a, b])
+    except ValueError:  # разные диски Windows
+        return False
+    return common in (a, b)
 
 
 def run_config(env: dict, test: bool = False) -> RunConfig:

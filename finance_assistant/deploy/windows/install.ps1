@@ -11,12 +11,21 @@
 param([string]$App = "C:\FinanceBot")
 
 $ErrorActionPreference = "Continue"   # ошибки внешних команд проверяем сами
+$App = $App.TrimEnd("\")               # «C:\FinanceBot\» сломал бы кавычки в задании
+$Stopped = $false
 $Task = "FinanceBot"
 $BackupTask = "FinanceBot-Backup"
 $PythonUrl = "https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe"
 
 function Say($text) { Write-Host "`n==> $text" -ForegroundColor Cyan }
-function Fail($text) { Write-Host "`nОшибка: $text" -ForegroundColor Red; exit 1 }
+function Fail($text) {
+    Write-Host "`nОшибка: $text" -ForegroundColor Red
+    if ($Stopped) {
+        Write-Host "Бот сейчас остановлен. Исправьте причину и запустите установку снова" -ForegroundColor Yellow
+        Write-Host "(или запустите прежнюю версию: Start-ScheduledTask FinanceBot)." -ForegroundColor Yellow
+    }
+    exit 1
+}
 
 $identity = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not $identity.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -29,10 +38,11 @@ if (-not (Test-Path (Join-Path $Src "finance\bot.py"))) {
 
 function Find-Python {
     $candidates = @()
-    if (Get-Command py -ErrorAction SilentlyContinue) { $candidates += ,@("py", "-3") }
-    if (Get-Command python -ErrorAction SilentlyContinue) { $candidates += ,@("python") }
+    # Сначала — Python для всех пользователей (Program Files).
     Get-ChildItem "$env:ProgramFiles\Python3*\python.exe" -ErrorAction SilentlyContinue |
         Sort-Object FullName -Descending | ForEach-Object { $candidates += ,@($_.FullName) }
+    if (Get-Command py -ErrorAction SilentlyContinue) { $candidates += ,@("py", "-3") }
+    if (Get-Command python -ErrorAction SilentlyContinue) { $candidates += ,@("python") }
     foreach ($c in $candidates) {
         $exe = $c[0]
         $rest = @($c | Select-Object -Skip 1)
@@ -50,25 +60,47 @@ function Set-FolderAccess {
     # Права ставятся только на саму папку, вложенное их наследует. (Прежняя
     # версия ставила их с /T на каждый файл и оставляла файлы без доступа
     # вовсе — сначала возвращаем владельца и наследование, это исправляет.)
+    # Порядок важен: сначала закрываем саму папку, потом вложенное наследует
+    # только её права (иначе на миг открылось бы наследование от C:\ для всех).
     & icacls $App /setowner "*S-1-5-32-544" /T /C /Q 2>&1 | Out-Null
-    & icacls $App /reset /T /C /Q 2>&1 | Out-Null
     & icacls $App /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" /C /Q 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) { Write-Host "   предупреждение: не удалось ограничить доступ к $App" -ForegroundColor Yellow }
+    if ($LASTEXITCODE -ne 0) { Fail "не удалось ограничить доступ к $App (там будут токены и базы)" }
+    if (Get-ChildItem $App -Force -ErrorAction SilentlyContinue) {
+        & icacls "$App\*" /reset /T /C /Q 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) { Fail "не удалось выставить права на файлы в $App" }
+    }
+}
+
+function Get-BotProcesses {
+    Get-CimInstance Win32_Process -Filter "Name like 'python%'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -match '-m\s+finance(\.supervise|\.settings_web)?(\s|$)' -and
+                       $_.CommandLine -notmatch 'set-password' }
 }
 
 function Stop-Bot {
     Stop-ScheduledTask -TaskName $Task -ErrorAction SilentlyContinue
     # Процессы, запущенные заданием, при его остановке сами не завершаются.
-    Get-CimInstance Win32_Process -Filter "Name like 'python%'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -match '-m\s+finance(\.supervise|\.settings_web)?(\s|$)' } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    Start-Sleep -Seconds 2
+    for ($i = 0; $i -lt 15; $i++) {
+        $left = @(Get-BotProcesses)
+        if (-not $left) { return }
+        $left | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        Start-Sleep -Seconds 1
+    }
+    Fail "не удалось остановить процессы бота — перезагрузите сервер и запустите установку снова"
 }
 
 Say "Проверяю Python"
 $Py = Find-Python
+$Profiles = Split-Path -Parent $env:PUBLIC   # обычно C:\Users
+if ($Py -and $Py.StartsWith($Profiles, [StringComparison]::OrdinalIgnoreCase)) {
+    # Python из профиля пользователя: задание работает от имени системы, а файлы
+    # в профиле может менять этот пользователь без прав администратора, и при
+    # удалении профиля или Python бот перестал бы запускаться.
+    Write-Host "   найден Python в профиле пользователя ($Py) — для службы нужен общий"
+    $Py = $null
+}
 if (-not $Py) {
-    Say "Python 3.10+ не найден — скачиваю и ставлю Python 3.12"
+    Say "Ставлю Python 3.12 для всех пользователей"
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     $installer = Join-Path $env:TEMP "python-3.12-amd64.exe"
     try {
@@ -78,8 +110,12 @@ if (-not $Py) {
     }
     $p = Start-Process -FilePath $installer -Wait -PassThru `
         -ArgumentList "/quiet", "InstallAllUsers=1", "PrependPath=1", "Include_launcher=1", "Include_test=0"
-    if ($p.ExitCode -ne 0) { Fail "установщик Python завершился с кодом $($p.ExitCode)" }
+    if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { Fail "установщик Python завершился с кодом $($p.ExitCode)" }
     $Py = Find-Python
+    if ($Py -and $Py.StartsWith($Profiles, [StringComparison]::OrdinalIgnoreCase)) {
+        $Py = Get-ChildItem "$env:ProgramFiles\Python3*\python.exe" -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+    }
     if (-not $Py) { Fail "Python установлен, но не найден — откройте новое окно PowerShell и запустите установку снова" }
 }
 Write-Host "   $Py"
@@ -93,6 +129,7 @@ if (Test-Path $App) {
 
 if ($Update) {
     Say "Обновление: останавливаю бота"
+    $Stopped = $true
     Stop-Bot
     if ((Test-Path $VPy) -and (Test-Path (Join-Path $App "finance\backup.py")) -and (Test-Path (Join-Path $App "data"))) {
         Say "Обновление: сначала бэкап баз"
@@ -112,7 +149,8 @@ if ($SameFolder) {
 }
 foreach ($dir in $(if ($SameFolder) { @() } else { "finance", "deploy" })) {
     $target = Join-Path $App $dir
-    if (Test-Path $target) { Remove-Item -Recurse -Force $target }
+    if (Test-Path $target) { Remove-Item -Recurse -Force $target -ErrorAction SilentlyContinue }
+    if (Test-Path $target) { Fail "не удалось удалить старую папку $target (файл занят?)" }
     Copy-Item -Recurse (Join-Path $Src $dir) $target
 }
 Get-ChildItem (Join-Path $App "finance") -Recurse -Directory -Filter "__pycache__" | Remove-Item -Recurse -Force
@@ -124,6 +162,11 @@ if (-not $SameFolder) {
 }
 
 Say "Ставлю зависимости (виртуальное окружение $App\venv)"
+$VenvCfg = Join-Path $App "venv\pyvenv.cfg"
+if ((Test-Path $VenvCfg) -and ((Get-Content $VenvCfg -Encoding UTF8) -match "^home\s*=\s*$([regex]::Escape($Profiles))")) {
+    Write-Host "   окружение было на Python из профиля пользователя — пересоздаю"
+    Remove-Item -Recurse -Force (Join-Path $App "venv")
+}
 if (-not (Test-Path $VPy)) {
     & $Py -m venv (Join-Path $App "venv")
     if ($LASTEXITCODE -ne 0) { Fail "не удалось создать виртуальное окружение" }
@@ -151,20 +194,28 @@ Set-FolderAccess
 Say "Задания Планировщика"
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
     -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew `
-    -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
+    -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -Priority 4
 $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 $action = New-ScheduledTaskAction -Execute $VPy -Argument "-m finance.supervise --app `"$App`"" -WorkingDirectory $App
-Register-ScheduledTask -TaskName $Task -Action $action -Principal $principal -Settings $settings `
-    -Trigger (New-ScheduledTaskTrigger -AtStartup) -Force `
-    -Description "Финансовый помощник: боевой и тестовый бот, страница настроек" | Out-Null
+# При старте Windows + каждые 5 минут: если супервизор почему-то завершился,
+# задание запустит его снова (а работающий второй раз не запускается).
+$triggers = @((New-ScheduledTaskTrigger -AtStartup),
+              (New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5)))
+try {
+    Register-ScheduledTask -TaskName $Task -Action $action -Principal $principal -Settings $settings `
+        -Trigger $triggers -Force -ErrorAction Stop `
+        -Description "Финансовый помощник: боевой и тестовый бот, страница настроек" | Out-Null
+} catch { Fail "не удалось создать задание $Task : $($_.Exception.Message)" }
 
 $backupAction = New-ScheduledTaskAction -Execute $VPy -WorkingDirectory $App `
     -Argument "-m finance.backup --data `"$App\data`" --dest `"$App\backups`""
 $backupSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 1)
-Register-ScheduledTask -TaskName $BackupTask -Action $backupAction -Principal $principal `
-    -Settings $backupSettings -Trigger (New-ScheduledTaskTrigger -Daily -At "03:30") -Force `
-    -Description "Финансовый помощник: ежедневный бэкап баз" | Out-Null
+try {
+    Register-ScheduledTask -TaskName $BackupTask -Action $backupAction -Principal $principal `
+        -Settings $backupSettings -Trigger (New-ScheduledTaskTrigger -Daily -At "03:30") -Force `
+        -ErrorAction Stop -Description "Финансовый помощник: ежедневный бэкап баз" | Out-Null
+} catch { Fail "не удалось создать задание $BackupTask : $($_.Exception.Message)" }
 
 Say "Запускаю"
 Start-ScheduledTask -TaskName $Task
@@ -172,7 +223,7 @@ Start-Sleep -Seconds 5
 $state = (Get-ScheduledTask -TaskName $Task).State
 if ("$state" -ne "Running") {
     $result = (Get-ScheduledTaskInfo -TaskName $Task).LastTaskResult
-    Get-Content (Join-Path $App "logs\supervisor.log") -Tail 30 -ErrorAction SilentlyContinue
+    Get-Content (Join-Path $App "logs\supervisor.log") -Tail 30 -Encoding UTF8 -ErrorAction SilentlyContinue
     Push-Location $App
     & $VPy -c "import finance.supervise; print('   запуск от администратора: код импортируется')"
     Pop-Location

@@ -194,7 +194,10 @@ def file_blocks(files: list[tuple[bytes, str]]) -> list[dict]:
         elif "spreadsheetml" in mime:
             blocks.append({"type": "text", "text": xlsx_to_csv_text(data)})
         else:  # csv / txt — пробуем как текст
-            blocks.append({"type": "text", "text": decode_text(data)})
+            text = decode_text(data)
+            if len(text) > MAX_TEXT_CHARS:
+                raise RecognitionError("текстовый файл слишком большой — пришлите выписку за месяц")
+            blocks.append({"type": "text", "text": text})
     return blocks
 
 
@@ -207,9 +210,22 @@ def decode_text(data: bytes) -> str:
     return data.decode("utf-8", errors="replace")
 
 
+MAX_XLSX_UNPACKED = 50 * 1024 * 1024  # больше — это не выписка, а «zip-бомба»
+MAX_TEXT_CHARS = 500_000               # столько текста выписки отдаём модели, не больше
+
+
 def xlsx_to_csv_text(data: bytes) -> str:
+    import zipfile
+
     import openpyxl
 
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            unpacked = sum(i.file_size for i in z.infolist())
+    except zipfile.BadZipFile:
+        raise RecognitionError("файл Excel повреждён — пересохраните его или пришлите PDF")
+    if unpacked > MAX_XLSX_UNPACKED:
+        raise RecognitionError("файл Excel слишком большой — пришлите выписку за месяц или PDF")
     wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
     out = io.StringIO()
     writer = csv.writer(out, delimiter=";")
@@ -217,6 +233,9 @@ def xlsx_to_csv_text(data: bytes) -> str:
         for row in ws.iter_rows(values_only=True):
             if any(v is not None for v in row):
                 writer.writerow(["" if v is None else v for v in row])
+                if out.tell() > MAX_TEXT_CHARS:
+                    raise RecognitionError("в таблице слишком много строк — пришлите выписку "
+                                           "за месяц")
     return out.getvalue()
 
 
@@ -298,5 +317,6 @@ class ClaudeRecognizer:
                 continue
             if isinstance(data, dict):
                 return data
-        log.error("Не JSON от модели: %r", whole)
+        # Сам ответ в журнал не пишем: в нём суммы и операции из выписки.
+        log.error("Не JSON от модели (%d символов)", sum(len(w) for w in whole))
         raise RecognitionError("не удалось разобрать ответ модели")
