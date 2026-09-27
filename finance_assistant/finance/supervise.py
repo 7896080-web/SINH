@@ -26,7 +26,9 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
+from logging.handlers import RotatingFileHandler
 
+from .logfilter import install_secret_filter
 from .setup_web import read_env
 
 log = logging.getLogger("finance.supervise")
@@ -35,6 +37,11 @@ RESTART_DELAY = 10      # сек между перезапусками упав�
 TICK = 1.0              # сек между проверками
 LOG_LIMIT = 5 * 1024 * 1024  # больше — старый журнал уходит в .1 при перезапуске
 MODULES = ("finance", "finance.settings_web")
+# Что из .env передаётся процессам. Остальное (например, чужой LD_PRELOAD или
+# PYTHONPATH, вписанный в .env) не передаётся.
+ENV_KEYS = ("TELEGRAM_BOT_TOKEN", "TELEGRAM_BOT_TOKEN_TEST", "ANTHROPIC_API_KEY",
+            "ALLOWED_USER_IDS", "TEST_USER_IDS", "FINANCE_DATA_DIR", "FINANCE_TEST_DATA_DIR",
+            "TZ", "FINANCE_TZ", "CLAUDE_MODEL")
 
 
 @dataclass
@@ -83,9 +90,11 @@ class Supervisor:
                                 "--dir", self.settings_dir, "--port", str(port)]
         return want
 
-    def child_env(self) -> dict[str, str]:
+    def child_env(self, name: str = "bot") -> dict[str, str]:
         env = dict(os.environ)
-        env.update(read_env(self.env_path))
+        if name != "settings":  # странице настроек токены не нужны: она сама читает .env
+            dotenv = read_env(self.env_path)
+            env.update({k: dotenv[k] for k in ENV_KEYS if k in dotenv})
         env["FINANCE_ENV_FILE"] = self.env_path
         env.setdefault("FINANCE_DATA_DIR", os.path.join(self.app, "data"))
         env.setdefault("FINANCE_TEST_DATA_DIR", os.path.join(self.app, "data-test"))
@@ -116,7 +125,7 @@ class Supervisor:
         stamp = time.strftime("%Y-%m-%d %H:%M:%S")
         child.log_file.write(f"\n===== {stamp} запуск: {child.name} =====\n".encode("utf-8"))
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        child.proc = subprocess.Popen(child.args, cwd=self.app, env=self.child_env(),
+        child.proc = subprocess.Popen(child.args, cwd=self.app, env=self.child_env(child.name),
                                       stdin=subprocess.DEVNULL, stdout=child.log_file,
                                       stderr=subprocess.STDOUT, creationflags=flags)
         log.info("Запущен %s (pid %s)", child.name, child.proc.pid)
@@ -157,7 +166,7 @@ class Supervisor:
             if now >= child.next_start:
                 try:
                     self.start(child)
-                except OSError as exc:
+                except Exception as exc:  # noqa: BLE001 — супервизор не должен падать
                     log.error("Не удалось запустить %s: %s", name, exc)
                     child.next_start = now + RESTART_DELAY
 
@@ -167,10 +176,14 @@ class Supervisor:
         self.children.clear()
 
     def run(self):
-        kill_leftovers()
+        kill_leftovers(self.app)
         try:
             while not self.stopping:
-                self.tick()
+                try:
+                    self.tick()
+                except Exception:  # noqa: BLE001 — упадёт супервизор, упадут и боты
+                    log.exception("Ошибка супервизора — продолжаю")
+                    time.sleep(RESTART_DELAY)
                 time.sleep(TICK)
         finally:
             self.stop_all()
@@ -184,8 +197,10 @@ def is_ours(cmdline: list[str]) -> bool:
     return False
 
 
-def kill_leftovers():
-    """Остановить процессы бота, оставшиеся от прежнего супервизора."""
+def kill_leftovers(app: str):
+    """Остановить процессы бота, оставшиеся от прежнего супервизора: только
+    запущенные из папки программы и только сами боты и страница (не, например,
+    `settings_web set-password`, который администратор запустил сейчас)."""
     try:
         import psutil
     except ImportError:
@@ -195,11 +210,15 @@ def kill_leftovers():
     mine = {me.pid} | {p.pid for p in me.parents()}  # venv на Windows запускает python через посредника
     for proc in psutil.process_iter(["pid", "cmdline"]):
         try:
-            if proc.pid not in mine and is_ours(proc.info["cmdline"] or []):
-                log.warning("Останавливаю оставшийся процесс %s: %s", proc.pid,
-                            " ".join(proc.info["cmdline"]))
-                proc.kill()
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            cmd = proc.info["cmdline"] or []
+            if proc.pid in mine or not is_ours(cmd) or "set-password" in cmd:
+                continue
+            if os.path.normcase(proc.cwd()) != os.path.normcase(app):
+                continue
+            log.warning("Останавливаю оставшийся процесс %s: %s", proc.pid, " ".join(cmd))
+            proc.kill()
+            proc.wait(10)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired):
             pass
 
 
@@ -210,8 +229,9 @@ def main(argv=None):
     os.makedirs(os.path.join(args.app, "logs"), exist_ok=True)
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
-        handlers=[logging.FileHandler(os.path.join(args.app, "logs", "supervisor.log"),
-                                      encoding="utf-8")])
+        handlers=[RotatingFileHandler(os.path.join(args.app, "logs", "supervisor.log"),
+                                      maxBytes=LOG_LIMIT, backupCount=1, encoding="utf-8")])
+    install_secret_filter()
     sup = Supervisor(args.app)
 
     def stop(*_):

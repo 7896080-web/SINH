@@ -2,11 +2,17 @@
 #   powershell -ExecutionPolicy Bypass -File C:\FinanceBot\deploy\windows\status.ps1
 param([string]$App = "C:\FinanceBot", [int]$Lines = 15)
 
+$identity = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+if (-not $identity.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Host "Запустите PowerShell от имени администратора — иначе журналы и процессы не видны." -ForegroundColor Red
+    exit 1
+}
+
 foreach ($name in "FinanceBot", "FinanceBot-Backup") {
     $task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
     if (-not $task) { Write-Host "$name — задание не найдено (запустите install.ps1)" -ForegroundColor Red; continue }
     $info = $task | Get-ScheduledTaskInfo
-    Write-Host ("{0,-18} {1,-8} последний запуск: {2}" -f $name, $task.State, $info.LastRunTime)
+    Write-Host ("{0,-18} {1,-8} последний запуск: {2}  код: 0x{3:X8}" -f $name, $task.State, $info.LastRunTime, $info.LastTaskResult)
 }
 Write-Host ""
 Write-Host "Процессы:"

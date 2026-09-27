@@ -67,8 +67,8 @@ for ($i = 0; $i -lt 30 -and -not $up; $i++) {
     try { $tcp.Connect("127.0.0.1", $Port); $up = $true } catch { } finally { $tcp.Close() }
 }
 if (-not $up) {
-    Get-Content (Join-Path $App "logs\settings.log") -Tail 20 -ErrorAction SilentlyContinue
-    Get-Content (Join-Path $App "logs\supervisor.log") -Tail 10 -ErrorAction SilentlyContinue
+    Get-Content (Join-Path $App "logs\settings.log") -Tail 20 -Encoding UTF8 -ErrorAction SilentlyContinue
+    Get-Content (Join-Path $App "logs\supervisor.log") -Tail 10 -Encoding UTF8 -ErrorAction SilentlyContinue
     Fail "страница не запустилась — выше журнал (или порт $Port занят: попробуйте -Port 9443)"
 }
 

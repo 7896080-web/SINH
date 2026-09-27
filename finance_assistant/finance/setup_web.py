@@ -19,6 +19,7 @@ import argparse
 import html
 import json
 import os
+import re
 import secrets
 import ssl
 import subprocess
@@ -39,16 +40,66 @@ TEMP_SUBTITLE = ("Страница временная: закроется пос
 
 # --- .env ------------------------------------------------------------------
 
+MAX_FORM = 64 * 1024
+# Символы, которые в .env начали бы новую строку (и новую переменную).
+_BAD_ENV_CHARS = set("\r\n\x00\x85\u2028\u2029") | {chr(c) for c in range(32) if c != 9} | {"\x7f"}
+
+
+def read_form(handler) -> dict[str, str] | None:
+    """Тело POST-формы или None (ответ об ошибке уже отправлен). Длину тела
+    проверяем до чтения: отрицательная или огромная Content-Length иначе
+    заставила бы читать сколько угодно данных в память."""
+    raw_len = handler.headers.get("Content-Length") or "0"
+    if not raw_len.isdigit():
+        handler.send_error(400)
+        return None
+    length = int(raw_len)
+    if length > MAX_FORM:
+        handler.send_error(413)
+        return None
+    raw = handler.rfile.read(length).decode("utf-8", "replace")
+    return {k: v[0].strip() for k, v in parse_qs(raw).items()}
+
+
+TOKEN_RE = re.compile(r"^\d+:[A-Za-z0-9_-]+$")
+KEY_RE = re.compile(r"^sk-ant-[A-Za-z0-9_-]+$")
+
+
+def format_errors(form: dict) -> list[str]:
+    """Проверка вида токенов и ключа до всего остального (в том числе до
+    живой проверки): в .env не должно попасть ничего, кроме них."""
+    errors = []
+    for field, pattern, what in (("TELEGRAM_BOT_TOKEN", TOKEN_RE, "токен бота"),
+                                 ("TELEGRAM_BOT_TOKEN_TEST", TOKEN_RE, "токен тестового бота"),
+                                 ("ANTHROPIC_API_KEY", KEY_RE, "ключ Claude API")):
+        value = form.get(field, "")
+        if value and not pattern.match(value):
+            errors.append(f"{what} выглядит неправильно — скопируйте его целиком, без пробелов")
+    return errors
+
+
+def clean_env_value(value: str) -> str:
+    if any(ch in _BAD_ENV_CHARS for ch in value):
+        raise ValueError("в значении недопустимые символы (перевод строки и т.п.)")
+    return value
+
+
 def read_env(path: str) -> dict[str, str]:
     values: dict[str, str] = {}
     if not os.path.exists(path):
         return values
-    with open(path, encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                key, _, value = line.partition("=")
-                values[key.strip()] = value.strip().strip('"').strip("'")
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    # Файл могли поправить Блокнотом: он пишет с BOM или в кодировке Windows.
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = raw.decode("cp1251", errors="replace")
+    for line in text.replace("\r\n", "\n").split("\n"):
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, _, value = line.partition("=")
+            values[key.strip()] = value.strip().strip('"').strip("'")
     return values
 
 
@@ -56,8 +107,18 @@ def write_env(path: str, updates: dict[str, str], group: str | None = None):
     """Заменить значения ключей, сохранив комментарии и прочие строки."""
     lines = []
     if os.path.exists(path):
-        with open(path, encoding="utf-8") as fh:
-            lines = fh.read().splitlines()
+        with open(path, "rb") as fh:
+            raw = fh.read()
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            text = raw.decode("cp1251", errors="replace")
+        # split("\n"), а не splitlines(): тот режет и по \u2028, \x85 и т.п.
+        lines = text.replace("\r\n", "\n").split("\n")
+        if lines and lines[-1] == "":
+            lines.pop()
+    for value in updates.values():
+        clean_env_value(value)
     done = set()
     for i, line in enumerate(lines):
         key = line.split("=", 1)[0].strip()
@@ -356,6 +417,7 @@ class SetupServer(ThreadingHTTPServer):
 
 
 class Handler(BaseHTTPRequestHandler):
+    timeout = 30  # зависшее соединение не держит поток вечно
     server: SetupServer
 
     def log_message(self, fmt, *args):  # без логов с секретом в адресе
@@ -386,10 +448,8 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return path[len(prefix):]
 
-    def _form(self) -> dict[str, str]:
-        length = min(int(self.headers.get("Content-Length") or 0), 64 * 1024)
-        raw = self.rfile.read(length).decode("utf-8", "replace")
-        return {k: v[0].strip() for k, v in parse_qs(raw).items()}
+    def _form(self) -> dict[str, str] | None:
+        return read_form(self)
 
     def do_GET(self):
         rest = self._authorized()
@@ -405,6 +465,8 @@ class Handler(BaseHTTPRequestHandler):
         if rest is None:
             return
         form = self._form()
+        if form is None:
+            return
         if not secrets.compare_digest(form.get("csrf", ""), self.server.csrf):
             self._send(403, "Forbidden", "text/plain")
             return
@@ -440,6 +502,10 @@ class Handler(BaseHTTPRequestHandler):
         updates, errors, notes = {}, [], []
         key = form.get("ANTHROPIC_API_KEY", "")
         token = form.get("TELEGRAM_BOT_TOKEN", "")
+        errors += format_errors(form)
+        if errors:
+            key = token = ""
+            form = {k: v for k, v in form.items() if not k.startswith(("TELEGRAM", "ANTHROPIC"))}
         try:
             ids = parse_ids(" ".join(x for x in (form.get("user1", ""), form.get("user2", "")) if x))
             updates["ALLOWED_USER_IDS"] = ",".join(map(str, ids))
@@ -518,7 +584,10 @@ def main(argv=None):
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         ctx.load_cert_chain(args.cert, args.key)
-        server.socket = ctx.wrap_socket(server.socket, server_side=True)
+        # Рукопожатие — в потоке соединения: одно зависшее подключение не
+        # блокирует страницу для остальных.
+        server.socket = ctx.wrap_socket(server.socket, server_side=True,
+                                        do_handshake_on_connect=False)
         url = f"https://{args.host_hint}:{args.port}/{secret}"
     else:
         url = f"http://localhost:{args.port}/{secret}"
