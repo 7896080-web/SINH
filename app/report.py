@@ -208,15 +208,25 @@ def current_dispatch_errors(db: Session, account_id: int | None = None) -> list[
     кабинета — «751», потому что считал все строки в `error` за всё время,
     включая мёртвые от уже починенного дефекта. Две страницы, противоречащие
     друг другу, хуже одной неточной: верить перестают обеим.
+
+    Тогда это закрыли наполовину — счётчик взял `latest_queue_ids`, а остальные
+    отборы отчёта (мёртвая пара, отказ, перекрытый более поздней отправкой)
+    остались только в находках. 27.09 половина и вышла боком: оператор разобрал
+    девяносто отказов «площадка не знает наш sku» единственным способом, каким
+    их и можно разобрать, — карточек этих товаров в кабинете нет, значит галочку
+    с кабинета долой, — и находка отчёта замолчала, как и должна была. А
+    счётчик кабинета на «Диагностике» показывал те же 91: `_only_live_pairs` к
+    нему не применялся вовсе. Человек сделал ровно то, что находка просила, и
+    страница по-прежнему звала разбирать разобранное — верный способ приучить
+    не читать её вовсе. Поэтому счёт идёт ПО ТЕМ ЖЕ ЗАПРОСАМ, что и обе находки
+    про отказы, а не по своему условию: разойдись они снова, узналось бы это
+    ровно так же — через человека, сделавшего всё правильно и не получившего
+    ответа.
     """
-    query = db.query(DispatchQueueItem).filter(
-        DispatchQueueItem.status == DispatchStatus.error,
-        DispatchQueueItem.is_test.is_(False),
-    )
+    rows = _q_dispatch_errors(db) + _q_unknown_sku(db)
     if account_id is not None:
-        query = query.filter(DispatchQueueItem.account_id == account_id)
-    latest = latest_queue_ids(db)
-    return [r for r in query.all() if r.id in latest]
+        rows = [r for r in rows if r.account_id == account_id]
+    return rows
 
 
 def latest_queue_ids(db: Session) -> set[int]:
@@ -381,6 +391,16 @@ def _only_live_pairs(db: Session, rows: list[DispatchQueueItem]) -> list[Dispatc
     площадке по-прежнему лежит 50, и она продаёт то, чего нет. Это настоящее
     расхождение, и `ever_transmitted` его сохраняет.
 
+    ВЫКЛЮЧЕННАЯ ТРАНСЛЯЦИЯ закрывает отказ так же, как снятая галочка, — по
+    симметрии, а не по боевому случаю: такого на бою пока не было, и написано
+    это здесь именно затем, чтобы потом не выдать симметрию за инцидент. Пара
+    «живая» значит «наружу по ней реально что-то пойдёт», а у нетранслируемого
+    товара не пойдёт ничего: отмеченный кабинет сам по себе не отправляет
+    ничего, автоматические пути такой товар в очередь не ставят вовсе, и отказ
+    по нему висел бы вечно, не описывая ничего. `ever_transmitted` и здесь
+    главнее: выключили трансляцию после того, как писали туда непустой
+    остаток, — на площадке лежит наше число, и это по-прежнему расхождение.
+
     Отсутствие товара в номенклатуре поводом НЕ считается: запись очереди
     переживает удаление товара, и строка обязана появиться всё равно — иначе
     находка насчитает больше, чем покажет (см. одноимённый тест).
@@ -389,17 +409,26 @@ def _only_live_pairs(db: Session, rows: list[DispatchQueueItem]) -> list[Dispatc
     """
     if not rows:
         return rows
+    uids = {r.uid_1c for r in rows}
     ticked = {
         (s.uid_1c, s.account_id) for s in
         db.query(SyncSetting.uid_1c, SyncSetting.account_id).filter(
-            SyncSetting.uid_1c.in_({r.uid_1c for r in rows}),
+            SyncSetting.uid_1c.in_(uids),
             SyncSetting.enabled.is_(True)).all()
+    }
+    # Товара может не быть в номенклатуре вовсе — запись очереди переживает его
+    # удаление. Молчать по такой строке НЕЛЬЗЯ (см. абзац выше), поэтому
+    # спрашиваем не «транслируется ли», а «известно ли, что НЕ транслируется»:
+    # ответ «товара нет» отказ не отменяет.
+    silenced = {
+        uid for (uid,) in db.query(Product.uid_1c).filter(
+            Product.uid_1c.in_(uids), Product.broadcast_enabled.is_(False)).all()
     }
 
     from app.transmit import ever_transmitted
 
     return [r for r in rows
-            if (r.uid_1c, r.account_id) in ticked
+            if ((r.uid_1c, r.account_id) in ticked and r.uid_1c not in silenced)
             or ever_transmitted(db, r.uid_1c, r.account_id)]
 
 
@@ -524,44 +553,76 @@ def _q_platform_divergence(db: Session) -> list[DispatchQueueItem]:
             or (r.sent_quantity - r.verified_quantity) > _sales_between(db, r)]
 
 
-def _check_platform_divergence(db: Session) -> Finding | None:
-    """Площадка держит не то, что мы ей отправили.
+def _q_platform_holds_more(db: Session) -> list[DispatchQueueItem]:
+    return [r for r in _q_platform_divergence(db)
+            if r.verified_quantity > r.sent_quantity]
+
+
+def _q_platform_holds_less(db: Session) -> list[DispatchQueueItem]:
+    return [r for r in _q_platform_divergence(db)
+            if r.verified_quantity < r.sent_quantity]
+
+
+def _divergence_details(rows: list[DispatchQueueItem]) -> list[str]:
+    return [f"{r.sent_sku}: отправили {r.sent_quantity}, площадка держит "
+            f"{r.verified_quantity} ({_age(r.verified_at)} назад)" for r in rows[:10]]
+
+
+def _check_platform_holds_more(db: Session) -> Finding | None:
+    """Площадка держит БОЛЬШЕ нашего числа — она продаёт то, чего нет.
 
     Сверку делает отдельный воркер (`app/workers/verify_stock.py`) — он ходит в
     API площадок; отчёт читает уже сохранённое в очереди и наружу не ходит.
-
-    Направление расхождения важнее самого факта, поэтому уровень от него и
-    зависит. Площадка держит БОЛЬШЕ нашего — она продаёт то, чего нет, это
-    оверселл и критично. МЕНЬШЕ — недоотправка: теряются продажи, но не деньги
-    покупателя.
 
     19.09.2026 на боевом WB нашли ровно это: в кабинет писала вторая система
     (та, с которой идёт переход) и перетирала наши остатки за три минуты, а
     отправка каждый раз отвечала успехом. Без такой сверки это видно только
     глазами и только если пойти смотреть.
     """
-    rows = _q_platform_divergence(db)
+    rows = _q_platform_holds_more(db)
     if not rows:
         return None
-
-    higher = [r for r in rows if r.verified_quantity > r.sent_quantity]
-    level = CRITICAL if higher else WARNING
-    if higher:
-        consequence = ("На площадке лежит БОЛЬШЕ, чем мы отправляли, — она продаёт "
-                       "то, чего нет. Наше число кто-то переписал: либо в кабинет "
-                       "пишет вторая система, либо отправка поняла ответ площадки "
-                       "не так.")
-    else:
-        consequence = ("На площадке лежит МЕНЬШЕ, чем мы отправляли: продажи по этим "
-                       "карточкам идут не с тем остатком, который есть на складе. "
-                       "Наше число кто-то переписал поверх.")
     return Finding(
-        key="platform_divergence", level=level,
-        title=f"Площадка держит не то, что мы отправили: {len(rows)} позиций",
-        consequence=consequence,
-        count=len(rows), link="/report/rows/platform_divergence",
-        details=[f"{r.sent_sku}: отправили {r.sent_quantity}, площадка держит "
-                 f"{r.verified_quantity} ({_age(r.verified_at)} назад)" for r in rows[:10]],
+        key="platform_holds_more", level=CRITICAL,
+        title=f"Площадка держит БОЛЬШЕ, чем мы отправили: {len(rows)} позиций",
+        consequence=("На площадке лежит больше, чем мы отправляли, — она продаёт "
+                     "то, чего нет. Наше число кто-то переписал: либо в кабинет "
+                     "пишет вторая система, либо отправка поняла ответ площадки "
+                     "не так."),
+        count=len(rows), link="/report/rows/platform_holds_more",
+        details=_divergence_details(rows),
+    )
+
+
+def _check_platform_holds_less(db: Session) -> Finding | None:
+    """Площадка держит МЕНЬШЕ нашего числа — товар недопродаётся.
+
+    Находка ОТДЕЛЬНАЯ от «держит больше», и это не опрятность. Раньше обе
+    стороны жили в одной: уровень и текст брались по тому, есть ли ХОТЬ ОДНА
+    строка «больше», — и весь набор объявлялся оверселлом. 27.09 на бою это
+    видно в чистом виде: восемь строк, у семи площадка держит МЕНЬШЕ
+    (отправили 18 — держит 10, отправили 28 — держит 0), у одной больше
+    (отправили 0 — держит 2), и находка всем восьми обещала «продаёт то, чего
+    нет». Для семи строк это прямая неправда, а человек, читающий текст
+    буквально, идёт искать оверселл там, где его нет, — и перестаёт верить
+    находке вовсе.
+
+    Уровень разный по той же причине, по которой разный текст: «держит больше»
+    это деньги покупателя прямо сейчас, «держит меньше» — упущенные продажи.
+    Смешай их, и критичное перестало бы значить «разбирать немедленно».
+    """
+    rows = _q_platform_holds_less(db)
+    if not rows:
+        return None
+    return Finding(
+        key="platform_holds_less", level=WARNING,
+        title=f"Площадка держит МЕНЬШЕ, чем мы отправили: {len(rows)} позиций",
+        consequence=("На площадке лежит меньше, чем мы отправляли: товар "
+                     "недопродаётся. Наше число кто-то переписал поверх — вторая "
+                     "система, правка карточки в кабинете или сосед по карточке "
+                     "(два товара 1С на одном размере пишут по очереди)."),
+        count=len(rows), link="/report/rows/platform_holds_less",
+        details=_divergence_details(rows),
     )
 
 
@@ -1515,7 +1576,8 @@ def _check_worker_failures(db: Session) -> Finding | None:
 CHECKS = (
     _check_dispatch_errors,
     _check_unknown_sku,
-    _check_platform_divergence,
+    _check_platform_holds_more,
+    _check_platform_holds_less,
     _check_tasks_needing_review,
     _check_broadcast_without_recalc,
     _check_offset_disagrees,
@@ -1597,8 +1659,15 @@ def _rows_unknown_sku(db: Session) -> list[list[str]]:
     return _queue_rows(db, _q_unknown_sku(db))
 
 
-def _rows_platform_divergence(db: Session) -> list[list[str]]:
-    rows = _q_platform_divergence(db)
+def _rows_platform_holds_more(db: Session) -> list[list[str]]:
+    return _divergence_rows(db, _q_platform_holds_more(db))
+
+
+def _rows_platform_holds_less(db: Session) -> list[list[str]]:
+    return _divergence_rows(db, _q_platform_holds_less(db))
+
+
+def _divergence_rows(db: Session, rows: list[DispatchQueueItem]) -> list[list[str]]:
     uids = {r.uid_1c for r in rows}
     products = {p.uid_1c: p for p in
                 db.query(Product).filter(Product.uid_1c.in_(uids)).all()} if uids else {}
@@ -1761,13 +1830,21 @@ FULL_LIST_GUIDANCE = {
         "расхождение измерено неправильно: поправьте его там же, оно и есть "
         "первоисточник. И скажите разработчику: строка здесь означает путь, "
         "который пишет порог, не пересчитывая его."),
-    "platform_divergence": (
-        "Площадка держит НЕ ТО число, которое мы отправили. Значит в кабинет "
-        "пишет кто-то ещё, и выигрывает написавший последним: наш остаток там "
-        "живёт до чужой записи.",
+    "platform_holds_more": (
+        "На площадке БОЛЬШЕ нашего числа, то есть она продаёт то, чего нет. "
+        "В кабинет пишет кто-то ещё, и выигрывает написавший последним: наш "
+        "остаток там живёт до чужой записи.",
         "Сверка ничего не чинит намеренно — автопереотправка при живом втором "
         "писателе превратилась бы в гонку. Сначала найдите, кто ещё пишет в "
         "кабинет, и остановите его; потом «Переотправить остаток»."),
+    "platform_holds_less": (
+        "На площадке МЕНЬШЕ нашего числа: товар недопродаётся. Денег покупателя "
+        "это не касается, но продажи идут не с тем остатком, который есть на "
+        "складе.",
+        "Сначала посмотрите на «Товарах», не делят ли эти строки карточку с "
+        "другим артикулом 1С («на карточке ещё …»): тогда число на площадке — "
+        "вклад соседа, и достаточно «Переотправить остаток», чтобы уехала сумма. "
+        "Если соседа нет — ищите второго писателя в кабинете, как и выше."),
     "reconciliation_review": (
         "Склад разошёлся с 1С больше, чем на порог. Остаток по этим строкам "
         "мы УЖЕ переписали по 1С — вопрос не в том, что делать с числом, а в "
@@ -1776,6 +1853,10 @@ FULL_LIST_GUIDANCE = {
         "этим строкам не поможет: она берёт то, что СТАРШЕ суток, а здесь "
         "последние сутки."),
 }
+
+DIVERGENCE_COLUMNS = ["Артикул", "Размер", "Цвет", "Наименование", "Кабинет",
+                      "Чем адресовали", "Отправили", "Площадка держит",
+                      "Когда сверяли"]
 
 FULL_LISTS = {
     "dispatch_errors": ("Рассылка не доехала до площадки", QUEUE_COLUMNS,
@@ -1795,10 +1876,10 @@ FULL_LISTS = {
                          "Расхождение", "Бронь", "Порог сейчас", "Порог по формуле",
                          "Уходит сейчас", "Ушло бы по формуле"],
                         _rows_offset_disagrees),
-    "platform_divergence": ("Площадка держит не то, что мы отправили",
-                           ["Артикул", "Размер", "Цвет", "Наименование", "Кабинет",
-                            "Чем адресовали", "Отправили", "Площадка держит",
-                            "Когда сверяли"], _rows_platform_divergence),
+    "platform_holds_more": ("Площадка держит БОЛЬШЕ, чем мы отправили",
+                           DIVERGENCE_COLUMNS, _rows_platform_holds_more),
+    "platform_holds_less": ("Площадка держит МЕНЬШЕ, чем мы отправили",
+                           DIVERGENCE_COLUMNS, _rows_platform_holds_less),
     "reconciliation_review": ("Крупные расхождения со складом 1С за сутки",
                               ["Артикул", "Размер", "Цвет", "Наименование",
                                "Когда сверяли", "Было у нас", "Стало по 1С",

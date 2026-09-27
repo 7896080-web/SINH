@@ -180,7 +180,7 @@ def test_the_report_tells_an_unknown_sku_apart_from_a_broken_dispatch(db):
     from app.report import collect_findings
 
     account = make_account(db)
-    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5, broadcast_enabled=True))
     db.add(DispatchQueueItem(
         uid_1c="u1", account_id=account.id, quantity=5, sent_sku="2000932279695",
         reason="manual_resend_all", status=DispatchStatus.error,
@@ -201,7 +201,7 @@ def test_a_dispatch_error_without_any_text_is_still_shown(db):
     from app.report import collect_findings
 
     account = make_account(db)
-    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5, broadcast_enabled=True))
     db.add(DispatchQueueItem(uid_1c="u1", account_id=account.id, quantity=5,
                              reason="order", status=DispatchStatus.error))
     db.commit()
