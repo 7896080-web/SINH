@@ -81,16 +81,25 @@ def write_env(path: str, updates: dict[str, str], group: str | None = None):
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(content)
     os.chmod(tmp, 0o640)
-    if os.path.exists(path) and os.geteuid() == 0:
-        st = os.stat(path)  # сохранить владельца прежнего файла
-        os.chown(tmp, st.st_uid, st.st_gid)
-    if group and os.geteuid() == 0:
-        import grp
+    if hasattr(os, "geteuid") and os.geteuid() == 0:  # на Windows владельцев так не меняют
+        if os.path.exists(path):
+            st = os.stat(path)  # сохранить владельца прежнего файла
+            os.chown(tmp, st.st_uid, st.st_gid)
+        if group:
+            import grp
+            try:
+                os.chown(tmp, os.stat(tmp).st_uid, grp.getgrnam(group).gr_gid)
+            except KeyError:
+                pass
+    for attempt in range(20):
         try:
-            os.chown(tmp, os.stat(tmp).st_uid, grp.getgrnam(group).gr_gid)
-        except KeyError:
-            pass
-    os.replace(tmp, path)
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            # Windows: файл как раз читает другой процесс — подождать и повторить.
+            if os.name != "nt" or attempt == 19:
+                raise
+            time.sleep(0.1)
 
 
 def mask(value: str) -> str:
