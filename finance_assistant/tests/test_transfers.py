@@ -75,11 +75,12 @@ def test_edit_and_delete_transfer(own):
     [ask] = flow.on_button(CHAT, "t:to:1")
     assert "Куда перевод П1?" in ask.text
     [same] = flow.on_button(CHAT, f"t:to:1:{cid(db, 'Россия')}")
-    assert "одна и та же карта" in same.text
+    # Ошибка — тот же вопрос снова с кнопками: выход есть всегда.
+    assert "одна и та же карта" in same.text and "t:to:1:0" in str(same.buttons)
     [r] = flow.on_button(CHAT, "t:to:1:0")
-    assert "Россия → другой ваш счёт" in r.text
+    assert "Россия → другой ваш счёт" in r.text and "Исправлено" in r.text
     [r] = flow.on_button(CHAT, "t:from:1:0")
-    assert "Хотя бы одна сторона" in r.text
+    assert "Хотя бы одна сторона" in r.text and "t:keep:1" in str(r.buttons)
     assert "П1" in flow.on_command(CHAT, "fix", "п1")[0].text
     [lst] = flow.on_command(CHAT, "list")
     assert "Переводы между своими счетами:" in lst.text and "П1 10.09" in lst.text
@@ -154,3 +155,22 @@ def test_transfer_missing_in_statement_warned(own):
     card_reply, *_ = flow.on_command(CHAT, "done")
     assert "Перевод записан, но в выписке не найден" in card_reply.text
     assert "П1 25.09  100 000,00 ₽  Россия → ВТБ" in card_reply.text
+
+
+def test_transfer_card_can_be_finished(own):
+    """Карточка перевода: видно, что он записан; «Готово» закрывает вопрос,
+    выбор той же карты — «без изменений», в вопросе отмечена текущая карта."""
+    db, rec, flow = own
+    rec.payments.append(move())
+    [card] = flow.on_files(CHAT, [png()], "")
+    assert "записан" in card.text and "t:ok:1" in str(card.buttons)
+    [ask] = flow.on_button(CHAT, "t:from:1")
+    current = next(label for row in ask.buttons for label, _ in row if label.startswith("✓ "))
+    assert db.transfer(1).from_card in current
+    [keep] = flow.on_button(CHAT, "t:keep:1")
+    assert keep.text.startswith("🔁") and "t:ok:1" in str(keep.buttons)
+    [same] = flow.on_button(CHAT, f"t:from:1:{db.transfer(1).from_card_id}")
+    assert same.text.startswith("Без изменений")
+    [done] = flow.on_button(CHAT, "t:ok:1")
+    assert "сохранён" in done.text and not done.buttons and done.menu
+    assert len(db.transfers("2026-09")) == 1
