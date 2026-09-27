@@ -301,6 +301,9 @@
 
 ## Установка на сервер
 
+Сервер на Windows — см. `УСТАНОВКА-WINDOWS.md` (установщик `deploy/windows/install.ps1`,
+автозапуск через Планировщик заданий). Ниже — Linux.
+
 Пошагово, для первой установки и обновления: **[УСТАНОВКА.md](УСТАНОВКА.md)**.
 Коротко:
 
@@ -398,6 +401,7 @@ venv/bin/python -m pytest -q
 - `finance/flow.py` — весь сценарий диалога (вопросы, кнопки, сверка), без Telegram;
 - `finance/bot.py` — обвязка python-telegram-bot;
 - `finance/mode.py` — боевой и тестовый режимы, проверки их разделения;
+- `finance/supervise.py`, `finance/backup.py`, `finance/windows.py` — запуск, бэкап и установка на Windows;
 - `finance/recognize.py` — запросы к Claude: скриншот → платёж, выписка → операции;
 - `finance/reconcile.py` — сопоставление с выпиской и месячный свод;
 - `finance/report.py` — тексты и Excel;

@@ -1,3 +1,8 @@
 anthropic>=1.8,<2
 python-telegram-bot>=22,<23
 openpyxl>=3.1,<4
+# Только для Windows: база часовых поясов, сертификат страницы настроек,
+# поиск оставшихся процессов бота (на Linux это делают система и systemd).
+tzdata; sys_platform == "win32"
+cryptography>=42; sys_platform == "win32"
+psutil>=5.9; sys_platform == "win32"

@@ -16,6 +16,7 @@ from telegram.constants import ChatAction, ChatType
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes,
                           MessageHandler, filters)
 
+from .clock import local_today
 from .flow import Reply
 from .mode import run_config
 from .recognize import ClaudeRecognizer, DEFAULT_MODEL
@@ -383,7 +384,8 @@ def main(argv=None):
         log.warning("ALLOWED_USER_IDS пуст — бот никому не ответит, кроме сообщения с id")
     os.makedirs(config.data_dir, mode=0o700, exist_ok=True)
     recognizer = ClaudeRecognizer(model=os.environ.get("CLAUDE_MODEL", DEFAULT_MODEL))
-    spaces = UserSpaces(config.data_dir, recognizer, config.user_ids, allow_reset=config.is_test)
+    spaces = UserSpaces(config.data_dir, recognizer, config.user_ids, allow_reset=config.is_test,
+                        today=local_today)
     if not config.is_test:
         spaces.migrate_shared_data()
     log.info("Режим: %s. Пользователей: %d, у каждого своя база в %s/users/<id>/",
