@@ -11,13 +11,14 @@ import logging
 import os
 import time
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
+from telegram import (BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputFile,
+                      KeyboardButton, ReplyKeyboardMarkup, Update)
 from telegram.constants import ChatAction, ChatType
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes,
                           MessageHandler, filters)
 
 from .clock import local_today
-from .flow import Reply
+from .flow import MENU_ROWS, Reply
 from .mode import run_config
 from .recognize import ClaudeRecognizer, DEFAULT_MODEL
 from .users import UserSpaces, parse_user_ids
@@ -66,8 +67,26 @@ def _marked(text: str, label: str) -> str:
     return f"{label}\n{text}" if label and text else text
 
 
-async def send(update: Update, replies: list[Reply], label: str = ""):
-    """label — пометка тестового режима перед каждым ответом («🧪 ТЕСТ»)."""
+RESET_LABEL = "🗑 Стереть тестовые данные"
+# Команды в меню Telegram (кнопка «Меню» слева от поля ввода).
+BOT_COMMANDS = [("start", "Главное меню и помощь"), ("list", "Записи за месяц"),
+                ("itog", "Итог: пришло, ушло, бизнес, личное"), ("sverka", "Сверка с выпиской"),
+                ("svod", "Сводная по статьям"), ("cards", "Мои карты"),
+                ("cancel", "Сбросить текущий вопрос")]
+
+
+def menu_keyboard(test: bool = False) -> ReplyKeyboardMarkup:
+    """Главное меню — постоянные кнопки внизу экрана."""
+    rows = [list(row) for row in MENU_ROWS] + ([[RESET_LABEL]] if test else [])
+    return ReplyKeyboardMarkup([[KeyboardButton(text) for text in row] for row in rows],
+                               resize_keyboard=True, is_persistent=True)
+
+
+async def send(update: Update, replies: list[Reply], label: str = "",
+               keyboard: ReplyKeyboardMarkup | None = None):
+    """label — пометка тестового режима перед каждым ответом («🧪 ТЕСТ»).
+    keyboard — главное меню: ставится под ответом с menu=True (у сообщения
+    может быть либо меню внизу, либо кнопки под ним — не то и другое сразу)."""
     chat = update.effective_chat
     for r in replies:
         chunks = _split(_marked(r.text, label)) or [""]
@@ -77,6 +96,8 @@ async def send(update: Update, replies: list[Reply], label: str = ""):
                 markup = InlineKeyboardMarkup(
                     [[InlineKeyboardButton(label, callback_data=data) for label, data in row]
                      for row in r.buttons])
+            elif r.menu and keyboard is not None and i == len(chunks) - 1:
+                markup = keyboard
             await chat.send_message(chunk, reply_markup=markup)
         if r.file:
             name, data = r.file
@@ -123,13 +144,30 @@ def build_app(token: str, flow_for, allowed: set[int], env_file: str | None = No
     Тестовый режим: label — пометка перед каждым ответом, reset(user_id) —
     стереть данные пользователя (команда /reset есть только тогда).
     """
-    builder = Application.builder().token(token)
-    if env_file:
-        async def start_watch(application: Application):
+    async def on_start(application: Application):
+        try:
+            await application.bot.set_my_commands([BotCommand(c, d) for c, d in BOT_COMMANDS])
+        except Exception as exc:  # не критично: команды и так работают
+            log.warning("Не удалось задать список команд: %s", exc)
+        if env_file:
             application.create_task(watch_env(application, env_file))
-        builder = builder.post_init(start_watch)
-    app = builder.build()
+    app = Application.builder().token(token).post_init(on_start).build()
     resolve = flow_for if callable(flow_for) else (lambda user_id: flow_for)
+    keyboard = menu_keyboard(test=reset is not None)
+    # Кому меню уже показано с запуска бота: остальным его покажем с первым
+    # подходящим ответом — так кнопки появятся и у тех, кто не нажимал /start.
+    menu_shown: set[int] = set()
+
+    async def reply(update: Update, replies: list[Reply]):
+        user_id = update.effective_user.id
+        if user_id not in menu_shown:
+            plain = next((r for r in replies if not r.buttons), None)
+            if plain is not None:
+                plain.menu = True
+                menu_shown.add(user_id)
+        elif any(r.menu for r in replies):
+            menu_shown.add(user_id)
+        await send(update, replies, label, keyboard)
 
     async def say(chat, text: str, **kwargs):
         await chat.send_message(_marked(text, label), **kwargs)
@@ -186,7 +224,7 @@ def build_app(token: str, flow_for, allowed: set[int], env_file: str | None = No
                 replies = await asyncio.to_thread(fn, chat.id, *args)
             finally:
                 typing.cancel()
-            await send(update, replies, label)
+            await reply(update, replies)
 
     def batch_note(n: int) -> str:
         if n == 1:
@@ -247,10 +285,10 @@ def build_app(token: str, flow_for, allowed: set[int], env_file: str | None = No
         if reset is None:  # в боевом режиме команды нет вовсе
             await update.effective_chat.send_message("Не знаю такой команды. /help — что я умею.")
             return
-        await send(update, [Reply(
+        await reply(update, [Reply(
             "Стереть ВСЕ тестовые данные: карты, записи, выписки, правила, скриншоты? "
             "Боевой учёт это не затронет.",
-            [[("🗑 Да, стереть", RESET_YES), ("Нет", RESET_NO)]])], label)
+            [[("🗑 Да, стереть", RESET_YES), ("Нет", RESET_NO)]])])
 
     async def do_reset(update: Update, data: str):
         chat = update.effective_chat
@@ -310,6 +348,9 @@ def build_app(token: str, flow_for, allowed: set[int], env_file: str | None = No
         if not await guard(update):
             return
         await flush_first(update)
+        if reset is not None and update.message.text.strip() == RESET_LABEL:
+            await ask_reset(update)
+            return
         await run(update, "on_text", update.message.text)
 
     async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):

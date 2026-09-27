@@ -27,8 +27,19 @@ from .storage import BUSINESS, BUSINESS_ACCOUNT, EXPENSE, PERSONAL, PERSONAL_CAR
 
 log = logging.getLogger(__name__)
 
+# Главное меню — постоянные кнопки внизу экрана. Нажатие присылает этот текст.
+MENU_RECORDS = "📋 Записи"
+MENU_ITOG = "📊 Итог"
+MENU_SVERKA = "🧾 Сверка"
+MENU_SVOD = "📈 Сводная"
+MENU_CARDS = "💳 Карты"
+MENU_MORE = "⚙️ Ещё"
+MENU_ROWS = [[MENU_RECORDS, MENU_ITOG], [MENU_SVERKA, MENU_SVOD], [MENU_CARDS, MENU_MORE]]
+MENU_LABELS = {label for row in MENU_ROWS for label in row}
+
 HELP = """\
 Я веду учёт расходов на бизнес, оплаченных с личных карт.
+Кнопки внизу — главное меню. Команды ниже работают так же, как кнопки.
 
 📸 Сделали оплату — пришлите скриншот (можно с подписью, что это). \
 Я распознаю сумму, дату, карту и статью, при необходимости переспрошу и запишу.
@@ -78,6 +89,7 @@ class Reply:
     text: str
     buttons: list[list[tuple[str, str]]] = field(default_factory=list)
     file: tuple[str, bytes] | None = None  # (имя файла, содержимое)
+    menu: bool = False  # показать под ответом кнопки главного меню (внизу экрана)
 
 
 def _month(today: date, shift: int = 0) -> str:
@@ -90,6 +102,12 @@ def _parse_month_arg(arg: str) -> str | None:
         return datetime.strptime(arg.strip(), "%Y-%m").strftime("%Y-%m")
     except ValueError:
         return None
+
+
+def _month_shift(month: str, shift: int) -> str:
+    year, mon = map(int, month.split("-"))
+    index = year * 12 + mon - 1 + shift
+    return f"{index // 12:04d}-{index % 12 + 1:02d}"
 
 
 def _short_month(month: str) -> str:
@@ -230,6 +248,7 @@ class Flow:
         }.get(command)
         if not handler:
             return [Reply("Не знаю такой команды. /help — что я умею.")]
+        self._forget_menu_input(chat_id)
         return handler(chat_id, arg.strip())
 
     def on_files(self, chat_id: int, files: list[tuple[bytes, str]], caption: str = "",
@@ -239,6 +258,7 @@ class Flow:
         file_ids — постоянные id файлов в Telegram (file_unique_id): по ним
         узнаём пересланный повторно файл, даже если Telegram пережал картинку.
         """
+        self._forget_menu_input(chat_id)
         keys = _file_keys(files, file_ids)
         state = self.db.get_state(chat_id)
         closed = self._close_idle_statement(chat_id, state)
@@ -265,6 +285,7 @@ class Flow:
         запись — последовательно, в порядке отправки. Итог — одна сводка,
         вопросы — по одному и только там, где без ответа не записать.
         """
+        self._forget_menu_input(chat_id)
         if len(items) == 1:
             return self.on_files(chat_id, **items[0])
         state = self.db.get_state(chat_id)
@@ -395,7 +416,14 @@ class Flow:
                 saved]
 
     def on_text(self, chat_id: int, text: str) -> list[Reply]:
+        if text.strip() in MENU_LABELS:
+            return self._menu(chat_id, text.strip())
         state = self.db.get_state(chat_id)
+        pending = state.pop("menu_input", None)
+        if pending:
+            # Нажали «➕ Добавить карту/статью» — это сообщение и есть ответ.
+            self.db.set_state(chat_id, state)
+            return self.on_command(chat_id, pending, text)
         ask = state.get("ask")
         if state.get("drafts") and ask in ("amount", "date"):
             return self._answer_text(chat_id, state, ask, text)
@@ -421,6 +449,9 @@ class Flow:
             return self._svod(chat_id, rest)
         if kind == "s":
             return self._sverka_button(chat_id, rest)
+        if kind == "m":
+            self._forget_menu_input(chat_id)
+            return self._menu_button(chat_id, rest)
         return []
 
     # --- распознавание платежа -----------------------------------------
@@ -976,7 +1007,90 @@ class Flow:
     # --- справочники ---------------------------------------------------
 
     def _help(self, chat_id, arg):
-        return [Reply(HELP)]
+        return [Reply(HELP, menu=True)]
+
+    # --- кнопочное меню --------------------------------------------------
+
+    def _forget_menu_input(self, chat_id):
+        state = self.db.get_state(chat_id)
+        if state.pop("menu_input", None):
+            self.db.set_state(chat_id, state)
+
+    def _menu(self, chat_id, label):
+        """Кнопка главного меню. Работает в любой момент, как команда."""
+        self._forget_menu_input(chat_id)
+        today = self.today()
+        if label == MENU_RECORDS:
+            return self._menu_list(chat_id, _month(today))
+        if label == MENU_ITOG:
+            this, prev = _month(today), _month(today, -1)
+            return [Reply("Итог за какой период?",
+                          [[("Этот месяц", f"m:itog:{this}"), ("Прошлый месяц", f"m:itog:{prev}")],
+                           [("С начала года", f"m:itog:{today.year}-01..{this}"),
+                            ("Прошлый год", f"m:itog:{today.year - 1}")]])]
+        if label == MENU_SVERKA:
+            if "statement" in self.db.get_state(chat_id):
+                return [Reply("Сейчас идёт загрузка выписки. Пришлите остальные файлы "
+                              "или закончите — посчитаю сверку.",
+                              [[("✅ Закончить и посчитать", "m:done")],
+                               [("Начать другую сверку", "m:sverka")]])]
+            return self._sverka(chat_id, "")
+        if label == MENU_SVOD:
+            return self._svod(chat_id, "")
+        if label == MENU_CARDS:
+            reply = self._cards(chat_id, "")[0]
+            row = [("➕ Добавить карту", "m:addcard")]
+            if self.db.cards():
+                row.append(("🗑 Удалить карту", "m:delpick"))
+            return [Reply(reply.text, [row])]
+        return [Reply("Что ещё?",
+                      [[("🏷 Статьи", "m:cats"), ("➕ Новая статья", "m:addcat")],
+                       [("🔗 Правила", "m:rules"), ("🧐 Личные списания", "m:vypiska")],
+                       [("❓ Помощь", "m:help"), ("✖️ Сбросить вопрос", "m:cancel")]])]
+
+    def _menu_list(self, chat_id, month):
+        replies = self._list(chat_id, month)
+        current = _month(self.today())
+        nav = [("◀ " + _short_month(_month_shift(month, -1)), f"m:list:{_month_shift(month, -1)}")]
+        if month < current:
+            nav.append((_short_month(_month_shift(month, 1)) + " ▶",
+                        f"m:list:{_month_shift(month, 1)}"))
+        if not replies[-1].buttons:
+            replies[-1].buttons = [nav]
+        return replies
+
+    def _menu_button(self, chat_id, rest):
+        what, _, value = rest.partition(":")
+        if what == "list" and _parse_month_arg(value):
+            return self._menu_list(chat_id, value)
+        if what == "itog":
+            return self._itog(chat_id, value)
+        if what in ("done", "sverka", "cats", "rules", "vypiska", "help", "cancel"):
+            return self.on_command(chat_id, what)
+        if what in ("addcard", "addcat"):
+            state = self.db.get_state(chat_id)
+            state["menu_input"] = what
+            self.db.set_state(chat_id, state)
+            if what == "addcard":
+                return [Reply("Напишите карту одним сообщением: название, последние 4 цифры, "
+                              "банк. Например:\nСбер 1234 Сбер\n"
+                              "Бизнес-счёт ИП — со словом «бизнес» в конце:\nПСБ 4987 ПСБ бизнес")]
+            return [Reply("Напишите название новой статьи расходов одним сообщением.")]
+        if what == "delpick":
+            cards = self.db.cards()
+            if not cards:
+                return [Reply("Карт нет.")]
+            return [Reply("Какую карту удалить? Удалить можно только карту без записей и выписок.",
+                          [[(c.label, f"m:delcard:{c.id}")] for c in cards])]
+        if what == "delcard" and value.isdigit() and self.db.card(int(value)):
+            card = self.db.card(int(value))
+            return [Reply(f"Удалить карту {card.label}?",
+                          [[("🗑 Да, удалить", f"m:delok:{card.id}"), ("Нет", "m:no")]])]
+        if what == "delok" and value.isdigit():
+            return self._del_card(chat_id, value)
+        if what == "no":
+            return [Reply("Хорошо, ничего не удаляю.")]
+        return []
 
     def _cancel(self, chat_id, arg):
         state = self.db.get_state(chat_id)
