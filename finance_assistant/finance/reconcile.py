@@ -26,7 +26,8 @@ def _gap(a: str, b: str) -> int:
 
 
 def match(records: list, lines: list[StatementLine], direction: str = "out",
-          used: set[int] | None = None, prefer_own: bool = False) -> tuple[dict[int, int], list]:
+          used: set[int] | None = None, prefer_own: bool = False,
+          closed_months: set[str] = frozenset()) -> tuple[dict[int, int], list]:
     """Сопоставить записи строкам выписки: сумма точно, дата ±MATCH_DAYS.
 
     Годится и для расходов, и для переводов (у тех и других есть id, op_date,
@@ -38,13 +39,17 @@ def match(records: list, lines: list[StatementLine], direction: str = "out",
     строк, чтобы ранняя запись не забрала строку, единственную для соседней.
     prefer_own — для переводов предпочитать строки, которые модель пометила как
     «свой перевод»; для расходов — наоборот, обычные строки.
+    closed_months — месяцы, где у карты выписка только с итогами (без строк):
+    запись такого месяца не уводим в строку соседнего месяца — по итогам не
+    проверить, что её там нет, а строка соседнего месяца — скорее другая покупка.
     """
     used = set() if used is None else used
 
     def candidates(r):
         return [ln for ln in lines
                 if ln.id not in used and ln.direction == direction and ln.amount == r.amount
-                and _gap(ln.op_date, r.op_date) <= MATCH_DAYS]
+                and _gap(ln.op_date, r.op_date) <= MATCH_DAYS
+                and (ln.op_date[:7] == r.op_date[:7] or r.op_date[:7] not in closed_months)]
 
     pairs: dict[int, int] = {}
     pending = sorted(records, key=lambda r: (r.op_date, r.id))
@@ -55,6 +60,7 @@ def match(records: list, lines: list[StatementLine], direction: str = "out",
         if not options:
             continue
         best = min(options, key=lambda ln: (ln.own_transfer != prefer_own,
+                                            ln.op_date[:7] != r.op_date[:7],
                                             _gap(ln.op_date, r.op_date), ln.op_date, ln.id))
         used.add(best.id)
         pairs[r.id] = best.id
@@ -96,11 +102,13 @@ def match_card(storage: Storage, card: Card) -> CardMatching:
     # Сначала переводы (им подходят строки, помеченные как «свои»), потом расходы
     # (им — обычные строки): иначе расход мог забрать строку перевода, и сумма
     # вычиталась бы дважды.
-    sent_pairs, _ = match(sent, lines, "out", used, prefer_own=True)
-    received_pairs, _ = match(received, lines, "in", used, prefer_own=True)
-    expense_pairs, _ = match(expenses, lines, "out", used, prefer_own=False)
     months = {m for (m,) in storage.conn.execute(
         "SELECT month FROM statements WHERE card_id = ?", (card.id,))}
+    line_months = {ln.op_date[:7] for ln in lines}
+    closed = {m for m in months if m not in line_months}   # выписка только с итогами
+    sent_pairs, _ = match(sent, lines, "out", used, prefer_own=True, closed_months=closed)
+    received_pairs, _ = match(received, lines, "in", used, prefer_own=True, closed_months=closed)
+    expense_pairs, _ = match(expenses, lines, "out", used, prefer_own=False, closed_months=closed)
     return CardMatching({ln.id: ln for ln in lines}, expense_pairs, sent_pairs,
                         received_pairs, months)
 
@@ -245,13 +253,19 @@ def summarize(storage: Storage, month: str, cache: dict | None = None) -> MonthS
         # версия) — движение между своими счетами, в расходы не входят.
         expenses = [e for e in storage.card_expenses(card.id) if e.kind == EXPENSE
                     and m.month_of(e.id, m.expense_line, e.op_date) == month]
-        has_lines = False
+        lines_complete = False
         found = storage.statement(card.id, month)
         if found:
-            has_lines = bool(found[1])
+            head, lines = found
+            # Строки считаем полными, если итога нет или он сходится с суммой строк.
+            # Экран «История» банка даёт итог месяца и только видимые строки:
+            # расход, которого среди них нет, ещё не значит «не та карта».
+            sum_out_lines = sum(ln.amount for ln in lines if ln.direction == "out")
+            lines_complete = bool(lines) and (head["total_out"] is None
+                                              or head["total_out"] == sum_out_lines)
         for e in expenses:
             cs.effective_dates[e.id] = m.date_of(e.id, m.expense_line, e.op_date)
-            unconfirmed = has_lines and e.id not in m.expense_line
+            unconfirmed = lines_complete and e.id not in m.expense_line
             if unconfirmed:
                 cs.missing.append(e)
             if e.purpose == BUSINESS:
@@ -287,12 +301,20 @@ def summarize(storage: Storage, month: str, cache: dict | None = None) -> MonthS
             # Строки, которые модель пометила как «свой перевод», но которые не
             # заняты ни записанным переводом, ни расходом, — тоже переводы.
             flagged = [ln for ln in lines if ln.own_transfer and ln.id not in used]
+            missing_sent = [t for t in sent if t.id not in m.sent_line]
+            missing_received = [t for t in received if t.id not in m.received_line]
+            # Записанный перевод, не найденный по дате (разрыв больше 3 дней), и
+            # помеченная строка той же суммы — это один перевод: не вычитаем дважды.
+            for t, direction in ([(t, "out") for t in missing_sent]
+                                 + [(t, "in") for t in missing_received]):
+                twin = next((ln for ln in flagged
+                             if ln.direction == direction and ln.amount == t.amount), None)
+                if twin is not None:
+                    flagged.remove(twin)
             cs.own_in += sum(ln.amount for ln in flagged if ln.direction == "in")
             cs.own_out += sum(ln.amount for ln in flagged if ln.direction == "out")
             if lines:
-                cs.missing_transfers = (
-                    [t for t in sent if t.id not in m.sent_line]
-                    + [t for t in received if t.id not in m.received_line])
+                cs.missing_transfers = missing_sent + missing_received
                 cs.unmatched_out = [ln for ln in lines if ln.direction == "out"
                                     and not ln.own_transfer and ln.id not in used]
         cards.append(cs)

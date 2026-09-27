@@ -520,7 +520,8 @@ class Storage:
         """Тот же перевод, присланный со второй стороны (списание и зачисление)."""
         for t in self.conn.execute(
             self._TRANSFER_SELECT + " WHERE t.amount = ?"
-            " AND abs(julianday(t.op_date) - julianday(?)) <= 1", (amount, op_date)
+            # ±3 дня, как при сверке: межбанковский перевод зачисляют и через выходные.
+            " AND abs(julianday(t.op_date) - julianday(?)) <= 3", (amount, op_date)
         ).fetchall():
             t = Transfer(**dict(t))
             merged_from = from_card_id or t.from_card_id
@@ -645,6 +646,12 @@ class Storage:
             "SELECT l.*, s.card_id, s.month FROM statement_lines l"
             " JOIN statements s ON s.id = l.statement_id WHERE l.id = ?", (line_id,)
         ).fetchone()
+
+    def mark_line_own_transfer(self, line_id: int):
+        """Строка выписки — перевод между своими счетами (не расход)."""
+        with self.conn:
+            self.conn.execute("UPDATE statement_lines SET own_transfer = 1, suggested_category = ''"
+                              " WHERE id = ?", (line_id,))
 
     def clear_suggestion(self, line_id: int):
         with self.conn:

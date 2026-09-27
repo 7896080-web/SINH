@@ -310,12 +310,17 @@ def svod_xlsx(period: Period, items: list[Item]) -> bytes:
     for cat in table:
         r = flt.max_row + 1
         flt.cell(r, 1, cat)
-        flt.cell(r, 2, f'=SUMIFS(Данные!$G$2:$G${last},Данные!$D$2:$D${last},A{r},'
-                       f'Данные!$A$2:$A${last},">="&$B$1,Данные!$A$2:$A${last},"<="&$B$2)')
+        # Точное сравнение названия статьи (SUMPRODUCT, а не SUMIFS): в SUMIFS
+        # «*» и «?» в названии сработали бы как шаблон, а «<», «>» в начале — как условие.
+        rng = lambda col: f"Данные!${col}$2:${col}${last}"
+        flt.cell(r, 2, f"=SUMPRODUCT(({rng('D')}=A{r})*({rng('A')}>=$B$1)"
+                       f"*({rng('A')}<=$B$2)*{rng('G')})")
         flt.cell(r, 2).number_format = money
     r = flt.max_row + 1
     flt.cell(r, 1, "Итого").font = bold
-    flt.cell(r, 2, f"=SUM(B6:B{r - 1})" if r > 6 else 0).number_format = money
+    rng = lambda col: f"Данные!${col}$2:${col}${last}"
+    flt.cell(r, 2, f"=SUMPRODUCT(({rng('A')}>=$B$1)*({rng('A')}<=$B$2)*{rng('G')})"
+             if r > 6 else 0).number_format = money
     flt.column_dimensions["A"].width = 34
     flt.column_dimensions["B"].width = 16
 

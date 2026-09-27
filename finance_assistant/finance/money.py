@@ -13,7 +13,7 @@ _SPACES = re.compile(r"[\s   '’]")
 
 
 def parse_amount(text: str) -> int:
-    """'1 234,50' / '1234.5' / '1.234,56' / '1,234.56' / '−110' -> копейки.
+    """'1 234,50' / '1234.5' / '1.234,56' / '1,234.56' / '12.500' / '−110' -> копейки.
 
     Бросает ValueError на мусоре, экспоненте и нереальных суммах.
     """
@@ -39,6 +39,12 @@ def parse_amount(text: str) -> int:
                 digits = "".join(parts)
             else:
                 raise ValueError(f"не похоже на сумму: {text!r}")
+        elif len(parts) == 2 and len(parts[1]) == 3 and 1 <= len(parts[0].lstrip("0")) <= 3:
+            # «12.500», «1,234» — разряды (у рублей копеек не бывает три знака).
+            digits = "".join(parts)
+        elif len(parts) == 2 and len(parts[1]) > 2 and parts[0].lstrip("0"):
+            # «1234.505» — ни разряды, ни копейки.
+            raise ValueError(f"не похоже на сумму: {text!r}")
         else:
             digits = digits.replace(",", ".")
     try:
