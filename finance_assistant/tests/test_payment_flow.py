@@ -76,8 +76,8 @@ def test_foreign_currency_asks_rubles(env):
     rec.payments.append(payment(currency="USD", amount="20"))
     [q] = flow.on_files(CHAT, [png()], "")
     assert "USD" in q.text
-    [again] = flow.on_text(CHAT, "двадцать")
-    assert "Не понял" in again.text
+    again, question = flow.on_text(CHAT, "двадцать")
+    assert "Не понял" in again.text and "USD" in question.text   # вопрос повторён
     flow.on_text(CHAT, "1 845,30")
     assert db.expenses("2026-09")[0].amount == 184530
 
@@ -107,8 +107,8 @@ def test_screenshots_queue_while_question_open(env):
     db, rec, flow = env
     rec.payments += [payment(card_last4="", bank=""), payment(amount="700", merchant="Ozon")]
     flow.on_files(CHAT, [png()], "")
-    [queued] = flow.on_files(CHAT, [png()], "")
-    assert "в очереди: 1" in queued.text
+    queued, current = flow.on_files(CHAT, [png()], "")
+    assert "в очереди: 1" in queued.text and "С какой карты" in current.text
     replies = answer(flow, f"d:card:{db.cards()[0].id}")
     assert [r.text.startswith("✅") for r in replies] == [True, True]
     assert sorted(e.amount for e in db.expenses("2026-09")) == [70000, 150000]
@@ -138,9 +138,13 @@ def test_edit_saved_expense(env):
     cat = db.category_id("Прочее")
     flow.on_button(CHAT, f"e:cat:{eid}:{cat}")
     assert db.expense(eid).category == "Прочее" and db.expense(eid).purpose == BUSINESS
-    flow.on_button(CHAT, f"e:del:{eid}")
+    [confirm] = flow.on_button(CHAT, f"e:del:{eid}")
+    assert buttons(confirm) == [f"e:delok:{eid}", f"e:keep:{eid}"] and db.expense(eid)
+    [back] = flow.on_button(CHAT, f"e:keep:{eid}")
+    assert back.text.startswith("✅") and db.expense(eid)
+    flow.on_button(CHAT, f"e:delok:{eid}")
     assert db.expense(eid) is None
-    [gone] = flow.on_button(CHAT, f"e:del:{eid}")
+    [gone] = flow.on_button(CHAT, f"e:delok:{eid}")
     assert "уже нет" in gone.text
 
 
@@ -154,9 +158,9 @@ def test_no_cards_yet(tmp_path):
     rec.payments.append(payment())
     [r] = flow.on_files(CHAT, [png()], "")
     assert "/addcard" in r.text
-    flow.on_command(CHAT, "addcard", "Сбер 1111 Сбер")
-    [saved] = answer(flow, "d:retry")
-    assert saved.text.startswith("✅")
+    added, saved = flow.on_command(CHAT, "addcard", "Сбер 1111 Сбер")
+    # Карту добавили — операция продолжается сама, «Продолжить» не нужно.
+    assert "Добавил карту" in added.text and saved.text.startswith("✅")
 
 
 def test_pdf_outside_sverka_is_not_a_payment(env):

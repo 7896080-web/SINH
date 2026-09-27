@@ -75,5 +75,5 @@ def test_huge_amount_in_dialog_does_not_crash(env):
     db, rec, flow = env
     rec.payments.append(payment(currency="USD"))
     flow.on_files(CHAT, [png()], "")
-    [r] = flow.on_text(CHAT, "1E30")
-    assert "Не понял сумму" in r.text
+    r, again = flow.on_text(CHAT, "1E30")
+    assert "Не понял сумму" in r.text and "Какая сумма" in again.text

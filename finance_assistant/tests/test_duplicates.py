@@ -39,7 +39,7 @@ def test_deleted_record_can_be_sent_again(env):
     shot = png()
     rec.payments += [payment(), payment()]
     flow.on_files(CHAT, [shot], "")
-    flow.on_button(CHAT, "e:del:1")
+    flow.on_button(CHAT, "e:delok:1")
     [r] = flow.on_files(CHAT, [shot], "")
     assert r.text.startswith("✅ Записано") and len(rec.calls) == 2
     assert len(db.expenses("2026-09")) == 1

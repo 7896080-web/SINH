@@ -217,8 +217,9 @@ def build_app(token: str, flow_for, allowed: set[int], env_file: str | None = No
         """
         chat = update.effective_chat
         user_id = update.effective_user.id
-        fn = getattr(resolve(user_id), method)
         async with locks.setdefault(user_id, asyncio.Lock()):
+            # Flow берём уже под замком: /reset в тестовом боте мог заменить его.
+            fn = getattr(resolve(user_id), method)
             if note:
                 await say(chat, note)
             typing = asyncio.create_task(keep_typing(chat))
@@ -377,7 +378,7 @@ def build_app(token: str, flow_for, allowed: set[int], env_file: str | None = No
         log.exception("Ошибка при обработке апдейта", exc_info=context.error)
         if isinstance(update, Update) and update.effective_chat:
             await say(update.effective_chat, 
-                "Что-то пошло не так, запись не сохранена. Попробуйте ещё раз; "
+                "Что-то пошло не так — действие не выполнено. Попробуйте ещё раз; "
                 "если ошибка повторяется — /cancel сбросит текущий вопрос.")
 
     # Только новые сообщения: отредактированное сообщение не должно

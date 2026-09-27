@@ -68,7 +68,9 @@ def test_add_card_and_category_by_buttons(env):
     assert buttons(cards) == ["m:addcard", "m:delpick"]
     [ask] = flow.on_button(CHAT, "m:addcard")
     assert "Сбер 1234" in ask.text
-    flow.on_text(CHAT, "ВТБ 4321 ВТБ")
+    [confirm] = flow.on_text(CHAT, "ВТБ 4321 ВТБ")
+    assert "Добавить карту: 💳 ВТБ · 4321 (ВТБ)?" == confirm.text
+    flow.on_button(CHAT, "m:yes")
     assert any(c.name == "ВТБ" and "4321" in c.numbers for c in db.cards())
     # Следующее сообщение — снова обычное (как расход), а не карта.
     assert "Пришлите скриншот" in flow.on_text(CHAT, "привет")[-1].text
@@ -77,6 +79,7 @@ def test_add_card_and_category_by_buttons(env):
     assert "m:addcat" in buttons(more)
     flow.on_button(CHAT, "m:addcat")
     flow.on_text(CHAT, "Реклама в Telegram")
+    flow.on_button(CHAT, "m:yes")
     assert "Реклама в Telegram" in [c["name"] for c in db.categories()]
 
 
@@ -123,7 +126,8 @@ def test_more_menu_buttons(env):
         if data in ("m:addcat",):
             continue
         assert flow.on_button(CHAT, data), data
-    assert flow.on_button(CHAT, "m:непонятно") == []          # старая/чужая кнопка — тишина
+    [stale] = flow.on_button(CHAT, "m:непонятно")          # старая/чужая кнопка — не тишина
+    assert "неактуальна" in stale.text and stale.menu
 
 
 def test_menu_button_works_while_question_pending(env):
