@@ -44,6 +44,18 @@ function Find-Python {
     return $null
 }
 
+function Set-FolderAccess {
+    # Доступ к папке — только у системы и администраторов: там токены и базы.
+    # SID вместо имён: на русской Windows группа называется «Администраторы».
+    # Права ставятся только на саму папку, вложенное их наследует. (Прежняя
+    # версия ставила их с /T на каждый файл и оставляла файлы без доступа
+    # вовсе — сначала возвращаем владельца и наследование, это исправляет.)
+    & icacls $App /setowner "*S-1-5-32-544" /T /C /Q 2>&1 | Out-Null
+    & icacls $App /reset /T /C /Q 2>&1 | Out-Null
+    & icacls $App /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" /C /Q 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Host "   предупреждение: не удалось ограничить доступ к $App" -ForegroundColor Yellow }
+}
+
 function Stop-Bot {
     Stop-ScheduledTask -TaskName $Task -ErrorAction SilentlyContinue
     # Процессы, запущенные заданием, при его остановке сами не завершаются.
@@ -74,6 +86,10 @@ Write-Host "   $Py"
 
 $Update = Test-Path (Join-Path $App "finance")
 $VPy = Join-Path $App "venv\Scripts\python.exe"
+if (Test-Path $App) {
+    Say "Проверяю права на $App"
+    Set-FolderAccess
+}
 
 if ($Update) {
     Say "Обновление: останавливаю бота"
@@ -130,10 +146,7 @@ Push-Location $App
 $rc = $LASTEXITCODE
 Pop-Location
 if ($rc -ne 0) { Fail "не удалось подготовить .env" }
-# Доступ к папке — только у системы и администраторов: там токены и базы.
-# SID вместо имён: на русской Windows группа называется «Администраторы».
-& icacls $App /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" /T /C /Q | Out-Null
-if ($LASTEXITCODE -ne 0) { Write-Host "   предупреждение: не удалось ограничить доступ к $App" -ForegroundColor Yellow }
+Set-FolderAccess
 
 Say "Задания Планировщика"
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
@@ -158,8 +171,12 @@ Start-ScheduledTask -TaskName $Task
 Start-Sleep -Seconds 5
 $state = (Get-ScheduledTask -TaskName $Task).State
 if ("$state" -ne "Running") {
+    $result = (Get-ScheduledTaskInfo -TaskName $Task).LastTaskResult
     Get-Content (Join-Path $App "logs\supervisor.log") -Tail 30 -ErrorAction SilentlyContinue
-    Fail "задание $Task не работает (состояние: $state) — выше журнал"
+    Push-Location $App
+    & $VPy -c "import finance.supervise; print('   запуск от администратора: код импортируется')"
+    Pop-Location
+    Fail ("задание $Task не работает (состояние: $state, код 0x{0:X8}) — пришлите этот вывод" -f $result)
 }
 Write-Host "   задание $Task работает; журналы: $App\logs"
 
