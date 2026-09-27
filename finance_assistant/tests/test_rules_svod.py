@@ -157,7 +157,7 @@ def test_svod_month_layout_and_excel(biz):
     assert data.max_row == 6 and "Operations" in data.tables
     flt = wb["Фильтр по датам"]
     assert flt["B1"].value.date() == date(2026, 9, 1)
-    assert flt["B6"].value.startswith("=SUMIFS(Данные!$G$2:$G$6,")
+    assert flt["B6"].value.startswith("=SUMPRODUCT((Данные!$D$2:$D$6=A6)")
 
     [year] = flow.on_command(CHAT, "svod", "2026")
     assert "💼 Всего: 29 199,00 ₽ (6 операций)" in year.text and "По месяцам:" in year.text

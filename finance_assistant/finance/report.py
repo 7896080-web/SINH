@@ -221,12 +221,15 @@ def _finish(wb) -> bytes:
     return buf.getvalue()
 
 
-def _expenses_sheet(wb, expenses: list[Expense]):
+def _expenses_sheet(wb, expenses: list[Expense], dates: dict[int, str] | None = None):
+    """dates — дата банка по выписке (как в /svod): запись, проведённую банком
+    1-го числа, показываем той датой, к месяцу которой она и отнесена."""
+    dates = dates or {}
     ops = wb.create_sheet("Бизнес-расходы")
     ops.append(["№", "Дата", "Сумма", "Карта", "Статья", "Получатель", "Что оплачено", "Чек"])
     _bold_row(ops, 1)
     for e in expenses:
-        ops.append([e.id, e.op_date, _num(e.amount), e.card, e.category or "", e.merchant,
+        ops.append([e.id, dates.get(e.id, e.op_date), _num(e.amount), e.card, e.category or "", e.merchant,
                     e.description, e.receipt_path])
     for col, width in zip("ABCDEFGH", (6, 12, 14, 18, 30, 26, 40, 30)):
         ops.column_dimensions[col].width = width
@@ -274,7 +277,8 @@ def month_xlsx(s: MonthSummary) -> bytes:
     ws.column_dimensions["A"].width = 34
     for col in "BCDEFGHI":
         ws.column_dimensions[col].width = 16
-    _expenses_sheet(wb, s.business_expenses)
+    _expenses_sheet(wb, s.business_expenses,
+                    {k: v for c in s.cards for k, v in c.effective_dates.items()})
     _missing_sheet(wb, [e for cs in s.cards for e in cs.missing])
     return _finish(wb)
 
@@ -309,6 +313,7 @@ def period_xlsx(summaries: list[MonthSummary]) -> bytes:
     _bold_row(cats, cats.max_row)
     cats.column_dimensions["A"].width = 34
 
-    _expenses_sheet(wb, [e for s in summaries for e in s.business_expenses])
+    _expenses_sheet(wb, [e for s in summaries for e in s.business_expenses],
+                    {k: v for s in summaries for c in s.cards for k, v in c.effective_dates.items()})
     _missing_sheet(wb, [e for s in summaries for cs in s.cards for e in cs.missing])
     return _finish(wb)

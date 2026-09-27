@@ -1386,6 +1386,8 @@ class Flow:
     def _sverka_button(self, chat_id, rest):
         what, _, value = rest.partition(":")
         state = self.db.get_state(chat_id)
+        if what in ("own", "pers", "keepbiz"):
+            return self._business_line_choice(what, value)
         if what == "m":
             return self._ask_card_for_statement(chat_id, value)
         if what == "c" and "sverka" in state:
@@ -1470,7 +1472,7 @@ class Flow:
             warn = f"\n⚠️ В документе карта …{last4}, а сверяем {card.label}. Проверьте."
 
         by_month: dict[str, list[dict]] = {}
-        skipped = 0
+        skipped = other_month = 0
         for op in data.get("operations", []):
             amount = _amount_or_none(op.get("amount", "").lstrip("-+"))
             op_date = _parse_date(op.get("date", ""), self.today())
@@ -1479,6 +1481,7 @@ class Flow:
                 continue
             if st["month"] and op_date[:7] != st["month"]:
                 skipped += 1  # операции соседнего месяца в выписку этого месяца не берём
+                other_month += 1
                 continue
             by_month.setdefault(op_date[:7], []).append({
                 "op_date": op_date, "op_time": _hhmm(op.get("time", "")), "amount": amount, "direction": op["direction"],
@@ -1490,6 +1493,13 @@ class Flow:
 
         total_in = _amount_or_none(data.get("total_in", ""))
         total_out = _amount_or_none(data.get("total_out", ""))
+        totals_note = ""
+        if other_month and (total_in is not None or total_out is not None):
+            # Документ захватывает и соседний месяц: его итоги — не итоги этого
+            # месяца. Считаем по строкам.
+            total_in = total_out = None
+            totals_note = ("\nИтоги документа не взял: в нём операции и другого месяца. "
+                           "Считаю по строкам этого месяца.")
         # Напечатанные итоги относим к месяцу, только если документ ровно за один месяц.
         totals_month = st["month"] or (next(iter(by_month)) if len(by_month) == 1 else None)
         if totals_month is None and (total_in is not None or total_out is not None) and not by_month:
@@ -1523,7 +1533,7 @@ class Flow:
             # Файл, из которого ничего не взяли (например, не тот месяц), не
             # запоминаем — его можно будет прислать для другого месяца.
             self.db.remember_files(list(keys), ref)
-        return [Reply("\n".join(msg) + warn + other_card)]
+        return [Reply("\n".join(msg) + totals_note + warn + other_card)]
 
     def _line_category(self, op: dict) -> str:
         """Статья для строки выписки: ваше правило для получателя важнее догадки модели."""
@@ -1663,20 +1673,52 @@ class Flow:
         self.db.set_state(chat_id, state)
         return self._advance(chat_id)
 
+    def _business_line_choice(self, what, value) -> list[Reply]:
+        row = self.db.statement_line(int(value)) if value.isdigit() else None
+        if not row:
+            return [Reply("Этой строки выписки уже нет.")]
+        card = self.db.card(row["card_id"])
+        if what == "keepbiz":
+            return [Reply("Хорошо, остаётся расходом бизнеса («Без статьи»). Разнести по "
+                          f"статье — /biz {row['id']}.")]
+        if what == "own":
+            self.db.mark_line_own_transfer(row["id"])
+            return [Reply(f"🔁 Отметил как перевод себе: {rub(row['amount'])}. Не расход — "
+                          "ни бизнеса, ни личный.")]
+        # Личное: запись «личное» по этой строке — она вычитается из бизнеса счёта.
+        expense_id = self.db.add_expense(
+            op_date=row["op_date"], amount=row["amount"], card_id=card.id, purpose=PERSONAL,
+            merchant=row["description"], description="по выписке")
+        return [Reply(f"👤 Записал как личное (№{expense_id}): {rub(row['amount'])}. "
+                      "Из бизнеса счёта исключено.")]
+
     def _notbiz(self, chat_id, arg):
         ids = [int(x) for x in arg.replace(",", " ").split() if x.isdigit()]
         if not ids:
             return [Reply("Укажите номера, которые не бизнес, например: /notbiz 12 15")]
         state = self.db.get_state(chat_id)
+        business_lines = []
         for line_id in ids:
             self.db.clear_suggestion(line_id)
+            row = self.db.statement_line(line_id)
+            if row and row["direction"] == "out" and self.db.card(row["card_id"]).is_business:
+                business_lines.append(row)
         left = [i for i in state.get("review", []) if i not in ids]
         state["review"] = left
         if not left:
             state.pop("review", None)
             state.pop("review_id", None)
         self.db.set_state(chat_id, state)
+        # С бизнес-счёта всё ушедшее — расход бизнеса, пока не сказано иное:
+        # просто «убрать из предложенных» его из бизнеса не исключит.
+        extra = [Reply(f"Бизнес-счёт: {date.fromisoformat(r['op_date']).strftime('%d.%m')} "
+                       f"{rub(r['amount'])} · {r['description'] or 'без описания'}\n"
+                       "Со счёта ИП всё ушедшее считается расходом бизнеса. Что это?",
+                       [[("🔁 Перевод себе", f"s:own:{r['id']}"),
+                         ("👤 Личное", f"s:pers:{r['id']}")],
+                        [("💼 Всё же бизнес", f"s:keepbiz:{r['id']}")]])
+                 for r in business_lines]
         if not left:
-            return [Reply("Убрал. Предложений больше не осталось.")]
+            return [Reply("Убрал. Предложений больше не осталось.")] + extra
         return [Reply(f"Убрал из предложенных: {len(ids)}. Осталось {len(left)}.",
-                      [[("✅ Записать оставшиеся как бизнес", f"s:acc:{state['review_id']}")]])]
+                      [[("✅ Записать оставшиеся как бизнес", f"s:acc:{state['review_id']}")]])] + extra
