@@ -181,6 +181,16 @@ def test_menu_shown_with_first_plain_reply_then_with_help():
     # У первого сообщения — свои кнопки; меню встаёт под первым без кнопок.
     assert isinstance(sent[0][1], InlineKeyboardMarkup)
     assert isinstance(sent[1][1], ReplyKeyboardMarkup)
+    # Если все ответы с кнопками — меню отдельной строкой (один раз).
+    app2 = build_app("123:ABC", SimpleNamespace(
+        on_text=lambda c, t: [Reply("Вопрос", [[("A", "x:1")]])]), {1})
+    upd2, sent2 = _update(1, "что-то")
+    asyncio.run(_handler(app2, "MessageHandler").callback(upd2, None))
+    assert isinstance(sent2[0][1], InlineKeyboardMarkup)
+    assert isinstance(sent2[1][1], ReplyKeyboardMarkup) and "меню" in sent2[1][0]
+    upd2, sent2 = _update(1, "ещё")
+    asyncio.run(_handler(app2, "MessageHandler").callback(upd2, None))
+    assert len(sent2) == 1
     upd, sent = _update(1, "ещё")
     asyncio.run(text.callback(upd, None))
     assert sent[1][1] is None                                 # второй раз не дублируем

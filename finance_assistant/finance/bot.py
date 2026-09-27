@@ -162,9 +162,13 @@ def build_app(token: str, flow_for, allowed: set[int], env_file: str | None = No
         user_id = update.effective_user.id
         if user_id not in menu_shown:
             plain = next((r for r in replies if not r.buttons), None)
-            if plain is not None:
-                plain.menu = True
-                menu_shown.add(user_id)
+            if plain is None:
+                # Все ответы с кнопками под сообщением — меню внизу показываем
+                # отдельной короткой строкой (одно сообщение не несёт и то и другое).
+                plain = Reply("Главное меню — кнопками внизу 👇")
+                replies = replies + [plain]
+            plain.menu = True
+            menu_shown.add(user_id)
         elif any(r.menu for r in replies):
             menu_shown.add(user_id)
         await send(update, replies, label, keyboard)

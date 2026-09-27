@@ -909,13 +909,27 @@ class Flow:
         card = self.db.card(d["card_id"])
         return f"Запомнил: …{number} — это карта «{card.name}». В следующий раз не спрошу."
 
-    def _transfer_reply(self, transfer_id: int) -> Reply:
+    def _transfer_reply(self, transfer_id: int, note: str = "") -> Reply:
         t = self.db.transfer(transfer_id)
-        text = (f"🔁 Перевод между своими счетами П{t.id}\n"
-                f"{rub(t.amount)} · {date.fromisoformat(t.op_date).strftime('%d.%m')} · {t.route}\n"
-                "Не расход: при сверке исключается из «пришло» и «ушло».")
+        text = (f"{note}\n" if note else "") + (
+            f"🔁 Перевод между своими счетами П{t.id} — записан\n"
+            f"{rub(t.amount)} · {date.fromisoformat(t.op_date).strftime('%d.%m')} · {t.route}\n"
+            "Не расход: при сверке исключается из «пришло» и «ушло».\n"
+            "Поправить — «Откуда» / «Куда». Всё верно — «Готово» (или просто "
+            "присылайте следующее: перевод уже сохранён).")
         return Reply(text, [[("Откуда", f"t:from:{t.id}"), ("Куда", f"t:to:{t.id}")],
-                            [("Удалить", f"t:del:{t.id}")]])
+                            [("✅ Готово", f"t:ok:{t.id}"), ("Удалить", f"t:del:{t.id}")]])
+
+    def _transfer_side_question(self, t, action: str, note: str = "") -> Reply:
+        """Выбор карты для стороны перевода; текущая отмечена галочкой."""
+        current = t.from_card_id if action == "from" else t.to_card_id
+        rows = [[(("✓ " if c.id == current else "") + c.label, f"t:{action}:{t.id}:{c.id}")]
+                for c in self.db.cards()]
+        rows.append([(("✓ " if current is None else "") + "Другой мой счёт (не веду в боте)",
+                      f"t:{action}:{t.id}:0")])
+        rows.append([("↩ Оставить как есть", f"t:keep:{t.id}")])
+        question = ("Откуда" if action == "from" else "Куда") + f" перевод П{t.id}?"
+        return Reply((f"{note}\n" if note else "") + question, rows)
 
     def _edit_transfer(self, chat_id, rest) -> list[Reply]:
         parts = rest.split(":")
@@ -926,19 +940,29 @@ class Flow:
         if action == "del":
             self._discard_receipt({"receipt": t.receipt_path})
             self.db.delete_transfer(transfer_id)
-            return [Reply(f"🗑 Перевод П{transfer_id} удалён.")]
+            return [Reply(f"🗑 Перевод П{transfer_id} удалён.", menu=True)]
+        if action == "ok":
+            return [Reply(f"✅ Перевод П{t.id} сохранён: {rub(t.amount)}, {t.route}.", menu=True)]
+        if action == "keep":
+            return [self._transfer_reply(transfer_id)]
+        if action not in ("from", "to"):
+            return []
         if len(parts) == 2:
-            rows = [[(c.label, f"t:{action}:{t.id}:{c.id}")] for c in self.db.cards()]
-            rows.append([("Другой мой счёт (не веду в боте)", f"t:{action}:{t.id}:0")])
-            return [Reply(("Откуда" if action == "from" else "Куда") + f" перевод П{t.id}?", rows)]
+            return [self._transfer_side_question(t, action)]
         value = int(parts[2]) or None
-        key, other = ("from_card_id", t.to_card_id) if action == "from" else ("to_card_id", t.from_card_id)
+        key, current, other = (("from_card_id", t.from_card_id, t.to_card_id) if action == "from"
+                               else ("to_card_id", t.to_card_id, t.from_card_id))
+        # Ошибка — снова тот же вопрос с кнопками, чтобы не остаться без выхода.
         if value is None and other is None:
-            return [Reply("Хотя бы одна сторона перевода должна быть вашей картой из списка.")]
+            return [self._transfer_side_question(
+                t, action, "Хотя бы одна сторона перевода должна быть вашей картой из списка.")]
         if value is not None and value == other:
-            return [Reply("Откуда и куда — одна и та же карта. Выберите другую.")]
+            return [self._transfer_side_question(
+                t, action, "Откуда и куда — одна и та же карта. Выберите другую.")]
+        if value == current:
+            return [self._transfer_reply(transfer_id, "Без изменений.")]
         self.db.update_transfer(transfer_id, **{key: value})
-        return [self._transfer_reply(transfer_id)]
+        return [self._transfer_reply(transfer_id, "Исправлено.")]
 
     def _offer_rule(self, merchant: str, category_id: int) -> list[Reply]:
         """После смены статьи — предложить поправить прошлые записи того же получателя."""
