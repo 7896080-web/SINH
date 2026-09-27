@@ -391,12 +391,12 @@ def test_the_divergence_finding_leads_to_a_page_that_exists(db):
                              sent_at=now_utc(), created_at=now_utc()))
     db.commit()
 
-    finding = report._check_platform_divergence(db)
+    finding = report._check_platform_holds_more(db)
     assert finding is not None
-    assert finding.link == "/report/rows/platform_divergence"
-    assert "platform_divergence" in report.FULL_LISTS
+    assert finding.link == "/report/rows/platform_holds_more"
+    assert "platform_holds_more" in report.FULL_LISTS
 
-    title, columns, rows_fn = report.FULL_LISTS["platform_divergence"]
+    title, columns, rows_fn = report.FULL_LISTS["platform_holds_more"]
     rows = rows_fn(db)
     assert len(rows) == 1
     assert len(rows[0]) == len(columns)

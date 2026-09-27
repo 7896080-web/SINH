@@ -75,7 +75,7 @@ def test_a_fresh_cabinet_with_a_fresh_catalog_is_quiet(db):
 def test_dispatch_errors_are_critical_and_name_the_consequence(db):
     """Самое дорогое расхождение: у нас списано, на площадку не уехало."""
     account = make_account(db)
-    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5, broadcast_enabled=True))
     db.add(DispatchQueueItem(uid_1c="u1", account_id=account.id, quantity=5,
                              reason="order", status=DispatchStatus.error,
                              last_error="429 после пяти попыток"))
@@ -95,14 +95,14 @@ def test_a_platform_holding_more_than_we_sent_is_critical(db):
     остатки. Направление решает срочность — БОЛЬШЕ нашего значит площадка
     продаёт то, чего нет."""
     account = make_account(db)
-    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5, broadcast_enabled=True))
     db.add(DispatchQueueItem(
         uid_1c="u1", account_id=account.id, quantity=5, sent_quantity=5,
         sent_sku="111", reason="order", status=DispatchStatus.sent,
         sent_at=now_utc(), verified_at=now_utc(), verified_quantity=12))
     db.commit()
 
-    finding = _by_key(collect_findings(db), "platform_divergence")
+    finding = _by_key(collect_findings(db), "platform_holds_more")
 
     assert finding is not None
     assert finding.level == CRITICAL
@@ -114,7 +114,7 @@ def test_a_platform_holding_less_than_we_sent_is_a_warning(db):
     """Ровно сегодняшний случай: отправили 68, площадка держит 0. Теряются
     продажи, но не деньги покупателя — значит не критично."""
     account = make_account(db)
-    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=68))
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=68, broadcast_enabled=True))
     db.add(DispatchQueueItem(
         uid_1c="u1", account_id=account.id, quantity=68, sent_quantity=68,
         sent_sku="2004896744404", reason="broadcast_toggled",
@@ -122,21 +122,21 @@ def test_a_platform_holding_less_than_we_sent_is_a_warning(db):
         verified_at=now_utc(), verified_quantity=0))
     db.commit()
 
-    assert _by_key(collect_findings(db), "platform_divergence").level == WARNING
+    assert _by_key(collect_findings(db), "platform_holds_less").level == WARNING
 
 
 def test_an_unverified_row_is_not_a_divergence(db):
     """Сверка не отработала (площадка молчит, sku она не знает, ещё не спрашивали)
     — это отсутствие проверки, а не расхождение."""
     account = make_account(db)
-    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5, broadcast_enabled=True))
     db.add(DispatchQueueItem(
         uid_1c="u1", account_id=account.id, quantity=5, sent_quantity=5,
         sent_sku="111", reason="order", status=DispatchStatus.sent,
         sent_at=now_utc(), verified_at=now_utc(), verified_quantity=None))
     db.commit()
 
-    assert "platform_divergence" not in _keys(collect_findings(db))
+    assert "platform_holds_less" not in _keys(collect_findings(db))
 
 
 def test_a_test_dispatch_error_is_not_a_discrepancy(db):
@@ -144,7 +144,7 @@ def test_a_test_dispatch_error_is_not_a_discrepancy(db):
     двигала — в отчёте ей делать нечего. Это та же граница `is_test`, что и
     везде, и нарушить её здесь значит звать человека разбирать собственный тест."""
     account = make_account(db)
-    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5, broadcast_enabled=True))
     db.add(DispatchQueueItem(uid_1c="u1", account_id=account.id, quantity=5,
                              reason="order", status=DispatchStatus.error, is_test=True))
     db.commit()
@@ -284,7 +284,7 @@ def test_a_stale_reconciliation_is_found(db):
 
 
 def test_negative_stock_is_reported(db):
-    db.add(Product(uid_1c="u1", article="46 NAVY", name="Товар", stock_on_hand=-9))
+    db.add(Product(uid_1c="u1", article="46 NAVY", name="Товар", stock_on_hand=-9, broadcast_enabled=True))
     db.commit()
 
     finding = _by_key(collect_findings(db), "negative_stock")
@@ -304,7 +304,7 @@ def test_a_task_waiting_for_a_human_is_not_also_counted_as_in_flight(db, monkeyp
     monkeypatch.setattr(ftp, "repost_enabled", lambda: False)   # тогда timeout идёт в разбор
 
     account = make_account(db)
-    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5, broadcast_enabled=True))
     db.add(Barcode(barcode="111", uid_1c="u1"))
     db.add(FtpTask(command="CREATE_MOVEMENT", barcode="111", quantity=2, order_id="o1",
                    account_id=account.id, status=FtpTaskStatus.timeout,
@@ -329,7 +329,7 @@ def test_a_broken_check_does_not_silence_the_rest(db, monkeypatch):
         raise RuntimeError("сломалась выборка")
 
     monkeypatch.setattr(report, "CHECKS", (boom, report._check_negative_stock))
-    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=-1))
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=-1, broadcast_enabled=True))
     db.commit()
 
     findings = report.collect_findings(db)
@@ -343,7 +343,7 @@ def test_a_broken_check_does_not_silence_the_rest(db, monkeypatch):
 
 def test_critical_findings_come_first(db):
     account = make_account(db, name="Кабинет")
-    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=-1))
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=-1, broadcast_enabled=True))
     db.add(DispatchQueueItem(uid_1c="u1", account_id=account.id, quantity=5,
                              reason="order", status=DispatchStatus.error))
     db.commit()
@@ -356,7 +356,7 @@ def test_critical_findings_come_first(db):
 
 def test_the_log_line_is_readable_without_opening_the_page(db):
     account = make_account(db)
-    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5, broadcast_enabled=True))
     db.add(DispatchQueueItem(uid_1c="u1", account_id=account.id, quantity=5,
                              reason="order", status=DispatchStatus.error))
     db.commit()
@@ -400,7 +400,7 @@ def test_the_report_page_shows_a_finding_with_its_consequence(logged_in_client, 
     account = PlatformAccount(platform=Platform.wb, name="ИП Яворская", warehouse_id="wh-1")
     web_db.add(account)
     web_db.commit()
-    web_db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    web_db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5, broadcast_enabled=True))
     web_db.add(DispatchQueueItem(uid_1c="u1", account_id=account.id, quantity=5,
                                  reason="order", status=DispatchStatus.error))
     # Кабинет отмечен: находка «рассылка не доехала» — про пару, на которую мы
@@ -476,7 +476,7 @@ def test_a_missing_card_is_not_called_a_broken_dispatch(db):
     нечего, оверселла не будет, чинить надо мэппинг. Написать про такую позицию
     «площадка продаёт то, чего нет» значит отправить человека чинить связь."""
     account = _kit_account(db)
-    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5, broadcast_enabled=True))
     db.add(DispatchQueueItem(
         uid_1c="u1", account_id=account.id, quantity=5, reason="manual_resend_all",
         status=DispatchStatus.error,
@@ -496,7 +496,7 @@ def test_an_error_covered_by_a_later_send_is_not_a_discrepancy(db):
     `error`. Считать их расхождением значит держать отчёт красным вечно, а
     вечно красный отчёт оператор пролистывает не читая."""
     account = _kit_account(db)
-    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5, broadcast_enabled=True))
     db.add(DispatchQueueItem(
         uid_1c="u1", account_id=account.id, quantity=5, reason="order",
         status=DispatchStatus.error, last_error="не отправлено за 5 попыток: 400",
@@ -514,7 +514,7 @@ def test_an_error_with_no_later_send_is_still_reported(db):
     """Перекрытие обязано быть ПОЗЖЕ отказа. Иначе достаточно одной старой
     удачной отправки, чтобы навсегда заглушить все будущие сбои по товару."""
     account = _kit_account(db)
-    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5, broadcast_enabled=True))
     db.add(DispatchQueueItem(
         uid_1c="u1", account_id=account.id, quantity=5, reason="manual_resend_all",
         status=DispatchStatus.sent, sent_at=now_utc() - timedelta(hours=5),
@@ -535,7 +535,7 @@ def test_a_send_to_another_cabinet_does_not_cover_the_error(db):
 
     kit = _kit_account(db)
     wb = make_account(db, Platform.wb, name="ИП ЯВОРСКАЯ", warehouse_id="wh-2")
-    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5, broadcast_enabled=True))
     db.add(DispatchQueueItem(
         uid_1c="u1", account_id=kit.id, quantity=5, reason="order",
         status=DispatchStatus.error, last_error="не отправлено за 5 попыток: 500",
@@ -559,7 +559,7 @@ def test_an_error_superseded_by_a_newer_error_is_not_reported_twice(db):
     чего нет», хотя свежая запись по той же паре говорит совсем другое —
     «карточки нет, разбирайте мэппинг»."""
     account = _kit_account(db)
-    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5, broadcast_enabled=True))
     db.add(DispatchQueueItem(
         uid_1c="u1", account_id=account.id, quantity=5, reason="order",
         status=DispatchStatus.error, last_error="не отправлено за 5 попыток: 400",
@@ -582,7 +582,7 @@ def test_the_newest_error_of_a_pair_is_always_reported(db):
     """Гашение не должно съедать пару целиком: последняя запись обязана
     остаться, иначе две записи одной секунды погасили бы друг друга."""
     account = _kit_account(db)
-    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5, broadcast_enabled=True))
     moment = now_utc() - timedelta(minutes=5)
     for _ in range(2):
         db.add(DispatchQueueItem(
@@ -608,7 +608,7 @@ def test_a_drop_explained_by_orders_is_not_a_divergence(db):
     from app.models import ProcessedOrder
 
     account = make_account(db)
-    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=39))
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=39, broadcast_enabled=True))
     db.add(DispatchQueueItem(
         uid_1c="u1", account_id=account.id, quantity=39, sent_quantity=39,
         sent_sku="2004896744503", reason="order", status=DispatchStatus.sent,
@@ -618,7 +618,7 @@ def test_a_drop_explained_by_orders_is_not_a_divergence(db):
                           quantity=1, processed_at=now_utc() - timedelta(minutes=20)))
     db.commit()
 
-    assert "platform_divergence" not in _keys(collect_findings(db))
+    assert "platform_holds_less" not in _keys(collect_findings(db))
 
 
 def test_a_drop_bigger_than_the_orders_is_still_a_divergence(db):
@@ -627,7 +627,7 @@ def test_a_drop_bigger_than_the_orders_is_still_a_divergence(db):
     from app.models import ProcessedOrder
 
     account = make_account(db)
-    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=39))
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=39, broadcast_enabled=True))
     db.add(DispatchQueueItem(
         uid_1c="u1", account_id=account.id, quantity=39, sent_quantity=39,
         sent_sku="111", reason="order", status=DispatchStatus.sent,
@@ -637,7 +637,7 @@ def test_a_drop_bigger_than_the_orders_is_still_a_divergence(db):
                           quantity=1, processed_at=now_utc() - timedelta(minutes=20)))
     db.commit()
 
-    assert "platform_divergence" in _keys(collect_findings(db))
+    assert "platform_holds_less" in _keys(collect_findings(db))
 
 
 def test_a_cancelled_order_does_not_explain_a_drop(db):
@@ -646,7 +646,7 @@ def test_a_cancelled_order_does_not_explain_a_drop(db):
     from app.models import OrderProcessStatus, ProcessedOrder
 
     account = make_account(db)
-    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=39))
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=39, broadcast_enabled=True))
     db.add(DispatchQueueItem(
         uid_1c="u1", account_id=account.id, quantity=39, sent_quantity=39,
         sent_sku="111", reason="order", status=DispatchStatus.sent,
@@ -657,7 +657,7 @@ def test_a_cancelled_order_does_not_explain_a_drop(db):
                           processed_at=now_utc() - timedelta(minutes=20)))
     db.commit()
 
-    assert "platform_divergence" in _keys(collect_findings(db))
+    assert "platform_holds_less" in _keys(collect_findings(db))
 
 
 def test_orders_on_another_cabinet_do_not_explain_a_drop(db):
@@ -667,7 +667,7 @@ def test_orders_on_another_cabinet_do_not_explain_a_drop(db):
 
     kit = make_account(db, Platform.kit, name="КИТ", warehouse_id="wh-2")
     wb = make_account(db, Platform.wb, name="ИП ЯВОРСКАЯ")
-    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=39))
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=39, broadcast_enabled=True))
     db.add(DispatchQueueItem(
         uid_1c="u1", account_id=wb.id, quantity=39, sent_quantity=39,
         sent_sku="111", reason="order", status=DispatchStatus.sent,
@@ -677,7 +677,7 @@ def test_orders_on_another_cabinet_do_not_explain_a_drop(db):
                           quantity=1, processed_at=now_utc() - timedelta(minutes=20)))
     db.commit()
 
-    assert "platform_divergence" in _keys(collect_findings(db))
+    assert "platform_holds_less" in _keys(collect_findings(db))
 
 
 # ------------------- застывшее расхождение: по паре уже ушло новое число
@@ -698,7 +698,7 @@ def test_a_divergence_superseded_by_a_newer_send_is_not_reported(db):
     """
     account = make_account(db)
     db.add(Product(uid_1c="u1", article="256250-030", name="Товар",
-                   stock_on_hand=59))
+                   stock_on_hand=59, broadcast_enabled=True))
     db.add(DispatchQueueItem(                       # старая: 60 против 59
         uid_1c="u1", account_id=account.id, quantity=60, sent_quantity=60,
         sent_sku="2000932309286", reason="order", status=DispatchStatus.sent,
@@ -711,7 +711,7 @@ def test_a_divergence_superseded_by_a_newer_send_is_not_reported(db):
         verified_at=now_utc(), verified_quantity=59))
     db.commit()
 
-    assert "platform_divergence" not in _keys(collect_findings(db))
+    assert "platform_holds_less" not in _keys(collect_findings(db))
 
 
 def test_the_newest_send_still_diverging_is_reported(db):
@@ -719,7 +719,7 @@ def test_the_newest_send_still_diverging_is_reported(db):
     расхождение, и глушить его нельзя — предыдущая удачная отправка по той же
     паре ничего о нынешней не говорит."""
     account = make_account(db)
-    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=59))
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=59, broadcast_enabled=True))
     db.add(DispatchQueueItem(
         uid_1c="u1", account_id=account.id, quantity=60, sent_quantity=60,
         sent_sku="111", reason="order", status=DispatchStatus.sent,
@@ -732,7 +732,7 @@ def test_the_newest_send_still_diverging_is_reported(db):
         verified_at=now_utc(), verified_quantity=99))
     db.commit()
 
-    finding = _by_key(collect_findings(db), "platform_divergence")
+    finding = _by_key(collect_findings(db), "platform_holds_more")
 
     assert finding is not None and finding.count == 1
     assert "отправили 59, площадка держит 99" in finding.details[0]
@@ -744,7 +744,7 @@ def test_a_newer_send_to_another_cabinet_does_not_silence_this_one(db):
     потерять оверселл на кабинете, которым давно не занимались."""
     wb = make_account(db, Platform.wb, name="ИП ЯВОРСКАЯ")
     kit = make_account(db, Platform.kit, name="КИТ", warehouse_id="wh-2")
-    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5, broadcast_enabled=True))
     db.add(DispatchQueueItem(
         uid_1c="u1", account_id=wb.id, quantity=5, sent_quantity=5,
         sent_sku="111", reason="order", status=DispatchStatus.sent,
@@ -757,7 +757,7 @@ def test_a_newer_send_to_another_cabinet_does_not_silence_this_one(db):
         verified_at=now_utc(), verified_quantity=5))
     db.commit()
 
-    finding = _by_key(collect_findings(db), "platform_divergence")
+    finding = _by_key(collect_findings(db), "platform_holds_more")
 
     assert finding is not None and finding.count == 1
     assert finding.level == CRITICAL           # площадка держит БОЛЬШЕ
@@ -772,7 +772,7 @@ def test_a_stale_reconciliation_difference_is_not_reported(db):
     отчёт жёлтым круглосуточно."""
     from app.models import ReconciliationClassification, ReconciliationLog
 
-    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5, broadcast_enabled=True))
     db.add(ReconciliationLog(
         uid_1c="u1", python_stock=-1, in_flight=0, expected_1c=-1, actual_1c=0,
         delta=1, classification=ReconciliationClassification.needs_review,
@@ -788,7 +788,7 @@ def test_a_fresh_large_difference_is_reported_even_if_applied(db):
     потеряла бы: свежие записи всегда применены."""
     from app.models import ReconciliationClassification, ReconciliationLog
 
-    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5, broadcast_enabled=True))
     db.add(ReconciliationLog(
         uid_1c="u1", python_stock=5, in_flight=0, expected_1c=5, actual_1c=17,
         delta=12, classification=ReconciliationClassification.needs_review,
@@ -807,7 +807,7 @@ def test_the_button_closes_only_old_reconciliation_rows(logged_in_client, web_db
     трогать нельзя: кнопка гасила бы сигнал вместо того, чтобы убрать архив."""
     from app.models import ReconciliationClassification, ReconciliationLog
 
-    web_db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    web_db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5, broadcast_enabled=True))
     old = ReconciliationLog(
         uid_1c="u1", python_stock=-1, in_flight=0, expected_1c=-1, actual_1c=0,
         delta=1, classification=ReconciliationClassification.needs_review,
@@ -834,7 +834,7 @@ def test_closing_old_rows_does_not_touch_stock(logged_in_client, web_db):
     значит отправить на площадки число, которого никто не считал."""
     from app.models import ReconciliationClassification, ReconciliationLog
 
-    web_db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    web_db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5, broadcast_enabled=True))
     web_db.add(ReconciliationLog(
         uid_1c="u1", python_stock=-1, in_flight=0, expected_1c=-1, actual_1c=0,
         delta=1, classification=ReconciliationClassification.needs_review,
@@ -851,7 +851,7 @@ def test_closing_old_rows_does_not_touch_stock(logged_in_client, web_db):
 def test_closing_old_rows_is_written_to_the_journal(logged_in_client, web_db):
     from app.models import AuditLog, ReconciliationClassification, ReconciliationLog
 
-    web_db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    web_db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5, broadcast_enabled=True))
     web_db.add(ReconciliationLog(
         uid_1c="u1", python_stock=-1, in_flight=0, expected_1c=-1, actual_1c=0,
         delta=1, classification=ReconciliationClassification.needs_review,
@@ -879,7 +879,7 @@ def test_a_missing_card_finding_names_the_article_and_the_cabinet(db):
     идёт с этим списком в кабинет площадки, они не говорят ничего."""
     account = _kit_account(db)
     db.add(Product(uid_1c="u1", article="TC26-2735", name="БлекВинил Куртка демисезон",
-                   stock_on_hand=5))
+                   stock_on_hand=5, broadcast_enabled=True))
     db.add(DispatchQueueItem(
         uid_1c="u1", account_id=account.id, quantity=5, reason="manual_resend_all",
         status=DispatchStatus.error,
@@ -905,7 +905,7 @@ def test_a_dispatch_error_finding_names_the_article_and_the_reason(db):
     адресе ручки, разобрать по ней было нечего."""
     account = _kit_account(db)
     db.add(Product(uid_1c="u1", article="D86321", name="Даунтлесс Куртка",
-                   stock_on_hand=5))
+                   stock_on_hand=5, broadcast_enabled=True))
     db.add(DispatchQueueItem(
         uid_1c="u1", account_id=account.id, quantity=5, reason="order",
         status=DispatchStatus.error,
@@ -938,7 +938,7 @@ def test_the_sent_key_is_shown_when_it_is_known(db):
     """Для WB sku — это то, чем ищут карточку в кабинете: без него по артикулу
     искать дольше."""
     account = make_account(db, Platform.wb, name="ИП ЯВОРСКАЯ")
-    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5, broadcast_enabled=True))
     db.add(DispatchQueueItem(
         uid_1c="u1", account_id=account.id, quantity=5, sent_sku="2000932279695",
         reason="order", status=DispatchStatus.error,
@@ -956,7 +956,7 @@ def test_the_reconciliation_finding_shows_what_diverged(db):
     Пара чисел «у нас было / в 1С стало» сразу показывает, куда уехал склад."""
     from app.models import ReconciliationClassification, ReconciliationLog
 
-    db.add(Product(uid_1c="u1", article="32481 (O)", name="МСЛ Рубашка К/р KAHVE",
+    db.add(Product(uid_1c="u1", article="32481 (O)", broadcast_enabled=True, name="МСЛ Рубашка К/р KAHVE",
                    stock_on_hand=5))
     db.add(ReconciliationLog(
         uid_1c="u1", python_stock=5, in_flight=0, expected_1c=5, actual_1c=17,
@@ -978,7 +978,7 @@ def test_the_diagnostics_counter_agrees_with_the_report(db):
     from app.report import current_dispatch_errors
 
     account = _kit_account(db)
-    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5, broadcast_enabled=True))
     db.add(DispatchQueueItem(
         uid_1c="u1", account_id=account.id, quantity=5, reason="order",
         status=DispatchStatus.error, last_error="старое, уже неактуальное",
@@ -991,3 +991,110 @@ def test_the_diagnostics_counter_agrees_with_the_report(db):
     assert current_dispatch_errors(db) == []
     assert current_dispatch_errors(db, account.id) == []
     assert "dispatch_errors" not in _keys(collect_findings(db))
+
+
+def test_a_mixed_set_is_not_described_by_one_consequence(db):
+    """27.09 на бою: восемь строк, у семи площадка держит МЕНЬШЕ, у одной больше.
+
+    Находка была одна, уровень и текст брались по наличию ХОТЬ ОДНОЙ строки
+    «больше» — и всем восьми обещалось «продаёт то, чего нет». Для семи это
+    прямая неправда: человек идёт искать оверселл там, где его нет, а найдя
+    вместо него недопродажу, перестаёт верить находке вовсе. Тот же класс, что
+    «зависшую отмену нельзя описывать словами создания».
+    """
+    account = make_account(db)
+    db.add(Product(uid_1c="u-меньше", article="A1", name="Товар", stock_on_hand=18, broadcast_enabled=True))
+    db.add(Product(uid_1c="u-больше", article="A2", name="Товар", stock_on_hand=0, broadcast_enabled=True))
+    db.add(DispatchQueueItem(
+        uid_1c="u-меньше", account_id=account.id, quantity=18, sent_quantity=18,
+        sent_sku="2000932159126", reason="order", status=DispatchStatus.sent,
+        sent_at=now_utc(), verified_at=now_utc(), verified_quantity=10))
+    db.add(DispatchQueueItem(
+        uid_1c="u-больше", account_id=account.id, quantity=0, sent_quantity=0,
+        sent_sku="2000932126845", reason="order", status=DispatchStatus.sent,
+        sent_at=now_utc(), verified_at=now_utc(), verified_quantity=2))
+    db.commit()
+
+    findings = collect_findings(db)
+    more = _by_key(findings, "platform_holds_more")
+    less = _by_key(findings, "platform_holds_less")
+
+    assert more is not None and less is not None, "обе стороны показаны порознь"
+    assert more.count == 1 and less.count == 1
+    assert more.level == CRITICAL and less.level == WARNING
+    # И каждая называет СВОИ строки: перепутай их, и человек пойдёт разбирать
+    # не тот баркод.
+    assert "2000932126845" in more.details[0]
+    assert "2000932159126" in less.details[0]
+    assert "продаёт то, чего нет" in more.consequence
+    assert "продаёт то, чего нет" not in less.consequence
+    assert "недопродаётся" in less.consequence
+
+
+def test_turning_off_broadcasting_closes_a_missing_card_error(db):
+    """Нетранслируемый товар: наружу по нему не пойдёт ничего, даже с галочкой.
+
+    Симметрия к снятой галочке, а не боевой случай: отмеченный кабинет сам по
+    себе ничего не отправляет, автоматические пути такой товар в очередь не
+    ставят вовсе — и отказ по нему висел бы вечно, не описывая ничего.
+    """
+    account = make_account(db)
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5,
+                   broadcast_enabled=False))
+    db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
+    db.add(DispatchQueueItem(
+        uid_1c="u1", account_id=account.id, quantity=5, reason="order",
+        status=DispatchStatus.error, card_missing=True,
+        last_error="площадка не знает такой ТОВАР", created_at=now_utc()))
+    db.commit()
+
+    assert "unknown_sku" not in _keys(collect_findings(db))
+
+
+def test_a_pair_we_actually_wrote_to_stays_a_divergence(db):
+    """Обратная половина: выключили трансляцию ПОСЛЕ того, как писали туда.
+
+    Отзыв (ноль) мог не доехать — тогда на площадке лежит наше число, и она
+    продаёт то, чего нет. Заглуши мы такую строку выключателем, оверселл стал
+    бы невидимым ровно в тот момент, когда человек думает, что всё закрыл.
+    """
+    account = make_account(db)
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5,
+                   broadcast_enabled=False))
+    db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True,
+                       last_nonzero_sent_at=now_utc() - timedelta(hours=2)))
+    db.add(DispatchQueueItem(
+        uid_1c="u1", account_id=account.id, quantity=5, reason="order",
+        status=DispatchStatus.error, last_error="связь оборвалась",
+        created_at=now_utc()))
+    db.commit()
+
+    assert "dispatch_errors" in _keys(collect_findings(db))
+
+
+def test_the_cabinet_counter_shows_what_the_report_shows(db):
+    """Счётчик «ошибок N» на «Диагностике» и находки отчёта — одна сущность.
+
+    20.09 их уже разводило: отчёт говорил «1 запись», счётчик — «751». Тогда
+    счётчику дали `latest_queue_ids`, а остальные отборы оставили в находках —
+    и 27.09 половинчатость вышла боком ровно так, как и должна была: оператор
+    снял галочку кабинета по девяноста товарам, которых на площадке нет,
+    находка отчёта замолчала, а счётчик кабинета показывал те же 91. Две
+    страницы, противоречащие друг другу, хуже одной неточной.
+
+    Состояние здесь — то самое: галочка СНЯТА, трансляция не тронута.
+    """
+    from app.report import current_dispatch_errors
+
+    account = make_account(db)
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=5,
+                   broadcast_enabled=True))
+    db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=False))
+    db.add(DispatchQueueItem(
+        uid_1c="u1", account_id=account.id, quantity=5, reason="order",
+        status=DispatchStatus.error, card_missing=True,
+        last_error="площадка не знает такой ТОВАР", created_at=now_utc()))
+    db.commit()
+
+    assert current_dispatch_errors(db) == []
+    assert current_dispatch_errors(db, account.id) == []
