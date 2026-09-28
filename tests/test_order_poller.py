@@ -31,8 +31,14 @@ class FakeClient:
         return []
 
 
-def _seed_product(db, uid="u1", stock=10, barcode="111", enabled_accounts=()):
-    db.add(Product(uid_1c=uid, article="A1", name="Товар", stock_on_hand=stock))
+def _seed_product(db, uid="u1", stock=10, barcode="111", enabled_accounts=(),
+                  broadcast=True):
+    # broadcast=True — товар, который УЖЕ транслируется: именно о таком все тесты
+    # рассылки ниже. С выключенной трансляцией в очередь не попадает ничего (см.
+    # `_enqueue_dispatch_to_others`), и это отдельно закреплено тестом
+    # `test_order_on_a_silent_product_queues_nothing`.
+    db.add(Product(uid_1c=uid, article="A1", name="Товар", stock_on_hand=stock,
+                   broadcast_enabled=broadcast))
     db.add(Barcode(barcode=barcode, uid_1c=uid))
     for account in enabled_accounts:
         db.add(SyncSetting(uid_1c=uid, account_id=account.id, enabled=True))
@@ -176,7 +182,23 @@ def test_cancellation_reverses_stock(db):
     assert cancel_task is not None
 
 
-def test_partial_refund_returns_only_refused_quantity(db):
+def test_partial_refund_is_refused_rather_than_half_done(db):
+    """Частичный отказ НЕ проводится — и это безопаснее, чем провести его наполовину.
+
+    Раньше мы возвращали себе только отказанное количество, а в 1С уходило
+    `CANCEL_MOVEMENT|order_id|площадка` — количества в этой команде нет ни поля, и
+    `ОтменитьПеремещенияЗаказа` реверсит исходный документ ЦЕЛИКОМ. Заказ на 5,
+    отказ от 2: у нас +2, в 1С +5. Расхождение в три единицы часовая сверка
+    втянет в остаток как приход, и мы начнём продавать отгруженное. Второй
+    частичный отказ по тому же заказу вдобавок отбрасывался как дубль — остаток
+    не возвращался вовсе, а площадка приносила эту отмену каждые две минуты все
+    тридцать дней окна.
+
+    Сегодня путь спящий: `is_partial_refund` не выставляет ни один клиент.
+    Поэтому дверь заперта явно — чтобы появившийся завтра частичный отказ не
+    поехал по сломанной дороге молча. Открывать её надо вместе с протоколом 1С
+    (количество в команде отмены и реверс на указанное число).
+    """
     account = make_account(db, platform=Platform.kit, name="Kit")
     _seed_product(db, stock=10, enabled_accounts=[account])
 
@@ -194,9 +216,14 @@ def test_partial_refund_returns_only_refused_quantity(db):
     ]
     stats = poll_cancellations(db, client, account)
 
-    assert stats["partial"] == 1
+    # Считаем и называем: непроведённая отмена не должна пропадать молча.
+    assert stats["unsupported"] == 1
+    assert stats["problems"], "непроведённый отказ не попал в проблемы"
+
     db.refresh(product)
-    assert product.stock_on_hand == 7  # вернулось только 2, не все 5
+    assert product.stock_on_hand == 5, "остаток тронут при непроведённом отказе"
+    assert db.query(FtpTask).filter(FtpTask.command == "CANCEL_MOVEMENT").count() == 0, (
+        "в 1С ушла отмена, которая отменит документ целиком")
 
     po = db.query(ProcessedOrder).filter(ProcessedOrder.order_id == "o1").first()
     assert po.status == OrderProcessStatus.processed
@@ -292,3 +319,94 @@ def test_new_order_can_drive_stock_negative(db):
         PlatformOrder(order_id="o1", barcode="111", quantity=3, raw_status="new"),
     ]), account, "WB.Ожидает")
     assert db.query(Product).filter(Product.uid_1c == "u1").first().stock_on_hand == -2  # 1 - 3
+
+
+# --------------------------------------------- до включения трансляции — тишина
+
+def test_order_on_a_silent_product_queues_nothing(db):
+    """Товар ещё не транслируется: идёт расчёт, оператор трансляцию не включал.
+
+    Заказ обработать надо — списать остаток, создать перемещение в 1С, — но на
+    площадки в этот момент не должно уйти НИЧЕГО. Раньше уходило: запись всё
+    равно попадала в очередь, рассылка считала по выключенному товару ноль и
+    отправляла его. Для карточки, по которой идут продажи, это обнуление, а не
+    отзыв остатка: мы туда ни разу ничего не отправляли.
+
+    Особенно это било по актуализации задним числом — там заказы проводятся
+    именно до включения трансляции, и каждый проведённый заказ слал ноль.
+    """
+    source = make_account(db, Platform.wb, name="Источник")
+    other = make_account(db, Platform.ozon, name="Другой")
+    _seed_product(db, enabled_accounts=(source, other), broadcast=False)
+
+    client = FakeClient(new_orders=[
+        PlatformOrder(order_id="o1", barcode="111", quantity=3, raw_status="new"),
+    ])
+    poll_new_orders(db, client, source, warehouse_pending="WB.Ожидает")
+
+    assert db.query(DispatchQueueItem).count() == 0
+    # при этом сам заказ обработан: остаток списан
+    assert db.query(Product).filter(Product.uid_1c == "u1").first().stock_on_hand == 7
+
+
+# ------------------------------------- окно открытых заказов ограничено по возрасту
+
+def test_open_orders_older_than_the_window_are_not_asked_about(db):
+    """Заказы WB и Ozon не закрываются никогда — детекта подтверждения у этих
+    площадок нет, и `processed` остаётся навсегда. Без окна список открытых рос
+    бы со скоростью продаж, а его идентификаторы каждые две минуты уходят в
+    запрос отмен: рано или поздно он упёрся бы в предел площадки, и отмены
+    перестали бы отслеживаться сразу по всему кабинету."""
+    from datetime import timedelta
+
+    from app.timeutils import now_utc
+    from app.workers.order_poller import OPEN_ORDER_WINDOW_DAYS, _real_open_orders
+
+    account = make_account(db, warehouse_id="wh-1")
+    db.add_all([
+        ProcessedOrder(order_id="fresh", account_id=account.id, uid_1c="u1",
+                       quantity=1, status=OrderProcessStatus.processed,
+                       processed_at=now_utc() - timedelta(days=1)),
+        ProcessedOrder(order_id="stale", account_id=account.id, uid_1c="u1",
+                       quantity=1, status=OrderProcessStatus.processed,
+                       processed_at=now_utc() - timedelta(
+                           days=OPEN_ORDER_WINDOW_DAYS + 1)),
+    ])
+    db.commit()
+
+    assert [o.order_id for o in _real_open_orders(db, account)] == ["fresh"]
+
+
+def test_a_backfilled_old_order_is_still_inside_the_window(db):
+    """Окно считается от МОМЕНТА ПРИЁМА заказа у нас, а не от даты заказа на
+    площадке. Это принципиально для старта задним числом: расчёт с базовой датой
+    за 90 дней проводит заказы столетней давности, но `ProcessedOrder` заводится
+    сейчас (`processed_at` = default `now_utc`), и отмены по ним отслеживаются
+    ещё 30 дней. Если когда-нибудь `processed_at` начнут заполнять датой заказа
+    (`order_date`), весь бэкфилл окажется ЗА окном в момент создания — отмены по
+    нему перестанут видеть вовсе. Этот тест такую правку уронит."""
+    from datetime import date, timedelta
+
+    from app.timeutils import now_utc
+    from app.workers.order_poller import (OPEN_ORDER_WINDOW_DAYS, _real_open_orders,
+                                          process_new_order)
+
+    account = make_account(db, name="Кабинет")
+    _seed_product(db, stock=10, enabled_accounts=[account])
+
+    старый = date.today() - timedelta(days=90)
+    process_new_order(db, PlatformOrder(order_id="old-1", barcode="111", quantity=1,
+                                        raw_status="new", order_date=старый),
+                      account, "WB.Ожидает", order_date=старый)
+    db.commit()
+
+    запись = db.query(ProcessedOrder).filter(ProcessedOrder.order_id == "old-1").first()
+    assert (now_utc() - запись.processed_at) < timedelta(days=1)   # принят СЕЙЧАС
+    assert [o.order_id for o in _real_open_orders(db, account)] == ["old-1"]
+
+    # А документ в 1С при этом датирован реальной датой заказа — это разные вещи
+    # и путать их нельзя.
+    задание = db.query(FtpTask).filter(FtpTask.order_id == "old-1").first()
+    assert задание.movement_date == старый
+
+    assert OPEN_ORDER_WINDOW_DAYS == 30

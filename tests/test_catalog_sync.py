@@ -52,7 +52,13 @@ def test_load_platform_catalog_registers_conflict_for_unknown_barcode(db):
     conflict = db.query(MappingConflict).filter(MappingConflict.barcode == "999").first()
     assert conflict is not None
     assert conflict.account_id == account.id
-    assert conflict.attempts == 1
+    # НОЛЬ, а не единица: `attempts` считает, сколько заказов по этому баркоду
+    # не удалось разнести, и здесь их не было ни одного — строку завела выгрузка
+    # каталога, чтобы конфликт стало видно ДО первого заказа. Единица была
+    # прямой неправдой: отчёт складывает `attempts`, печатает сумму как «заказов
+    # по ним N» и обещает «остаток завышен ровно на эти продажи». Счётчик
+    # поднимет `resolve_barcode`, когда заказ действительно придёт.
+    assert conflict.attempts == 0
 
 
 def test_load_platform_catalog_updates_existing_conflict_not_duplicates(db):

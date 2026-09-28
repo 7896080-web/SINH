@@ -6,6 +6,15 @@
   .pr-table th,.pr-table td{border-bottom:1px solid #eef0f4;padding:6px 8px;vertical-align:top}
   .pr-table th{text-align:left;font-size:12px;color:#556;white-space:nowrap}
   .pr-num{text-align:right}
+  /* Галочка и артикул не уезжают при горизонтальной прокрутке: колонок вместе с
+     кабинетами больше десятка, и без якоря слева непонятно, к какому товару
+     относится строка, до которой доскроллил. Разделитель рисуем тенью, а не
+     границей: при border-collapse граница у прилипшей ячейки не отрисовывается. */
+  .pr-table th:nth-child(-n+2), .pr-table td:nth-child(-n+2){
+      position:sticky; background:#fff; box-shadow:1px 0 0 #eef0f4}
+  .pr-table th:nth-child(1), .pr-table td:nth-child(1){left:0; z-index:1}
+  .pr-table th:nth-child(2), .pr-table td:nth-child(2){left:34px; z-index:1}
+  .pr-table thead th:nth-child(-n+2){z-index:3}
   .pr-input{width:68px;padding:3px 5px;font-size:12px;text-align:right}
   .pr-input--tiny{width:46px}
   .pr-date{padding:3px 5px;font-size:12px}
@@ -13,9 +22,13 @@
   .pr-hint--warn{color:#9a1c1c}
         .pr-error{color:#b3261e;background:#fdecea;border:1px solid #f3b8b2;border-radius:4px;padding:2px 6px;margin-top:4px;font-size:12px;line-height:1.35}
   .pr-hint--good{color:#16794a;font-weight:600}
+  .pr-hint--pending{color:#2f5d9f}
   .pr-mini{font-size:11px;padding:1px 6px}
-  .pr-calc summary{font-size:11px;color:#567;cursor:pointer;margin-top:2px}
-  .pr-calc label{display:block;font-size:11px;color:#556;margin-top:3px}
+  .pr-calcbox{min-width:190px}
+  .pr-calcrow{display:flex;align-items:center;gap:6px;margin-bottom:3px}
+  .pr-calcrow label{font-size:11px;color:#556;min-width:66px}
+  .pr-ro{font-size:12px;color:#334;background:#f2f4f7;border-radius:4px;padding:2px 7px}
+  .pr-calcres{border-top:1px dashed #dfe3ea;margin-top:4px;padding-top:4px;font-size:12px}
   .pr-on{background:#16794a;color:#fff}
   .pr-off{background:#9a1c1c;color:#fff}
   .pr-flag{background:#fde68a;border:none;border-radius:4px;cursor:pointer}
@@ -25,12 +38,36 @@
   .pr-cab:last-child{border-bottom:none}
   .pr-cab__name{font-size:12px;min-width:104px;color:#334}
   .pr-cab .pr-hint{margin-top:0}
+  .pr-thr{font-size:11px;border-radius:999px;padding:1px 7px;white-space:nowrap}
+  .pr-thr--live{background:#fbf1de;color:#8a5a08}
+  .pr-thr--idle{background:#eef0f4;color:#667}
+  .pr-thr .pr-mini{margin-left:4px}
   .pr-masters{display:flex;flex-wrap:wrap;gap:10px;margin:8px 0 14px}
   .pr-masters form{display:flex;align-items:center;gap:6px;border:1px solid #dfe3ea;border-radius:8px;padding:6px 10px;background:#fafbfc}
-  .pr-bulk{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:10px 0;padding:8px 10px;border:1px dashed #c7cdd6;border-radius:8px;background:#fbfcfe}
+  .pr-bulk{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin:10px 0;padding:8px 10px;border:1px dashed #c7cdd6;border-radius:8px;background:#fbfcfe}
   .pr-bulk input{width:auto}
+  /* Рамка у группы обязательна, и это не украшение. Поле и кнопки, которые его
+     применяют, стояли в общем ряду с тем же зазором, что и всё остальное, —
+     и «число» читалось как самостоятельное поле неизвестно для чего. 21.09
+     оператор ровно так и спросил: «за ним пустое поле, зачем оно». Рамка
+     отвечает на это без единого слова: внутри неё — одно действие. */
+  .pr-group{display:inline-flex;align-items:center;gap:6px;flex-wrap:nowrap;
+            padding:4px 8px;border:1px solid #dfe4ec;border-radius:8px;background:#fff}
+  .pr-group__label{font-size:12px;color:#556;white-space:nowrap}
+  .pr-count{font-size:12px;padding:1px 8px;border-radius:999px;background:#eef0f4;color:#667;white-space:nowrap}
+  .pr-count--on{background:#e8eef7;color:#2f5d9f;font-weight:600}
   .pr-ladder{font-size:13px;line-height:1.7;margin:6px 0 0}
   .pr-ladder li{margin-bottom:2px}
+  .pr-status{display:inline-block;font-size:11px;padding:1px 7px;border-radius:999px;margin-bottom:4px;white-space:nowrap;max-width:100%}
+  .pr-th-narrow{white-space:nowrap}
+  .pr-status--no_cabinet{background:#f8e9e9;color:#a83636}
+  .pr-status--none{background:#eef0f4;color:#667}
+  .pr-status--waiting{background:#fbf1de;color:#b5750f}
+  .pr-status--need_recalc_account{background:#f8e9e9;color:#a83636}
+  .pr-status--need_fact{background:#fbf1de;color:#b5750f}
+  .pr-status--need_recalc{background:#e8eef7;color:#2f5d9f}
+  .pr-status--ready{background:#e7f3ec;color:#2f7d4f;font-weight:600}
+  .pr-allfilter{margin:8px 0 0;padding:8px 10px;border:1px solid #f0d9a8;background:#fdf6e6;border-radius:6px;font-size:13px}
 </style>
 
 <div class="page-header">
@@ -41,7 +78,24 @@
         рядом написана причина.</p>
     </div>
     <div class="toolbar">
-        <a href="/products/export?q={{ q }}&only_proposals={{ only_proposals|lower }}&only_blocked={{ only_blocked|lower }}&hide_size_u={{ hide_size_u|lower }}" class="btn">Экспорт в Excel</a>
+        {# Кнопка ЧУЖОЙ формы, и форма эта — МАССОВОЙ ПРАВКИ, а не фильтров.
+           Отметки строк живут в браузере, и форма фильтров о них не знает вовсе:
+           оператор отмечал одну строку, жал экспорт и получал весь отбор — файл
+           на тысячи строк вместо одной, и понять по нему, что отметка потерялась,
+           было нечем. Форма массовой правки уже умеет всё нужное: несёт фильтры
+           скрытыми полями из фрагмента таблицы, дописывает невидимые отметки
+           перед отправкой и знает про «весь отбор». Правило то же, что у кнопок
+           рядом с ней, — оператор его уже знает.
+
+           `name="action"` здесь БЫТЬ НЕ ДОЛЖНО: по нему JS спрашивает
+           подтверждение массовой правки, а выгрузка ничего не меняет, и лишний
+           вопрос на безопасном действии приучает жать «Да» не читая. #}
+        <button type="submit" id="pr-export" form="bulk-form"
+                formaction="/products/export" formmethod="post"
+                class="btn"
+                title="Отмечены строки — уедут только они; ничего не отмечено или включён «весь отбор» — уедет всё, что подходит под фильтры">
+            Экспорт в Excel
+        </button>
         <form method="post" action="/products/import" enctype="multipart/form-data" style="display:inline;">
             <label class="btn file-upload-btn">
                 Импорт из Excel
@@ -61,8 +115,45 @@
         <li>Иначе → <b>остаток ЦС − резерв</b>, и если результат не больше <b>порога кабинета</b>, уходит 0.</li>
     </ol>
     <p class="help-text">Порог трансляции — это постоянное расхождение между учётом 1С и реальным складом.
-    Считается один раз по пересчёту: учёт 1С на дату минус реально найденное количество. Кнопка «посчитать» в колонке порога сделает вычитание сама.</p>
+    Он не вводится руками, а выводится из трёх чисел на выбранную дату:
+    <b>порог = остаток ЦС на дату − (факт на дату − бронь)</b>. Остаток ЦС на дату приходит
+    из 1С (ответ идёт до десяти минут — до него строка пишет «ждём выгрузку»), факт вводит
+    оператор, бронь — сколько держим у себя. Дальше на площадки всегда уходит
+    <b>остаток ЦС сейчас − порог</b>: заказы, приходы, списания и пересортица двигают остаток,
+    а порог стоит на месте.</p>
 </details>
+
+<details class="card" style="padding:10px 14px;">
+    <summary><b>Настройка пачкой через Excel: что заполнять в файле</b></summary>
+    <ol class="pr-ladder">
+        <li><b>Дата расчёта</b> — ГГГГ-ММ-ДД, не из будущего. Выгрузку 1С на эту дату
+            файл закажет сам, отдельно ходить не надо.</li>
+        <li><b>Факт на дату</b> — сколько лежало на складе на самом деле. Смена даты
+            стирает прежний факт: он всегда «факт НА ДАТУ».</li>
+        <li><b>Резерв</b> — сколько держим у себя.</li>
+        <li><b>&lt;Кабинет&gt; — Синхронизировать</b> = Да у тех кабинетов, куда товар пойдёт.
+            Без единого отмеченного кабинета расчёту неоткуда брать заказы.</li>
+        <li><b>Трансляция</b> = Да. Сразу она не включится — сначала расчёт; строка
+            встаёт в ожидание и включается сама, когда он закончится.</li>
+    </ol>
+    <p class="help-text"><b>Пустая ячейка ничего не меняет.</b> Стёртая «Трансляция»
+    или «Синхронизировать» не выключает строку, пустой «Факт на дату» не стирает факт,
+    пустая «Дата расчёта» не снимает расчёт. Иначе один стёртый столбец отозвал бы
+    остаток — то есть отправил ноль на живые карточки — сразу по всему файлу. Чтобы
+    снять значение, впишите <b>«-»</b>: это отдельное слово, и случайно оно не появится.</p>
+    <p class="help-text"><b>«Порог трансляции» в файле не правят</b> — у товара с датой расчёта он
+    выводится из даты, факта и брони, и изменённое значение уедет в ошибки импорта.
+    Менять порог надо через «Факт на дату». Колонки «Остаток ЦС на дату» и «Уходит на
+    площадки» импорт не читает вовсе — это ответ 1С и итог расчёта.</p>
+    <p class="help-text">После загрузки файл сам ставит <b>расчёт</b> по тем строкам,
+    которым он нужен: подъём заказов площадок с указанной даты и перемещения в 1С.
+    Идёт он минутами, прогресс виден на этой странице. Когда он закончится и остаток
+    сойдётся с продажами, трансляция у отмеченных строк включится без второго захода.
+    Расчёт, закончившийся проблемами, не включает ничего — просьба останется висеть
+    до следующего.</p>
+</details>
+
+{% if recalc_job %}{% include "products_recalc.html" %}{% endif %}
 
 <h3>Рассылка по площадкам (пауза)</h3>
 <div class="pr-masters">
@@ -86,13 +177,19 @@
   </form>
 </div>
 
-<form class="filters"
+<form class="filters" id="pr-filters"
       hx-get="/products/rows" hx-target="#pr-table"
       hx-trigger="keyup changed delay:400ms from:input, change from:input[type=checkbox]"
       hx-include="this">
     <div class="field">
         <label for="q">Поиск</label>
-        <input type="search" id="q" name="q" value="{{ q }}" placeholder="артикул, наименование">
+        {# Enter в поиске НЕ должен ничего отправлять. К форме привязана кнопка
+           экспорта, а она единственная submit-кнопка — значит нажатие Enter
+           браузер трактовал как её нажатие, и при вводе артикула сам собой
+           скачивался файл выгрузки. Поиск и так живой (htmx по keyup), Enter в
+           нём не нужен вовсе. #}
+        <input type="search" id="q" name="q" value="{{ q }}" placeholder="артикул, наименование, штрихкод"
+               onkeydown="if (event.key === 'Enter') event.preventDefault();">
     </div>
     <label class="checkbox-inline" style="padding-bottom:8px;">
         <input type="checkbox" name="only_proposals" value="true" {% if only_proposals %}checked{% endif %}>
@@ -107,22 +204,437 @@
         <input type="checkbox" name="hide_size_u" value="true" {% if hide_size_u %}checked{% endif %}>
         Скрыть размер U
     </label>
+    <label class="filter-check" title="Прячет строки, по которым на ЦС сейчас ноль. Отрицательный остаток (пересортица) остаётся видимым — это как раз то, что надо разбирать.">
+        <input type="checkbox" name="hide_zero_stock" value="true" {% if hide_zero_stock %}checked{% endif %}>
+        Скрыть с нулевым остатком
+    </label>
+    <label class="checkbox-inline" style="padding-bottom:8px;"
+           title="Дата расчёта задана, но 1С ещё не ответила либо факт не введён.">
+        <input type="checkbox" name="only_unfinished" value="true" {% if only_unfinished %}checked{% endif %}>
+        Только незавершённый расчёт
+    </label>
+    {# Фильтр отметок — КЛИЕНТСКИЙ, и иначе быть не может: галочки строк живут
+       в браузере, сервер о них не знает вовсе. Поэтому он не уходит в запрос,
+       а прячет неотмеченные строки прямо на странице. #}
+    <label class="checkbox-inline" style="padding-bottom:8px;"
+           title="Прячет строки без галочки. Отметки живут в браузере, поэтому фильтр работает по загруженным строкам: если вы отмечали «все по фильтру», показаны будут только те из них, что есть на странице.">
+        <input type="checkbox" id="only-selected">
+        Только отмеченные товары
+    </label>
+    <label class="checkbox-inline" style="padding-bottom:8px;"
+           title="Трансляция включена у самого товара — его остаток уходит наружу прямо сейчас. Это не то же, что отмеченный кабинет: галочка кабинета говорит, КУДА передавать, а трансляция — передаём ли вообще. Выключенная перекрывает любые галочки.">
+        <input type="checkbox" name="only_broadcasting" value="true" {% if only_broadcasting %}checked{% endif %}>
+        Только с включённой трансляцией
+    </label>
+    <label class="checkbox-inline" style="padding-bottom:8px;"
+           title="Трансляция выключена — остаток наружу не уходит, сколько бы кабинетов ни было отмечено. Сюда же попадают строки, попросившие включения из файла: пока расчёт не закончен, они тоже молчат.">
+        <input type="checkbox" name="only_silent" value="true" {% if only_silent %}checked{% endif %}>
+        Только с выключенной трансляцией
+    </label>
+    <label class="checkbox-inline" style="padding-bottom:8px;"
+           title="Отмечен хотя бы один кабинет — то есть по этому товару уже принято решение передавать его наружу. Кабинет при этом не обязан быть активным: галочку ставил человек, и выключение кабинета его решения не отменяет.">
+        <input type="checkbox" name="only_marked" value="true" {% if only_marked %}checked{% endif %}>
+        Только отмеченные кабинеты
+    </label>
+    <label class="checkbox-inline" style="padding-bottom:8px;"
+           title="Баркод товара нашёлся в каталоге хотя бы одного кабинета — значит карточка на площадке есть и подключать товар есть куда. Кабинет при этом не обязан быть активным: каталог остаётся и от выключенного, а товар на площадке от этого никуда не делся.">
+        <input type="checkbox" name="only_on_platform" value="true" {% if only_on_platform %}checked{% endif %}>
+        Только найденные на площадке
+    </label>
 </form>
 
+{# Фильтры для этой формы приходят из фрагмента таблицы (products_rows.html):
+   он перерисовывается при каждом изменении отбора, а шапка страницы — нет. #}
+{# Панель разбита на группы, и каждая группа не переносится внутри себя.
+   Раньше кнопки шли сплошным потоком: при переносе строки поле даты осталось в
+   конце первого ряда, рядом с «Трансляция выкл», а «Дата расчёта =» уехала на
+   второй — и поле читалось как чужое. Теперь ввод стоит вместе с кнопками,
+   которые его забирают, и разъехаться они не могут. #}
 <form id="bulk-form" method="post" action="/products/bulk" class="pr-bulk">
-  <input type="hidden" name="q" value="{{ q }}">
+  {# Счётчик, а не просто подпись: галочки стоят в таблице, панель — над ней, и
+     без числа непонятно, на что вообще подействует кнопка. Оператор жаловался
+     ровно на это: «ставлю галочки, а в панели ничего не меняется». Заодно
+     счётчик не даёт применить действие к отбору, про который забыли. #}
   <span class="muted">С отмеченными:</span>
-  <input type="number" name="int_value" placeholder="число" style="width:80px;">
-  <button name="action" value="set_reserve">Резерв =</button>
-  <button name="action" value="set_offset">Порог трансляции =</button>
-  <button name="action" value="clear_offset">Сбросить порог</button>
-  <button name="action" value="broadcast_on" class="pr-on">Трансляция вкл</button>
-  <button name="action" value="broadcast_off" class="pr-off">Трансляция выкл</button>
-  <input type="date" name="date_value">
-  <button name="action" value="set_active_since">Активно с =</button>
+  <span class="pr-count" id="pr-count">ничего не отмечено</span>
+  <button type="button" class="pr-mini" id="pr-clear" hidden>снять выбор</button>
+
+  <span class="pr-group">
+    {# Подпись, а не подсказка внутри поля: «число» в placeholder исчезало при
+       первом же вводе и не говорило, кому это число достанется. Теперь читается
+       слева направо: «число 5 → Резерв (бронь) =», то есть «поставить бронь 5». #}
+    <label class="pr-group__label" for="bulk-int">число →</label>
+    <input type="number" id="bulk-int" name="int_value" style="width:70px;"
+           title="Число, которое подставят кнопки справа — бронь или факт на дату.">
+    <button name="action" value="set_reserve"
+            title="Поставить эту бронь всем отмеченным товарам.">Резерв (бронь) =</button>
+    <button name="action" value="set_fact"
+            title="Записать это число как «сколько лежало на складе на самом деле» на заданную дату. Порог пересчитается сразу.">
+        Факт на дату =</button>
+    {# Расхождение правится и массово: поле есть в строке и колонка в файле, а
+       правило проекта — массовый путь делает то же, что построчный. Через него
+       же ставят ноль («склад сошёлся с учётом»): ввод факта, равного учёту,
+       расхождения намеренно не трогает. #}
+    <button name="action" value="set_discrepancy"
+            title="Учёт 1С минус реальный склад, со знаком: плюс — в 1С числится больше, чем лежит; минус — на складе больше, чем знает 1С. Ноль — «склад сошёлся». Переживает любую смену даты расчёта.">
+        Расхождение =</button>
+  </span>
+
+  <span class="pr-group">
+    <label class="pr-group__label" for="bulk-date">на дату →</label>
+    <input type="date" id="bulk-date" name="date_value">
+    <button name="action" value="set_base_date"
+            title="Проставить эту дату в поле «на дату» всем отмеченным товарам. Снимок ЦС на неё подставится сразу, если он уже есть; если нет — строки встанут в ожидание и досчитаются, когда придёт ответ 1С.">
+        Дата расчёта =</button>
+    <button name="action" value="stock_to_fact" class="pr-on"
+            title="Весь расчёт одним нажатием: поставить эту дату (или взять уже заданную у товара), подтянуть остаток ЦС на неё и записать его как факт.">
+        Записать остаток ЦС на дату</button>
+    <button name="action" value="set_active_since">Активно с =</button>
+  </span>
+
+  <span class="pr-group">
+    <button name="action" value="fact_from_stock" title="Там, где факт не введён, подставить остаток ЦС на дату">Факт = остаток ЦС</button>
+    <button name="action" value="recalc" class="btn-primary"
+            title="Поднять с площадок реальные заказы с даты расчёта и провести их: списать остаток и создать перемещения в 1С. На площадки при этом не уходит ничего — трансляция включается потом, вручную.">
+        Расчёт</button>
+    <button name="action" value="clear_offset">Сбросить порог</button>
+  </span>
+
+  {# Выключение и снятие кабинета спрашивают подтверждение, а включение — нет, и
+     это не непоследовательность. Выключение не просто гасит строку: по каждой
+     паре, куда мы реально отправляли непустой остаток, уходит ОТЗЫВ — ноль на
+     живую карточку площадки. Сразу по всему отбору, а отбор живёт в браузере и
+     переживает смену фильтра, так что отмеченные строки могут быть уже не видны
+     на экране. Ошибиться здесь стоит дороже всего на странице, и цена
+     подтверждения — одно лишнее нажатие. #}
+  <span class="pr-group">
+    <button name="action" value="broadcast_on" class="pr-on">Трансляция вкл</button>
+    <button name="action" value="broadcast_off" class="pr-off"
+            data-confirm="Выключить трансляцию у отмеченных строк (%COUNT%)?\n\nПо тем парам, куда остаток реально уходил, на площадки уедет ноль — карточки перестанут продавать.\n\nОтмеченные строки могут быть не видны при текущем фильтре.">
+        Трансляция выкл</button>
+  </span>
+
+  {# Кабинет — отдельная группа со своим списком: правила те же, что у галочки в
+     строке. Включение ставит доотправку в очередь, снятие — отзыв, и только
+     если на этот кабинет реально что-то уходило. #}
+  <span class="pr-group">
+    <label class="pr-group__label" for="bulk-account">кабинет</label>
+    <select id="bulk-account" name="account_id">
+        <option value="">— выберите —</option>
+        {% for a in accounts %}
+        <option value="{{ a.id }}">{{ a.name }} ({{ a.platform.value|upper }})</option>
+        {% endfor %}
+    </select>
+    <button name="action" value="cabinet_on" class="pr-on"
+            title="Отметить этот кабинет всем отмеченным товарам. Остаток уйдёт туда только после расчёта — как и по галочке в строке.">
+        Отметить</button>
+    <button name="action" value="cabinet_off" class="pr-off"
+            title="Снять этот кабинет у отмеченных товаров. Ноль на площадку уйдёт только там, куда мы реально отправляли остаток."
+            data-confirm="Снять кабинет у отмеченных строк (%COUNT%)?\n\nПо тем парам, куда остаток реально уходил, на этот кабинет уедет ноль.\n\nОтмеченные строки могут быть не видны при текущем фильтре.">
+        Снять</button>
+    {# Переотправка стоит ЗДЕСЬ, у списка кабинетов, а не среди правок строки:
+       она ничего в строке не меняет, а кабинет ей нужен — выбран он, уедет
+       только туда, не выбран — на все отмеченные у товара.
+
+       Подтверждения не спрашивает намеренно. Ноль по ней не уходит вовсе:
+       каждая пара идёт через `enqueue_full_resend`, то есть через те же
+       гейты, — и лишний вопрос на безопасном действии приучил бы жать «Да»
+       не читая, а тогда перестали бы работать вопросы у «Трансляция выкл» и
+       «Снять», где ноль как раз уезжает. Про строки вне экрана спросит общая
+       проверка ниже, как у любой кнопки массовой правки. #}
+    <button name="action" value="resend"
+            title="Поставить в очередь текущий остаток заново — не меняя ни одного поля строки. Нужно, когда числа на площадке стёрли мимо нас: правкой карточек в кабинете, публикацией витрины, второй системой. Кабинет выбран — уедет только туда; не выбран — на все отмеченные у товара. Ноль по этой кнопке не уходит никогда.">
+        Переотправить остаток</button>
+  </span>
 </form>
 
-<div class="card" style="padding:0; overflow-x:auto;">
+<script>
+// Отбор и фильтры переживают и перерисовку таблицы, и перезагрузку страницы.
+//
+// Два разных сброса, на которые жаловался оператор:
+//   1. htmx подменяет #pr-table целиком при каждом изменении фильтра — вместе с
+//      разметкой уезжали и проставленные галочки;
+//   2. фильтры применяются живьём, адресная строка при этом не менялась, и F5
+//      возвращал пустую страницу без артикула в поиске. А обновлять её мы сами
+//      же и просим — после расчёта строки в таблице показаны на момент загрузки.
+//
+// Выбор держим в sessionStorage (переживает F5, умирает с вкладкой), фильтры —
+// в адресной строке: /products принимает ровно те же параметры, что и
+// /products/rows, поэтому перезагрузка восстанавливает отбор сама.
+// Два фильтра трансляции спрашивают об одном поле противоположное, и вместе
+// дают заведомо пустой отбор. Сервер про это скажет словами — он тут главный, а
+// в адресной строке параметры можно свести и руками. Но доводить до пустой
+// таблицы незачем: снимаем соседнюю галочку в момент, когда ставят эту.
+// Программная установка `checked` события `change` не порождает, поэтому htmx
+// уйдёт ОДИН раз и уже с правильным набором фильтров.
+(function () {
+    var PAIR = {only_broadcasting: "only_silent", only_silent: "only_broadcasting"};
+    document.addEventListener("change", function (e) {
+        var other = e.target && PAIR[e.target.name];
+        if (!other || !e.target.checked) { return; }
+        var box = document.querySelector('#pr-filters input[name="' + other + '"]');
+        if (box) { box.checked = false; }
+    }, true);       // на этапе перехвата: раньше, чем htmx соберёт параметры
+})();
+
+(function () {
+    var KEY = "pr-selected";
+    // Галочка «весь отбор» живёт В ШАПКЕ ТАБЛИЦЫ, а таблицу htmx подменяет
+    // целиком при каждом изменении фильтра — и приходит она с сервера всегда
+    // снятой. Отметки строк восстанавливались из хранилища, а эта галочка нет:
+    // она молча гасла, счётчик переключался с «весь отбор» на число отметок, и
+    // правка уходила по показанным строкам. На боевом каталоге это ровно тот
+    // случай, на который жаловался оператор: страница обещает «все 1739»,
+    // изменено — 500, то есть потолок показа. Поэтому флаг хранится рядом с
+    // самим отбором и восстанавливается на каждую подмену разметки.
+    var KEY_ALL = "pr-all-filtered";
+
+    function load() {
+        try { return new Set(JSON.parse(sessionStorage.getItem(KEY) || "[]")); }
+        catch (e) { return new Set(); }        // приватный режим, запрет на хранилище
+    }
+    function save(set) {
+        try { sessionStorage.setItem(KEY, JSON.stringify(Array.from(set))); }
+        catch (e) { /* не смогли запомнить — работаем без памяти, но работаем */ }
+    }
+    function loadWhole() {
+        try { return sessionStorage.getItem(KEY_ALL) === "1"; }
+        catch (e) { return false; }
+    }
+    function saveWhole(on) {
+        try { sessionStorage.setItem(KEY_ALL, on ? "1" : "0"); }
+        catch (e) { /* без памяти, но работаем */ }
+    }
+
+    var selected = load();
+    var whole = loadWhole();
+
+    function boxes() { return document.querySelectorAll('input[name="uids"]'); }
+
+    // Сколько строк под текущим фильтром — приходит из фрагмента таблицы, то
+    // есть обновляется вместе с ней.
+    function totalText() {
+        var node = document.getElementById("pr-total");
+        return node ? (node.dataset.total || "") : "";
+    }
+
+    function paint() {
+        var all = document.getElementById("pr-all");
+        if (all) all.checked = whole;
+        var count = document.getElementById("pr-count");
+        var clear = document.getElementById("pr-clear");
+        if (count) {
+            // ЧИСЛО обязательно: флаг переживает смену фильтра, и «весь отбор»
+            // без числа не говорит человеку, какой именно отбор он сейчас
+            // значит. С числом смена фильтра видна сразу — оно меняется.
+            count.textContent = whole
+                ? (totalText() ? "весь отбор — " + totalText() + " шт" : "весь отбор")
+                : selected.size ? selected.size + " шт" : "ничего не отмечено";
+            count.classList.toggle("pr-count--on", whole || selected.size > 0);
+        }
+        if (clear) clear.hidden = !(whole || selected.size > 0);
+        // Подпись кнопки экспорта говорит, ЧТО уедет. Молчаливая «Экспорт в
+        // Excel» и была источником недоумения «отобран один товар, в выгрузке
+        // все»: правило у кнопки то же, что у массовой правки, но узнать это
+        // можно было только нажав.
+        var exportBtn = document.getElementById("pr-export");
+        if (exportBtn) {
+            exportBtn.textContent = (!whole && selected.size)
+                ? "Экспорт отмеченных (" + selected.size + ")"
+                : "Экспорт в Excel — весь отбор";
+        }
+    }
+
+    function restore() {
+        boxes().forEach(function (cb) { cb.checked = selected.has(cb.value); });
+        paint();
+        applyOnlySelected();
+    }
+
+    // «Только отмеченные» — фильтр по галочкам строк. Он КЛИЕНТСКИЙ, и иначе
+    // быть не может: отметки живут в браузере (sessionStorage), сервер о них не
+    // знает вовсе, а отправить их запросом нельзя — отмеченных бывают сотни, и
+    // адрес строки такого не выдержит.
+    //
+    // Отсюда честное ограничение, о котором сказано в подсказке к галочке:
+    // прячутся строки НА СТРАНИЦЕ. Если оператор нажал «отметить весь отбор»,
+    // показаны будут только те из отбора, что уже загружены.
+    function applyOnlySelected() {
+        var on = document.getElementById("only-selected");
+        if (!on) return;
+        boxes().forEach(function (cb) {
+            var row = cb.closest("tr");
+            if (!row) return;
+            row.hidden = on.checked && !cb.checked;
+        });
+    }
+
+    document.addEventListener("change", function (e) {
+        var t = e.target;
+        if (t.id === "pr-all") {
+            // Галочка в шапке — «весь текущий отбор»: она уходит на сервер как
+            // all_filtered, и правка применяется ко ВСЕМ подходящим товарам, а не
+            // к показанным строкам. Здесь только видимая часть.
+            whole = t.checked; saveWhole(whole);
+            boxes().forEach(function (cb) {
+                cb.checked = t.checked;
+                if (t.checked) { selected.add(cb.value); } else { selected.delete(cb.value); }
+            });
+            save(selected); paint(); return;
+        }
+        if (t.name === "uids") {
+            if (t.checked) { selected.add(t.value); } else { selected.delete(t.value); }
+            // Снятая галочка строки при включённом «весь отбор» — противоречие:
+            // «всё, кроме этой» сервер выразить не умеет, там либо фильтр
+            // целиком, либо перечисленные отметки. Оставить «весь отбор» значило
+            // бы изменить строку, которую человек только что исключил; молча
+            // перейти на отметки — сузить правку с 1739 строк до показанных 499.
+            // Второе и делаем, но НЕ молча: счётчик тут же меняет число, и сужение
+            // видно ровно в тот момент, когда оно происходит.
+            if (!t.checked && whole) { whole = false; saveWhole(whole); }
+            save(selected); paint();
+        }
+    });
+
+    document.addEventListener("click", function (e) {
+        if (e.target.id !== "pr-clear") return;
+        selected.clear(); save(selected);
+        whole = false; saveWhole(whole);
+        var all = document.getElementById("pr-all");
+        if (all) all.checked = false;
+        boxes().forEach(function (cb) { cb.checked = false; });
+        paint();
+    });
+
+    // Разметку подменил htmx — вернуть галочки на место.
+    //
+    // Проверка была ТОЛЬКО на #pr-table, то есть на подмену всей таблицы
+    // фильтром. Но строка перерисовывается и поодиночке: любая кнопка в ней
+    // (трансляция, галочка кабинета, бронь, факт, дата) отвечает свежим
+    // `<tr>` с hx-swap="outerHTML", и в этой разметке отметка `uids` приходит
+    // с сервера пустой — он о выборе не знает, выбор живёт только в браузере.
+    // Условие не совпадало, restore() не звался, и галочка у строки пропадала
+    // от нажатия соседней кнопки. Отбор из sessionStorage при этом оставался
+    // цел: пропадала именно отрисовка, и «С отмеченными» показывал одно, а
+    // таблица другое.
+    //
+    // Поэтому восстанавливаем БЕЗУСЛОВНО, на любую подмену. Попытка угадать,
+    // какая именно подмена важна, этот дефект и породила, а стоит проверка
+    // одного прохода по трёмстам чекбоксам. Новая кнопка в строке теперь не
+    // потребует правки здесь — и не сможет сломать отбор молча.
+    document.body.addEventListener("htmx:afterSwap", function () {
+        restore();
+    });
+
+    document.getElementById("bulk-form").addEventListener("click", function (e) {
+        var button = e.target.closest('button[name="action"]');
+        if (!button) { return; }
+
+        // ПРАВКА ЗАТРОНЕТ СТРОКИ, КОТОРЫХ НА ЭКРАНЕ НЕТ.
+        //
+        // Отбор живёт в браузере и переживает смену фильтра — это сделано
+        // намеренно: иначе правка уходила бы по показанным строкам, а счётчик
+        // обещал бы все. Но у свойства есть обратная сторона, и 24.09 она
+        // выстрелила на бою в первый же день: в отборе накопилось 846 строк от
+        // прежних фильтров, оператор нашёл поиском ОДИН товар, отметил его
+        // строку и нажал «Расчёт» — задание ушло по всем 846. С экрана это
+        // выглядело как работа с одной строкой: искал один товар, видел один
+        // товар, отметил один товар.
+        //
+        // Счётчик «846 шт» рядом с кнопками не спас и не мог: он маленький,
+        // серый и не объясняет, что 845 из этих строк сейчас не видно.
+        //
+        // Поэтому спрашиваем — но ТОЛЬКО когда экран действительно расходится с
+        // тем, что уедет. Отмечено ровно то, что видно, — вопроса нет: лишний
+        // вопрос на безопасном действии приучает жать «Да» не читая, и тогда
+        // вопрос на опасном тоже перестаёт работать. «Весь отбор» тоже молчит:
+        // там галочка стоит в шапке той самой таблицы, счётчик называет число
+        // текущего отбора и меняет его при смене фильтра, а строка под таблицей
+        // говорит это словами.
+        if (!whole) {
+            var shown = 0;
+            boxes().forEach(function (cb) { if (cb.checked) { shown++; } });
+            var offscreen = selected.size - shown;
+            if (offscreen > 0 && !confirm(
+                    "Отмечено строк: " + selected.size + ", на экране из них " + shown + ".\n\n"
+                    + "Правка затронет и остальные " + offscreen + " — их сейчас не видно: "
+                    + "отбор переживает смену фильтра и поиска.\n\n"
+                    + "Продолжить? «Отмена» — ничего не изменится, "
+                    + "снять отбор можно кнопкой «снять выбор».")) {
+                e.preventDefault();
+                return;
+            }
+        }
+
+        // Подтверждение для действий, которые отправляют на площадки НОЛЬ.
+        //
+        // Вопрос собирается здесь, а не в атрибуте onsubmit, по одной причине: в нём
+        // должно стоять ЧИСЛО отмеченных строк, а его знает только этот скрипт —
+        // отбор живёт в браузере. Число здесь не украшение: отбор переживает смену
+        // фильтра, и отмеченные строки могут быть уже не видны на экране, так что
+        // «выключить у отмеченных» без числа не говорит человеку ничего.
+        if (button.dataset.confirm) {
+            var count = document.getElementById("pr-count").textContent;
+            if (!confirm(button.dataset.confirm.replace("%COUNT%", count))) {
+                e.preventDefault();
+            }
+        }
+    });
+
+    // Отмеченная строка, которой НЕТ на экране, тоже обязана уехать на сервер.
+    //
+    // Форма отправляет то, что есть в разметке, а отбор живёт в браузере и
+    // переживает и смену фильтра, и потолок показа: отмеченных бывает 849, а
+    // чекбоксов на странице 500. Счётчик при этом честно показывал 849 — и
+    // расходился с тем, что уходило запросом. Дописываем недостающие отметки
+    // скрытыми полями прямо перед отправкой: они живут ровно один запрос и
+    // снимаются в начале следующего, иначе после «назад» в браузере к новой
+    // отправке приклеился бы прошлый отбор.
+    document.getElementById("bulk-form").addEventListener("submit", function () {
+        var form = this;
+        form.querySelectorAll('input[data-extra-uid]').forEach(function (el) { el.remove(); });
+        if (whole) { return; }      // весь отбор сервер соберёт сам, по фильтру
+        var shown = new Set();
+        boxes().forEach(function (cb) { if (cb.checked) { shown.add(cb.value); } });
+        selected.forEach(function (uid) {
+            if (shown.has(uid)) { return; }
+            var extra = document.createElement("input");
+            extra.type = "hidden"; extra.name = "uids"; extra.value = uid;
+            extra.setAttribute("data-extra-uid", "1");
+            form.appendChild(extra);
+        });
+    });
+
+    // Щелчок по самому фильтру и по любой галочке строки: список скрытых строк
+    // обязан пересобираться сразу, иначе снятая отметка оставляет строку
+    // висеть в отфильтрованном списке — и её правят, думая, что она отмечена.
+    document.addEventListener("change", function (e) {
+        if (e.target && (e.target.id === "only-selected"
+                         || e.target.name === "uids"
+                         || e.target.id === "pr-all")) {
+            applyOnlySelected();
+        }
+    });
+
+    // Фильтры отработали — переписать адресную строку, чтобы F5 их не терял.
+    // Именно replaceState: каждое нажатие клавиши в поиске иначе добавляло бы
+    // запись в историю, и «назад» пришлось бы жать по разу на символ.
+    document.body.addEventListener("htmx:afterRequest", function (e) {
+        var form = document.getElementById("pr-filters");
+        if (!form || !e.target || !form.contains(e.target) && e.target !== form) return;
+        var params = new URLSearchParams();
+        new FormData(form).forEach(function (value, key) {
+            if (value !== "" && value !== null) params.append(key, value);
+        });
+        var qs = params.toString();
+        history.replaceState(null, "", qs ? "/products?" + qs : "/products");
+    });
+
+    restore();
+})();
+</script>
+
+<div class="card table-scroll" style="padding:0;">
     <div id="pr-table">
         {% include "products_rows.html" %}
     </div>

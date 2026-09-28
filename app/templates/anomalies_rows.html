@@ -1,5 +1,5 @@
 {% if rows %}
-<table>
+<div class="table-scroll"><table>
     <thead>
         <tr>
             <th>Товар</th>
@@ -43,7 +43,7 @@
         </tr>
         {% endfor %}
     </tbody>
-</table>
+</table></div>
 {% else %}
 <div class="empty-state">
     {% if status == 'new' %}

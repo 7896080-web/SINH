@@ -43,19 +43,19 @@ def test_stale_stock_snapshot_is_skipped(tmp_path):
     """Файл старше последнего запроса выгрузки не применяется, а архивируется."""
     ex = _exchange(tmp_path)
     requested_at = now_utc()
-    _write_stock(ex, "stock_old.txt", "u1|A|Т|10|111", mtime=requested_at - timedelta(hours=1))
+    _write_stock(ex, "stock_20260919010000.txt", "u1|A|Т|10|111", mtime=requested_at - timedelta(hours=1))
 
     rows = fetch_stock_export_rows(ex, not_older_than=requested_at)
 
     assert rows == []
-    assert (tmp_path / "a" / "stock_old.txt").exists()      # унесён в архив, не залипает
-    assert not (tmp_path / "r" / "stock_old.txt").exists()
+    assert (tmp_path / "a" / "stock_20260919010000.txt").exists()      # унесён в архив, не залипает
+    assert not (tmp_path / "r" / "stock_20260919010000.txt").exists()
 
 
 def test_fresh_stock_snapshot_is_applied(tmp_path):
     ex = _exchange(tmp_path)
     requested_at = now_utc() - timedelta(minutes=5)
-    _write_stock(ex, "stock_new.txt", "u1|A|Т|8|111", mtime=now_utc())
+    _write_stock(ex, "stock_20260919020000.txt", "u1|A|Т|8|111", mtime=now_utc())
 
     rows = fetch_stock_export_rows(ex, not_older_than=requested_at)
 
@@ -83,7 +83,7 @@ def test_stale_snapshot_no_longer_inflates_stock(db, tmp_path):
 
     ex = _exchange(tmp_path)
     requested_at = now_utc()
-    _write_stock(ex, "stock_old.txt", "u1|A|Т|10|111", mtime=requested_at - timedelta(hours=1))
+    _write_stock(ex, "stock_20260919010000.txt", "u1|A|Т|10|111", mtime=requested_at - timedelta(hours=1))
     rows = fetch_stock_export_rows(ex, not_older_than=requested_at)
     if rows:
         run_reconciliation(db, {"111": rows[0]["quantity"]}, missing_means_zero=True)
@@ -194,14 +194,42 @@ def test_synthetic_order_never_reaches_confirmation_polling(db):
     assert client.asked_confirm == ["5467811441"]
 
 
-def test_wb_client_would_have_crashed_on_synthetic_id():
-    """Фиксируем причину: номер синтетического заказа нельзя привести к целому,
-    а клиент WB делает именно это. Отсюда и падение живого опроса."""
-    import pytest
+def test_wb_client_skips_an_id_it_cannot_parse(monkeypatch):
+    """Нечисловой номер заказа клиент WB отбрасывает, а не падает на всей пачке.
+
+    Раньше падал — `int("TEST-abc")` бросал ValueError ещё до похода в сеть, — и
+    это было ПРИЧИНОЙ падения живого опроса. Починили тогда с другой стороны
+    (`_real_open_orders` не отдаёт синтетические заказы), и правильно; этот тест
+    фиксировал саму причину, чтобы её не потеряли.
+
+    Теперь причина убрана и здесь. Повод — не красота: нечисловой номер может
+    взяться и без страницы тестирования. Заказ WB без поля `id` превращался в
+    строку «None», оседал в `ProcessedOrder` — и дальше отмены переставали
+    отслеживаться по ВСЕМУ кабинету, а через пять опросов предохранитель гасил
+    его совсем. Одна испорченная запись не должна этого делать.
+
+    Фильтр синтетических заказов при этом никуда не делся — его проверяют
+    соседние тесты; здесь мы лишь убеждаемся, что вторая линия обороны есть.
+    """
+    from app.workers.platform_clients import wb as wb_module
     from app.workers.platform_clients.wb import WbClient
 
-    with pytest.raises(ValueError):
-        WbClient(token="x", warehouse_id="w").get_cancelled_orders([f"{TEST_ORDER_PREFIX}abc"])
+    asked = []
+
+    def _fake_post(self, path, body):
+        asked.append(body)
+        return {"orders": []}
+
+    monkeypatch.setattr(WbClient, "_post", _fake_post)
+    client = WbClient(token="x", warehouse_id="w")
+
+    # Только нечисловой — в сеть идти не с чем, запроса быть не должно.
+    assert client.get_cancelled_orders([f"{TEST_ORDER_PREFIX}abc"]) == []
+    assert asked == []
+
+    # Нечисловой рядом с настоящим — настоящий доезжает.
+    client.get_cancelled_orders([f"{TEST_ORDER_PREFIX}abc", "5467811441"])
+    assert asked == [{"orders": [5467811441]}]
 
 
 def test_file_mtime_is_timezone_independent(tmp_path):

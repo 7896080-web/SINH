@@ -1,0 +1,224 @@
+{% extends "base.html" %}
+{% block title %}Коробка возвратов{% endblock %}
+{% block content %}
+
+<div class="page-header">
+    <div>
+        <h1>Коробка возвратов</h1>
+        <p>Полный цикл одним проходом: скан заводит вещь, одна кнопка передаёт всю
+           коробку в 1С — перемещение со склада площадки на «{{ target_warehouse }}»
+           и сразу возврат в оборот или утилизация.</p>
+    </div>
+    {# Ссылка на разбор нужна: страница отдельная, и без неё кладовщик,
+       которому попалась спорная вещь, ищет выход перезагрузкой. #}
+    <a class="btn" href="/returns">Приёмка и разбор по одной →</a>
+</div>
+
+{% include "returns_test_banner.html" %}
+
+{# Инструкция на самой странице, а не в бумажке рядом с монитором. #}
+<details class="card" style="margin-bottom:14px" open>
+    <summary style="cursor:pointer;font-weight:600">Что делать на этой странице</summary>
+    <ol style="margin:10px 0 0;padding-left:22px;line-height:1.7">
+        <li>Выберите <strong>склад</strong>, с которого привезли коробку. 1С перенесёт
+            вещи с него на «{{ target_warehouse }}» и уже там вернёт в оборот или спишет.</li>
+        <li>Выберите <strong>действие</strong> — вернуть в продажу или утилизировать.
+            Для утиля сразу выберите <strong>причину</strong>: она уйдёт в 1С у всей пачки.</li>
+        <li><strong>Сканируйте баркоды</strong> вещей прямо из коробки. Скан ЗАВОДИТ
+            вещь — через приёмку их проводить не нужно. Каждый скан — ОДНА вещь:
+            три одинаковых свитшота дают три скана и три записи.</li>
+        <li>Проверьте итоги и нажмите <strong>«Передать в 1С»</strong>.
+            До этого наружу не уходит ничего.</li>
+    </ol>
+    <p style="margin:10px 0 0;color:var(--ink-soft)">
+        Склад выбирается <strong>до сканов</strong>: по нему проставляется площадка
+        вещи, и вернуть товар 1С может только оттуда, куда он уехал при продаже.
+        Вещь с другой площадкой в пачке — <strong>отказ всей передаче</strong>, с
+        именами строк: вопрос тут не про две лишние вещи, а про то, что коробка
+        собрана не с того склада.
+        Вещь, которая уже лежит в разборе (вернулась из химчистки, была отложена),
+        сканируется <strong>номером RET-… с наклейки</strong> — товарный баркод
+        завёл бы для неё вторую запись.
+        Пачка <strong>общая на всю установку</strong>: если рядом работает второй
+        человек, вы увидите его сканы здесь же.
+    </p>
+</details>
+
+{# Действие и причина — РАНЬШЕ сканов и на виду всё время. Уехав не с той
+   причиной, вещи лягут не на ту статью затрат в 1С, а претензию площадке пишут
+   именно по этому полю: увидят расхождение в отчётах через месяц. #}
+<form method="post" action="/returns/box/mode" class="card" style="margin-bottom:14px">
+    {# Склад — ПЕРВЫМ и на виду: он решает, откуда 1С заберёт вещь, а имя уезжает
+       туда строкой. Список ровно тот, на который товар уехал при продаже. #}
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px">
+        <label for="warehouse" style="font-size:13px;color:var(--ink-soft)">
+            СКЛАД, С КОТОРОГО ПРИШЛА КОРОБКА
+        </label>
+        <select id="warehouse" name="warehouse" style="padding:9px 12px;font-size:15px;min-width:280px">
+            <option value="">— выберите склад —</option>
+            {% for p, w in warehouses.items() %}
+            <option value="{{ w }}" {% if warehouse == w %}selected{% endif %}>
+                {{ w }} · {{ platform_labels[p] }}
+            </option>
+            {% endfor %}
+        </select>
+        <span style="color:var(--ink-soft)">→ «{{ target_warehouse }}»</span>
+    </div>
+    <div style="display:flex;gap:10px;margin-bottom:12px">
+        <button type="submit" name="mode" value="sale"
+                style="flex-grow:1;padding:13px 0;font-size:16px;border-radius:var(--radius);cursor:pointer;
+                       {% if mode != 'scrap' %}font-weight:600;color:#fff;background:#2f7d4f;border:2px solid #2f7d4f
+                       {% else %}color:var(--ink-soft);background:var(--surface);border:2px solid var(--line){% endif %}">
+            Вернуть в продажу
+        </button>
+        <button type="submit" name="mode" value="scrap"
+                style="flex-grow:1;padding:13px 0;font-size:16px;border-radius:var(--radius);cursor:pointer;
+                       {% if mode == 'scrap' %}font-weight:600;color:#fff;background:#9c3a3a;border:2px solid #9c3a3a
+                       {% else %}color:var(--ink-soft);background:var(--surface);border:2px solid var(--line){% endif %}">
+            Утилизировать
+        </button>
+    </div>
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <label for="reason" style="font-size:13px;color:var(--ink-soft)">
+            ПРИЧИНА УТИЛИЗАЦИИ — ОДНА НА ВСЮ ПАЧКУ
+        </label>
+        <select id="reason" name="reason" style="padding:9px 12px;font-size:15px;min-width:260px">
+            <option value="">— выберите причину —</option>
+            {% for r in scrap_reasons %}
+            <option value="{{ r.value }}" {% if reason == r.value %}selected{% endif %}>
+                {{ scrap_labels[r] }} → «{{ scrap_operations[r] }}»
+            </option>
+            {% endfor %}
+        </select>
+        <button type="submit" name="mode" value="{{ mode }}" class="btn btn--small">Запомнить</button>
+    </div>
+</form>
+
+{% set scrapping = mode == 'scrap' %}
+{% set bar = '#9c3a3a' if scrapping else '#2f7d4f' %}
+<div style="border:2px solid {{ bar }};border-radius:var(--radius);overflow:hidden;background:var(--surface);margin-bottom:16px">
+    <div style="background:{{ bar }};color:#fff;padding:10px 18px;display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap">
+        <span style="font-size:17px;font-weight:600">
+            {% if scrapping %}УТИЛИЗАЦИЯ{% if reason %} — {{ scrap_labels[scrap_reasons|selectattr('value','equalto',reason)|first] }}{% endif %}
+            {% else %}ВОЗВРАТ В ПРОДАЖУ{% endif %}
+        </span>
+        <span>
+            {% if warehouse %}{{ warehouse }} → {{ target_warehouse }}
+            {% else %}склад не выбран{% endif %}
+        </span>
+        <span>в пачке: <strong style="font-size:20px">{{ totals.total }}</strong></span>
+    </div>
+    <div style="padding:18px">
+        {% if not warehouse %}
+        <div class="flash flash--warn" style="margin:0 0 12px">
+            Склад не выбран — сканировать нельзя. По нему проставляется площадка
+            вещи, и с него же 1С заберёт её: вернуть товар можно только оттуда,
+            куда он уехал при продаже.
+        </div>
+        {% endif %}
+        {% if totals.foreign %}
+        <div class="flash flash--warn" style="margin:0 0 12px">
+            В пачке {{ totals.foreign|length }} вещей с другой площадки — с этого
+            склада их вернуть нельзя. Передача откажет целиком: уберите их или
+            выберите их склад.
+        </div>
+        {% endif %}
+        {% if scrapping and not reason %}
+        <div class="flash flash--warn" style="margin:0 0 12px">
+            Причина не выбрана. Без неё передать пачку нельзя: по ней 1С выбирает
+            хоз. операцию списания, а по ней же пишут претензию площадке.
+        </div>
+        {% endif %}
+        <form method="post" action="/returns/box/scan">
+            <label for="code" style="display:block;font-size:13px;color:var(--ink-soft);margin-bottom:6px">
+                Товарный баркод — сканер наберёт сам, вещь заведётся сразу.
+                Номер <strong>RET-…</strong> с наклейки берёт вещь, уже лежащую в разборе.
+            </label>
+            <input id="code" name="code" type="text" autocomplete="off"
+                   {% if warehouse %}autofocus{% else %}disabled{% endif %}
+                   placeholder="{% if warehouse %}сканируйте баркод{% else %}сначала выберите склад{% endif %}"
+                   style="width:100%;box-sizing:border-box;padding:14px 16px;font-size:20px;
+                          font-family:ui-monospace,Menlo,Consolas,monospace;
+                          border:2px solid var(--accent);border-radius:var(--radius)">
+        </form>
+    </div>
+</div>
+
+{# Итоги: всего, по площадкам и отдельно — то, что передать не выйдет. Говорим
+   об этом ДО нажатия: иначе человек получит список отказов там, где ждал
+   готового дела. #}
+<div class="card" style="margin-bottom:14px;display:flex;gap:26px;flex-wrap:wrap;align-items:center">
+    <div>
+        <div style="font-size:13px;color:var(--ink-soft)">ВСЕГО В ПАЧКЕ</div>
+        <div style="font-size:26px;font-weight:600">{{ totals.total }}</div>
+    </div>
+    {% for p, n in totals.by_platform.items() %}
+    <div>
+        <div style="font-size:13px;color:var(--ink-soft)">{{ platform_labels[p]|upper }}</div>
+        <div style="font-size:26px;font-weight:600;color:{{ platform_colors[p] }}">{{ n }}</div>
+    </div>
+    {% endfor %}
+    {% if totals.foreign %}
+    <div>
+        <div style="font-size:13px;color:var(--warn)">НЕ С ЭТОГО СКЛАДА</div>
+        <div style="font-size:26px;font-weight:600;color:var(--warn)">{{ totals.foreign|length }}</div>
+    </div>
+    {% endif %}
+    {% if totals.no_product %}
+    <div>
+        <div style="font-size:13px;color:var(--warn)">БЕЗ ТОВАРА 1С — НЕ УЕДУТ</div>
+        <div style="font-size:26px;font-weight:600;color:var(--warn)">{{ totals.no_product }}</div>
+    </div>
+    {% endif %}
+    <div style="flex-grow:1"></div>
+    <form method="post" action="/returns/box/send" style="display:flex;gap:10px;align-items:center">
+        <input type="hidden" name="mode" value="{{ mode }}">
+        <input type="hidden" name="reason" value="{{ reason }}">
+        <input type="hidden" name="warehouse" value="{{ warehouse }}">
+        {# Число в вопросе обязательно: пачка переживает перезагрузку и смену
+           человека, и «передать всё» без числа не говорит ни о чём. #}
+        <button type="submit" class="btn btn--primary"
+                {% if not totals.total or not warehouse or totals.foreign %}disabled{% endif %}
+                data-confirm="Передать в 1С: {{ totals.total }} шт.&#10;Склад: {{ warehouse }} → {{ target_warehouse }}&#10;&#10;{% if scrapping %}Действие: УТИЛИЗАЦИЯ. 1С сделает по каждой вещи возврат со склада на ЦС и списание с него — отменить можно будет только сторно в самой 1С.{% else %}Действие: возврат в продажу. 1С перенесёт вещи со склада на ЦС, и они войдут в остаток, когда она ответит.{% endif %}&#10;&#10;Продолжить?">
+            Передать в 1С — {{ totals.total }} шт
+        </button>
+        </form>
+    <form method="post" action="/returns/box/clear">
+        <button type="submit" class="btn"
+                {% if not totals.total %}disabled{% endif %}
+                data-confirm="Убрать из пачки все {{ totals.total }} шт?&#10;&#10;В 1С не уйдёт ничего, вещи останутся принятыми и будут лежать в разборе.">
+            Очистить пачку
+        </button>
+    </form>
+</div>
+
+<div class="card" style="padding:0;overflow:hidden">
+    <div style="padding:10px 16px;border-bottom:1px solid var(--line-soft);font-size:13px;color:var(--ink-soft)">
+        В ПАЧКЕ — ПРИНЯТЫ, НО В 1С ЕЩЁ НЕ ОТПРАВЛЕНЫ (до {{ max_batch }} шт)
+    </div>
+    {% for item in batch %}
+    {% set p = products.get(item.uid_1c) %}
+    {% set foreign = warehouse and warehouse_platform and item.platform != warehouse_platform %}
+    <div style="display:flex;align-items:center;gap:14px;padding:11px 16px;border-bottom:1px solid var(--line-soft);
+                {% if not item.uid_1c or foreign %}background:var(--warn-soft){% endif %}">
+        <a href="/returns/item/{{ item.id }}" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:16px;font-weight:600;width:100px">{{ label_number(item) }}</a>
+        <span style="flex-grow:1;min-width:0">
+            {% if p %}{{ p.article }} · {{ p.size or '' }} · {{ p.color or '' }}
+                <span style="color:var(--ink-soft)">— {{ p.name or '' }}</span>
+            {% else %}<span style="color:var(--warn)">баркод {{ item.barcode }} не опознан — в 1С не уедет, сначала мэппинг</span>{% endif %}
+        </span>
+        <span style="font-family:ui-monospace,Menlo,Consolas,monospace;color:var(--ink-soft)">{{ item.barcode }}</span>
+        <span class="badge" style="background:{{ platform_colors[item.platform] }};color:#fff">{{ platform_labels[item.platform] }}</span>
+        {% if foreign %}<span class="badge" style="background:#9c3a3a;color:#fff">не с этого склада</span>{% endif %}
+        <span class="badge">{{ labels[item.status] }}</span>
+        {% if item.is_test %}<span class="badge" style="background:#8a4b00;color:#fff">ТРЕНИРОВКА</span>{% endif %}
+        <form method="post" action="/returns/box/drop/{{ item.id }}" style="display:inline">
+            <button type="submit" class="btn btn--small">Убрать</button>
+        </form>
+    </div>
+    {% else %}
+    <div style="padding:16px;color:var(--ink-soft)">Пачка пуста — сканируйте вещи.</div>
+    {% endfor %}
+</div>
+
+{% endblock %}

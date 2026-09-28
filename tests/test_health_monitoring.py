@@ -210,8 +210,17 @@ def test_worker_error_text_is_not_exposed_anonymously(client, web_db):
 
     assert r.status_code == 503
     assert "wildberries.ru" not in r.text
-    assert "401" not in r.text
-    worker = r.json()["workers"][0]
+    # Код ответа ищем В ПОЛЯХ ВОРКЕРА, а не по всему телу. `"401" not in r.text`
+    # ловило ещё и `age_seconds` вроде 401 или 4012 — то есть тест падал от
+    # случайного числа секунд, и тем чаще, чем больше воркеров в ответе. Проверка
+    # про то, что ТЕКСТ ОШИБКИ не виден анониму, а не про отсутствие трёх цифр
+    # где угодно в JSON.
+    leaked = next(w for w in r.json()["workers"] if w["worker"] == "dispatch")
+    assert "401" not in str(leaked.get("last_error") or "")
+    # ПО ИМЕНИ, а не по индексу: воркеров в ответе несколько, и «первый» — это
+    # не «наш». Раньше тест брал нулевой элемент и падал, стоило списку
+    # измениться (порядок строк в базе не задан, добавился новый воркер).
+    worker = next(w for w in r.json()["workers"] if w["worker"] == "dispatch")
     assert worker["last_success"] is False       # факт ошибки виден
     assert worker["last_error"] == ERROR_PLACEHOLDER
 
@@ -224,3 +233,210 @@ def test_error_text_is_still_available_to_the_operator(logged_in_client, web_db)
     r = logged_in_client.get("/diagnostics")
 
     assert "wildberries.ru" in r.text
+
+
+# ------------------- 15б. per-account задание, не отработавшее НИ РАЗУ
+
+def test_a_never_run_account_job_is_missing_not_invisible(client, web_db):
+    """Находка 19.09: суточная выгрузка каталога не запускалась вовсе — первый
+    прогон откладывался на сутки, а процесс столько не живёт. Строки heartbeat не
+    было, проверялись только существующие строки, и /health был зелёный при
+    снимке каталога пятидневной давности."""
+    account = _account(web_db)
+    _all_required(web_db)
+    _hb(web_db, f"poll_orders_account_{account.id}")
+    # catalog_poll_account_<id> не писали вовсе — задание не отработало ни разу
+
+    r = client.get("/health")
+
+    assert r.status_code == 503
+    assert r.json()["missing_workers"] == [f"catalog_poll_account_{account.id}"]
+
+
+def test_account_jobs_that_did_run_keep_health_green(client, web_db):
+    account = _account(web_db)
+    _all_required(web_db)
+    _hb(web_db, f"poll_orders_account_{account.id}")
+    _hb(web_db, f"catalog_poll_account_{account.id}")
+
+    r = client.get("/health")
+
+    assert r.status_code == 200
+    assert r.json()["missing_workers"] == []
+
+
+def test_account_jobs_are_forgiven_right_after_restart(client, web_db):
+    """Сразу после рестарта выгрузка каталога ещё не отработала — это не тревога."""
+    _account(web_db)
+    _all_required(web_db, uptime_seconds=60)
+
+    r = client.get("/health")
+
+    assert r.status_code == 200
+    assert r.json()["missing_workers"] == []
+
+
+def test_a_disabled_account_does_not_demand_its_jobs(client, web_db):
+    """Снятый кабинет заданий не имеет — требовать их отчёта нельзя."""
+    _account(web_db, active=False)
+    _all_required(web_db)
+
+    r = client.get("/health")
+
+    assert r.status_code == 200
+    assert r.json()["missing_workers"] == []
+
+
+def test_the_worker_list_has_a_stable_order(client, web_db):
+    """Человек смотрит /health два раза подряд — и обязан видеть один и тот же
+    порядок. Без `order_by` SQLite отдаёт строки как ему удобно."""
+    _hb(web_db, "verify_stock")
+    _hb(web_db, "dispatch")
+    _hb(web_db, "backup")
+
+    names = [w["worker"] for w in client.get("/health").json()["workers"]]
+
+    assert names == sorted(names)
+
+
+# --------------- срок протухания обязан соответствовать расписанию
+
+def _add_job_calls(source: str) -> list:
+    """Тела вызовов `sched.add_job(...)` целиком.
+
+    Скобки считаем руками, а не регуляркой до конца строки: вызовы занимают по
+    три-четыре строки, и разбор «до первого перевода» терял у них `id=` — то
+    есть проверка молча пропускала ровно те задания, ради которых написана.
+    """
+    calls, marker = [], "sched.add_job("
+    start = source.find(marker)
+    while start != -1:
+        depth, i = 0, start + len(marker) - 1
+        while i < len(source):
+            if source[i] == "(":
+                depth += 1
+            elif source[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        calls.append(source[start:i])
+        start = source.find(marker, i)
+    return calls
+
+
+def _scheduled_intervals() -> dict:
+    """{id задания: интервал в секундах} — из самого расписания.
+
+    Читаем исходник планировщика, а не поднимаем его: `build_scheduler` лезет
+    в базу и пишет heartbeat, а нам нужны только числа. Константы
+    (`BACKUP_INTERVAL_HOURS` и подобные) разрешаем через сам модуль.
+    """
+    import re
+
+    from app.workers import scheduler as sched_module
+
+    source = open("app/workers/scheduler.py", encoding="utf-8").read()
+    unit = {"seconds": 1, "minutes": 60, "hours": 3600, "days": 86400}
+    found = {}
+    for call in _add_job_calls(source):
+        job_id = re.search(r'id="([^"]+)"', call)
+        amount = re.search(r"\b(seconds|minutes|hours|days)=([\w.]+)", call)
+        if not job_id or not amount:
+            continue
+        raw = amount.group(2)
+        value = int(raw) if raw.isdigit() else getattr(sched_module, raw, None)
+        if value is None:
+            continue
+        found[job_id.group(1)] = int(value) * unit[amount.group(1)]
+    return found
+
+
+def test_every_scheduled_job_has_a_matching_staleness_window():
+    """Задание, которое ходит раз в сутки, по умолчанию протухает через десять
+    минут — и держит /health красным все оставшиеся двадцать три часа с
+    лишним. Так уже было с недельным импортом справочника, с часовым отчётом и
+    21.09 с бэкапом: механизм добавили, а сюда записать забыли, и мониторинг
+    покраснел через десять минут после первой копии.
+
+    Проверяем не «есть запись», а «срок не меньше двух интервалов»: запись,
+    сделанная с потолка, не спасает.
+    """
+    from app.routers.health import _expected_seconds
+
+    too_tight = {name: (interval, _expected_seconds(name))
+                 for name, interval in _scheduled_intervals().items()
+                 if _expected_seconds(name) < interval * 2}
+
+    assert too_tight == {}, (
+        "срок протухания короче двух интервалов — /health покраснеет сам собой: "
+        f"{too_tight}")
+
+
+def test_the_daily_jobs_are_actually_seen_by_this_check():
+    """Проверка выше полезна ровно настолько, насколько находит задания. Если
+    разбор расписания однажды перестанет их видеть, она замолчит молча."""
+    found = _scheduled_intervals()
+
+    assert found.get("backup") == 86400
+    assert found.get("retention") == 86400
+    assert found.get("dispatch") == 45
+
+
+def _scheduled_job_ids() -> set:
+    """id всех статических заданий расписания — из самого исходника."""
+    import re
+
+    source = open("app/workers/scheduler.py", encoding="utf-8").read()
+    found = set()
+    for call in _add_job_calls(source):
+        job_id = re.search(r'id="([^"]+)"', call)
+        if job_id:
+            found.add(job_id.group(1))
+    return found
+
+
+# Отметки, у которых СВОЕГО задания в расписании нет и быть не может: их пишет
+# другое задание по ходу своей работы. Список нарочно короткий — каждая строка
+# здесь это отказ от проверки, а не мелочь.
+HEARTBEATS_WRITTEN_BY_ANOTHER_JOB = {
+    # Применение снимка остатков 1С: отметку ставит job_ftp_receive, разобрав
+    # файл выгрузки. Отдельного задания у неё нет — файл приходит когда придёт.
+    "reconciliation_applied",
+}
+
+
+def test_every_required_worker_is_actually_scheduled():
+    """Запись в REQUIRED_WORKERS без задания в расписании красит /health
+    НАВСЕГДА: строки heartbeat не появится, потому что писать её некому.
+
+    Обратная сторона той же беды, ради которой REQUIRED_WORKERS и заведён. Там
+    ловилось «задание есть, а отметки нет»; здесь — «отметку требуем, а
+    задания нет». 24.09 это чуть не случилось со сторожем: имя внесли в
+    REQUIRED_WORKERS одной правкой, а `sched.add_job` — другой, и между ними
+    /health покраснел бы через пять минут после первого же перезапуска, причём
+    без единой строки в логе.
+    """
+    from app.routers.health import ACCOUNT_REQUIRED_GRACE, REQUIRED_WORKERS
+
+    scheduled = _scheduled_job_ids()
+    missing = {
+        name for name in REQUIRED_WORKERS
+        if name not in scheduled
+        and name not in HEARTBEATS_WRITTEN_BY_ANOTHER_JOB
+        and not any(name.startswith(p) for p in ACCOUNT_REQUIRED_GRACE)
+    }
+
+    assert missing == set(), (
+        "/health требует отметку, которую некому поставить — задания в "
+        f"расписании нет: {sorted(missing)}")
+
+
+def test_the_excused_heartbeats_are_written_by_someone():
+    """Список исключений выше — дыра в проверке, и он обязан быть честным:
+    имя, которое никто не пишет, через него прошло бы точно так же."""
+    source = open("app/workers/scheduler.py", encoding="utf-8").read()
+
+    for name in HEARTBEATS_WRITTEN_BY_ANOTHER_JOB:
+        assert f'"{name}"' in source, (
+            f"отметку «{name}» не ставит никто, а /health её требует")

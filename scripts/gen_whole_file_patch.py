@@ -20,7 +20,7 @@ import os
 import sys
 import zlib
 
-APPLY_TEMPLATE = r'''import base64, hashlib, io, os, shutil
+APPLY_TEMPLATE = r'''import base64, datetime, hashlib, io, os, shutil
 ROOT = r"C:\sync_admin"
 TAG = {tag!r}
 FILES = {files!r}
@@ -70,6 +70,31 @@ for rel in DELETE:
                     os.remove(os.path.join(cache, f))
     print("del", rel)
     written += 1
+# Отметка «какой блок наката тут реально применялся». Пишем ПОСЛЕ всех файлов,
+# то есть только когда всё записано и сверено по sha.
+#
+# Зачем. Блок наката и `update_windows.ps1` — два независимых шага, и второй
+# ничего не знает о первом. 23.09 это стоило вечера: APPLY не запускали вовсе,
+# `update_windows.ps1` честно отработал на СТАРОМ коде и закончился зелёным —
+# копия снята, тесты зелёные (код и база друг другу соответствуют), `/health`
+# 200. Понять, что новой версии на сервере нет, удалось только по отсутствию
+# строки `Running upgrade` в логе миграций, то есть по косвенному признаку,
+# которого никто не ищет.
+#
+# Теперь версия названа вслух, а `update_windows.ps1 -Tag pm114` сверяет её с
+# той, которую человек собирался ставить, и отказывается работать при
+# расхождении.
+marker = os.path.join(ROOT, "deploy", "INSTALLED_TAG")
+os.makedirs(os.path.dirname(marker), exist_ok=True)
+with io.open(marker, "w", encoding="utf-8") as f:
+    # `now(timezone.utc)`, а не `utcnow()`: второй помечен на удаление и на
+    # боевом Python печатает DeprecationWarning ПЕРВОЙ строкой наката. Строка
+    # выходит та же, а предупреждение в самом начале вывода — это то, что учит
+    # не читать вывод целиком; дальше там «DONE N» и метка версии, ради которых
+    # его и смотрят.
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    f.write(TAG + "\n" + stamp + " UTC\n")
+print("tag", TAG)
 print("DONE", written)
 '''
 
@@ -154,7 +179,15 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     text, info = build(a.root, a.files, a.tag, a.parts, a.width, a.delete)
-    with open(a.out, "w", encoding="utf-8", newline="\r\n") as f:
+    # utf-8-SIG, то есть с BOM, и это не косметика. Windows PowerShell 5.1
+    # считает, что .ps1 без BOM написан в системной кодировке (cp1251), и
+    # кириллица в комментариях и сообщениях превращается в мусор. Беда не в
+    # нечитаемости: длинное тире «—» (E2 80 94) читается как «вЂ"», и последний
+    # символ закрывает строковый литерал раньше времени — парсер падает на
+    # «непредвиденная лексема», не дойдя до блоков. 21.09 на бою так и вышло при
+    # запуске патча ФАЙЛОМ. Вставка блоков руками в консоль это не ловила:
+    # там кодировка уже верная, поэтому дефект дожил до первого запуска файлом.
+    with open(a.out, "w", encoding="utf-8-sig", newline="\r\n") as f:
         f.write(text)
     print(info)
     return 0

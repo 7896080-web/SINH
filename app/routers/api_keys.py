@@ -1,9 +1,9 @@
 from fastapi import APIRouter, Request, Depends, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
-from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.templating import templates as shared_templates
 from app.dependencies import get_current_user
 from app.models import ApiCredential, PlatformAccount, Platform, User
 from app.crypto import encrypt_value, decrypt_value, mask_value
@@ -12,7 +12,7 @@ from app.flash import set_flash, pop_flash
 from app.workers.scheduler import PENDING_WAREHOUSE_NAME, SOLD_WAREHOUSE_NAME, SOURCE_WAREHOUSE_NAME
 
 router = APIRouter()
-templates = Jinja2Templates(directory="app/templates")
+templates = shared_templates
 
 # Поля, которые нужны любому кабинету данной площадки.
 PLATFORM_FIELDS = {
@@ -97,6 +97,8 @@ def api_keys_page(request: Request, db: Session = Depends(get_db), user: User = 
             "id": account.id, "name": account.name, "platform": account.platform.value,
             "platform_label": PLATFORM_LABELS[account.platform],
             "warehouse_id": account.warehouse_id or "", "is_active": account.is_active,
+            "publish_hidden_on_stock": account.publish_hidden_on_stock,
+            "supports_publish": account.platform == Platform.kit,
             "fields": fields,
         })
 
@@ -167,6 +169,19 @@ def activate_account(
         return RedirectResponse("/api-keys", status_code=303)
 
     account.is_active = True
+    # Счётчик предохранителя сбрасываем ВМЕСТЕ с включением.
+    #
+    # Без этого включение почти ничего не значило: кабинет гасится на пятом
+    # сбое подряд, счётчик остаётся на пяти, и ПЕРВАЯ же ошибка даёт шестой —
+    # `record_failure` гасит кабинет снова. Пяти попыток, ради которых
+    # предохранитель и сделан, у включённого кабинета не было вовсе.
+    #
+    # А включают его ровно тогда, когда первая попытка чаще всего и не
+    # проходит: оператор поправил ключи или склад и даёт кабинету новый шанс.
+    # Кнопка на «Диагностике» счётчик сбрасывает, а эта — нет, хотя человек
+    # обеими делает одно и то же.
+    account.consecutive_failures = 0
+    account.last_error = None
     log_action(db, user.username, "account_activated", account.name)
     db.commit()
 
@@ -194,6 +209,37 @@ def update_warehouse(
     db.commit()
 
     set_flash(request, f"Склад для «{account.name}» обновлён.", "good")
+    return RedirectResponse("/api-keys", status_code=303)
+
+
+@router.post("/api-keys/accounts/{account_id}/publish-hidden")
+def update_publish_hidden(
+    request: Request, account_id: int,
+    publish_hidden_on_stock: str = Form(""),
+    db: Session = Depends(get_db), user: User = Depends(get_current_user),
+):
+    """Возвращать ли на витрину карточки, спрятанные площадкой за нулевой остаток.
+
+    Пишется в журнал: это действие наружу — после включения мы сами меняем
+    статус чужих карточек, и человек должен потом видеть, кто и когда разрешил.
+    """
+    account = db.query(PlatformAccount).filter(PlatformAccount.id == account_id).first()
+    if account is None:
+        return RedirectResponse("/api-keys", status_code=303)
+
+    was = account.publish_hidden_on_stock
+    account.publish_hidden_on_stock = publish_hidden_on_stock == "on"
+    if account.publish_hidden_on_stock != was:
+        log_action(db, user.username, "publish_hidden_changed",
+                   f"{account.name}: автопубликация скрытых карточек "
+                   f"{'включена' if account.publish_hidden_on_stock else 'выключена'}")
+    db.commit()
+
+    set_flash(request, (
+        f"Скрытые карточки «{account.name}» будут возвращаться на витрину при ненулевом остатке."
+        if account.publish_hidden_on_stock else
+        f"Автопубликация скрытых карточек «{account.name}» выключена."
+    ), "good")
     return RedirectResponse("/api-keys", status_code=303)
 
 

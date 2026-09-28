@@ -1,3 +1,4 @@
+import atexit
 import os
 import sys
 import tempfile
@@ -10,8 +11,27 @@ os.environ.setdefault("SECRETS_ENCRYPTION_KEY", "EfYA4-I-29JUEh7MiU9I4odQtKEB87p
 # Файловая, а не :memory: SQLite — TestClient гоняет запросы через пул потоков
 # (anyio.to_thread), а SQLite ":memory:" при подключении из разных потоков
 # каждый раз видит новую пустую базу. Файл на диске от этой проблемы избавлен.
-_web_db_path = os.path.join(tempfile.gettempdir(), "sync_admin_web_tests.db")
+#
+# Имя несёт номер процесса. Файл был один на всех, а фикстура `web_db` после
+# КАЖДОГО веб-теста делает `drop_all`: два прогона рядом (а во время разбора их
+# запускают именно так — один полный в фоне, один точечный руками) сносили
+# таблицы друг у друга. Выглядело это сотней ошибок вида «UNIQUE constraint
+# failed: users.username», то есть как поломка кода, а не как столкновение
+# прогонов — и на этом теряли время не один раз.
+_web_db_path = os.path.join(tempfile.gettempdir(),
+                            f"sync_admin_web_tests_{os.getpid()}.db")
 _default_url = f"sqlite:///{_web_db_path}"
+
+
+@atexit.register
+def _drop_web_db_file():
+    """Убрать свой файл базы после прогона — раз уж имя теперь у каждого своё,
+    иначе %TEMP% зарастёт по файлу на запуск."""
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            os.remove(_web_db_path + suffix)
+        except OSError:
+            pass
 
 
 def looks_like_test_database(url: str) -> bool:
@@ -57,7 +77,13 @@ def db():
     не связан с app.database.engine, который используют веб-тесты ниже)."""
     engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
     Base.metadata.create_all(bind=engine)
-    Session = sessionmaker(bind=engine)
+    # autoflush=False — КАК В БОЮ (app/database.py). Раньше фикстура брала
+    # умолчание SQLAlchemy (autoflush=True), и тестовая сессия вела себя иначе,
+    # чем боевая: незаписанные изменения были видны запросам. На этом проехал
+    # настоящий дефект — расчёт порога читал строки ответа 1С, ещё не ушедшие в
+    # базу, в тестах видел их, а на боевом получал пустой снимок и считал порог
+    # всему каталогу по нулям.
+    Session = sessionmaker(bind=engine, autoflush=False)
     session = Session()
     try:
         yield session
@@ -72,7 +98,7 @@ def web_db():
     app.database.get_db, а не через фикстуру выше."""
     from app.database import engine as app_engine
     Base.metadata.create_all(bind=app_engine)
-    Session = sessionmaker(bind=app_engine)
+    Session = sessionmaker(bind=app_engine, autoflush=False)   # как в бою
     session = Session()
     try:
         yield session
@@ -99,3 +125,27 @@ def logged_in_client(client, web_db):
     web_db.commit()
     client.post("/login", data={"username": "admin", "password": "secret123"})
     return client
+
+
+@pytest.fixture(autouse=True)
+def _fresh_module_caches():
+    """Модульные кэши не должны переживать границу теста.
+
+    Их два, и оба существуют ради скорости на боевом масштабе: лента заказов в
+    `recalc` (одна выкачка на кабинет вместо одной на товар) и картина кластеров
+    в `platform_matching` (3,5 секунды сборки вместо неё на каждое нажатие
+    клавиши). Оба живут минутами, то есть заведомо дольше теста: без сброса
+    второй тест видел бы данные первого и падал бы в совершенно неожиданном
+    месте — так и случилось с обоими, каждый раз по разу.
+
+    На бою ту же роль играют явные события: `create_job` для ленты (новое
+    задание — новая картина) и загрузка каталога для кластеров.
+    """
+    from app.recalc import clear_orders_cache
+    from app.routers.platform_matching import clear_clusters_cache
+
+    clear_orders_cache()
+    clear_clusters_cache()
+    yield
+    clear_orders_cache()
+    clear_clusters_cache()

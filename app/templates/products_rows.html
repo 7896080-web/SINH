@@ -1,11 +1,14 @@
 <table class="pr-table">
     <thead>
         <tr>
-            <th></th>
-            <th>Артикул</th><th>Размер</th><th>Цвет</th><th>Наименование</th>
+            <th><input type="checkbox" id="pr-all" name="all_filtered" value="true"
+                       form="bulk-form"
+                       title="Выбрать ВСЕ товары текущего отбора — не только показанные строки"></th>
+            <th>Артикул</th><th class="pr-th-narrow">Размер</th><th class="pr-th-narrow">Цвет</th><th>Наименование</th>
             <th title="Из 1С, вручную не меняется">Остаток ЦС</th>
-            <th title="Держим у себя; только в автоматическом режиме">Резерв</th>
-            <th title="Постоянное расхождение учёта 1С и реального склада">Порог трансляции</th>
+            <th title="Бронь: держим у себя и не отдаём площадкам. Входит в расчёт порога.">Резерв (бронь)</th>
+            <th title="Дата, остаток ЦС на неё, факт и бронь — из них выводится порог">
+                Расчёт порога<div class="pr-hint">дата · ЦС · факт → порог</div></th>
             <th title="Главный выключатель товара">Трансляция</th>
             <th title="Итог уровня товара, до порогов кабинетов">Уходит</th>
             <th title="От неё стартует бэкфилл на «Тестировании»">Активно с</th>
@@ -14,6 +17,16 @@
         </tr>
     </thead>
     <tbody>
+        {# Два фильтра трансляции спрашивают об одном поле противоположное.
+           Отбор при этом честно пуст, но «Ничего не найдено» здесь — неправда
+           о каталоге: это ответ не про товары, а про сами фильтры. #}
+        {% if filters_contradict %}
+        <tr><td colspan="12">
+            <div class="pr-hint pr-hint--warn">«Только с включённой трансляцией» и
+            «только с выключенной» вместе не дают ничего: товар либо один, либо
+            другой. Снимите одну из галочек.</div>
+        </td></tr>
+        {% endif %}
         {% for row in rows %}
             {% include "products_row.html" %}
         {% else %}
@@ -26,3 +39,36 @@
         {% endif %}
     </tbody>
 </table>
+
+{# Фильтры уезжают в форму массовой правки ОТСЮДА, а не из шапки страницы: этот
+   фрагмент перерисовывается при каждом изменении фильтра, значит значения всегда
+   те, что оператор видит на экране. В шапке они оставались бы от прошлой полной
+   загрузки — и правка «по всему фильтру» применилась бы не к тому отбору. #}
+<input type="hidden" name="q" value="{{ q }}" form="bulk-form">
+{% if only_proposals %}<input type="hidden" name="only_proposals" value="true" form="bulk-form">{% endif %}
+{% if only_blocked %}<input type="hidden" name="only_blocked" value="true" form="bulk-form">{% endif %}
+{% if hide_size_u %}<input type="hidden" name="hide_size_u" value="true" form="bulk-form">{% endif %}
+{% if hide_zero_stock %}<input type="hidden" name="hide_zero_stock" value="true" form="bulk-form">{% endif %}
+{% if only_unfinished %}<input type="hidden" name="only_unfinished" value="true" form="bulk-form">{% endif %}
+{% if only_on_platform %}<input type="hidden" name="only_on_platform" value="true" form="bulk-form">{% endif %}
+{% if only_marked %}<input type="hidden" name="only_marked" value="true" form="bulk-form">{% endif %}
+{% if only_broadcasting %}<input type="hidden" name="only_broadcasting" value="true" form="bulk-form">{% endif %}
+{% if only_silent %}<input type="hidden" name="only_silent" value="true" form="bulk-form">{% endif %}
+
+{# Число строк отбора — отсюда его берёт счётчик «С отмеченными». Он обязан
+   называть ЧИСЛО, а не одно слово «весь отбор»: галочка в шапке переживает
+   смену фильтра, и без числа оператор не видит, что отбор под ней стал другим.
+   Значение приходит уже готовой строкой: при оборванном счёте `total`
+   отрицательный, и складывать этот знак в скрипт значило бы повторить правило
+   в двух местах. #}
+<span id="pr-total" hidden data-total="{% if total is defined %}{% if total < 0 %}{{ -total }}+{% else %}{{ total }}{% endif %}{% endif %}"></span>
+
+<div class="pr-allfilter">
+    Галочка в шапке таблицы выбирает <b>весь текущий отбор</b>
+    {% if total is defined %}— все {% if total < 0 %}{{ -total }}+{% else %}{{ total }}{% endif %}{% endif %},
+    а не только показанные строки. Массовая правка применится ко всем им.
+    {% if total is defined and (total > rows|length or total < 0) %}
+    <div class="pr-hint pr-hint--warn">Показано {{ rows|length }} — остальные под отбор
+        тоже попадают и тоже будут изменены, хотя их не видно.</div>
+    {% endif %}
+</div>

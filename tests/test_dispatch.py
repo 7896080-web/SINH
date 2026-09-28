@@ -121,6 +121,10 @@ def test_dispatch_uses_active_accounts_from_db_when_not_provided(db):
     account = make_account(db, warehouse_id="wh-1")
     db.add(Product(broadcast_enabled=True, uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
     db.add(Barcode(barcode="111", uid_1c="u1"))
+    # Отметка кабинета: запись очереди по НЕотмеченной паре в бою не
+    # появляется, а без неё рассылка справедливо не шлёт ничего —
+    # ноль на карточку, которой мы не касались, её обнуляет.
+    db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
     db.add(DispatchQueueItem(uid_1c="u1", account_id=account.id, quantity=5, reason="order"))
     db.commit()
 
@@ -138,6 +142,10 @@ def test_dispatch_enriches_platform_identifiers_from_catalog(db):
     account = make_account(db, platform=Platform.ozon, warehouse_id="wh-1")
     db.add(Product(broadcast_enabled=True, uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
     db.add(Barcode(barcode="111", uid_1c="u1"))
+    # Отметка кабинета: запись очереди по НЕотмеченной паре в бою не
+    # появляется, а без неё рассылка справедливо не шлёт ничего —
+    # ноль на карточку, которой мы не касались, её обнуляет.
+    db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
     db.add(PlatformCatalogItem(account_id=account.id, external_id="pid-9", barcode="111", article="OFR-9", name="Товар"))
     db.add(DispatchQueueItem(uid_1c="u1", account_id=account.id, quantity=5, reason="order"))
     db.commit()
@@ -157,6 +165,10 @@ def test_dispatch_without_catalog_leaves_identifiers_empty(db):
     account = make_account(db, warehouse_id="wh-1")
     db.add(Product(broadcast_enabled=True, uid_1c="u1", article="A1", name="Товар", stock_on_hand=5))
     db.add(Barcode(barcode="111", uid_1c="u1"))
+    # Отметка кабинета: запись очереди по НЕотмеченной паре в бою не
+    # появляется, а без неё рассылка справедливо не шлёт ничего —
+    # ноль на карточку, которой мы не касались, её обнуляет.
+    db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
     db.add(DispatchQueueItem(uid_1c="u1", account_id=account.id, quantity=5, reason="order"))
     db.commit()
 
@@ -189,6 +201,10 @@ def test_dispatch_reserve_ge_stock_sends_zero(db):
     account = make_account(db, warehouse_id="wh-1")
     db.add(Product(broadcast_enabled=True, uid_1c="u1", article="A1", name="Т", stock_on_hand=5, reserve=5))
     db.add(Barcode(barcode="111", uid_1c="u1"))
+    # Отметка кабинета: запись очереди по НЕотмеченной паре в бою не
+    # появляется, а без неё рассылка справедливо не шлёт ничего —
+    # ноль на карточку, которой мы не касались, её обнуляет.
+    db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
     db.add(DispatchQueueItem(uid_1c="u1", account_id=account.id, quantity=5, reason="order"))
     db.commit()
 
@@ -283,6 +299,10 @@ def test_dispatch_negative_stock_from_1c_sends_zero(db):
     account = make_account(db, warehouse_id="wh-1")
     db.add(Product(broadcast_enabled=True, uid_1c="u1", article="A1", name="Т", stock_on_hand=-3))
     db.add(Barcode(barcode="111", uid_1c="u1"))
+    # Отметка кабинета: запись очереди по НЕотмеченной паре в бою не
+    # появляется, а без неё рассылка справедливо не шлёт ничего —
+    # ноль на карточку, которой мы не касались, её обнуляет.
+    db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
     db.add(DispatchQueueItem(uid_1c="u1", account_id=account.id, quantity=-3, reason="reconciliation"))
     db.commit()
 

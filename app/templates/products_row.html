@@ -3,11 +3,11 @@
     <td><input type="checkbox" name="uids" value="{{ row.uid_1c }}" form="bulk-form"></td>
 
     <td class="mono">{{ row.article or '—' }}</td>
-    <td>{{ row.size or '' }}</td>
-    <td>{{ row.color or '' }}</td>
+    <td class="pr-th-narrow">{{ row.size or '' }}</td>
+    <td class="pr-th-narrow">{{ row.color or '' }}</td>
     <td>
         {{ row.name or '—' }}
-        {% if error and error_field not in ('reserve', 'offset', 'active_since') and not error_field.startswith('threshold:') %}
+        {% if error and error_field not in ('reserve', 'offset', 'active_since', 'base_date', 'fact', 'broadcast') and not error_field.startswith('threshold:') %}
             <div class="pr-error" role="alert">⚠ {{ error }}</div>
         {% endif %}
         {% if not row.has_barcode %}
@@ -41,26 +41,108 @@
         {{ field_error('reserve') }}
     </td>
 
-    <td>
-        <input type="number" value="{% if row.broadcast_offset is not none %}{{ row.broadcast_offset }}{% endif %}"
-               placeholder="—" class="pr-input"
-               hx-post="/products/{{ row.uid_1c }}/offset" hx-trigger="change"
-               hx-vals="js:{value: event.target.value}"
-               hx-target="#row-{{ row.uid_1c }}" hx-swap="outerHTML"
-               title="Постоянное расхождение между учётом 1С и реальным складом. Уходит max(0, остаток ЦС − порог). Пусто — порог не задан. Может быть отрицательным.">
+    <td class="pr-calcbox">
+        <div class="pr-status pr-status--{{ row.calc_status }}">
+            {% if row.calc_status == 'ready' %}✓ {% endif %}{{ row.calc_status_label }}
+        </div>
+        {% if row.calc_status == 'ready' and not row.broadcast_enabled %}
+            {# Отдельной строкой, а не внутри значка: значок не переносится, и эта
+               подсказка растягивала колонку на всю ширину, выдавливая «Размер» и
+               «Цвет» за край таблицы. #}
+            <div class="pr-hint">перемещения в 1С созданы — можно включать трансляцию</div>
+        {% endif %}
+        {% if row.broadcast_requested and not row.broadcast_enabled %}
+            {# Ожидание обязано быть видно: иначе строка выглядит просто
+               выключенной, и оператор включает её вторым заходом руками. #}
+            <div class="pr-hint">трансляция включится сама после расчёта (просьба из файла)</div>
+        {% endif %}
+        <div class="pr-calcrow">
+            <label>на дату</label>
+            <input type="date" value="{{ row.base_date.isoformat() if row.base_date else '' }}" class="pr-date"
+                   hx-post="/products/{{ row.uid_1c }}/base-date" hx-trigger="change"
+                   hx-vals="js:{value: event.target.value}"
+                   hx-target="#row-{{ row.uid_1c }}" hx-swap="outerHTML"
+                   title="Дата, на которую считается порог. Остаток ЦС на неё берётся из выгрузки 1С.">
+        </div>
+        {{ field_error('base_date') }}
+
+        {% if row.waiting_for_1c %}
+            <div class="pr-hint pr-hint--warn">ждём выгрузку 1С на {{ row.base_date.strftime('%d.%m.%Y') }}</div>
+            <div class="pr-hint">факт можно ввести сейчас — порог посчитается, как придёт ответ</div>
+        {% elif row.base_date %}
+            <div class="pr-calcrow">
+                <label>остаток ЦС</label>
+                <span class="mono pr-ro" title="Что 1С показала на эту дату. Товара не было в выгрузке — 0.">{{ row.base_stock }}</span>
+            </div>
+        {% endif %}
+
+        {% if row.base_date %}
+        <div class="pr-calcrow">
+            <label>факт</label>
+            <input type="number" min="0" class="pr-input"
+                   value="{% if row.fact_at_date is not none %}{{ row.fact_at_date }}{% endif %}"
+                   placeholder="{{ row.base_stock if row.base_stock is not none else '—' }}"
+                   hx-post="/products/{{ row.uid_1c }}/fact" hx-trigger="change"
+                   hx-vals="js:{value: event.target.value}"
+                   hx-target="#row-{{ row.uid_1c }}" hx-swap="outerHTML"
+                   title="Сколько лежало на складе НА САМОМ ДЕЛЕ на эту дату. Отличается от учёта — расхождение ниже перезапишется. Равен учёту — расхождение НЕ трогаем: это «мне нечего возразить цифре 1С», а не «склад сошёлся»; сказать второе можно, поставив расхождение 0.">
+        </div>
+        {{ field_error('fact') }}
+        {% endif %}
+
+        {# РАСХОЖДЕНИЕ — поле, а не подпись. Это ХРАНИМОЕ свойство товара
+           (`учёт 1С − сколько лежит на самом деле`), из которого складывается
+           порог; дата к нему отношения не имеет. Раньше оно выводилось из пары
+           «учёт − факт», то есть носителем была ДАТА: сменили её, факт стёрся,
+           расхождение исчезло, порог схлопнулся до брони, и наружу поехал
+           остаток, завышенный ровно на расхождение. 23.09 так схлопнулись пороги
+           у 62 товаров. #}
+        <div class="pr-calcrow">
+            <label>расхожд.</label>
+            <input type="number" class="pr-input"
+                   value="{% if row.stock_discrepancy is not none %}{{ row.stock_discrepancy }}{% endif %}"
+                   placeholder="не измерено"
+                   hx-post="/products/{{ row.uid_1c }}/discrepancy" hx-trigger="change"
+                   hx-vals="js:{value: event.target.value}"
+                   hx-target="#row-{{ row.uid_1c }}" hx-swap="outerHTML"
+                   title="Учёт 1С минус реальный склад. Плюс — в 1С числится больше, чем лежит; минус — на складе больше, чем знает 1С. Пусто — не измеряли; ноль — измеряли, склад сошёлся. Переживает любую смену даты расчёта.">
+        </div>
+        {{ field_error('discrepancy') }}
+
         {{ field_error('offset') }}
-        <details class="pr-calc">
-            <summary>посчитать</summary>
-            <form hx-post="/products/{{ row.uid_1c }}/offset"
-                  hx-target="#row-{{ row.uid_1c }}" hx-swap="outerHTML">
-                <label>учёт 1С на дату <input type="number" name="stock_at_date" class="pr-input"></label>
-                <label>реально на дату <input type="number" name="available" class="pr-input"></label>
-                <button type="submit" class="pr-mini">ОК</button>
-            </form>
-        </details>
+        <div class="pr-calcres">
+            {% if row.broadcast_offset is not none %}
+                порог <b>{{ row.broadcast_offset }}</b>
+                {% if row.stock_discrepancy is not none %}
+                    {# Порог называется СЛАГАЕМЫМИ, а не формулой от даты: только
+                       так видно, что именно изменит правка расхождения и что —
+                       правка брони. Факт в этой строке уже не участвует: он был
+                       способом ИЗМЕРИТЬ расхождение, а измеренное хранится само. #}
+                    <div class="pr-hint">
+                        расхождение <b>{{ row.stock_discrepancy }}</b> + бронь {{ row.reserve }}
+                    </div>
+                {% elif row.base_date and not row.waiting_for_1c %}
+                    {# Расхождение не измеряли: порог сводится к брони. Так стоят
+                       строки, настроенные до появления колонки, — трогать их
+                       молча нельзя, и объяснить надо тоже. #}
+                    <div class="pr-hint">расхождение не измерено — порог равен брони {{ row.reserve }}</div>
+                {% elif row.waiting_for_1c %}
+                    {# Дату сменили, 1С по новой ещё не ответила, а порог остался
+                       от прошлого расчёта: стирать его нельзя — это молча вернуло
+                       бы на площадки полный остаток. Но и называть его «заданным
+                       вручную» неправда: считали его мы, и на другую дату. #}
+                    <div class="pr-hint pr-hint--warn">от прошлого расчёта — ждём новый</div>
+                {% else %}
+                    <div class="pr-hint">задан вручную</div>
+                {% endif %}
+            {% else %}
+                <span class="pr-hint">порог не задан</span>
+            {% endif %}
+        </div>
     </td>
 
     <td>
+        {{ field_error('broadcast') }}
         <button type="button" class="{{ 'pr-on' if row.broadcast_enabled else 'pr-off' }}"
                 hx-post="/products/{{ row.uid_1c }}/broadcast"
                 hx-vals='{"enabled": "{{ 'false' if row.broadcast_enabled else 'true' }}"}'
@@ -111,18 +193,49 @@
                        title="Передавать этот товар в кабинет «{{ account.name }}».">
             {% endif %}
             <span class="pr-cab__name">{{ account.name }}</span>
-            <input type="number" value="{{ state.min_threshold }}" min="0" class="pr-input pr-input--tiny"
-                   hx-post="/products/{{ row.uid_1c }}/{{ account.id }}/threshold" hx-trigger="change"
-                   hx-vals="js:{min_threshold: event.target.value}"
-                   hx-target="#row-{{ row.uid_1c }}" hx-swap="outerHTML"
-                   title="Порог кабинета: если доступно не больше этого числа — уходит 0. 0 — выключен. Не применяется, когда задан порог трансляции.">
+            {# Поле «порог кабинета» с этой строки убрано. Оно применяется только в
+               автоматическом режиме, то есть при заданном пороге трансляции молчит —
+               и при этом стоит вплотную к расчётному числу, из-за чего туда вписывали
+               количество для трансляции. Сохранённое ненулевое значение по-прежнему
+               видно, и его можно снять: скрывать его было бы хуже, чем показывать. #}
+            {% if state.min_threshold %}
+                <span class="pr-thr {{ 'pr-thr--live' if state.threshold_active else 'pr-thr--idle' }}"
+                      title="{% if state.threshold_active %}Пока доступно не больше {{ state.min_threshold }} — на площадку уходит 0.{% else %}Не применяется: задан порог трансляции. Сработает, если порог трансляции сбросить.{% endif %}">
+                    порог кабинета {{ state.min_threshold }}{% if not state.threshold_active %} · не применяется{% endif %}
+                    <button type="button" class="pr-mini"
+                            hx-post="/products/{{ row.uid_1c }}/{{ account.id }}/threshold"
+                            hx-vals='{"min_threshold": "0"}'
+                            hx-target="#row-{{ row.uid_1c }}" hx-swap="outerHTML">снять</button>
+                </span>
+            {% endif %}
             {{ field_error('threshold:' ~ account.id) }}
             {% if not state.enabled %}
                 <span class="pr-hint">не передаётся</span>
+            {% elif state.blocked and state.potential and row.calc_status == 'ready' %}
+                {# Прогноз вместо нуля: оператор смотрит сюда перед включением,
+                   и «0, потому что выключено» не отвечает на его вопрос — ему
+                   нужно знать, какое число уйдёт, если нажать «Вкл».
+                   Только у ГОТОВОЙ строки: пока расчёт не закончен, это число
+                   считается от порога, оставшегося с другой даты, и обещает то,
+                   чего включать ещё нельзя. #}
+                <span class="pr-hint pr-hint--pending" title="{{ state.reason }}. {{ state.fix_hint }}">
+                    → <b>{{ state.potential }}</b> после включения</span>
+            {% elif state.blocked and not row.broadcast_enabled and row.calc_status != 'ready' %}
+                <span class="pr-hint" title="{{ row.calc_status_label }} — трансляцию включать рано">
+                    → после расчёта</span>
             {% elif state.blocked %}
                 <span class="pr-hint pr-hint--warn" title="{{ state.fix_hint }}">→ 0: {{ state.reason }}</span>
             {% else %}
                 <span class="pr-hint pr-hint--good">→ {{ state.quantity }}</span>
+            {% endif %}
+            {# Один физический товар под двумя артикулами 1С — на площадке это
+               ОДНА карточка, и рассылка отправляет туда сумму. Без этой строки
+               число выше выглядит тем, что лежит на витрине, а там другое:
+               человек сверяет строку с кабинетом и не сходится. #}
+            {% if state.shares_with %}
+                <span class="pr-hint pr-hint--warn"
+                      title="На эту карточку площадки ведут несколько товаров 1С: {{ state.shares_with|join(', ') }}. Остаток на витрине — их сумма.">
+                    на карточке ещё {{ state.shares_with|join(', ') }}{% if state.cell_total is not none %} — уходит {{ state.cell_total }}{% endif %}</span>
             {% endif %}
         </div>
         {% endfor %}

@@ -1,39 +1,60 @@
-from datetime import datetime
+import collections
+from datetime import datetime, timedelta
 from app.timeutils import now_utc
 
-from fastapi import APIRouter, Request, Depends
+from fastapi import APIRouter, Request, Depends, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
-from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 
 from app.database import get_db
+from app.templating import templates as shared_templates
 from app.dependencies import get_current_user
 from app.models import (
     PlatformAccount, WorkerHeartbeat, DispatchQueueItem, DispatchStatus,
-    FtpTask, FtpTaskStatus, MappingConflict, SyncAnomaly, AnomalyStatus, User,
+    Barcode, FtpTask, FtpTaskStatus, MappingConflict, Product, ReconciliationLog,
+    SyncAnomaly, AnomalyStatus, User,
 )
+from app.workers.ftp_channel import (MAX_REPOSTS, repost_enabled, resolve_stuck_task,
+                                     review_effect, tasks_needing_review)
 from app.workers.client_factory import build_client
 from app.workers.credentials import CredentialsMissing
 from app.workers.order_poller import poll_new_orders, poll_cancellations
 from app.workers.catalog_sync import load_platform_catalog
+from app.routers.platform_matching import clear_clusters_cache
 from app.workers.scheduler import PENDING_WAREHOUSE_NAME
 from app.audit import log_action
+from app.report import (CRITICAL as REPORT_CRITICAL, collect_findings,
+                        current_dispatch_errors)
+from app.transmit import enqueue_resend_all
 from app.flash import set_flash, pop_flash
 
 router = APIRouter()
-templates = Jinja2Templates(directory="app/templates")
+templates = shared_templates
+
+# Насколько старым должно быть расхождение сверки, чтобы кнопка его закрыла.
+# Сутки — ровно то окно, по которому отчёт показывает свежие: закрыть можно
+# только то, что отчёт уже не считает находкой, иначе команда гасила бы сигнал.
+CLOSE_RECONCILIATION_OLDER_THAN = timedelta(hours=24)
+# По сколько строк за раз и сколько порций за одно нажатие. Те же соображения,
+# что у `retention.CHUNK`: длинная транзакция блокирует запись всем остальным.
+CLOSE_RECONCILIATION_CHUNK = 500
+CLOSE_RECONCILIATION_MAX_CHUNKS = 200
 
 
-def _queue_counts(db: Session, account_id: int) -> dict:
+def _queue_counts(db: Session, account_id: int, errors: int | None = None) -> dict:
     dispatch_pending = db.query(DispatchQueueItem).filter(
         DispatchQueueItem.account_id == account_id, DispatchQueueItem.status == DispatchStatus.pending,
         DispatchQueueItem.is_test.is_(False),
     ).count()
-    dispatch_errors = db.query(DispatchQueueItem).filter(
-        DispatchQueueItem.account_id == account_id, DispatchQueueItem.status == DispatchStatus.error,
-        DispatchQueueItem.is_test.is_(False),
-    ).count()
+    # Считаем ТО ЖЕ, что показывает отчёт: последнюю запись пары товар+кабинет.
+    # Иначе счётчик набирает мёртвые строки от давно починенных дефектов и
+    # спорит с отчётом — на бою 20.09 он говорил «751» против «1 запись».
+    #
+    # Число приходит готовым: считать его здесь значило бы проходить всю очередь
+    # заново на КАЖДЫЙ кабинет, а их пять.
+    dispatch_errors = (errors if errors is not None
+                       else len(current_dispatch_errors(db, account_id)))
     # Записи, которые уже сорвались и ждут следующей попытки: сама по себе это не
     # ошибка (площадка отвечает не всегда), но растущее число — повод посмотреть
     # в last_error, пока попытки не исчерпались и запись не стала ошибкой.
@@ -70,32 +91,102 @@ def _heartbeat_for(db: Session, worker_name: str):
 def diagnostics_page(request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     accounts = db.query(PlatformAccount).order_by(PlatformAccount.platform, PlatformAccount.name).all()
 
+    # Один проход по очереди на всю страницу, а не на каждый кабинет.
+    errors_by_account = collections.Counter(
+        r.account_id for r in current_dispatch_errors(db))
+
     account_rows = []
     for account in accounts:
         hb = _heartbeat_for(db, f"poll_orders_account_{account.id}")
         account_rows.append({
             "account": account,
-            "queue": _queue_counts(db, account.id),
+            "queue": _queue_counts(db, account.id, errors_by_account[account.id]),
             "heartbeat": hb,
+            # Выгрузка каталога кабинета своим заданием и своей отметкой. Её тут
+            # не показывали вовсе, хотя обрыв выдачи защитным пределом страниц
+            # пишется именно в неё: снимок при этом выглядит свежим, а по нему
+            # считаются ключи отправки — chrtId у WB, variant_id у Kit, артикул
+            # у Ozon. В комментарии `job_catalog_poll` прямо стояло «Диагностика
+            # показывает именно его», и это было неправдой.
+            "catalog_heartbeat": _heartbeat_for(db, f"catalog_poll_account_{account.id}"),
         })
 
-    shared_workers = ["dispatch", "ftp_send", "ftp_receive", "reconciliation"]
+    # `reconciliation_applied` — рядом с `reconciliation` намеренно: первое говорит,
+    # когда сверка ЗАПУСКАЛАСЬ, второе — когда она в последний раз реально применила
+    # выгрузку 1С. Разъехавшиеся времена в этих двух строках означают, что 1С не
+    # отдаёт выгрузку, и остаток в приложении больше не сверяется со складом.
+    #
+    # `verify_stock` здесь тоже не было, а это единственная проверка, которая
+    # ловит перезапись наших остатков второй системой. Её тишину и её чистый
+    # результат отличить было неоткуда.
+    shared_workers = ["dispatch", "ftp_send", "ftp_receive", "reconciliation",
+                      "reconciliation_applied", "verify_stock", "backup",
+                      "retention", "alerts", "watchdog"]
     shared_heartbeats = [{"name": w, "hb": _heartbeat_for(db, w)} for w in shared_workers]
+
+    from app.alerts import configured_channels
+    alert_channels = configured_channels(db)
+
+    report_findings = collect_findings(db)
 
     global_stats = {
         "conflicts": db.query(MappingConflict).count(),
         "anomalies_new": db.query(SyncAnomaly).filter(
             SyncAnomaly.status == AnomalyStatus.new, SyncAnomaly.is_test.is_(False),
         ).count(),
-        "dispatch_errors_total": db.query(DispatchQueueItem).filter(DispatchQueueItem.status == DispatchStatus.error).count(),
+        "dispatch_errors_total": len(current_dispatch_errors(db)),
     }
 
     return templates.TemplateResponse(request, "diagnostics.html", {
         "request": request, "current_user": user, "active_page": "diagnostics",
         "account_rows": account_rows, "shared_heartbeats": shared_heartbeats,
         "global_stats": global_stats, "now": now_utc(),
+        "stuck_tasks": _stuck_rows(db),
+        "repost_enabled": repost_enabled(), "max_reposts": MAX_REPOSTS,
         "flash": pop_flash(request),
+        # Сводка отчёта о расхождениях — здесь, а не сам отчёт: «Диагностика»
+        # отвечает на вопрос «жива ли система», отчёт — «где она разошлась с
+        # реальностью». Смешать их значит получить страницу, которую читают по
+        # диагонали. Но оператор ходит СЮДА, поэтому одну строку со ссылкой
+        # показываем: иначе отчёт есть, а узнать о нём неоткуда.
+        "report_findings": report_findings,
+        "report_critical": sum(1 for f in report_findings if f.level == REPORT_CRITICAL),
+        "alert_channels": alert_channels,
     })
+
+
+def _stuck_rows(db: Session) -> list[dict]:
+    """Зависшие задания 1С с тем, что нужно человеку для решения: какой товар,
+    сколько штук, сколько висит и что ответила 1С."""
+    now = now_utc()
+    rows = []
+    for t in tasks_needing_review(db):
+        product = None
+        if t.barcode:
+            bc = db.query(Barcode).filter(Barcode.barcode == t.barcode).first()
+            if bc is not None:
+                product = db.query(Product).filter(Product.uid_1c == bc.uid_1c).first()
+        started = t.sent_at or t.created_at
+        # Направление ошибки зависит от КОМАНДЫ, и текст живёт в одном месте на
+        # всех читателей (`ftp_channel.review_effect`): четыре текста про одну
+        # сущность уже расходились между собой, и человек, читающий их буквально,
+        # перестаёт верить всем четырём.
+        effect = review_effect(t)
+        rows.append({
+            "task": t,
+            "product": product,
+            "age_hours": round((now - started).total_seconds() / 3600, 1) if started else None,
+            # У возврата кабинета НЕТ и быть не может: оприходование идёт на ЦС,
+            # ИП к документу отношения не имеет. Печатать тут «None» значит
+            # показывать человеку сбой там, где всё в порядке.
+            "account": (t.account.name if t.account else
+                        (t.platform.value.upper() if t.platform else "—")),
+            "effect": effect["effect"],
+            # Что произойдёт по кнопке «документа нет» и о чём предупредить.
+            "no_document_effect": effect["no_document_effect"],
+            "warning": effect["warning"],
+        })
+    return rows
 
 
 @router.post("/diagnostics/accounts/{account_id}/test-connection")
@@ -122,6 +213,98 @@ def test_connection(
     db.commit()
 
     set_flash(request, f"«{account.name}»: {message}", "good" if ok else "warn")
+    return RedirectResponse("/diagnostics", status_code=303)
+
+
+@router.post("/diagnostics/resend-all")
+def resend_all(
+    request: Request,
+    db: Session = Depends(get_db), user: User = Depends(get_current_user),
+):
+    """Поставить в очередь текущий остаток по ВСЕМ транслируемым товарам.
+
+    Рассылка событийная: отправив число, она считает его доставленным и сама к
+    нему не возвращается. Если на площадке наше число кто-то перетёр — а именно
+    это делала вторая система во время перехода, — сдвинуть её картину нечем:
+    событий по товару больше не будет, остаток-то не менялся. Эта команда и есть
+    такое событие, поставленное руками.
+
+    Ничего не обходит: каждая пара идёт через те же гейты, что и обычная
+    доотправка. Товар без включённой трансляции и кабинет, которого не касался
+    расчёт, в очередь не попадут — по ним ушёл бы ноль и обнулил живую карточку.
+
+    Отправляет не сразу: кладёт в очередь, дальше её разбирает штатный цикл
+    рассылки. Так команда не зависит от доступности площадки в момент нажатия, а
+    сбой отправки повторяется обычным порядком.
+    """
+    stats = enqueue_resend_all(db)
+    log_action(db, user.username, "resend_all",
+               f"переотправка: товаров {stats['products']}, записей {stats['queued']}")
+    db.commit()
+
+    if not stats["queued"]:
+        set_flash(request, "Переотправлять нечего: ни по одному транслируемому товару "
+                           "нет кабинета, покрытого расчётом.", "warn")
+    else:
+        set_flash(request, f"В очередь поставлено {stats['queued']} записей "
+                           f"по {stats['products']} товарам — уйдут ближайшими "
+                           f"циклами рассылки.", "good")
+    return RedirectResponse("/diagnostics", status_code=303)
+
+
+@router.post("/diagnostics/close-old-reconciliation")
+def close_old_reconciliation(
+    request: Request,
+    db: Session = Depends(get_db), user: User = Depends(get_current_user),
+):
+    """Закрыть старые расхождения сверки, которые ждут решения, которого нет.
+
+    До сентябрьской правки крупная разница с 1С помечалась `needs_review` и
+    ждала ручного решения. Теперь сверка применяет ЛЮБОЕ движение склада сама и
+    ставит `resolved` тут же — то есть решать эти строки некому и незачем: по
+    ним остаток давно переписан, а сами они остались висеть. 20.09 на бою таких
+    было 909 штук от 14–16.09.
+
+    Трогаем ТОЛЬКО журнальную пометку и ТОЛЬКО у старых записей. Остатки,
+    очередь и площадки эта команда не касается вовсе: расхождения, по которым и
+    правда стоит разобраться, отчёт показывает по свежим записям за сутки, и
+    порог `RECONCILIATION_WINDOW` тут не при чём — свежие сюда не попадут.
+    """
+    cutoff = now_utc() - CLOSE_RECONCILIATION_OLDER_THAN
+    # ПОРЦИЯМИ, а не одной транзакцией на всю выборку. Раньше кнопка поднимала в
+    # память ORM-объекты по каждой подходящей строке и обновляла их одним
+    # коммитом: замер на 250 тысячах строк — 3,8 с на загрузку, 10,9 с на
+    # обновление, 857 МБ памяти, и всё это время писать в базу не может никто —
+    # ни рассылка, ни приём заказов, ни приём ответов 1С. За `busy_timeout` в
+    # тридцать секунд следует `database is locked`, нигде не перехваченный.
+    # Атомарность тут не нужна: каждая строка независима, недоделанное доделает
+    # следующее нажатие.
+    closed = 0
+    for _ in range(CLOSE_RECONCILIATION_MAX_CHUNKS):
+        ids = [row[0] for row in db.query(ReconciliationLog.id).filter(
+            ReconciliationLog.resolved.is_(False),
+            ReconciliationLog.checked_at < cutoff,
+        ).limit(CLOSE_RECONCILIATION_CHUNK).all()]
+        if not ids:
+            break
+        db.query(ReconciliationLog).filter(ReconciliationLog.id.in_(ids)).update(
+            {ReconciliationLog.resolved: True}, synchronize_session=False)
+        db.commit()
+        closed += len(ids)
+
+    log_action(db, user.username, "reconciliation_closed_old",
+               f"закрыто старых расхождений сверки: {closed}")
+    db.commit()
+
+    if not closed:
+        set_flash(request, "Старых расхождений сверки нет — закрывать нечего.", "good")
+    else:
+        tail = ""
+        if closed >= CLOSE_RECONCILIATION_CHUNK * CLOSE_RECONCILIATION_MAX_CHUNKS:
+            tail = (" Это предел за одно нажатие — строки могли остаться, "
+                    "нажмите ещё раз.")
+        set_flash(request, f"Закрыто старых расхождений сверки: {closed}. "
+                           f"Остатки не тронуты — это пометка в журнале.{tail}", "good")
     return RedirectResponse("/diagnostics", status_code=303)
 
 
@@ -164,15 +347,82 @@ def catalog_now(
     try:
         client = build_client(db, account_id)
         stats = load_platform_catalog(db, client, account)
+        # Картина кластеров на «Сопоставлении площадок» собрана по СТАРОМУ
+        # каталогу — после загрузки она врёт. Минута ожидания тут была бы
+        # особенно обидной: человек нажал «Загрузить каталог» ровно затем, чтобы
+        # увидеть новое.
+        clear_clusters_cache()
         log_action(db, user.username, "manual_catalog_sync", f"{account.name}: {stats}")
         db.commit()
-        set_flash(request, f"«{account.name}»: загружено {stats['fetched']} карточек, новых конфликтов {stats['new_conflicts']}.", "good")
+        done = (f"«{account.name}»: загружено {stats['fetched']} карточек, "
+                f"новых конфликтов {stats['new_conflicts']}.")
+        if stats.get("truncated"):
+            # См. тот же случай в `mapping.mapping_load_catalog`: зелёное
+            # «загружено N» на обрезанной выгрузке оставляет человека в
+            # уверенности, что каталог полон, — а по не попавшим карточкам
+            # остаток уйдёт не тем ключом или не уйдёт вовсе.
+            set_flash(request, done + " ВЫГРУЗКА ОБОРВАНА защитным пределом "
+                                      "страниц — снимок неполон.", "warn")
+        else:
+            set_flash(request, done, "good")
     except CredentialsMissing as e:
         set_flash(request, f"«{account.name}»: {e}", "warn")
     except Exception as e:
         set_flash(request, f"«{account.name}»: ошибка при загрузке каталога — {e}", "warn")
 
     return RedirectResponse("/diagnostics", status_code=303)
+
+
+@router.post("/diagnostics/alerts/test")
+def send_test_alert(
+    request: Request,
+    db: Session = Depends(get_db), user: User = Depends(get_current_user),
+):
+    """Отправить пробное уведомление по настроенным каналам.
+
+    Канал, который не проверили, — это надежда, а не канал: ровно то же уже
+    проходили с бэкапом, который снимался, но никогда не проверялся чтением.
+    Опечататься в токене бота или пароле почты проще простого, а узнать об
+    ошибке иначе можно было бы только в тот час, когда случилась настоящая
+    поломка, — то есть в худший из возможных.
+
+    Шлёт СРАЗУ и мимо всей дедупликации: это проверка связи, а не тревога, и
+    запоминать её как «последнюю сообщённую картину» нельзя — иначе настоящая
+    тревога следом сочлась бы повтором и не ушла.
+    """
+    from app.alerts import configured_channels, deliver
+
+    channels = configured_channels(db)
+    if not channels:
+        set_flash(request,
+                  "Каналы уведомлений не настроены: система никого не позовёт. "
+                  "Заполните Telegram или почту на странице «Уведомления».",
+                  "warn")
+        return RedirectResponse("/diagnostics#workers", status_code=303)
+
+    sent, failed = deliver(
+        db,
+        "[Sync Admin] Проверка связи",
+        "Это пробное сообщение, отправленное со страницы «Диагностика».\n"
+        "Настоящие уведомления приходят, только когда система встала или "
+        "разошлась с реальностью.",
+    )
+    log_action(db, user.username, "alert_test_sent",
+               f"доставлено: {', '.join(sent) or 'никуда'}; "
+               f"отказов: {len(failed)}")
+    db.commit()
+
+    if failed and not sent:
+        set_flash(request, "Уведомление НЕ доставлено ни по одному каналу. "
+                           + "; ".join(failed), "warn")
+    elif failed:
+        set_flash(request, f"Доставлено: {', '.join(sent)}. "
+                           f"Не доставлено — {'; '.join(failed)}", "warn")
+    else:
+        set_flash(request, f"Пробное уведомление отправлено: {', '.join(sent)}. "
+                           f"Если оно не пришло, проверьте адресата на странице "
+                           f"«Уведомления».", "good")
+    return RedirectResponse("/diagnostics#workers", status_code=303)
 
 
 @router.post("/diagnostics/accounts/{account_id}/reset-failures")
@@ -182,9 +432,31 @@ def reset_failures(
 ):
     """Сбрасывает счётчик автоотключения вручную — например, после того как
     оператор поправил ключи и хочет дать кабинету новый шанс немедленно,
-    не дожидаясь первого успешного цикла."""
+    не дожидаясь первого успешного цикла.
+
+    ПОГАШЕННОМУ кабинету кнопка отказывает. Она гасила единственный сигнал о
+    нём, ничего не чиня: `is_active` не трогала, а `_check_breaker_disabled`
+    требует ОБОИХ признаков — выключен И счётчик ненулевой. После нажатия
+    критичная находка исчезала навсегда: у выключенного кабинета per-account
+    задание снято, счётчик больше никто не увеличит, `/health` выключенные
+    кабинеты пропускает намеренно. Кабинет неделями не опрашивался бы при полной
+    тишине — а продажи по нему идут.
+
+    Убрать из находки второе условие было нельзя: без него в неё попал бы и
+    кабинет, выключенный человеком осознанно, и отчёт стал бы вечно красным.
+    Поэтому чинится здесь: включают кабинет на «API-ключах», и там же
+    (`activate_account`) счётчик сбрасывается заодно — одним действием и с
+    понятным следствием.
+    """
     account = db.query(PlatformAccount).filter(PlatformAccount.id == account_id).first()
     if account is None:
+        return RedirectResponse("/diagnostics", status_code=303)
+    if not account.is_active:
+        set_flash(request,
+                  f"«{account.name}» отключён предохранителем — сброс счётчика его "
+                  f"не включит, а единственную находку отчёта о нём погасит. "
+                  f"Включите кабинет на странице «API-ключи»: счётчик сбросится там же.",
+                  "warn")
         return RedirectResponse("/diagnostics", status_code=303)
 
     account.consecutive_failures = 0
@@ -193,4 +465,52 @@ def reset_failures(
     db.commit()
 
     set_flash(request, f"Счётчик сбоев для «{account.name}» сброшен.", "good")
+    return RedirectResponse("/diagnostics", status_code=303)
+
+
+@router.post("/diagnostics/stuck-tasks/{task_id}/resolve")
+def resolve_stuck(
+    request: Request, task_id: int, document_exists: str = Form(""),
+    db: Session = Depends(get_db), user: User = Depends(get_current_user),
+):
+    """Разбор зависшего задания решением человека, посмотревшего в 1С.
+
+    Два исхода различаются не формулировкой, а последствием для остатка, поэтому
+    флаг обязателен и не имеет умолчания: «документ создан» просто закрывает
+    задание, «документа нет» ВОЗВРАЩАЕТ единицу в наш остаток. Пустое или
+    неизвестное значение — отказ, а не догадка.
+    """
+    task = db.query(FtpTask).filter(FtpTask.id == task_id).first()
+    if task is None:
+        set_flash(request, "Задание не найдено.", "warn")
+        return RedirectResponse("/diagnostics", status_code=303)
+    if task.status not in (FtpTaskStatus.timeout, FtpTaskStatus.failed):
+        set_flash(request, "Задание уже закрыто — разбирать нечего.", "info")
+        return RedirectResponse("/diagnostics", status_code=303)
+    if document_exists not in ("yes", "no"):
+        set_flash(request, "Не указано, есть ли документ в 1С.", "warn")
+        return RedirectResponse("/diagnostics", status_code=303)
+
+    exists = document_exists == "yes"
+    resolve_stuck_task(db, task, exists, user.username)
+    log_action(db, user.username, "stuck_task_resolved",
+               f"#{task.id} {task.command} заказ {task.order_id}: "
+               f"документ в 1С {'найден' if exists else 'НЕ найден'}")
+    db.commit()
+
+    if exists:
+        set_flash(request, f"Задание #{task.id} закрыто как проведённое.", "good")
+    else:
+        # Направление зависит от КОМАНДЫ, и этого условия здесь не было вовсе:
+        # текст был собран по созданию и обещал «вернутся в остаток» всегда. У
+        # отмены всё наоборот — открытое `CANCEL_MOVEMENT` считается «в пути» со
+        # знаком минус, то есть остаток сейчас ЗАВЫШЕН, и закрытие его уменьшит.
+        # Оператор, читающий сообщение буквально, получал прямо противоположное
+        # тому, что произошло. Формулировку берём ту же, что печатает карточка
+        # «Диагностики» (`_stuck_rows`), чтобы три текста про одно и то же не
+        # расходились между собой.
+        set_flash(request, f"Задание #{task.id} ({task.command}) закрыто: "
+                           f"документа в 1С нет. "
+                           f"{review_effect(task)['no_document_effect'].capitalize()}.",
+                  "warn")
     return RedirectResponse("/diagnostics", status_code=303)

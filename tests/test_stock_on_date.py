@@ -15,7 +15,7 @@ import pytest
 
 from app.models import (Barcode, DispatchQueueItem, Product, StockDateRow, StockDateSnapshot,
                         StockDateStatus, SyncSetting)
-from app.timeutils import now_utc
+from app.timeutils import now_utc, today_local
 from app.workers.ftp_channel import (LocalExchange, MAX_DATE_REQUESTS_PER_BATCH,
                                      STOCK_ON_DATE_TIMEOUT_MINUTES, apply_stock_on_date_files,
                                      build_task_batch, detect_timed_out_stock_date_requests,
@@ -345,7 +345,7 @@ def test_bad_date_is_refused_with_a_message(logged_in_client, web_db):
 
 
 def test_future_date_is_refused(logged_in_client, web_db):
-    tomorrow = (now_utc().date() + timedelta(days=1)).isoformat()
+    tomorrow = (today_local() + timedelta(days=1)).isoformat()
 
     r = logged_in_client.post("/stock-on-date/request", data={"value": tomorrow},
                               follow_redirects=True)
@@ -411,3 +411,56 @@ def test_export_gives_an_xlsx(logged_in_client, web_db):
 
 def test_unknown_snapshot_id_does_not_crash_the_page(logged_in_client, web_db):
     assert logged_in_client.get("/stock-on-date", params={"snapshot_id": "мусор"}).status_code == 200
+
+
+# --------------------------------------------------- порог считается при приёме файла
+
+def test_arriving_file_computes_the_threshold_for_waiting_products(db, tmp_path):
+    """Сквозная проверка связки: оператор задал дату заранее, 1С ответила файлом —
+    порог обязан посчитаться прямо здесь.
+
+    Без этого массовая простановка даты не работала бы вовсе: ответ 1С идёт до
+    десяти минут, и расчёт застревал бы до тех пор, пока каждую из 152 тысяч
+    строк не тронут руками.
+    """
+    from app.offset_base import set_base_date
+
+    exchange = _exchange(tmp_path)
+    snapshot = _request(db, status=StockDateStatus.sent)
+    product = Product(uid_1c="u1", article="A-1", name="Джинсы", stock_on_hand=9,
+                      reserve=2, broadcast_enabled=True)
+    db.add(product)
+    db.commit()
+    # Порядок: сначала дата, потом факт. Смена даты стирает факт — он всегда
+    # «факт на дату», и число, пересчитанное на другое число, к делу не относится.
+    set_base_date(db, product, date(2026, 8, 7))
+    product.fact_at_date = 5
+    db.commit()
+    assert product.broadcast_offset is None        # ответа ещё нет — считать не из чего
+
+    _result_file(exchange, "ondate_20260807_20260908121314.txt", ROW)   # u1 -> 7
+    apply_stock_on_date_files(db, exchange)
+
+    db.refresh(product)
+    assert product.offset_base_stock == 7
+    assert product.broadcast_offset == 4           # 7 − (5 − 2)
+
+
+def test_arriving_file_does_not_touch_the_current_stock(db, tmp_path):
+    """Граница, ради которой выгрузка на дату живёт отдельно, от нового расчёта
+    не сдвигается: остаток товара — по-прежнему «сейчас», а не «на дату»."""
+    from app.offset_base import set_base_date
+
+    exchange = _exchange(tmp_path)
+    _request(db, status=StockDateStatus.sent)
+    product = Product(uid_1c="u1", article="A-1", name="Джинсы", stock_on_hand=9,
+                      reserve=0, broadcast_enabled=True)
+    db.add(product)
+    db.commit()
+    set_base_date(db, product, date(2026, 8, 7))
+
+    _result_file(exchange, "ondate_20260807_20260908121314.txt", ROW)   # u1 -> 7
+    apply_stock_on_date_files(db, exchange)
+
+    db.refresh(product)
+    assert product.stock_on_hand == 9              # НЕ 7

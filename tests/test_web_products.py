@@ -172,13 +172,68 @@ def test_clear_legacy_override(logged_in_client, web_db):
     assert web_db.query(Product).first().transmit_override is None
 
 
+def _ready_for_broadcast(web_db, uid="u1", account=None):
+    """Строка, доведённая до «актуализирован»: кабинет отмечен, дата задана, 1С
+    ответила, факт подтверждён, расчёт прошёл и покрыл этот кабинет.
+
+    Трансляция включается только с этого состояния — правило «сначала расчёт,
+    потом трансляция». Раньше включить можно было что угодно и когда угодно, и
+    строка ZJYM269002 XL показала, чем это кончается: «ждём 1С», а рядом
+    «→ 21 после включения» от порога, оставшегося с другой даты.
+    """
+    from datetime import date as _date
+
+    from app.timeutils import now_utc
+
+    account = account or _accounts(web_db, (Platform.wb, "WB-1"))[0]
+    _sync(web_db, uid, account)
+    product = web_db.query(Product).filter(Product.uid_1c == uid).one()
+    product.offset_base_date = _date(2026, 8, 7)
+    product.offset_base_stock = 10
+    product.fact_at_date = 10
+    product.recalc_done_at = now_utc()
+    product.recalc_account_ids = str(account.id)
+    web_db.commit()
+    return account
+
+
 def test_broadcast_toggle(logged_in_client, web_db):
     _product(web_db, broadcast=False)
+    _ready_for_broadcast(web_db)
+
     logged_in_client.post("/products/u1/broadcast", data={"enabled": "true"})
     web_db.expire_all()
     assert web_db.query(Product).first().broadcast_enabled is True
 
     logged_in_client.post("/products/u1/broadcast", data={"enabled": "false"})
+    web_db.expire_all()
+    assert web_db.query(Product).first().broadcast_enabled is False
+
+
+def test_broadcast_cannot_be_switched_on_before_the_catch_up(logged_in_client, web_db):
+    """Ровно случай ZJYM269002 XL: расчёта не было, 1С на новую дату не ответила,
+    а порог остался с прошлой — включение отправило бы на площадки остаток,
+    не сверенный ни с чем."""
+    _product(web_db, broadcast=False, offset=0)
+    account = _accounts(web_db, (Platform.wb, "WB-1"))[0]
+    _sync(web_db, "u1", account)
+
+    r = logged_in_client.post("/products/u1/broadcast", data={"enabled": "true"})
+
+    web_db.expire_all()
+    assert web_db.query(Product).first().broadcast_enabled is False
+    assert "Включать трансляцию рано" in r.text
+
+
+def test_switching_broadcast_off_is_never_blocked(logged_in_client, web_db):
+    """Снять с трансляции должно быть можно всегда: товар мог начать
+    транслироваться до того, как появилось это правило."""
+    _product(web_db, broadcast=True)
+    account = _accounts(web_db, (Platform.wb, "WB-1"))[0]
+    _sync(web_db, "u1", account)
+
+    logged_in_client.post("/products/u1/broadcast", data={"enabled": "false"})
+
     web_db.expire_all()
     assert web_db.query(Product).first().broadcast_enabled is False
 
@@ -309,7 +364,10 @@ def test_export_contains_new_columns(logged_in_client, web_db):
     assert values["Уходит на площадки"] == 18
 
 
-def test_import_updates_offset_broadcast_and_cabinets(logged_in_client, web_db):
+def test_import_sets_the_manual_offset_and_the_cabinet(logged_in_client, web_db):
+    """Товар без даты расчёта: порог у него живёт как введённое руками число, и
+    файл его задаёт. Трансляцию такому товару не включить ни отсюда, ни со
+    страницы — расчёт не начат, и остаток ничем не сверен."""
     a1, = _accounts(web_db, (Platform.wb, "WB-1"))
     _product(web_db, stock=29, broadcast=False)
 
@@ -317,8 +375,8 @@ def test_import_updates_offset_broadcast_and_cabinets(logged_in_client, web_db):
     from openpyxl import Workbook
     wb = Workbook()
     ws = wb.active
-    ws.append(["ID_1С", "Резерв", "Порог трансляции", "Трансляция", "WB-1 (WB) — Синхронизировать", "WB-1 (WB) — Порог"])
-    ws.append(["u1", 0, 11, "Да", "Да", 0])
+    ws.append(["ID_1С", "Резерв", "Порог трансляции", "WB-1 (WB) — Синхронизировать", "WB-1 (WB) — Порог"])
+    ws.append(["u1", 0, 11, "Да", 0])
     buf = io.BytesIO()
     wb.save(buf)
 
@@ -328,7 +386,41 @@ def test_import_updates_offset_broadcast_and_cabinets(logged_in_client, web_db):
     web_db.expire_all()
     p = web_db.query(Product).first()
     assert p.broadcast_offset == 11
-    assert p.broadcast_enabled is True
+    assert web_db.query(SyncSetting).first().enabled is True
+
+
+def test_import_switches_broadcast_on_for_a_calculated_product(logged_in_client, web_db):
+    """Полный сценарий массовой настройки: файлом отмечают кабинет И включают
+    трансляцию. Кабинеты поэтому разбираются РАНЬШЕ «Трансляции» — гейт
+    включения спрашивает, есть ли отмеченный кабинет, покрытый расчётом, и при
+    обратном порядке такой файл всегда упирался бы в отказ."""
+    from datetime import date
+
+    from app.timeutils import now_utc
+
+    a1, = _accounts(web_db, (Platform.wb, "WB-1"))
+    product = _product(web_db, stock=29, broadcast=False)
+    product.offset_base_date = date(2026, 9, 1)
+    product.offset_base_stock = 30
+    product.fact_at_date = 30
+    product.recalc_done_at = now_utc()
+    product.recalc_account_ids = str(a1.id)
+    web_db.commit()
+
+    import io
+    from openpyxl import Workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["ID_1С", "Трансляция", "WB-1 (WB) — Синхронизировать", "WB-1 (WB) — Порог"])
+    ws.append(["u1", "Да", "Да", 0])
+    buf = io.BytesIO()
+    wb.save(buf)
+
+    logged_in_client.post("/products/import",
+                          files={"file": ("p.xlsx", buf.getvalue(),
+                                          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
+    web_db.expire_all()
+    assert web_db.query(Product).first().broadcast_enabled is True
     assert web_db.query(SyncSetting).first().enabled is True
 
 

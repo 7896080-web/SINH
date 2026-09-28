@@ -9,18 +9,213 @@
     </div>
 </div>
 
-<div class="card">
+<div class="card" id="findings">
+    <h3 style="margin-top:0">
+        Расхождения
+        {% if report_critical %}
+            <span class="badge badge--bad">критичных {{ report_critical }}</span>
+        {% elif report_findings %}
+            <span class="badge badge--warn">{{ report_findings|length }}</span>
+        {% else %}
+            <span class="badge badge--good">нет</span>
+        {% endif %}
+    </h3>
+    {% if report_findings %}
+    <ul style="margin:0 0 10px; padding-left:18px">
+        {% for f in report_findings[:5] %}
+        <li>{{ f.title }}</li>
+        {% endfor %}
+    </ul>
+    {% if report_findings|length > 5 %}
+        <p class="help-text">…и ещё {{ report_findings|length - 5 }}.</p>
+    {% endif %}
+    {% else %}
+    <p class="help-text" style="margin-top:0">
+        Очереди не стоят, задания 1С закрываются, каталоги свежие, разбирать нечего.
+    </p>
+    {% endif %}
+    <p style="margin-bottom:0"><a href="/report">Полный отчёт о расхождениях →</a></p>
+</div>
+
+<div class="card" id="resend">
+    <h3 style="margin-top:0">Переотправка остатков</h3>
+    <p class="help-text" style="margin-top:0">
+        Ставит в очередь текущий остаток по всем транслируемым товарам и всем
+        отмеченным у них кабинетам. Нужна, когда на площадке наше число кто-то
+        перетёр: рассылка событийная и сама к отправленному не возвращается —
+        событий по товару больше не будет, пока не изменится остаток.
+        Гейты те же, что обычно: товар без трансляции и кабинет, которого не
+        касался расчёт, не поедут. Отправка пойдёт ближайшими циклами, не сразу.
+    </p>
+    <form method="post" action="/diagnostics/resend-all" style="margin-bottom:0"
+          onsubmit="return confirm('Поставить в очередь текущий остаток по всем транслируемым товарам?');">
+        <button type="submit">Переотправить остаток на площадки</button>
+    </form>
+</div>
+
+<div class="card" id="reconciliation">
+    <h3 style="margin-top:0">Старые расхождения сверки</h3>
+    <p class="help-text" style="margin-top:0">
+        До сентябрьской правки крупная разница с 1С помечалась «ждёт решения» и
+        висела, пока человек не разберёт. Теперь сверка применяет любое движение
+        склада сама и закрывает запись тут же — то есть решать старые строки
+        некому и незачем: остаток по ним давно переписан. Кнопка закрывает те,
+        что старше суток. Остатки, очередь и площадки она не трогает — это
+        пометка в журнале.
+    </p>
+    <p class="help-text" style="margin-top:0">
+        <b>Находку «Крупных расхождений со складом 1С за сутки» она не гасит</b>
+        — и не должна: кнопка берёт то, что старше суток, а находка показывает
+        последние сутки. Эти две вещи не пересекаются намеренно. Свежие крупные
+        разницы разбирают не здесь, а в 1С: остаток по ним уже переписан по 1С,
+        вопрос в том, почему склад разошёлся.
+    </p>
+    <form method="post" action="/diagnostics/close-old-reconciliation" style="margin-bottom:0"
+          onsubmit="return confirm('Закрыть расхождения сверки старше суток? Остатки не изменятся.');">
+        <button type="submit">Закрыть старые расхождения</button>
+    </form>
+</div>
+
+<div class="card" id="overview">
     <h3 style="margin-top:0">Общая картина</h3>
-    <table>
+    <div class="table-scroll"><table>
         <tr><td>Конфликтов сопоставления</td><td class="mono" style="text-align:right">{{ global_stats.conflicts }}</td></tr>
         <tr><td>Необработанных аномалий</td><td class="mono" style="text-align:right">{{ global_stats.anomalies_new }}</td></tr>
         <tr><td>Ошибок в очереди рассылки</td><td class="mono" style="text-align:right">{{ global_stats.dispatch_errors_total }}</td></tr>
-    </table>
+    </table></div>
 </div>
 
-<div class="card">
+<div class="card" id="stuck-tasks">
+    <h3 style="margin-top:0">Зависшие задания 1С — нужен разбор</h3>
+    {% if stuck_tasks %}
+    <p class="help-text" style="margin-top:0">
+        1С забрала файл задания и не ответила по нему — ни «OK», ни «ERROR».
+        Пока задание не закрыто, его количество считается «в пути». Направление
+        ошибки зависит от команды и указано в каждой строке: незакрытое
+        <span class="mono">CREATE_MOVEMENT</span> ЗАНИЖАЕТ остаток (наружу уходит
+        меньше, чем есть), а незакрытое <span class="mono">CANCEL_MOVEMENT</span> —
+        наоборот ЗАВЫШАЕТ, и это уже риск оверселла.
+        {% if repost_enabled %}
+            Автоматически повторяем до {{ max_reposts }} раз; строки ниже предел уже исчерпали.
+        {% else %}
+            Автоповтор <strong>выключен</strong> (нет идемпотентности в 1С по номеру заказа),
+            поэтому разбирать нужно руками.
+        {% endif %}
+    </p>
+    <p class="help-text">
+        <strong>Как решить:</strong> в 1С открыть список «Перемещение товаров», отбор по
+        Комментарию → «содержит» → вставить строку <span class="mono">order_id=…</span> из
+        нужной строки ниже. Нашёлся проведённый документ — «1С документ создала».
+        Не нашёлся — «документа нет», но сперва убедитесь, что товар физически на складе:
+        эта кнопка вернёт его количество в остаток.
+    </p>
+    <div class="table-scroll"><table>
+        <thead><tr>
+            <th>Товар</th><th>Кабинет</th><th style="text-align:right">Кол-во</th>
+            <th style="text-align:right">Висит</th><th>Ответ 1С</th><th>Решение</th>
+        </tr></thead>
+        <tbody>
+        {% for row in stuck_tasks %}
+            <tr>
+                <td>
+                    {% if row.product %}
+                        {{ row.product.article }} · {{ row.product.size }} · {{ row.product.color }}
+                    {% else %}
+                        <span class="help-text">товар по баркоду не найден</span>
+                    {% endif %}
+                    <div class="help-text mono">
+                        {{ row.task.barcode }}{% if row.task.warehouse_to %} → {{ row.task.warehouse_to }}{% endif %}
+                        · {{ row.task.command }}
+                    </div>
+                    <div class="help-text">{{ row.effect }}</div>
+                    <div class="help-text">
+                        искать в 1С по комментарию:
+                        <span class="mono">order_id={{ row.task.order_id }}</span>
+                    </div>
+                    {% if row.task.batch_filename %}
+                    <div class="help-text mono">файл задания: {{ row.task.batch_filename }}</div>
+                    {% endif %}
+                </td>
+                <td>{{ row.account }}</td>
+                <td class="mono" style="text-align:right">{{ row.task.quantity }}</td>
+                <td class="mono" style="text-align:right">
+                    {% if row.age_hours is not none %}{{ row.age_hours }} ч{% else %}—{% endif %}
+                    {% if row.task.repost_count %}
+                    <div class="help-text">повторов: {{ row.task.repost_count }}</div>
+                    {% endif %}
+                </td>
+                <td>
+                    {% if row.task.status.value == 'failed' %}
+                        <span class="badge badge--bad">ERROR</span>
+                        <div class="help-text">{{ row.task.result_detail }}</div>
+                    {% else %}
+                        <span class="badge badge--bad">ответа нет</span>
+                    {% endif %}
+                </td>
+                <td style="white-space:nowrap">
+                    <form method="post" action="/diagnostics/stuck-tasks/{{ row.task.id }}/resolve"
+                          style="display:inline">
+                        <input type="hidden" name="document_exists" value="yes">
+                        <button type="submit" class="btn btn--small"
+                                title="Документ перемещения по этому заказу в 1С есть. Задание закроется как проведённое, остаток сойдётся с 1С.">
+                            1С документ создала
+                        </button>
+                    </form>
+                    <form method="post" action="/diagnostics/stuck-tasks/{{ row.task.id }}/resolve"
+                          style="display:inline"
+                          onsubmit="return confirm('Документа в 1С нет.\n\nПоследствие: {{ row.no_document_effect }}.\n\n{{ row.warning }}\n\nПродолжить?')">
+                        <input type="hidden" name="document_exists" value="no">
+                        <button type="submit" class="btn btn--small btn--danger"
+                                title="Документа в 1С нет и не будет. Единица вернётся в остаток — применяйте, только если товар физически на складе.">
+                            документа нет
+                        </button>
+                    </form>
+                </td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table></div>
+    {% else %}
+    <p class="help-text" style="margin-bottom:0">Зависших заданий нет.</p>
+    {% endif %}
+</div>
+
+<div class="card" id="alerts">
+    <h3 style="margin-top:0">
+        Уведомления наружу
+        {% if alert_channels %}
+            <span class="badge badge--good">{{ alert_channels|join(', ') }}</span>
+        {% else %}
+            <span class="badge badge--warn">не настроены</span>
+        {% endif %}
+    </h3>
+    {% if alert_channels %}
+    <p class="help-text" style="margin-top:0">
+        Система сама напишет, когда встанет или разойдётся с реальностью:
+        <b>неработающее задание</b> и <b>критичная находка отчёта</b>. Жёлтые
+        находки не будят никогда — разбудив на жёлтом, мы научим не читать и
+        красное. Одно и то же сообщение не повторяется, пока картина не
+        изменилась; когда всё пройдёт, придёт отбой.
+    </p>
+    <p class="help-text">
+        Проверьте канал сейчас, а не в тот час, когда он понадобится: опечатка в
+        токене или адресе выглядит точно так же, как исправная тишина.
+    </p>
+    {% else %}
+    <p class="help-text" style="margin-top:0">
+        <b>Сейчас система никого не позовёт.</b> Упади службы ночью — узнать об
+        этом можно будет только открыв эту страницу. Настроить Telegram или почту —
+        на странице <a href="/notifications">«Уведомления»</a>; достаточно одного канала.
+    </p>
+    {% endif %}
+    <form method="post" action="/diagnostics/alerts/test" style="margin-bottom:0">
+        <button type="submit" class="btn">Отправить пробное уведомление</button>
+    </form>
+</div>
+
+<div class="card" id="workers">
     <h3 style="margin-top:0">Общие фоновые процессы</h3>
-    <table>
+    <div class="table-scroll"><table>
         <thead><tr><th>Процесс</th><th>Последний запуск</th><th>Статус</th></tr></thead>
         <tbody>
         {% for item in shared_heartbeats %}
@@ -29,7 +224,14 @@
                 {% if item.hb %}
                 <td>{{ item.hb.last_run_at.strftime('%d.%m.%Y %H:%M:%S') }}</td>
                 <td>
-                    {% if item.hb.last_success %}
+                    {% if item.hb.last_success and item.hb.last_error %}
+                        {# Задание отработало, но НЕ всю работу: часть заказов не
+                           проведена, площадка не ответила, выгрузка оборвана.
+                           Раньше здесь стояло зелёное «ок», и текст не показывал
+                           никто — ни эта страница, ни /health. #}
+                        <span class="badge badge--warn">с оговоркой</span>
+                        <div class="help-text">{{ item.hb.last_error }}</div>
+                    {% elif item.hb.last_success %}
                         <span class="badge badge--good">ок</span>
                     {% else %}
                         <span class="badge badge--bad" title="{{ item.hb.last_error }}">ошибка</span>
@@ -41,12 +243,13 @@
             </tr>
         {% endfor %}
         </tbody>
-    </table>
+    </table></div>
 </div>
 
+<h3 id="accounts" style="margin-top:24px">Кабинеты площадок</h3>
 {% for row in account_rows %}
 {% set account = row.account %}
-<div class="card" style="{% if not account.is_active %}opacity:0.6;{% endif %}">
+<div class="card" id="account-{{ account.id }}" style="{% if not account.is_active %}opacity:0.6;{% endif %}">
     <div style="display:flex; justify-content:space-between; align-items:baseline; flex-wrap:wrap; gap:8px;">
         <h3 style="margin-top:0">
             {{ account.name }}
@@ -68,10 +271,15 @@
             <form method="post" action="/diagnostics/accounts/{{ account.id }}/catalog-now" style="display:inline;">
                 <button type="submit" class="btn" {% if not account.is_active %}disabled{% endif %}>Обновить каталог сейчас</button>
             </form>
-            {% if account.consecutive_failures > 0 %}
+            {% if account.consecutive_failures > 0 and account.is_active %}
             <form method="post" action="/diagnostics/accounts/{{ account.id }}/reset-failures" style="display:inline;">
                 <button type="submit" class="btn">Сбросить счётчик сбоев</button>
             </form>
+            {% elif account.consecutive_failures > 0 %}
+            {# Погашенному предохранителем кабинету сброс счётчика не помогает, а
+               единственную находку отчёта о нём гасит. Включают такой кабинет на
+               «API-ключах», счётчик сбрасывается там же. #}
+            <span class="muted">Отключён предохранителем — включить на «API-ключах»</span>
             {% endif %}
         </div>
     </div>
@@ -87,20 +295,47 @@
     </p>
     {% endif %}
 
-    <table>
+    <div class="table-scroll"><table>
         <tbody>
             <tr>
                 <td>Опрос заказов — последний запуск</td>
                 <td>
                     {% if row.heartbeat %}
                         {{ row.heartbeat.last_run_at.strftime('%d.%m.%Y %H:%M:%S') }}
-                        {% if row.heartbeat.last_success %}
+                        {% if row.heartbeat.last_success and row.heartbeat.last_error %}
+                            {# Цикл дошёл до конца, но часть заказов не проведена.
+                               Сбойный заказ откатывается целиком, вместе с аномалией
+                               и отметкой об обработке, — в базе от него не остаётся
+                               ничего, и до этой правки зелёное «ок» было всем, что
+                               видел человек. А непроведённый заказ означает: единица
+                               продана, у нас не списана, в 1С документа нет. #}
+                            <span class="badge badge--warn">с оговоркой</span>
+                            <div class="help-text">{{ row.heartbeat.last_error }}</div>
+                        {% elif row.heartbeat.last_success %}
                             <span class="badge badge--good">ок</span>
                         {% else %}
                             <span class="badge badge--bad" title="{{ row.heartbeat.last_error }}">ошибка</span>
                         {% endif %}
                     {% else %}
                         <span class="help-text">ещё не запускался</span>
+                    {% endif %}
+                </td>
+            </tr>
+            <tr>
+                <td>Выгрузка каталога — последний запуск</td>
+                <td>
+                    {% if row.catalog_heartbeat %}
+                        {{ row.catalog_heartbeat.last_run_at.strftime('%d.%m.%Y %H:%M:%S') }}
+                        {% if row.catalog_heartbeat.last_success and row.catalog_heartbeat.last_error %}
+                            <span class="badge badge--warn">с оговоркой</span>
+                            <div class="help-text">{{ row.catalog_heartbeat.last_error }}</div>
+                        {% elif row.catalog_heartbeat.last_success %}
+                            <span class="badge badge--good">ок</span>
+                        {% else %}
+                            <span class="badge badge--bad" title="{{ row.catalog_heartbeat.last_error }}">ошибка</span>
+                        {% endif %}
+                    {% else %}
+                        <span class="help-text">ещё не запускалась</span>
                     {% endif %}
                 </td>
             </tr>
@@ -129,7 +364,7 @@
                 </td>
             </tr>
         </tbody>
-    </table>
+    </table></div>
 </div>
 {% endfor %}
 

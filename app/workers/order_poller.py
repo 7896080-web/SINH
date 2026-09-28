@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from app.timeutils import now_utc
 
 from sqlalchemy.orm import Session
@@ -8,6 +8,7 @@ from app.models import (
     Product, SyncSetting, SyncAnomaly, AnomalyReason, ProcessedOrder,
     OrderProcessStatus, DispatchQueueItem, FtpTask, Barcode, PlatformAccount,
 )
+from app.transmit import covered_accounts, coverage_is_tracked
 from app.workers.matching import resolve_barcode
 from app.workers.platform_clients.base import PlatformClient, PlatformOrder
 
@@ -22,13 +23,49 @@ logger = logging.getLogger("sync_worker")
 TEST_ORDER_PREFIX = "TEST-"
 
 
+# Сколько дней после приёма заказ ещё считается «живым» и опрашивается на
+# отмену/подтверждение.
+#
+# Окно обязано быть конечным. Заказы WB и Ozon НЕ ЗАКРЫВАЮТСЯ НИКОГДА: детект
+# подтверждения у этих площадок не реализован (`base.get_confirmed_orders`
+# возвращает пустой список), поэтому заказ навсегда остаётся `processed`. Без
+# окна список открытых заказов рос бы со скоростью продаж, а его идентификаторы
+# каждые две минуты уходят в запрос отмен — то есть в предел площадки на размер
+# запроса мы упёрлись бы рано или поздно обязательно.
+#
+# Тридцать дней с запасом: отмена неподтверждённого заказа приходит в первые дни,
+# у месячного отменять уже нечего. Цена ошибки в эту сторону безопасна: пропущенная
+# отмена означает, что мы не вернули единицу на склад, то есть остаток занижен —
+# недоотправка, а не оверселл.
+#
+# ОКНО СЧИТАЕТСЯ ОТ МОМЕНТА ПРИЁМА ЗАКАЗА У НАС (`processed_at`), А НЕ ОТ ДАТЫ
+# ЗАКАЗА НА ПЛОЩАДКЕ. Это принципиально для старта задним числом: расчёт с
+# базовой датой за 90 дней поднимает заказы трёхмесячной давности, но строка
+# `ProcessedOrder` заводится СЕЙЧАС, и отмены по ней отслеживаются ещё 30 дней
+# от проведения. Реальная дата заказа уходит в `movement_date` — ею датируется
+# документ в 1С, и только туда. Если `processed_at` когда-нибудь начнут
+# заполнять `order_date`, весь бэкфилл окажется за окном В МОМЕНТ СОЗДАНИЯ и
+# отмены по нему перестанут отслеживаться вовсе; тест
+# `test_a_backfilled_old_order_is_still_inside_the_window` такую правку роняет.
+#
+# Идемпотентности расчёта окно не касается вовсе: повторный прогон ищет заказ
+# по паре (кабинет, номер) среди ВСЕХ строк без ограничения по возрасту, так что
+# сдвиг базовой даты назад не создаёт вторых перемещений.
+OPEN_ORDER_WINDOW_DAYS = 30
+
+
 def _real_open_orders(db: Session, account: PlatformAccount) -> list[ProcessedOrder]:
-    """Принятые, но ещё не закрытые заказы кабинета — только НАСТОЯЩИЕ.
-    Их идентификаторы уходят прямо в API площадки, поэтому синтетика исключается."""
+    """Принятые, но ещё не закрытые заказы кабинета — только НАСТОЯЩИЕ и только
+    за последние `OPEN_ORDER_WINDOW_DAYS` дней.
+
+    Их идентификаторы уходят прямо в API площадки, поэтому синтетика исключается,
+    а список ограничен по возрасту (см. комментарий у константы)."""
+    cutoff = now_utc() - timedelta(days=OPEN_ORDER_WINDOW_DAYS)
     return db.query(ProcessedOrder).filter(
         ProcessedOrder.account_id == account.id,
         ProcessedOrder.status == OrderProcessStatus.processed,
         ProcessedOrder.order_id.notlike(f"{TEST_ORDER_PREFIX}%"),
+        ProcessedOrder.processed_at >= cutoff,
     ).all()
 
 
@@ -51,13 +88,30 @@ def _enqueue_dispatch_to_others(db: Session, uid_1c: str, source_account_id: int
 
     is_test=True (со страницы тестирования) помечает запись так, что
     dispatch.py заведомо её не отправит — см. комментарий у DispatchQueueItem."""
+    # Трансляция товара выключена — не ставим в очередь НИЧЕГО. Иначе рассылка
+    # посчитает по нему ноль и отправит этот ноль на площадку: для товара, по
+    # которому мы ещё не транслировали, это обнуление живой карточки, а не отзыв
+    # остатка. Особенно важно при актуализации задним числом: там заказы
+    # проводятся до включения трансляции, и каждый проведённый заказ отправлял бы
+    # ноль. Осознанный отзыв идёт отдельной функцией enqueue_withdrawal.
+    product = db.query(Product).filter(Product.uid_1c == uid_1c).first()
+    if product is not None and not product.broadcast_enabled:
+        return []
+
     settings = db.query(SyncSetting).filter(
         SyncSetting.uid_1c == uid_1c, SyncSetting.enabled.is_(True),
     ).all()
 
+    # Кабинеты, которых расчёт не касался, пропускаем по той же причине: по ним
+    # рассылка посчитает ноль и отправит его на живую карточку.
+    covered = covered_accounts(product)
+    gate_by_recalc = coverage_is_tracked(product)
+
     targets = []
     for setting in settings:
         if setting.account_id == source_account_id:
+            continue
+        if gate_by_recalc and setting.account_id not in covered:
             continue
         db.add(DispatchQueueItem(
             uid_1c=uid_1c, account_id=setting.account_id, quantity=new_quantity, reason=reason,
@@ -210,11 +264,21 @@ def process_new_order(db: Session, order: PlatformOrder, account: PlatformAccoun
 def existing_cancel_task(db: Session, order_id: str, account_id: int, is_test: bool = False):
     """Уже созданное задание отмены по этому заказу и кабинету, если оно есть.
 
-    Отмена в 1С НЕ идемпотентна: обработка ищет движения заказа по шаблону, а
-    обратный документ сам под этот шаблон подходит — повторная отмена создаёт
-    ФАНТОМНЫЙ ПРИХОД товара, которого не было. Исправить это в обработке нельзя:
-    база 1С только боевая, тестовой нет. Поэтому гарантируем со своей стороны,
-    что второе задание отмены по одному заказу не уедет никогда.
+    Отмена в 1С НЕ идемпотентна — в отличие от `CREATE_MOVEMENT`, где
+    идемпотентность по номеру заказа сделана и проверена на бою 19.09. Поэтому
+    гарантируем со своей стороны, что второе задание отмены по одному заказу не
+    уедет никогда.
+
+    МЕХАНИЗМ ПОМЕНЯЛСЯ 19.09, ВЫВОД — НЕТ. Раньше `ОтменитьПеремещенияЗаказа`
+    находила по шаблону комментария и собственные реверсы (их комментарий
+    начинается с `sync REVERSE` и содержит тот же `order_id`): вторая отмена
+    отменила бы и само перемещение, и его возврат, то есть товар уехал бы на
+    склад площадки вместо возврата на ЦС. Теперь реверсы из выборки исключены
+    (`НЕ Комментарий ПОДОБНО "sync REVERSE%"`), но ИСХОДНОЕ перемещение остаётся
+    проведённым и находится снова — значит вторая отмена создаст ВТОРОЙ обратный
+    документ, и на ЦС вернётся вдвое больше, чем оттуда уезжало. Лишний приход
+    товара, которого нет, как и был; починить это в обработке нельзя, не заведя
+    там собственный учёт уже отменённых заказов.
 
     Смотрим задания в ЛЮБОМ статусе, а не только незакрытые:
     - `done` — 1С отмену уже провела, повтор и есть тот самый фантом;
@@ -241,7 +305,35 @@ def process_cancellation(db: Session, cancelled_order: PlatformOrder, record: Pr
     result = {"status": None, "return_quantity": 0, "new_stock": None, "dispatched_to": [],
               "ftp_task_id": None, "duplicate_cancel": False}
 
-    return_quantity = cancelled_order.refused_quantity if cancelled_order.is_partial_refund else record.quantity
+    if cancelled_order.is_partial_refund:
+        # ЧАСТИЧНЫЙ отказ мы провести не можем, и делать вид, что можем, опаснее,
+        # чем отказаться.
+        #
+        # Мы вернули бы себе только отказанное количество, а в 1С ушло бы
+        # `CANCEL_MOVEMENT|order_id|площадка` — количества в этой команде нет ни
+        # поля, и `ОтменитьПеремещенияЗаказа` реверсит исходный документ ЦЕЛИКОМ.
+        # Заказ на 3, отказ от 1: у нас +1, в 1С +3. Расхождение в две единицы
+        # часовая сверка втянет в остаток как приход, и мы начнём продавать
+        # отгруженное. Второй частичный отказ по тому же заказу вдобавок
+        # отбрасывался как дубль — остаток не возвращался вовсе, а площадка
+        # приносила эту отмену каждые две минуты все тридцать дней окна.
+        #
+        # Сегодня путь спящий: `is_partial_refund` не выставляет ни один клиент.
+        # Поэтому это не потеря возможности, а запертая дверь — чтобы появившийся
+        # завтра частичный отказ не поехал по сломанной дороге молча. Открывать
+        # её надо вместе с протоколом 1С (количество в команде отмены и реверс на
+        # указанное число), а не здесь.
+        result["status"] = "unsupported"
+        logger.warning(
+            "частичный отказ по заказу %s (кабинет %s, отказано %s из %s) не проведён: "
+            "команда отмены в 1С отменяет документ целиком, частичный реверс протоколом "
+            "не предусмотрен — разберите вручную",
+            cancelled_order.order_id, account.id,
+            cancelled_order.refused_quantity, record.quantity,
+        )
+        return result
+
+    return_quantity = record.quantity
     if return_quantity <= 0:
         result["status"] = "skipped"
         return result
@@ -256,9 +348,11 @@ def process_cancellation(db: Session, cancelled_order: PlatformOrder, record: Pr
         result["status"] = "duplicate"
         result["duplicate_cancel"] = True
         result["ftp_task_id"] = already.id
-        if not cancelled_order.is_partial_refund and record.status != OrderProcessStatus.cancelled:
+        if record.status != OrderProcessStatus.cancelled:
             # Заказ всё-таки закрываем: иначе опрос будет приносить его каждые
-            # две минуты и каждый раз упираться в эту же проверку.
+            # две минуты и каждый раз упираться в эту же проверку. Оговорка про
+            # частичный отказ отсюда убрана: до этой строки он больше не доходит,
+            # его отсекает проверка в начале функции.
             record.status = OrderProcessStatus.cancelled
             record.cancelled_at = now_utc()
             db.commit()
@@ -289,12 +383,10 @@ def process_cancellation(db: Session, cancelled_order: PlatformOrder, record: Pr
     result["return_quantity"] = return_quantity
     result["new_stock"] = new_stock
 
-    if cancelled_order.is_partial_refund:
-        result["status"] = "partial"
-    else:
-        record.status = OrderProcessStatus.cancelled
-        record.cancelled_at = now_utc()
-        result["status"] = "reversed"
+    # Частичный отказ сюда не доходит — отсечён в начале функции.
+    record.status = OrderProcessStatus.cancelled
+    record.cancelled_at = now_utc()
+    result["status"] = "reversed"
 
     result["dispatched_to"] = _enqueue_dispatch_to_others(
         db, record.uid_1c, account.id, new_stock, reason="cancel", is_test=is_test,
@@ -357,13 +449,27 @@ def poll_new_orders(db: Session, client: PlatformClient, account: PlatformAccoun
     process_new_order, агрегируя статистику."""
 
     orders = client.get_orders_awaiting_confirmation()
-    stats = {"processed": 0, "already_processed": 0, "unmatched": 0, "anomalies": 0, "skipped_disabled": 0}
+    stats = {"processed": 0, "already_processed": 0, "unmatched": 0, "anomalies": 0,
+             "skipped_disabled": 0, "failed": 0, "problems": []}
 
     status_to_stat = {"processed": "processed", "already_processed": "already_processed",
                       "unmatched": "unmatched", "skipped_disabled": "skipped_disabled"}
 
     for order in orders:
-        result = process_new_order(db, order, account, warehouse_pending)
+        # Заказ обрабатывается ПООТДЕЛЬНО, как и в расчёте (`recalc.apply_orders`).
+        # Раньше цикл не был защищён ничем: исключение на одной строке — гонка за
+        # `database is locked` во время часовой сверки, ошибка целостности,
+        # что угодно — обрывало весь цикл, и остальные новые заказы кабинета в
+        # этом проходе не проводились вовсе. Без отката сессия вдобавок остаётся
+        # сломанной после неудачного commit внутри `process_new_order`, так что
+        # следующий заказ падал бы уже на ровном месте.
+        try:
+            result = process_new_order(db, order, account, warehouse_pending)
+        except Exception as e:                      # noqa: BLE001 — причина уходит наверх текстом
+            db.rollback()
+            stats["failed"] += 1
+            stats["problems"].append(f"заказ {order.order_id}: {type(e).__name__}: {e}")
+            continue
         stat_key = status_to_stat.get(result["status"])
         if stat_key:
             stats[stat_key] += 1
@@ -385,18 +491,32 @@ def poll_cancellations(db: Session, client: PlatformClient, account: PlatformAcc
     orders_by_id = {o.order_id: o for o in open_orders}
 
     cancelled = client.get_cancelled_orders(order_ids)
-    stats = {"reversed": 0, "partial": 0}
+    stats = {"reversed": 0, "unsupported": 0, "failed": 0, "problems": []}
 
     for c in cancelled:
         record = orders_by_id.get(c.order_id)
         if record is None or record.uid_1c is None:
             continue
 
-        result = process_cancellation(db, c, record, account)
+        # По одной отмене, как и в приёме заказов: пропущенная отмена — это
+        # невозвращённая на ЦС единица, и терять из-за неё весь остаток цикла
+        # нельзя. Без отката сессия после неудачного commit внутри
+        # `process_cancellation` остаётся сломанной.
+        try:
+            result = process_cancellation(db, c, record, account)
+        except Exception as e:                      # noqa: BLE001 — причина уходит наверх текстом
+            db.rollback()
+            stats["failed"] += 1
+            stats["problems"].append(f"отмена {c.order_id}: {type(e).__name__}: {e}")
+            continue
         if result["status"] == "reversed":
             stats["reversed"] += 1
-        elif result["status"] == "partial":
-            stats["partial"] += 1
+        elif result["status"] == "unsupported":
+            # Частичный отказ: провести нечем (см. process_cancellation). Считаем
+            # и называем — молчать о непроведённой отмене нельзя.
+            stats["unsupported"] += 1
+            stats["problems"].append(
+                f"отмена {c.order_id}: частичный отказ, протоколом 1С не поддержан")
 
     return stats
 
@@ -411,13 +531,22 @@ def poll_confirmations(db: Session, client: PlatformClient, account: PlatformAcc
     orders_by_id = {o.order_id: o for o in open_orders}
 
     confirmed = client.get_confirmed_orders(order_ids)
-    stats = {"confirmed": 0}
+    stats = {"confirmed": 0, "failed": 0, "problems": []}
 
     for c in confirmed:
         record = orders_by_id.get(c.order_id)
         if record is None or record.uid_1c is None:
             continue
-        result = process_confirmation(db, record, account, warehouse_pending, warehouse_sold)
+        # См. `poll_new_orders`: сбой на одном подтверждении не должен уносить
+        # ни остальные подтверждения, ни ОТМЕНЫ — они опрашиваются следующим
+        # шагом того же задания, и без этой защиты пропадали вместе с ним.
+        try:
+            result = process_confirmation(db, record, account, warehouse_pending, warehouse_sold)
+        except Exception as e:                      # noqa: BLE001 — причина уходит наверх текстом
+            db.rollback()
+            stats["failed"] += 1
+            stats["problems"].append(f"подтверждение {c.order_id}: {type(e).__name__}: {e}")
+            continue
         if result["status"] == "confirmed":
             stats["confirmed"] += 1
 
