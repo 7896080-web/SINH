@@ -685,21 +685,25 @@ def bulk_page(request: Request, db: Session = Depends(get_db),
     полю, и увидят расхождение в отчётах через месяц.
     """
     items = R.batch_entries(db)
+    warehouses = R.warehouse_choices()
+    warehouse = request.session.get("returns_bulk_warehouse") or ""
     ctx = _base(request, user, db)
     ctx.update({
-        "items": items, "products": _products(db, items),
-        "totals": R.batch_totals(db, items),
+        "batch": items, "products": _products(db, items),
+        "totals": R.batch_totals(db, items, warehouse),
         "mode": request.session.get("returns_bulk_mode") or "sale",
         "reason": request.session.get("returns_bulk_reason") or "",
+        "warehouse": warehouse, "warehouses": warehouses,
+        "warehouse_platform": R.platform_of_warehouse(warehouse),
         "scrap_reasons": list(ScrapReason),
-        "max_batch": R.MAX_BATCH,
+        "max_batch": R.MAX_BATCH, "target_warehouse": R.TARGET_WAREHOUSE,
     })
     return templates.TemplateResponse(request, "returns_bulk.html", ctx)
 
 
 @router.post("/returns/bulk/mode")
 def bulk_mode(request: Request, mode: str = Form("sale"), reason: str = Form(""),
-              user=Depends(get_current_user)):
+              warehouse: str = Form(""), user=Depends(get_current_user)):
     """Что делаем с пачкой и, для утиля, по какой причине.
 
     Живёт в сессии браузера, а не в базе: это не состояние установки, а выбор
@@ -708,6 +712,11 @@ def bulk_mode(request: Request, mode: str = Form("sale"), reason: str = Form("")
     """
     request.session["returns_bulk_mode"] = "scrap" if mode == "scrap" else "sale"
     request.session["returns_bulk_reason"] = reason if reason else ""
+    # Склад принимаем ТОЛЬКО из карты: имя уезжает в 1С строкой, и чужое там
+    # означало бы документ, который либо не проведётся, либо вернёт товар не
+    # оттуда. Незнакомое значит «не выбран», а не «запишем как есть».
+    request.session["returns_bulk_warehouse"] = (
+        warehouse if R.platform_of_warehouse(warehouse) else "")
     return RedirectResponse("/returns/bulk", status_code=303)
 
 
@@ -767,6 +776,7 @@ def bulk_clear(request: Request, db: Session = Depends(get_db),
 
 @router.post("/returns/bulk/send")
 def bulk_send(request: Request, mode: str = Form("sale"), reason: str = Form(""),
+              warehouse: str = Form(""),
               db: Session = Depends(get_db), user=Depends(get_current_user)):
     """Передать пачку в 1С — тем же путём, что и кнопка на странице вещи.
 
@@ -792,11 +802,28 @@ def bulk_send(request: Request, mode: str = Form("sale"), reason: str = Form("")
                                "пишут претензию.", "warn")
             return RedirectResponse("/returns/bulk", status_code=303)
 
-    result = R.send_batch(db, items, to_scrap, scrap_reason)
+    if not R.platform_of_warehouse(warehouse):
+        set_flash(request, "Выберите склад, с которого пришла коробка: с него 1С "
+                           f"вернёт вещи на «{R.TARGET_WAREHOUSE}», и только "
+                           "оттуда.", "warn")
+        return RedirectResponse("/returns/bulk", status_code=303)
+
+    result = R.send_batch(db, items, to_scrap, scrap_reason, warehouse)
+    if result["wrong_warehouse"]:
+        # Отказ ВСЕЙ пачке, и строки названы поимённо: вопрос тут не про две
+        # лишние вещи, а про то, что коробка собрана не с того склада.
+        names = ", ".join(R.label_number(i) for i in result["wrong_warehouse"][:5])
+        more = (f" и ещё {len(result['wrong_warehouse']) - 5}"
+                if len(result["wrong_warehouse"]) > 5 else "")
+        set_flash(request, f"Не передано НИЧЕГО: склад «{warehouse}», а эти вещи "
+                           f"приняты с другой площадки — {names}{more}. Уберите их "
+                           f"из пачки или выберите их склад.", "warn")
+        return RedirectResponse("/returns/bulk", status_code=303)
     what = (f"утилизация, «{R.SCRAP_LABELS[scrap_reason]}»" if to_scrap
             else "возврат в продажу")
     log_action(db, user.username, "returns_bulk_send",
-               f"{what}: передано {result['sent']}, отказов {len(result['failed'])}")
+               f"{what} со склада «{warehouse}»: передано {result['sent']}, "
+               f"отказов {len(result['failed'])}")
     db.commit()
 
     if result["failed"]:
@@ -809,5 +836,7 @@ def bulk_send(request: Request, mode: str = Form("sale"), reason: str = Form("")
                   "warn")
     else:
         set_flash(request, f"Передано в 1С: {result['sent']} ({what}). "
-                           f"Статус поставит ответ 1С.", "good")
+                           f"1С перенесёт вещи «{warehouse}» → "
+                           f"«{R.TARGET_WAREHOUSE}»; статус поставит её ответ.",
+                  "good")
     return RedirectResponse("/returns/bulk", status_code=303)
