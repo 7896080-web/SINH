@@ -1,16 +1,20 @@
 {% extends "base.html" %}
-{% block title %}Возвраты — массовое решение{% endblock %}
+{% block title %}Коробка возвратов{% endblock %}
 {% block content %}
 
 <div class="page-header">
     <div>
-        <h1>Массовое решение</h1>
-        <p>Коробка целиком: сканируйте вещи подряд, потом одной кнопкой передайте
-           их в 1С — вернуть в продажу или утилизировать.</p>
+        <h1>Коробка возвратов</h1>
+        <p>Полный цикл одним проходом: скан заводит вещь, одна кнопка передаёт всю
+           коробку в 1С — перемещение со склада площадки на «{{ target_warehouse }}»
+           и сразу возврат в оборот или утилизация.</p>
     </div>
+    {# Ссылка на разбор нужна: страница отдельная, и без неё кладовщик,
+       которому попалась спорная вещь, ищет выход перезагрузкой. #}
+    <a class="btn" href="/returns">Приёмка и разбор по одной →</a>
 </div>
 
-{% include "returns_tabs.html" %}
+{% include "returns_test_banner.html" %}
 
 {# Инструкция на самой странице, а не в бумажке рядом с монитором. #}
 <details class="card" style="margin-bottom:14px" open>
@@ -20,17 +24,21 @@
             вещи с него на «{{ target_warehouse }}» и уже там вернёт в оборот или спишет.</li>
         <li>Выберите <strong>действие</strong> — вернуть в продажу или утилизировать.
             Для утиля сразу выберите <strong>причину</strong>: она уйдёт в 1С у всей пачки.</li>
-        <li><strong>Сканируйте баркоды</strong> вещей. Каждый скан кладёт в пачку
-            ОДНУ вещь: три одинаковых свитшота — три скана.</li>
+        <li><strong>Сканируйте баркоды</strong> вещей прямо из коробки. Скан ЗАВОДИТ
+            вещь — через приёмку их проводить не нужно. Каждый скан — ОДНА вещь:
+            три одинаковых свитшота дают три скана и три записи.</li>
         <li>Проверьте итоги и нажмите <strong>«Передать в 1С»</strong>.
-            До этого не происходит ничего — статусы вещей не меняются.</li>
+            До этого наружу не уходит ничего.</li>
     </ol>
     <p style="margin:10px 0 0;color:var(--ink-soft)">
-        Склад и площадка должны сходиться: площадка проставлена у каждой вещи ещё
-        на приёмке, и вернуть товар 1С может только оттуда, куда он уехал при
-        продаже. Вещь из другой коробки в пачке — <strong>отказ всей передаче</strong>,
-        с именами строк: вопрос тут не про две лишние вещи, а про то, что коробка
+        Склад выбирается <strong>до сканов</strong>: по нему проставляется площадка
+        вещи, и вернуть товар 1С может только оттуда, куда он уехал при продаже.
+        Вещь с другой площадкой в пачке — <strong>отказ всей передаче</strong>, с
+        именами строк: вопрос тут не про две лишние вещи, а про то, что коробка
         собрана не с того склада.
+        Вещь, которая уже лежит в разборе (вернулась из химчистки, была отложена),
+        сканируется <strong>номером RET-… с наклейки</strong> — товарный баркод
+        завёл бы для неё вторую запись.
         Пачка <strong>общая на всю установку</strong>: если рядом работает второй
         человек, вы увидите его сканы здесь же.
     </p>
@@ -39,7 +47,7 @@
 {# Действие и причина — РАНЬШЕ сканов и на виду всё время. Уехав не с той
    причиной, вещи лягут не на ту статью затрат в 1С, а претензию площадке пишут
    именно по этому полю: увидят расхождение в отчётах через месяц. #}
-<form method="post" action="/returns/bulk/mode" class="card" style="margin-bottom:14px">
+<form method="post" action="/returns/box/mode" class="card" style="margin-bottom:14px">
     {# Склад — ПЕРВЫМ и на виду: он решает, откуда 1С заберёт вещь, а имя уезжает
        туда строкой. Список ровно тот, на который товар уехал при продаже. #}
     <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px">
@@ -103,9 +111,9 @@
     <div style="padding:18px">
         {% if not warehouse %}
         <div class="flash flash--warn" style="margin:0 0 12px">
-            Склад не выбран. Без него передать нельзя: 1С должна знать, ОТКУДА
-            забрать вещь, — вернуть её можно только с того склада, куда она
-            уехала при продаже.
+            Склад не выбран — сканировать нельзя. По нему проставляется площадка
+            вещи, и с него же 1С заберёт её: вернуть товар можно только оттуда,
+            куда он уехал при продаже.
         </div>
         {% endif %}
         {% if totals.foreign %}
@@ -121,12 +129,14 @@
             хоз. операцию списания, а по ней же пишут претензию площадке.
         </div>
         {% endif %}
-        <form method="post" action="/returns/bulk/scan">
+        <form method="post" action="/returns/box/scan">
             <label for="code" style="display:block;font-size:13px;color:var(--ink-soft);margin-bottom:6px">
-                Товарный баркод — сканер наберёт сам. Номер <strong>RET-…</strong> с наклейки тоже принимается.
+                Товарный баркод — сканер наберёт сам, вещь заведётся сразу.
+                Номер <strong>RET-…</strong> с наклейки берёт вещь, уже лежащую в разборе.
             </label>
-            <input id="code" name="code" type="text" autofocus autocomplete="off"
-                   placeholder="сканируйте баркод"
+            <input id="code" name="code" type="text" autocomplete="off"
+                   {% if warehouse %}autofocus{% else %}disabled{% endif %}
+                   placeholder="{% if warehouse %}сканируйте баркод{% else %}сначала выберите склад{% endif %}"
                    style="width:100%;box-sizing:border-box;padding:14px 16px;font-size:20px;
                           font-family:ui-monospace,Menlo,Consolas,monospace;
                           border:2px solid var(--accent);border-radius:var(--radius)">
@@ -161,7 +171,7 @@
     </div>
     {% endif %}
     <div style="flex-grow:1"></div>
-    <form method="post" action="/returns/bulk/send" style="display:flex;gap:10px;align-items:center">
+    <form method="post" action="/returns/box/send" style="display:flex;gap:10px;align-items:center">
         <input type="hidden" name="mode" value="{{ mode }}">
         <input type="hidden" name="reason" value="{{ reason }}">
         <input type="hidden" name="warehouse" value="{{ warehouse }}">
@@ -173,10 +183,10 @@
             Передать в 1С — {{ totals.total }} шт
         </button>
         </form>
-    <form method="post" action="/returns/bulk/clear">
+    <form method="post" action="/returns/box/clear">
         <button type="submit" class="btn"
                 {% if not totals.total %}disabled{% endif %}
-                data-confirm="Убрать из пачки все {{ totals.total }} шт?&#10;&#10;Статусы вещей не изменятся — они останутся в разборе.">
+                data-confirm="Убрать из пачки все {{ totals.total }} шт?&#10;&#10;В 1С не уйдёт ничего, вещи останутся принятыми и будут лежать в разборе.">
             Очистить пачку
         </button>
     </form>
@@ -184,7 +194,7 @@
 
 <div class="card" style="padding:0;overflow:hidden">
     <div style="padding:10px 16px;border-bottom:1px solid var(--line-soft);font-size:13px;color:var(--ink-soft)">
-        В ПАЧКЕ — ПОКА НИЧЕГО НЕ ОТПРАВЛЕНО (до {{ max_batch }} шт)
+        В ПАЧКЕ — ПРИНЯТЫ, НО В 1С ЕЩЁ НЕ ОТПРАВЛЕНЫ (до {{ max_batch }} шт)
     </div>
     {% for item in batch %}
     {% set p = products.get(item.uid_1c) %}
@@ -202,7 +212,7 @@
         {% if foreign %}<span class="badge" style="background:#9c3a3a;color:#fff">не с этого склада</span>{% endif %}
         <span class="badge">{{ labels[item.status] }}</span>
         {% if item.is_test %}<span class="badge" style="background:#8a4b00;color:#fff">ТРЕНИРОВКА</span>{% endif %}
-        <form method="post" action="/returns/bulk/drop/{{ item.id }}" style="display:inline">
+        <form method="post" action="/returns/box/drop/{{ item.id }}" style="display:inline">
             <button type="submit" class="btn btn--small">Убрать</button>
         </form>
     </div>
