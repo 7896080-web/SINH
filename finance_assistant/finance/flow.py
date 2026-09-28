@@ -1032,14 +1032,15 @@ class Flow:
                              f"на {rub(sum(x.amount for x in others))}. Исправить?",
                       [[(f"Да, все в «{category}»", f"e:ruleall:{others[0].id}:{category_id}")]])]
 
-    def _saved_reply(self, expense_id: int) -> Reply:
+    def _saved_reply(self, expense_id: int, note: str = "") -> Reply:
         e = self.db.expense(expense_id)
         buttons = [[("Статья", f"e:cat:{e.id}"), ("Карта", f"e:card:{e.id}")],
-                   [("Удалить", f"e:del:{e.id}")]]
+                   [("Удалить", f"e:del:{e.id}")],
+                   [("✅ Готово", f"e:ok:{e.id}")]]
         if e.kind == EXPENSE:
             other = ("Это личное", PERSONAL) if e.purpose == BUSINESS else ("Это бизнес", BUSINESS)
             buttons[1].insert(0, (other[0], f"e:purpose:{e.id}:{other[1]}"))
-        text = expense_card(e)
+        text = (f"{note}\n" if note else "") + expense_card(e)
         rule = self.db.rule_for(e.merchant) if e.purpose == BUSINESS else None
         if rule and rule == self.db.category_id(e.category or ""):
             text += "\n📌 Статья по правилу для этого получателя (/rules)"
@@ -1061,6 +1062,8 @@ class Flow:
             return [Reply(f"🗑 Запись №{expense_id} удалена.", menu=True)]
         if action == "keep":
             return [self._saved_reply(expense_id)]
+        if action == "ok":
+            return [Reply(f"✅ Запись №{e.id} сохранена: {expense_line(e)}", menu=True)]
         current_cat = self.db.category_id(e.category or "") if e.category else None
         if action == "cat" and len(parts) == 2:
             return [Reply(f"Статья для №{e.id}:",
@@ -1070,12 +1073,16 @@ class Flow:
             if not any(c["id"] == category_id for c in self.db.categories()):
                 return [Reply(f"Такой статьи нет. Статья для №{e.id}:",
                               self._category_buttons(f"e:cat:{e.id}:", current_cat) + [keep])]
+            if category_id == current_cat and e.purpose == BUSINESS:
+                return [self._saved_reply(expense_id, "Без изменений.")]
             self.db.update_expense(expense_id, category_id=category_id, purpose=BUSINESS)
             # Запись из выписки: «получатель» — это описание операции банка,
             # правило по нему не создаём.
             from_statement = e.description.startswith("по выписке") and not e.receipt_path
             if not from_statement and self.db.set_rule(e.merchant, category_id):
-                return [self._saved_reply(expense_id)] + self._offer_rule(e.merchant, category_id)
+                return ([self._saved_reply(expense_id, "Исправлено: статья.")]
+                        + self._offer_rule(e.merchant, category_id))
+            return [self._saved_reply(expense_id, "Исправлено: статья.")]
         elif action == "ruleall":
             category_id = int(parts[2])
             changed = 0
@@ -1091,11 +1098,16 @@ class Flow:
                 return [Reply(f"Карта для №{e.id}:", picker)]
             if not self.db.card(int(parts[2])):
                 return [Reply(f"Этой карты уже нет. Карта для №{e.id}:", picker)]
+            if int(parts[2]) == e.card_id:
+                return [self._saved_reply(expense_id, "Без изменений.")]
             self.db.update_expense(expense_id, card_id=int(parts[2]))
+            return [self._saved_reply(expense_id, "Исправлено: карта.")]
         elif action == "purpose":
             self.db.update_expense(expense_id, purpose=parts[2])
             if parts[2] == BUSINESS and not e.category:
                 return [Reply(f"Статья для №{e.id}:", self._category_buttons(f"e:cat:{e.id}:", None))]
+            return [self._saved_reply(expense_id, "Исправлено: " + (
+                "бизнес." if parts[2] == BUSINESS else "личное."))]
         else:
             return []
         return [self._saved_reply(expense_id)]
