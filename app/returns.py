@@ -211,6 +211,28 @@ def source_warehouse(platform: Platform) -> str:
     return PENDING_WAREHOUSE_NAME[platform]
 
 
+def warehouse_choices() -> dict[Platform, str]:
+    """Склады, с которых приходят возвраты. Ровно те, на которые товар уехал
+    при приёме заказа, — карта одна на проект (`PENDING_WAREHOUSE_NAME`).
+
+    Своего списка здесь нет намеренно. Имя склада уезжает в 1С СТРОКОЙ, и
+    разойдись оно с тем, куда перемещение увезло единицу при продаже, документ
+    возврата либо не проведётся, либо вернёт товар не оттуда — а увидят это в
+    отчётах через месяц.
+    """
+    from app.workers.scheduler import PENDING_WAREHOUSE_NAME
+
+    return dict(PENDING_WAREHOUSE_NAME)
+
+
+def platform_of_warehouse(name: str) -> Platform | None:
+    """Площадка по имени склада. None — склад незнакомый."""
+    for platform, warehouse in warehouse_choices().items():
+        if warehouse == name:
+            return platform
+    return None
+
+
 def send_to_1c(db: Session, item: ReturnItem) -> FtpTask:
     """Решение «вернуть в продажу»: задание в 1С и статус «ждём 1С».
 
@@ -488,6 +510,12 @@ TERMINAL = tuple(s for s in ReturnStatus if s not in IN_WORK)
 # отказ говорит это вслух. Молча взять ту же самую значило бы отправить в 1С
 # один номер дважды, а вторую вещь оставить лежать в разборе навсегда.
 
+# СКЛАД выбирают на коробку, а не на вещь: она физически приехала с одного ПВЗ,
+# и вопрос «откуда 1С вернёт единицу» у всей коробки один. Список — ровно те
+# склады, на которые товар уехал при продаже (`warehouse_choices`); своего мы не
+# заводим, потому что имя уезжает в 1С строкой и разойтись ему не с чем.
+# Несовпадение со площадкой вещи — отказ ВСЕЙ пачке, см. `send_batch`.
+
 # Сколько вещей влезает в одну пачку. Предел не про базу, а про человека и про
 # запрос: коробка из ПВЗ — это десятки вещей, сотня уже редкость, а страница
 # рисует каждую строку и считает по ним итоги.
@@ -572,8 +600,25 @@ def clear_batch(db: Session) -> int:
     return n
 
 
-def batch_totals(db: Session, items: list[ReturnItem]) -> dict:
-    """Итоги пачки: всего и по ПЛОЩАДКАМ.
+def foreign_to_warehouse(items: list[ReturnItem],
+                         warehouse: str) -> list[ReturnItem]:
+    """Вещи пачки, которые на ЭТОТ склад не ложатся.
+
+    Склад выбирают на коробку: она физически пришла с одного ПВЗ. А площадка у
+    вещи проставлена на приёмке, и от неё зависит, ОТКУДА 1С вернёт единицу.
+    Разойдись они — документ вернул бы товар не с того склада, и учёт разъехался
+    бы молча: на чужом складе стало бы на единицу меньше, чем лежит, а на своём
+    она осталась бы висеть навсегда.
+    """
+    want = platform_of_warehouse(warehouse)
+    if want is None:
+        return list(items)
+    return [i for i in items if i.platform is not want]
+
+
+def batch_totals(db: Session, items: list[ReturnItem],
+                 warehouse: str = "") -> dict:
+    """Итоги пачки: всего, по ПЛОЩАДКАМ и что не ложится на выбранный склад.
 
     Разбивка по площадкам не для красоты. Склад-источник перемещения берётся по
     площадке (`source_warehouse`), то есть от неё зависит, ОТКУДА 1С вернёт
@@ -586,6 +631,7 @@ def batch_totals(db: Session, items: list[ReturnItem]) -> dict:
     return {
         "total": len(items),
         "by_platform": by_platform,
+        "foreign": foreign_to_warehouse(items, warehouse) if warehouse else [],
         # Вещь без товара 1С отправить нельзя ни поштучно, ни пачкой: 1С
         # опознаёт строку по баркоду, а этого баркода она не знает. Считаем их
         # ОТДЕЛЬНО и говорим заранее — иначе человек нажмёт «Передать» и получит
@@ -595,7 +641,8 @@ def batch_totals(db: Session, items: list[ReturnItem]) -> dict:
 
 
 def send_batch(db: Session, items: list[ReturnItem], to_scrap: bool,
-               scrap_reason: ScrapReason | None = None) -> dict:
+               scrap_reason: ScrapReason | None = None,
+               warehouse: str = "") -> dict:
     """Передать пачку в 1С. Возвращает {"sent": N, "failed": [(вещь, причина)]}.
 
     Каждая вещь идёт через ТЕ ЖЕ `send_to_1c` / `send_scrap_to_1c`, что и кнопка
@@ -607,6 +654,14 @@ def send_batch(db: Session, items: list[ReturnItem], to_scrap: bool,
     своей причиной, а уехавшие из пачки уходят. Иначе человек, получив «передано
     40» при пятидесяти в коробке, не узнал бы, какие десять остались.
     """
+    # Чужой склад — отказ ВСЕЙ пачке, до единого задания. Пропусти мы такие
+    # строки поодиночке, человек получил бы «передано 38 из 40» и разбирался с
+    # двумя оставшимися, а вопрос на самом деле общий: коробка собрана не с того
+    # склада, и остальные 38, возможно, уехали неверно.
+    strangers = foreign_to_warehouse(items, warehouse) if warehouse else []
+    if strangers:
+        return {"sent": 0, "failed": [], "wrong_warehouse": strangers}
+
     sent, failed = 0, []
     for item in items:
         try:
@@ -619,7 +674,7 @@ def send_batch(db: Session, items: list[ReturnItem], to_scrap: bool,
             continue
         drop_from_batch(db, item.id)
         sent += 1
-    return {"sent": sent, "failed": failed}
+    return {"sent": sent, "failed": failed, "wrong_warehouse": []}
 
 
 # --------------------------------------------------------------- тренировка

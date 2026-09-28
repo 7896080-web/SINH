@@ -36,8 +36,20 @@ def _accept(web_db, barcode, platform=Platform.wb, status=ReturnStatus.accepted)
     return item
 
 
-def _mode(client, mode, reason=""):
-    client.post("/returns/bulk/mode", data={"mode": mode, "reason": reason})
+WB_WH = "Wildberries_Склад_FBO"
+OZON_WH = "OZON_Склад"
+
+
+def _mode(client, mode, reason="", warehouse=WB_WH):
+    client.post("/returns/bulk/mode",
+                data={"mode": mode, "reason": reason, "warehouse": warehouse})
+
+
+def _send(client, mode="sale", reason="", warehouse=WB_WH):
+    return client.post("/returns/bulk/send",
+                       data={"mode": mode, "reason": reason,
+                             "warehouse": warehouse},
+                       follow_redirects=True)
 
 
 def _scan(client, code):
@@ -129,8 +141,7 @@ def test_sending_the_batch_goes_through_the_same_path_as_one_item(
     _scan(logged_in_client, "2000000000017")
     _scan(logged_in_client, "2000000000024")
 
-    page = logged_in_client.post("/returns/bulk/send", data={"mode": "sale"},
-                                 follow_redirects=True).text
+    page = _send(logged_in_client).text
 
     assert "Передано в 1С: 2" in page, page[:400]
     web_db.refresh(a), web_db.refresh(b)
@@ -149,9 +160,7 @@ def test_a_scrap_batch_carries_the_one_common_reason(logged_in_client, web_db, g
     _scan(logged_in_client, "2000000000017")
     _scan(logged_in_client, "2000000000024")
 
-    logged_in_client.post("/returns/bulk/send",
-                          data={"mode": "scrap", "reason": ScrapReason.swapped.value},
-                          follow_redirects=True)
+    _send(logged_in_client, "scrap", ScrapReason.swapped.value)
 
     web_db.refresh(a), web_db.refresh(b)
     assert a.scrap_reason is ScrapReason.swapped
@@ -171,9 +180,7 @@ def test_scrap_without_a_reason_is_refused_before_anything_moves(
     _mode(logged_in_client, "scrap")
     _scan(logged_in_client, "2000000000017")
 
-    page = logged_in_client.post("/returns/bulk/send",
-                                 data={"mode": "scrap", "reason": ""},
-                                 follow_redirects=True).text
+    page = _send(logged_in_client, "scrap", "").text
 
     assert "обязательна причина" in page
     web_db.refresh(item)
@@ -197,8 +204,7 @@ def test_one_refusal_does_not_carry_away_the_rest(logged_in_client, web_db, good
     _scan(logged_in_client, "2000000000099")
     _scan(logged_in_client, "2000000000017")
 
-    page = logged_in_client.post("/returns/bulk/send", data={"mode": "sale"},
-                                 follow_redirects=True).text
+    page = _send(logged_in_client).text
 
     assert "Передано в 1С: 1" in page
     assert "Осталось в пачке 1" in page
@@ -298,3 +304,123 @@ def test_a_scan_in_test_mode_keeps_the_batch_honest(logged_in_client, web_db, go
     page = logged_in_client.get("/returns/bulk").text
 
     assert "ТРЕНИРОВКА" in page
+
+
+# --------------------------------------------------------------- склад
+
+def test_a_wrong_warehouse_refuses_the_whole_batch_by_name(
+        logged_in_client, web_db, goods):
+    """Коробка приехала с одного ПВЗ, и склад у неё один.
+
+    Вещь другой площадки в пачке — это не «две лишние строки», а признак, что
+    коробку собрали не с того склада: остальные тридцать восемь, возможно,
+    уехали бы неверно. Поэтому отказ ВСЕЙ передаче, до единого задания, и
+    строки названы поимённо — «нельзя» человеку не помогает.
+    """
+    ours = _accept(web_db, "2000000000017", platform=Platform.wb)
+    alien = _accept(web_db, "2000000000024", platform=Platform.ozon)
+    _mode(logged_in_client, "sale", warehouse=WB_WH)
+    _scan(logged_in_client, "2000000000017")
+    _scan(logged_in_client, "2000000000024")
+
+    page = _send(logged_in_client, warehouse=WB_WH).text
+
+    assert "Не передано НИЧЕГО" in page, page[:400]
+    assert R.label_number(alien) in page
+    web_db.refresh(ours), web_db.refresh(alien)
+    assert ours.status is ReturnStatus.accepted, "своя вещь тоже осталась на месте"
+    assert web_db.query(FtpTask).count() == 0
+    assert web_db.query(ReturnBatchEntry).count() == 2, "пачка цела"
+
+
+def test_sending_without_a_warehouse_is_refused(logged_in_client, web_db, goods):
+    """Без склада 1С не знает, ОТКУДА забрать вещь.
+
+    Вернуть её можно только с того склада, куда она уехала при продаже, — иначе
+    документ либо не проведётся, либо вернёт товар не оттуда, и на чужом складе
+    станет на единицу меньше, чем лежит.
+    """
+    item = _accept(web_db, "2000000000017")
+    _mode(logged_in_client, "sale", warehouse="")
+    _scan(logged_in_client, "2000000000017")
+
+    page = _send(logged_in_client, warehouse="").text
+
+    assert "Выберите склад" in page
+    web_db.refresh(item)
+    assert item.status is ReturnStatus.accepted
+    assert web_db.query(FtpTask).count() == 0
+
+
+def test_an_unknown_warehouse_name_is_not_remembered(logged_in_client, web_db):
+    """Имя склада уезжает в 1С СТРОКОЙ, и чужое там означало бы документ не с
+    того склада. Незнакомое значит «не выбран», а не «запишем как есть»."""
+    _mode(logged_in_client, "sale", warehouse="Склад-которого-нет")
+
+    page = logged_in_client.get("/returns/bulk").text
+
+    assert "склад не выбран" in page
+    assert "Склад-которого-нет" not in page
+
+
+def test_the_task_moves_the_item_from_that_warehouse_to_the_central_one(
+        logged_in_client, web_db, goods):
+    """Механика возврата: со склада площадки на ЦС, и уже там — решение.
+
+    Проверяем СЛЕДСТВИЕ — что уехало в задании, — а не то, что страница
+    показала: имя склада в документе и есть вся суть выбора.
+    """
+    _accept(web_db, "2000000000017", platform=Platform.wb)
+    _mode(logged_in_client, "sale", warehouse=WB_WH)
+    _scan(logged_in_client, "2000000000017")
+
+    _send(logged_in_client, warehouse=WB_WH)
+
+    task = web_db.query(FtpTask).one()
+    assert task.warehouse_from == WB_WH
+    assert task.warehouse_to == R.TARGET_WAREHOUSE
+
+
+def test_a_scrap_batch_moves_from_the_same_warehouse(logged_in_client, web_db, goods):
+    """У утилизации склад тот же: 1С сначала вернёт вещь со склада площадки на
+    ЦС и только потом спишет её оттуда — иначе единица висела бы на складе
+    площадки вечно."""
+    _accept(web_db, "2000000000017", platform=Platform.wb)
+    _mode(logged_in_client, "scrap", ScrapReason.defect.value, warehouse=WB_WH)
+    _scan(logged_in_client, "2000000000017")
+
+    _send(logged_in_client, "scrap", ScrapReason.defect.value, WB_WH)
+
+    task = web_db.query(FtpTask).one()
+    assert task.command == R.SCRAP_COMMAND
+    assert task.warehouse_from == WB_WH and task.warehouse_to == R.TARGET_WAREHOUSE
+
+
+def test_the_page_marks_the_rows_that_do_not_fit_the_warehouse(
+        logged_in_client, web_db, goods):
+    """Отказ на передаче — поздно, если до него человек не видел проблемы."""
+    _accept(web_db, "2000000000017", platform=Platform.wb)
+    _accept(web_db, "2000000000024", platform=Platform.ozon)
+    _mode(logged_in_client, "sale", warehouse=WB_WH)
+    _scan(logged_in_client, "2000000000017")
+    _scan(logged_in_client, "2000000000024")
+
+    page = logged_in_client.get("/returns/bulk").text
+
+    assert "не с этого склада" in page
+    assert "НЕ С ЭТОГО СКЛАДА" in page
+
+
+def test_the_warehouse_list_is_the_one_used_when_the_order_shipped(web_db):
+    """Своего списка складов у страницы нет и быть не должно.
+
+    Вернуть вещь 1С может только оттуда, куда её увезло перемещение при
+    продаже. Заведи мы второй список — он однажды разошёлся бы с первым, и
+    документ возврата перестал бы проводиться, а узнали бы мы об этом на живой
+    коробке.
+    """
+    from app.workers.scheduler import PENDING_WAREHOUSE_NAME
+
+    assert R.warehouse_choices() == PENDING_WAREHOUSE_NAME
+    assert R.platform_of_warehouse(WB_WH) is Platform.wb
+    assert R.platform_of_warehouse("чужое") is None
