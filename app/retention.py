@@ -38,7 +38,8 @@ from sqlalchemy.orm import Session
 
 from app.models import (AnomalyStatus, AuditLog, DispatchQueueItem, DispatchStatus,
                         FtpTask, FtpTaskStatus, ReconciliationLog, ReturnItem,
-                        ReturnItemLog, ReturnStatus, StockDiscrepancyLog,
+                        ReturnBatchEntry, ReturnItemLog, ReturnStatus,
+                        StockDiscrepancyLog,
                         SyncAnomaly, TestLogEntry)
 from app.returns import TERMINAL as RETURN_TERMINAL
 from app.timeutils import now_utc
@@ -200,6 +201,12 @@ def apply_retention(db: Session) -> dict:
         & ReturnItem.status.in_(RETURN_TERMINAL)).scalar_subquery()
     stats["return_item_log"] = _purge(
         db, ReturnItemLog, ReturnItemLog.return_id.in_(doomed), "история возвратов")
+    # Строка пачки — такая же таблица-ребёнок, и правило то же. Терминальная
+    # вещь в пачке лежать не должна вовсе (передача её оттуда убирает), но
+    # чистка на это не рассчитывает: осиротевшая строка показала бы в пачке
+    # вещь, которой уже нет.
+    stats["return_batch"] = _purge(
+        db, ReturnBatchEntry, ReturnBatchEntry.return_id.in_(doomed), "пачка возвратов")
     stats["return_items"] = _purge(
         db, ReturnItem,
         (ReturnItem.status_changed_at < now - RETURN_KEEP)

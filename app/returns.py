@@ -47,8 +47,9 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.models import (
-    Barcode, FtpTask, FtpTaskStatus, Platform, Product, ReturnItem, ReturnItemLog,
-    ReturnStatus, ScrapReason, RETURN_BY_1C, RETURN_TRANSITIONS,
+    Barcode, FtpTask, FtpTaskStatus, Platform, Product, ReturnBatchEntry,
+    ReturnItem, ReturnItemLog, ReturnStatus, ScrapReason, RETURN_BY_1C,
+    RETURN_TRANSITIONS,
 )
 from app.timeutils import now_utc
 
@@ -163,6 +164,10 @@ def cancel_acceptance(db: Session, item: ReturnItem) -> None:
     """
     if item.status is not ReturnStatus.accepted:
         raise ReturnError("Отменить приёмку можно, только пока вещь не тронута")
+    # Из пачки — ЯВНО. `ondelete="CASCADE"` на SQLite по умолчанию не
+    # проверяется вовсе, а осиротевшая строка пачки показала бы в списке вещь,
+    # которой уже нет, и «Передать в 1С» спотыкалась бы о неё каждый раз.
+    drop_from_batch(db, item.id)
     db.delete(item)
 
 
@@ -464,6 +469,159 @@ IN_WORK = (ReturnStatus.accepted, ReturnStatus.cleaning, ReturnStatus.repack,
 TERMINAL = tuple(s for s in ReturnStatus if s not in IN_WORK)
 
 
+# ------------------------------------------------------------------- пачка
+#
+# Массовое решение по коробке: отсканировали десятки вещей, потом ОДНОЙ кнопкой
+# отправили их все в 1С — вернуть в продажу или утилизировать с общей причиной.
+#
+# **Идентификатор здесь БАРКОД, а не номер наклейки, и это осознанное отличие от
+# страницы утилизации файлом.** Там строку выбирают глазами по списку, и баркод
+# не годится: он опознаёт SKU, а три одинаковых свитшота дают три записи с одним
+# баркодом — по нему не понять, КАКУЮ выбросили. Здесь вопрос другой: человек
+# держит вещь в руках и решает про неё, а какая именно из трёх записей ей
+# соответствует, не знает никто и знать не нужно — вещи физически неразличимы.
+# Важно только, чтобы СЧЁТ сошёлся: отсканировал три раза — уехали три вещи, а
+# не одна трижды.
+#
+# Отсюда всё устройство `pick_for_batch`: скан берёт ОДНУ подходящую вещь,
+# следующий скан того же баркода — СЛЕДУЮЩУЮ, а когда подходящих не осталось,
+# отказ говорит это вслух. Молча взять ту же самую значило бы отправить в 1С
+# один номер дважды, а вторую вещь оставить лежать в разборе навсегда.
+
+# Сколько вещей влезает в одну пачку. Предел не про базу, а про человека и про
+# запрос: коробка из ПВЗ — это десятки вещей, сотня уже редкость, а страница
+# рисует каждую строку и считает по ним итоги.
+MAX_BATCH = 500
+
+
+def batch_entries(db: Session) -> list[ReturnItem]:
+    """Вещи в пачке, в порядке добавления. Пустая пачка — пустой список."""
+    return (db.query(ReturnItem)
+            .join(ReturnBatchEntry, ReturnBatchEntry.return_id == ReturnItem.id)
+            .order_by(ReturnBatchEntry.added_at.asc(), ReturnBatchEntry.id.asc())
+            .all())
+
+
+def batch_size(db: Session) -> int:
+    return db.query(func.count(ReturnBatchEntry.id)).scalar() or 0
+
+
+def in_batch(db: Session) -> set[int]:
+    return {r for (r,) in db.query(ReturnBatchEntry.return_id).all()}
+
+
+def pick_for_batch(db: Session, barcode: str, to_status: ReturnStatus) -> ReturnItem:
+    """Какая вещь с этим баркодом поедет по массовому решению.
+
+    Правило выбора и есть весь смысл страницы, поэтому оно здесь, а не в
+    обработчике: скан обязан давать РАЗНЫЕ вещи на повторных сканах.
+
+    Берём САМУЮ СТАРУЮ из подходящих — ту, что дольше лежит в разборе. Выбор
+    детерминированный намеренно: возьми мы произвольную, два одинаковых прогона
+    по одной коробке разошлись бы, и разобраться потом было бы нечем.
+
+    Подходящая — та, из чьего статуса вообще МОЖНО в нужное ожидание
+    (`can_change`). Вещь в химчистке физически не в коробке, и её сюда не
+    сканируют; вещь, по которой решение уже принято и задание ушло, второго
+    решения не примет. Спрашиваем ту же таблицу переходов, что и одиночная
+    кнопка: разойдись они, пачка отправляла бы то, чего страница вещи не даёт.
+    """
+    barcode = (barcode or "").strip()
+    if not barcode:
+        raise ReturnError("Пустой баркод")
+    if batch_size(db) >= MAX_BATCH:
+        raise ReturnError(f"В пачке уже {MAX_BATCH} вещей — передайте их в 1С "
+                          f"и начните новую")
+
+    rows = (db.query(ReturnItem)
+            .filter(ReturnItem.barcode == barcode)
+            .order_by(ReturnItem.created_at.asc(), ReturnItem.id.asc()).all())
+    if not rows:
+        raise ReturnError(f"Баркод {barcode} на складе не принимали — "
+                          f"сначала приёмка")
+
+    taken = in_batch(db)
+    free = [i for i in rows if i.id not in taken]
+    fit = [i for i in free if can_change(i, to_status)]
+    if fit:
+        return fit[0]
+
+    # Отказ обязан называть ПРИЧИНУ, а не «нельзя»: человек стоит с вещью в
+    # руках, и «уже в пачке» лечится одним взглядом на список, а «решение уже
+    # принято» — совсем другим действием.
+    if free:
+        busy = ", ".join(sorted({RETURN_LABELS[i.status] for i in free}))
+        raise ReturnError(f"Баркод {barcode}: по этой вещи решение уже принято "
+                          f"({busy}) — массово её не отправить")
+    raise ReturnError(f"Баркод {barcode}: все вещи с ним уже в пачке "
+                      f"({len(rows)} шт)")
+
+
+def add_to_batch(db: Session, item: ReturnItem) -> None:
+    db.add(ReturnBatchEntry(return_id=item.id))
+
+
+def drop_from_batch(db: Session, return_id: int) -> None:
+    db.query(ReturnBatchEntry).filter(
+        ReturnBatchEntry.return_id == return_id).delete(synchronize_session=False)
+
+
+def clear_batch(db: Session) -> int:
+    n = batch_size(db)
+    db.query(ReturnBatchEntry).delete(synchronize_session=False)
+    return n
+
+
+def batch_totals(db: Session, items: list[ReturnItem]) -> dict:
+    """Итоги пачки: всего и по ПЛОЩАДКАМ.
+
+    Разбивка по площадкам не для красоты. Склад-источник перемещения берётся по
+    площадке (`source_warehouse`), то есть от неё зависит, ОТКУДА 1С вернёт
+    вещь; и претензию по подменам пишут тоже площадке. Коробка обычно из одного
+    ПВЗ, поэтому две площадки в итогах — сигнал, что в пачку попало лишнее.
+    """
+    by_platform: dict[Platform, int] = {}
+    for i in items:
+        by_platform[i.platform] = by_platform.get(i.platform, 0) + 1
+    return {
+        "total": len(items),
+        "by_platform": by_platform,
+        # Вещь без товара 1С отправить нельзя ни поштучно, ни пачкой: 1С
+        # опознаёт строку по баркоду, а этого баркода она не знает. Считаем их
+        # ОТДЕЛЬНО и говорим заранее — иначе человек нажмёт «Передать» и получит
+        # список отказов там, где ждал готового дела.
+        "no_product": sum(1 for i in items if not i.uid_1c),
+    }
+
+
+def send_batch(db: Session, items: list[ReturnItem], to_scrap: bool,
+               scrap_reason: ScrapReason | None = None) -> dict:
+    """Передать пачку в 1С. Возвращает {"sent": N, "failed": [(вещь, причина)]}.
+
+    Каждая вещь идёт через ТЕ ЖЕ `send_to_1c` / `send_scrap_to_1c`, что и кнопка
+    на её странице. Массовый путь, делающий не то же самое, что построчный, —
+    отдельный класс дефектов этого проекта, и здесь цена особенно велика: пачкой
+    уезжают десятки вещей сразу.
+
+    Отказ по ОДНОЙ вещи не уносит остальные и не молчит: она остаётся в пачке со
+    своей причиной, а уехавшие из пачки уходят. Иначе человек, получив «передано
+    40» при пятидесяти в коробке, не узнал бы, какие десять остались.
+    """
+    sent, failed = 0, []
+    for item in items:
+        try:
+            if to_scrap:
+                send_scrap_to_1c(db, item, scrap_reason)
+            else:
+                send_to_1c(db, item)
+        except ReturnError as e:
+            failed.append((item, str(e)))
+            continue
+        drop_from_batch(db, item.id)
+        sent += 1
+    return {"sent": sent, "failed": failed}
+
+
 # --------------------------------------------------------------- тренировка
 
 
@@ -506,7 +664,7 @@ def clear_test_data(db: Session) -> int:
     обстоятельствах, это задеть настоящий возврат. Он описывает вещь, лежащую на
     складе, и восстановить его будет неоткуда.
 
-    История и задание удаляются ЯВНО, а не каскадом: чистка по всему проекту
+    История, строка пачки и задание удаляются ЯВНО, а не каскадом: чистка по всему проекту
     ходит массовым `DELETE`, а он не поднимает ни каскад ORM, ни
     `ON DELETE CASCADE` — на SQLite внешние ключи по умолчанию вообще не
     проверяются. Здесь объём маленький и можно было бы иначе, но правило одно на
@@ -518,6 +676,8 @@ def clear_test_data(db: Session) -> int:
     ids = [i.id for i in items]
     task_ids = [i.ftp_task_id for i in items if i.ftp_task_id]
 
+    db.query(ReturnBatchEntry).filter(ReturnBatchEntry.return_id.in_(ids)).delete(
+        synchronize_session=False)
     db.query(ReturnItemLog).filter(ReturnItemLog.return_id.in_(ids)).delete(
         synchronize_session=False)
     db.query(ReturnItem).filter(ReturnItem.id.in_(ids)).delete(

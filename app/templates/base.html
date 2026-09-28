@@ -141,7 +141,12 @@
                     <svg class="nav__icon" aria-hidden="true"><use href="#i-collapse"/></svg>
                 </button>
             </div>
-            {% set items = [
+            {# Имя ЛОКАЛЬНОЕ и намеренно редкое. `{% set %}` в базовом шаблоне
+               перекрывает одноимённую переменную КОНТЕКСТА в блоках дочерних
+               страниц, а короткое `items` они называют естественнее всего — и
+               страница получала бы вместо своих строк кортежи меню. Поймано на
+               «Массовом решении»: страница падала на `item.id` пункта меню. #}
+            {% set nav_items = [
                 ('returns', '/returns', 'Возвраты', 'i-returns'),
                 ('mapping', '/mapping', 'Мэппинг', 'i-mapping'),
                 ('platform-matching', '/platform-matching', 'Сопоставление площадок', 'i-matching'),
@@ -164,7 +169,7 @@
             } %}
             {# Фильтр — та же функция, что стережёт вход в страницу. Пункт,
                который всё равно не откроется, показывать незачем. #}
-            {% for key, href, label, icon in items if can_see(current_user, href) %}
+            {% for key, href, label, icon in nav_items if can_see(current_user, href) %}
             {# title обязателен: в свёрнутом меню подпись не видна, и без него
                иконки становятся ребусом. #}
             <a class="nav__item {% if active_page == key %}active{% endif %}"
