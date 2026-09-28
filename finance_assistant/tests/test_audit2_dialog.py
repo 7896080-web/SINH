@@ -168,3 +168,24 @@ def test_reset_waits_for_running_request():
     asyncio.run(scenario())
     assert order == [("new", "после сброса")]
     assert MENU_RECORDS  # меню не мешает
+
+
+def test_expense_card_can_be_finished(env):
+    """Карточка расхода: «Готово» закрывает её; выбор той же карты/статьи —
+    «Без изменений», другой — «Исправлено» (раньше карточка просто
+    возвращалась та же, и казалось, что бот застрял)."""
+    db, rec, flow = env
+    rec.payments.append(payment())
+    [card] = flow.on_files(CHAT, [png()], "")
+    e = db.expenses("2026-09")[0]
+    assert f"e:ok:{e.id}" in buttons(card)
+    [same] = flow.on_button(CHAT, f"e:card:{e.id}:{e.card_id}")
+    assert same.text.startswith("Без изменений") and f"e:ok:{e.id}" in buttons(same)
+    other = next(c for c in db.cards() if c.id != e.card_id)
+    [changed] = flow.on_button(CHAT, f"e:card:{e.id}:{other.id}")
+    assert changed.text.startswith("Исправлено: карта") and db.expense(e.id).card_id == other.id
+    cat = db.category_id(e.category)
+    [same_cat] = flow.on_button(CHAT, f"e:cat:{e.id}:{cat}")
+    assert same_cat.text.startswith("Без изменений")
+    [done] = flow.on_button(CHAT, f"e:ok:{e.id}")
+    assert "сохранена" in done.text and not done.buttons and done.menu
