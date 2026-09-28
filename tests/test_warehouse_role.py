@@ -131,3 +131,37 @@ def test_an_existing_user_is_an_admin(web_db):
     web_db.commit()
 
     assert user.role is UserRole.admin
+
+
+def _shortcut_paths() -> list[str]:
+    """Адреса, зашитые в ярлыки складской машины."""
+    import re
+    from pathlib import Path
+
+    text = (Path(__file__).resolve().parent.parent / "deploy"
+            / "create_desktop_shortcut.ps1").read_text(encoding="utf-8-sig")
+    return re.findall(r'\$base \+ "([^"]+)"', text)
+
+
+def test_the_desktop_shortcuts_lead_where_the_warehouse_can_go():
+    """Ярлык на стороннюю страницу — отказ сразу после входа.
+
+    Ярлыки склада ведут на КОНКРЕТНЫЕ адреса, а не на корень, и цена этому —
+    вот такая проверка. Переименуют страницу, разведут разделы по ролям, — и
+    значок на рабочем столе останется прежним: кладовщик нажимает его, получает
+    отказ или пустоту и решает, что учётная запись сломалась. Отсюда он никуда
+    не сообщит: сервер он видит только через этот стол.
+
+    Проверяется и то, что адреса ВООБЩЕ нашлись: перепиши кто-нибудь скрипт
+    иначе, разбор замолчал бы и тест стерёг бы пустоту.
+    """
+    paths = _shortcut_paths()
+
+    assert sorted(paths) == ["/returns", "/returns/box"], paths
+
+
+def test_every_shortcut_opens_under_the_warehouse_account(warehouse_client):
+    """И то же самое следствием, а не разбором текста: страницы открываются."""
+    codes = {p: warehouse_client.get(p).status_code for p in _shortcut_paths()}
+
+    assert {p: c for p, c in codes.items() if c != 200} == {}
