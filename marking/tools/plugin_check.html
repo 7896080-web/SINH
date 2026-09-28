@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Проверка плагина КриптоПро</title>
+<!--
+  Проверка: доверяет ли КриптоПро ЭЦП Browser plug-in адресу, с которого
+  открыта эта страница (для программы маркировки — http://10.77.0.1:8001).
+
+  Страница НИЧЕГО никуда не отправляет. Она только:
+    1) загружает плагин;
+    2) показывает сертификаты из хранилища «Личное» с ИНН и сроком;
+    3) по кнопке подписывает строку «проверка» выбранным сертификатом
+       и показывает длину подписи.
+  Подпись остаётся на экране и никуда не уходит.
+
+  Запуск на сервере (туннель WireGuard поднят):
+    C:\sync_admin\.venv\Scripts\python.exe -m http.server 8001 --bind 10.77.0.1 --directory C:\marking\tools
+  Открыть в браузере на машине с КриптоПро:
+    http://10.77.0.1:8001/plugin_check.html
+-->
+<script src="https://www.cryptopro.ru/sites/default/files/products/cades/cadesplugin_api.js"></script>
+<style>
+  body { font: 15px/1.45 system-ui, sans-serif; margin: 24px; max-width: 900px; }
+  .ok { color: #1b7a2e; } .bad { color: #b3261e; } .warn { color: #8a5a00; }
+  table { border-collapse: collapse; margin: 12px 0; width: 100%; }
+  td, th { border: 1px solid #ccc; padding: 4px 8px; text-align: left; font-size: 14px; }
+  #log div { margin: 2px 0; }
+  button { font-size: 15px; padding: 6px 14px; }
+</style>
+</head>
+<body>
+<h1>Проверка плагина КриптоПро</h1>
+<p>Адрес этой страницы: <b id="origin"></b></p>
+<p>Статус плагина: <b id="status">загрузка…</b></p>
+<table id="certs" hidden>
+  <thead><tr><th></th><th>Владелец</th><th>ИНН</th><th>Действует до</th></tr></thead>
+  <tbody></tbody>
+</table>
+<p><button id="signBtn" disabled>Подписать тестовую строку выбранным сертификатом</button></p>
+<div id="log"></div>
+
+<script>
+  var certs = [];
+  function $(id) { return document.getElementById(id); }
+  function log(text, cls) {
+    var d = document.createElement('div');
+    d.textContent = new Date().toLocaleTimeString('ru-RU') + '  ' + text;
+    if (cls) d.className = cls;
+    $('log').appendChild(d);
+  }
+  function setStatus(text, cls) { $('status').textContent = text; $('status').className = cls; }
+  function errText(e) { return (window.cadesplugin && cadesplugin.getLastError) ? cadesplugin.getLastError(e) : String(e); }
+
+  // ИНН в имени субъекта: у сертификатов ФНС встречается как «ИНН=», «INN=»
+  // или «OID.1.2.643.3.131.1.1=»; у юрлица ещё «ИННЮЛ=».
+  function innOf(subject) {
+    var m = subject.match(/(?:^|,\s*)(?:ИНН|INN|OID\.1\.2\.643\.3\.131\.1\.1)=\s*"?(\d{10,12})/);
+    var ul = subject.match(/(?:^|,\s*)(?:ИННЮЛ|INNLE|OID\.1\.2\.643\.100\.4)=\s*"?(\d{10})/);
+    return [m ? m[1] : '', ul ? 'ЮЛ ' + ul[1] : ''].filter(Boolean).join(', ') || '—';
+  }
+  function cnOf(subject) {
+    var m = subject.match(/(?:^|,\s*)CN=\s*"?([^",]+)/);
+    return m ? m[1] : subject.split(',')[0];
+  }
+
+  $('origin').textContent = location.origin;
+
+  if (!window.cadesplugin) {
+    setStatus('плагин не найден', 'bad');
+    log('Скрипт плагина не загрузился или расширение «CryptoPro Extension for CAdES Browser Plug-in» не установлено/выключено.', 'bad');
+  } else {
+    cadesplugin.then(function () {
+      setStatus('плагин активен', 'ok');
+      log('Плагин загружен. Читаю сертификаты…');
+      listCerts();
+    }, function (e) {
+      setStatus('плагин не инициализировался', 'bad');
+      log('Ошибка: ' + errText(e), 'bad');
+    });
+  }
+
+  function listCerts() {
+    cadesplugin.async_spawn(function* () {
+      try {
+        var store = yield cadesplugin.CreateObjectAsync('CAdESCOM.Store');
+        yield store.Open(cadesplugin.CAPICOM_CURRENT_USER_STORE, cadesplugin.CAPICOM_MY_STORE,
+                         cadesplugin.CAPICOM_STORE_OPEN_MAXIMUM_ALLOWED);
+        var coll = yield store.Certificates;
+        var n = yield coll.Count;
+        var body = $('certs').querySelector('tbody');
+        for (var i = 1; i <= n; i++) {
+          var c = yield coll.Item(i);
+          var subj = yield c.SubjectName;
+          var to = yield c.ValidToDate;
+          certs.push(c);
+          var tr = document.createElement('tr');
+          var expired = new Date(to) < new Date();
+          tr.innerHTML = '<td><input type="radio" name="cert" value="' + (i - 1) + '"' + (i === 1 ? ' checked' : '') + '></td>'
+            + '<td></td><td></td><td class="' + (expired ? 'bad' : '') + '"></td>';
+          tr.children[1].textContent = cnOf(subj);
+          tr.children[2].textContent = innOf(subj);
+          tr.children[3].textContent = new Date(to).toLocaleDateString('ru-RU') + (expired ? ' (истёк)' : '');
+          body.appendChild(tr);
+        }
+        yield store.Close();
+        $('certs').hidden = n === 0;
+        if (n === 0) {
+          log('Сертификатов в хранилище «Личное» нет.', 'warn');
+        } else {
+          log('Найдено сертификатов: ' + n + '. Список прочитан — значит, доступ к ключам с этого адреса разрешён.', 'ok');
+          $('signBtn').disabled = false;
+        }
+      } catch (e) {
+        log('Не удалось прочитать сертификаты: ' + errText(e), 'bad');
+      }
+    });
+  }
+
+  $('signBtn').onclick = function () {
+    var sel = document.querySelector('input[name=cert]:checked');
+    var cert = certs[+sel.value];
+    log('Подписываю строку «проверка»… (может запросить PIN)');
+    cadesplugin.async_spawn(function* () {
+      try {
+        var signer = yield cadesplugin.CreateObjectAsync('CAdESCOM.CPSigner');
+        yield signer.propset_Certificate(cert);
+        yield signer.propset_CheckCertificate(true);
+        var sd = yield cadesplugin.CreateObjectAsync('CAdESCOM.CadesSignedData');
+        yield sd.propset_ContentEncoding(cadesplugin.CADESCOM_BASE64_TO_BINARY);
+        yield sd.propset_Content(btoa(unescape(encodeURIComponent('проверка'))));
+        var sig = yield sd.SignCades(signer, cadesplugin.CADESCOM_CADES_BES, false);
+        log('Подпись создана, ' + String(sig).replace(/\s+/g, '').length + ' символов base64. Всё работает.', 'ok');
+      } catch (e) {
+        log('Подписать не удалось: ' + errText(e), 'bad');
+      }
+    });
+  };
+</script>
+</body>
+</html>
