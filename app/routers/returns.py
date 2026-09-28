@@ -663,3 +663,151 @@ def label(request: Request, item_id: int, db: Session = Depends(get_db),
         "accepted_on": local_date_of(item.created_at),
         "platform_label": PLATFORM_LABELS.get(item.platform, ""),
     })
+
+
+# --------------------------------------------------------- массовое решение
+
+@router.get("/returns/bulk", response_class=HTMLResponse)
+def bulk_page(request: Request, db: Session = Depends(get_db),
+              user=Depends(get_current_user)):
+    """Коробка целиком: сканируем вещи, потом ОДНОЙ кнопкой отправляем в 1С.
+
+    Зачем отдельный экран, когда решение есть на странице вещи. Затем, что
+    коробка из ПВЗ — это десятки вещей, и открывать по каждой её страницу
+    означает десятки переходов там, где человек делает одно и то же движение.
+    Разбор по одной остаётся для спорных: там решение принимают, глядя на вещь,
+    и подсказки на той странице про это.
+
+    Действие и причина выбираются РАНЬШЕ сканов и видны всё время. Причина одна
+    на всю пачку — так просил склад, и это честно: коробку разбирают под одну
+    задачу. Но именно поэтому она крупная на экране: уехав не с той причиной,
+    вещи лягут не на ту статью затрат в 1С, а претензию площадке пишут по этому
+    полю, и увидят расхождение в отчётах через месяц.
+    """
+    items = R.batch_entries(db)
+    ctx = _base(request, user, db)
+    ctx.update({
+        "items": items, "products": _products(db, items),
+        "totals": R.batch_totals(db, items),
+        "mode": request.session.get("returns_bulk_mode") or "sale",
+        "reason": request.session.get("returns_bulk_reason") or "",
+        "scrap_reasons": list(ScrapReason),
+        "max_batch": R.MAX_BATCH,
+    })
+    return templates.TemplateResponse(request, "returns_bulk.html", ctx)
+
+
+@router.post("/returns/bulk/mode")
+def bulk_mode(request: Request, mode: str = Form("sale"), reason: str = Form(""),
+              user=Depends(get_current_user)):
+    """Что делаем с пачкой и, для утиля, по какой причине.
+
+    Живёт в сессии браузера, а не в базе: это не состояние установки, а выбор
+    текущего человека за текущей коробкой, и число тут одно — потерять его
+    вместе с cookie не страшно, страницу видно целиком.
+    """
+    request.session["returns_bulk_mode"] = "scrap" if mode == "scrap" else "sale"
+    request.session["returns_bulk_reason"] = reason if reason else ""
+    return RedirectResponse("/returns/bulk", status_code=303)
+
+
+@router.post("/returns/bulk/scan")
+def bulk_scan(request: Request, code: str = Form(""), db: Session = Depends(get_db),
+              user=Depends(get_current_user)):
+    """Скан кладёт вещь в пачку. Статус её при этом НЕ меняется.
+
+    До «Передать в 1С» не случилось ничего: вынуть строку обратно ничего не
+    стоит, и передумать можно всей коробкой. Обратный порядок (скан сразу
+    отправляет) выглядит быстрее и платит хуже — ошибившись причиной на сороковой
+    вещи, человек отменял бы сорок отправок по одной.
+    """
+    code = (code or "").strip()
+    # `RET-…` со старой наклейки тоже принимаем: человек сканирует то, что видит
+    # на вещи, и отказ «не тот формат» здесь ничему не учит.
+    number = R.parse_label(code)
+    to_scrap = (request.session.get("returns_bulk_mode") or "sale") == "scrap"
+    target = ReturnStatus.awaiting_scrap if to_scrap else ReturnStatus.awaiting_1c
+    try:
+        if number is not None:
+            item = db.query(ReturnItem).filter(ReturnItem.id == number).first()
+            if item is None:
+                raise R.ReturnError(f"Возврата {code} нет")
+            if item.id in R.in_batch(db):
+                raise R.ReturnError(f"{code} уже в пачке")
+            if not R.can_change(item, target):
+                raise R.ReturnError(f"{code}: по этой вещи решение уже принято "
+                                    f"({R.RETURN_LABELS[item.status]})")
+        else:
+            item = R.pick_for_batch(db, code, target)
+        R.add_to_batch(db, item)
+    except R.ReturnError as e:
+        set_flash(request, str(e), "warn")
+        return RedirectResponse("/returns/bulk", status_code=303)
+    db.commit()
+    return RedirectResponse("/returns/bulk", status_code=303)
+
+
+@router.post("/returns/bulk/drop/{item_id}")
+def bulk_drop(request: Request, item_id: int, db: Session = Depends(get_db),
+              user=Depends(get_current_user)):
+    R.drop_from_batch(db, item_id)
+    db.commit()
+    return RedirectResponse("/returns/bulk", status_code=303)
+
+
+@router.post("/returns/bulk/clear")
+def bulk_clear(request: Request, db: Session = Depends(get_db),
+               user=Depends(get_current_user)):
+    removed = R.clear_batch(db)
+    db.commit()
+    set_flash(request, f"Пачка очищена, вещей убрано: {removed}. "
+                       f"Их статусы не менялись — они остались в разборе.", "info")
+    return RedirectResponse("/returns/bulk", status_code=303)
+
+
+@router.post("/returns/bulk/send")
+def bulk_send(request: Request, mode: str = Form("sale"), reason: str = Form(""),
+              db: Session = Depends(get_db), user=Depends(get_current_user)):
+    """Передать пачку в 1С — тем же путём, что и кнопка на странице вещи.
+
+    Действие и причина приходят ФОРМОЙ, а не из сессии: между выбором и нажатием
+    человек мог поменять их в соседнем окне (пачка одна на установку), и решать
+    судьбу сорока вещей по значению, которого он сейчас не видит, нельзя.
+    """
+    to_scrap = mode == "scrap"
+    items = R.batch_entries(db)
+    if not items:
+        set_flash(request, "Пачка пуста — сканировать нечего.", "warn")
+        return RedirectResponse("/returns/bulk", status_code=303)
+
+    scrap_reason = None
+    if to_scrap:
+        try:
+            scrap_reason = ScrapReason(reason) if reason else None
+        except ValueError:
+            scrap_reason = None
+        if scrap_reason is None:
+            set_flash(request, "У утилизации обязательна причина: по ней 1С "
+                               "выбирает хоз. операцию списания, а площадке "
+                               "пишут претензию.", "warn")
+            return RedirectResponse("/returns/bulk", status_code=303)
+
+    result = R.send_batch(db, items, to_scrap, scrap_reason)
+    what = (f"утилизация, «{R.SCRAP_LABELS[scrap_reason]}»" if to_scrap
+            else "возврат в продажу")
+    log_action(db, user.username, "returns_bulk_send",
+               f"{what}: передано {result['sent']}, отказов {len(result['failed'])}")
+    db.commit()
+
+    if result["failed"]:
+        # Отказавшие остаются в пачке со своей причиной: молча потерять их
+        # значило бы оставить человека в уверенности, что коробка передана вся.
+        examples = "; ".join(f"{R.label_number(i)} — {why}"
+                             for i, why in result["failed"][:3])
+        set_flash(request, f"Передано в 1С: {result['sent']}. Осталось в пачке "
+                           f"{len(result['failed'])} — их не приняли: {examples}",
+                  "warn")
+    else:
+        set_flash(request, f"Передано в 1С: {result['sent']} ({what}). "
+                           f"Статус поставит ответ 1С.", "good")
+    return RedirectResponse("/returns/bulk", status_code=303)
