@@ -3,14 +3,28 @@ from datetime import datetime
 from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
+from app.audit import log_action
+from app.workers.catalog_sync import POOL_GUESS_SOURCE
+from app.transmit import enqueue_full_resend
 from app.models import (
     Product, Barcode, FtpTask, FtpTaskStatus, ReconciliationLog,
-    ReconciliationClassification, DispatchQueueItem, SyncSetting,
+    ReconciliationClassification, SyncSetting,
     PlatformCatalogItem, MappingConflict,
 )
 
 LARGE_DELTA_ABSOLUTE = 5
 LARGE_DELTA_RATIO = 0.3
+
+
+# По сколько строк справочника коммитить. Замер 21.09 на боевом масштабе
+# (154 232 строки, параллельно писатель, изображающий рассылку): одной
+# транзакцией — импорт 36,0 с и ожидание записи до **13,37 с**; порциями по
+# тысяче — 26,2 с и 0,43 с. Отказов «database is locked» в замере не было только
+# потому, что `busy_timeout` тридцать секунд: тринадцать — опасно близко, и на
+# диске помедленнее или справочнике побольше это ровно тот отказ, который у нас
+# нигде не перехвачен. Порциями вдобавок БЫСТРЕЕ: большая транзакция сама по себе
+# стоит работы.
+DICT_COMMIT_EVERY = 1000
 
 
 def classify_delta(delta: int, python_stock: int) -> ReconciliationClassification:
@@ -142,10 +156,34 @@ def import_barcode_dict(db: Session, rows: list[dict], full: bool = False) -> di
         r[0] for r in db.query(PlatformCatalogItem.barcode).distinct().all() if r[0]
     }
     existing_uids = {r[0] for r in db.query(Product.uid_1c).all()}
-    existing_bcs = {b.barcode for b in db.query(Barcode).all()}
+    # Нужен не только факт «баркод есть», но и К ЧЕМУ он привязан и КЕМ: догадку
+    # автопривязки справочник 1С обязан перебить (см. ниже). Тремя колонками, а
+    # не объектами ORM: строк сто пятьдесят четыре тысячи.
+    existing_map = {b: (uid, src) for b, uid, src in db.query(
+        Barcode.barcode, Barcode.uid_1c, Barcode.source_platform).all()}
+    existing_bcs = set(existing_map)
 
-    stats = {"products": 0, "barcodes": 0, "conflicts_cleared": 0, "full": full}
+    stats = {"products": 0, "barcodes": 0, "conflicts_cleared": 0, "full": full,
+             "repointed_guesses": 0, "recalc_dropped": 0}
     resolved = set()
+    # Товары, которым справочник завёл НОВЫЙ баркод. Отметку «актуализирован» у
+    # них надо снять: расчёт собирал заказы строго по прежнему набору баркодов,
+    # значит продажи по только что привязанному он заведомо не видел, а догнать
+    # их нечем — товар числится актуализированным, `catch_up_product` по нему не
+    # зовут, живой опрос старый заказ не принесёт, и наружу уходит остаток,
+    # завышенный ровно на эти продажи. Правило то же, что у переподвязки,
+    # автопривязки по пулу и импорта «Мэппинга»; здесь его не было.
+    #
+    # Одним запросом в конце, а не `drop_recalc_mark` на строку: полный прогон —
+    # сто пятьдесят четыре тысячи строк, и отдельный SELECT товара на каждую
+    # новую означал бы ту же беду, ради которой тут заведён `existing_map`.
+    # Условие `recalc_done_at IS NOT NULL` несёт обе предосторожности помощника:
+    # у товара без расчёта не трогаем НИЧЕГО (иначе пустая строка в
+    # `recalc_account_ids` включила бы ступень 2 лестницы там, где она обязана
+    # молчать, и на отмеченный кабинет уехал бы ноль), а тем, у кого расчёт был,
+    # ставим пустую СТРОКУ, а не NULL.
+    newly_linked: set[str] = set()
+    seen = 0
     for r in rows:
         uid = (r.get("uid_1c") or "").strip()
         barcode = (r.get("barcode") or "").strip()
@@ -163,11 +201,67 @@ def import_barcode_dict(db: Session, rows: list[dict], full: bool = False) -> di
             stats["products"] += 1
         if barcode not in existing_bcs:
             db.add(Barcode(barcode=barcode, uid_1c=uid, source_platform="1c_dict"))
+            existing_map[barcode] = (uid, "1c_dict")
             existing_bcs.add(barcode)
             stats["barcodes"] += 1
+            newly_linked.add(uid)
+        else:
+            known_uid, source = existing_map[barcode]
+            if known_uid != uid and source == POOL_GUESS_SOURCE:
+                # Привязку, сделанную ДОГАДКОЙ, справочник 1С перебивает — и
+                # только её. `pool_match` ставит `catalog_sync`, когда баркод
+                # незнаком, но его соседи по карточке площадки ведут к одному
+                # товару 1С. Догадка полезная, но она не первичный учёт: 1С
+                # ведёт баркод в карточке товара, и если числа разошлись, права
+                # 1С. Раньше приём справочника не менял существующие привязки
+                # НИКОГДА, поэтому ошибочная догадка жила вечно: заказ по этому
+                # баркоду списывался с чужого товара — у него остаток падал зря,
+                # а у настоящего оставался завышенным, то есть уезжал наружу.
+                # Конфликт при этом был удалён, и разбирать было нечего.
+                #
+                # Ручную переподвязку (`excel_repoint`) и записи самой 1С не
+                # трогаем: первое — осознанное решение человека под отдельной
+                # галочкой, второе и так отсюда.
+                row = db.query(Barcode).filter(Barcode.barcode == barcode).first()
+                if row is not None:
+                    row.uid_1c = uid
+                    row.source_platform = "1c_dict"
+                    existing_map[barcode] = (uid, "1c_dict")
+                    # Отметку «актуализирован» снимаем у ОБОИХ товаров: расчёт
+                    # собирал заказы по прежнему набору баркодов.
+                    for affected in (known_uid, uid):
+                        p = db.query(Product).filter(Product.uid_1c == affected).first()
+                        if p is not None:
+                            p.recalc_done_at = None
+                            p.recalc_account_ids = ""
+                    log_action(db, "1c_dict", "barcode_guess_corrected",
+                               f"{barcode}: {known_uid} -> {uid} (была догадка "
+                               f"автопривязки, справочник 1С поправил)")
+                    stats["repointed_guesses"] += 1
         resolved.add(barcode)
 
+        # Коммитим ПОРЦИЯМИ, как часовая сверка. Полный прогон справочника — это
+        # сто пятьдесят четыре тысячи строк, и одна транзакция на всё держала
+        # эксклюзивную блокировку записи всё время импорта: ни рассылка, ни приём
+        # заказов, ни веб писать не могли, а за `busy_timeout` в 30 секунд —
+        # `database is locked`, нигде не перехваченный. Атомарность тут не нужна
+        # и даже вредна: каждая строка независима, импорт идемпотентен по
+        # построению (заводим только недостающее), и оборвавшийся на середине
+        # прогон доделает следующий, а не откатит сделанное.
+        seen += 1
+        if seen % DICT_COMMIT_EVERY == 0:
+            db.commit()
+
     db.flush()
+    linked = list(newly_linked)
+    for i in range(0, len(linked), 500):
+        stats["recalc_dropped"] += db.query(Product).filter(
+            Product.uid_1c.in_(linked[i:i + 500]),
+            Product.recalc_done_at.isnot(None),
+        ).update({"recalc_done_at": None, "recalc_account_ids": ""},
+                 synchronize_session=False)
+        db.commit()
+
     resolved = list(resolved)
     for i in range(0, len(resolved), 500):
         stats["conflicts_cleared"] += db.query(MappingConflict).filter(
@@ -181,6 +275,10 @@ def import_barcode_dict(db: Session, rows: list[dict], full: bool = False) -> di
 # обнуление по отсутствию НЕ применяется: лучше не тронуть остаток, чем обнулить
 # весь ассортимент из-за обрезанного или подсунутого вручную файла.
 MIN_SNAPSHOT_COVERAGE = 0.5
+
+# По сколько товаров коммитить сверку. Двести — компромисс: блокировка держится
+# доли секунды, а накладные расходы на коммит не становятся заметными.
+RECONCILE_COMMIT_EVERY = 200
 
 
 def run_reconciliation(db: Session, stock_from_1c: dict[str, int],
@@ -201,11 +299,12 @@ def run_reconciliation(db: Session, stock_from_1c: dict[str, int],
     склад единицы, которые площадка уже продала."""
 
     stats = {"normal": 0, "auto_plus": 0, "auto_minus": 0, "needs_review": 0,
-             "unmatched_barcodes": 0, "zeroed_missing": 0}
+             "unmatched_barcodes": 0, "zeroed_missing": 0, "barcode_conflicts": 0}
 
     # Группируем полученные из 1С количества по uid_1c (может быть несколько
     # баркодов на один товар — считаем максимум, т.к. это один физический остаток)
     uid_to_actual = {}
+    conflicting_uids: set[str] = set()
     for barcode, qty in stock_from_1c.items():
         row = db.query(Barcode).filter(Barcode.barcode == barcode).first()
         if row is None:
@@ -217,7 +316,21 @@ def run_reconciliation(db: Session, stock_from_1c: dict[str, int],
         # специально хранит минус как есть (приём заказа, сверка), на площадку
         # всё равно уходит max(0, …). Поэтому первое значение берём как есть.
         previous = uid_to_actual.get(row.uid_1c)
+        if previous is not None and previous != qty:
+            # Несколько штрихкодов одного SKU держат ОДИН физический остаток, и
+            # 1С отдаёт по ним одно и то же число. Разные числа означают, что
+            # один из баркодов привязан к чужому товару, — и максимум тогда
+            # берёт ЧУЖОЙ остаток: на площадку уходит больше, чем лежит на
+            # складе. Формулу это не меняет (минимум и сумма врут так же, просто
+            # в другую сторону, а починка тут одна — мэппинг), но молчать об
+            # этом нельзя: предохранитель, сработавший молча, — половина
+            # предохранителя. Считаем и отдаём наверх.
+            conflicting_uids.add(row.uid_1c)
         uid_to_actual[row.uid_1c] = qty if previous is None else max(previous, qty)
+
+    # Считаем ТОВАРЫ, а не расхождения: разбирать человеку товар, и три
+    # разошедшихся баркода на одном товаре — это один разбор, а не два.
+    stats["barcode_conflicts"] = len(conflicting_uids)
 
     if missing_means_zero and uid_to_actual:
         # Товары с баркодами и ненулевым остатком, которых в снимке нет.
@@ -234,7 +347,18 @@ def run_reconciliation(db: Session, stock_from_1c: dict[str, int],
                 uid_to_actual[uid] = 0
             stats["zeroed_missing"] = len(missing)
 
-    for uid_1c, actual_1c in uid_to_actual.items():
+    for processed, (uid_1c, actual_1c) in enumerate(uid_to_actual.items(), start=1):
+        # Коммит ПОРЦИЯМИ, а не один в конце. Раньше вся выгрузка — около
+        # полутора тысяч товаров — шла одной транзакцией, и всё это время писать
+        # в базу не мог никто: ни рассылка (цикл раз в 45 секунд), ни приём
+        # заказов, ни оператор в браузере. `busy_timeout` — тридцать секунд, за
+        # ним `database is locked`, а этот случай нигде не перехватывается.
+        # Атомарность тут не нужна и не нужна была: каждая строка независима, а
+        # недосчитанная порция досчитается в следующий час — сверка идемпотентна
+        # по построению, она сравнивает текущее состояние со снимком.
+        if processed % RECONCILE_COMMIT_EVERY == 1 and processed > 1:
+            db.commit()
+
         product = db.query(Product).filter(Product.uid_1c == uid_1c).first()
         if product is None:
             continue
@@ -249,6 +373,17 @@ def run_reconciliation(db: Session, stock_from_1c: dict[str, int],
             uid_1c=uid_1c, python_stock=product.stock_on_hand, in_flight=in_flight,
             expected_1c=expected_1c, actual_1c=actual_1c, delta=delta,
             classification=classification,
+            # Совпадение — не расхождение, и разрешать его некому и незачем.
+            # Раньше `resolved` ставился ТОЛЬКО при delta != 0, поэтому каждая
+            # сходящаяся строка — а это подавляющее большинство, около сорока
+            # тысяч в сутки — оставалась «неразрешённой» навсегда. Кнопка
+            # «Закрыть старые расхождения» поднимала их все разом одной
+            # транзакцией: замер на 250 тысячах дал 3,8 с на загрузку, 10,9 с на
+            # обновление и 857 МБ памяти, а к девяностому дню хранения их стало
+            # бы около трёх с половиной миллионов. Десять секунд эксклюзивной
+            # блокировки записи — это `database is locked` у рассылки и приёма
+            # заказов, нигде не перехваченный.
+            resolved=(delta == 0),
         )
         db.add(log)
         stats[classification.value] += 1
@@ -288,14 +423,22 @@ def run_reconciliation(db: Session, stock_from_1c: dict[str, int],
             # Рассылаем актуальное значение на включённые кабинеты (дефицит — риск
             # оверселла, поэтому сразу, не ждём батч-цикл). Если задан override,
             # dispatch отправит именно его (см. _quantity_to_send).
+            #
+            # ЧЕРЕЗ `enqueue_full_resend`, а не прямым `db.add`. Раньше было
+            # прямым, и это обходило ОБА гейта трансляции: товар с выключенной
+            # трансляцией и кабинет, не покрытый расчётом, всё равно попадали в
+            # очередь. Дальше `quantity_for_account` честно возвращал по ним 0
+            # (ступени 0 и 2 лестницы), и этот ноль уходил на площадку — рассылка
+            # нули не пропускает. Для карточки, на которую мы ни разу не
+            # отправляли остаток, это не отзыв, а обнуление чужих продаж: ровно
+            # то, что случилось 18.09 с Озоном и Kit. Тогда гейты добавили в приём
+            # заказа и в саму `enqueue_full_resend`, а путь сверки остался мимо
+            # них и продолжал обнулять каждый час.
             enabled_platforms = db.query(SyncSetting).filter(
                 SyncSetting.uid_1c == uid_1c, SyncSetting.enabled.is_(True),
             ).all()
             for setting in enabled_platforms:
-                db.add(DispatchQueueItem(
-                    uid_1c=uid_1c, account_id=setting.account_id, quantity=new_stock,
-                    reason="reconciliation",
-                ))
+                enqueue_full_resend(db, uid_1c, setting.account_id, reason="reconciliation")
 
     db.commit()
     return stats

@@ -1,4 +1,4 @@
-"""Сквозной прогон живого приложения: цепочка «заказ → 1С → сверка → площадка».
+"""Сквозной прогон живого приложения: цепочка «заказ -> 1С -> сверка -> площадка».
 
 Проверяются не отдельные функции, а причинно-следственные связи между блоками:
 что реально уходит на площадку, что попадает в файл задания для 1С, как ответ 1С
@@ -16,6 +16,40 @@ from datetime import date, timedelta
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.chdir(ROOT)
+
+# --- Своя база, и только своя. ДО первого импорта из `app`. ---------------
+#
+# Скрипт не мокает базу: он заводит боевые по типу объекты (`PlatformAccount`,
+# `Product`, заказы через `process_new_order`, записи очереди) и зовёт настоящие
+# функции. `DATABASE_URL` раньше не подменялся вовсе, а `app/__init__.py` вне
+# pytest читает `.env` — на боевом сервере это живая `C:/sync_admin/sync_admin.db`.
+#
+# Дальше начиналось непоправимое: `build_task_batch` забирает ВСЕ задания в
+# `pending` с `is_test=False`, до пятисот строк, помечает их `sent` и коммитит, а
+# содержимое скрипт никуда не публикует — каталог обмена у него временный. Для
+# `CANCEL_MOVEMENT` это без обратного хода: автоповтор их не берёт, второго
+# задания `existing_cancel_task` не даст, обратного документа в 1С не будет
+# никогда. То есть один запуск «аудита» на сервере тихо съедал бы настоящие
+# задания 1С.
+#
+# Отсюда два предохранителя. Свой файл базы задаём принудительно; а если кто-то
+# указал `DATABASE_URL` руками — требуем, чтобы он был явно тестовым, тем же
+# правилом, что и `tests/conftest.py`. Отказ, а не молчаливая подмена: человек,
+# задавший переменную, должен узнать, что его не послушались.
+_own_url = "sqlite:///./e2e_audit.db"
+_given = os.environ.get("DATABASE_URL")
+if _given and _given != _own_url:
+    _p = _given[len("sqlite:///"):].replace("\\", "/").lower() \
+        if _given.startswith("sqlite:///") else ""
+    if not (_p and (_p == ":memory:" or "test" in os.path.basename(_p))):
+        sys.exit(
+            "DATABASE_URL указывает на НЕ тестовую базу: " + _given + "\n"
+            "Этот скрипт заводит боевые по типу объекты и ЗАБИРАЕТ настоящие "
+            "задания 1С из очереди, никуда их не публикуя. Уберите переменную "
+            "(в PowerShell: Remove-Item Env:DATABASE_URL) и запустите заново."
+        )
+else:
+    os.environ["DATABASE_URL"] = _own_url
 
 FAIL = []
 STEP = [0]
@@ -75,7 +109,7 @@ exchange = LocalExchange(f"{SYNC}/tasks", f"{SYNC}/results", f"{SYNC}/archive")
 exchange._ensure_dirs()
 
 print("=" * 78)
-print("СКВОЗНОЙ ПРОГОН: заказ → списание → площадка → 1С → сверка → отмена")
+print("СКВОЗНОЙ ПРОГОН: заказ -> списание -> площадка -> 1С -> сверка -> отмена")
 print("=" * 78)
 
 # --------------------------------------------------------------- подготовка
@@ -111,7 +145,7 @@ client_wb = FakeClient(new_orders=[order])
 stats = poll_new_orders(db, client_wb, wb, "Wildberries_Склад_FBO")
 db.expire_all()
 product = db.query(Product).filter(Product.uid_1c == UID).first()
-check("заказ списал остаток ЦС", product.stock_on_hand == 40, f"43 − 3 = {product.stock_on_hand}")
+check("заказ списал остаток ЦС", product.stock_on_hand == 40, f"43 - 3 = {product.stock_on_hand}")
 check("заказ отмечен обработанным (идемпотентность)",
       db.query(ProcessedOrder).filter(ProcessedOrder.order_id == "WB-1001").count() == 1)
 
@@ -149,7 +183,7 @@ fields = move[0].split("|")
 check("строка перемещения имеет 8 полей (8-е — дата документа)", len(fields) == 8, f"полей: {len(fields)}: {fields}")
 check("склад-источник ЦС, склад-приёмник площадки, количество заказа",
       fields[2] == "ЦС Склад" and fields[3] == "Wildberries_Склад_FBO" and fields[4] == "3",
-      f"{fields[2]} → {fields[3]}, кол-во {fields[4]}")
+      f"{fields[2]} -> {fields[3]}, кол-во {fields[4]}")
 check("запрос выгрузки остатков попал в то же задание", "EXPORT_STOCK_ON_HAND" in lines)
 
 exchange.upload_task_file(fname, content)
@@ -215,7 +249,7 @@ o2 = PlatformOrder(order_id="WB-1002", barcode="2000932153735", quantity=2, raw_
 poll_new_orders(db, FakeClient(new_orders=[o2]), wb, "Wildberries_Склад_FBO")
 db.expire_all()
 product = db.query(Product).filter(Product.uid_1c == UID).first()
-check("новый заказ списал локально", product.stock_on_hand == before - 2, f"{before} → {product.stock_on_hand}")
+check("новый заказ списал локально", product.stock_on_hand == before - 2, f"{before} -> {product.stock_on_hand}")
 # 1С ещё НЕ провела это перемещение: отдаёт прежние 35
 stats_rec3 = run_reconciliation(db, {"2000932153735": 35, "2000932153742": 35})
 db.expire_all()

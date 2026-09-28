@@ -17,22 +17,30 @@ SKU, сопоставленные между площадками и с 1С. К�
 поштучным по баркоду (см. matching.resolve_barcode) — денежный путь не
 меняется: каждый размер должен резолвиться своим баркодом.
 """
+from datetime import datetime, timedelta
+
 from collections import defaultdict
 
 from fastapi import APIRouter, Request, Depends, Query
 from fastapi.responses import HTMLResponse
-from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.templating import templates as shared_templates
 from app.dependencies import get_current_user
+from app.timeutils import now_utc
 from app.models import Barcode, Platform, PlatformAccount, PlatformCatalogItem, User
 from app.excel_utils import build_xlsx_response
 
 router = APIRouter()
-templates = Jinja2Templates(directory="app/templates")
+templates = shared_templates
 
 RESULT_LIMIT = 300
+
+# По сколько значений за раз кладём в `IN (...)`. У SQLite есть предел на число
+# параметров запроса (по умолчанию 999 в сборках до 3.32), и боевой каталог его
+# превышает в шестнадцать раз.
+_IN_CHUNK = 900
 
 
 class _UnionFind:
@@ -55,15 +63,88 @@ class _UnionFind:
             self.parent[ra] = rb
 
 
+def _barcodes_1c_near(db: Session, catalog_barcodes: set[str]) -> list[tuple[str, str]]:
+    """Баркоды 1С, которые вообще могут попасть в кластер площадки.
+
+    Читать ВСЮ таблицу баркодов было незачем и дорого: на боевом каталоге это
+    154 232 строки на каждый запрос страницы, а сама страница перезапрашивает
+    таблицу на каждой паузе в наборе (`hx-trigger="keyup"`). Замер на копии
+    боевых данных: 1,33 с и 109 МБ пиковой памяти НА ЗАПРОС.
+
+    При этом в кластер попадает только тот товар 1С, у которого хотя бы один
+    баркод есть в каталоге площадок: кластеры заводятся по позициям каталога
+    (цикл по `items` ниже), а баркоды 1С лишь довязывают к ним свой uid. Значит
+    нужны баркоды ровно тех товаров 1С, что каталогом задеты, — на тех же
+    данных 18 124 строки вместо 154 232, за 0,25 с. Результат побайтово тот же:
+    отброшены строки, которые старый код прочитал бы и выбросил по `root in
+    clusters`.
+    """
+    if not catalog_barcodes:
+        return []
+    known = list(catalog_barcodes)
+    uids: set[str] = set()
+    # Порциями: у SQLite предел на число параметров в IN, и он ниже, чем размер
+    # боевого каталога.
+    for start in range(0, len(known), _IN_CHUNK):
+        uids.update(uid for (uid,) in db.query(Barcode.uid_1c).filter(
+            Barcode.barcode.in_(known[start:start + _IN_CHUNK])).distinct().all())
+    if not uids:
+        return []
+    rows: list[tuple[str, str]] = []
+    uid_list = list(uids)
+    for start in range(0, len(uid_list), _IN_CHUNK):
+        rows.extend(db.query(Barcode.barcode, Barcode.uid_1c).filter(
+            Barcode.uid_1c.in_(uid_list[start:start + _IN_CHUNK])).all())
+    return rows
+
+
+# Сколько живёт собранная картина кластеров.
+#
+# Сборка читает ВЕСЬ каталог площадок и связанные с ним баркоды 1С и строит по
+# ним union-find. Замер 21.09 на боевом масштабе (16 127 карточек, 154 232
+# баркода): 3,5 с и 52 МБ на КАЖДЫЙ запрос. А запросов много: фильтры на странице
+# живые, htmx дёргает фрагмент через 400 мс после набора, то есть поиск из шести
+# букв — это несколько полных пересборок подряд, и всё это время веб-служба
+# занята ими, а она же принимает заказы с площадок.
+#
+# После кэша: первый заход те же 3,4 с, следующие — 0,05 с и 1 МБ.
+#
+# Минута безопасна: каталог меняется не сам по себе, а загрузкой — кнопкой со
+# страницы «Мэппинг» или суточным заданием, — и оба пути кэш сбрасывают
+# (`clear_clusters_cache`). То есть минута — это предел для случая, когда каталог
+# поменяли МИМО приложения, прямо в базе.
+CLUSTERS_CACHE_TTL = timedelta(minutes=1)
+
+_clusters_cache: tuple[datetime, list[dict]] | None = None
+
+
+def clear_clusters_cache() -> None:
+    """Забыть собранную картину. Зовётся после загрузки каталога кабинета: иначе
+    оператор, нажавший «Загрузить каталог», минуту видел бы прежнее."""
+    global _clusters_cache
+    _clusters_cache = None
+
+
+def _clusters(db: Session) -> list[dict]:
+    """Кластеры из кэша или собранные заново."""
+    global _clusters_cache
+    if _clusters_cache is not None and now_utc() - _clusters_cache[0] <= CLUSTERS_CACHE_TTL:
+        return _clusters_cache[1]
+    rows = _build_clusters(db)
+    _clusters_cache = (now_utc(), rows)
+    return rows
+
+
 def _build_clusters(db: Session) -> list[dict]:
     """Строит кластеры товаров по пулам баркодов через все площадки и 1С."""
     items = db.query(
         PlatformCatalogItem.account_id, PlatformCatalogItem.external_id,
         PlatformCatalogItem.barcode, PlatformCatalogItem.article, PlatformCatalogItem.name,
     ).all()
-    platmap = {a.id: a.platform.value for a in db.query(PlatformAccount).all()}
-    cabmap = {a.id: a.name for a in db.query(PlatformAccount).all()}
-    barcodes_1c = db.query(Barcode.barcode, Barcode.uid_1c).all()
+    accounts = db.query(PlatformAccount).all()
+    platmap = {a.id: a.platform.value for a in accounts}
+    cabmap = {a.id: a.name for a in accounts}
+    barcodes_1c = _barcodes_1c_near(db, {bc for _a, _e, bc, _ar, _n in items})
     uid_of = {bc: uid for bc, uid in barcodes_1c}
 
     uf = _UnionFind()
@@ -137,7 +218,7 @@ def _build_clusters(db: Session) -> list[dict]:
 
 
 def _filtered(db: Session, q: str, coverage: str, mapped: str) -> list[dict]:
-    rows = _build_clusters(db)
+    rows = _clusters(db)
 
     if coverage == "multi":
         rows = [r for r in rows if r["platform_count"] >= 2]

@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}{{ title }}{% endblock %}
+{% block content %}
+
+<div class="page-header">
+    <div>
+        <h1>{{ title }}</h1>
+        <p>Полный список строк находки. Отчёт показывает первые десять — здесь все.</p>
+    </div>
+    <div class="toolbar">
+        <a class="btn" href="/report">← к отчёту</a>
+        {% if rows %}
+        <a class="btn" href="/report/rows/{{ key }}/export">Выгрузить в Excel</a>
+        {% endif %}
+    </div>
+</div>
+
+{# Следствие и действие — ДО таблицы. Человек пришёл сюда по ссылке «разобрать»,
+   то есть именно за ответом «что делать»; таблица без него отвечает только на
+   «что нашлось». Следствие первым: оно объясняет, зачем это вообще трогать, а
+   без него список читается как очередной отчёт, который можно пролистать. #}
+{% if consequence and rows %}
+<div class="card">
+    <p style="margin-top:0"><b>Чем это обернётся.</b> {{ consequence }}</p>
+    <p style="margin-bottom:0"><b>Что делать.</b> {{ what_to_do }}</p>
+</div>
+{% endif %}
+
+<div class="card">
+    {% if not columns %}
+        <div class="empty-state">Такой находки нет. Вернитесь к отчёту и откройте
+        ссылку «Разобрать» заново — список собирается по текущему состоянию.</div>
+    {% elif not rows %}
+        <div class="empty-state">Сейчас по этой находке ничего нет — она разобрана.</div>
+    {% else %}
+        <p class="help-text" style="margin-top:0">
+            Всего строк: <b>{{ total }}</b>{% if total > rows|length %},
+            показано {{ rows|length }} — остальные в выгрузке Excel{% endif %}.
+        </p>
+        <div class="table-scroll"><table>
+            <thead><tr>{% for c in columns %}<th>{{ c }}</th>{% endfor %}</tr></thead>
+            <tbody>
+            {% for row in rows %}
+                <tr>{% for cell in row %}<td{% if loop.last %} class="help-text"{% endif %}>{{ cell }}</td>{% endfor %}</tr>
+            {% endfor %}
+            </tbody>
+        </table></div>
+    {% endif %}
+</div>
+
+{% endblock %}

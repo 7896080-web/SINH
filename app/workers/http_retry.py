@@ -7,6 +7,16 @@ logger = logging.getLogger("sync_worker.http_retry")
 
 MAX_ATTEMPTS = 3
 DEFAULT_BACKOFF_SECONDS = 2
+# Потолок на паузу внутри одного вызова. Площадка вправе прислать
+# `Retry-After: 3600`, и раньше это значение уходило в `sleep` как есть —
+# ДВАЖДЫ за вызов, то есть два часа сна в потоке планировщика. Рассылка на это
+# время просто не отправляет остатки, а снаружи всё выглядит работающим, пока
+# не протухнет heartbeat.
+#
+# Повтор внутри вызова имеет смысл ровно пока он дешевле следующего цикла:
+# рассылка ходит раз в 45 секунд и имеет собственный backoff на 1/2/5/15 минут.
+# Всё, что дольше минуты, обязано возвращаться наверх ошибкой и ехать по нему.
+MAX_SLEEP_SECONDS = 60
 
 
 def with_retry(func, max_attempts: int = MAX_ATTEMPTS):
@@ -25,7 +35,12 @@ def with_retry(func, max_attempts: int = MAX_ATTEMPTS):
             status = e.response.status_code if e.response is not None else None
 
             if status == 429:
-                wait = _retry_after_seconds(e.response) or DEFAULT_BACKOFF_SECONDS * attempt
+                asked = _retry_after_seconds(e.response) or DEFAULT_BACKOFF_SECONDS * attempt
+                wait = min(asked, MAX_SLEEP_SECONDS)
+                if asked > wait:
+                    logger.warning("площадка просит ждать %.0fс — это дольше цикла рассылки; "
+                                   "ждём %.0fс и отдаём ошибку наверх, дальше сработает "
+                                   "штатный повтор", asked, wait)
                 logger.warning("429 от площадки, попытка %d/%d, ждём %.1fс", attempt, max_attempts, wait)
                 if attempt < max_attempts:
                     time.sleep(wait)

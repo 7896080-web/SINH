@@ -1,0 +1,357 @@
+"""Разбор «на площадке были остатки, а стали нули» обязан называть ВИНОВНИКА.
+
+Вопрос этот про кабинет целиком, а не про строку: пока не видно, одна это
+карточка или шестьсот и одним ли событием они обнулились, разбирать нечего.
+Ответ при этом обязан различать два случая, которые выглядят одинаково —
+и вся цена ошибки здесь:
+
+* ноль по СНЯТОЙ паре — это отзыв, то есть работа человека, и разбирать нечего;
+* ноль по паре, где кабинет отмечен И трансляция включена, — это уже сбой, и
+  на площадке сейчас продаётся не то, что у нас на складе.
+
+Отдельно — два товара 1С на одну карточку площадки. У Kit пара «товар+склад»
+повторяться не может, и такие товары пишут по очереди: у одного 20, у второго
+0, на витрине 0. По ОДНОЙ строке это не находится никогда — каждая про свой
+товар и каждая по-своему права.
+
+Прогоняем САМ СКРИПТ подпроцессом: предмет правки — то, что увидит человек в
+консоли сервера.
+"""
+import os
+import subprocess
+import sys
+from datetime import timedelta
+from pathlib import Path
+
+import pytest
+from cryptography.fernet import Fernet
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from app.models import (AuditLog, Barcode, Base, DispatchQueueItem,
+                        DispatchStatus, Platform, PlatformAccount,
+                        PlatformCatalogItem, Product, SyncSetting)
+from app.timeutils import now_utc
+
+ROOT = Path(__file__).resolve().parent.parent
+SCRIPT = ROOT / "scripts" / "probe_zero_sends.py"
+
+
+def _product(session, uid, article, size, broadcast):
+    session.add(Product(uid_1c=uid, article=article, name="Рубашка", size=size,
+                        color="Белый", stock_on_hand=20, reserve=0,
+                        broadcast_enabled=broadcast))
+
+
+def _queue(session, uid, account_id, quantity, sent, reason, when,
+           sku=None, status=DispatchStatus.sent):
+    session.add(DispatchQueueItem(
+        uid_1c=uid, account_id=account_id, quantity=quantity, sent_quantity=sent,
+        reason=reason, status=status, sent_sku=sku, created_at=when))
+
+
+@pytest.fixture()
+def cabinet(tmp_path):
+    """Файловая база: скрипт идёт ОТДЕЛЬНЫМ процессом и in-memory не увидит."""
+    path = tmp_path / "probe_zero.db"
+    url = f"sqlite:///{path}"
+    engine = create_engine(url, connect_args={"check_same_thread": False})
+    Base.metadata.create_all(bind=engine)
+    s = sessionmaker(bind=engine, autoflush=False)()
+
+    s.add(PlatformAccount(id=1, platform=Platform.kit, name="КИТ"))
+    s.add(PlatformAccount(id=2, platform=Platform.ozon, name="ОЗОН"))
+
+    now = now_utc()
+    recent, old = now - timedelta(hours=2), now - timedelta(hours=200)
+
+    # A — отмечен и транслируется, а ушёл ноль. Ровно то, что надо разбирать.
+    _product(s, "u-A", "3030-3032", "L", True)
+    s.add(SyncSetting(uid_1c="u-A", account_id=1, enabled=True))
+    _queue(s, "u-A", 1, 20, 20, "order", now - timedelta(hours=3), sku="V-A")
+    _queue(s, "u-A", 1, 20, 0, "order", recent, sku="V-A")
+
+    # B — галочку сняли, ноль ушёл отзывом. Это норма.
+    _product(s, "u-B", "3030-3033", "M", False)
+    s.add(SyncSetting(uid_1c="u-B", account_id=1, enabled=False))
+    _queue(s, "u-B", 1, 5, 0, "broadcast_off", recent, sku="V-B")
+
+    # C и D — РАЗНЫЕ товары 1С на ОДНОЙ карточке площадки.
+    _product(s, "u-C", "3030-9001", "S", True)
+    _product(s, "u-D", "3030-9002", "S", True)
+    s.add(SyncSetting(uid_1c="u-C", account_id=1, enabled=True))
+    s.add(SyncSetting(uid_1c="u-D", account_id=1, enabled=True))
+    _queue(s, "u-C", 1, 12, 12, "order", recent - timedelta(minutes=5), sku="V-777")
+    _queue(s, "u-D", 1, 0, 0, "order", recent, sku="V-777")
+
+    # E — трансляция ВКЛЮЧЕНА, а галочку кабинета сняли: самый частый отзыв.
+    # Без этой строки признак «пара отмечена» ничего не различал бы: у B
+    # выключено и то и другое, и ответ выходил одинаковым, спрашивай мы про
+    # галочку или не спрашивай.
+    _product(s, "u-E", "3030-9003", "XL", True)
+    s.add(SyncSetting(uid_1c="u-E", account_id=1, enabled=False))
+    _queue(s, "u-E", 1, 8, 0, "broadcast_toggled", recent, sku="V-E")
+
+    # F и G — тот же случай на WB, и по `sent_sku` он НЕ ВИДЕН. Баркоды
+    # разные, значит и `sent_sku` разные, а в теле запроса уезжает chrtId из
+    # каталога — он у обоих один, то есть пишут они в одну ячейку и затирают
+    # друг друга. Раздел, считающий по `sent_sku`, здесь молчит — и молчание
+    # это хуже отсутствия раздела: по нему решают, что дело не в мэппинге.
+    s.add(PlatformAccount(id=3, platform=Platform.wb, name="ИП ПРОБА",
+                          warehouse_id="1"))
+    _product(s, "u-F", "4033", "3XL", True)
+    _product(s, "u-G", "4052", "3XL", True)
+    for uid, bc in (("u-F", "2000000000011"), ("u-G", "2000000000022")):
+        s.add(Barcode(barcode=bc, uid_1c=uid))
+        s.add(PlatformCatalogItem(account_id=3, external_id="177:4242",
+                                  barcode=bc, article="WB-4033"))
+        s.add(SyncSetting(uid_1c=uid, account_id=3, enabled=True))
+    _queue(s, "u-F", 3, 10, 10, "order", recent - timedelta(minutes=5),
+           sku="2000000000011")
+    _queue(s, "u-G", 3, 18, 18, "order", recent, sku="2000000000022")
+
+    # Чужой кабинет и запись за пределами окна — в ответ попасть не должны.
+    _queue(s, "u-A", 2, 9, 0, "reconciliation", recent, sku="OZ-A")
+    _queue(s, "u-A", 1, 7, 0, "excel_import", old, sku="V-A")
+
+    s.add(AuditLog(actor="ruslan", action="products_bulk",
+                   details="broadcast_off по отбору 48 шт", created_at=recent))
+    s.add(AuditLog(actor="ruslan", action="products_bulk",
+                   details="это было давно", created_at=old))
+    s.commit()
+    s.close()
+    engine.dispose()
+    return url
+
+
+def _run(url, *args, console=None):
+    env = dict(os.environ)
+    if console:
+        # Так пишет stdout Python на боевом Windows. Воспроизводим здесь:
+        # иначе этот класс дефектов виден только на сервере, в накате, уже
+        # после копии базы и тринадцати минут тестов.
+        env["PYTHONIOENCODING"] = console
+    env["DATABASE_URL"] = url
+    env["SESSION_SECRET"] = "x" * 32
+    env["SECRETS_ENCRYPTION_KEY"] = Fernet.generate_key().decode()
+    if console:
+        # Читаем БАЙТАМИ и раскодируем той же кодировкой, что писал скрипт:
+        # с `text=True` их разбирал бы UTF-8, и падал бы уже сам тест — на
+        # выводе, который на сервере читается прекрасно.
+        done = subprocess.run([sys.executable, str(SCRIPT), *args],
+                              capture_output=True, env=env, cwd=str(ROOT))
+        return (done.stdout + done.stderr).decode(console, "replace")
+    done = subprocess.run([sys.executable, str(SCRIPT), *args],
+                          capture_output=True, text=True, env=env, cwd=str(ROOT))
+    return done.stdout + done.stderr
+
+
+def test_it_names_who_put_the_zeros_there(cabinet):
+    """Причина постановки в очередь и есть ответ на «кто это сделал»."""
+    out = _run(cabinet, "КИТ", "48")
+    assert "КАБИНЕТ 1: КИТ" in out, out
+    assert "ОТКУДА ВЗЯЛИСЬ НУЛИ" in out
+    assert "broadcast_off" in out, "не назван отзыв человеком\n" + out
+    assert "order" in out, "не названа продажа\n" + out
+
+
+def test_a_zero_from_the_ladder_is_told_apart_from_a_switch(cabinet):
+    """Главное различие всего разбора, и оба нуля выглядят одинаково.
+
+    26.09 на бою это стоило ложной тревоги на 517 товаров: порог 6 при остатке
+    5 даёт ноль по построению — всё работало правильно, а разбор объявил «надо
+    разбирать». Находка, срабатывающая на норме, приучает пролистывать вывод
+    целиком, и тогда настоящую она уже не покажет.
+    """
+    out = _run(cabinet, "КИТ", "48")
+    assert "ПОЧЕМУ УШЁЛ НОЛЬ" in out, out
+    # B и E: трансляция выключена / кабинет снят — это выключатели.
+    assert "ВЫКЛЮЧАТЕЛЬ" in out, out
+    assert "Разбирают только ВЫКЛЮЧАТЕЛЬ" in out, out
+    # И обязательно сказано, что законный ноль разбирать не надо: без этой
+    # строки человек считает тревогой весь список.
+    assert "уходить ОБЯЗАН" in out, out
+
+
+def test_two_products_on_one_platform_card_are_shown(cabinet):
+    """По одной строке это не находится никогда: каждая по-своему права."""
+    out = _run(cabinet, "КИТ", "48")
+    assert "ОДИН КЛЮЧ — НЕСКОЛЬКО ТОВАРОВ" in out, out
+    assert "ключ V-777" in out
+    assert "3030-9001" in out and "3030-9002" in out
+    # И ключ, по которому товар ОДИН, сюда попасть не должен — иначе раздел
+    # перечислял бы весь кабинет и ничего не значил.
+    assert "ключ V-A" not in out
+
+
+def test_wb_products_that_share_a_chrt_id_are_shown_too(cabinet):
+    """У WB `sent_sku` — баркод, а в теле уезжает chrtId.
+
+    Два разных баркода, ведущие на один размер карточки, по `sent_sku`
+    выглядят как разные ключи: раздел молчал бы ровно там, где он нужен, и
+    по этому молчанию человек решил бы, что мэппинг ни при чём, и пошёл бы
+    искать беду в площадке — «отправили 18, держит 10».
+    """
+    out = _run(cabinet, "ПРОБА", "48")
+    assert "ОДИН КЛЮЧ — НЕСКОЛЬКО ТОВАРОВ" in out, out
+    assert "ключ chrtId 4242" in out, out
+    assert "4033" in out and "4052" in out, out
+    # Баркод при этом не теряется: им адресовали, и по нему ищут строку.
+    assert "адресовали 2000000000011" in out, out
+    assert "адресовали 2000000000022" in out, out
+
+
+def test_a_wb_key_with_a_single_product_is_not_called_a_clash(cabinet):
+    """Иначе раздел перечислял бы весь кабинет и не значил бы ничего."""
+    out = _run(cabinet, "КИТ", "48")
+    assert "ключ V-A" not in out, out
+
+
+def test_nonzero_sends_are_shown_next_to_the_zeros(cabinet):
+    """Без них сводка нулей одинакова и при поломке, и при обычной жизни."""
+    out = _run(cabinet, "КИТ", "48")
+    assert "НЕПУСТЫЕ отправки за то же окно" in out, out
+    assert "ушло непустых: 2" in out
+
+
+def test_another_cabinet_does_not_leak_into_the_answer(cabinet):
+    """Ответ про кабинет обязан быть про ЭТОТ кабинет."""
+    out = _run(cabinet, "КИТ", "48")
+    assert "OZ-A" not in out, "запись чужого кабинета попала в ответ\n" + out
+    assert "reconciliation" not in out
+
+
+def test_the_window_actually_cuts_off_old_rows(cabinet):
+    """Окно — не украшение: старый ноль описывает прошлое и путает счёт."""
+    out = _run(cabinet, "КИТ", "6")
+    assert "excel_import" not in out, "запись вне окна попала в ответ\n" + out
+    assert "это было давно" not in out
+
+
+def test_bulk_actions_are_listed_so_zeros_can_be_matched_to_them(cabinet):
+    """Кнопка отбора трогает много пар сразу — связывают их по ВРЕМЕНИ."""
+    out = _run(cabinet, "КИТ", "48")
+    assert "МАССОВЫЕ ДЕЙСТВИЯ" in out
+    assert "broadcast_off по отбору 48 шт" in out, out
+
+
+def test_an_unknown_cabinet_is_refused_with_the_list(cabinet):
+    """Отказ со списком, а не пустой ответ: пустой читается как «нулей нет»."""
+    out = _run(cabinet, "ВБ", "48")
+    assert "не найден" in out, out
+    assert "1:КИТ" in out and "2:ОЗОН" in out
+
+
+def test_the_server_console_does_not_kill_the_output(tmp_path):
+    """Тело ответа площадки печатается как есть — и может содержать что угодно.
+
+    26.09 накат встал ровно на этом, только символ был наш собственный. Здесь
+    он приходит ИЗ БАЗЫ, то есть сканером исходников не ловится вовсе: держать
+    чужие данные в пределах cp1251 мы не можем, поэтому вывод их переживает.
+
+    `PYTHONIOENCODING=cp1251` — и есть боевая консоль, принесённая сюда.
+    """
+    path = tmp_path / "console.db"
+    url = f"sqlite:///{path}"
+    engine = create_engine(url, connect_args={"check_same_thread": False})
+    Base.metadata.create_all(bind=engine)
+    s = sessionmaker(bind=engine, autoflush=False)()
+    s.add(PlatformAccount(id=1, platform=Platform.kit, name="КИТ"))
+    _product(s, "u-X", "3030-7777", "L", True)
+    s.add(SyncSetting(uid_1c="u-X", account_id=1, enabled=True))
+    _queue(s, "u-X", 1, 5, 0, "order", now_utc() - timedelta(hours=1), sku="V-X")
+    # Ответ площадки с символом, которого в cp1251 нет. `flush` обязателен:
+    # сессии живут с `autoflush=False`, и запрос НЕ УВИДИТ только что
+    # добавленную запись — та же ловушка, на которой в этом проекте уже
+    # проезжал расчёт порога.
+    s.flush()
+    row = s.query(DispatchQueueItem).first()
+    row.last_error = 'VALIDATION_ERROR: товар ✱ не найден \u2192 проверьте'
+    s.commit(); s.close(); engine.dispose()
+
+    out = _run(url, "КИТ", "48", console="cp1251")
+
+    assert "UnicodeEncodeError" not in out, out
+    assert "Traceback" not in out, out
+    assert "ПОСЛЕДНИЕ НУЛИ" in out, out
+    assert "3030-7777" in out, "строка с чужим символом до вывода не дошла"
+
+
+def test_a_threshold_that_ate_the_stock_is_not_called_a_problem(tmp_path):
+    """Ровно боевой случай 26.09: порог 6 при остатке 5.
+
+    Ноль тут законный — площадке так и надо сказать «не продавать». Назови мы
+    это проблемой, в списке «разбирать» оказались бы сотни исправных строк.
+    """
+    path = tmp_path / "threshold.db"
+    url = f"sqlite:///{path}"
+    engine = create_engine(url, connect_args={"check_same_thread": False})
+    Base.metadata.create_all(bind=engine)
+    s = sessionmaker(bind=engine, autoflush=False)()
+    s.add(PlatformAccount(id=1, platform=Platform.kit, name="КИТ"))
+    s.add(Product(uid_1c="u-T", article="36080", name="Футболка", size="L",
+                  color="LACIVERT", stock_on_hand=5, reserve=0,
+                  broadcast_enabled=True, broadcast_offset=6,
+                  stock_discrepancy=6,
+                  recalc_done_at=now_utc(), recalc_account_ids="1"))
+    s.add(SyncSetting(uid_1c="u-T", account_id=1, enabled=True))
+    _queue(s, "u-T", 1, 5, 0, "manual_resend_all", now_utc() - timedelta(hours=1),
+           sku="V-T")
+    s.commit(); s.close(); engine.dispose()
+
+    out = _run(url, "КИТ", "48")
+
+    assert "законный ноль: порог 6 при остатке 5" in out, out
+    assert "Ни одного нуля от выключателя: разбирать нечего" in out, out
+    assert "ВЫКЛЮЧАТЕЛЬ" not in out, "исправная строка попала в «разбирать»"
+
+
+def test_a_model_filter_narrows_the_counts_too(cabinet):
+    """Вопрос «кто ставил ноль по этой модели» — про строки, а не про кабинет.
+
+    Сужать надо ДО счётчиков: посчитай сводку по кабинету целиком и покажи
+    отфильтрованный список — числа перестанут относиться к строкам под ними,
+    а решают по ним.
+    """
+    out = _run(cabinet, "КИТ", "48", "3030-3033")
+
+    assert "отбор по «3030-3033»" in out, out
+    # У 3030-3033 ноль один и от выключения трансляции.
+    assert "broadcast_off" in out
+    # А продажи и столкновение ключей — у других моделей, их быть не должно.
+    assert "V-777" not in out, "в отбор попали чужие строки"
+    assert "3030-9001" not in out
+
+
+def test_an_empty_filter_says_so_instead_of_looking_broken(cabinet):
+    """Пустой ответ читается как «нулей не было», а это разные вещи."""
+    out = _run(cabinet, "КИТ", "48", "такого-артикула-нет")
+    assert "отбор по «такого-артикула-нет»: 0 записей" in out, out
+    assert "по этому отбору" in out
+
+
+def test_a_truncated_list_says_it_was_truncated(tmp_path):
+    """Молчаливая обрезка — человек считает, что видит всё.
+
+    Отдельный класс дефектов этого проекта: так уже было с выгрузкой конфликтов
+    сопоставления, где отдавались первые триста и ни слова об остальных.
+    """
+    path = tmp_path / "many.db"
+    url = f"sqlite:///{path}"
+    engine = create_engine(url, connect_args={"check_same_thread": False})
+    Base.metadata.create_all(bind=engine)
+    s = sessionmaker(bind=engine, autoflush=False)()
+    s.add(PlatformAccount(id=1, platform=Platform.kit, name="КИТ"))
+    when = now_utc() - timedelta(hours=1)
+    for i in range(45):
+        uid = f"u-{i:03d}"
+        _product(s, uid, "3030-0001", "L", False)
+        s.add(SyncSetting(uid_1c=uid, account_id=1, enabled=False))
+        _queue(s, uid, 1, 3, 0, "broadcast_off", when, sku=f"V-{i}")
+    s.commit(); s.close(); engine.dispose()
+
+    out = _run(url, "КИТ", "48")
+
+    assert "ушло НОЛЕЙ: 45" in out, out
+    assert "показаны последние 40 из 45" in out, out
+    assert "сузьте отбор" in out

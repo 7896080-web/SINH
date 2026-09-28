@@ -19,20 +19,21 @@ from datetime import date, datetime
 
 from fastapi import APIRouter, Request, Depends, Form, Query
 from fastapi.responses import HTMLResponse, RedirectResponse
-from fastapi.templating import Jinja2Templates
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.audit import log_action
 from app.database import get_db
+from app.templating import templates as shared_templates
 from app.dependencies import get_current_user
 from app.excel_utils import build_xlsx_response
 from app.flash import set_flash, pop_flash
 from app.models import StockDateRow, StockDateSnapshot, StockDateStatus, User
-from app.timeutils import now_utc
+from app.offset_base import open_request
+from app.timeutils import today_local
 
 router = APIRouter()
-templates = Jinja2Templates(directory="app/templates")
+templates = shared_templates
 
 # Сколько строк показываем на странице. Выгрузка — это склад целиком (тысячи
 # позиций), рисовать её всю в браузере незачем: для полного списка есть Excel.
@@ -46,14 +47,10 @@ STATUS_LABELS = {
 }
 
 
-def _open_request(db: Session, snapshot_date: date) -> StockDateSnapshot | None:
-    """Незакрытая заявка на ту же дату. Вторую заводить нельзя: 1С назовёт файл
-    по дате, один ответ закрыл бы только одну заявку, а вторая висела бы до
-    таймаута."""
-    return db.query(StockDateSnapshot).filter(
-        StockDateSnapshot.snapshot_date == snapshot_date,
-        StockDateSnapshot.status.in_([StockDateStatus.pending, StockDateStatus.sent]),
-    ).order_by(StockDateSnapshot.id.asc()).first()
+# Правило «одна открытая заявка на дату» живёт в app/offset_base: оттуда же его
+# применяет страница товаров, задавая дату расчёта порога. Двух копий быть не
+# должно — разойдутся, и на одну дату уедет две заявки.
+_open_request = open_request
 
 
 def _snapshots(db: Session) -> list[StockDateSnapshot]:
@@ -105,7 +102,7 @@ def _render(request: Request, db: Session, user: User, template: str,
         "total": total, "shown": len(rows), "quantity_total": quantity_total,
         "rows_limit": ROWS_LIMIT, "q": q, "nonzero": nonzero,
         "status_labels": STATUS_LABELS,
-        "today": now_utc().date().isoformat(),
+        "today": today_local().isoformat(),
         "flash": pop_flash(request) if template == "stock_on_date.html" else None,
     })
 
@@ -141,7 +138,7 @@ def request_stock_on_date(
         set_flash(request, "Дата должна быть в формате ГГГГ-ММ-ДД.", "warn")
         return RedirectResponse("/stock-on-date", status_code=303)
 
-    if snapshot_date > now_utc().date():
+    if snapshot_date > today_local():
         set_flash(request, "Остатков на будущую дату в 1С нет — выберите сегодняшнее или "
                            "прошедшее число.", "warn")
         return RedirectResponse("/stock-on-date", status_code=303)

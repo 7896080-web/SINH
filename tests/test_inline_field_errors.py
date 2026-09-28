@@ -120,22 +120,34 @@ def test_bad_date_shows_the_error_in_the_row(logged_in_client, web_db):
 # --------------------------------------------- ошибка стоит у нужного поля
 
 # Подсказки (title) полей строки — по ним находим, у какого именно поля встала ошибка.
+#
+# Поля «порог трансляции» в строке больше нет: порог стал расчётным и выводится
+# из даты, факта и брони. Вместо него в наборе два поля, которые появились на его
+# месте, — они и принимают ввод оператора.
 FIELD_ANCHORS = {
-    "offset": "Постоянное расхождение между учётом 1С",
+    "base_date": "Дата, на которую считается порог",
+    "fact": "Сколько лежало на складе НА САМОМ ДЕЛЕ",
     "reserve": "Сколько штук держим у себя",
     "active_since": "Дата старта задним числом",
 }
 
 
 @pytest.mark.parametrize("url,data,field", [
-    ("/products/u1/offset", {"value": "12,5"}, "offset"),
+    ("/products/u1/base-date", {"value": "07.08.2026"}, "base_date"),
+    ("/products/u1/fact", {"value": "12,5"}, "fact"),
     ("/products/u1/reserve", {"reserve": "12,5"}, "reserve"),
     ("/products/u1/active-since", {"value": "07.08.2026"}, "active_since"),
 ])
 def test_error_is_placed_next_to_its_own_field(logged_in_client, web_db, url, data, field):
     """Ошибка должна стоять у того поля, куда вводили: полей в строке больше
     восьми, и сообщение «введите целое число» без привязки бесполезно."""
-    _product(web_db)
+    from datetime import date
+
+    product = _product(web_db)
+    # Поле «факт» появляется в строке только вместе с датой расчёта: без даты
+    # оно бессмысленно — факт всегда «на дату».
+    product.offset_base_date = date(2026, 8, 7)
+    web_db.commit()
 
     r = logged_in_client.post(url, data=data)
 

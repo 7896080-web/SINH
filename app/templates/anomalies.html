@@ -59,7 +59,16 @@
 </form>
 
 <div class="card" style="padding:0;">
-    <div id="anomalies-table">
+    {# Автообновление: аномалии появляются при опросе заказов и исчезают по мере
+       включения товаров. Оператор держит страницу открытой и работает по ней —
+       без опроса он видел бы список на момент открытия и разбирал бы то, что
+       уже разобрано. Фильтры уходят вместе с запросом (hx-include), иначе
+       обновление сбрасывало бы отбор. #}
+    <div id="anomalies-table"
+         hx-get="/anomalies/rows"
+         hx-trigger="every {{ refresh_seconds }}s"
+         hx-include=".filters"
+         hx-swap="innerHTML">
         {% include "anomalies_rows.html" %}
     </div>
 </div>

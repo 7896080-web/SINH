@@ -1,5 +1,5 @@
 {% if log_entries %}
-<table>
+<div class="table-scroll"><table>
     <tbody>
         {% for entry in log_entries %}
         <tr>
@@ -15,7 +15,7 @@
         </tr>
         {% endfor %}
     </tbody>
-</table>
+</table></div>
 {% else %}
 <div class="empty-state">Журнал пуст — выполните любое действие выше.</div>
 {% endif %}

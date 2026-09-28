@@ -3,10 +3,10 @@ from datetime import datetime, date
 
 from fastapi import APIRouter, Request, Depends, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
-from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.templating import templates as shared_templates
 from app.dependencies import get_current_user
 from app.models import (
     Product, Barcode, SyncSetting, PlatformAccount, ProcessedOrder, OrderProcessStatus,
@@ -18,13 +18,17 @@ from app.workers.order_poller import (process_new_order, process_cancellation, p
                                       TEST_ORDER_PREFIX, open_test_out)
 from app.workers.scheduler import PENDING_WAREHOUSE_NAME, SOLD_WAREHOUSE_NAME
 from app.workers.dispatch import _resolve_push_target, _quantity_to_send
-from app.transmit import explain
+from app.transmit import (explain, offset_from_base, recompute_offset, sku_quantity,
+                          enqueue_full_resend, ever_transmitted)
+from app.offset_base import apply_fact, ensure_snapshot_requested, set_base_date
 from app.workers.platform_clients.base import PlatformOrder, StockPushItem
+from app.timeutils import now_utc
 from app.audit import log_action
 from app.flash import set_flash, pop_flash
+from app.timeutils import today_local
 
 router = APIRouter()
-templates = Jinja2Templates(directory="app/templates")
+templates = shared_templates
 
 
 
@@ -51,6 +55,32 @@ def _sku_send(product) -> int:
     return explain(product, None, None).quantity
 
 
+def _refuse_live_order(order_id: str) -> str | None:
+    """Почему этот заказ нельзя трогать со страницы «Тестирование».
+
+    `is_test` защищает от того, чтобы симуляция создала БОЕВУЮ побочную запись.
+    Здесь дыра с другой стороны: боевую запись можно было ПЕРЕДАТЬ в симуляцию.
+    Обе кнопки искали заказ только по номеру и кабинету, без единой проверки,
+    что он тестовый, а номер приходит формой.
+
+    Что происходило с боевым заказом. «Симулировать отмену» возвращает остаток
+    у НАС по-настоящему, а задание в 1С помечает `is_test=True` — значит
+    обратного документа там не будет никогда: товар вернулся в продажу у нас и
+    остался отгруженным в 1С, то есть наружу уходит больше, чем есть. Вдобавок
+    заказ помечен `cancelled`, и настоящую отмену, придя она позже, живой опрос
+    пропустит как уже обработанную. «Симулировать подтверждение» тем же способом
+    съедает перемещение «Ожидает → Склад»: у нас заказ закрыт, в 1С единица
+    вечно висит на промежуточном складе.
+    """
+    if not (order_id or "").startswith(TEST_ORDER_PREFIX):
+        return ("Это боевой заказ, а не тестовый. Симуляция закрыла бы его у нас, "
+                "не создав документа в 1С: остаток разошёлся бы с 1С, а настоящую "
+                f"отмену опрос потом пропустил бы как уже обработанную. Тестовые "
+                f"заказы начинаются с «{TEST_ORDER_PREFIX}» и создаются кнопкой "
+                "«Симулировать заказ» на этой же странице.")
+    return None
+
+
 def _real_processed_orders(db: Session, uid_1c: str) -> list:
     """Реальные (не синтетические TEST-) обработанные заказы товара по всем кабинетам —
     след прошлого бэкфилла/живого опроса. Именно их снимает «Сброс истории бэкфилла»."""
@@ -73,6 +103,33 @@ def _open_1c_tasks(db: Session, orders: list) -> int:
             FtpTask.is_test.is_(False),
         ).count()
     return n
+
+
+def _offset_calc(db: Session, product) -> dict | None:
+    """Расчёт порога для карточки на «Тестировании» — тот же, что на странице товаров.
+
+    Здесь он нужен, чтобы проверить старт задним числом ЧИСЛАМИ, а не на глаз:
+    оператор видит, сколько уходило бы на дату старта, и сколько уходит сейчас,
+    после всех проведённых бэкфиллом заказов и движений склада. Если бэкфилл
+    отработал правильно, второе число объясняется первым и разницей остатка.
+    """
+    if product is None:
+        return None
+    fact = product.fact_at_date
+    base = product.offset_base_stock
+    offset = offset_from_base(product)
+    return {
+        "date": product.offset_base_date,
+        "base_stock": base,
+        "fact": fact,
+        "reserve": product.reserve or 0,
+        "offset": product.broadcast_offset,
+        "computed": offset,
+        "waiting": product.offset_base_date is not None and base is None,
+        # Сколько уходило бы на саму дату расчёта — точка отсчёта для проверки.
+        "send_at_date": (max(0, base - offset) if (base is not None and offset is not None) else None),
+        "send_now": sku_quantity(product),
+    }
 
 
 def _backfill_summary(db: Session, product) -> dict:
@@ -248,6 +305,7 @@ def testing_page(
         # иначе оператор видит в журнале одно, а в карточке другое.
         "simulated_stock": (product.stock_on_hand - open_test_out(db, product.uid_1c)) if product else None,
         "backfill": _backfill_summary(db, product),
+        "calc": _offset_calc(db, product),
         "flash": pop_flash(request),
     })
 
@@ -311,6 +369,46 @@ def test_push_stock(
     barcode, external_id, article = target
     quantity = _quantity_to_send(db, uid_1c, account_id, product.stock_on_hand)
 
+    # Пауза кабинета — это «в этот кабинет сейчас не писать», и рассылка её
+    # соблюдает (`dispatch_enabled` в `run_dispatch_cycle`). Кнопка писала мимо
+    # неё: оператор останавливал кабинет ровно потому, что там что-то не так —
+    # переход, чужая система, разбор расхождений, — а проверка ключей молча
+    # клала туда число. Отказ громкий: иначе «ничего не произошло» выглядит как
+    # поломка кнопки.
+    account_row = db.query(PlatformAccount).filter(PlatformAccount.id == account_id).first()
+    if account_row is not None and not account_row.dispatch_enabled:
+        _log(db, uid_1c, account_id, TestLogLevel.warn, "push_stock",
+             "Отправка отменена: рассылка на этот кабинет стоит на паузе. "
+             "Боевая рассылка его тоже пропускает — проверка ключей не должна "
+             "быть единственным, что пишет в остановленный кабинет.")
+        db.commit()
+        set_flash(request, "Рассылка на этот кабинет стоит на паузе — отправка отменена. "
+                           "Снимите паузу на странице «Кабинеты», если проверять надо именно сейчас.",
+                  "warn")
+        return RedirectResponse(f"/testing?uid_1c={uid_1c}&account_id={account_id}", status_code=303)
+
+    # Ноль на карточку, куда мы ни разу не отправляли непустой остаток, — это не
+    # проверка ключей, а обнуление чужой витрины. А кнопку нажимают ровно в этом
+    # состоянии: страница «Тестирование» для того и нужна, чтобы прогнать товар
+    # ДО включения трансляции, и лестница в этот момент даёт ноль. Оператор при
+    # этом видел зелёное «Остаток 0 шт. успешно отправлен».
+    #
+    # Условие то же, что у осознанного отзыва (`transmit.should_withdraw`):
+    # спрашиваем не «включено ли», а «было ли что отзывать».
+    if quantity == 0 and not ever_transmitted(db, uid_1c, account_id):
+        reason = ("трансляция у товара выключена" if not product.broadcast_enabled
+                  else "лестница приоритетов даёт 0")
+        _log(db, uid_1c, account_id, TestLogLevel.warn, "push_stock",
+             f"Отправка отменена: к отправке вышло 0 шт. ({reason}), а непустой остаток "
+             f"на этот кабинет не уходил ни разу. Ноль здесь не отозвал бы наш остаток, "
+             f"а обнулил бы карточку площадки, по которой идут чужие продажи.")
+        db.commit()
+        set_flash(request, "Отправка отменена: к отправке вышло 0 шт., а на этот кабинет мы "
+                           "ни разу не отправляли непустой остаток — ноль обнулил бы живую "
+                           "карточку. Сначала доведите товар до «актуализирован» и включите "
+                           "трансляцию, потом проверяйте отправку.", "warn")
+        return RedirectResponse(f"/testing?uid_1c={uid_1c}&account_id={account_id}", status_code=303)
+
     _log(db, uid_1c, account_id, TestLogLevel.info, "push_stock",
          f"Отправка: физический остаток {product.stock_on_hand}, к отправке {quantity} шт. "
          f"(после резерва/порога) по баркоду {barcode}...")
@@ -324,6 +422,22 @@ def test_push_stock(
         ok = barcode in result.get("ok", [])
         log_action(db, user.username, "test_push_stock", f"{uid_1c} / кабинет #{account_id}: {result}")
         if ok:
+            if quantity > 0:
+                # То же, что пишет боевая рассылка при успешной отправке
+                # непустого остатка. Без этой отметки система забывает, что
+                # писала на карточку: очередь — недолговечная память (чистка
+                # уносит терминальные записи через тридцать суток), и снятие
+                # галочки потом не отзовёт остаток — площадка продолжит
+                # продавать по нашему числу. Отправка отсюда настоящая, значит и
+                # след от неё обязан быть настоящим.
+                setting = db.query(SyncSetting).filter(
+                    SyncSetting.uid_1c == uid_1c,
+                    SyncSetting.account_id == account_id,
+                ).first()
+                if setting is None:
+                    setting = SyncSetting(uid_1c=uid_1c, account_id=account_id, enabled=False)
+                    db.add(setting)
+                setting.last_nonzero_sent_at = now_utc()
             _log(db, uid_1c, account_id, TestLogLevel.good, "push_stock",
                  f"Успешно. Ответ площадки: ok={result.get('ok')}, errors={result.get('errors')}")
             set_flash(request, f"Остаток {quantity} шт. успешно отправлен в «{account.name}».", "good")
@@ -424,6 +538,14 @@ def simulate_confirm(
     """Шаг подтверждения: тот же process_confirmation, что и живой опрос —
     перемещение «<Площадка>.Ожидает» → «Склад <Площадка>». Остаток не меняет.
     Помечает задание в 1С is_test=True (в реальный файл не попадёт)."""
+    refusal = _refuse_live_order(order_id)
+    if refusal:
+        _log(db, uid_1c, account_id, TestLogLevel.warn, "simulate_confirm",
+             f"Заказ {order_id}: {refusal}")
+        db.commit()
+        set_flash(request, refusal, "warn")
+        return RedirectResponse(f"/testing?uid_1c={uid_1c}&account_id={account_id}", status_code=303)
+
     account = db.query(PlatformAccount).filter(PlatformAccount.id == account_id).first()
     record = db.query(ProcessedOrder).filter(
         ProcessedOrder.order_id == order_id, ProcessedOrder.account_id == account_id,
@@ -461,6 +583,14 @@ def simulate_cancel(
     db: Session = Depends(get_db), user: User = Depends(get_current_user),
 ):
     """Шаг 3: реверс тестового заказа — проверяет обратный ход (раздел 5)."""
+    refusal = _refuse_live_order(order_id)
+    if refusal:
+        _log(db, uid_1c, account_id, TestLogLevel.warn, "simulate_cancel",
+             f"Заказ {order_id}: {refusal}")
+        db.commit()
+        set_flash(request, refusal, "warn")
+        return RedirectResponse(f"/testing?uid_1c={uid_1c}&account_id={account_id}", status_code=303)
+
     account = db.query(PlatformAccount).filter(PlatformAccount.id == account_id).first()
     record = db.query(ProcessedOrder).filter(
         ProcessedOrder.order_id == order_id, ProcessedOrder.account_id == account_id,
@@ -529,14 +659,20 @@ def cleanup_test_data(
         # Реальным кабинетам с включённой синхронизацией шлём текущий боевой
         # остаток: тестовые значения до них не доходили (is_test исключает записи
         # в dispatch.py), но лишняя сверка с реальностью после теста не мешает.
+        #
+        # ЧЕРЕЗ `enqueue_full_resend`, а не прямым `db.add`. Прямая постановка
+        # обходила ОБА гейта трансляции: у товара с выключенной трансляцией
+        # лестница считает ноль (ступень 0), и этот ноль уходил на площадку.
+        # Для карточки, на которую мы ни разу ничего не отправляли, это не отзыв
+        # остатка, а обнуление чужих продаж — ровно инцидент 18.09. И повторялся
+        # он тут особенно легко: страница «Тестирование» для того и нужна, чтобы
+        # прогнать товар ДО включения трансляции, то есть кнопку «Очистить»
+        # нажимают именно в том состоянии, в котором лестница даёт ноль.
         enabled_settings = db.query(SyncSetting).filter(
             SyncSetting.uid_1c == uid_1c, SyncSetting.enabled.is_(True),
         ).all()
         for setting in enabled_settings:
-            db.add(DispatchQueueItem(
-                uid_1c=uid_1c, account_id=setting.account_id,
-                quantity=product.stock_on_hand, reason="test_cleanup",
-            ))
+            enqueue_full_resend(db, uid_1c, setting.account_id, reason="test_cleanup")
 
     order_ids = [o.order_id for o in test_orders]
     deleted_ftp = deleted_anomaly = 0
@@ -676,6 +812,84 @@ def backfill_real_orders(
     return redirect
 
 
+@router.post("/testing/offset-calc")
+def testing_offset_calc(
+    request: Request, uid_1c: str = Form(...), account_id: str = Form(""),
+    base_date: str = Form(""), fact: str = Form(""),
+    db: Session = Depends(get_db), user: User = Depends(get_current_user),
+):
+    """Расчёт порога с этой страницы: та же формула и те же поля, что на «Товарах».
+
+    Отдельный эндпоинт, а не переиспользование products-роутов, потому что те
+    отвечают фрагментом строки таблицы для htmx, а здесь страница целиком.
+    Считает и пишет всё равно один и тот же `recompute_offset` — двух реализаций
+    формулы быть не должно.
+    """
+    redirect = RedirectResponse(f"/testing?uid_1c={uid_1c}&account_id={account_id}",
+                                status_code=303)
+    product = db.query(Product).filter(Product.uid_1c == uid_1c).first()
+    if product is None:
+        set_flash(request, "Товар не найден.", "warn")
+        return redirect
+
+    raw_date = (base_date or "").strip()
+    if raw_date:
+        try:
+            day = datetime.strptime(raw_date, "%Y-%m-%d").date()
+        except ValueError:
+            set_flash(request, "Дата расчёта: формат ГГГГ-ММ-ДД.", "warn")
+            return redirect
+        if day > today_local():
+            set_flash(request, "Остатков на будущую дату в 1С нет.", "warn")
+            return redirect
+    else:
+        day = None
+
+    raw_fact = (fact or "").strip()
+    if raw_fact:
+        try:
+            parsed_fact = max(0, int(raw_fact))
+        except ValueError:
+            set_flash(request, "Факт на дату: введите целое число (без запятой).", "warn")
+            return redirect
+    else:
+        parsed_fact = None
+
+    # Порядок важен: СНАЧАЛА дата, потом факт. Смена даты стирает факт (он всегда
+    # «факт на дату»), и если поставить факт первым, он тут же обнулится — форма
+    # молча теряла бы введённое число.
+    if day != product.offset_base_date:
+        set_base_date(db, product, day)
+    apply_fact(db, product, parsed_fact, username=user.username)
+    asked = ensure_snapshot_requested(db, day, user.username) if day is not None else False
+    recompute_offset(product)
+
+    # Новое число обязано уехать — рассылка СОБЫТИЙНАЯ и сама к порогу не
+    # вернётся: следующая отправка будет, только когда изменится остаток, а у
+    # медленного размера это месяцы. Близнец на странице «Товары» (`_repropagate`
+    # после правки даты и факта) это делает, а здесь не делал: оператор видел
+    # новый порог в строке и считал, что карточка обновлена, — при том что на
+    # площадке лежало прежнее число.
+    #
+    # Через `enqueue_full_resend`, а не прямым `db.add`: страницу «Тестирование»
+    # открывают ровно в том состоянии, где лестница даёт ноль, и мимо гейтов
+    # такая запись обнулила бы живую карточку.
+    for setting in product.sync_settings:
+        if setting.enabled:
+            enqueue_full_resend(db, uid_1c, setting.account_id, reason="offset_recalc")
+
+    log_action(db, user.username, "offset_calc_from_testing",
+               f"{uid_1c} -> дата {raw_date or 'снята'}, факт {raw_fact or 'сброшен'}")
+    db.commit()
+
+    if asked:
+        set_flash(request, f"Запрос остатков ЦС на {day:%d.%m.%Y} поставлен в очередь — "
+                           f"порог посчитается, как ответит 1С.", "info")
+    elif product.broadcast_offset is not None:
+        set_flash(request, f"Порог: {product.broadcast_offset}.", "good")
+    return redirect
+
+
 @router.post("/testing/reset-backfill")
 def reset_backfill(
     request: Request, uid_1c: str = Form(...), account_id: str = Form(""),
@@ -726,12 +940,15 @@ def reset_backfill(
     deleted_log = db.query(TestLogEntry).filter(TestLogEntry.uid_1c == uid_1c).delete(synchronize_session=False)
 
     # Площадкам — актуальное значение заново (dispatch пересчитает от текущего
-    # остатка/порога в момент отправки).
+    # остатка/порога в момент отправки). ЧЕРЕЗ `enqueue_full_resend`, а не прямым
+    # `db.add`: см. ту же правку в `cleanup_test_data`. Прямая постановка обходила
+    # оба гейта, и по нетранслируемому товару на площадку уезжал ноль — обнуление
+    # живой карточки вместо отзыва нашего остатка.
     targets = []
-    for s in db.query(SyncSetting).filter(SyncSetting.uid_1c == uid_1c, SyncSetting.enabled.is_(True)).all():
-        db.add(DispatchQueueItem(uid_1c=uid_1c, account_id=s.account_id,
-                                 quantity=product.stock_on_hand, reason="backfill_reset"))
-        targets.append(s.account_id)
+    for setting in db.query(SyncSetting).filter(
+            SyncSetting.uid_1c == uid_1c, SyncSetting.enabled.is_(True)).all():
+        if enqueue_full_resend(db, uid_1c, setting.account_id, reason="backfill_reset"):
+            targets.append(setting.account_id)
 
     msg = (f"История бэкфилла сброшена: заказов {deleted_orders}, заданий 1С {deleted_ftp}, аномалий {deleted_anomaly}, "
            f"записей рассылки {deleted_dispatch}, записей журнала {deleted_log}. Остаток ЦС не менялся "

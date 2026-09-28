@@ -1,6 +1,9 @@
+{% if total is defined and total > rows|length %}
+<p class="help-text">Показаны первые {{ rows|length }} из {{ total }} строк отбора — страница не грузит весь справочник целиком. Уточните поиск, чтобы увидеть нужную, или выгрузите отбор в Excel: в файл уходит до {{ export_limit }} строк.</p>
+{% endif %}
 {% if view == 'conflicts' %}
     {% if rows %}
-    <table>
+    <div class="table-scroll"><table>
         <thead>
             <tr>
                 <th>Баркод</th>
@@ -25,13 +28,13 @@
             </tr>
             {% endfor %}
         </tbody>
-    </table>
+    </table></div>
     {% else %}
     <div class="empty-state">Конфликтов сопоставления не найдено — все баркоды с площадок распознаны.</div>
     {% endif %}
 {% else %}
     {% if rows %}
-    <table>
+    <div class="table-scroll"><table>
         <thead>
             <tr>
                 <th>Баркод</th>
@@ -56,7 +59,7 @@
             </tr>
             {% endfor %}
         </tbody>
-    </table>
+    </table></div>
     {% else %}
     <div class="empty-state">По заданным фильтрам ничего не найдено.</div>
     {% endif %}

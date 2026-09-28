@@ -21,7 +21,11 @@ def _seed_product_with_two_accounts(db):
     source = make_account(db, name="Источник (тестируем его)")
     other = make_account(db, name="Другой реальный кабинет", warehouse_id="wh-real")
 
-    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=10))
+    # Транслируемый товар: тесты ниже про то, что СИМУЛЯЦИЯ не уходит на боевую
+    # площадку. У нетранслируемого товара в очередь не попадает ничего вообще, и
+    # проверять на нём изоляцию бессмысленно — она получилась бы сама собой.
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=10,
+                   broadcast_enabled=True))
     db.add(Barcode(barcode="111", uid_1c="u1"))
     db.add(SyncSetting(uid_1c="u1", account_id=source.id, enabled=True))
     db.add(SyncSetting(uid_1c="u1", account_id=other.id, enabled=True))

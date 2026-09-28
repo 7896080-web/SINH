@@ -1,0 +1,234 @@
+"""Что происходило с порогом у одного товара — только чтение.
+
+Запуск:
+    C:\\sync_admin\\.venv\\Scripts\\python.exe C:\\sync_admin\\scripts\\probe_offset.py 2000932153711
+    ... probe_offset.py "36446 b" 5XL          # артикул + РАЗМЕР
+
+Ищет по ID_1С, БАРКОДУ, артикулу целиком и по куску артикула — в таком
+порядке. Баркод обязателен: артикул оператор видит на площадке, а он может не
+совпасть с тем, что записано у нас (пробелы, регистр, другой разделитель
+цвета), и тогда строка «не найдена» при том, что она есть.
+
+**Артикул один на весь размерный ряд**, и это главное про поиск. Раньше по
+артикулу бралась `.first()` — то есть ПРОИЗВОЛЬНЫЙ размер, а в выводе размера не
+было вовсе: человек спрашивал про 5XL, получал числа по S и не мог этого
+заметить. Ответ выглядел ответом. Теперь неоднозначность — это ОТКАЗ со списком
+строк, а размер печатается всегда, даже когда строка нашлась одна.
+
+Ничего не меняет и не коммитит. Нужен, когда порог «сам» съехал: по трём
+числам на экране этого не понять — надо видеть, В КАКОМ ПОРЯДКЕ их правили и
+кто. Журнал действий это помнит, а строка на странице показывает только итог.
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from app.database import SessionLocal                      # noqa: E402
+from app.models import (AuditLog, Barcode, DispatchQueueItem,  # noqa: E402
+                        ProcessedOrder, Product, StockDateSnapshot,
+                        StockDiscrepancyLog, SyncSetting)
+from app.transmit import offset_from_base                  # noqa: E402
+
+
+# Консоль боевого сервера пишет в cp1251, и один символ, которого в ней нет,
+# роняет ВЕСЬ вывод скрипта посреди строки — с `UnicodeEncodeError` вместо
+# ответа на вопрос, ради которого скрипт и запускали. Свои строки мы держим в
+# пределах cp1251 (закрыто тестом), но сюда печатаются и ЧУЖИЕ данные: тело
+# ответа площадки из `last_error`, названия товаров, артикулы. Там может
+# оказаться что угодно, и заменить символ на «?» несравнимо лучше, чем не
+# напечатать ничего.
+try:
+    sys.stdout.reconfigure(errors="replace")
+except (AttributeError, ValueError):  # перенаправленный вывод, старый Python
+    pass
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        print("укажите артикул или ID_1С")
+        return 1
+    needle = sys.argv[1].strip()
+    # Размер вторым аргументом: артикул один на весь ряд, и без него вопрос
+    # «откуда расхождение на 5XL» не имеет однозначного ответа.
+    wanted_size = sys.argv[2].strip() if len(sys.argv) > 2 else ""
+
+    db = SessionLocal()
+    try:
+        product = db.query(Product).filter(Product.uid_1c == needle).first()
+        if product is None:
+            link = db.query(Barcode).filter(Barcode.barcode == needle).first()
+            if link is not None:
+                product = db.query(Product).filter(
+                    Product.uid_1c == link.uid_1c).first()
+                if product is None:
+                    # Баркод есть, а товара нет — привязка висит в пустоту.
+                    # Само по себе находка: заказ по такому баркоду разнести
+                    # не на что.
+                    print(f"баркод {needle} привязан к {link.uid_1c}, "
+                          f"но товара с таким ID_1С в номенклатуре НЕТ")
+                    return 1
+        if product is None:
+            # По артикулу строк бывает СТОЛЬКО, СКОЛЬКО РАЗМЕРОВ. Берём все и
+            # решаем ниже — молча взять первую значит ответить не про тот товар,
+            # о котором спросили.
+            found = db.query(Product).filter(Product.article == needle).all()
+            if not found:
+                found = db.query(Product).filter(
+                    Product.article.ilike(f"%{needle}%")).all()
+            if wanted_size:
+                exact = [p for p in found
+                         if (p.size or "").strip().upper() == wanted_size.upper()]
+                if not exact:
+                    print(f"артикул нашёлся ({len(found)} строк), "
+                          f"а размера «{wanted_size}» среди них НЕТ. Есть: "
+                          + ", ".join(sorted((p.size or "—") for p in found)))
+                    return 1
+                found = exact
+            if len(found) > 1:
+                # Отказ, а не выбор наугад: числа по чужому размеру выглядят
+                # точно так же, как по нужному, и проверить их нечем.
+                print(f"под «{needle}» подходит {len(found)} строк — "
+                      f"укажите размер вторым аргументом или ID_1С:")
+                for p in sorted(found, key=lambda p: (p.size or "", p.uid_1c)):
+                    print(f"  {p.uid_1c}  размер {p.size or '—':6} "
+                          f"цвет {p.color or '—':20} {p.name}")
+                return 1
+            product = found[0] if found else None
+        if product is None:
+            print(f"не найден ни по ID_1С, ни по баркоду, ни по артикулу: {needle}")
+            return 1
+
+        print("=" * 70)
+        print(f"ID_1С:            {product.uid_1c}")
+        print(f"Артикул:          {product.article}")
+        # Размер и цвет печатаются ВСЕГДА, даже когда строка нашлась одна: без
+        # них вывод по многоразмерному артикулу нечем проверить, а ошибиться
+        # тут — значит смотреть на числа чужой строки.
+        print(f"Размер:           {product.size or '—'}")
+        print(f"Цвет:             {product.color or '—'}")
+        print(f"Название:         {product.name}")
+        print("-" * 70)
+        print(f"Остаток ЦС:       {product.stock_on_hand}")
+        print(f"Бронь:            {product.reserve}")
+        print(f"Порог:            {product.broadcast_offset}")
+        print(f"Ручной остаток:   {product.transmit_override}")
+        print("-" * 70)
+        print(f"Дата расчёта:     {product.offset_base_date}")
+        print(f"Учёт 1С на дату:  {product.offset_base_stock}")
+        print(f"Факт на дату:     {product.fact_at_date}")
+        print(f"Расхождение:      {product.stock_discrepancy}")
+        print(f"Порог по формуле: {offset_from_base(product)}"
+              "  (расхождение + бронь)")
+        print("-" * 70)
+        print(f"Актуализирован:   {product.recalc_done_at}")
+        print(f"Покрытые кабинеты:{product.recalc_account_ids!r}")
+        print(f"Трансляция:       {product.broadcast_enabled}")
+        print(f"Просьба включить: {product.broadcast_requested_at}")
+
+        if product.offset_base_date is not None:
+            snap = db.query(StockDateSnapshot).filter(
+                StockDateSnapshot.snapshot_date == product.offset_base_date,
+            ).order_by(StockDateSnapshot.id.desc()).first()
+            print("-" * 70)
+            if snap is None:
+                print(f"Срез 1С на {product.offset_base_date}: ЗАЯВКИ НЕТ")
+            else:
+                print(f"Срез 1С на {product.offset_base_date}: {snap.status} "
+                      f"(строк {snap.rows_count}, заявка {snap.created_at})")
+
+        codes = [b.barcode for b in db.query(Barcode).filter(
+            Barcode.uid_1c == product.uid_1c).order_by(Barcode.id).all()]
+        print("-" * 70)
+        print(f"Баркоды ({len(codes)}): {', '.join(codes) if codes else 'нет'}")
+
+        marks = db.query(SyncSetting).filter(
+            SyncSetting.uid_1c == product.uid_1c, SyncSetting.enabled.is_(True)).all()
+        print("-" * 70)
+        print(f"Отмечено кабинетов: {[m.account_id for m in marks]}")
+
+        print("=" * 70)
+        print("ЗАКАЗЫ И ОТМЕНЫ (последние 25, время UTC):")
+        # Номера заказов не показывает НИ ОДНА страница и ни одна выгрузка:
+        # `ProcessedOrder` читают только отчёт (внутри себя) и «Тестирование» —
+        # и то по одному выбранному товару и кабинету. Поэтому связать строку в
+        # 1С («sync REVERSE sync order_id=…») с тем, что видела система,
+        # приходилось сверкой по часам, да ещё и с пересчётом МСК в UTC.
+        # Очередь рассылки ниже номеров заказов не несёт вовсе — она про то,
+        # какое ЧИСЛО ушло на площадку, а не про то, что его вызвало.
+        orders = db.query(ProcessedOrder).filter(
+            ProcessedOrder.uid_1c == product.uid_1c,
+        ).order_by(ProcessedOrder.processed_at.desc()).limit(25).all()
+        for o in reversed(orders):
+            # Отмена печатается ЗАМЕТНО: по ней остаток вернулся, и именно её
+            # ищут, когда в 1С нашёлся обратный документ.
+            mark = "  <= ОТМЕНА" if o.status.value == "cancelled" else ""
+            print(f"  {o.processed_at}  каб.{o.account_id}  заказ {o.order_id:<24}"
+                  f" {o.quantity:>3} шт  {o.status.value}{mark}")
+        if not orders:
+            print("  пусто — заказов по этому товару система не проводила")
+
+        print("=" * 70)
+        print("ИСТОРИЯ РАСХОЖДЕНИЯ (время UTC):")
+        # Отдельно от журнала действий намеренно: массовые пути (кнопки отбора,
+        # импорт Excel) в журнал построчно не пишут вовсе, и по конкретной строке
+        # там следа нет — а расхождение уходит в порог и дальше на площадки.
+        gaps = db.query(StockDiscrepancyLog).filter(
+            StockDiscrepancyLog.uid_1c == product.uid_1c,
+        ).order_by(StockDiscrepancyLog.id).all()
+        for g in gaps:
+            print(f"  {g.created_at}  {str(g.old_value):>6} -> {str(g.new_value):>6}  "
+                  f"{g.source.value:9} {g.username or '-':12} "
+                  f"дата {g.base_date} учёт {g.base_stock} факт {g.fact}"
+                  + (f"  {g.note}" if g.note else ""))
+        if not gaps:
+            print("  пусто — расхождение не измеряли ни разу")
+
+        print("=" * 70)
+        print("ЖУРНАЛ ПО ЭТОЙ СТРОКЕ (последние 40, время UTC):")
+        rows = db.query(AuditLog).filter(
+            AuditLog.details.contains(product.uid_1c),
+        ).order_by(AuditLog.id.desc()).limit(40).all()
+        for r in reversed(rows):
+            print(f"  {r.created_at}  {r.actor:12} {r.action:28} {r.details}")
+        if not rows:
+            print("  пусто — строку правили только массово или файлом")
+
+        # Очередь рассылки — единственный след ПОРОГА во времени.
+        #
+        # Сам порог нигде не версионируется: страница показывает итог, а журнал
+        # действий записывает только правку руками. Зато `sent_quantity` — это
+        # «сколько ушло на площадку НА САМОМ ДЕЛЕ», посчитанное всей лестницей.
+        # Зная остаток на тот момент (`quantity` — он пишется при постановке),
+        # порог считается обратно: порог = остаток − ушло. Приблизительно —
+        # сверху могли сработать порог кабинета и пауза, — но для вопроса «съехал
+        # ли порог и когда» этого хватает.
+        print("-" * 70)
+        print("ОЧЕРЕДЬ РАССЫЛКИ (последние 25; «порог~» = остаток - ушло):")
+        queue = db.query(DispatchQueueItem).filter(
+            DispatchQueueItem.uid_1c == product.uid_1c,
+        ).order_by(DispatchQueueItem.id.desc()).limit(25).all()
+        for q in reversed(queue):
+            guess = ("—" if q.sent_quantity is None
+                     else str((q.quantity or 0) - q.sent_quantity))
+            print(f"  {q.created_at}  каб.{q.account_id}  остаток {q.quantity}"
+                  f"  ушло {q.sent_quantity}  порог~{guess}"
+                  f"  {q.status.value if q.status else ''}  {q.reason}")
+        if not queue:
+            print("  пусто")
+
+        print("-" * 70)
+        print("МАССОВЫЕ ДЕЙСТВИЯ И РАСЧЁТЫ (последние 30):")
+        bulk = db.query(AuditLog).filter(
+            AuditLog.action.in_(["products_bulk", "products_bulk_import_excel",
+                                 "recalc_started"]),
+        ).order_by(AuditLog.id.desc()).limit(30).all()
+        for r in reversed(bulk):
+            print(f"  {r.created_at}  {r.actor:12} {r.action:28} {r.details}")
+        return 0
+    finally:
+        db.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

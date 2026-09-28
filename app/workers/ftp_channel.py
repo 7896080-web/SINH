@@ -7,12 +7,73 @@ from app.timeutils import now_utc
 
 from sqlalchemy.orm import Session
 
-from app.models import (FtpTask, FtpTaskStatus, Platform, StockDateRow, StockDateSnapshot,
-                        StockDateStatus)
+from app.returns import (RETURN_COMMAND, RETURN_COMMANDS, SCRAP_COMMAND,
+                         apply_1c_result)
+
+from app.models import (FtpTask, FtpTaskStatus, OrderProcessStatus, Platform,
+                        ProcessedOrder, StockDateRow, StockDateSnapshot,
+                        StockDateStatus, StockDeltaDocument)
 
 logger = logging.getLogger("sync_worker")
 
 TASK_TIMEOUT_MINUTES = 15
+
+# --- Перепроведение зависших перемещений -----------------------------------
+# 1С иногда забирает файл задания и не отвечает по нему НИ ОДНОЙ строкой — ни OK,
+# ни ERROR. 19.09 так пропали два файла из пятидесяти трёх (12 строк): остаток по
+# 11 товарам навсегда занижен, потому что незакрытое задание вечно считается «в
+# пути». Разобрать его было нечем: `timeout` означает «неизвестно, создан
+# документ или нет», а повторная отправка вслепую завела бы ВТОРОЙ документ
+# перемещения на тот же заказ.
+#
+# Механизм опирается на идемпотентность 1С по номеру заказа: обработка перед
+# созданием ищет документ с этим номером и, если он есть, возвращает OK, ничего
+# не создавая. Тогда повтор безопасен и одновременно служит проверкой — ответ OK
+# значит «документ есть», независимо от того, был он раньше или создан сейчас.
+#
+# ВЫКЛЮЧЕНО ПО УМОЛЧАНИЮ. Пока идемпотентности в 1С нет, включать нельзя: каждый
+# повтор задвоит документ. Включается переменной окружения на боевом сервере,
+# осознанно и после подтверждения со стороны 1С.
+MOVEMENT_REPOST_ENV = "MOVEMENT_REPOST_ENABLED"
+# Сколько ждём после отметки `timeout`, прежде чем повторять. Ответ 1С штатно
+# приходит за 4–7 минут, `timeout` ставится через 15 — к этому сроку опоздавший
+# ответ уже закрыл бы задание сам (`apply_result_batch` принимает и поздние).
+REPOST_AFTER_MINUTES = 30
+# Больше пяти раз не долбим: если и после них тишина, дело не в случайности —
+# задание уходит в ручной разбор на «Диагностику», а не молотит вечно.
+MAX_REPOSTS = 5
+# Повторы уходят ОТДЕЛЬНЫМ маленьким файлом, а не подмешиваются к свежим
+# заданиям. Причина та же, из-за которой они и зависли: 1С роняет файл ЦЕЛИКОМ,
+# и строка, на которой она спотыкается, утащила бы за собой ни в чём не повинные
+# свежие перемещения.
+REPOST_BATCH_LINES = 3
+
+# --- Оперативное изменение остатка ЦС ---------------------------------------
+# 1С сама кладёт `delta_ГГГГММДДЧЧММСС.txt`, когда меняется остаток ЦС, — чтобы не
+# ждать часовой выгрузки (полный снимок это 152 тыс. товаров, чаще его не просят).
+# Строка: `баркод|новый остаток ЦС|источник|идентификатор документа`.
+#
+# Количество — НОВЫЙ АБСОЛЮТНЫЙ остаток, а не приращение. Приращения копят ошибку:
+# один потерянный или задвоенный файл — и расхождение остаётся навсегда, а
+# абсолютное число самолечится следующим же сообщением.
+#
+# Два разных предохранителя, и нужны оба:
+#  1. ИСТОЧНИК. Документы, созданные по нашим же заданиям, 1С помечает `sync`.
+#     Их надо отбрасывать: наше перемещение уже уменьшило остаток в момент приёма
+#     заказа, и применить его ещё раз значит списать единицу дважды. Это эхо
+#     собственных действий, а не новость со склада.
+#  2. ИДЕНТИФИКАТОР ДОКУМЕНТА. Один и тот же документ приезжает повторно при
+#     переотправке файла, повторном проведении, ручном перезапуске обработки.
+#     Применённые идентификаторы храним (`StockDeltaDocument`) и второй раз не
+#     применяем — иначе порядок файлов начинает решать, и старое сообщение может
+#     затереть новое.
+#
+# И главное: частичный файл применяется ТОЛЬКО как частичный. Полный снимок
+# обнуляет всё, чего в нём нет (иначе распроданный товар транслировался бы
+# вечно), и дельта, применённая как снимок, обнулила бы весь каталог с первого
+# же сообщения.
+STOCK_DELTA_FIELDS = 4
+SYNC_SOURCE = "sync"
 
 # Выгрузка остатков на заданное число: команда в task_*.txt и ответ ondate_*.txt.
 STOCK_ON_DATE_COMMAND = "EXPORT_STOCK_ON_DATE"
@@ -67,9 +128,27 @@ class LocalExchange:
         return sorted(p.name for p in self.dir_results.glob("result_*.txt"))
 
     def list_stock_files(self) -> list[str]:
+        """Полные снимки склада: `stock_ГГГГММДДЧЧММСС.txt`.
+
+        Цифра в шаблоне не для красоты. Снимок применяется как ПОЛНЫЙ — товар,
+        которого в нём нет, обнуляется, — поэтому попасть сюда не должен никакой
+        другой файл, чьё имя начинается на `stock_`. Достаточно завести рядом
+        `stock_delta_*` или `stock_backup_*`, и он был бы разобран как снимок
+        склада со всеми последствиями.
+        """
         if not self.dir_results.exists():
             return []
-        return sorted(p.name for p in self.dir_results.glob("stock_*.txt"))
+        return sorted(p.name for p in self.dir_results.glob("stock_[0-9]*.txt"))
+
+    def list_stock_delta_files(self) -> list[str]:
+        """Оперативные изменения остатка ЦС: `delta_ГГГГММДДЧЧММСС.txt`.
+
+        Префикс намеренно НЕ начинается на `stock_`: это частичный файл, и
+        применять его как снимок нельзя ни при каких обстоятельствах.
+        """
+        if not self.dir_results.exists():
+            return []
+        return sorted(p.name for p in self.dir_results.glob("delta_*.txt"))
 
     def list_stock_on_date_files(self) -> list[str]:
         """Выгрузка остатков НА ДАТУ. Префикс намеренно другой (`ondate_`, а не
@@ -97,15 +176,37 @@ class LocalExchange:
             return []
         return sorted(p.name for p in self.dir_results.glob("barcodes_*.txt"))
 
-    def download_and_archive_result(self, filename: str) -> str:
+    def read_result(self, filename: str) -> str:
+        """Читает файл из results, НЕ трогая его на диске.
+
+        utf-8-sig: обработка 1С пишет файлы через ЗаписьТекста(…, КодировкаТекста.UTF8),
+        то есть С BOM. При чтении как чистого utf-8 три байта BOM прилипали к первому
+        полю первой строки — первая строка result_*.txt не сопоставлялась с заданием
+        (задание вечно "sent"), а первый uid в stock_*.txt/barcodes_*.txt искажался.
+        """
+        return (self.dir_results / filename).read_text(encoding="utf-8-sig")
+
+    def archive_result(self, filename: str) -> None:
+        """Убирает разобранный файл в архив. Отдельно от чтения намеренно."""
         self._ensure_dirs()
         src = self.dir_results / filename
-        # utf-8-sig: обработка 1С пишет файлы через ЗаписьТекста(…, КодировкаТекста.UTF8),
-        # то есть С BOM. При чтении как чистого utf-8 три байта BOM прилипали к первому
-        # полю первой строки — первая строка result_*.txt не сопоставлялась с заданием
-        # (задание вечно "sent"), а первый uid в stock_*.txt/barcodes_*.txt искажался.
-        content = src.read_text(encoding="utf-8-sig")
-        os.replace(src, self.dir_archive / filename)
+        if src.exists():
+            os.replace(src, self.dir_archive / filename)
+
+    def download_and_archive_result(self, filename: str) -> str:
+        """Читает и сразу архивирует.
+
+        Осталось для путей, где разбор ничего не пишет в базу. Там, где за
+        разбором идёт `commit`, так делать НЕЛЬЗЯ: сбой коммита (на бою это
+        `database is locked` — случай, ради которого сверку резали на порции)
+        оставлял бы файл только в архиве, откуда его никто не перечитывает.
+        Задания при этом навсегда оставались «в пути»: по созданию остаток
+        занижен, по отмене — завышен. Читай `read_result`, разбирай, коммить, и
+        только потом `archive_result`.
+        """
+        self._ensure_dirs()
+        content = self.read_result(filename)
+        self.archive_result(filename)
         return content
 
 
@@ -198,13 +299,32 @@ def build_task_batch(db: Session, max_lines: int = 500, request_stock_export: bo
         FtpTask.status == FtpTaskStatus.pending,
         FtpTask.is_test.is_(False),  # тестовые задания со страницы тестирования — никогда не уходят в реальный файл для 1С
     ).limit(max_lines).all()
+
+    # ИНВАРИАНТ: повтор зависшего перемещения никогда не едет в одном файле ни с
+    # чем другим. 1С роняет файл ЦЕЛИКОМ — именно так и зависли 12 строк, — значит
+    # строка, на которой она спотыкается, утащила бы за собой и свежие
+    # перемещения, и запрос выгрузки. Поэтому либо файл целиком из повторов, либо
+    # повторов в нём нет вовсе.
+    #
+    # Файл с запросом выгрузки (часовой/суточный) повторы не забирает никогда:
+    # иначе запрос остатков оказался бы проглочен, сверка встала бы на час, и мы
+    # починили бы одно, сломав другое. Повторы уедут следующим минутным файлом.
+    reposts = [t for t in tasks if (t.repost_count or 0) > 0]
+    asking_export = request_stock_export or request_barcode_export
+    if reposts and not asking_export:
+        tasks = reposts[:REPOST_BATCH_LINES]
+        date_requests_allowed = False
+    else:
+        tasks = [t for t in tasks if (t.repost_count or 0) == 0]
+        date_requests_allowed = True
     # Запросы остатков на дату (страница «Остатки на дату»). Флага is_test у них
     # нет и не нужно: команда только ЧИТАЕТ регистр остатков и ничего в 1С не
     # создаёт и не меняет — побочного эффекта, от которого защищает is_test, у
     # неё не существует.
     date_requests = db.query(StockDateSnapshot).filter(
         StockDateSnapshot.status == StockDateStatus.pending,
-    ).order_by(StockDateSnapshot.id.asc()).limit(MAX_DATE_REQUESTS_PER_BATCH).all()
+    ).order_by(StockDateSnapshot.id.asc()).limit(MAX_DATE_REQUESTS_PER_BATCH).all() \
+        if date_requests_allowed else []
 
     if not tasks and not date_requests and not request_stock_export and not request_barcode_export:
         return None
@@ -215,6 +335,24 @@ def build_task_batch(db: Session, max_lines: int = 500, request_stock_export: bo
         lines.append("EXPORT_STOCK_ON_HAND")
     if request_barcode_export:
         lines.append("EXPORT_BARCODES")
+
+    # Причины утилизации — ОДНИМ запросом на пачку, а не по строке. Их в файле
+    # единицы, но правило общее: подзапрос на строку у нас уже стоил 134,9 с
+    # монопольной блокировки на боевом масштабе.
+    scrap_ids = [t.id for t in tasks if t.command == SCRAP_COMMAND]
+    scrap_reasons = {}
+    scrap_responsible = ""
+    if scrap_ids:
+        from app.returns import scrap_responsible as _responsible
+
+        scrap_responsible = _responsible(db)
+    if scrap_ids:
+        from app.returns import SCRAP_OPERATION
+        from app.models import ReturnItem
+
+        for rid, reason in db.query(ReturnItem.ftp_task_id, ReturnItem.scrap_reason).filter(
+                ReturnItem.ftp_task_id.in_(scrap_ids)).all():
+            scrap_reasons[rid] = SCRAP_OPERATION.get(reason, "")
 
     sent_dates = set()
     for snapshot in date_requests:
@@ -232,7 +370,9 @@ def build_task_batch(db: Session, max_lines: int = 500, request_stock_export: bo
         # .epf на старой базе про кабинеты ничего не знает, ей нужен только
         # физический товар и склад. Имя кабинета оседает в комментарии
         # документа, если понадобится аудит "какой именно ИП продал".
-        platform_value = t.account.platform.value
+        # У возврата кабинета нет — площадка стоит на самом задании.
+        platform_value = (t.account.platform.value if t.account is not None
+                          else (t.platform.value if t.platform else ""))
         # Дата документа (старт задним числом), ГГГГММДД; пусто = текущая дата в 1С.
         mdate = t.movement_date.strftime("%Y%m%d") if t.movement_date else ""
         if t.command == "CREATE_MOVEMENT":
@@ -248,11 +388,51 @@ def build_task_batch(db: Session, max_lines: int = 500, request_stock_export: bo
             ]))
         elif t.command == "CANCEL_MOVEMENT":
             lines.append("|".join(["CANCEL_MOVEMENT", t.order_id, platform_value]))
+        elif t.command in RETURN_COMMANDS:
+            # Возврат: зеркало приёма заказа, «склад площадки → ЦС». Формат
+            # строки тот же, что у создания, — 1С разбирает их одним циклом.
+            # У утилизации к тому же перемещению добавляется списание с ЦС, и
+            # делает их 1С ОДНОЙ транзакцией: между документами остаток ЦС
+            # вырос бы на единицу, и часовая выгрузка, попав в промежуток,
+            # увезла бы на площадки вещь, которая уже в мусоре.
+            row = [t.command, t.barcode, t.warehouse_from or "",
+                   t.warehouse_to or "ЦС Склад", str(t.quantity or 0),
+                   t.order_id, platform_value, mdate]
+            if t.command == SCRAP_COMMAND:
+                # Девятое поле — НАИМЕНОВАНИЕ ХОЗ. ОПЕРАЦИИ списания, а не текст
+                # причины: в 1С оно определяет проводки, и искать его там будут
+                # точным совпадением. Десятое — ответственный: значение одно на
+                # все задания, но едет в каждой строке намеренно, потому что
+                # обработка не должна знать наших людей, а правка модуля 1С
+                # требует Конфигуратора и переноса вручную.
+                #
+                # Разделители в обоих значениях невозможны (оба наши), но чистим
+                # на общих основаниях: значение с «|» разъехалось бы по полям и
+                # разобралось как другая строка.
+                row.append(scrap_reasons.get(t.id, "").replace("|", " ").strip())
+                row.append(scrap_responsible.replace("|", " ").strip())
+            lines.append("|".join(row))
 
         t.status = FtpTaskStatus.sent
         t.batch_filename = filename
         t.sent_at = now_utc()
 
+    # Пометка «отправлено» коммитится ДО публикации файла, и это ОСОЗНАННО —
+    # не забытый порядок.
+    #
+    # Соблазн переставить понятен: если публикация сорвётся (нет места, права,
+    # антивирус придержал файл), задания останутся `sent`, 1С их не получит, и
+    # они дойдут до `timeout` — остаток занижен на их количество. Но обратный
+    # порядок (сначала файл, потом пометка) платит хуже: при сбое коммита файл
+    # УЖЕ у 1С, задания остались `pending`, и следующий цикл отправит их второй
+    # раз. Для `CREATE_MOVEMENT` это безвредно — 1С идемпотентна по номеру
+    # заказа, проверено на бою 19.09. Для `CANCEL_MOVEMENT` нет и быть не может:
+    # второй файл создаст ВТОРОЙ обратный документ, на ЦС вернётся вдвое больше,
+    # чем оттуда уезжало, и это завышенный остаток, то есть оверселл.
+    #
+    # Потеря при нынешнем порядке видна и разбирается: задание висит в `sent`,
+    # уходит в `timeout` и попадает на «Диагностику» в ручной разбор. Двойной
+    # возврат не виден вообще ничем.
     db.commit()
     return filename, "\n".join(lines)
 
@@ -276,6 +456,110 @@ def parse_stock_export_file(content: str) -> dict[str, int]:
         for barcode in barcodes:
             result[barcode] = quantity
     return result
+
+
+def parse_stock_delta_file(content: str) -> list[dict]:
+    """Разбор `delta_*.txt`: `баркод|новый остаток|источник|идентификатор документа`.
+
+    Формат намеренно свой и минимальный, а не расширение строки `stock_*.txt`: там
+    поля разбираются справа из-за наименований с «|» внутри, и подмешивать туда
+    ещё два поля значило бы делать разбор хрупким ради экономии.
+    """
+    rows = []
+    for line in content.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split("|")
+        if len(parts) < STOCK_DELTA_FIELDS:
+            continue
+        barcode = parts[0].strip()
+        digits = parts[1].strip().lstrip("-")
+        if not barcode or not digits.isdigit():
+            continue
+        rows.append({
+            "barcode": barcode,
+            "quantity": int(parts[1]),
+            "source": parts[2].strip().lower(),
+            "document_id": parts[3].strip(),
+        })
+    return rows
+
+
+def collect_stock_delta(db: Session, exchange: "LocalExchange") -> tuple[dict[str, int], dict]:
+    """Забирает и архивирует `delta_*.txt`, отсеивая всё, что применять нельзя.
+
+    Возвращает `({баркод: новый остаток}, статистика)`. САМ НИЧЕГО НЕ ПРИМЕНЯЕТ:
+    остаток двигает `run_reconciliation` — та же функция, что и на часовой
+    выгрузке, чтобы формула «остаток = 1С минус в пути» жила в одном месте.
+    Вызывающий обязан звать её с `missing_means_zero=False`.
+    """
+    stats = {"files": 0, "lines": 0, "ours_skipped": 0, "already_applied": 0,
+             "no_document_id": 0, "applied": 0,
+             # Время САМОГО СТАРОГО файла пачки, а не «сейчас». Вызывающий
+             # передаёт его в `run_reconciliation` как момент снимка: дельта
+             # описывает склад на ту минуту, когда 1С её записала, а не на
+             # минуту, когда мы её прочитали. Со временем приёма задания,
+             # закрытые в промежутке, переставали считаться «в пути», хотя в
+             # файле их ещё нет, — и уже отгруженные единицы возвращались на
+             # склад и уезжали на площадки. Берём самое раннее: ошибка в эту
+             # сторону занижает остаток, а не завышает.
+             "snapshot_at": None,
+             # Файлы архивируются ПОСЛЕ применения — см. `finalize_stock_delta`.
+             "files_pending": [],
+             "documents_pending": {}}
+    mapping: dict[str, int] = {}
+    fresh_documents: dict[str, dict] = {}
+
+    for filename in exchange.list_stock_delta_files():
+        content = exchange.read_result(filename)
+        stats["files_pending"].append(filename)
+        moment = exchange.file_mtime_utc(filename)
+        if moment is not None and (stats["snapshot_at"] is None
+                                   or moment < stats["snapshot_at"]):
+            stats["snapshot_at"] = moment
+        stats["files"] += 1
+        for row in parse_stock_delta_file(content):
+            stats["lines"] += 1
+
+            if row["source"] == SYNC_SOURCE:
+                # Наш же документ: остаток по нему уже списан в момент приёма
+                # заказа. Применить ещё раз — списать дважды.
+                stats["ours_skipped"] += 1
+                continue
+
+            doc_id = row["document_id"]
+            if not doc_id:
+                # Без идентификатора повтор не отличить от новости, и порядок
+                # файлов начал бы решать. Пропускаем: часовая выгрузка всё равно
+                # принесёт этот остаток, самое позднее через час.
+                stats["no_document_id"] += 1
+                continue
+
+            if doc_id not in fresh_documents and db.query(StockDeltaDocument).filter(
+                    StockDeltaDocument.document_id == doc_id).first() is not None:
+                stats["already_applied"] += 1
+                continue
+
+            mapping[row["barcode"]] = row["quantity"]
+            entry = fresh_documents.setdefault(doc_id, {"source": row["source"], "lines": 0})
+            entry["lines"] += 1
+            stats["applied"] += 1
+
+    # Документы НЕ помечаются применёнными здесь: остаток ещё не тронут. Раньше
+    # пометка коммитилась сразу, и падение на применении означало, что файл уже
+    # в архиве, документ уже «применён», а остаток не изменился — то есть правка
+    # 1С терялась насовсем, и повторная присылка того же файла ничего бы не
+    # исправила.
+    stats["documents_pending"] = fresh_documents
+
+    if stats["files"]:
+        logger.info("stock_delta: %s", stats)
+    if stats["no_document_id"]:
+        logger.warning("stock_delta: %d строк без идентификатора документа — "
+                       "пропущены, защита от задвоения без него невозможна",
+                       stats["no_document_id"])
+    return mapping, stats
 
 
 def fetch_stock_export_files(exchange: "LocalExchange") -> dict[str, int]:
@@ -389,10 +673,19 @@ def apply_stock_on_date_files(db: Session, exchange: "LocalExchange") -> dict:
     запросил всего лишь для справки. Всё, что делает функция, — складывает
     строки файла в отдельную таблицу и закрывает заявку."""
     stats = {"files": 0, "rows": 0, "unmatched": 0}
+    # Файлы, разбор которых дошёл до конца. Архивируем их ПОСЛЕ коммита: раньше
+    # файл уезжал в архив первым действием, и сбой на любом следующем шаге
+    # (`database is locked` на коммите, ошибка в `fill_waiting_products`) уносил
+    # ответ 1С безвозвратно — из архива его никто не перечитывает. Заявка при
+    # этом оставалась в `sent`, товары с этой базовой датой — в «ждём выгрузку»
+    # навсегда, а повторно 1С этот файл не пришлёт.
+    applied_files: list[str] = []
 
     for filename in exchange.list_stock_on_date_files():
         snapshot_date = parse_stock_on_date_filename(filename)
         if snapshot_date is None:
+            # Имя не разобрано — разбирать нечего и в следующем цикле тоже, файл
+            # можно убирать сразу: иначе он будет мозолить глаза каждую минуту.
             exchange.download_and_archive_result(filename)
             stats["unmatched"] += 1
             logger.warning("stock_on_date: имя %s не разобрано — файл убран в архив", filename)
@@ -403,8 +696,9 @@ def apply_stock_on_date_files(db: Session, exchange: "LocalExchange") -> dict:
             StockDateSnapshot.status != StockDateStatus.done,
         ).order_by(StockDateSnapshot.id.asc()).first()
 
-        content = exchange.download_and_archive_result(filename)
+        content = exchange.read_result(filename)
         if snapshot is None:
+            exchange.archive_result(filename)
             stats["unmatched"] += 1
             logger.warning("stock_on_date: выгрузка за %s не сопоставлена ни с одной заявкой "
                            "(файл %s лежит в архиве)", snapshot_date, filename)
@@ -432,8 +726,26 @@ def apply_stock_on_date_files(db: Session, exchange: "LocalExchange") -> dict:
         snapshot.note = "" if rows else "1С вернула пустую выгрузку"
         stats["files"] += 1
         stats["rows"] += len(rows)
+        applied_files.append(filename)
+
+        # Товары, которым оператор задал эту дату для расчёта порога, ждали
+        # именно этого файла. Подставляем им остаток на дату и пересчитываем
+        # порог здесь же: между «задал дату» и «1С ответила» проходит до десяти
+        # минут, и если не доделать сейчас, расчёт застрянет до тех пор, пока
+        # оператор не тронет строку руками.
+        from app.offset_base import fill_waiting_products   # локально: цикл импортов
+        filled = fill_waiting_products(db, snapshot)
+        if filled["filled"]:
+            stats["offset_base_filled"] = stats.get("offset_base_filled", 0) + filled["filled"]
+            logger.info("stock_on_date: порог посчитан для %d товаров "
+                        "(изменился у %d, в очередь рассылки %d)",
+                        filled["filled"], filled["offsets_changed"],
+                        filled["queued"])
 
     db.commit()
+    # Только теперь — разбор дошёл до базы.
+    for filename in applied_files:
+        exchange.archive_result(filename)
     return stats
 
 
@@ -455,10 +767,22 @@ def detect_timed_out_stock_date_requests(db: Session) -> list:
 
 
 def prune_stock_date_snapshots(db: Session, keep: int = STOCK_ON_DATE_KEEP) -> int:
-    """Оставляет последние `keep` заявок, остальные удаляет вместе со строками.
+    """Оставляет последние `keep` ОТВЕЧЕННЫХ заявок, остальные удаляет со строками.
+
     Каждая выгрузка — полный снимок склада (тысячи строк), а нужна она обычно
-    один раз; без уборки база росла бы от справок."""
+    один раз; без уборки база росла бы от справок.
+
+    Незавершённые заявки (`pending`/`sent`) не удаляются НИКОГДА, сколько бы их
+    ни накопилось. Раньше уборка шла просто по номеру: закажи оператор больше
+    десяти срезов подряд — и самые старые исчезали вместе с теми, на которые 1С
+    ещё не ответила. Пропадало сразу три вещи: сама заявка (ответ, когда он
+    придёт, лёг бы в никуда), находка отчёта «Заявок на срез без ответа 1С»
+    (ей не на что смотреть) и — главное — товары с этой базовой датой оставались
+    в «ждём выгрузку 1С» навсегда, потому что ждать стало нечего.
+    """
     ids = [row.id for row in db.query(StockDateSnapshot.id)
+           .filter(StockDateSnapshot.status.notin_(
+               [StockDateStatus.pending, StockDateStatus.sent]))
            .order_by(StockDateSnapshot.id.desc()).offset(keep).all()]
     if not ids:
         return 0
@@ -468,6 +792,24 @@ def prune_stock_date_snapshots(db: Session, keep: int = STOCK_ON_DATE_KEEP) -> i
         StockDateSnapshot.id.in_(ids)).delete(synchronize_session=False)
     db.commit()
     return len(ids)
+
+
+def finalize_stock_delta(db: Session, exchange: "LocalExchange", stats: dict) -> None:
+    """Закрепить применённую дельту: пометить документы и убрать файлы в архив.
+
+    Зовётся ТОЛЬКО после того, как остаток реально применён. Раньше и то и
+    другое делалось при чтении, до применения: сбой на применении оставлял файл
+    в архиве (оттуда его никто не перечитывает) и документ помеченным
+    применённым, то есть правка остатка из 1С пропадала насовсем — повторная
+    присылка того же файла была бы отброшена как «уже применён».
+    """
+    for doc_id, entry in (stats.get("documents_pending") or {}).items():
+        db.add(StockDeltaDocument(document_id=doc_id, source=entry["source"],
+                                  lines=entry["lines"]))
+    if stats.get("documents_pending"):
+        db.commit()
+    for filename in stats.get("files_pending") or []:
+        exchange.archive_result(filename)
 
 
 KNOWN_COMMANDS = ("CREATE_MOVEMENT", "CONFIRM_MOVEMENT", "CANCEL_MOVEMENT")
@@ -544,12 +886,268 @@ def apply_result_batch(db: Session, content: str) -> dict:
         task.completed_at = now_utc()
         closed_ids.add(task.id)
 
+        # Возврат и утилизация: статус вещи двигает ТОЛЬКО ответ 1С — ни одна
+        # кнопка на странице из ожидания не выводит. Здесь и есть единственный
+        # путь в оба терминальных статуса: «возвращён в продажу» (растущий
+        # остаток) и «утилизирован» (учёт сошёлся со складом).
+        if task.command in RETURN_COMMANDS:
+            apply_1c_result(db, task, ok)
+
         if not ok:
             logger.error("1С отказала по заданию %s %s: %s", task.command, order_id, detail[:255])
         stats["ok" if ok else "error"] += 1
 
     db.commit()
     return stats
+
+
+def repost_enabled() -> bool:
+    """Включено ли перепроведение зависших перемещений.
+
+    Читаем окружение В МОМЕНТ ВЫЗОВА, а не при импорте: так состояние видно в
+    тестах и меняется рестартом службы, без пересборки образа.
+    """
+    return os.environ.get(MOVEMENT_REPOST_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def repost_stuck_movements(db: Session) -> dict:
+    """Возвращает зависшие перемещения в очередь на отправку.
+
+    Берём только `timeout`: `failed` — это внятный отказ 1С, там документа
+    заведомо нет и повтор ничего не проверяет, такое разбирает человек. `sent`
+    ещё в работе. Отменам (`CANCEL_MOVEMENT`) повтор тоже не делаем: идемпотентность
+    обещана по созданию, про отмену такой договорённости нет, а угадывать в
+    сторону 1С нельзя.
+
+    Само задание не пересоздаём, а возвращаем в `pending` — тогда у него
+    сохраняется вся история (когда создано, сколько раз повторяли), и «в пути»
+    оно как считалось, так и считается: остаток не дёргается туда-сюда, пока
+    ответа нет.
+    """
+    stats = {"reposted": 0, "exhausted": 0, "skipped_disabled": 0,
+             "order_cancelled": 0}
+
+    stuck = db.query(FtpTask).filter(
+        FtpTask.status == FtpTaskStatus.timeout,
+        FtpTask.command == "CREATE_MOVEMENT",
+        FtpTask.is_test.is_(False),
+    ).order_by(FtpTask.id).all()
+    if not stuck:
+        return stats
+
+    cutoff = now_utc() - timedelta(minutes=REPOST_AFTER_MINUTES)
+    ready = [t for t in stuck
+             if t.sent_at is not None and t.sent_at < cutoff]
+
+    # Заказ УЖЕ ОТМЕНЁН — повторять создание нельзя ни в коем случае.
+    #
+    # Отмена уходит минутным файлом, а повтор — не раньше получаса, то есть
+    # всегда позже. `ОтменитьПеремещенияЗаказа` документа не находит (его и не
+    # было, ради этого повтор и написан), отвечает `OK|нет документов для
+    # отмены`, и задание отмены закрывается как выполненное. Следом приходит
+    # повтор создания, `НайтиПроведённоеПеремещение` пусто — и 1С СОЗДАЁТ
+    # перемещение по заказу, которого больше нет. Отменить его нечем:
+    # `existing_cancel_task` видит закрытое CANCEL_MOVEMENT в любом статусе и
+    # второго не выпустит, а сам заказ со статусом `cancelled` из опроса отмен
+    # выпал. Единица навсегда числится отгруженной, физически лёжа на ЦС.
+    #
+    # Идемпотентность 1С тут не помогает, а работает против: она обещана по
+    # СУЩЕСТВУЮЩЕМУ документу, а здесь документа нет вовсе.
+    #
+    # Обратный случай (1С документ создала, потерялся только ответ — ровно
+    # инцидент 19.09) от этой проверки не страдает: такое задание просто уходит
+    # в ручной разбор, где человек смотрит в 1С и закрывает его как проведённое.
+    cancelled = _orders_already_cancelled(db, ready)
+    stats["order_cancelled"] = len([t for t in ready if _pair(t) in cancelled])
+    ready = [t for t in ready if _pair(t) not in cancelled]
+
+    stats["exhausted"] = len([t for t in ready if (t.repost_count or 0) >= MAX_REPOSTS])
+    ready = [t for t in ready if (t.repost_count or 0) < MAX_REPOSTS]
+
+    if not repost_enabled():
+        # Молча ничего не делаем, но СЧИТАЕМ: иначе выключенный механизм выглядел
+        # бы как отсутствие проблемы, а зависшие задания никуда не делись.
+        stats["skipped_disabled"] = len(ready)
+        return stats
+
+    for t in ready[:REPOST_BATCH_LINES]:
+        t.status = FtpTaskStatus.pending
+        t.repost_count = (t.repost_count or 0) + 1
+        t.batch_filename = None
+        t.sent_at = None
+        stats["reposted"] += 1
+
+    if stats["reposted"]:
+        db.commit()
+        logger.info("repost_stuck_movements: вернули в очередь %d зависших перемещений",
+                    stats["reposted"])
+    return stats
+
+
+def _pair(task: FtpTask) -> tuple[str | None, int | None]:
+    """Ключ заказа: номер плюс КАБИНЕТ. Номера заказов у разных площадок могут
+    совпасть, и сверять их без кабинета значило бы закрыть чужое задание."""
+    return (task.order_id, task.account_id)
+
+
+def _orders_already_cancelled(db: Session,
+                              tasks: list[FtpTask]) -> set[tuple[str | None, int | None]]:
+    """Из этих заданий — те пары заказ+кабинет, которые уже отменены.
+
+    ОДИН запрос на весь список: зависших заданий на бою бывают десятки, и запрос
+    на строку здесь ничего не стоил бы только пока их мало.
+    """
+    pairs = {_pair(t) for t in tasks if t.order_id}
+    if not pairs:
+        return set()
+    rows = db.query(ProcessedOrder.order_id, ProcessedOrder.account_id).filter(
+        ProcessedOrder.order_id.in_({p[0] for p in pairs}),
+        ProcessedOrder.status == OrderProcessStatus.cancelled,
+    ).all()
+    return {(order_id, account_id) for order_id, account_id in rows} & pairs
+
+
+def tasks_needing_review(db: Session) -> list[FtpTask]:
+    """Задания, которые сами уже не разберутся — их закрывает человек.
+
+    Правило одно: зависшее задание, которого НЕ ВОЗЬМЁТ автоповтор, обязано
+    попасть сюда. Иначе оно висит вечно и невидимо, а «в пути» по нему считается
+    всё это время.
+
+    Автоповтор не берёт:
+      * `failed` — 1С ответила ERROR, документа заведомо нет;
+      * `timeout`, исчерпавший `MAX_REPOSTS`;
+      * `timeout` при ВЫКЛЮЧЕННОМ перепроведении;
+      * **любую команду, кроме `CREATE_MOVEMENT`** — отмены и подтверждения
+        `repost_stuck_movements` не трогает никогда, и это закреплено тестом.
+        Раньше такое задание в разбор не попадало ВООБЩЕ: условие требовало
+        исчерпанных повторов, а счётчик повторов у отмены не растёт и не может.
+        При включённом на бою автоповторе зависшая отмена висела бы бесконечно,
+        а `_in_flight_adjustment` вычитал бы её количество — остаток завышен,
+        наружу уходит больше, чем есть, то есть прямой оверселл. Карточка
+        «Диагностики» этот случай уже умеет показывать (направление ошибки у
+        отмены обратное), ей просто никогда не доставалось таких строк;
+      * `CREATE_MOVEMENT`, заказ по которому уже отменён — повтор по нему
+        запрещён (см. `repost_stuck_movements`), а решить, есть ли документ в
+        1С, может только человек.
+
+    Свежий `timeout` не берём: опоздавший ответ 1С закрывает такое задание сам
+    (`apply_result_batch` принимает и поздние), и звать человека рано.
+    """
+    cutoff = now_utc() - timedelta(minutes=REPOST_AFTER_MINUTES)
+    rows = db.query(FtpTask).filter(
+        FtpTask.status.in_([FtpTaskStatus.timeout, FtpTaskStatus.failed]),
+        FtpTask.is_test.is_(False),
+    ).order_by(FtpTask.id).all()
+
+    stale = [t for t in rows
+             if t.status is FtpTaskStatus.timeout
+             and not (t.sent_at is not None and t.sent_at >= cutoff)]
+    cancelled = _orders_already_cancelled(db, stale)
+
+    out = []
+    for t in rows:
+        if t.status is FtpTaskStatus.failed:
+            out.append(t)
+            continue
+        if t.sent_at is not None and t.sent_at >= cutoff:
+            continue                                  # ещё может закрыться сам
+        if (t.repost_count or 0) >= MAX_REPOSTS or not repost_enabled():
+            out.append(t)
+        elif t.command != "CREATE_MOVEMENT":
+            out.append(t)
+        elif _pair(t) in cancelled:
+            out.append(t)
+    return out
+
+
+# --------------------------------------------------------------------------- ручной разбор
+
+def review_effect(task: FtpTask) -> dict:
+    """Что зависшее задание делает с остатком СЕЙЧАС и что изменит решение.
+
+    Один текст на четырёх читателей: карточка «Диагностики» (`_stuck_rows`),
+    подтверждение у кнопки «документа нет», сообщение после неё и находка отчёта
+    `_check_tasks_needing_review`. Раньше их было четыре разных, собранных по
+    СОЗДАНИЮ, и они уже расходились между собой: у отмены знак обратный, и
+    человек, читавший предупреждение буквально, отказывался нажимать — оставляя
+    систему ровно в опасном состоянии.
+
+    Направление зависит от команды, и третий случай, возврат, не похож ни на
+    один из двух. `RETURN_TO_STOCK` в «в пути» НЕ участвует вовсе
+    (`reconciliation._in_flight_adjustment` знает только создание и отмену), то
+    есть остаток не занижен и не завышен — он просто ещё не вырос: вещь лежит на
+    складе, 1С её не оприходовала, и на площадки она не уедет. Описать это
+    словами создания («остаток занижен, наружу уходит меньше») значило бы
+    пообещать, что оно рассосётся сверкой само, — а оно не рассосётся никогда.
+    """
+    qty = task.quantity or 0
+    if task.command == "CANCEL_MOVEMENT":
+        return {
+            "effect": f"остаток завышен на {qty} — наружу уходит больше, чем есть "
+                      f"(риск оверселла)",
+            "no_document_effect": f"остаток УМЕНЬШИТСЯ на {qty} после ближайшей сверки: "
+                                  f"1С товар не вернула, и возвращать его нам тоже не за чем",
+            "warning": "Применяйте, если возврата от площадки физически не было.",
+            "oversell": True,
+        }
+    if task.command == SCRAP_COMMAND:
+        return {
+            "effect": f"вещь выброшена, но 1С об этом не знает: единица {qty} шт "
+                      f"числится на складе площадки и будет числиться там, пока "
+                      f"документы не проведены",
+            "no_document_effect": "остаток НЕ изменится: 1С ни возврата, ни "
+                                  "списания не провела. Вещь вернётся в разбор, и "
+                                  "решение придётся принять заново",
+            "warning": "Вещь физически выброшена, а по учёту так и останется на "
+                       "складе площадки — расхождение придётся закрывать в 1С руками.",
+            "oversell": False,
+        }
+    if task.command == RETURN_COMMAND:
+        return {
+            "effect": f"вещь принята на складе, но 1С её не оприходовала: остаток "
+                      f"не вырос на {qty}, и на площадки она не уедет",
+            "no_document_effect": "остаток НЕ изменится: 1С вещь не приходовала. "
+                                  "Возврат вернётся в разбор, и решение придётся "
+                                  "принять заново",
+            "warning": "Вещь останется непринятой: пока возврат не проведут, "
+                       "продавать её нечем.",
+            "oversell": False,
+        }
+    return {
+        "effect": f"остаток занижен на {qty} — наружу уходит меньше, чем есть",
+        "no_document_effect": f"остаток ВЫРАСТЕТ на {qty}: 1С единицу не списала",
+        "warning": "Если товар на самом деле ОТГРУЖЕН, площадки начнут продавать проданное.",
+        "oversell": False,
+    }
+
+
+def resolve_stuck_task(db: Session, task: FtpTask, document_exists: bool,
+                       actor: str) -> FtpTask:
+    """Закрывает зависшее задание решением человека, посмотревшего в 1С.
+
+    `document_exists=True` — документ в 1С есть: задание закрываем как
+    проведённое, «в пути» снимается, остаток сходится с 1С сам собой.
+
+    `document_exists=False` — документа нет и не будет: задание получает
+    `no_document`. Это ТОЖЕ снимает «в пути», и остаток вырастет на количество
+    задания — потому что 1С эту единицу у себя так и не списала. Решение опасное
+    и сознательно оставлено человеку: если товар на самом деле отгружен, возврат
+    единицы в остаток означает, что площадки начнут продавать проданное.
+    """
+    task.status = FtpTaskStatus.done if document_exists else FtpTaskStatus.no_document
+    task.result_status = "OK" if document_exists else "NO_DOCUMENT"
+    task.result_detail = ("разобрано вручную (%s): документ в 1С %s"
+                          % (actor, "найден" if document_exists else "не найден"))[:255]
+    task.completed_at = now_utc()
+    # Возврат ждёт ответа так же, как ждал бы ответа 1С: не сдвинь мы его здесь,
+    # вещь осталась бы в «ждём 1С» навсегда — молча, при закрытом задании, и
+    # увидеть это можно было бы только придя смотреть глазами.
+    apply_1c_result(db, task, document_exists)
+    db.commit()
+    logger.info("resolve_stuck_task: #%s %s -> %s (%s)",
+                task.id, task.order_id, task.status.value, actor)
+    return task
 
 
 def detect_timed_out_tasks(db: Session) -> list[FtpTask]:

@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}Расхождения учёта со складом{% endblock %}
+{% block content %}
+
+<div class="page-header">
+    <div>
+        <h1>Расхождения учёта со складом</h1>
+        <p>
+            Насколько учёт 1С разошёлся с тем, что реально лежит на складе. Из этого
+            числа складывается порог трансляции (<b>порог = расхождение + бронь</b>),
+            то есть оно напрямую решает, сколько уходит на площадки.
+            Ненулевое расхождение — это НОРМА, а не поломка: склад пересчитали,
+            он разошёлся с 1С, и мы это учли. Разбирать надо не сам факт, а
+            устаревшие измерения.
+        </p>
+    </div>
+    <div>
+        <a class="btn" href="/products" style="white-space:nowrap">← К товарам</a>
+    </div>
+</div>
+
+<div class="card">
+    <form class="filters" id="dsc-filters"
+          hx-get="/discrepancies/rows" hx-target="#dsc-table"
+          hx-trigger="change from:input[type=checkbox]">
+        <label class="checkbox-inline" style="padding-bottom:8px;"
+               title="«На складе больше, чем знает 1С». По таким товарам наружу осознанно уходит БОЛЬШЕ учётного остатка — устаревшее измерение здесь уже оверселл.">
+            <input type="checkbox" name="only_negative" value="true"
+                   {% if only_negative %}checked{% endif %}>
+            Только отрицательные (уходит больше учёта)
+        </label>
+        <label class="checkbox-inline" style="padding-bottom:8px;"
+               title="Только те, чей остаток уходит наружу прямо сейчас: по остальным неверное расхождение ничем пока не грозит.">
+            <input type="checkbox" name="only_broadcasting" value="true"
+                   {% if only_broadcasting %}checked{% endif %}>
+            Только с включённой трансляцией
+        </label>
+        <div class="field" style="align-self:flex-end">
+            <button type="submit" class="btn" formaction="/discrepancies/export"
+                    formmethod="get" hx-boost="false">Выгрузить в Excel</button>
+        </div>
+    </form>
+    <p class="help-text" style="margin-bottom:0">
+        <b>Знак значим, и стороны неравноценны.</b> Плюс — «в 1С числится больше, чем
+        лежит»: мы придерживаем ровно столько, и если измерение устарело, товар зря
+        не продаётся. Минус — «на складе больше, чем знает 1С»: наружу осознанно
+        уходит больше учётного остатка, и устаревшее измерение здесь уже оверселл.
+        Ноль в список не попадает: «измеряли, склад сошёлся» — это отсутствие
+        расхождения, а не расхождение.
+        Правят его в строке товара на «Товарах» или колонкой «Расхождение» в файле.
+    </p>
+</div>
+
+{# Автообновление: расхождение меняют ввод факта, правка руками, импорт файла и
+   задание порога. Оператор держит страницу открытой и работает по ней. #}
+<div class="card" id="dsc-table"
+     hx-get="/discrepancies/rows"
+     hx-trigger="every {{ refresh_seconds }}s"
+     hx-include="#dsc-filters"
+     hx-swap="innerHTML">
+    {% include "discrepancies_rows.html" %}
+</div>
+
+{% endblock %}

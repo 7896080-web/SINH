@@ -1,5 +1,7 @@
 import os
+import threading
 import logging
+import sys
 import time
 from datetime import datetime, timedelta
 from app.timeutils import now_utc
@@ -7,6 +9,10 @@ from app.timeutils import now_utc
 from apscheduler.schedulers.blocking import BlockingScheduler
 
 from app.database import SessionLocal
+from app.backup import last_backup, make_backup
+from app.retention import apply_retention
+from app.report import CRITICAL, collect_findings, summary_line
+from app.workers.verify_stock import verify_all
 from app.models import Platform, PlatformAccount, WorkerHeartbeat
 from app.routers.health import SCHEDULER_START_MARKER
 from app.workers.credentials import CredentialsMissing
@@ -17,7 +23,8 @@ from app.workers.dispatch import run_dispatch_cycle
 from app.workers.catalog_sync import load_platform_catalog
 from app.workers.catalog_poller import poll_catalog
 from app.workers.ftp_channel import (
-    LocalExchange, build_task_batch, apply_result_batch, detect_timed_out_tasks,
+    LocalExchange, build_task_batch, apply_result_batch, collect_stock_delta,
+    detect_timed_out_tasks, repost_stuck_movements, finalize_stock_delta,
     fetch_stock_export_files, fetch_stock_export_snapshot, fetch_barcode_dict_files,
     apply_stock_on_date_files, detect_timed_out_stock_date_requests,
     prune_stock_date_snapshots,
@@ -38,7 +45,39 @@ def _log_time_offset() -> str:
     return time.strftime("%z")
 
 
+def use_utf8(stream) -> bool:
+    """Заставляет поток лога писать в UTF-8 вне зависимости от локали системы.
+
+    NSSM перенаправляет stderr процесса в `worker.err.log`, а Python кодирует
+    его в кодировку локали — на русской Windows это cp1251. Кириллица в логе
+    оказывалась в однобайтовой кодировке, и любой инструмент, читающий файл как
+    UTF-8, показывал вместо неё мусор: строка
+    `reconciliation: нет свежего файла выгрузки остатков — пропуск`
+    читалась как `��� ������� ����� ... � �������`. Это не косметика: именно по
+    этой строке видно, что сверка не сверяет, а найти её поиском по слову было
+    нельзя. Наша же инструкция (`deploy/README_WINDOWS.md`) велела читать лог
+    как UTF-8 — то есть гарантированно показывала мусор.
+
+    `errors="replace"` — чтобы неожиданный символ (например, имя файла, которое
+    файловая система отдала суррогатом) портил одну букву в строке, а не ронял
+    саму запись в лог.
+
+    Возвращает False, если поток переключить нельзя (его подменили на объект без
+    `reconfigure` — так делает перехват вывода в тестах): лог тогда остаётся в
+    прежней кодировке, но воркер из-за этого не падает.
+    """
+    reconfigure = getattr(stream, "reconfigure", None)
+    if reconfigure is None:
+        return False
+    try:
+        reconfigure(encoding="utf-8", errors="replace")
+    except (ValueError, OSError):
+        return False
+    return True
+
+
 def configure_logging(level: int = logging.INFO):
+    use_utf8(sys.stderr)
     logging.basicConfig(level=level, format=LOG_FORMAT.format(offset=_log_time_offset()))
     # APScheduler на КАЖДЫЙ цикл пишет «Running job» и «executed successfully».
     # При задании раз в 45 секунд плюс по заданию на кабинет это сотни строк в час
@@ -79,6 +118,28 @@ SOLD_WAREHOUSE_NAME = {
 
 
 def _heartbeat(db, worker_name: str, success: bool, error: str = ""):
+    """Отметка «задание отработало». ОТКАТ ПЕРВЫМ ДЕЛОМ — это не перестраховка.
+
+    Отметку почти всегда зовут из `except`-ветки, а самый важный класс сбоя —
+    упавший `commit` внутри задания (`database is locked` после `busy_timeout`,
+    ошибка целостности). После него сессия сломана, и `_heartbeat` падал САМ, с
+    `PendingRollbackError`: запись об ошибке не появлялась вовсе, а в базе
+    оставались время и `last_success=True` от ПРОШЛОГО удачного прогона. То есть
+    ровно в тот момент, когда задание перестало работать, `/health` оставался
+    зелёным, «Диагностика» пустой, а текст ошибки терялся. Для заданий с длинным
+    окном (сверка — три часа, бэкап и чистка — трое суток) зелёный держался
+    соответственно долго.
+
+    Откат стоит ЗДЕСЬ, а не в каждой ветке: иначе новое задание заведёт этот
+    дефект заново, а заметить его можно будет только по тишине.
+
+    Откатываем ТОЛЬКО сломанную сессию (`is_active` ложно ровно в этом случае —
+    проверено). Безусловный откат был бы лекарством хуже болезни: отметку зовут и
+    из успешных веток, а часть заданий коммитит свою работу тем же коммитом, что
+    и отметку.
+    """
+    if not db.is_active:
+        db.rollback()
     hb = db.query(WorkerHeartbeat).filter(WorkerHeartbeat.worker_name == worker_name).first()
     if hb is None:
         hb = WorkerHeartbeat(worker_name=worker_name, last_run_at=now_utc())
@@ -119,14 +180,45 @@ def job_poll_orders(account_id: int):
         cancel_stats = poll_cancellations(db, client, account)
         logger.info("%s (%s): new=%s confirm=%s cancel=%s",
                     worker_name, account.name, new_stats, confirm_stats, cancel_stats)
+        # Сбойные ОТДЕЛЬНЫЕ заказы цикл переживает (см. poll_new_orders), но
+        # молчать о них нельзя: пропущенный заказ — это несписанный остаток.
+        stuck = []
+        for label, st in (("заказов", new_stats), ("подтверждений", confirm_stats),
+                          ("отмен", cancel_stats)):
+            if st.get("failed"):
+                logger.warning("%s (%s): %s не проведено из-за ошибок: %d — %s",
+                               worker_name, account.name, label, st["failed"],
+                               "; ".join(st.get("problems") or [])[:500])
+                stuck.append(f"{label} не проведено: {st['failed']} — "
+                             + "; ".join(st.get("problems") or [])[:300])
+        # Предохранитель сбрасываем ДАЖЕ при сбойных заказах — намеренно: гасить
+        # кабинет целиком из-за одной битой строки хуже, чем оставить его жить.
         record_success(db, account)
         db.commit()
-        _heartbeat(db, worker_name, True)
+        # А вот молчать нельзя. Раньше heartbeat писался безусловно успешным, и
+        # непроведённый заказ не оставлял следа НИГДЕ: `db.rollback()` в
+        # обработчике (`order_poller`) уносит и `SyncAnomaly`, и `ProcessedOrder`,
+        # а в логе строка живёт до ротации. Устойчивый отказ на одном заказе
+        # означает: единица продана, у нас не списана, перемещения в 1С нет,
+        # остаток завышен и уезжает наружу — при зелёном `/health`, пустой
+        # «Диагностике» и молчащем отчёте.
+        #
+        # Отметка остаётся УСПЕШНОЙ, а текст уезжает в `last_error` — тот же
+        # приём, что у `reconciliation_applied`: `/health` про живость, а
+        # расхождение разбирает отчёт (`_check_orders_not_processed`). Разовый
+        # сбой при этом сам себя стирает через 45 секунд следующим циклом, и
+        # находки не будет — она про УСТОЙЧИВЫЙ отказ, а не про мигание.
+        _heartbeat(db, worker_name, True, "; ".join(stuck) if stuck else "")
     except CredentialsMissing as e:
         logger.warning("%s: %s", worker_name, e)
         _heartbeat(db, worker_name, False, str(e))
     except Exception as e:
         logger.exception("%s failed", worker_name)
+        # Откат ПЕРЕД записью сбоя. Сессия после неудачного commit внутри цикла
+        # остаётся сломанной, и `record_failure` + `commit` по ней падали бы
+        # сами — вместе с ними терялись и счётчик предохранителя, и heartbeat,
+        # то есть сбой оставался невидимым и для «Диагностики», и для /health.
+        db.rollback()
         if account is not None:
             disabled = record_failure(db, account, str(e))
             db.commit()
@@ -158,6 +250,11 @@ def job_dispatch():
         db.close()
 
 
+# Замок на все три расписания `job_ftp_send`: см. его докстроку. Ставится на
+# уровне модуля, потому что расписания живут в одном процессе воркера.
+_FTP_SEND_LOCK = threading.Lock()
+
+
 def job_ftp_send(request_stock_export: bool = False, request_barcode_export: bool = False,
                  heartbeat_name: str = "ftp_send"):
     """Отправка накопленных заданий в 1С. Три расписания зовут эту же функцию:
@@ -167,10 +264,39 @@ def job_ftp_send(request_stock_export: bool = False, request_barcode_export: boo
     выгрузки — то есть фактическая остановка сверки — была бы не видна в /health.
 
     Время heartbeat часового запроса дополнительно служит отметкой «когда мы в
-    последний раз попросили выгрузку»: сверка применяет только снимок новее её."""
+    последний раз попросили выгрузку»: сверка применяет только снимок новее её.
+
+    ОДИН ЗАМОК НА ВСЕ ТРИ РАСПИСАНИЯ. `max_instances=1` действует на каждый `id`
+    по отдельности, а расписаний здесь три — то есть два прогона могли идти
+    одновременно в разных потоках пула. `build_task_batch` читает `pending`-задания
+    и помечает их отправленными в одной транзакции, но коммитит только в конце,
+    так что оба успевали прочитать ОДНИ И ТЕ ЖЕ строки и разложить их по ДВУМ
+    файлам для 1С. Для `CREATE_MOVEMENT` это безвредно — 1С идемпотентна по номеру
+    заказа. Для `CANCEL_MOVEMENT` нет: отмена идемпотентной не сделана и сделана
+    быть не может, второй файл создаёт ВТОРОЙ обратный документ, и на ЦС
+    возвращается вдвое больше, чем оттуда уезжало. `existing_cancel_task` тут не
+    помогает — она не даёт завести второе ЗАДАНИЕ, а здесь одно задание уезжает
+    дважды.
+
+    Расписания сами по себе разведены на 20 и 40 секунд и на секундной сетке не
+    сходятся. Но `misfire_grace_time` плюс `coalesce` означают, что после любой
+    паузы воркера все просроченные задания уходят в пул ОДНОВРЕМЕННО.
+    """
+    with _FTP_SEND_LOCK:
+        _job_ftp_send_locked(request_stock_export, request_barcode_export, heartbeat_name)
+
+
+def _job_ftp_send_locked(request_stock_export: bool, request_barcode_export: bool,
+                         heartbeat_name: str):
     db = SessionLocal()
     try:
         exchange = _build_ftp_exchange()
+        # Зависшие перемещения возвращаем в очередь ПЕРЕД сборкой файла, чтобы они
+        # уехали этим же циклом. Механизм сам решает, включён ли он, и сам держит
+        # предел повторов — здесь никаких условий не дублируем.
+        repost_stats = repost_stuck_movements(db)
+        if repost_stats["reposted"] or repost_stats["exhausted"]:
+            logger.info("ftp_send: перепроведение зависших %s", repost_stats)
         batch = build_task_batch(db, request_stock_export=request_stock_export,
                                  request_barcode_export=request_barcode_export,
                                  exchange=exchange)
@@ -188,16 +314,67 @@ def job_ftp_send(request_stock_export: bool = False, request_barcode_export: boo
 
 def job_ftp_receive():
     db = SessionLocal()
+    # Счётчики непроведённой работы. Правило общее: задание, вернувшее
+    # ненулевой такой счётчик, пишет текст в `last_error` УСПЕШНОГО heartbeat, и
+    # у текста обязан быть читатель. У опроса заказов, сверки остатков и
+    # выгрузки каталога это закрыто; канал 1С — где настоящие документы и
+    # настоящий остаток — оставался без него, и всё уходило только в лог. А лог
+    # читают, когда уже что-то случилось.
+    unmatched_results = 0          # ответ 1С не лёг ни на одно задание
+    unmatched_on_date = 0          # строка выгрузки на дату не легла ни на одну заявку
     try:
         exchange = _build_ftp_exchange()
         for filename in exchange.list_result_files():
-            content = exchange.download_and_archive_result(filename)
-            stats = apply_result_batch(db, content)
+            # Читаем → разбираем → коммитим → и ТОЛЬКО ПОТОМ убираем в архив.
+            # Раньше файл уезжал в архив первым действием, и любой сбой разбора
+            # (на бою это `database is locked`) уносил ответы 1С безвозвратно:
+            # из архива их никто не перечитывает, задания оставались «в пути»
+            # навсегда, остаток — заниженным по созданиям и завышенным по
+            # отменам. Повторный разбор того же файла безопасен: задание
+            # закрывается один раз, повторный ответ по закрытому даёт
+            # `unmatched`. Потеря — нет.
+            content = exchange.read_result(filename)
+            try:
+                stats = apply_result_batch(db, content)
+            except Exception:
+                db.rollback()
+                logger.exception("ftp_receive: %s не разобран — файл оставлен в results "
+                                 "на следующий цикл", filename)
+                continue
+            exchange.archive_result(filename)
+            unmatched_results += stats.get("unmatched", 0)
             logger.info("ftp_receive: %s -> %s", filename, stats)
+
+        # Оперативные изменения остатка ЦС: 1С кладёт их сама, не дожидаясь
+        # часовой выгрузки. Применяются ТОЛЬКО как частичные —
+        # `missing_means_zero=False`: товар, которого в файле нет, не трогаем.
+        # Полный снимок обнуляет отсутствующих намеренно, и дельта, применённая
+        # как снимок, обнулила бы весь каталог с первого же сообщения.
+        delta, delta_stats = collect_stock_delta(db, exchange)
+        if delta:
+            # Момент снимка — время ФАЙЛА, а не время приёма: дельта описывает
+            # склад на ту минуту, когда 1С её записала. Со временем приёма
+            # задания, закрытые в промежутке, переставали считаться «в пути»,
+            # хотя в файле их ещё нет, и уже отгруженные единицы возвращались на
+            # склад. `finalize_stock_delta` помечает документы и убирает файлы в
+            # архив ТОЛЬКО после успешного применения — иначе правка 1С терялась
+            # насовсем.
+            recon = run_reconciliation(
+                db, delta, missing_means_zero=False,
+                snapshot_at=delta_stats.get("snapshot_at") or now_utc())
+            finalize_stock_delta(db, exchange, delta_stats)
+            logger.info("ftp_receive: изменение остатка ЦС %s -> сверка %s",
+                        {k: v for k, v in delta_stats.items()
+                         if k not in ("files_pending", "documents_pending")}, recon)
+        else:
+            # Применять нечего (все строки отсеяны), но файлы прочитаны — их
+            # надо убрать, иначе они будут перечитываться каждую минуту.
+            finalize_stock_delta(db, exchange, delta_stats)
 
         # Выгрузки остатков на дату — отдельный префикс файлов и отдельная
         # таблица: в остаток товара и в сверку они не попадают никогда.
         on_date = apply_stock_on_date_files(db, exchange)
+        unmatched_on_date += on_date["unmatched"]
         if on_date["files"] or on_date["unmatched"]:
             logger.info("ftp_receive: остатки на дату -> %s", on_date)
         prune_stock_date_snapshots(db)
@@ -210,10 +387,77 @@ def job_ftp_receive():
         if stale_dates:
             logger.warning("ftp_receive: %d заявок на остатки на дату без ответа", len(stale_dates))
 
-        _heartbeat(db, "ftp_receive", True)
+        # Отказ 1С (`stats["error"]`) сюда НЕ идёт намеренно: задание уходит в
+        # `failed`, а его уже читают двое — `_check_stuck_1c_tasks` и ручной
+        # разбор на «Диагностике». Второй сигнал о том же не добавил бы знания, а
+        # место в оговорке занял бы. Строки дельты без идентификатора документа —
+        # тоже: их пропуск осознан, и часовая выгрузка принесёт этот остаток.
+        notes = []
+        if unmatched_results:
+            notes.append(f"ответов 1С не сопоставлено: {unmatched_results}")
+        if unmatched_on_date:
+            notes.append(f"строк выгрузки на дату мимо заявок: {unmatched_on_date}")
+        _heartbeat(db, "ftp_receive", True, "; ".join(notes))
     except Exception as e:
         logger.exception("ftp_receive failed")
         _heartbeat(db, "ftp_receive", False, str(e))
+    finally:
+        db.close()
+
+
+# Метка фактически применённой сверки. Само задание `reconciliation` отчитывается
+# об успехе и когда сверять было нечем: свежего файла выгрузки 1С нет — задание
+# честно отработало, ошибки не случилось. Но для системы про остатки «сверка
+# запускалась» и «остатки сверены» — разные вещи: пока 1С не отдаёт выгрузку,
+# остаток в приложении живёт сам по себе, расходится со складом и уезжает на
+# площадки как есть, то есть это прямая дорога к оверселлу. Такое молчание уже
+# ловили дважды (находки 14 и 15), здесь тот же случай: heartbeat зелёный,
+# мониторинг доволен, а сверки нет. По этой метке /health видит именно её
+# отсутствие.
+RECONCILIATION_APPLIED = "reconciliation_applied"
+
+
+def _heartbeat_at(db, worker_name: str):
+    hb = db.query(WorkerHeartbeat).filter(WorkerHeartbeat.worker_name == worker_name).first()
+    return hb.last_run_at if hb else None
+
+
+def _export_request_answered(db) -> bool:
+    """Ответ 1С на последний запрос выгрузки уже применён?
+
+    Сравниваются две отметки: когда в последний раз ПОПРОСИЛИ выгрузку и когда в
+    последний раз её ПРИМЕНИЛИ. Применили позже, чем попросили — цикл закрыт,
+    ждать нечего. Нет хотя бы одной отметки (первый запуск на чистой базе) —
+    считаем, что ответа ещё нет: сказать про ожидание лишний раз безопаснее, чем
+    промолчать о том, что сверка стоит.
+    """
+    requested = _heartbeat_at(db, "ftp_send_export_request")
+    applied = _heartbeat_at(db, RECONCILIATION_APPLIED)
+    if requested is None or applied is None:
+        return False
+    return applied >= requested
+
+
+def job_recalc():
+    """Массовая актуализация остатков — порциями, чтобы не занимать базу надолго.
+
+    Раз в 20 секунд берёт незавершённое задание и обрабатывает несколько товаров.
+    Нет задания — мгновенно выходит. Работу делает воркер, а не веб: здесь и ключи
+    площадок, и канал 1С, и запрос от браузера столько не живёт.
+    """
+    from app.recalc import run_tick
+
+    db = SessionLocal()
+    try:
+        result = run_tick(db, build_client, lambda platform: PENDING_WAREHOUSE_NAME.get(
+            platform, "Ожидает"))
+        if result.get("job") and not result.get("finished"):
+            logger.info("recalc: задание #%s — обработано %s из %s",
+                        result["job"], result.get("processed"), result.get("total"))
+        _heartbeat(db, "recalc", True)
+    except Exception as e:
+        logger.exception("recalc failed")
+        _heartbeat(db, "recalc", False, str(e))
     finally:
         db.close()
 
@@ -224,10 +468,8 @@ def job_reconciliation():
         exchange = _build_ftp_exchange()
         # Снимок старше последнего запроса выгрузки — ответ на ПРОШЛЫЙ цикл: он
         # отражает склад часовой давности и вернул бы проданное за час обратно.
-        marker = db.query(WorkerHeartbeat).filter(
-            WorkerHeartbeat.worker_name == "ftp_send_export_request").first()
-        rows, snapshot_at = fetch_stock_export_snapshot(
-            exchange, not_older_than=marker.last_run_at if marker else None)
+        requested_at = _heartbeat_at(db, "ftp_send_export_request")
+        rows, snapshot_at = fetch_stock_export_snapshot(exchange, not_older_than=requested_at)
         if rows:
             # 1С — хозяин ассортимента: сначала заводим/обновляем товары
             # (новые SKU, размер/цвет), затем сверяем остатки.
@@ -242,8 +484,46 @@ def job_reconciliation():
             stats = run_reconciliation(db, stock, missing_means_zero=True,
                                        snapshot_at=snapshot_at)
             logger.info("reconciliation: %s", stats)
-        else:
-            logger.info("reconciliation: нет свежего файла выгрузки остатков — пропуск")
+            # Предохранитель «снимок подозрительный» сработал: сверка перестала
+            # обнулять распроданное. Это правильно (обрезанный файл не должен
+            # стереть каталог), но МОЛЧА так быть не может — состояние
+            # самоподдерживающееся, снимок сам не вырастет, и предохранитель
+            # будет срабатывать каждый час бесконечно. Всё это время на площадки
+            # уходит последнее ненулевое число по товарам, которых на складе нет.
+            suspicious = stats.get("snapshot_suspicious")
+            if suspicious:
+                logger.warning(
+                    "reconciliation: снимок 1С покрыл только %s позиций — это меньше "
+                    "половины прежних ненулевых, обнуление распроданного ОТКЛЮЧЕНО. "
+                    "Наружу продолжает уходить остаток по товарам, которых на складе "
+                    "нет. Проверьте выгрузку 1С: файл обрезан или сформирован не "
+                    "полностью.", suspicious)
+            # Разные остатки по баркодам ОДНОГО товара: несколько штрихкодов
+            # одного SKU держат один физический остаток, и 1С отдаёт по ним одно
+            # число. Разные значат, что один баркод привязан к чужому товару, —
+            # а максимум тогда берёт ЧУЖОЙ остаток, и наружу уходит больше, чем
+            # лежит на складе. Чинится мэппингом, но сначала об этом надо узнать.
+            conflicts = stats.get("barcode_conflicts")
+            if conflicts:
+                logger.warning(
+                    "reconciliation: у %s товаров 1С отдала РАЗНЫЕ остатки по разным "
+                    "баркодам одного товара. Один из баркодов привязан к чужому "
+                    "товару: сверка берёт наибольшее, то есть чужое число, и на "
+                    "площадки уходит больше, чем есть. Разберите привязку на "
+                    "странице «Мэппинг».", conflicts)
+            # Отдельная метка: сверка не просто отработала, а ФАКТИЧЕСКИ применила
+            # снимок 1С. Ниже, в ветке пропуска, её намеренно нет — см. RECONCILIATION_APPLIED.
+            _heartbeat(db, RECONCILIATION_APPLIED, True,
+                       error=(f"снимок покрыл {suspicious} позиций — обнуление "
+                              f"распроданного отключено" if suspicious else ""))
+        elif not _export_request_answered(db):
+            # Проверок теперь двенадцать в час, а ответ 1С — один. Писать строку на
+            # каждый холостой заход значит вернуть в лог тот самый шум, ради которого
+            # глушили apscheduler. Пишем только пока ОЖИДАЕМ ответа на последний
+            # запрос: это 1-2 строки в час и ровно та информация, ради которой лог
+            # читают — «попросили, ответа пока нет». После применения снимка ждать
+            # нечего, и до следующего запроса сверка молчит.
+            logger.info("reconciliation: ответа 1С на запрос выгрузки ещё нет — ждём")
         _heartbeat(db, "reconciliation", True)
     except Exception as e:
         logger.exception("reconciliation failed")
@@ -304,11 +584,35 @@ def job_catalog_poll(account_id: int):
         account = db.query(PlatformAccount).filter(PlatformAccount.id == account_id).first()
         if account is None or not account.is_active:
             return
+        hb = db.query(WorkerHeartbeat).filter(
+            WorkerHeartbeat.worker_name == worker_name).first()
+        if hb is not None and hb.last_success \
+                and now_utc() - hb.last_run_at < CATALOG_POLL_MIN_GAP:
+            return
         client = build_client(db, account_id)
         load_stats = load_platform_catalog(db, client, account)
         proposal_stats = poll_catalog(db, account)
         logger.info("%s (%s): загрузка=%s предложения=%s", worker_name, account.name, load_stats, proposal_stats)
-        _heartbeat(db, worker_name, True)
+        # Выдачу оборвал защитный предел страниц. Снимок каталога при этом
+        # выглядит свежим, но неполон: часть карточек осталась со старыми
+        # данными или не завелась вовсе. По снимку считаются ключи отправки —
+        # chrtId у WB, variant_id у Kit, — и по не попавшим в него позициям
+        # остаток либо уйдёт баркодом, либо не уйдёт совсем. Heartbeat, а не
+        # только лог: лог на бою читают, когда уже что-то случилось. Читателя
+        # этой отметке завела находка отчёта `_check_truncated_catalog` — до неё
+        # признак вычислялся и не показывался НИГДЕ: «Диагностика» рисует по
+        # кабинету только `poll_orders_account_*` и пять общих имён, а `/health`
+        # при `last_success=True` текст не отдаёт.
+        if load_stats.get("truncated"):
+            logger.warning(
+                "%s (%s): выгрузка каталога ОБОРВАНА защитным пределом страниц — "
+                "снимок неполон, по не попавшим в него карточкам остаток может "
+                "уйти не тем ключом или не уйти вовсе", worker_name, account.name)
+            _heartbeat(db, worker_name, True,
+                       error="выгрузка каталога оборвана пределом страниц — "
+                             "снимок неполон")
+        else:
+            _heartbeat(db, worker_name, True)
     except CredentialsMissing as e:
         _heartbeat(db, worker_name, False, str(e))
     except Exception as e:
@@ -320,6 +624,28 @@ def job_catalog_poll(account_id: int):
 
 POLL_ORDERS_JOB_PREFIX = "poll_orders_account_"
 CATALOG_POLL_JOB_PREFIX = "catalog_poll_account_"
+
+# Выгрузка каталога кабинета — раз в сутки. Но триггер `interval` у APScheduler
+# отсчитывает ПЕРВЫЙ запуск от момента добавления задания, а задания живут в
+# памяти процесса и навешиваются заново при каждом старте воркера. Значит суточное
+# задание срабатывает, только если процесс проработал сутки без перезапуска — а на
+# бою он перезапускается чаще. 19.09 это и вскрылось: у `catalog_poll_account_5`
+# не было ни одной отметки о прогоне ВООБЩЕ, снимок каталога Kit лежал от 14.09
+# (его сделали руками со страницы «Мэппинг»). Поэтому явно просим первый запуск
+# вскоре после старта, а не через сутки.
+CATALOG_POLL_INTERVAL_HOURS = 24
+# Сколько задание имеет право опоздать и всё-таки выполниться. Умолчание
+# APScheduler — ОДНА СЕКУНДА, и это означает «занят в момент запуска — значит
+# не выполнять». Пять минут покрывают любую разумную занятость воркера,
+# включая длинную транзакцию сверки и накат.
+MISFIRE_GRACE_SECONDS = 300
+
+CATALOG_POLL_FIRST_RUN_DELAY = timedelta(minutes=2)
+# Раз задание теперь запускается после каждого старта, а стартов за сутки бывает
+# много, саму выгрузку пропускаем, если она недавно уже отработала успешно.
+# Считаем по своей же отметке: пропуск её НЕ трогает, иначе он сдвигал бы срок
+# вперёд на каждом рестарте и выгрузка снова не случилась бы никогда.
+CATALOG_POLL_MIN_GAP = timedelta(hours=20)
 
 
 def reconcile_account_jobs(sched, db) -> dict:
@@ -344,8 +670,14 @@ def reconcile_account_jobs(sched, db) -> dict:
             added += 1
         catalog_id = f"{CATALOG_POLL_JOB_PREFIX}{account_id}"
         if catalog_id not in existing_catalog:
-            sched.add_job(job_catalog_poll, "interval", hours=24, args=[account_id],
-                          id=catalog_id, max_instances=1)
+            # `next_run_time` обязателен: без него первый прогон — через сутки
+            # после старта, до которых процесс не доживает (см. константы выше).
+            # Планировщик поднят с timezone="UTC", naive-время он трактует в ней
+            # же, так что `now_utc()` тут ровно то, что нужно.
+            sched.add_job(job_catalog_poll, "interval",
+                          hours=CATALOG_POLL_INTERVAL_HOURS, args=[account_id],
+                          id=catalog_id, max_instances=1,
+                          next_run_time=now_utc() + CATALOG_POLL_FIRST_RUN_DELAY)
             added += 1
 
     dropped_heartbeats = 0
@@ -382,13 +714,336 @@ def job_reconcile_accounts(sched):
         db.close()
 
 
+# Сверка отправленного с тем, что площадка держит на самом деле. Раз в полчаса:
+# чаще незачем (проверяем не сиюминутное состояние, а «осталось ли наше число»),
+# реже — теряем связь с событием. Ходит В API ПЛОЩАДОК, поэтому вынесена в
+# отдельное задание, а не в отчёт: отчёт обязан оставаться чистым чтением базы.
+VERIFY_STOCK_INTERVAL_MINUTES = 30
+
+
+def job_verify_stock():
+    db = SessionLocal()
+    try:
+        accounts = _active_accounts(db)
+        stats = verify_all(db, build_client, accounts)
+        if stats["diverged"] or stats["errors"] or stats["silent"]:
+            # WARNING: площадка держит не то, что мы отправили. Либо кто-то
+            # пишет поверх нас, либо отправка поняла ответ неверно. Либо — и это
+            # добавлено отдельно — сверка по кабинету вовсе не прошла: раньше
+            # ветка смотрела ТОЛЬКО на `diverged`, а он ноль и когда не проверено
+            # ничего, так что сорванный прогон выглядел как чистый.
+            logger.warning("сверка остатков: %s", stats)
+        else:
+            logger.info("сверка остатков: %s", stats)
+        # «Площадка промолчала» — отдельно от «кабинет упал»: следствие одно
+        # (сверки не было), а причины разные, и человеку разбирать их по-разному.
+        trouble = []
+        if stats["errors"]:
+            trouble.append(f"сверка не прошла по кабинетам: {stats['errors']}")
+        if stats["silent"]:
+            trouble.append(f"площадка не ответила на чтение остатков, позиций: "
+                           f"{stats['silent']}")
+        _heartbeat(db, "verify_stock", True, "; ".join(trouble))
+    except Exception as e:
+        logger.exception("verify_stock failed")
+        _heartbeat(db, "verify_stock", False, str(e))
+    finally:
+        db.close()
+
+
+# Отчёт о расхождениях — раз в час. Ничего не чинит и не отправляет наружу,
+# только читает и пишет ОДНУ строку в лог. Смысл именно в строке: каждый
+# серьёзный дефект сентября был виден в данных за часы до того, как его нашли, —
+# не хватало не данных, а того, кто посмотрит. Теперь смотреть можно по логу, не
+# открывая браузер.
+DISCREPANCY_REPORT_INTERVAL_MINUTES = 60
+
+
+def job_discrepancy_report():
+    db = SessionLocal()
+    try:
+        findings = collect_findings(db)
+        line = summary_line(findings)
+        if any(f.level == CRITICAL for f in findings):
+            # WARNING, а не INFO: критичная находка — это деньги, и она обязана
+            # отличаться от обычного «посмотрел, всё в порядке» при поиске по логу.
+            logger.warning("расхождения: %s", line)
+        else:
+            # Пишем и когда всё чисто. Отсутствие строки должно означать «отчёт не
+            # собирался», а не «расхождений не было» — иначе молчание неотличимо
+            # от поломки самого отчёта.
+            logger.info("расхождения: %s", line)
+        _heartbeat(db, "discrepancy_report", True)
+    except Exception as e:
+        logger.exception("discrepancy_report failed")
+        _heartbeat(db, "discrepancy_report", False, str(e))
+    finally:
+        db.close()
+
+
+# Бэкап базы. Раз в сутки, первый прогон — вскоре после старта: суточное
+# задание на `interval` до своего первого запуска не доживает (процесс
+# перезапускается чаще раза в сутки, см. историю с выгрузкой каталога).
+BACKUP_INTERVAL_HOURS = 24
+BACKUP_FIRST_RUN_DELAY = timedelta(minutes=5)
+# Не снимать копию, если свежая уже есть. Иначе цепочка перезапусков воркера
+# наделала бы копий на каждый старт и вытеснила бы ими всю историю.
+BACKUP_MIN_GAP = timedelta(hours=20)
+
+
+def job_backup():
+    """Резервная копия базы — единственное, что отделяет от невосстановимой
+    потери мэппинга и истории проведения.
+
+    Копия снимается на живой базе штатным механизмом SQLite и сразу
+    проверяется (см. `app/backup.py`). Пропуск при свежей копии — тоже успех:
+    инвариант «свежая копия есть» выполнен, и heartbeat об этом и говорит.
+    Молчать в журнале нельзя ни в одном из случаев: бэкап, о котором ничего не
+    написано, неотличим от бэкапа, которого не было.
+
+    «Свежая копия есть» считается по `last_backup()`, то есть ПО ИМЕНИ ФАЙЛА, и
+    это безопасно ровно потому, что неудавшаяся попытка под именем копии не
+    остаётся: `make_backup` откладывает её в `.bad`. Пока этого не было, одна
+    сорвавшаяся попытка делала следующий запуск «пропуском при свежей копии» —
+    зелёный heartbeat, никакой новой попытки двадцать часов и молчащая находка
+    отчёта двое суток, при том что копии нет.
+    """
+    db = SessionLocal()
+    try:
+        moment, total = last_backup()
+        if moment is not None and now_utc() - moment < BACKUP_MIN_GAP:
+            logger.info("бэкап: свежая копия уже есть (%s), пропуск; всего копий %d",
+                        moment.strftime("%d.%m.%Y %H:%M"), total)
+            _heartbeat(db, "backup", True)
+            return
+
+        # Сессию передаём свою: папку зеркала задаёт страница настроек, и
+        # без неё `make_backup` открыл бы вторую — лишнее соединение к той же
+        # базе ровно в тот момент, когда с неё снимается копия.
+        result = make_backup(db=db)
+        if result.ok:
+            logger.info("бэкап: %s, %.1f МБ, удалено старых %d",
+                        result.path, result.size_bytes / 1024 / 1024, result.removed)
+            # Копия снята и проверена — это УСПЕХ, даже если зеркало не
+            # ответило: локальная копия есть, и объявлять бэкап неудачным из-за
+            # недоступной сетевой папки значило бы поднять тревогу о том, чего
+            # не случилось. Но и молчать нельзя: вторая площадка заводится
+            # против отказа диска, и зеркало, о котором думают, что оно есть,
+            # хуже отсутствующего. Текст в `last_error` успешной отметки — тот
+            # же приём, что у опроса заказов и сверки; читатель у него есть
+            # (`report._check_backup_mirror`).
+            if result.mirror_error:
+                logger.warning("бэкап: копия НЕ доехала до зеркала — %s",
+                               result.mirror_error)
+            _heartbeat(db, "backup", True,
+                       f"копия не доехала до зеркала: {result.mirror_error}"
+                       if result.mirror_error else "")
+        else:
+            # WARNING, а не INFO: неснятая копия — это риск потерять всё, и в
+            # журнале она обязана отличаться от обычного прогона.
+            logger.warning("бэкап НЕ СНЯТ: %s", result.error)
+            _heartbeat(db, "backup", False, result.error)
+    except Exception as e:
+        logger.exception("backup failed")
+        _heartbeat(db, "backup", False, str(e))
+    finally:
+        db.close()
+
+
+# Чистка истории по срокам хранения. Раз в сутки и с тем же «первым прогоном
+# вскоре после старта», что и бэкап: суточное задание на `interval` до своего
+# первого запуска не доживает.
+RETENTION_INTERVAL_HOURS = 24
+RETENTION_FIRST_RUN_DELAY = timedelta(minutes=9)
+# Насколько свежей обязана быть копия, чтобы чистка вообще началась.
+# Считается ОТ ИНТЕРВАЛА БЭКАПА, а не числом: разойдись они, условие однажды
+# начало бы отказывать на исправной системе — а отказ чистки виден не сразу.
+# Двухчасовой запас покрывает обычный перезапуск, при котором бэкап выходит по
+# `BACKUP_MIN_GAP` и копия остаётся вчерашней. Смысл предела не в этом случае, а
+# в том, когда бэкап СЛОМАЛСЯ: тогда чистка день за днём удаляла бы историю,
+# имея за спиной копию всё большей давности, и `/health` при этом был бы зелёным
+# — своей работы чистка делает ровно столько, сколько обещала.
+RETENTION_REQUIRES_BACKUP_WITHIN = timedelta(hours=BACKUP_INTERVAL_HOURS + 2)
+
+
+def job_retention():
+    """Удалить историю, вышедшую за срок хранения (`app/retention.py`).
+
+    Девять минут после старта, а не пять: бэкап идёт первым намеренно. Если
+    чистка когда-нибудь удалит лишнее, копия, снятая ДО неё, окажется тем
+    единственным, что это исправит.
+    """
+    db = SessionLocal()
+    try:
+        # Копия обязана БЫТЬ и быть свежей — это условие, а не совпадение двух
+        # расписаний. До сих пор порядок держался на четырёх минутах между
+        # заданиями, и держался он не всегда: после перезапуска бэкап выходит по
+        # `BACKUP_MIN_GAP` («свежая копия уже есть»), а чистка отрабатывает
+        # полностью. 24.09 это видно в журнале боевого сервера: 08:03 бэкап
+        # пропустил, 08:07 чистка прошла, и единственную свежую копию снял в
+        # 08:07:13 накат — то есть по случайности, за двенадцать секунд до.
+        #
+        # Отказ, а не предупреждение: чистка удаляет безвозвратно, и работать ей
+        # без копии не с чего. Молчать при этом нельзя — оговорка успешной
+        # отметки, её показывает «Диагностика». Отдельной находки отчёта тут нет
+        # намеренно: причина у отказа одна — бэкап не снимается, — и о ней уже
+        # говорит `report._check_backup_missing`. Вторая находка о том же
+        # приучила бы пролистывать обе.
+        moment, _ = last_backup()
+        if moment is None or now_utc() - moment > RETENTION_REQUIRES_BACKUP_WITHIN:
+            age = "копий нет вовсе" if moment is None else \
+                f"последней {(now_utc() - moment).days} сут."
+            logger.warning("хранение: чистка не начата — нет свежей копии (%s)", age)
+            _heartbeat(db, "retention", True,
+                       f"чистка не начата: нет свежей копии базы ({age}) — "
+                       f"удалять историю, не имея чем её вернуть, нельзя")
+            return
+        stats = apply_retention(db)
+        total = sum(stats.values())
+        if total:
+            logger.info("хранение: удалено %d строк (%s)", total,
+                        ", ".join(f"{k}={v}" for k, v in stats.items() if v))
+        else:
+            # Пишем и когда чистить нечего: молчание обязано означать «задание не
+            # отработало», а не «всё в пределах сроков».
+            logger.info("хранение: удалять нечего")
+        _heartbeat(db, "retention", True)
+    except Exception as e:
+        logger.exception("retention failed")
+        _heartbeat(db, "retention", False, str(e))
+    finally:
+        db.close()
+
+
+# Как часто смотреть, не пора ли позвать человека. Пять минут — чуть больше
+# самого короткого срока протухания в `/health` (135 с у рассылки): реагируем
+# почти сразу, но не превращаем задание в опрос ради опроса. Само по себе оно
+# ничего не шлёт, пока картина не изменилась.
+ALERT_INTERVAL_MINUTES = 5
+# Первый прогон — не сразу после старта: службы только поднялись, часть заданий
+# ещё не отчиталась ни разу, и `/health` в эти минуты красный законно. Разбудить
+# человека сообщением «всё сломано» на каждом перезапуске — лучший способ
+# добиться, чтобы уведомления выключили в первый же день.
+ALERT_FIRST_RUN_DELAY = timedelta(minutes=12)
+
+
+def job_alerts():
+    """Позвать человека, если система встала или разошлась с реальностью.
+
+    Единственное задание, которое говорит НАРУЖУ. Само ничего не чинит и не
+    трогает ни площадки, ни 1С — только читает и рассказывает (см. `app/alerts.py`).
+    """
+    from app.alerts import configured_channels, run_alert_cycle
+
+    db = SessionLocal()
+    try:
+        stats = run_alert_cycle(db)
+        db.commit()
+        if stats["action"] in ("alarm", "clear"):
+            logger.warning("уведомления: %s", stats)
+        else:
+            # Пишем всегда: тишина обязана означать «задание не отработало», а не
+            # «говорить было нечего».
+            logger.info("уведомления: %s", stats)
+
+        # Ненастроенные каналы и не доехавшее сообщение — РАЗНЫЕ вещи, и обе
+        # обязаны быть видны. Первое штатно на свежей установке, второе значит,
+        # что тревога прямо сейчас не дошла до человека, и он об этом не узнает
+        # ниоткуда — кроме этой строки на «Диагностике».
+        if not configured_channels(db):
+            note = ("каналы уведомлений не настроены — система никого не позовёт, "
+                    "заполните страницу «Уведомления»")
+        elif stats["failed"]:
+            note = f"каналов не ответило: {stats['failed']} — сообщение не доставлено"
+        else:
+            note = ""
+        _heartbeat(db, "alerts", True, note)
+    except Exception as e:
+        logger.exception("alerts failed")
+        _heartbeat(db, "alerts", False, str(e))
+    finally:
+        db.close()
+
+
+# Как часто дёргать внешнего сторожа. Совпадает с частотой уведомлений не
+# случайно, а потому что чаще незачем: сторож отвечает на один вопрос, «жив ли
+# воркер», и пять минут — разумная зернистость ответа.
+WATCHDOG_INTERVAL_MINUTES = 5
+# А вот первый прогон — СРАЗУ, и это главное отличие от `job_alerts`.
+# Двенадцатиминутная задержка у уведомлений заведена под КАНАЛЫ: после старта
+# часть заданий ещё не отчиталась, `/health` красный законно, и сообщение «всё
+# сломано» на каждом перезапуске выключило бы уведомления в первый же день.
+# К сторожу это не относится вовсе: он не разбирает находки, а сообщает, что
+# процесс жив, и это верно с первой секунды.
+#
+# Пока сторож жил внутри `job_alerts`, он наследовал чужую задержку, и штатный
+# разрыв пингов при накате выходил около тринадцати минут. Значит на той стороне
+# приходилось держать `period` + `grace` не меньше пятнадцати минут — иначе
+# тревога била бы на каждом перезапуске, и сторожа замьютили бы, как жёлтые
+# находки. То есть чужая задержка покупалась четвертью часа слепоты к настоящей
+# смерти воркера. Теперь разрыв — время перезапуска плюс полминуты.
+WATCHDOG_FIRST_RUN_DELAY = timedelta(seconds=30)
+
+
+def job_watchdog():
+    """Сказать внешнему сторожу, что воркер жив. Больше НИЧЕГО.
+
+    Обратная полярность ко всему остальному механизму уведомлений: те молчат,
+    пока всё хорошо, а этот регулярно подаёт голос — перестал, и о молчании
+    пишет человеку внешний сервис. Только так покрывается случай, ради которого
+    всё и затевалось («ночью легли обе службы»): процесс, которого нет, не
+    сообщит, что его нет.
+
+    Пинг идёт независимо от того, всё ли в порядке ВНУТРИ. Смешай мы сюда второй
+    смысл, сигнал сторожа стал бы неотличим от падения службы, а о беде внутри
+    живой системы и так скажут каналы.
+    """
+    from app.alerts import ping_alive, ping_web_alive
+
+    db = SessionLocal()
+    try:
+        notes = []
+        problem = ping_alive(db)
+        if problem:
+            logger.warning("сторож: пинг не доехал — %s", problem)
+            notes.append(f"внешний сторож не ответил: {problem}")
+        # Второй сторож — про ВЕБ-СЛУЖБУ, и он здесь же, потому что полярность
+        # та же. Смыслы при этом раздельные: два URL, у каждого один вопрос.
+        # Задание — только носитель, оно ничего не смешивает.
+        web = ping_web_alive(db)
+        if web:
+            notes.append(web)
+        # Оговорка успешной отметки: не доехавший пинг — это не поломка
+        # задания, а факт, который надо показать. Читатель — «Диагностика».
+        _heartbeat(db, "watchdog", True, "; ".join(notes))
+    except Exception as e:                           # noqa: BLE001
+        logger.exception("watchdog failed")
+        _heartbeat(db, "watchdog", False, str(e))
+    finally:
+        db.close()
+
+
 def build_scheduler() -> BlockingScheduler:
     """Статические задания навешиваются один раз, per-account задания —
     через reconcile_account_jobs() (первый прогон при старте плюс
     периодический каждые 5 минут). Новый активный кабинет из админки
     подхватывается автоматически в пределах этого интервала — перезапуск
     процесса больше не требуется."""
-    sched = BlockingScheduler(timezone="UTC")
+    # `job_defaults` обязателен, и вот почему. По умолчанию APScheduler даёт
+    # заданию `misfire_grace_time = 1` СЕКУНДУ: если момент запуска прошёл
+    # больше секунды назад (воркер был занят, машина притормозила, база держала
+    # блокировку), задание не выполняется вовсе — оно помечается пропущенным.
+    # Для рассылки раз в 45 секунд это безобидно, следующий цикл всё доделает.
+    # Но тем же правилом живут ЧАСОВОЙ запрос выгрузки остатков у 1С и СУТОЧНЫЙ
+    # запрос справочника баркодов: там пропуск означает час и сутки без данных
+    # соответственно — молча, и узнаёшь об этом по последствиям.
+    # `coalesce` не даёт накопившимся пропускам выполниться пачкой: нам нужен
+    # один прогон, а не пять подряд.
+    sched = BlockingScheduler(
+        timezone="UTC",
+        job_defaults={"misfire_grace_time": MISFIRE_GRACE_SECONDS,
+                      "coalesce": True, "max_instances": 1},
+    )
 
     # Отметка старта: по ней /health понимает, сколько планировщик работает, и не
     # объявляет пропавшим воркер, который просто ещё не отработал первый раз.
@@ -409,16 +1064,42 @@ def build_scheduler() -> BlockingScheduler:
                                        heartbeat_name="ftp_send_export_request"), "interval",
                   hours=1, id="ftp_send_export_request", max_instances=1,
                   next_run_time=start + timedelta(seconds=20))
-    # Сверка — через 5 минут после запроса выгрузки, чтобы 1С успела ответить:
-    # обработка запускается по своему расписанию, и читать результат через 10 секунд
-    # означало читать файл прошлого цикла.
-    sched.add_job(job_reconciliation, "interval", hours=1, id="reconciliation", max_instances=1,
-                  next_run_time=start + timedelta(minutes=5))
+    # Сверка смотрит папку ответов КАЖДЫЕ 5 МИНУТ, хотя выгрузку просим раз в час.
+    # Раньше она была часовой и шла через 5 минут после запроса — «чтобы 1С успела
+    # ответить». Это молчаливо предполагало, что 1С отвечает быстрее пяти минут, а на
+    # боевом обработка запускается по СВОЕМУ расписанию, раз в 10 минут. Ответ приходил
+    # в среднем через 7 минут, то есть всегда ПОСЛЕ того, как сверка уже посмотрела и
+    # ушла, а на следующем цикле тот же файл отбраковывался как более старый, чем новый
+    # запрос. И это не разовое невезение: оба расписания периодические, поэтому фаза,
+    # выпавшая при старте воркера, держится до его перезапуска — сверка, промахнувшись один раз,
+    # не срабатывала уже никогда. Именно так она простояла 17.09.2026.
+    # Разделяем два разных вопроса: «как часто просить у 1С выгрузку» (дорого — раз в час,
+    # это полный снимок 152 тыс. товаров) и «как часто проверять, не пришёл ли ответ»
+    # (дёшево — это чтение каталога). Ни на какое расписание 1С мы больше не закладываемся.
+    # Правило свежести при этом НЕ ослаблено: применяется по-прежнему только снимок новее
+    # последнего запроса — учащение проверок не даёт применить ни одного файла, который
+    # старая схема сочла бы устаревшим.
+    sched.add_job(job_reconciliation, "interval", minutes=5, id="reconciliation",
+                  max_instances=1, next_run_time=start + timedelta(minutes=1))
     sched.add_job(lambda: job_ftp_send(request_barcode_export=True,
                                        heartbeat_name="ftp_send_barcode_request"), "interval",
                   hours=24, id="ftp_send_barcode_request", max_instances=1,
                   next_run_time=start + timedelta(seconds=40))
     sched.add_job(job_import_barcodes, "interval", minutes=15, id="import_barcodes", max_instances=1)
+    # Массовая актуализация: частый опрос дешёвый (без задания — один SELECT),
+    # зато прогресс на странице двигается заметно для человека.
+    sched.add_job(job_recalc, "interval", seconds=20, id="recalc", max_instances=1)
+    # Первый прогон вскоре после старта, а не через час: суточные и часовые задания
+    # на `interval` отсчитывают первый запуск от момента добавления, а воркер
+    # перезапускается чаще (см. историю `job_catalog_poll` выше).
+    sched.add_job(job_discrepancy_report, "interval",
+                  minutes=DISCREPANCY_REPORT_INTERVAL_MINUTES, id="discrepancy_report",
+                  max_instances=1, next_run_time=start + timedelta(minutes=2))
+    # Первый прогон через три минуты после старта — по той же причине, что и у
+    # отчёта: `interval` отсчитывает первый запуск от момента добавления задания.
+    sched.add_job(job_verify_stock, "interval",
+                  minutes=VERIFY_STOCK_INTERVAL_MINUTES, id="verify_stock",
+                  max_instances=1, next_run_time=start + timedelta(minutes=3))
 
     # Per-account задания: первичная простановка + периодическая сверка.
     db = SessionLocal()
@@ -426,6 +1107,17 @@ def build_scheduler() -> BlockingScheduler:
         reconcile_account_jobs(sched, db)
     finally:
         db.close()
+    sched.add_job(job_backup, "interval", hours=BACKUP_INTERVAL_HOURS, id="backup",
+                  max_instances=1, next_run_time=start + BACKUP_FIRST_RUN_DELAY)
+    sched.add_job(job_watchdog, "interval", minutes=WATCHDOG_INTERVAL_MINUTES,
+                  id="watchdog", max_instances=1,
+                  next_run_time=start + WATCHDOG_FIRST_RUN_DELAY)
+    sched.add_job(job_alerts, "interval", minutes=ALERT_INTERVAL_MINUTES,
+                  id="alerts", max_instances=1,
+                  next_run_time=start + ALERT_FIRST_RUN_DELAY)
+    sched.add_job(job_retention, "interval", hours=RETENTION_INTERVAL_HOURS,
+                  id="retention", max_instances=1,
+                  next_run_time=start + RETENTION_FIRST_RUN_DELAY)
     sched.add_job(job_reconcile_accounts, "interval", minutes=5, args=[sched],
                   id="reconcile_accounts", max_instances=1)
 

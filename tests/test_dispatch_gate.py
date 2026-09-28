@@ -36,6 +36,22 @@ def _stocked_product(db, stock: int = 12, uid: str = "u1", barcode: str = "111")
     return p
 
 
+def _already_transmitted(db, account_id: int, uid: str = "u1", quantity: int = 12):
+    """Отправка, которая реально дошла до площадки.
+
+    Отзыв остатка с неё и начинается: ноль снимает НАШЕ число, а если мы ничего
+    не отправляли, он обнуляет чужую карточку. Раньше здесь этого не было — до
+    18.09 отзыв срабатывал по одной только включённой трансляции, и на Озон с
+    Kit уехали нули по товару, который туда ни разу не транслировался.
+    """
+    from app.timeutils import now_utc
+
+    db.add(DispatchQueueItem(
+        uid_1c=uid, account_id=account_id, quantity=quantity, sent_quantity=quantity,
+        reason="manual_enable", status=DispatchStatus.sent, sent_at=now_utc()))
+    db.commit()
+
+
 # ------------------------------------------------ 6. снятие галочки отзывает остаток
 
 def test_unchecking_cabinet_enqueues_zero(logged_in_client, web_db):
@@ -44,23 +60,33 @@ def test_unchecking_cabinet_enqueues_zero(logged_in_client, web_db):
     account = make_account(web_db, name="Кабинет")
     web_db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
     web_db.commit()
+    _already_transmitted(web_db, account.id)
 
     r = logged_in_client.post(f"/products/u1/{account.id}/toggle", data={"enabled": "false"})
 
     assert r.status_code == 200
-    queued = web_db.query(DispatchQueueItem).filter(DispatchQueueItem.account_id == account.id).all()
+    queued = web_db.query(DispatchQueueItem).filter(
+        DispatchQueueItem.reason == "manual_disable").all()
     assert [(q.quantity, q.reason) for q in queued] == [(0, "manual_disable")]
 
 
 def test_zero_actually_reaches_the_platform(web_db):
     """Ноль должен не просто лечь в очередь, а дойти до площадки — иначе товар
-    остаётся в продаже там, где мы его больше не контролируем."""
+    остаётся в продаже там, где мы его больше не контролируем.
+
+    История отправки здесь ОБЯЗАТЕЛЬНА, и не для полноты картины: запись с
+    причиной `manual_disable` в бою и заводится только тогда, когда на кабинет
+    уходил непустой остаток (`should_withdraw`). Без неё фикстура описывала
+    недостижимое состояние — отзыв по карточке, которой мы не касались, — и
+    молча требовала обнулить чужие продажи.
+    """
     _stocked_product(web_db)
     account = make_account(web_db, warehouse_id="wh-1")
     web_db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=False))
     web_db.add(DispatchQueueItem(uid_1c="u1", account_id=account.id, quantity=0,
                                  reason="manual_disable"))
     web_db.commit()
+    _already_transmitted(web_db, account.id)
 
     client = FakePlatformClient()
     run_dispatch_cycle(web_db, {account.id: client}, [account])
@@ -89,10 +115,13 @@ def test_repeated_uncheck_does_not_pile_up_zeros(logged_in_client, web_db):
     web_db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
     web_db.commit()
 
+    _already_transmitted(web_db, account.id)
+
     for _ in range(3):
         logged_in_client.post(f"/products/u1/{account.id}/toggle", data={"enabled": "false"})
 
-    assert web_db.query(DispatchQueueItem).count() == 1
+    assert web_db.query(DispatchQueueItem).filter(
+        DispatchQueueItem.reason == "manual_disable").count() == 1
 
 
 def test_uncheck_is_written_to_audit(logged_in_client, web_db):
@@ -102,6 +131,8 @@ def test_uncheck_is_written_to_audit(logged_in_client, web_db):
     account = make_account(web_db, name="Кабинет")
     web_db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
     web_db.commit()
+
+    _already_transmitted(web_db, account.id)
 
     logged_in_client.post(f"/products/u1/{account.id}/toggle", data={"enabled": "false"})
 
@@ -114,7 +145,15 @@ def test_uncheck_is_written_to_audit(logged_in_client, web_db):
 
 def test_queued_item_does_not_reach_unchecked_cabinet(web_db):
     """Сценарий из аудита: запись легла в очередь при отмеченном кабинете, галочку
-    сняли, и цикл рассылки отправлял полный остаток на отключённый кабинет."""
+    сняли, и цикл рассылки отправлял полный остаток на отключённый кабинет.
+
+    Полный остаток туда не уходит — это и проверялось изначально. Но и НОЛЬ туда
+    уходить не должен, а раньше уходил: различие «осознанно отзываем» против
+    «никогда не отправляли» соблюдалось на входе в очередь и терялось на выходе.
+    Мы на этот кабинет непустого остатка не посылали, значит отзывать нечего, а
+    ноль обнулил бы живую чужую карточку — ровно авария 18.09, только с другой
+    стороны.
+    """
     _stocked_product(web_db, stock=12)
     account = make_account(web_db, warehouse_id="wh-1")
     setting = SyncSetting(uid_1c="u1", account_id=account.id, enabled=True)
@@ -128,13 +167,44 @@ def test_queued_item_does_not_reach_unchecked_cabinet(web_db):
     client = FakePlatformClient()
     run_dispatch_cycle(web_db, {account.id: client}, [account])
 
+    assert client.push_calls == [], f"на площадку ушло {client.push_calls}"
+    item = web_db.query(DispatchQueueItem).first()
+    assert item.status == DispatchStatus.sent      # запись закрыта, а не висит вечно
+    assert item.sent_at is None                    # но отправкой не считается
+
+
+def test_queued_item_to_an_unchecked_cabinet_is_withdrawn_if_we_wrote_there(web_db):
+    """Та же запись, но остаток туда УЖЕ уходил — тогда ноль обязан уехать.
+
+    Отправляли 50, человек снял галочку, отзыв не доехал — на площадке лежит 50 и
+    она продолжает продавать. Это настоящее расхождение, и молчание здесь стоило
+    бы оверселла.
+    """
+    _stocked_product(web_db, stock=12)
+    account = make_account(web_db, warehouse_id="wh-1")
+    setting = SyncSetting(uid_1c="u1", account_id=account.id, enabled=True)
+    web_db.add(setting)
+    web_db.add(DispatchQueueItem(uid_1c="u1", account_id=account.id, quantity=12, reason="order"))
+    web_db.commit()
+    _already_transmitted(web_db, account.id)
+
+    setting.enabled = False
+    web_db.commit()
+
+    client = FakePlatformClient()
+    run_dispatch_cycle(web_db, {account.id: client}, [account])
+
     _, items = client.push_calls[0]
     assert [i.quantity for i in items] == [0]
 
 
-def test_queued_item_without_any_setting_sends_zero(web_db):
+def test_queued_item_without_any_setting_sends_nothing(web_db):
     """Строки SyncSetting вообще нет — пара товар+кабинет не отмечена никогда.
-    Такая запись в очереди может остаться от удалённой отметки."""
+
+    Тем более нечего отправлять: ни полного остатка, ни нуля. Такая запись могла
+    остаться от удалённой отметки, и обнулять по ней чужую карточку — то же самое
+    обнуление, что и в тесте выше.
+    """
     _stocked_product(web_db, stock=12)
     account = make_account(web_db, warehouse_id="wh-1")
     web_db.add(DispatchQueueItem(uid_1c="u1", account_id=account.id, quantity=12, reason="order"))
@@ -143,8 +213,7 @@ def test_queued_item_without_any_setting_sends_zero(web_db):
     client = FakePlatformClient()
     run_dispatch_cycle(web_db, {account.id: client}, [account])
 
-    _, items = client.push_calls[0]
-    assert [i.quantity for i in items] == [0]
+    assert client.push_calls == []
 
 
 def test_paused_account_computes_zero(web_db):
@@ -206,3 +275,71 @@ def test_ui_and_dispatch_agree(web_db, broadcast, enabled, dispatch_enabled, thr
     from_dispatch = quantity_for_account(web_db, "u1", account.id, 12)
 
     assert from_ui == from_dispatch == expected
+
+
+# --------------------------------------------- тишина до включения трансляции
+
+def test_editing_a_silent_product_queues_nothing(db):
+    """Правка брони, факта или порога у товара, который ещё не транслируется, не
+    должна ничего отправлять на площадку.
+
+    Это и есть требование «до момента полного расчёта не транслируем ни ноль, ни
+    какой-либо остаток»: оператор настраивает товар, а карточка на площадке живёт
+    своей жизнью, пока он не нажмёт «Вкл»."""
+    from app.models import DispatchQueueItem, Platform, Product, SyncSetting
+    from app.transmit import enqueue_full_resend
+    from tests.factories import make_account
+
+    account = make_account(db, Platform.wb)
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=10,
+                   broadcast_enabled=False))
+    db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
+    db.commit()
+
+    enqueue_full_resend(db, "u1", account.id, reason="reserve_changed")
+    db.commit()
+
+    assert db.query(DispatchQueueItem).count() == 0
+
+
+def test_a_transmitting_product_still_gets_its_update(db):
+    """Обратная сторона: у включённого товара правка по-прежнему доезжает."""
+    from app.models import DispatchQueueItem, Platform, Product, SyncSetting
+    from app.transmit import enqueue_full_resend
+    from tests.factories import make_account
+
+    account = make_account(db, Platform.wb)
+    db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=10,
+                   broadcast_enabled=True))
+    db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
+    db.commit()
+
+    enqueue_full_resend(db, "u1", account.id, reason="reserve_changed")
+    db.commit()
+
+    assert db.query(DispatchQueueItem).count() == 1
+
+
+def test_switching_a_product_off_still_withdraws_the_stock(web_db, logged_in_client):
+    """Граница, которую легко снести этим же правилом: снятие с трансляции —
+    ОСОЗНАННЫЙ отзыв. На площадку обязан уйти ноль, иначе она продолжит продавать
+    по последнему присланному числу. Раньше это работало побочным эффектом
+    (в очередь ставилась обычная доотправка, а рассылка считала по ней ноль);
+    теперь отзыв делается явно."""
+    from app.models import DispatchQueueItem, Platform, PlatformAccount, Product, SyncSetting
+
+    account = PlatformAccount(platform=Platform.wb, name="WB-1", warehouse_id="wh")
+    web_db.add(account)
+    web_db.commit()
+    web_db.add(Product(uid_1c="u1", article="A1", name="Товар", stock_on_hand=10,
+                       broadcast_enabled=True))
+    web_db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
+    web_db.commit()
+    _already_transmitted(web_db, account.id, quantity=10)
+
+    logged_in_client.post("/products/u1/broadcast", data={"enabled": "false"})
+
+    queued = web_db.query(DispatchQueueItem).filter(
+        DispatchQueueItem.reason == "broadcast_off").all()
+    assert len(queued) == 1
+    assert queued[0].quantity == 0

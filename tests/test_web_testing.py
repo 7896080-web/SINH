@@ -356,13 +356,24 @@ def test_push_stock_applies_reserve_and_resolves_identifiers(logged_in_client, w
 
 
 def test_push_stock_negative_stock_clamped_to_zero(logged_in_client, web_db, monkeypatch):
+    """Пересортица (остаток ушёл в минус) уезжает нулём, а не отрицательным числом.
+
+    Паре товар+кабинет дана история отправки: ноль сюда — это ОТЗЫВ уже
+    отправленного числа, и он обязан уйти. Ноль на карточку, куда мы ни разу
+    ничего не отправляли, — другое дело, см. тест ниже.
+    """
     import app.routers.testing as testing_router
-    from app.models import Product, Barcode, PlatformAccount
+    from app.models import Product, Barcode, PlatformAccount, SyncSetting, DispatchQueueItem, DispatchStatus
+    from app.timeutils import now_utc
 
     wb = PlatformAccount(platform="wb", name="WB", warehouse_id="wh")
     web_db.add(wb); web_db.commit(); web_db.refresh(wb)
     web_db.add(Product(broadcast_enabled=True, uid_1c="u1", article="A", name="Т", stock_on_hand=-3))  # пересортица
     web_db.add(Barcode(barcode="111", uid_1c="u1"))
+    web_db.add(SyncSetting(uid_1c="u1", account_id=wb.id, enabled=True))
+    web_db.add(DispatchQueueItem(uid_1c="u1", account_id=wb.id, quantity=7, sent_quantity=7,
+                                 reason="manual_enable", status=DispatchStatus.sent,
+                                 sent_at=now_utc()))
     web_db.commit()
 
     captured = {}
@@ -376,6 +387,38 @@ def test_push_stock_negative_stock_clamped_to_zero(logged_in_client, web_db, mon
     logged_in_client.post("/testing/push-stock", data={"uid_1c": "u1", "account_id": wb.id})
 
     assert captured["items"][0].quantity == 0  # отрицательный -> 0
+
+
+def test_push_stock_refuses_to_zero_a_card_we_never_wrote_to(logged_in_client, web_db, monkeypatch):
+    """Кнопка «Шаг 1» не обнуляет карточку, на которую мы ни разу не отправляли.
+
+    Её нажимают ровно в этом состоянии: страница «Тестирование» нужна, чтобы
+    прогнать товар ДО включения трансляции, и лестница тогда даёт ноль. Отправка
+    этого нуля — не проверка ключей, а обнуление чужой витрины, по которой идут
+    продажи; оператор при этом видел зелёное «успешно отправлен».
+    """
+    import app.routers.testing as testing_router
+    from app.models import Product, Barcode, PlatformAccount, SyncSetting
+
+    wb = PlatformAccount(platform="wb", name="WB", warehouse_id="wh")
+    web_db.add(wb); web_db.commit(); web_db.refresh(wb)
+    # Трансляция выключена — обычное состояние товара, который ещё настраивают.
+    web_db.add(Product(broadcast_enabled=False, uid_1c="u2", article="A", name="Т", stock_on_hand=50))
+    web_db.add(Barcode(barcode="222", uid_1c="u2"))
+    web_db.add(SyncSetting(uid_1c="u2", account_id=wb.id, enabled=True))
+    web_db.commit()
+
+    called = {"push": False}
+
+    class FakeClient:
+        def push_stock(self, warehouse_id, items):
+            called["push"] = True
+            return {"ok": [], "errors": []}
+
+    monkeypatch.setattr(testing_router, "build_client", lambda db, account_id: FakeClient())
+    logged_in_client.post("/testing/push-stock", data={"uid_1c": "u2", "account_id": wb.id})
+
+    assert called["push"] is False, "ноль ушёл на площадку, которой мы ничего не отправляли"
 
 
 def test_simulate_confirm_moves_to_platform_warehouse(logged_in_client, web_db):

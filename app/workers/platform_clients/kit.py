@@ -13,6 +13,38 @@ BASE_URL = "https://api.kit.yandex.net"
 # риском не добрать часть данных после исчерпания попыток.
 _THROTTLE_SECONDS = 0.25
 
+# Защитный предел на число страниц ленты заказов за один обход. Упёрлись в него
+# — картина неполная, и клиент обязан сказать об этом (`last_truncated`).
+MAX_ORDER_PAGES = 200
+
+# Сколько пар товар+склад Kit принимает в одном запросе остатков (предел из
+# спеки, `BulkUpdateStocksRequest.items.maxItems`).
+MAX_STOCK_ITEMS = 5000
+
+# Коды ошибки ЭЛЕМЕНТА массовой операции (`BulkOperationItemError.code`).
+# Повторять такие незачем: ответ не изменится, пока не поправят каталог или
+# мэппинг, — поэтому рассылка закрывает их сразу, не тратя пять попыток.
+TERMINAL_ITEM_CODES = {
+    "VARIANT_NOT_FOUND": "площадка не знает такой товар (variant_id {vid}) — "
+                         "карточки в этом кабинете нет",
+    "VARIANT_ARCHIVED": "карточка товара в архиве — остаток на неё не принимают",
+    "DUPLICATE_ITEM": "одна и та же пара товар+склад ушла в запросе дважды",
+    "INVALID_QUANTITY": "площадка не приняла количество",
+}
+
+# Из них — те, что означают ровно «карточки этого товара в кабинете нет».
+# Следствие у них своё: продавать нечего, оверселла не будет, и чинить надо
+# мэппинг, а не связь. Признак уезжает наверх ДАННЫМИ (`card_missing`), а не
+# русским текстом: отчёт искал две подстроки и ни с одной из этих не совпадал,
+# так что «нет карточки» у Kit попадало в КРИТИЧНУЮ находку «рассылка не
+# доехала» — и навсегда.
+CARD_MISSING_ITEM_CODES = frozenset({"VARIANT_NOT_FOUND", "VARIANT_ARCHIVED"})
+
+# А эти два кода — про КАБИНЕТ, а не про позицию: склад в его настройках указан
+# неверно или заархивирован. Выкидывать по ним позиции нельзя: они не виноваты,
+# и очередь вымерла бы целиком, хотя чинится это одной правкой настройки.
+ACCOUNT_ERROR_CODES = {"WAREHOUSE_NOT_FOUND", "WAREHOUSE_ARCHIVED"}
+
 # Статусы заказа подтверждены по OpenAPI-спеке Kit (skill yandex-kit-cabinet).
 # WAIT_FOR_CONFIRMATION — «ожидает подтверждения продавца» (наш триггер приёма).
 CANCELLED_STATUSES = {"CANCELLED", "DELIVERY_CANCELLED", "FULL_REFUND"}
@@ -28,12 +60,44 @@ CONFIRMED_STATUSES = {
 
 class KitClient(PlatformClient):
     name = "kit"
+    # Остаток Kit адресует variant_id варианта, он же external_id строки
+    # каталога. Баркод в этой роли не работает: площадка отвечает на него
+    # VARIANT_NOT_FOUND и бракует ВЕСЬ запрос, а не одну позицию.
+    stock_key = "external_id"
 
-    def __init__(self, token: str, session: requests.Session | None = None):
+    def __init__(self, token: str, session: requests.Session | None = None,
+                 variant_map_loader=None):
         self.session = session or requests.Session()
         # Авторизация Bearer — подтверждена на живом API (вызовы /v1/orders,
         # /v1/warehouses, /v1/variants возвращают 200 с этим заголовком).
         self.session.headers.update({"Authorization": f"Bearer {token}"})
+
+        # `variant_map_loader` — функция без аргументов, отдающая уже известное
+        # соответствие variant_id -> баркод из НАШЕЙ базы (снимок каталога
+        # кабинета, `platform_catalog_items`, где для Kit external_id и есть
+        # идентификатор варианта). Без неё клиент спрашивает баркод у площадки
+        # отдельным GET на КАЖДУЮ строку КАЖДОГО заказа: на одной странице их
+        # больше сотни, страниц до двухсот, и всё это заново на каждый товар —
+        # Kit отвечает на такое 429, а 429 здесь оборачивается потерей заказа.
+        # Загружаем лениво и один раз на экземпляр клиента.
+        self._variant_map_loader = variant_map_loader
+        self._variant_map: dict[str, str] | None = None
+
+        # Сколько строк заказов пришлось выбросить, потому что баркод узнать НЕ
+        # УДАЛОСЬ (429 после всех повторов, сетевая ошибка, 4xx). Это не то же
+        # самое, что вариант без баркода: там ответ получен и он пустой — такой
+        # товар просто не наш. Разница принципиальна: пустой ответ это факт, а
+        # неудача — пробел, и расчёт, не знающий о пробеле, поставит товару
+        # «актуализирован» по заказам, которых не видел.
+        self.last_unresolved = 0
+        # Выдачу оборвал защитный предел страниц, а не конец данных — картина
+        # неполная (см. `_walk_orders`), и `recalc.collect_orders` превращает это
+        # в проблему, не давая поставить товару «актуализирован».
+        self.last_truncated = False
+        # Варианты, по которым запрос уже провалился в пределах текущего вызова.
+        # Нужны отдельно от кэша баркодов: в кэше пустая строка значит «ответ
+        # получен, баркода нет» — это не потеря, и путать их нельзя.
+        self._failed_variants: set[str] = set()
 
     def _get(self, path: str, params=None):
         def call():
@@ -67,96 +131,157 @@ class KitClient(PlatformClient):
         except requests.RequestException as e:
             return False, f"Не удалось связаться с Kit: {e}"
 
-    def get_orders_awaiting_confirmation(self) -> list[PlatformOrder]:
-        result = []
-        variant_barcode_cache: dict[str, str] = {}
+    def _walk_orders(self):
+        """Сырая лента `/v1/orders` постранично.
 
-        page = 1
-        while True:
+        Конец ленты определяет `total_count` из ответа, а НЕ длина страницы.
+        Короткая страница у площадки не обязана значить «данные кончились»: ровно
+        на этом WB терял заказы неделями (см. `wb.ORDERS_WINDOW_DAYS`), и здесь
+        стоял тот же стоп `len(orders) < 100`. 18.09 на живом кабинете он оказался
+        честным — страницы 100/100/88, четвёртая пустая, `total_count` = 288
+        сошёлся с собранным, — но это совпадение, а не гарантия. `total_count` Kit
+        отдаёт сам и отвечает на вопрос прямо, так что спрашиваем его.
+
+        Если `total_count` в ответе нет, идём до пустой страницы: лишний запрос
+        дешевле пропущенной продажи. Упёрлись в `MAX_ORDER_PAGES` — поднимаем
+        `last_truncated`: выдачу оборвали мы, а не площадка.
+        """
+        collected = 0
+        for page in range(1, MAX_ORDER_PAGES + 1):
             data = self._get("/v1/orders", params={"page": page, "per_page": 100})
             orders = data.get("orders", [])
             if not orders:
-                break
+                return
+            yield from orders
+            collected += len(orders)
+            total = data.get("total_count")
+            if isinstance(total, int) and collected >= total:
+                return
+        self.last_truncated = True
 
-            for o in orders:
-                if o.get("status") != "WAIT_FOR_CONFIRMATION":
-                    continue
-                for chunk in o.get("delivery_chunks", []):
-                    for item in chunk.get("items", []):
-                        variant_id = item["product_variant_id"]
+    def get_orders_awaiting_confirmation(self) -> list[PlatformOrder]:
+        result = []
+        variant_barcode_cache: dict[str, str] = {}
+        self.last_unresolved = 0
+        self.last_truncated = False
+        self._failed_variants = set()
 
-                        # У Kit заказ отдаёт product_variant_id, а не баркод
-                        # напрямую (см. предупреждение в base.py — этот участок
-                        # закрывает ту нестыковку). Резолвим через тот же
-                        # объект Variant, где 'barcode' — подтверждённое поле.
-                        barcode = variant_barcode_cache.get(variant_id)
-                        if barcode is None:
-                            barcode = self._resolve_variant_barcode(variant_id)
-                            variant_barcode_cache[variant_id] = barcode or ""
-                        if not barcode:
-                            continue
+        for o in self._walk_orders():
+            if o.get("status") != "WAIT_FOR_CONFIRMATION":
+                continue
+            for chunk in o.get("delivery_chunks", []):
+                for item in chunk.get("items", []):
+                    variant_id = item["product_variant_id"]
 
-                        result.append(PlatformOrder(
-                            order_id=f"{o['id']}:{chunk['id']}:{item['id']}",
-                            barcode=barcode,
-                            quantity=item.get("quantity", 1),
-                            raw_status="WAIT_FOR_CONFIRMATION",
-                        ))
-            if len(orders) < 100:
-                break
-            page += 1
+                    # У Kit заказ отдаёт product_variant_id, а не баркод
+                    # напрямую (см. предупреждение в base.py — этот участок
+                    # закрывает ту нестыковку). Резолвим через тот же
+                    # объект Variant, где 'barcode' — подтверждённое поле.
+                    barcode = self._barcode_for_variant(variant_id, variant_barcode_cache)
+                    if not barcode:
+                        continue
+
+                    result.append(PlatformOrder(
+                        order_id=f"{o['id']}:{chunk['id']}:{item['id']}",
+                        barcode=barcode,
+                        quantity=item.get("quantity", 1),
+                        raw_status="WAIT_FOR_CONFIRMATION",
+                    ))
         return result
 
     def get_orders_since(self, date_from):
         """FBS-заказы Kit с даты date_from. /v1/orders постранично; фильтруем
         по created_at на нашей стороне (в разобранном API нет параметра
         диапазона дат). order_date = дата заказа."""
-        from datetime import datetime as _dt, date as _date
-        threshold = date_from.date() if isinstance(date_from, _dt) else date_from
+        from datetime import datetime as _dt, timezone
+        from app.timeutils import local_date_of, local_day_start_utc
+        # Граница — МОМЕНТ начала местных суток, а не UTC-шное число. Дата,
+        # взятая из UTC-времени, у заказа первых трёх часов дня оказывается
+        # вчерашней, и такой заказ отсеивался как «раньше базовой даты»:
+        # продажа не проводилась, остаток оставался завышенным на неё.
+        threshold_day = local_date_of(date_from) if isinstance(date_from, _dt) else date_from
+        threshold = local_day_start_utc(threshold_day)
 
         result = []
         variant_barcode_cache: dict[str, str] = {}
-        page = 1
-        while page <= 200:  # защитный предел на число страниц
-            data = self._get("/v1/orders", params={"page": page, "per_page": 100})
-            orders = data.get("orders", [])
-            if not orders:
-                break
-            for o in orders:
-                order_date = None
-                raw = o.get("created_at") or o.get("created")
-                if raw:
-                    try:
-                        order_date = _dt.fromisoformat(str(raw).replace("Z", "+00:00")).date()
-                    except ValueError:
-                        order_date = None
-                if order_date is not None and order_date < threshold:
-                    continue
-                for chunk in o.get("delivery_chunks", []):
-                    for item in chunk.get("items", []):
-                        variant_id = item["product_variant_id"]
-                        barcode = variant_barcode_cache.get(variant_id)
-                        if barcode is None:
-                            barcode = self._resolve_variant_barcode(variant_id)
-                            variant_barcode_cache[variant_id] = barcode or ""
-                        if not barcode:
-                            continue
-                        result.append(PlatformOrder(
-                            order_id=f"{o['id']}:{chunk['id']}:{item['id']}",
-                            barcode=barcode, quantity=item.get("quantity", 1),
-                            raw_status=str(o.get("status") or ""), order_date=order_date,
-                        ))
-            if len(orders) < 100:
-                break
-            page += 1
+        self.last_unresolved = 0
+        self.last_truncated = False
+        self._failed_variants = set()
+        for o in self._walk_orders():
+            order_date, created_at = None, None
+            raw = o.get("created_at") or o.get("created")
+            if raw:
+                try:
+                    created_at = _dt.fromisoformat(str(raw).replace("Z", "+00:00"))
+                except ValueError:
+                    created_at = None
+                if created_at is not None:
+                    if created_at.tzinfo is None:
+                        created_at = created_at.replace(tzinfo=timezone.utc)
+                    # Местная дата: уезжает в 1С датой перемещения.
+                    order_date = local_date_of(created_at)
+            if created_at is not None and created_at < threshold:
+                continue
+            for chunk in o.get("delivery_chunks", []):
+                for item in chunk.get("items", []):
+                    variant_id = item["product_variant_id"]
+                    barcode = self._barcode_for_variant(variant_id, variant_barcode_cache)
+                    if not barcode:
+                        continue
+                    result.append(PlatformOrder(
+                        order_id=f"{o['id']}:{chunk['id']}:{item['id']}",
+                        barcode=barcode, quantity=item.get("quantity", 1),
+                        raw_status=str(o.get("status") or ""), order_date=order_date,
+                    ))
         return result
 
+    def _local_variant_map(self) -> dict[str, str]:
+        if self._variant_map is None:
+            try:
+                self._variant_map = dict(self._variant_map_loader() or {}) \
+                    if self._variant_map_loader else {}
+            except Exception:   # своя база недоступна — просто идём в API, как раньше
+                self._variant_map = {}
+        return self._variant_map
+
     def _resolve_variant_barcode(self, variant_id: str) -> str | None:
-        try:
-            variant = self._get(f"/v1/variants/{variant_id}")
-            return variant.get("barcode") or None
-        except requests.HTTPError:
+        """Баркод варианта, или None — если у варианта его нет.
+
+        ПОДНИМАЕТ исключение, если спросить не удалось. Раньше здесь стоял
+        `except requests.HTTPError: return None`, и 429 после исчерпания попыток
+        становился неотличим от «у варианта нет баркода»: заказ молча исчезал,
+        наверх не уходило ничего, и расчёт считал, что кабинет честно ответил
+        «продаж не было». Отличать отсутствие от неудачи обязан вызывающий."""
+        variant = self._get(f"/v1/variants/{variant_id}")
+        return variant.get("barcode") or None
+
+    def _barcode_for_variant(self, variant_id: str, cache: dict[str, str]) -> str | None:
+        """Баркод строки заказа: своя база → кэш вызова → площадка.
+
+        None означает «этой строки у нас не будет». Если причина — неудачный
+        запрос, счётчик `last_unresolved` растёт, и вызывающий узнает, что
+        картина неполная."""
+        # Считаем ПОТЕРЯННЫЕ СТРОКИ, а не различающиеся варианты: один и тот же
+        # вариант встречается в разных заказах, и каждая его строка — отдельная
+        # непроведённая отгрузка. Повторно спрашивать площадку при этом не идём.
+        if variant_id in self._failed_variants:
+            self.last_unresolved += 1
             return None
+        if variant_id in cache:
+            return cache[variant_id] or None
+
+        barcode = self._local_variant_map().get(variant_id)
+        if not barcode:
+            try:
+                barcode = self._resolve_variant_barcode(variant_id)
+            except requests.RequestException:
+                # Больше по этому варианту в пределах вызова не ходим: если Kit
+                # уже отвечает 429, повторы только усугубят лимит.
+                self._failed_variants.add(variant_id)
+                self.last_unresolved += 1
+                return None
+        cache[variant_id] = barcode or ""
+        return barcode or None
 
     def get_cancelled_orders(self, order_ids: list[str]) -> list[PlatformOrder]:
         # Учитываем ТОЛЬКО НАШУ (продавцовскую) отмену до отгрузки. В разобранном
@@ -203,47 +328,236 @@ class KitClient(PlatformClient):
         except requests.HTTPError:
             return False
 
+    def _item_errors(self, response) -> dict[str, str]:
+        """{variant_id: код ошибки} из тела отказа массовой операции.
+
+        Спека (`BulkOperationError`) обещает рядом с общим `code`/`message`
+        список `errors` с разбором ПО ЭЛЕМЕНТАМ: `variant_id`, `warehouse_id`,
+        `code`. Именно его мы раньше не читали — а в `last_error` он и не
+        попадал, потому что рассылка режет текст и список обрезало."""
+        try:
+            payload = response.json()
+        except Exception:
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        out: dict[str, str] = {}
+        for entry in payload.get("errors") or []:
+            if not isinstance(entry, dict):
+                continue
+            vid = str(entry.get("variant_id") or "")
+            if vid:
+                out[vid] = str(entry.get("code") or "")
+        return out
+
     def push_stock(self, warehouse_id: str, items: list[StockPushItem]) -> dict:
-        ok, errors = [], []
-        for i in range(0, len(items), 5000):
-            chunk = items[i:i + 5000]
-            # Kit идентифицирует позицию по variant_id (UUID варианта), НЕ по
-            # баркоду. Берём external_id (id варианта из каталога); если каталог
-            # не загружен — падаем на баркод (для реального Kit не сработает).
+        """Остатки на Kit: `POST /v1/variants/stocks/bulk_update`.
+
+        ОДНА НЕПРИНЯТАЯ ПОЗИЦИЯ РОНЯЕТ ВЕСЬ ЗАПРОС — это главное про этот метод.
+        20.09 на бою по кабинету КИТ не уехало НИ ОДНОГО остатка: каждый запрос
+        возвращал `400 VALIDATION_ERROR`, потому что в каждой пачке было
+        несколько позиций без карточки в каталоге кабинета. 642 записи очереди
+        сожгли по пять попыток и легли в `error`, а на площадке всё это время
+        стояли чужие числа.
+
+        Kit, в отличие от WB, виновных называет прямо — `errors[]` с
+        `variant_id` и кодом. Поэтому вынимаем их из запроса и шлём остальное, а
+        сами позиции закрываем пометкой `terminal`: пока карточки нет или она в
+        архиве, ответ не изменится, и пять попыток с паузами только оттянут
+        момент, когда человек узнает про неразрешённую пару товар+кабинет.
+
+        Код про СКЛАД (`WAREHOUSE_NOT_FOUND`/`WAREHOUSE_ARCHIVED`) так не
+        разбираем: позиции в нём не виноваты, виновата настройка кабинета.
+        Выкинув их, мы бы похоронили всю очередь вместо того, чтобы дать
+        повторам дождаться правки.
+        """
+        ok: list[str] = []
+        errors: list[dict] = []
+        for start in range(0, len(items), MAX_STOCK_ITEMS):
+            part_ok, part_errors = self._push_stock_chunk(
+                warehouse_id, items[start:start + MAX_STOCK_ITEMS])
+            ok += part_ok
+            errors += part_errors
+        return {"ok": ok, "errors": errors}
+
+    def _push_stock_chunk(self, warehouse_id: str,
+                          chunk: list[StockPushItem]) -> tuple[list[str], list[dict]]:
+        # Позиция без variant_id не просто не уедет — она уронит запрос целиком
+        # (площадка ответит VALIDATION_ERROR на всё тело). Рассылка такие сюда
+        # уже не пускает, но клиент обязан защищаться сам: падать на баркод
+        # «а вдруг поймёт» здесь нельзя ни при каких обстоятельствах.
+        dropped: list[dict] = [
+            {"sku": it.barcode, "terminal": True, "card_missing": True,
+             "detail": "нет variant_id: карточки этого товара нет в каталоге кабинета"}
+            for it in chunk if not it.external_id
+        ]
+        remaining = [it for it in chunk if it.external_id]
+
+        # Цикл, а не одна попытка: Kit называет виновных, но обещания назвать
+        # ВСЕХ сразу не давал. Предел по числу позиций — каждый проход выносит
+        # хотя бы одну, иначе выходим сами.
+        for _ in range(len(chunk) + 1):
+            if not remaining:
+                return [], dropped
+
             body = {"items": [
-                {"variant_id": it.external_id or it.barcode, "warehouse_id": warehouse_id, "quantity": it.quantity}
-                for it in chunk
+                {"variant_id": it.external_id, "warehouse_id": warehouse_id,
+                 "quantity": it.quantity}
+                for it in remaining
             ]}
 
-            def call():
-                r = self.session.post(f"{BASE_URL}/v1/variants/stocks/bulk_update", json=body, timeout=30)
+            def call(body=body):
+                r = self.session.post(f"{BASE_URL}/v1/variants/stocks/bulk_update",
+                                      json=body, timeout=30)
                 r.raise_for_status()
                 return r
 
             try:
                 with_retry(call)
-                ok.extend(it.barcode for it in chunk)
+                return [it.barcode for it in remaining], dropped
             except requests.HTTPError as e:
-                detail = {}
-                try:
-                    detail = e.response.json()
-                except Exception:
-                    pass
-                errors.append({"detail": str(e), "response": detail})
+                response = e.response
+                detail = str(e)
+                item_errors = self._item_errors(response) if response is not None else {}
+                if response is not None:
+                    try:
+                        detail = f"{detail}: {str(response.json())[:400]}"
+                    except Exception:
+                        pass
+
+                if ACCOUNT_ERROR_CODES & set(item_errors.values()):
+                    return [], dropped + [{"detail": detail}]
+
+                by_variant = {it.external_id: it for it in remaining}
+                bad = {vid: code for vid, code in item_errors.items()
+                       if vid in by_variant and code in TERMINAL_ITEM_CODES}
+                if not bad:
+                    # Либо площадка не назвала виновных, либо код незнакомый.
+                    # Урезать отправку молча в таком случае значит решить за
+                    # неё, что именно она забраковала.
+                    return [], dropped + [{"detail": detail}]
+
+                for vid, code in sorted(bad.items()):
+                    dropped.append({
+                        "sku": by_variant[vid].barcode, "terminal": True,
+                        "card_missing": code in CARD_MISSING_ITEM_CODES,
+                        "detail": TERMINAL_ITEM_CODES[code].format(vid=vid),
+                    })
+                remaining = [it for it in remaining if it.external_id not in bad]
+                continue
             except requests.RequestException as e:
-                errors.append({"detail": str(e)})
-        return {"ok": ok, "errors": errors}
+                return [], dropped + [{"detail": str(e)}]
+
+        # Сюда попадаем, только если Kit забраковал все позиции по очереди.
+        return [], dropped
+
+    # ------------------------------------------------ публикация карточки
+
+    def hidden_stock_keys(self) -> set[str] | None:
+        """variant_id карточек в статусе `HIDDEN`.
+
+        На витрине Kit есть настройка «скрывать товары с нулевым остатком»:
+        распроданная карточка сама уходит в `HIDDEN` — и обратно САМА НЕ
+        ВОЗВРАЩАЕТСЯ. Прихода остатка ей мало, нужен явный перевод статуса,
+        иначе товар есть, а купить его нельзя.
+
+        Спрашиваем список одним проходом, а не статус по каждой позиции: у
+        площадки лимит десять запросов в секунду, а скрытых карточек обычно
+        куда меньше, чем отправляемых остатков.
+
+        `status` в запросе — фильтр, но полагаться на него одного нельзя:
+        неизвестные параметры Kit молча игнорирует, и если фильтр однажды
+        перестанет быть известным, мы получили бы ВЕСЬ каталог и опубликовали
+        всё подряд. Поэтому статус каждой строки проверяем ещё и у себя.
+
+        `None` — спросить не удалось ИЛИ список вышел неполным; публикация в этом
+        случае не делается вовсе. Неполный список опаснее отсутствующего: он
+        выглядит как ответ, и карточки за его границей остаются скрытыми молча.
+        """
+        found: set[str] = set()
+        collected = 0
+        for page in range(1, MAX_ORDER_PAGES + 1):
+            try:
+                data = self._get("/v1/variants",
+                                 params={"page": page, "per_page": 100, "status": "HIDDEN"})
+            except requests.RequestException:
+                return None
+            rows = data.get("variants") or []
+            if not rows:
+                return found
+            for v in rows:
+                if str(v.get("status") or "") == "HIDDEN" and v.get("id"):
+                    found.add(str(v["id"]))
+            collected += len(rows)
+            total = data.get("total_count")
+            if isinstance(total, int) and collected >= total:
+                return found
+        # Упёрлись в предел страниц — список НЕПОЛНЫЙ, и вернуть его как полный
+        # нельзя: контракт у метода ровно обратный («None — спросить не удалось,
+        # публиковать вслепую нельзя»). Карточки за границей остались бы
+        # скрытыми навсегда: остаток передан, площадка его приняла, у нас всё
+        # зелено — а товара на витрине нет и продаж не будет.
+        return None
+
+    def publish_stock_key(self, key: str) -> bool:
+        """Вернуть карточку на витрину: `status` → `PUBLISHED`.
+
+        `PATCH /v1/variants/{id}` — это JSON Merge Patch: передаём ТОЛЬКО
+        статус, остальное у карточки остаётся как есть. Передать заодно
+        остатки было бы опасно — в этом методе они заменяют весь список
+        целиком, и неполный список обнулил бы склады, которых в нём нет.
+
+        Архивные карточки сюда не попадают: их площадка не отдаёт в списке
+        скрытых, а патч архивной карточки она всё равно отвергает (сначала
+        разархивация — это осознанное решение человека, не наше).
+        """
+        def call():
+            time.sleep(_THROTTLE_SECONDS)
+            r = self.session.patch(
+                f"{BASE_URL}/v1/variants/{key}",
+                json={"status": "PUBLISHED"},
+                headers={"Content-Type": "application/merge-patch+json"},
+                timeout=30,
+            )
+            r.raise_for_status()
+            return r
+
+        try:
+            with_retry(call)
+            return True
+        except requests.RequestException:
+            return False
 
     def get_catalog_items(self) -> list[CatalogItem]:
+        """Каталог кабинета постранично.
+
+        Конец определяет `total_count`, а НЕ длина страницы — ровно по той же
+        причине, что и у ленты заказов (см. `_walk_orders`): короткая страница у
+        Kit не значит «данные кончились». Стоял здесь именно такой стоп, и
+        недогруженный каталог тихо стоит дорого: у части товаров нет
+        `external_id`, а без variant_id рассылка закрывает позицию как «нет
+        карточки в каталоге кабинета» — остаток туда не уедет никогда.
+
+        И обязательный предел страниц. Kit молча игнорирует неизвестные
+        параметры; перестань однажды действовать `page` — цикл `while True` не
+        закончился бы вовсе, бесконечно копя дубли в памяти воркера.
+        """
         result = []
-        page = 1
-        while True:
+        collected = 0
+        self.last_truncated = False
+        for page in range(1, MAX_ORDER_PAGES + 1):
             data = self._get("/v1/variants", params={"page": page, "per_page": 100})
-            result.extend(_parse_kit_variants(data))
             variants = data.get("variants", [])
-            if len(variants) < 100:
-                break
-            page += 1
+            if not variants:
+                return result
+            result.extend(_parse_kit_variants(data))
+            collected += len(variants)
+            total = data.get("total_count")
+            if isinstance(total, int) and collected >= total:
+                return result
+        # Выдачу оборвали мы, а не площадка: каталог неполон, и молчать об этом
+        # нельзя — иначе огрызок примут за полный каталог.
+        self.last_truncated = True
         return result
 
 
