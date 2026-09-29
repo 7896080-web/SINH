@@ -217,3 +217,9 @@ def test_upd_number_always_equals_supply_number(client, db):
     assert s.doc_number == s.number == "12570"
     from markapp import supplies as S
     assert any("не равен номеру поставки" in e for e in S.validate_numbers(db, "1", "2"))
+
+
+def test_plugin_check_is_served_from_the_program_address(client):
+    """Доверие плагина КриптоПро зависит от адреса страницы — проверка идёт с адреса программы."""
+    r = client.get("/diagnostics/plugin-check")
+    assert r.status_code == 200 and "<html" in r.text.lower()
