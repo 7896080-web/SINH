@@ -1,0 +1,9 @@
+.env
+*.db
+*.db-wal
+*.db-shm
+backups/
+logs/
+tools/rclone.exe
+rclone.conf
+__pycache__/

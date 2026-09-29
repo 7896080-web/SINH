@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}Диагностика{% endblock %}
+{% block content %}
+<h1>Диагностика</h1>
+{% if stale %}<div class="flash error">Фоновые задания не отвечают: {{ stale|join('; ') }}</div>{% endif %}
+{% if stuck %}<div class="flash warn">Заданий 1С без ответа: {{ stuck }} — см. таблицу ниже и страницы поставок.</div>{% endif %}
+
+<div class="card">
+  <h2 style="margin-top:0">Обработка 1С</h2>
+  {% if epf_version %}
+  <p class="ok">Обновлена под маркировку: версия {{ epf_version }}, ответ на PING {{ epf_ping_at }} UTC.</p>
+  {% else %}
+  <p class="warn">Ответа на PING ещё не было — задания поставок в 1С не отправляются. Обновите обработку по инструкции
+  (<code>marking/1c/</code>) и нажмите «Отправить PING». Старая обработка на PING просто молчит.</p>
+  {% endif %}
+  <form method="post" action="/diagnostics/ping"><button class="secondary">Отправить PING</button></form>
+  <p class="muted">Папки: {% for k, v in dirs.items() %}{{ k }} — <code>{{ v }}</code>{{ '; ' if not loop.last }}{% endfor %}</p>
+</div>
+
+<h2>Фоновые задания</h2>
+<table><tr><th>Задание</th><th>Последний прогон (UTC)</th><th>Итог</th><th>Сообщение</th></tr>
+{% for b in beats %}<tr><td>{{ b.name }}</td><td>{{ b.last_run_at.strftime('%d.%m %H:%M:%S') if b.last_run_at else '' }}</td>
+<td class="{{ 'ok' if b.last_success and not b.last_error else ('warn' if b.last_success else 'bad') }}">{{ 'ок' if b.last_success and not b.last_error else ('с оговоркой' if b.last_success else 'ошибка') }}</td>
+<td>{{ b.last_error }}</td></tr>{% endfor %}
+</table>
+
+<h2>Задания 1С (последние 50)</h2>
+<table><tr><th>#</th><th>Команда</th><th>order_id</th><th>Статус</th><th>Ответ</th><th>Файл</th><th>Создано (UTC)</th></tr>
+{% for t in tasks %}<tr><td>{{ t.id }}</td><td>{{ t.command }}</td><td>{% if t.supply_id %}<a href="/supplies/{{ t.supply_id }}">{{ t.order_id }}</a>{% else %}{{ t.order_id }}{% endif %}</td>
+<td class="{{ 'ok' if t.status == 'done' else ('bad' if t.status in ('failed','timeout') else '') }}">{{ t.status }}</td><td>{{ t.result_detail }}</td><td>{{ t.filename }}</td>
+<td>{{ t.created_at.strftime('%d.%m %H:%M') }}</td></tr>{% endfor %}
+</table>
+
+<h2>Журнал (последние 50)</h2>
+<table><tr><th>Когда (UTC)</th><th>Кто</th><th>Действие</th><th>Объект</th><th>Подробности</th></tr>
+{% for l in log %}<tr><td>{{ l.at.strftime('%d.%m %H:%M') }}</td><td>{{ l.username }}</td><td>{{ l.action }}</td><td>{{ l.object }}</td><td>{{ l.details }}</td></tr>{% endfor %}
+</table>
+{% endblock %}

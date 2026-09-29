@@ -1,0 +1,18 @@
+# Программа «Маркировка и поставки». Версии — как у sync_admin на том же
+# сервере: один Python, одни и те же колёса, меньше сюрпризов при установке.
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+sqlalchemy==2.0.35
+jinja2==3.1.4
+python-multipart==0.0.9
+itsdangerous==2.2.0
+passlib==1.7.4
+bcrypt==4.0.1
+cryptography==43.0.1
+python-dotenv==1.0.1
+openpyxl==3.1.5
+APScheduler==3.10.4
+requests==2.32.3
+alembic==1.13.3
+pytest==8.3.3
+httpx==0.27.2

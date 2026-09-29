@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}Одежда полный{% endblock %}
+{% block content %}
+<h1>Справочник «Одежда полный»</h1>
+<div class="card">
+  <form method="post" action="/catalog/import" enctype="multipart/form-data" class="row">
+    <label>Выгрузка каталога Lamoda Seller (лист «Upload Template»)<input type="file" name="file" accept=".xlsx" required></label>
+    <button>Загрузить</button>
+  </form>
+  <p class="muted">Повторная загрузка обновляет артикулы и показывает, у каких сменились штрихкод или цена.
+  Артикулы, которых нет в новой выгрузке, не удаляются. Всего в справочнике: {{ all_count }}.</p>
+</div>
+<form class="row" method="get" action="/catalog" style="margin-bottom:10px">
+  <input name="q" value="{{ q }}" placeholder="артикул, штрихкод или Lamoda SKU" size="40">
+  <button class="secondary">Найти</button>
+  <span class="muted">найдено {{ total }}{% if total > limit %}, показаны первые {{ limit }}{% endif %}</span>
+</form>
+<div class="scroll">
+<table>
+  <tr><th>Размерный артикул</th><th>EAN</th><th class="num">Цена</th><th>Lamoda SKU</th><th>Размер</th><th>Цвет</th><th>ТН ВЭД</th><th>НДС</th><th>Последний раз в выгрузке</th></tr>
+  {% for c in items %}
+  <tr><td>{{ c.supplier_sku }}</td><td>{{ c.ean }}</td><td class="num">{{ c.price|money }}</td><td>{{ c.lamoda_sku }}</td>
+    <td>{{ c.size }}</td><td>{{ c.color }}</td><td>{{ c.tn_ved }}</td><td>{{ c.tax_class }}</td><td>{{ c.last_seen_at.strftime('%d.%m.%Y') }}</td></tr>
+  {% endfor %}
+</table>
+</div>
+{% endblock %}

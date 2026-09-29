@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}Организации{% endblock %}
+{% block content %}
+<div class="row" style="justify-content:space-between">
+  <h1>Организации</h1><a class="btn secondary" href="/organizations/0">Добавить ИП</a>
+</div>
+<table>
+  <tr><th>Название</th><th>ИНН</th><th>ОГРНИП</th><th>НДС</th><th>Договор</th><th></th></tr>
+  {% for o in orgs %}
+  <tr><td>{{ o.name }}{% if o.id == lamoda_id %} <span class="badge moved">ИП для Lamoda</span>{% endif %}</td>
+    <td>{{ o.inn }}</td><td>{{ o.ogrnip }}</td><td>{{ o.vat_rate }}%</td><td>{{ o.contract_number }}</td>
+    <td><a href="/organizations/{{ o.id }}">изменить</a></td></tr>
+  {% endfor %}
+</table>
+
+<h2>Настройки Lamoda</h2>
+<div class="card">
+  <form method="post" action="/lamoda-settings" onsubmit="return confirm('Сохранить настройки Lamoda? Смена ИП не меняет уже созданные поставки.')">
+    <div class="row">
+      <label>ИП для Lamoda<select name="org_id">{% for o in orgs %}<option value="{{ o.id }}" {{ 'selected' if o.id == lamoda_id }}>{{ o.name }}</option>{% endfor %}</select></label>
+      <label>Агентский договор с<input name="agency_from" value="{{ agency_from }}" size="10"></label>
+      <label>Последний номер поставки<input name="last_number" value="{{ last_number }}" size="8"></label>
+      <label>Шаг<input name="step" value="{{ step }}" size="4"></label>
+      <button>Сохранить</button>
+    </div>
+  </form>
+  <p class="muted">С Lamoda работает один ИП. Нумерация поставок общая: следующий номер = последний + шаг.</p>
+</div>
+{% endblock %}

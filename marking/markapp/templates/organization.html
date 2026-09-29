@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}Организация{% endblock %}
+{% block content %}
+<h1>{{ org.name or 'Новый ИП' }}</h1>
+<div class="card">
+<form method="post" action="/organizations/{{ org.id or 0 }}">
+  {% set labels = {'name': 'Название для экрана', 'surname': 'Фамилия', 'firstname': 'Имя', 'patronymic': 'Отчество',
+     'inn': 'ИНН', 'ogrnip': 'ОГРНИП', 'address': 'Адрес (для УПД)', 'signer_role': 'Должность подписанта',
+     'contract_number': 'Номер договора с Купишуз', 'sticker_sender': 'Строка «Отправитель» на стикерах',
+     'edo_sender_id': 'ID участника ЭДО (Диадок)'} %}
+  {% for f in fields %}
+  <p><label>{{ labels[f] }}<br><input name="{{ f }}" value="{{ org[f] or '' }}" size="60" {{ 'required' if f in ('name','surname','firstname','inn','ogrnip','address') }}></label></p>
+  {% endfor %}
+  <p><label>НДС, %<br><input type="number" name="vat_rate" value="{{ org.vat_rate or 5 }}" min="0" max="22"></label></p>
+  <button>Сохранить</button>
+</form>
+</div>
+{% endblock %}
