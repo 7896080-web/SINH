@@ -18,6 +18,7 @@ WB» против «это мы сами».
 import os
 import subprocess
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -46,8 +47,14 @@ def db_url(tmp_path):
                         size="L", color="Тёмно-коричневый", stock_on_hand=3))
     session.add(PlatformAccount(id=1, platform=Platform.wb, name="ИП КАРАМАН",
                                 warehouse_id="wh-1"))
+    # Времена ставим явно и ровно те, что были на бою: заказ принят и отменён
+    # через двадцать секунд. Оставь мы `cancelled_at` пустым, строка про разрыв
+    # не печаталась бы вовсе, и проверка на неё молчала бы по неверной причине.
+    taken = datetime(2026, 9, 25, 16, 37, 22)
     session.add(ProcessedOrder(account_id=1, order_id=ORDER, uid_1c="uid-1",
-                               quantity=1, status=OrderProcessStatus.cancelled))
+                               quantity=1, status=OrderProcessStatus.cancelled,
+                               processed_at=taken,
+                               cancelled_at=taken + timedelta(seconds=20)))
     session.commit()
     session.close()
     engine.dispose()
@@ -100,6 +107,24 @@ def test_a_live_cancel_without_a_human_trace_points_at_the_cabinet(db_url):
     assert "опрос площадки" in out.lower(), out
     assert "supplierStatus=cancel" in out
     assert "в кабинете WB" in out
+    # Площадка у заказа известна через кабинет; «-» тут читалось бы как
+    # «неизвестно» и отправило бы человека искать несуществующий пробел.
+    assert "площадка: wb" in out
+
+
+def test_the_gap_between_intake_and_cancel_is_printed_as_a_number(db_url):
+    """Двадцать секунд и два часа — разные дела, а глазами они неразличимы.
+
+    Оба времени стоят в соседних строках и отличаются только секундами; человек
+    вычитает их в уме и ошибается ровно там, где это решает, кто отменял:
+    автоматика или человек в кабинете.
+    """
+    url, _ = db_url
+    _add(url, _cancel_task())
+
+    out = _run(url)
+
+    assert "отменён через 20 с после приёма" in out, out
 
 
 def test_a_simulated_cancel_names_the_person(db_url):

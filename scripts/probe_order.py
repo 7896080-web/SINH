@@ -65,6 +65,14 @@ def _dt(value) -> str:
     return value.strftime("%d.%m.%Y %H:%M:%S") if value else "-"
 
 
+def _gap(seconds: float) -> str:
+    if seconds < 60:
+        return f"{int(seconds)} с"
+    if seconds < 3600:
+        return f"{int(seconds // 60)} мин {int(seconds % 60)} с"
+    return f"{seconds / 3600:.1f} ч"
+
+
 def _product(db, uid: str | None) -> str:
     if not uid:
         return "товар не определён"
@@ -105,6 +113,15 @@ def main() -> int:
             print(f"    количество: {o.quantity}, статус: {o.status.value}")
             print(f"    принят:  {_dt(o.processed_at)}")
             print(f"    отменён: {_dt(o.cancelled_at)}")
+            # Разрыв между приёмом и отменой печатаем ЧИСЛОМ, а не оставляем
+            # человеку вычитать одно время из другого. Двадцать секунд и два
+            # часа — это разные дела: за двадцать секунд человек в кабинете
+            # новый заказ не найдёт, значит отменяла автоматика, и вопрос сразу
+            # сужается до «чья». Глазами эта разница не бросается: оба времени
+            # отличаются только секундами в одной строке.
+            if o.cancelled_at and o.processed_at:
+                gap = (o.cancelled_at - o.processed_at).total_seconds()
+                print(f"    отменён через {_gap(gap)} после приёма")
         print()
 
         tasks = (db.query(FtpTask).filter(FtpTask.order_id == order_id)
@@ -118,8 +135,13 @@ def main() -> int:
             print(f"  #{t.id} {t.command} [{t.status.value}]{mark}")
             print(f"    склад: {t.warehouse_from or '-'} -> {t.warehouse_to or '-'}, "
                   f"кол-во {t.quantity}")
-            print(f"    кабинет: {acc.name if acc else '-'}, "
-                  f"площадка: {t.platform.value if t.platform else '-'}")
+            # Площадку берём у кабинета, если своя пуста: своё поле задания
+            # заполняется только у возвратов (у них кабинета нет вовсе), а у
+            # заказа площадка известна через кабинет. Печатать тут «-» значило
+            # бы говорить «неизвестно» о том, что известно.
+            platform = (t.platform.value if t.platform
+                        else (acc.platform.value if acc else "-"))
+            print(f"    кабинет: {acc.name if acc else '-'}, площадка: {platform}")
             print(f"    заведено: {_dt(t.created_at)}")
             print(f"    отправлено: {_dt(t.sent_at)}  файл: {t.batch_filename or '-'}")
             print(f"    ответ 1С: {t.result_status or '-'} "
