@@ -26,6 +26,30 @@
 
 Команды на сервере — PowerShell **от администратора**.
 
+## Коротко: что ставится на сервер
+
+**Только OpenSSH Server** (бесплатный, от Microsoft) и его настройка. Ни
+Python, ни самой программы, ни служб маркировки на сервере нет. Отдельно, в
+Конфигураторе, обновляется обработка 1С (`1c/ОБНОВЛЕНИЕ_ОБРАБОТКИ.md`).
+
+1. Если OpenSSH Server ещё не стоит — скачать `OpenSSH-Win64-v*.msi` (не
+   Preview) с `github.com/PowerShell/Win32-OpenSSH/releases` и:
+   ```powershell
+   msiexec /i C:\путь\OpenSSH-Win64-vX.X.X.X.msi ADDLOCAL=Server
+   ```
+2. Скопировать на сервер `server_sftp_setup.ps1` (например, в
+   `C:\marking_setup\`) и запустить с открытым ключом рабочего компьютера
+   (строка из вывода `install_workstation.ps1`):
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File C:\marking_setup\server_sftp_setup.ps1 -PublicKey "ssh-ed25519 AAAA... marking@PC"
+   ```
+   Скрипт делает шаги 2–5 ниже сам: учётная запись, папки и права,
+   `sshd_config` (с копией прежнего; при ошибке проверки возвращает прежний),
+   ключ, брандмауэр, служба — и печатает отпечаток ключа сервера для сверки.
+   Повторный запуск безопасен.
+
+Шаги ниже — то же самое руками, для справки и разбора.
+
 ---
 
 ## 1. Сервер: OpenSSH на 443
