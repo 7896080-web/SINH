@@ -11,7 +11,7 @@
     <span>Штук: <b>{{ totals.units }}</b></span>
     <span>Сумма с НДС: <b>{{ totals.money|money }}</b></span>
     <span>Без GTIN: <b class="{{ 'warn' if no_gtin else '' }}">{{ no_gtin }}</b> арт.</span>
-    <span>Файл: {{ supply.source_filename }}</span>
+    <span>Исходный файл: {% if supply.source_file %}<a href="/supplies/{{ supply.id }}/source">{{ supply.source_filename or 'скачать' }}</a>{% else %}{{ supply.source_filename or '—' }} <span class="muted">(не сохранён — загружен до версии, хранящей файл)</span>{% endif %}</span>
     {% if supply.onec_document %}<span>Документ 1С: <b>{{ supply.onec_document }}</b></span>{% endif %}
   </div>
   <form method="post" action="/supplies/{{ supply.id }}/header" style="margin-top:10px">

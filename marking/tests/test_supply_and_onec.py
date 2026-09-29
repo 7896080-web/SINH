@@ -198,6 +198,7 @@ def test_stale_check_answer_does_not_approve_changed_supply(db, catalog, exchang
     new = onec.enqueue_check(db, s)
     db.commit()
     onec.publish_pending(db)
+    onec.publish_pending(db)            # проверки уходят по одной на файл
     _answer(exchange_dirs, "mark_1", f"{old.order_id}|OK||SUPPLY_CHECK", _check_file(s))
     onec.collect_results(db)
     db.refresh(s)
@@ -270,8 +271,8 @@ def test_answer_file_survives_failed_commit(db, catalog, exchange_dirs, monkeypa
     def boom():
         raise RuntimeError("database is locked")
     monkeypatch.setattr(db, "commit", boom)
-    with pytest.raises(RuntimeError):
-        onec.collect_results(db)
+    stats = onec.collect_results(db)
+    assert stats["files"] == 0 and "database is locked" in stats["failed_files"][0]
     assert (exchange_dirs.ONEC_RESULTS_DIR / "result_mark_1.txt").exists()
 
 
@@ -361,3 +362,84 @@ def test_ambiguous_barcode_answer_is_shown(db, catalog, exchange_dirs):
     onec.collect_results(db)
     db.refresh(s)
     assert s.status == "draft" and s.rows[0].onec_status == "ambiguous"
+
+
+# --- аудит 29.09: причинно-следственные дыры -------------------------------------
+
+def test_b1_date_as_excel_number_is_read(db):
+    """Файл из инструмента КИЗ несёт дату в B1 числом (46297) — она не теряется."""
+    parsed = S.parse_input(fixture_bytes("reference_kiz_tool_supply_12550.xlsx"))
+    assert not parsed.errors
+    assert parsed.supply_date == date(2026, 10, 2) and parsed.number == "12550"
+
+
+def test_underscore_in_supply_number_is_refused(db):
+    """Номер поставки — ключ поиска документа в 1С через ПОДОБНО, где «_» — любой символ."""
+    assert any("без «_»" in e for e in S.validate_numbers(db, "A_1", "A_1"))
+    assert not any("без «_»" in e for e in S.validate_numbers(db, "A-1", "A_1"))
+
+
+def test_supply_is_frozen_once_movement_is_sent(db, catalog, exchange_dirs):
+    """До ответа 1С поставка «проверена», но документ уже создаётся: правка
+    разошлась бы с ним, а смена номера сломала бы идемпотентность повтора."""
+    _ready(db)
+    s = _supply(db)
+    s.status = "checked"
+    onec.enqueue_movement(db, s)
+    db.commit()
+    for action in (lambda: S.update_row_qty(s, s.rows[0].id, 1),
+                   lambda: S.refresh_from_catalog(db, s),
+                   lambda: S.ensure_editable(s)):
+        with pytest.raises(S.SupplyError, match="перемещение уже отправлено"):
+            action()
+    # Зависло без ответа — всё равно заморожено: документ мог быть создан.
+    db.query(OnecTask).update({"status": "timeout"})
+    db.commit()
+    with pytest.raises(S.SupplyError):
+        S.ensure_editable(s)
+    # Внятный отказ 1С — документа нет, править снова можно.
+    db.query(OnecTask).update({"status": "failed"})
+    db.commit()
+    S.ensure_editable(s)
+
+
+def test_one_supply_check_per_file(db, catalog, exchange_dirs):
+    """supplycheck — один файл на задание и без order_id: две проверки в одном
+    файле перепутали бы строки двух поставок."""
+    _ready(db)
+    a, b = _supply(db), _supply(db)
+    onec.enqueue_check(db, a)
+    onec.enqueue_check(db, b)
+    onec.enqueue_ping(db)
+    db.commit()
+    assert onec.publish_pending(db) == 2          # проверка A + PING
+    assert onec.publish_pending(db) == 1          # проверка B — отдельным файлом
+    files = sorted(exchange_dirs.ONEC_TASKS_DIR.glob("task_mark_*.txt"))
+    assert len(files) == 2
+    assert all(f.read_text(encoding="utf-8").count("SUPPLY_CHECK") == 1 for f in files)
+
+
+def test_catalog_change_after_upload_blocks_until_reread(db, catalog):
+    from markapp.models import CatalogItem
+    s = _supply(db)
+    assert not S.catalog_drift(db, s)
+    item = db.query(CatalogItem).filter(CatalogItem.supplier_sku == s.rows[0].supplier_sku).one()
+    item.ean = "2000000000000"
+    db.commit()
+    assert S.catalog_drift(db, s) and "Перечитать" in S.catalog_drift(db, s)[0]
+    S.refresh_from_catalog(db, s)
+    db.commit()
+    assert not S.catalog_drift(db, s)
+
+
+def test_broken_answer_file_does_not_block_the_next(db, catalog, exchange_dirs):
+    _ready(db)
+    task = onec.enqueue_ping(db)
+    db.commit()
+    onec.publish_pending(db)
+    (exchange_dirs.ONEC_RESULTS_DIR / "result_mark_0.txt").write_bytes(b"\xff\xfe\x00bad")
+    _answer(exchange_dirs, "mark_1", f"{task.order_id}|OK|mark-1|PING")
+    stats = onec.collect_results(db)
+    assert stats["files"] == 1 and len(stats["failed_files"]) == 1
+    assert onec.epf_ready(db)
+    assert (exchange_dirs.ONEC_RESULTS_DIR / "result_mark_0.txt").exists()

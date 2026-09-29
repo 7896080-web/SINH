@@ -7,7 +7,7 @@
   <form method="post" action="/supplies/new" enctype="multipart/form-data">
     <div class="row">
       <label>Файл поставки (шаблон Lamoda, лист «Лист1»)<input type="file" name="file" accept=".xlsx" required></label>
-      <label>Номер поставки<input name="number" value="{{ next_number }}" size="10"></label>
+      <label>Номер поставки<input name="number" placeholder="из B2 или {{ next_number }}" size="14"></label>
       <label>Номер документа<input name="doc_number" placeholder="= номеру поставки" size="12"></label>
       <label>Дата поставки<input type="date" name="supply_date"></label>
       <button type="submit" {{ 'disabled' if not org }}>Загрузить</button>
@@ -15,6 +15,9 @@
   </form>
   <p class="muted">Во входящем файле достаточно размерного артикула и количества. Штрихкод и цена берутся
   из справочника «Одежда полный». ИП — {{ org.name if org else '—' }} (настройка «ИП для Lamoda»).
-  Номер документа — он же номер УПД и имя файлов; по умолчанию равен номеру поставки.</p>
+  Номер поставки: из поля, иначе из B2 файла, иначе следующий по нумерации ({{ next_number }}).
+  Дата: из поля, иначе из B1 файла.
+  Номер документа — он же номер УПД и имя файлов; по умолчанию равен номеру поставки.
+  Файл сохраняется при поставке — его можно скачать со страницы поставки.</p>
 </div>
 {% endblock %}

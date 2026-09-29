@@ -72,13 +72,17 @@ async def supply_create(request: Request, file: UploadFile = File(...),
         flash(request, "Не выбран ИП для Lamoda — укажите его на странице «Организации».", "error")
         return RedirectResponse("/supplies/new", status_code=303)
     try:
-        parsed = S.parse_input(await _read(file))
-        number = (number or parsed.number or S.next_number(db)).strip()
+        data = await _read(file)
+        parsed = S.parse_input(data)
+        # Номер: поле формы → B2 файла → следующий по нумерации. Форма больше не
+        # подставляет номер заранее: заполненное поле молча перебивало B2.
+        number = (number.strip() or parsed.number or S.next_number(db)).strip()
         doc_number = (doc_number or number).strip()
         d = _date_or_none(supply_date) or parsed.supply_date
         supply = S.create_supply(db, parsed, organization_id=org.id, number=number,
                                  doc_number=doc_number, supply_date=d,
-                                 filename=file.filename or "", username=user.username)
+                                 filename=file.filename or "", username=user.username,
+                                 source_file=data)
         audit.log(db, user.username, "supply_created", f"поставка {number}",
                   f"{len(supply.rows)} строк, файл {file.filename}")
         db.commit()
@@ -114,16 +118,30 @@ def supply_detail(supply_id: int, request: Request, db: Session = Depends(get_db
     gtins = {r.id: gmap.get(r.supplier_sku, "") for r in supply.rows}
     from markapp.models import NkCard
     cards = {c.gtin: c for c in db.query(NkCard).filter(NkCard.gtin.in_([g for g in gtins.values() if g])).all()}
+    editable = (supply.status in [s.value for s in EDITABLE_STATUSES]
+                and not S.movement_sent(supply))
+    problems = S.blocking_problems(supply) + (S.catalog_drift(db, supply) if editable else [])
     return render(request, "supply.html", user, "supplies", supply=supply, tasks=tasks,
-                  totals=S.totals(supply), problems=S.blocking_problems(supply),
+                  totals=S.totals(supply), problems=problems,
                   move_problems=S.movement_problems(supply),
-                  editable=supply.status in [s.value for s in EDITABLE_STATUSES],
+                  editable=editable,
                   epf_ready=onec.epf_ready(db), fbo=fbo, upd=upd, scheme=scheme,
                   scheme_warn=scheme_warn, sticker_warn=sticker_warn,
                   scheme_labels=U.SCHEME_LABELS, pending=pending, today=today_local(),
                   gtins=gtins, cards=cards, onec_notes=S.shared_onec_items(supply),
                   no_gtin=len({r.supplier_sku for r in supply.rows if not gtins[r.id]}),
                   organizations=db.query(Organization).filter(Organization.is_active.is_(True)).all())
+
+
+@router.get("/supplies/{supply_id}/source")
+def supply_source(supply_id: int, db: Session = Depends(get_db),
+                  user: User = Depends(get_current_user)):
+    """Исходный файл, из которого собран черновик, — как был загружен."""
+    supply = db.get(Supply, supply_id)
+    if supply is None or not supply.source_file:
+        return RedirectResponse(f"/supplies/{supply_id}", status_code=303)
+    return _attachment(supply.source_file, supply.source_filename or f"поставка_{supply.number}.xlsx",
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
 @router.post("/supplies/{supply_id}/header")
@@ -135,10 +153,11 @@ def supply_header(supply_id: int, request: Request, number: str = Form(...),
     try:
         supply = _get(db, supply_id)
         number, doc_number = number.strip(), doc_number.strip()
-        editable = supply.status in [s.value for s in EDITABLE_STATUSES]
+        editable = (supply.status in [s.value for s in EDITABLE_STATUSES]
+                    and not S.movement_sent(supply))
         if not editable and (number != supply.number or doc_number != supply.doc_number
                              or _date_or_none(supply_date) != supply.supply_date):
-            raise S.SupplyError("номер и дата поставки после перемещения не меняются")
+            raise S.SupplyError("номер и дата поставки после отправки перемещения в 1С не меняются")
         if db.query(UpdDocument).filter(UpdDocument.supply_id == supply.id).first() \
                 and doc_number != supply.doc_number:
             raise S.SupplyError("УПД уже выпущен — номер документа не меняется")
@@ -222,7 +241,7 @@ def supply_check(supply_id: int, request: Request, db: Session = Depends(get_db)
     try:
         supply = _get(db, supply_id)
         S.ensure_editable(supply)
-        problems = S.blocking_problems(supply)
+        problems = S.blocking_problems(supply) + S.catalog_drift(db, supply)
         if problems:
             raise S.SupplyError("; ".join(problems))
         if not onec.epf_ready(db):
@@ -245,7 +264,8 @@ def supply_move(supply_id: int, request: Request, db: Session = Depends(get_db),
         supply = _get(db, supply_id)
         if supply.status != SupplyStatus.checked.value:
             raise S.SupplyError("переместить можно только после успешной проверки остатка в 1С")
-        problems = S.blocking_problems(supply) + S.movement_problems(supply)
+        problems = (S.blocking_problems(supply) + S.catalog_drift(db, supply)
+                    + S.movement_problems(supply))
         if problems:
             raise S.SupplyError("; ".join(problems))
         if not onec.epf_ready(db):

@@ -148,6 +148,13 @@ def publish_pending(db: Session, tasks_dir: Path | None = None) -> int:
                        OnecTask.is_test.is_(False))
                .order_by(OnecTask.id).all())
     pending = [t for t in pending if t.command == "PING" or epf_ready(db)]
+    # Не больше ОДНОЙ проверки поставки на файл. Подробности проверки обработка
+    # пишет одним `supplycheck_<метка>.txt` на весь файл, строкой на штрихкод и
+    # без order_id. Две проверки в одном файле дали бы общий список, и строки
+    # поставки A получили бы остаток и статус по «нужно» поставки B (общий
+    # штрихкод — обычное дело). Остальные проверки уйдут следующими циклами.
+    first_check = next((t for t in pending if t.command == "SUPPLY_CHECK"), None)
+    pending = [t for t in pending if t.command != "SUPPLY_CHECK" or t is first_check]
     if not pending:
         return 0
     tasks_dir.mkdir(parents=True, exist_ok=True)
@@ -302,20 +309,26 @@ def collect_results(db: Session, results_dir: Path | None = None,
     """
     results_dir = Path(results_dir or config.ONEC_RESULTS_DIR)
     archive_dir = Path(archive_dir or config.ONEC_ARCHIVE_DIR)
-    total = {"files": 0, "ok": 0, "error": 0, "unmatched": 0}
+    total = {"files": 0, "ok": 0, "error": 0, "unmatched": 0, "failed_files": []}
     if not results_dir.exists():
         return total
     for path in sorted(results_dir.glob("result_mark_*.txt")):
         label = path.name[len("result_"):-len(".txt")]
         check_path = results_dir / f"supplycheck_{label}.txt"
-        text = path.read_text(encoding="utf-8-sig")
-        check_text = check_path.read_text(encoding="utf-8-sig") if check_path.exists() else ""
+        # Файл, который не разбирается, НЕ останавливает остальные: раньше
+        # исключение уходило наверх, и каждый цикл спотыкался об один и тот же
+        # первый по имени файл — ответы за ним не применялись никогда, а зависшие
+        # задания не отмечались. Сломанный файл остаётся на месте (повторно 1С
+        # его не пришлёт) и называется в отметке задания.
         try:
+            text = path.read_text(encoding="utf-8-sig")
+            check_text = check_path.read_text(encoding="utf-8-sig") if check_path.exists() else ""
             stats = apply_result_text(db, text, check_text)
             db.commit()
-        except Exception:
+        except Exception as e:
             db.rollback()
-            raise
+            total["failed_files"].append(f"{path.name}: {type(e).__name__}: {e}"[:300])
+            continue
         archive_dir.mkdir(parents=True, exist_ok=True)
         os.replace(path, archive_dir / path.name)
         if check_path.exists():
