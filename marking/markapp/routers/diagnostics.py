@@ -25,8 +25,19 @@ def diagnostics(request: Request, db: Session = Depends(get_db), user: User = De
                   last_backup=backup.last_backup(),
                   remote=backup.RCLONE_REMOTE,
                   log=db.query(AuditLog).order_by(AuditLog.id.desc()).limit(50).all(),
-                  dirs={"задания": config.ONEC_TASKS_DIR, "ответы": config.ONEC_RESULTS_DIR,
-                        "архив": config.ONEC_ARCHIVE_DIR, "копии": config.BACKUP_DIR})
+                  dirs=_dirs())
+
+
+def _dirs() -> dict:
+    """Куда на самом деле ходит обмен — чтобы при сбое было видно, что проверять."""
+    if config.ONEC_SFTP_HOST:
+        where = f"SFTP {config.ONEC_SFTP_USER}@{config.ONEC_SFTP_HOST}:{config.ONEC_SFTP_PORT}"
+        return {"обмен с 1С": where, "задания": config.ONEC_SFTP_TASKS,
+                "ответы": config.ONEC_SFTP_RESULTS, "архив на сервере": config.ONEC_SFTP_ARCHIVE,
+                "архив здесь": config.ONEC_ARCHIVE_DIR, "копии": config.BACKUP_DIR}
+    return {"обмен с 1С": "локальные папки", "задания": config.ONEC_TASKS_DIR,
+            "ответы": config.ONEC_RESULTS_DIR, "архив": config.ONEC_ARCHIVE_DIR,
+            "копии": config.BACKUP_DIR}
 
 
 @router.post("/diagnostics/ping")

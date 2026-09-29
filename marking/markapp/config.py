@@ -21,6 +21,20 @@ ONEC_TASKS_DIR = _path("MARKING_ONEC_TASKS_DIR", r"C:\sync\tasks")
 ONEC_RESULTS_DIR = _path("MARKING_ONEC_RESULTS_DIR", r"C:\sync\results\marking")
 ONEC_ARCHIVE_DIR = _path("MARKING_ONEC_ARCHIVE_DIR", r"C:\sync\archive\marking")
 
+# Программа стоит на машине с КриптоПро, 1С — на сервере: папки выше тогда
+# сервера, а не этой машины, и до них ходим по SFTP (`exchange.py`, ТЗ 9.1).
+# Хост не задан — папки локальные (вариант «на сервере» и тесты).
+ONEC_SFTP_HOST = os.environ.get("MARKING_ONEC_SFTP_HOST", "")
+ONEC_SFTP_PORT = int(os.environ.get("MARKING_ONEC_SFTP_PORT", "443"))
+ONEC_SFTP_USER = os.environ.get("MARKING_ONEC_SFTP_USER", "marking_sftp")
+ONEC_SFTP_KEY = os.environ.get("MARKING_ONEC_SFTP_KEY", str(BASE_DIR / "ssh" / "id_ed25519"))
+ONEC_SFTP_KNOWN_HOSTS = os.environ.get("MARKING_ONEC_SFTP_KNOWN_HOSTS",
+                                       str(BASE_DIR / "ssh" / "known_hosts"))
+# Пути внутри SFTP: учётная запись заперта в C:\sync (ChrootDirectory).
+ONEC_SFTP_TASKS = os.environ.get("MARKING_ONEC_SFTP_TASKS", "/tasks")
+ONEC_SFTP_RESULTS = os.environ.get("MARKING_ONEC_SFTP_RESULTS", "/results/marking")
+ONEC_SFTP_ARCHIVE = os.environ.get("MARKING_ONEC_SFTP_ARCHIVE", "/archive/marking")
+
 # Через сколько минут без ответа задание 1С считается зависшим. Обработка
 # запускается по расписанию; штатный ответ у sync_admin приходит за 4-7 минут.
 ONEC_TIMEOUT_MINUTES = int(os.environ.get("MARKING_ONEC_TIMEOUT_MINUTES", "15"))

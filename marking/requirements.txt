@@ -22,3 +22,4 @@ zint-bindings==1.2.2
 reportlab==5.0.1
 zxing-cpp==3.1.1
 pillow==12.3.0
+paramiko==3.5.0

@@ -14,7 +14,8 @@
   <code>C:\marking\1c\ОБНОВЛЕНИЕ_ОБРАБОТКИ.md</code> и нажмите «Отправить PING». Старая обработка на PING просто молчит.</p>
   {% endif %}
   <form method="post" action="/diagnostics/ping"><button class="secondary">Отправить PING</button></form>
-  <p class="muted">Папки: {% for k, v in dirs.items() %}{{ k }} — <code>{{ v }}</code>{{ '; ' if not loop.last }}{% endfor %}</p>
+  <p class="muted">К 1С программа обращается только при заданиях, ждущих отправки или ответа.<br>
+  {% for k, v in dirs.items() %}{{ k }} — <code>{{ v }}</code>{{ '; ' if not loop.last }}{% endfor %}</p>
 </div>
 
 <div class="card">

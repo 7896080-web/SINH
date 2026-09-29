@@ -89,7 +89,9 @@ if (-not (Test-Path $envFile)) {
         "MARKING_BACKUP_DIR=$Root\backups",
         "MARKING_RCLONE_EXE=$Root\tools\rclone.exe",
         "MARKING_RCLONE_CONFIG=$Root\rclone.conf",
-        "MARKING_RCLONE_REMOTE="
+        "MARKING_RCLONE_REMOTE=",
+        # Здесь фоновую работу делает служба marking_worker, веб её не дублирует.
+        "MARKING_BACKGROUND=0"
     )
     Set-Content -Path $envFile -Value $lines -Encoding UTF8
     Ok ".env создан"
