@@ -148,6 +148,9 @@ def _remember_number(db: Session, number: str) -> None:
 
 def validate_numbers(db: Session, number: str, doc_number: str, supply_id: int | None = None) -> list[str]:
     errs = []
+    if doc_number != number:
+        # Правило Lamoda: номер поставки и номер УПД (B3, имена файлов) совпадают.
+        errs.append(f"номер УПД {doc_number} не равен номеру поставки {number} — по правилу Lamoda они совпадают")
     for label, value in (("номер поставки", number), ("номер документа", doc_number)):
         if not NUMBER_RE.match(value or ""):
             errs.append(f"{label} «{value}»: до 20 символов — латиница, цифры, «_», «-»")

@@ -16,8 +16,8 @@
   </div>
   <form method="post" action="/supplies/{{ supply.id }}/header" style="margin-top:10px">
     <div class="row">
-      <label>Номер поставки<input name="number" value="{{ supply.number }}" size="10" {{ '' if editable else 'readonly' }}></label>
-      <label>Номер документа<input name="doc_number" value="{{ supply.doc_number }}" size="12" {{ 'readonly' if upd else '' }}></label>
+      <label>Номер поставки<input name="number" value="{{ supply.number }}" size="10" {{ '' if (editable and not upd) else 'readonly' }}></label>
+      <label>Номер поставки = номер УПД<input value="{{ supply.doc_number }}" size="10" readonly disabled title="правило Lamoda: номер УПД равен номеру поставки"></label>
       <label>Дата поставки<input type="date" name="supply_date" value="{{ supply.supply_date or '' }}" {{ '' if editable else 'readonly' }}></label>
       <label>Плановая дата УПД<input type="date" name="planned_upd_date" value="{{ supply.planned_upd_date or '' }}"></label>
       <label>Схема договора

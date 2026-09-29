@@ -77,7 +77,9 @@ async def supply_create(request: Request, file: UploadFile = File(...),
         # Номер: поле формы → B2 файла → следующий по нумерации. Форма больше не
         # подставляет номер заранее: заполненное поле молча перебивало B2.
         number = (number.strip() or parsed.number or S.next_number(db)).strip()
-        doc_number = (doc_number or number).strip()
+        # Правило Lamoda: номер поставки = номер УПД (= B3, = имена файлов).
+        # Поле формы оставлено только ради старых закладок и не читается.
+        doc_number = number
         d = _date_or_none(supply_date) or parsed.supply_date
         supply = S.create_supply(db, parsed, organization_id=org.id, number=number,
                                  doc_number=doc_number, supply_date=d,
@@ -146,13 +148,15 @@ def supply_source(supply_id: int, db: Session = Depends(get_db),
 
 @router.post("/supplies/{supply_id}/header")
 def supply_header(supply_id: int, request: Request, number: str = Form(...),
-                  doc_number: str = Form(...), supply_date: str = Form(""),
+                  doc_number: str = Form(""), supply_date: str = Form(""),
                   planned_upd_date: str = Form(""), scheme_choice: str = Form("auto"),
                   scheme_reason: str = Form(""), db: Session = Depends(get_db),
                   user: User = Depends(get_current_user)):
     try:
         supply = _get(db, supply_id)
-        number, doc_number = number.strip(), doc_number.strip()
+        # Номер УПД не вводится отдельно — он равен номеру поставки (правило Lamoda).
+        number = number.strip()
+        doc_number = number
         editable = (supply.status in [s.value for s in EDITABLE_STATUSES]
                     and not S.movement_sent(supply))
         if not editable and (number != supply.number or doc_number != supply.doc_number
@@ -160,7 +164,7 @@ def supply_header(supply_id: int, request: Request, number: str = Form(...),
             raise S.SupplyError("номер и дата поставки после отправки перемещения в 1С не меняются")
         if db.query(UpdDocument).filter(UpdDocument.supply_id == supply.id).first() \
                 and doc_number != supply.doc_number:
-            raise S.SupplyError("УПД уже выпущен — номер документа не меняется")
+            raise S.SupplyError("УПД уже выпущен — номер поставки (он же номер УПД) не меняется")
         errs = S.validate_numbers(db, number, doc_number, supply.id)
         if errs:
             raise S.SupplyError("; ".join(errs))
