@@ -43,6 +43,8 @@ def db_url(tmp_path):
     session = sessionmaker(bind=engine, autoflush=False)()
     session.add(Product(uid_1c="uid-1", article="57020 5299", name="Рубашка",
                         size="L", color="Тёмно-коричневый", stock_on_hand=0))
+    session.add(Product(uid_1c="uid-2", article="K.836 BSS LINEN", name="Рубашка",
+                        size="34", color="WHITE", stock_on_hand=2))
     session.add(PlatformAccount(id=3, platform=Platform.wb, name="ИП КАРАМАН",
                                 warehouse_id="wh-1"))
     session.commit()
@@ -56,17 +58,17 @@ def _session(url):
     return sessionmaker(bind=engine, autoflush=False)(), engine
 
 
-def _order(url, order_id, gap_seconds, zero_after=None, days_ago=1):
+def _order(url, order_id, gap_seconds, zero_after=None, days_ago=1, uid="uid-1"):
     """Заказ, отменённый через `gap_seconds`; `zero_after` — наш ноль в окне."""
     session, engine = _session(url)
     taken = now_utc() - timedelta(days=days_ago)
-    session.add(ProcessedOrder(account_id=3, order_id=order_id, uid_1c="uid-1",
+    session.add(ProcessedOrder(account_id=3, order_id=order_id, uid_1c=uid,
                                quantity=1, status=OrderProcessStatus.cancelled,
                                processed_at=taken,
                                cancelled_at=taken + timedelta(seconds=gap_seconds)))
     if zero_after is not None:
         session.add(DispatchQueueItem(
-            uid_1c="uid-1", account_id=3, quantity=0, sent_quantity=0,
+            uid_1c=uid, account_id=3, quantity=0, sent_quantity=0,
             reason="order", status=DispatchStatus.sent,
             sent_at=taken + timedelta(seconds=zero_after)))
     session.commit()
@@ -90,7 +92,9 @@ def test_our_own_zero_before_the_cancel_points_at_us(db_url):
     Не скажи скрипт этого, человек пошёл бы отключать вторую систему, которой
     там может уже и не быть, — а круг продолжал бы крутиться.
     """
-    for i in range(3):
+    # Пять — это `MIN_FOR_VERDICT`: меньше, и скрипт отказывается судить о
+    # причине вовсе, потому что большинство на двух строках ничего не значит.
+    for i in range(6):
         _order(db_url, f"55830150{i}", gap_seconds=20, zero_after=8)
 
     out = _run(db_url, "КАРАМАН")
@@ -106,7 +110,7 @@ def test_no_zero_in_the_window_points_outside(db_url):
     Нуля не было — значит повод не наш, и смотреть надо историю сборочного
     задания в кабинете.
     """
-    for i in range(3):
+    for i in range(6):
         _order(db_url, f"55830150{i}", gap_seconds=20)
 
     out = _run(db_url, "КАРАМАН")
@@ -122,7 +126,8 @@ def test_a_zero_after_the_cancel_is_not_a_cause(db_url):
     где мы всего лишь отработали чужую отмену: она вернула единицу, и следующая
     рассылка увезла новое число.
     """
-    _order(db_url, "5583015069", gap_seconds=20, zero_after=300)
+    for i in range(6):
+        _order(db_url, f"55830150{i}", gap_seconds=20, zero_after=300)
 
     out = _run(db_url, "КАРАМАН")
 
@@ -163,3 +168,40 @@ def test_an_unknown_cabinet_lists_the_real_ones(db_url):
 
     assert "не нашёлся" in out
     assert "ИП КАРАМАН" in out
+
+
+def test_two_cancels_are_not_enough_to_blame_anyone(db_url):
+    """Первый же боевой прогон: 1869 принятых заказов, быстрых отмен ДВЕ.
+
+    У одной из двух наш ноль был — и разбор по большинству уверенно объявил
+    причиной нас. Уверенность ложная: два случая на две тысячи заказов это не
+    поток, а совпадение, и причина у каждого может быть своя. Хуже того, такой
+    вердикт отправляет человека чинить запас по товарам, с которыми всё в
+    порядке. Молчание тут честнее — и оно обязано называть число, иначе
+    читается как «ничего не нашли».
+    """
+    # Товары РАЗНЫЕ, как и было на бою: ноль по одному не должен попадать в
+    # окно другого — иначе тест сам себе подстроил бы «у обоих ноль был».
+    _order(db_url, "5583015069", gap_seconds=20, zero_after=5)
+    _order(db_url, "5590226186", gap_seconds=82, uid="uid-2")
+
+    out = _run(db_url, "КАРАМАН")
+
+    assert "МАЛО для вывода" in out, out
+    assert "Наш ноль в окне был у 1 из 2" in out
+    assert "probe_order.py" in out, "разбор по одной строке остаётся без адреса"
+    assert "отменяет площадка" not in out
+    assert "СНАРУЖИ" not in out
+
+
+def test_the_scale_is_printed_next_to_the_verdict(db_url):
+    """«Две отмены» и «две отмены на две тысячи заказов» читаются по-разному.
+
+    По сводке масштаб надо складывать глазами по дням, и без него любой вывод
+    ниже выглядит крупнее, чем он есть.
+    """
+    _order(db_url, "5583015069", gap_seconds=20)
+
+    out = _run(db_url, "КАРАМАН")
+
+    assert "при 1 принятых заказах" in out, out
