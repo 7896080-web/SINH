@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 
-from markapp import audit, config, onec, settings
+from markapp import audit, backup, config, onec, settings
 from markapp.database import get_db
 from markapp.deps import get_current_user
 from markapp.flash import flash
@@ -22,6 +22,8 @@ def diagnostics(request: Request, db: Session = Depends(get_db), user: User = De
                   stuck=db.query(OnecTask).filter(OnecTask.status == "timeout").count(),
                   beats=db.query(WorkerHeartbeat).order_by(WorkerHeartbeat.name).all(),
                   stale=stale_workers(db),
+                  last_backup=backup.last_backup(),
+                  remote=backup.RCLONE_REMOTE,
                   log=db.query(AuditLog).order_by(AuditLog.id.desc()).limit(50).all(),
                   dirs={"задания": config.ONEC_TASKS_DIR, "ответы": config.ONEC_RESULTS_DIR,
                         "архив": config.ONEC_ARCHIVE_DIR, "копии": config.BACKUP_DIR})
