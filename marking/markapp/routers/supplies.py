@@ -116,6 +116,7 @@ def supply_detail(supply_id: int, request: Request, db: Session = Depends(get_db
     cards = {c.gtin: c for c in db.query(NkCard).filter(NkCard.gtin.in_([g for g in gtins.values() if g])).all()}
     return render(request, "supply.html", user, "supplies", supply=supply, tasks=tasks,
                   totals=S.totals(supply), problems=S.blocking_problems(supply),
+                  move_problems=S.movement_problems(supply),
                   editable=supply.status in [s.value for s in EDITABLE_STATUSES],
                   epf_ready=onec.epf_ready(db), fbo=fbo, upd=upd, scheme=scheme,
                   scheme_warn=scheme_warn, sticker_warn=sticker_warn,
@@ -244,6 +245,9 @@ def supply_move(supply_id: int, request: Request, db: Session = Depends(get_db),
         supply = _get(db, supply_id)
         if supply.status != SupplyStatus.checked.value:
             raise S.SupplyError("переместить можно только после успешной проверки остатка в 1С")
+        problems = S.blocking_problems(supply) + S.movement_problems(supply)
+        if problems:
+            raise S.SupplyError("; ".join(problems))
         if not onec.epf_ready(db):
             raise S.SupplyError("обработка 1С не обновлена под маркировку")
         busy = (db.query(OnecTask).filter(OnecTask.supply_id == supply.id,

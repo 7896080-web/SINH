@@ -315,9 +315,9 @@ def test_one_barcode_on_two_articles_blocks_the_supply(db, catalog):
     assert f"«{b.supplier_sku}»" in a.warnings and f"«{a.supplier_sku}»" in b.warnings
 
 
-def test_two_barcodes_of_one_1c_item_are_noted_not_blocked(db, catalog, exchange_dirs):
-    """Разные штрихкоды одного товара 1С — альтернативные баркоды: остаток
-    общий, 1С сложит нужное. Замечание, а не отказ."""
+def test_two_articles_on_one_1c_sku_block_the_movement(db, catalog, exchange_dirs):
+    """Штрихкоды двух артикулов Lamoda лежат в пуле одного SKU 1С: сопоставление
+    не один к одному. 1С ответила OK, но поставка не становится проверенной."""
     _ready(db)
     s = _supply(db)
     task = onec.enqueue_check(db, s)
@@ -328,10 +328,22 @@ def test_two_barcodes_of_one_1c_item_are_noted_not_blocked(db, catalog, exchange
     _answer(exchange_dirs, "mark_1", f"{task.order_id}|OK||SUPPLY_CHECK", check)
     onec.collect_results(db)
     db.refresh(s)
-    assert s.status == "checked"
+    assert s.status == "draft"
     notes = S.shared_onec_items(s)
     assert set(notes) == {a.id, b.id}
-    assert b.supplier_sku in notes[a.id] and "суммой" in notes[a.id]
+    assert b.supplier_sku in notes[a.id] and "один артикул" in notes[a.id]
+    problems = S.movement_problems(s)
+    assert problems and a.supplier_sku in problems[0] and b.supplier_sku in problems[0]
+    # Перепроверка не закрыта: штрихкод могли поправить в 1С.
+    assert not S.blocking_problems(s)
+    # Исправили — следующий ответ без совпадения SKU ставит «проверена».
+    task2 = onec.enqueue_check(db, s)
+    db.commit()
+    onec.publish_pending(db)
+    _answer(exchange_dirs, "mark_2", f"{task2.order_id}|OK||SUPPLY_CHECK", _check_file(s))
+    onec.collect_results(db)
+    db.refresh(s)
+    assert s.status == "checked" and not S.movement_problems(s)
 
 
 def test_ambiguous_barcode_answer_is_shown(db, catalog, exchange_dirs):
