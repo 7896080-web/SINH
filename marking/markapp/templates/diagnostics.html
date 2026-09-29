@@ -11,10 +11,18 @@
   <p class="ok">Обновлена под маркировку: версия {{ epf_version }}, ответ на PING {{ epf_ping_at }} UTC.</p>
   {% else %}
   <p class="warn">Ответа на PING ещё не было — задания поставок в 1С не отправляются. Обновите обработку по инструкции
-  (<code>marking/1c/</code>) и нажмите «Отправить PING». Старая обработка на PING просто молчит.</p>
+  <code>C:\marking\1c\ОБНОВЛЕНИЕ_ОБРАБОТКИ.md</code> и нажмите «Отправить PING». Старая обработка на PING просто молчит.</p>
   {% endif %}
   <form method="post" action="/diagnostics/ping"><button class="secondary">Отправить PING</button></form>
   <p class="muted">Папки: {% for k, v in dirs.items() %}{{ k }} — <code>{{ v }}</code>{{ '; ' if not loop.last }}{% endfor %}</p>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">Резервная копия</h2>
+  <p>Последняя копия: {% if last_backup %}<b>{{ last_backup.strftime('%d.%m.%Y %H:%M') }} UTC</b>{% else %}<span class="warn">ещё не снималась</span>{% endif %}.
+  Облако: {% if remote %}<code>{{ remote }}</code>{% else %}<span class="warn">не настроено</span> — копия только на этом диске
+  (<code>MARKING_RCLONE_REMOTE</code> в <code>.env</code>, инструкция — <code>deploy/README.md</code>){% endif %}.</p>
+  <p class="muted">Ключ шифрования (<code>MARKING_SECRETS_KEY</code>) хранится отдельно от копий: без него копия бесполезна, вместе с ним — утечка.</p>
 </div>
 
 <h2>Фоновые задания</h2>
