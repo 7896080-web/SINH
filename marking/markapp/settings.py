@@ -19,6 +19,11 @@ NK_BLOCKED_UNTIL = "nk_blocked_until"
 NK_ATTR_COLOR = "nk_attr_color"
 NK_ATTR_SIZE = "nk_attr_size"
 NK_ATTR_TNVED = "nk_attr_tnved"
+# Этикетка: шаблоны строк с подстановками {…} и размер модуля DataMatrix.
+LABEL_TITLE = "label_title"
+LABEL_RIGHT = "label_right_lines"
+LABEL_BOTTOM = "label_bottom_lines"
+LABEL_MODULE = "label_module_mm"
 
 DEFAULTS = {
     SUPPLY_LAST_NUMBER: "12550",
@@ -28,6 +33,11 @@ DEFAULTS = {
     NK_ATTR_COLOR: "Цвет",
     NK_ATTR_SIZE: "Размер одежды; Размер изделия; Размер; Российский размер",
     NK_ATTR_TNVED: "Код ТН ВЭД; ТН ВЭД; Код ТНВЭД; ТНВЭД",
+    # Главная строка — размерный артикул: цвет и размер в нём уже есть.
+    LABEL_TITLE: "{артикул}",
+    LABEL_RIGHT: "GTIN {GTIN}",
+    LABEL_BOTTOM: "Изготовитель: {изготовитель}, ИНН {ИНН}\n{дата}  №{номер}/{всего}",
+    LABEL_MODULE: "0.5",
 }
 
 # Реквизиты ИП Яворской — из upd-constructor (источник истины — принятые УПД).

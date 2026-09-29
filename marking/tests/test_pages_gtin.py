@@ -63,3 +63,32 @@ def test_fbo_upload_feeds_the_gtin_directory(client, db):
     assert "Справочник GTIN: новых пар 80" in r.text
     page = client.get(f"/supplies/{s.id}").text
     assert "Без GTIN: <b class=\"\">0</b>" in page
+
+
+def test_labels_page_gives_pdf_or_warnings_first(client, db):
+    codes = fixture_bytes("codes_12550.txt")
+    assert client.get("/labels").status_code == 200
+    # Без справочника GTIN — сначала предупреждения, PDF по ссылке.
+    r = client.post("/labels/print", data={"label_date": "2026-09-29", "supply_number": "12550"},
+                    files={"file": ("codes.txt", codes, "text/plain")})
+    assert "Проверьте перед печатью (338 этикеток)" in r.text
+    import re
+    token = re.search(r"/labels/ready/([\w-]+)", r.text).group(1)
+    pdf = client.get(f"/labels/ready/{token}")
+    assert pdf.headers["content-type"] == "application/pdf" and pdf.content.startswith(b"%PDF")
+    assert "устарел" in client.get(f"/labels/ready/{token}").text     # второй раз не отдаётся
+    # Со справочником — сразу PDF.
+    client.post("/catalog/import", files={"file": ("c.xlsx", fixture_bytes("lamoda_catalog_full_2026-09-28.xlsx"), XLSX)})
+    from markapp import gtin as G
+    from markapp.upd_service import read_fbo
+    G.import_fbo_pairs(db, read_fbo(fixture_bytes("lamoda_postavki_fbo_12550.xlsx")).rows, "fbo")
+    db.commit()
+    r = client.post("/labels/print", data={"label_date": "2026-09-29"},
+                    files={"file": ("codes.txt", codes, "text/plain")})
+    assert r.headers["content-type"] == "application/pdf"
+
+
+def test_label_template_rejects_unknown_placeholder(client, db):
+    r = client.post("/labels/settings", data={"t_title": "{артикул}", "t_right": "{опечатка}",
+                                              "t_bottom": "", "module": "0.5"})
+    assert "неизвестная подстановка {опечатка}" in r.text

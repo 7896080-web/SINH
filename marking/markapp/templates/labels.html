@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}Этикетки{% endblock %}
+{% block content %}
+<h1>Этикетки 58×40</h1>
+{% if warnings %}
+<div class="flash warn">
+  <p><b>Проверьте перед печатью ({{ count }} этикеток):</b></p>
+  <ul>{% for w in warnings[:30] %}<li>{{ w }}</li>{% endfor %}{% if warnings|length > 30 %}<li>… и ещё {{ warnings|length - 30 }}</li>{% endif %}</ul>
+  <p>GTIN без артикула добавьте в «Справочник GTIN» и загрузите коды заново — или печатайте как есть.</p>
+  <a class="btn" href="/labels/ready/{{ token }}">Скачать PDF как есть</a>
+</div>
+{% endif %}
+<div class="steps">
+  <div class="card">
+    <h2>Напечатать</h2>
+    <form method="post" action="/labels/print" enctype="multipart/form-data">
+      <p><label>Файл кодов (.txt: полный код на строку, как выдаёт СУЗ)<br><input type="file" name="file" accept=".txt,.csv" required></label></p>
+      <div class="row">
+        <label>Дата на этикетке<input type="date" name="label_date" value="{{ today }}"></label>
+        <label>Поставка (необяз.)<input name="supply_number" size="8"></label>
+      </div>
+      <p><button>Сделать PDF</button></p>
+    </form>
+    <p class="muted">Главная строка — размерный артикул поставщика (в нём цвет и размер), он находится по GTIN из кода
+    через «Справочник GTIN». Каждый код до выдачи читается обратно декодером. Страница — ровно 58×40 мм, одна этикетка на странице.
+    Печатать с масштабом 100% («фактический размер»).</p>
+  </div>
+  <div class="card">
+    <h2>Шаблон строк</h2>
+    <form method="post" action="/labels/settings">
+      <p><label>Заголовок (жирный, справа от кода)<br><input name="t_title" value="{{ t_title }}" size="40"></label></p>
+      <p><label>Строки справа от кода<br><textarea name="t_right" rows="2" cols="40">{{ t_right }}</textarea></label></p>
+      <p><label>Строки под кодом<br><textarea name="t_bottom" rows="3" cols="40">{{ t_bottom }}</textarea></label></p>
+      <p><label>Модуль DataMatrix, мм (203 dpi — 0,5; 300 dpi — 0,508)<br><input name="module" value="{{ module }}" size="6"></label></p>
+      <button class="secondary">Сохранить шаблон</button>
+    </form>
+    <p class="muted">Подстановки: {% for p in placeholders %}<code>{{ '{' ~ p ~ '}' }}</code>{{ ', ' if not loop.last }}{% endfor %}.
+    Строка, где все подстановки пусты, не печатается.</p>
+  </div>
+</div>
+{% endblock %}

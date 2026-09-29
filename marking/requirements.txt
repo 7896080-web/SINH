@@ -16,3 +16,9 @@ requests==2.32.3
 alembic==1.13.3
 pytest==8.3.3
 httpx==0.27.2
+# Этикетки DataMatrix (ТЗ, 7.3). Все четыре ставятся на Windows + Python 3.14
+# готовыми колёсами (проверено pip download --platform win_amd64 --python-version 3.14).
+zint-bindings==1.2.2
+reportlab==5.0.1
+zxing-cpp==3.1.1
+pillow==12.3.0
