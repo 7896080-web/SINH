@@ -3,8 +3,9 @@
 Программа стоит на рабочем компьютере с КриптоПро, а 1С и её обработка
 `ОбменССайтом` — на сервере. Протокол обмена не меняется: задание ложится в
 `C:\sync\tasks`, ответ приходит в `C:\sync\results\marking`. Меняется только
-путь файла — SFTP через тот же SSH-сервер на порту 443, что уже стоит для
-туннеля. Почему так, а не FTP, — `ТЗ_МАРКИРОВКА.md`, п. 9.1.
+путь файла — SFTP до сервера на порт 443. На сервере для программы до этого
+не установлено НИЧЕГО; ставится один OpenSSH Server (Microsoft) и его
+настройка. Почему так, а не FTP, — `ТЗ_МАРКИРОВКА.md`, п. 9.1.
 
 ```
 программа (рабочий компьютер) ── SFTP, TCP 443 ──► сервер 136.243.92.95
@@ -54,9 +55,32 @@ Python, ни самой программы, ни служб маркировки
 
 ## 1. Сервер: OpenSSH на 443
 
-Если туннель по `SSH_TUNNEL.md` уже настраивали — этот шаг сделан, переходите
-ко второму. Иначе — шаги 1, 3 (только первая часть: `Port 443`,
-`PasswordAuthentication no`) и 5 (порт и служба) из `SSH_TUNNEL.md`.
+1. Скачать `OpenSSH-Win64-vX.X.X.X.msi` (последний не `Preview`) со страницы
+   `github.com/PowerShell/Win32-OpenSSH/releases` и поставить только сервер:
+   ```powershell
+   msiexec /i C:\путь\OpenSSH-Win64-vX.X.X.X.msi ADDLOCAL=Server
+   ```
+2. Запустить один раз — служба создаст `C:\ProgramData\ssh\sshd_config` и
+   ключи сервера — и остановить:
+   ```powershell
+   Start-Service sshd
+   Stop-Service sshd
+   ```
+3. Проверить, что порт 443 никем не занят (пустой вывод — свободен):
+   ```powershell
+   netstat -ano | findstr ":443 " | findstr LISTENING
+   ```
+   Занят (IIS, другая программа) — остановиться и разобраться: SSH на него
+   не встанет. Скрипт `server_sftp_setup.ps1` проверяет это сам.
+4. В `C:\ProgramData\ssh\sshd_config` **в начале файла** (до первой строки
+   `Match`): `#Port 22` → `Port 443`, `#PasswordAuthentication yes` →
+   `PasswordAuthentication no`. Правило брандмауэра установщика на 22
+   выключить — SSH там больше не слушает:
+   ```powershell
+   Get-NetFirewallRule | Where-Object { $_.DisplayName -like "*OpenSSH*" } | Disable-NetFirewallRule
+   New-NetFirewallRule -DisplayName "SFTP marking 443" -Direction Inbound -Protocol TCP -LocalPort 443 -Action Allow
+   Set-Service sshd -StartupType Automatic
+   ```
 
 ## 2. Сервер: учётная запись и папки
 
@@ -79,10 +103,9 @@ icacls C:\sync\archive\marking  /grant "marking_sftp:(OI)(CI)M"
 notepad C:\ProgramData\ssh\sshd_config
 ```
 
-В строке `AllowUsers` в начале файла добавить `marking_sftp` через пробел
-(было `AllowUsers marking_tunnel` — станет
-`AllowUsers marking_tunnel marking_sftp`; если туннель больше не нужен —
-просто `AllowUsers marking_sftp`).
+В начале файла (до первой строки `Match`) добавить строку
+`AllowUsers marking_sftp`. С ней SSH на этом сервере пускает только эту
+учётную запись.
 
 **В самый конец файла** дописать:
 ```
