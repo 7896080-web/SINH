@@ -1,0 +1,135 @@
+{% extends "base.html" %}
+{% block title %}Поставка {{ supply.number }}{% endblock %}
+{% block content %}
+<h1>Поставка {{ supply.number }} <span class="badge {{ supply.status }}">{{ status_label(supply.status) }}</span></h1>
+
+<div class="card">
+  <div class="row muted">
+    <span>ИП: <b>{{ supply.organization.name }}</b></span>
+    <span>Артикулов: <b>{{ totals.articles }}</b></span>
+    <span>Строк: <b>{{ totals.rows }}</b></span>
+    <span>Штук: <b>{{ totals.units }}</b></span>
+    <span>Сумма с НДС: <b>{{ totals.money|money }}</b></span>
+    <span>Файл: {{ supply.source_filename }}</span>
+    {% if supply.onec_document %}<span>Документ 1С: <b>{{ supply.onec_document }}</b></span>{% endif %}
+  </div>
+  <form method="post" action="/supplies/{{ supply.id }}/header" style="margin-top:10px">
+    <div class="row">
+      <label>Номер поставки<input name="number" value="{{ supply.number }}" size="10" {{ '' if editable else 'readonly' }}></label>
+      <label>Номер документа<input name="doc_number" value="{{ supply.doc_number }}" size="12" {{ 'readonly' if upd else '' }}></label>
+      <label>Дата поставки<input type="date" name="supply_date" value="{{ supply.supply_date or '' }}" {{ '' if editable else 'readonly' }}></label>
+      <label>Плановая дата УПД<input type="date" name="planned_upd_date" value="{{ supply.planned_upd_date or '' }}"></label>
+      <label>Схема договора
+        <select name="scheme_choice">
+          {% for k, v in scheme_labels.items() %}<option value="{{ k }}" {{ 'selected' if supply.scheme_choice == k }}>{{ v }}</option>{% endfor %}
+        </select></label>
+      <label>Причина ручного выбора<input name="scheme_reason" value="{{ supply.scheme_reason }}" size="24"></label>
+      <button type="submit" class="secondary">Сохранить</button>
+    </div>
+  </form>
+  <p class="muted" style="margin-bottom:0">Схема сейчас: <b>{{ scheme_labels[scheme] }}</b>{% if scheme_warn %} — <span class="warn">{{ scheme_warn }}</span>{% endif %}.
+  По дате УПД: по 30.09.2026 — комиссия, с 01.10.2026 — агентский договор; одна схема управляет и УПД, и стикерами.</p>
+</div>
+
+{% if problems and editable %}<div class="flash warn">Мешает отправке в 1С: {{ problems|join('; ') }}</div>{% endif %}
+{% if not epf_ready %}<div class="flash warn">Обработка 1С ещё не обновлена под маркировку (нет ответа на PING) — отправка в 1С выключена. См. «Диагностика».</div>{% endif %}
+
+<div class="steps">
+  <div class="card">
+    <h2>1. Проверка остатка в 1С</h2>
+    <p class="muted">1С по штрихкоду находит каждую строку и отвечает по остатку «ЦС Склад». Документ не создаётся.</p>
+    <form method="post" action="/supplies/{{ supply.id }}/check">
+      <button {{ 'disabled' if (not editable or problems or not epf_ready or pending) }}>Проверить в 1С</button>
+    </form>
+  </div>
+  <div class="card">
+    <h2>2. Перемещение на Lamoda_Склад</h2>
+    <p class="muted">Один документ «ЦС Склад → Lamoda_Склад» на всю поставку, сегодняшней датой. После него состав не меняется, отмены нет.</p>
+    <form method="post" action="/supplies/{{ supply.id }}/move" onsubmit="return confirm('Переместить {{ totals.units }} шт. поставки {{ supply.number }} на склад Lamoda в 1С? После этого поставку нельзя изменить или удалить.')">
+      <button {{ 'disabled' if (supply.status != 'checked' or not epf_ready or pending) }}>Переместить в 1С</button>
+    </form>
+  </div>
+  <div class="card">
+    <h2>3. Выгрузка «Поставки FBO»</h2>
+    <p class="muted">После загрузки файла с кодами в Lamoda Seller скачайте оттуда «Поставки FBO» и загрузите сюда — программа сверит её с поставкой.</p>
+    <form method="post" action="/supplies/{{ supply.id }}/fbo" enctype="multipart/form-data">
+      <input type="file" name="file" accept=".xlsx" required>
+      <button {{ 'disabled' if supply.status not in ('moved', 'upd_issued') }}>Загрузить</button>
+    </form>
+    {% if fbo %}<p class="{{ 'ok' if fbo.ok else 'bad' }}">{{ fbo.filename }} — {{ 'сходится с поставкой' if fbo.ok else 'НЕ сходится' }}</p>
+      {% if fbo.report %}<pre>{{ fbo.report }}</pre>{% endif %}{% endif %}
+  </div>
+  <div class="card">
+    <h2>4. УПД</h2>
+    <form method="post" action="/supplies/{{ supply.id }}/upd"
+          {% if upd %}onsubmit="return confirm('УПД {{ upd.doc_number }} уже выпущен. Перевыпустить (только если он ещё не отправлен в Диадок)?')"{% endif %}>
+      <div class="row">
+        <label>Дата УПД<input type="date" name="doc_date" value="{{ upd.doc_date if upd else (supply.planned_upd_date or today) }}" required></label>
+        <label>Итоги<select name="totals_mode"><option value="rows">rows — шапка = сумма строк</option><option value="reference">reference — как в эталонах</option></select></label>
+        <button {{ 'disabled' if not (fbo and fbo.ok) }}>{{ 'Перевыпустить' if upd else 'Выпустить УПД' }}</button>
+      </div>
+    </form>
+    {% if upd %}
+    <p><a class="btn secondary" href="/supplies/{{ supply.id }}/upd.xml">Скачать {{ upd.doc_number }}.xml</a></p>
+    <p class="muted">от {{ upd.doc_date|ru }}, схема: {{ scheme_labels[upd.scheme] }}{{ ' (вручную)' if upd.scheme_manual }},
+      {{ upd.positions }} поз., с НДС {{ upd.total_with_vat|money }}</p>
+    {% if upd.check_report %}<pre class="{{ 'bad' if upd.has_errors else '' }}">{{ upd.check_report }}</pre>{% endif %}
+    {% endif %}
+  </div>
+  <div class="card">
+    <h2>5. Стикеры коробов</h2>
+    {% if sticker_warn %}<p class="warn">{{ sticker_warn }}</p>{% endif %}
+    <form method="post" action="/supplies/{{ supply.id }}/stickers">
+      <div class="row"><label>Коробов<input type="number" name="boxes" min="1" max="500" value="1" style="width:80px"></label>
+      <button {{ 'disabled' if not supply.supply_date }}>Скачать стикеры (Excel)</button></div>
+    </form>
+    <p class="muted">«КОМИССИЯ» / «АГЕНТ» — по той же схеме, что УПД.</p>
+  </div>
+</div>
+
+{% if tasks %}
+<h2>Задания 1С</h2>
+<table>
+  <tr><th>#</th><th>Команда</th><th>order_id</th><th>Статус</th><th>Ответ 1С</th><th>Создано (UTC)</th><th></th></tr>
+  {% for t in tasks %}
+  <tr><td>{{ t.id }}</td><td>{{ t.command }}</td><td>{{ t.order_id }}</td>
+    <td class="{{ 'ok' if t.status == 'done' else ('bad' if t.status in ('failed','timeout') else '') }}">{{ t.status }}</td>
+    <td>{{ t.result_detail }}</td><td>{{ t.created_at.strftime('%d.%m %H:%M') }}</td>
+    <td>{% if t.status == 'timeout' and t.command == 'SUPPLY_MOVEMENT' %}
+      <form method="post" action="/supplies/{{ supply.id }}/retry/{{ t.id }}" onsubmit="return confirm('Сначала посмотрите в 1С, есть ли документ. Повтор безопасен: если документ есть, 1С вернёт его номер. Повторить?')"><button class="secondary">Повторить</button></form>
+    {% endif %}</td></tr>
+  {% endfor %}
+</table>
+{% endif %}
+
+<h2>Строки</h2>
+<div class="row" style="margin-bottom:8px">
+  {% if editable %}
+  <form method="post" action="/supplies/{{ supply.id }}/refresh"><button class="secondary">Перечитать из «Одежды полной»</button></form>
+  <form method="post" action="/supplies/{{ supply.id }}/delete" onsubmit="return confirm('Удалить черновик поставки {{ supply.number }}? Номер больше не выдаётся.')"><button class="danger">Удалить черновик</button></form>
+  {% endif %}
+</div>
+<div class="scroll">
+<table>
+  <tr><th>#</th><th>Размерный артикул</th><th class="num">Кол-во</th><th class="num">Цена</th><th>EAN</th>
+    {% for h in supply.extra_headers %}<th>{{ h }}</th>{% endfor %}
+    <th>1С: товар</th><th class="num">Остаток ЦС</th><th>1С</th><th>Замечания</th></tr>
+  {% for r in supply.rows %}
+  <tr>
+    <td>{{ r.position }}</td>
+    <td>{{ r.supplier_sku }}</td>
+    <td class="num">{% if editable %}<form method="post" action="/supplies/{{ supply.id }}/rows/{{ r.id }}" style="display:flex;gap:4px;justify-content:flex-end">
+      <input type="number" name="qty" value="{{ r.qty }}" min="0" style="width:64px"><button class="secondary" title="0 — убрать строку">✓</button></form>{% else %}{{ r.qty }}{% endif %}</td>
+    <td class="num">{{ r.price|money }}</td>
+    <td>{{ r.ean }}</td>
+    {% for v in r.extras %}<td>{{ v }}</td>{% endfor %}
+    <td>{{ r.onec_name }}{% if r.onec_size %} · {{ r.onec_size }}{% endif %}{% if r.onec_color %} · {{ r.onec_color }}{% endif %}</td>
+    <td class="num">{{ r.onec_stock if r.onec_stock is not none else '' }}</td>
+    <td class="{{ 'ok' if r.onec_status == 'ok' else ('bad' if r.onec_status else '') }}">
+      {{ {'ok': 'хватает', 'short': 'не хватает', 'not_found': 'не найден'}.get(r.onec_status, r.onec_status) }}</td>
+    <td class="warn">{{ r.warnings }}</td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+{% endblock %}

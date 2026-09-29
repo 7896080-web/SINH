@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}Новая поставка{% endblock %}
+{% block content %}
+<h1>Новая поставка</h1>
+<div class="card">
+  {% if not org %}<p class="bad">Не выбран ИП для Lamoda — укажите его на странице «Организации».</p>{% endif %}
+  <form method="post" action="/supplies/new" enctype="multipart/form-data">
+    <div class="row">
+      <label>Файл поставки (шаблон Lamoda, лист «Лист1»)<input type="file" name="file" accept=".xlsx" required></label>
+      <label>Номер поставки<input name="number" value="{{ next_number }}" size="10"></label>
+      <label>Номер документа<input name="doc_number" placeholder="= номеру поставки" size="12"></label>
+      <label>Дата поставки<input type="date" name="supply_date"></label>
+      <button type="submit" {{ 'disabled' if not org }}>Загрузить</button>
+    </div>
+  </form>
+  <p class="muted">Во входящем файле достаточно размерного артикула и количества. Штрихкод и цена берутся
+  из справочника «Одежда полный». ИП — {{ org.name if org else '—' }} (настройка «ИП для Lamoda»).
+  Номер документа — он же номер УПД и имя файлов; по умолчанию равен номеру поставки.</p>
+</div>
+{% endblock %}

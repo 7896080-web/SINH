@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}Поставки Lamoda{% endblock %}
+{% block content %}
+<div class="row" style="justify-content:space-between">
+  <h1>Поставки Lamoda</h1>
+  <a class="btn" href="/supplies/new">Новая поставка</a>
+</div>
+{% if not supplies %}
+<div class="card muted">Поставок ещё нет. Начните с «Новая поставка» — нужен файл с размерными артикулами и количеством.</div>
+{% else %}
+<table>
+  <tr><th>Номер</th><th>Документ</th><th>Дата</th><th>ИП</th><th>Статус</th>
+      <th class="num">Артикулов</th><th class="num">Штук</th><th class="num">Сумма с НДС</th><th>Документ 1С</th></tr>
+  {% for s in supplies %}{% set t = totals[s.id] %}
+  <tr>
+    <td><a href="/supplies/{{ s.id }}">{{ s.number }}</a></td>
+    <td>{{ s.doc_number }}</td>
+    <td>{{ s.supply_date|ru }}</td>
+    <td>{{ s.organization.name }}</td>
+    <td><span class="badge {{ s.status }}">{{ status_label(s.status) }}</span></td>
+    <td class="num">{{ t.articles }}</td>
+    <td class="num">{{ t.units }}</td>
+    <td class="num">{{ t.money|money }}</td>
+    <td>{{ s.onec_document }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% endblock %}
