@@ -154,3 +154,49 @@ def test_failing_required_job_turns_health_red(client, db):
     beat(db, "onec_exchange", False, "не разобраны файлы ответов 1С")
     r = client.get("/health")
     assert r.status_code == 503 and "не разобраны" in r.text
+
+
+def test_upd_reissue_needs_reason_and_the_current_document(client, db):
+    """Перевыпуск — новый документ под тем же номером: только с причиной и по
+    странице, на которой человек видел именно действующий УПД."""
+    from markapp.models import UpdDocument
+    _upload_catalog(client)
+    client.post("/supplies/new", data={"number": "12550", "doc_number": "", "supply_date": "2026-10-02"},
+                files={"file": ("in.xlsx", fixture_bytes("lamoda_shipment_input_typical.xlsx"), XLSX)})
+    s = db.query(Supply).one()
+    s.status = "moved"
+    db.commit()
+    client.post(f"/supplies/{s.id}/fbo", files={"file": ("fbo.xlsx", fixture_bytes(
+        "lamoda_postavki_fbo_12550.xlsx"), XLSX)})
+    upd = {"doc_date": "2026-10-01", "totals_mode": "rows"}
+    assert "выпущен" in client.post(f"/supplies/{s.id}/upd", data=upd).text
+    first = db.query(UpdDocument).one()
+    # Повторная отправка формы без подтверждения — отказ, документ тот же.
+    r = client.post(f"/supplies/{s.id}/upd", data=upd)
+    assert "обновите страницу" in r.text
+    first_file = first.id_file
+    r = client.post(f"/supplies/{s.id}/upd", data={**upd, "replace_id": first_file})
+    assert "требует причины" in r.text
+    db.expire_all()
+    assert db.query(UpdDocument).one().id_file == first_file
+    r = client.post(f"/supplies/{s.id}/upd", data={**upd, "replace_id": first_file,
+                                                   "replace_reason": "исправлена дата"})
+    assert "выпущен" in r.text
+    db.expire_all()
+    assert db.query(UpdDocument).one().id_file != first_file
+    # Вчерашняя вкладка с прежним УПД больше не перевыпускает: id строки SQLite
+    # мог совпасть, ИдФайл — нет.
+    r = client.post(f"/supplies/{s.id}/upd", data={**upd, "replace_id": first_file,
+                                                   "replace_reason": "повтор"})
+    assert "обновите страницу" in r.text
+
+
+def test_numbering_cannot_go_below_a_taken_number(client, db):
+    _upload_catalog(client)
+    _create(client)                       # 12560
+    r = client.post("/lamoda-settings", data={"org_id": settings.lamoda_org(db).id,
+                                              "agency_from": "01.10.2026", "last_number": "12550",
+                                              "step": "10"})
+    assert "меньше уже выданного 12560" in r.text
+    db.expire_all()
+    assert settings.get(db, settings.SUPPLY_LAST_NUMBER) == "12560"

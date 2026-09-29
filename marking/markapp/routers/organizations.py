@@ -100,6 +100,17 @@ def org_lamoda(request: Request, org_id: int = Form(...), agency_from: str = For
     if org is None:
         flash(request, "Организация не найдена.", "error")
         return RedirectResponse("/organizations", status_code=303)
+    # Номер ниже уже занятого снова выдал бы номера, которые Lamoda видела у
+    # поставок, в том числе удалённых (их в базе нет, но в Lamoda они могли
+    # уйти). Ниже текущей отметки — только ниже НЕЁ, но не ниже занятых, и с
+    # записью в журнал: это откат нумерации руками.
+    from markapp.models import Supply
+    taken = [int(n) for (n,) in db.query(Supply.number).all() if n.isdigit()]
+    if taken and int(last_number) < max(taken):
+        flash(request, f"Последний номер не может быть меньше уже выданного {max(taken)}.", "error")
+        return RedirectResponse("/organizations", status_code=303)
+    previous = settings.get(db, settings.SUPPLY_LAST_NUMBER)
+    lowered = previous.isdigit() and int(last_number) < int(previous)
     before = settings.lamoda_org(db)
     settings.put(db, settings.LAMODA_ORG, str(org.id))
     settings.put(db, settings.AGENCY_FROM, agency_from.strip())
@@ -107,7 +118,8 @@ def org_lamoda(request: Request, org_id: int = Form(...), agency_from: str = For
     settings.put(db, settings.SUPPLY_STEP, step.strip())
     audit.log(db, user.username, "lamoda_settings",
               details=f"ИП для Lamoda: {before.name if before else '—'} → {org.name}; "
-                      f"агентский с {agency_from}; последний номер {last_number}, шаг {step}")
+                      f"агентский с {agency_from}; последний номер {previous} → {last_number}"
+                      f"{' (ПОНИЖЕН)' if lowered else ''}, шаг {step}")
     db.commit()
     flash(request, "Настройки Lamoda сохранены. Созданные поставки остаются за своим ИП.", "ok")
     return RedirectResponse("/organizations", status_code=303)

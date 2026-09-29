@@ -23,6 +23,11 @@ def local_date_of(moment_utc: datetime) -> date:
     return moment_utc.replace(tzinfo=timezone.utc).astimezone().date()
 
 
+def local_day_start_utc(d: date) -> datetime:
+    """Начало местных суток `d` как наивное UTC-время (так хранятся отметки)."""
+    return datetime(d.year, d.month, d.day).astimezone().astimezone(timezone.utc).replace(tzinfo=None)
+
+
 def ru(d: date | None) -> str:
     return d.strftime("%d.%m.%Y") if d else ""
 

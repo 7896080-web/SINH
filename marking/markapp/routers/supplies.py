@@ -346,6 +346,7 @@ async def supply_fbo(supply_id: int, request: Request, file: UploadFile = File(.
 @router.post("/supplies/{supply_id}/upd")
 def supply_upd(supply_id: int, request: Request, doc_date: str = Form(...),
                totals_mode: str = Form("rows"), force: str = Form(""),
+               replace_id: str = Form(""), replace_reason: str = Form(""),
                db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     try:
         supply = _get(db, supply_id)
@@ -366,9 +367,24 @@ def supply_upd(supply_id: int, request: Request, doc_date: str = Form(...),
             raise S.SupplyError("проверка УПД нашла ошибки, документ не выпущен: "
                                 + U.findings_text(built.findings)[:300])
         old = db.query(UpdDocument).filter(UpdDocument.supply_id == supply.id).all()
+        # Перевыпуск — это новый документ под ТЕМ ЖЕ номером. Если прежний уже
+        # ушёл в Lamoda по ЭДО, это корректировка, и решение принимает человек:
+        # сервер требует причину и то, что человек видел именно этот УПД.
+        # Подтверждения в браузере мало — повторная отправка формы (F5, двойной
+        # клик, открытая вчера вкладка) заменила бы документ молча.
+        # Метка «видел этот УПД» — ИдФайл (в нём uuid), а не id строки: SQLite
+        # отдаёт id удалённой строки новой, и вчерашняя вкладка с id=1 совпала
+        # бы с перевыпущенным документом, тоже получившим id=1.
+        if old:
+            current = max(old, key=lambda o: o.id).id_file
+            if replace_id != current:
+                raise S.SupplyError("УПД уже выпущен (или перевыпущен в другой вкладке) — "
+                                    "обновите страницу и укажите причину перевыпуска")
+            if not replace_reason.strip():
+                raise S.SupplyError("перевыпуск УПД требует причины: прежний мог уже уйти в Lamoda")
         for o in old:
             audit.log(db, user.username, "upd_replaced", f"УПД {o.doc_number}",
-                      f"прежний от {ru(o.doc_date)} заменён")
+                      f"прежний от {ru(o.doc_date)} заменён; причина: {replace_reason.strip()}")
             db.delete(o)
         db.flush()
         doc = UpdDocument(supply_id=supply.id, fbo_upload_id=fbo.id, doc_number=supply.doc_number,
