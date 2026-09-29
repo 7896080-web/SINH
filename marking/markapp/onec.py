@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session
 
 from markapp import audit, config, settings
 from markapp.models import OnecTask, OnecTaskStatus, Supply, SupplyStatus
+from markapp.supplies import movement_problems
 from markapp.timeutils import now_utc, ru
 
 COMMANDS = ("PING", "SUPPLY_CHECK", "SUPPLY_MOVEMENT")
@@ -237,8 +238,10 @@ def _apply_check(db: Session, task: OnecTask, res: ResultLine, check: dict[str, 
     if latest is not None and latest.id != task.id:
         return
     if supply.status in (SupplyStatus.draft.value, SupplyStatus.checked.value):
-        supply.status = (SupplyStatus.checked.value if res.status == "OK"
-                         else SupplyStatus.draft.value)
+        # 1С ответила OK, но два артикула легли на один SKU 1С — сопоставление не
+        # один к одному, перемещать нельзя (`supplies.movement_problems`).
+        ok = res.status == "OK" and not movement_problems(supply)
+        supply.status = SupplyStatus.checked.value if ok else SupplyStatus.draft.value
 
 
 def _apply_movement(db: Session, task: OnecTask, res: ResultLine) -> None:

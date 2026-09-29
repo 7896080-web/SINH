@@ -33,6 +33,7 @@
 </div>
 
 {% if problems and editable %}<div class="flash warn">Мешает отправке в 1С: {{ problems|join('; ') }}</div>{% endif %}
+{% if move_problems and editable %}<div class="flash warn">Мешает перемещению: {{ move_problems|join('; ') }}</div>{% endif %}
 {% if not epf_ready %}<div class="flash warn">Обработка 1С ещё не обновлена под маркировку (нет ответа на PING) — отправка в 1С выключена. См. «Диагностика».</div>{% endif %}
 
 <div class="steps">
@@ -47,7 +48,7 @@
     <h2>2. Перемещение на Lamoda_Склад</h2>
     <p class="muted">Один документ «ЦС Склад → Lamoda_Склад» на всю поставку, сегодняшней датой. После него состав не меняется, отмены нет.</p>
     <form method="post" action="/supplies/{{ supply.id }}/move" onsubmit="return confirm('Переместить {{ totals.units }} шт. поставки {{ supply.number }} на склад Lamoda в 1С? После этого поставку нельзя изменить или удалить.')">
-      <button {{ 'disabled' if (supply.status != 'checked' or not epf_ready or pending) }}>Переместить в 1С</button>
+      <button {{ 'disabled' if (supply.status != 'checked' or move_problems or not epf_ready or pending) }}>Переместить в 1С</button>
     </form>
   </div>
   <div class="card">
