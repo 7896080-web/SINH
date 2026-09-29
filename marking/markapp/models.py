@@ -127,6 +127,9 @@ class Supply(Base):
     scheme_choice = Column(String(20), nullable=False, default="auto")
     scheme_reason = Column(Text, nullable=False, default="")
     source_filename = Column(String(300), nullable=False, default="")
+    # Сам входящий файл, из которого собран черновик: к нему возвращаются, когда
+    # строка поставки вызывает вопрос («а что было в файле?»).
+    source_file = Column(LargeBinary, nullable=True)
     # Заголовки дополнительных колонок входного файла (например «ТНВЭД»):
     # они копируются в каждую строку при развёртке.
     extra_headers = Column(JSON, nullable=False, default=list)

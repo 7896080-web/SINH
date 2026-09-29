@@ -13,11 +13,13 @@ from dataclasses import dataclass, field
 from datetime import date
 
 import openpyxl
-from sqlalchemy.orm import Session
+from openpyxl.utils.datetime import from_excel
+from sqlalchemy.orm import Session, object_session
 
 from markapp import settings
 from markapp.catalog import cell_text, loose_sku, norm_sku, to_price
-from markapp.models import CatalogItem, EDITABLE_STATUSES, Supply, SupplyRow, SupplyStatus
+from markapp.models import (CatalogItem, EDITABLE_STATUSES, OnecTask, Supply, SupplyRow,
+                            SupplyStatus)
 from markapp.timeutils import parse_ru
 
 HEADER_ROW = 4
@@ -67,6 +69,14 @@ def parse_input(data: bytes) -> InputFile:
     b1, b2 = ws.cell(1, 2).value, ws.cell(2, 2).value
     if isinstance(b1, date):
         out.supply_date = b1.date() if hasattr(b1, "date") else b1
+    elif isinstance(b1, (int, float)) and not isinstance(b1, bool):
+        # Дата, записанная числом Excel без формата ячейки (так приходит файл из
+        # инструмента КИЗ: 46297 = 02.10.2026). Раньше такое число молча
+        # отбрасывалось — поставка создавалась без даты, хотя дата в файле была.
+        try:
+            out.supply_date = from_excel(b1).date()
+        except (ValueError, OverflowError, TypeError):
+            out.errors.append(f"B1: дата поставки «{b1}» — не дата")
     elif isinstance(b1, str) and b1.strip():
         try:
             out.supply_date = parse_ru(b1)
@@ -141,6 +151,12 @@ def validate_numbers(db: Session, number: str, doc_number: str, supply_id: int |
     for label, value in (("номер поставки", number), ("номер документа", doc_number)):
         if not NUMBER_RE.match(value or ""):
             errs.append(f"{label} «{value}»: до 20 символов — латиница, цифры, «_», «-»")
+    if "_" in (number or ""):
+        # Номер поставки — ключ идемпотентности перемещения (`order_id=lamoda-<номер>`),
+        # а 1С ищет уже проведённый документ через ПОДОБНО, где «_» — любой символ.
+        # Поставка «A_1» нашла бы документ поставки «AB1» и объявила себя
+        # перемещённой, не переместив ничего. Lamoda «_» разрешает, мы — нет.
+        errs.append(f"номер поставки «{number}»: без «_» — в 1С он служит ключом поиска документа")
     q = db.query(Supply)
     if supply_id:
         q = q.filter(Supply.id != supply_id)
@@ -188,7 +204,8 @@ def fill_row_from_catalog(row: SupplyRow, exact, loose) -> None:
 
 
 def create_supply(db: Session, parsed: InputFile, *, organization_id: int, number: str,
-                  doc_number: str, supply_date: date | None, filename: str, username: str) -> Supply:
+                  doc_number: str, supply_date: date | None, filename: str, username: str,
+                  source_file: bytes | None = None) -> Supply:
     if parsed.errors:
         raise SupplyError("; ".join(parsed.errors))
     errs = validate_numbers(db, number, doc_number)
@@ -197,6 +214,7 @@ def create_supply(db: Session, parsed: InputFile, *, organization_id: int, numbe
     supply = Supply(number=number, doc_number=doc_number, supply_date=supply_date,
                     planned_upd_date=supply_date, organization_id=organization_id,
                     status=SupplyStatus.draft.value, source_filename=filename,
+                    source_file=source_file,
                     extra_headers=parsed.extra_headers, created_by=username)
     db.add(supply)
     exact, loose = _catalog_maps(db)
@@ -216,10 +234,36 @@ def create_supply(db: Session, parsed: InputFile, *, organization_id: int, numbe
     return supply
 
 
+# Перемещение считается ушедшим в 1С с момента постановки в очередь и до ОТКАЗА
+# 1С: pending/sent — файл в пути, timeout — ответа нет, но документ мог быть
+# создан, done — создан. Только failed значит «документа нет».
+MOVEMENT_OUT = ("pending", "sent", "timeout", "done")
+
+
+def movement_sent(supply: Supply) -> bool:
+    db = object_session(supply)
+    if db is None or supply.id is None:
+        return False
+    return db.query(OnecTask).filter(OnecTask.supply_id == supply.id,
+                                     OnecTask.command == "SUPPLY_MOVEMENT",
+                                     OnecTask.status.in_(MOVEMENT_OUT)).first() is not None
+
+
 def ensure_editable(supply: Supply) -> None:
+    """Состав и шапку можно менять, только пока в 1С заведомо нет документа.
+
+    Статуса «перемещено» для этого мало: он ставится ОТВЕТОМ 1С, а до ответа
+    поставка остаётся «проверенной». Правка в этом промежутке расходится с
+    документом, который 1С уже создаёт: количество меняется у нас, а в 1С
+    уехало прежнее; новый номер поставки меняет ключ идемпотентности, и повтор
+    зависшего перемещения создал бы ВТОРОЙ документ. Отмены у поставки нет.
+    """
     if supply.status not in [s.value for s in EDITABLE_STATUSES]:
         raise SupplyError("поставка уже перемещена в 1С — состав зафиксирован. "
                           "Исправление перемещения делается вручную в 1С")
+    if movement_sent(supply):
+        raise SupplyError("перемещение уже отправлено в 1С — состав зафиксирован до ответа. "
+                          "Если 1С откажет, поставку снова можно будет править")
 
 
 def mark_edited(supply: Supply) -> None:
@@ -228,6 +272,29 @@ def mark_edited(supply: Supply) -> None:
     supply.status = SupplyStatus.draft.value
     for row in supply.rows:
         row.onec_status = ""
+
+
+def catalog_drift(db: Session, supply: Supply) -> list[str]:
+    """Строки, чьи штрихкод или цена разошлись с «Одеждой полной» после загрузки.
+
+    Каталог обновляют отдельно, а черновик хранит значения на момент загрузки.
+    Без этой проверки поставка уехала бы в 1С со СТАРЫМ штрихкодом, а Lamoda ждёт
+    новый: выгрузка «Поставки FBO» потом не сойдётся, УПД не выпустится, а
+    перемещение уже не отменить (ТЗ, 5.2).
+    """
+    exact, _ = _catalog_maps(db)
+    out = []
+    for r in supply.rows:
+        item = exact.get(r.supplier_sku)
+        if item is None:
+            continue
+        if item.ean != r.ean or item.price != r.price:
+            out.append(r.supplier_sku)
+    if not out:
+        return []
+    return [f"справочник «Одежда полный» изменился после загрузки поставки — у {len(out)} стр. "
+            f"другой штрихкод или цена ({out[0]}{' …' if len(out) > 1 else ''}). "
+            "Нажмите «Перечитать из «Одежды полной»»"]
 
 
 def refresh_from_catalog(db: Session, supply: Supply) -> None:

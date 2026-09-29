@@ -45,4 +45,9 @@ def stale_workers(db: Session) -> list[str]:
             continue
         if now - row.last_run_at > timedelta(seconds=seconds):
             out.append(f"{name}: последний прогон {row.last_run_at:%d.%m %H:%M} UTC")
+        elif required and not row.last_success:
+            # Свежая отметка с ошибкой — задание живо, но работы не делает. Раньше
+            # /health смотрел только на возраст и был зелёным, пока обмен с 1С
+            # падал каждые 30 секунд.
+            out.append(f"{name}: ошибка — {row.last_error[:200]}")
     return out

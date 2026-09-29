@@ -129,3 +129,28 @@ def test_lamoda_settings_change_keeps_existing_supply(client, db):
     db.refresh(s)
     assert s.organization.name == "ИП Яворская Т.Н."
     assert settings.lamoda_org(db).id == other.id
+
+
+def test_source_file_is_kept_and_b2_number_is_used(client, db):
+    """Входящий файл хранится при поставке и скачивается со страницы; номер из B2
+    не перебивается номером, заранее подставленным в форму."""
+    _upload_catalog(client)
+    data = fixture_bytes("reference_kiz_tool_supply_12550.xlsx")
+    r = client.post("/supplies/new", data={"number": "", "doc_number": "", "supply_date": ""},
+                    files={"file": ("kiz.xlsx", data, XLSX)})
+    s = db.query(Supply).one()
+    assert s.number == "12550" and str(s.supply_date) == "2026-10-02"
+    assert f"/supplies/{s.id}/source" in r.text
+    r = client.get(f"/supplies/{s.id}/source")
+    assert r.status_code == 200 and r.content == data
+
+
+def test_failing_required_job_turns_health_red(client, db):
+    from markapp.workers.heartbeat import EXPECTED, beat
+    for name, (_, required) in EXPECTED.items():
+        if required:
+            beat(db, name)
+    assert client.get("/health").status_code == 200
+    beat(db, "onec_exchange", False, "не разобраны файлы ответов 1С")
+    r = client.get("/health")
+    assert r.status_code == 503 and "не разобраны" in r.text

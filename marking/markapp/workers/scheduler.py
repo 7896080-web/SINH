@@ -34,6 +34,11 @@ def job_onec_exchange() -> None:
             notes.append(f"ответов 1С без задания: {got['unmatched']}")
         if stuck:
             notes.append(f"заданий без ответа дольше срока: {stuck}")
+        if got["failed_files"]:
+            # Ответ 1С лежит и не применяется — это не оговорка, а отказ канала.
+            beat(db, "onec_exchange", False,
+                 "не разобраны файлы ответов 1С: " + "; ".join(got["failed_files"] + notes))
+            return
         beat(db, "onec_exchange", True, "; ".join(notes))
         if sent or got["files"]:
             logger.info("1С: отправлено строк %s, разобрано файлов %s (%s)", sent, got["files"], got)
