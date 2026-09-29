@@ -443,3 +443,12 @@ def test_broken_answer_file_does_not_block_the_next(db, catalog, exchange_dirs):
     assert stats["files"] == 1 and len(stats["failed_files"]) == 1
     assert onec.epf_ready(db)
     assert (exchange_dirs.ONEC_RESULTS_DIR / "result_mark_0.txt").exists()
+
+
+def test_local_day_start_is_the_local_midnight():
+    """Граница местных суток — по часам сервера (Москва на бою), не по UTC."""
+    from markapp.timeutils import local_date_of, local_day_start_utc
+    d = date(2026, 10, 2)
+    start = local_day_start_utc(d)
+    assert local_date_of(start) == d
+    assert local_date_of(start - timedelta(seconds=1)) == d - timedelta(days=1)

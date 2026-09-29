@@ -125,14 +125,14 @@ def gtin_export(db: Session = Depends(get_db), user: User = Depends(get_current_
 def gtin_unexport(request: Request, day: str = Form(...), db: Session = Depends(get_db),
                   user: User = Depends(get_current_user)):
     """Файл скачали, но в Lamoda не загрузили — вернуть пары этого дня в очередь."""
-    from datetime import date, datetime, timedelta, timezone
+    from datetime import date, timedelta
+    from markapp.timeutils import local_day_start_utc
     try:
         d = date.fromisoformat(day)
     except ValueError:
         flash(request, "Дата — ГГГГ-ММ-ДД.", "error")
         return RedirectResponse("/gtin", status_code=303)
-    start_local = datetime(d.year, d.month, d.day).astimezone()
-    start = start_local.astimezone(timezone.utc).replace(tzinfo=None)
+    start = local_day_start_utc(d)
     pairs = (db.query(GtinPair).filter(GtinPair.exported_at >= start,
                                         GtinPair.exported_at < start + timedelta(days=1),
                                         GtinPair.source != "product_gtin").all())

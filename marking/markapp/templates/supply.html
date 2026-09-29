@@ -68,6 +68,8 @@
       <div class="row">
         <label>Дата УПД<input type="date" name="doc_date" value="{{ upd.doc_date if upd else (supply.planned_upd_date or today) }}" required></label>
         <label>Итоги<select name="totals_mode"><option value="rows">rows — шапка = сумма строк</option><option value="reference">reference — как в эталонах</option></select></label>
+        {% if upd %}<input type="hidden" name="replace_id" value="{{ upd.id_file }}">
+        <label>Причина перевыпуска<input name="replace_reason" size="28" required placeholder="обязательно"></label>{% endif %}
         <button {{ 'disabled' if not (fbo and fbo.ok) }}>{{ 'Перевыпустить' if upd else 'Выпустить УПД' }}</button>
       </div>
     </form>
