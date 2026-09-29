@@ -34,5 +34,5 @@ input, select, textarea { font:inherit; padding:5px 8px; border:1px solid var(--
 .scroll { max-height:560px; overflow:auto; border:1px solid var(--line); border-radius:6px; }
 pre { white-space:pre-wrap; background:#f3f4f7; padding:8px; border-radius:6px; font-size:12px; }
 @media (max-width:700px) { header nav a { padding:8px 5px; } main { padding:12px; } }
-.steps input[type=file], .steps select { max-width:100%; }
+.steps input, .steps select { max-width:100%; }
 .steps .row label { max-width:100%; }

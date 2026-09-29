@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% block title %}Справочник GTIN{% endblock %}
+{% block content %}
+<h1>Справочник GTIN</h1>
+<div class="steps">
+  <div class="card">
+    <h2>Загрузить product_gtin</h2>
+    <p class="muted">Файлы, которые уже загружались в Lamoda Seller. Можно несколько сразу. Конфликт не перезаписывается, а показывается.</p>
+    <form method="post" action="/gtin/import" enctype="multipart/form-data">
+      <input type="file" name="files" accept=".xlsx" multiple required> <button>Загрузить</button>
+    </form>
+  </div>
+  <div class="card">
+    <h2>Выгрузить для Lamoda</h2>
+    <p>Новых пар, которых Lamoda не получала: <b>{{ pending_export }}</b>.</p>
+    <p class="muted">Файл по шаблону Lamoda, не больше 1000 строк в файле. После скачивания пары считаются выгруженными.</p>
+    <a class="btn {{ '' if pending_export else 'secondary' }}" href="/gtin/export">Скачать product_gtin</a>
+    <form method="post" action="/gtin/unexport" class="row" style="margin-top:8px">
+      <label>Не загрузили в Lamoda — вернуть выгрузку дня<input type="date" name="day"></label>
+      <button class="secondary">Вернуть</button>
+    </form>
+  </div>
+  <div class="card">
+    <h2>Добавить пару вручную</h2>
+    <form method="post" action="/gtin/add">
+      <p><label>Размерный артикул<br><input name="supplier_sku" size="34" required></label></p>
+      <p><label>GTIN (14 цифр)<br><input name="gtin" size="16" required></label></p>
+      <button>Добавить</button>
+    </form>
+  </div>
+  <div class="card">
+    <h2>Нацкаталог</h2>
+    {% if not has_key %}<p class="warn">Нет API-ключа Нацкаталога у ИП для Lamoda ({{ org.name if org else '—' }}) — карточки не запрашиваются.
+      Ключ вводится на странице организации.</p>{% endif %}
+    <p>Карточки: получено <b>{{ counts.ok }}</b>, ждут <b>{{ counts.pending }}</b>, нет в НК <b>{{ counts.not_found }}</b>, ошибок <b>{{ counts.error }}</b>.</p>
+    <p class="muted">Лимит НК — 10 запросов за 5 минут по 25 GTIN; работаем на {{ nk_limit }}. Воркер забирает очередь сам.</p>
+  </div>
+</div>
+
+<details class="card">
+  <summary><b>Имена атрибутов карточки НК</b> — откуда брать цвет, размер, ТН ВЭД</summary>
+  <p class="muted">Имена — через «;», в порядке приоритета. Они берутся из живой карточки: откройте любую карточку ниже, там показаны все её атрибуты.
+  После сохранения уже полученные карточки разбираются заново, без запросов в НК.</p>
+  <form method="post" action="/gtin/nk-settings">
+    <p><label>Цвет<br><input name="attr_color" value="{{ attr_color }}" size="70"></label></p>
+    <p><label>Размер<br><input name="attr_size" value="{{ attr_size }}" size="70"></label></p>
+    <p><label>ТН ВЭД<br><input name="attr_tnved" value="{{ attr_tnved }}" size="70"></label></p>
+    <p><label>Запросов за 5 минут (1–10)<br><input name="nk_limit" value="{{ nk_limit }}" size="4"></label></p>
+    <button>Сохранить</button>
+  </form>
+</details>
+
+<form class="row" method="get" action="/gtin" style="margin:10px 0">
+  <input name="q" value="{{ q }}" placeholder="артикул или GTIN" size="40">
+  <label style="flex-direction:row;gap:6px;align-items:center"><input type="checkbox" name="only" value="new" {{ 'checked' if only == 'new' }}> только не выгруженные в Lamoda</label>
+  <button class="secondary">Найти</button>
+  <span class="muted">найдено {{ total }} из {{ all_count }}{% if total > limit %}, показаны первые {{ limit }}{% endif %}</span>
+</form>
+<div class="scroll">
+<table>
+  <tr><th>Размерный артикул</th><th>GTIN</th><th>Источник</th><th>В Lamoda</th><th>Карточка НК</th><th>Цвет</th><th>Размер</th><th>ТН ВЭД</th></tr>
+  {% for p in pairs %}{% set c = cards.get(p.gtin) %}
+  <tr><td>{{ p.supplier_sku }}</td><td><a href="/gtin/card/{{ p.gtin }}">{{ p.gtin }}</a></td>
+    <td>{{ {'product_gtin': 'product_gtin', 'fbo': 'Поставки FBO', 'manual': 'вручную'}.get(p.source, p.source) }}</td>
+    <td class="{{ '' if p.exported_at else 'warn' }}">{{ p.exported_at.strftime('%d.%m.%Y') if p.exported_at else 'не выгружено' }}</td>
+    <td class="{{ 'ok' if c and c.status == 'ok' else ('bad' if c and c.status in ('not_found','error') else 'muted') }}">
+      {{ {'ok': 'есть', 'pending': 'ждёт', 'not_found': 'нет в НК', 'error': 'ошибка'}.get(c.status, '') if c else '—' }}</td>
+    <td>{{ c.color if c }}</td><td>{{ c.size if c }}</td><td>{{ c.tn_ved if c }}</td></tr>
+  {% endfor %}
+</table>
+</div>
+{% endblock %}

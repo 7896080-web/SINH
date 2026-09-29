@@ -3,6 +3,7 @@
 Задания:
 - `onec_exchange` каждые 30 с: положить ждущие задания в 1С, разобрать ответы,
   отметить зависшие;
+- `nk_fetch` каждую минуту: карточки Нацкаталога в пределах лимита;
 - `backup` раз в сутки; первый прогон — через 10 минут после старта, чтобы
   суточное задание на `interval` не откладывалось каждым перезапуском воркера
   (у sync_admin выгрузка каталога так не запускалась ни разу).
@@ -12,7 +13,7 @@ from datetime import datetime, timedelta
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 
-from markapp import backup, onec
+from markapp import backup, nk, onec
 from markapp.database import Base, SessionLocal, engine
 from markapp.settings import ensure_defaults
 from markapp.timeutils import now_utc
@@ -39,6 +40,19 @@ def job_onec_exchange() -> None:
     except Exception as e:
         logger.exception("1С: обмен упал")
         beat(db, "onec_exchange", False, f"{type(e).__name__}: {e}")
+    finally:
+        db.close()
+
+
+def job_nk_fetch() -> None:
+    """Карточки Нацкаталога — в пределах лимита (10 запросов за 5 минут)."""
+    db = SessionLocal()
+    try:
+        stats = nk.fetch_due(db)
+        beat(db, "nk_fetch", True, stats.get("note", ""))
+    except Exception as e:
+        logger.exception("НК: запрос карточек упал")
+        beat(db, "nk_fetch", False, f"{type(e).__name__}: {e}")
     finally:
         db.close()
 
@@ -73,6 +87,8 @@ def main() -> None:
     common = dict(misfire_grace_time=300, coalesce=True, max_instances=1)
     sched.add_job(job_onec_exchange, "interval", seconds=30, id="onec_exchange",
                   next_run_time=datetime.now(), **common)
+    sched.add_job(job_nk_fetch, "interval", seconds=60, id="nk_fetch",
+                  next_run_time=datetime.now() + timedelta(seconds=20), **common)
     sched.add_job(job_backup, "interval", hours=24, id="backup",
                   next_run_time=datetime.now() + timedelta(minutes=10), **common)
     logger.info("воркер маркировки запущен")

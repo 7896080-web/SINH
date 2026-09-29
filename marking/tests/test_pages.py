@@ -105,11 +105,13 @@ def test_ping_button_queues_ping(client, db):
     assert t.command == "PING" and t.line == f"PING|{t.order_id}"
 
 
-def test_health_needs_onec_exchange(client, db):
+def test_health_needs_every_required_job(client, db):
+    from markapp.workers.heartbeat import EXPECTED, beat
     r = client.get("/health")
-    assert r.status_code == 503 and "onec_exchange" in r.text
-    from markapp.workers.heartbeat import beat
-    beat(db, "onec_exchange")
+    assert r.status_code == 503 and "onec_exchange" in r.text and "nk_fetch" in r.text
+    for name, (_, required) in EXPECTED.items():
+        if required:
+            beat(db, name)
     assert client.get("/health").status_code == 200
 
 

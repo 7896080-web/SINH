@@ -43,7 +43,8 @@ def org_save(org_id: int, request: Request, db: Session = Depends(get_db),
              patronymic: str = Form(""), inn: str = Form(...), ogrnip: str = Form(...),
              address: str = Form(...), signer_role: str = Form("ИП"), vat_rate: int = Form(5),
              contract_number: str = Form("б/н"), sticker_sender: str = Form(""),
-             edo_sender_id: str = Form("")):
+             edo_sender_id: str = Form(""), oms_id: str = Form(""), connection_id: str = Form(""),
+             nk_api_key: str = Form(""), clear_api_key: str = Form("")):
     inn = inn.strip()
     if not (inn.isdigit() and len(inn) in (10, 12)):
         flash(request, "ИНН — 10 или 12 цифр.", "error")
@@ -59,13 +60,25 @@ def org_save(org_id: int, request: Request, db: Session = Depends(get_db),
     for k, v in values.items():
         setattr(org, k, v.strip())
     org.vat_rate = vat_rate
+    org.oms_id = oms_id.strip() or None
+    org.connection_id = connection_id.strip() or None
+    # Ключ: пустое поле — «не менять». Показать сохранённый ключ страница не
+    # может и не должна; стереть — только явной галочкой.
+    from markapp import nk
+    key_note = ""
+    if clear_api_key:
+        nk.set_api_key(db, org, "")
+        key_note = "; API-ключ удалён"
+    elif nk_api_key.strip():
+        nk.set_api_key(db, org, nk_api_key)
+        key_note = "; API-ключ заменён"
     try:
         db.flush()
     except Exception:
         db.rollback()
         flash(request, "Организация с таким ИНН уже есть.", "error")
         return RedirectResponse("/organizations", status_code=303)
-    audit.log(db, user.username, "organization_saved", org.name, f"ИНН {org.inn}")
+    audit.log(db, user.username, "organization_saved", org.name, f"ИНН {org.inn}{key_note}")
     db.commit()
     flash(request, f"Сохранено: {org.name}.", "ok")
     return RedirectResponse("/organizations", status_code=303)

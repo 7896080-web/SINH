@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}GTIN {{ gtin }}{% endblock %}
+{% block content %}
+<h1>GTIN {{ gtin }}</h1>
+<div class="card">
+  <p>Артикул: <b>{{ pair.supplier_sku if pair else 'не сопоставлен' }}</b></p>
+  {% if not card %}<p class="muted">Карточка ещё не запрашивалась.</p>
+  {% else %}
+  <p>Статус: <b>{{ {'ok': 'получена', 'pending': 'ждёт запроса', 'not_found': 'в НК нет', 'error': 'ошибка'}.get(card.status, card.status) }}</b>
+    {% if card.fetched_at %} · {{ card.fetched_at.strftime('%d.%m.%Y %H:%M') }} UTC{% endif %}
+    {% if card.error %} · <span class="bad">{{ card.error }}</span>{% endif %}</p>
+  {% if card.status == 'ok' %}
+  <p>{{ card.name }} · статус карточки: {{ card.card_status or '—' }} · good_id {{ card.good_id }}</p>
+  <p>Разобрано: цвет <b>{{ card.color or '—' }}</b>, размер <b>{{ card.size or '—' }}</b>, ТН ВЭД <b>{{ card.tn_ved or '—' }}</b></p>
+  <h2>Все атрибуты карточки</h2>
+  <p class="muted">Если цвет или размер не разобрались — впишите имя нужного атрибута в «Имена атрибутов» на странице «Справочник GTIN».</p>
+  <table><tr><th>Атрибут</th><th>Значение</th><th>Группа</th><th>id</th></tr>
+    {% for a in card.attrs %}<tr><td>{{ a.attr_name }}</td><td>{{ a.attr_value }}</td><td>{{ a.attr_group_name or '' }}</td><td class="muted">{{ a.attr_id }}</td></tr>{% endfor %}
+  </table>
+  {% endif %}{% endif %}
+  <form method="post" action="/gtin/card/{{ gtin }}/refresh" style="margin-top:10px"><button class="secondary">Запросить заново</button></form>
+</div>
+{% if card and card.raw %}<details class="card"><summary>Сырой ответ НК</summary><pre>{{ card.raw }}</pre></details>{% endif %}
+{% endblock %}
