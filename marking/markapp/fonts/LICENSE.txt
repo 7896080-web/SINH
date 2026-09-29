@@ -1,0 +1,5 @@
+Шрифты DejaVu (DejaVuSans.ttf, DejaVuSans-Bold.ttf) — свободная лицензия
+Bitstream Vera / DejaVu (https://dejavu-fonts.github.io/License.html):
+разрешено использовать, копировать и распространять вместе с программой.
+Шрифт лежит в репозитории, а не берётся с диска машины: на Windows Server
+DejaVu нет, а кириллица на этикетке без него превратилась бы в квадраты.

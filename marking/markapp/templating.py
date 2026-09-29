@@ -22,6 +22,7 @@ NAV = [
     ("supplies", "/supplies", "Поставки Lamoda"),
     ("catalog", "/catalog", "Одежда полный"),
     ("gtin", "/gtin", "Справочник GTIN"),
+    ("labels", "/labels", "Этикетки"),
     ("organizations", "/organizations", "Организации"),
     ("diagnostics", "/diagnostics", "Диагностика"),
 ]

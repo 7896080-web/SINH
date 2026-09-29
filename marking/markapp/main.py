@@ -9,7 +9,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from markapp.database import Base, SessionLocal, engine
 from markapp.deps import NotAuthenticated
-from markapp.routers import auth, catalog, diagnostics, gtin, health, organizations, supplies
+from markapp.routers import auth, catalog, diagnostics, gtin, health, labels, organizations, supplies
 from markapp.settings import ensure_defaults
 
 
@@ -42,7 +42,7 @@ app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET, same_site="lax"
 app.mount("/static", StaticFiles(directory=str(Path(__file__).resolve().parent / "static")),
           name="static")
 
-for r in (auth, supplies, catalog, gtin, organizations, diagnostics, health):
+for r in (auth, supplies, catalog, gtin, labels, organizations, diagnostics, health):
     app.include_router(r.router)
 
 
