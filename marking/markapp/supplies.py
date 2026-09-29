@@ -210,6 +210,7 @@ def create_supply(db: Session, parsed: InputFile, *, organization_id: int, numbe
         if counts[r.sku] > 1:
             row.warnings = "; ".join(filter(None, [row.warnings, "артикул стоит в файле не одной строкой"]))
         supply.rows.append(row)
+    _mark_shared_barcodes(supply)
     _remember_number(db, number)
     db.flush()
     return supply
@@ -234,6 +235,7 @@ def refresh_from_catalog(db: Session, supply: Supply) -> None:
     exact, loose = _catalog_maps(db)
     for row in supply.rows:
         fill_row_from_catalog(row, exact, loose)
+    _mark_shared_barcodes(supply)
     mark_edited(supply)
 
 
@@ -252,6 +254,65 @@ def update_row_qty(supply: Supply, row_id: int, qty: int) -> None:
     raise SupplyError("строка не найдена")
 
 
+# --- Сопоставление по штрихкоду --------------------------------------------------
+#
+# Правило то же, что у sync_admin (`app/workers/matching.py`, справочник баркодов
+# 1С): штрихкод — ключ ОДНОГО товара 1С (номенклатура + характеристика), у
+# товара баркодов бывает несколько, и все они делят один остаток. Отсюда два
+# случая, и следствия у них разные.
+#
+# 1. Один штрихкод у РАЗНЫХ артикулов Lamoda. 1С различить их не может: задание
+#    несёт `баркод:кол`, одинаковые баркоды складываются в одну позицию, и оба
+#    артикула уедут одним товаром. Ответ проверки ляжет на обе строки как на
+#    одну, а коды и УПД Lamoda пойдут по двум разным артикулам. Отмены поставки
+#    нет — значит это отказ ДО отправки, а не замечание после.
+# 2. Разные штрихкоды, а товар 1С один (видно после ответа проверки). Это
+#    законно — альтернативный баркод того же размера, — и 1С считает остаток по
+#    товару, то есть сумму. Но две карточки Lamoda на одну вещь — повод
+#    посмотреть на карточки, поэтому замечание, а не отказ: тот же случай, что у
+#    sync_admin «одна вещь под двумя артикулами».
+#
+# Догадку по соседям карточки (`catalog_sync`, POOL_GUESS) сюда НЕ переносим
+# намеренно: у Lamoda на артикул один штрихкод, соседей нет, а перемещение по
+# угаданному товару — документ, который нечем отменить.
+
+def shared_barcodes(supply: Supply) -> dict[str, list[str]]:
+    """Штрихкод -> разные артикулы с ним (только где их больше одного)."""
+    by_ean: dict[str, list[str]] = {}
+    for r in supply.rows:
+        if r.ean:
+            skus = by_ean.setdefault(r.ean, [])
+            if r.supplier_sku not in skus:
+                skus.append(r.supplier_sku)
+    return {e: s for e, s in by_ean.items() if len(s) > 1}
+
+
+def shared_onec_items(supply: Supply) -> dict[int, str]:
+    """Строка -> замечание «на этот же товар 1С ведёт …» по ответу проверки."""
+    by_item: dict[str, list] = {}
+    for r in supply.rows:
+        if r.onec_item_id and r.onec_status:
+            by_item.setdefault(r.onec_item_id, []).append(r)
+    notes = {}
+    for rows in by_item.values():
+        if len({r.ean for r in rows}) < 2:
+            continue
+        for r in rows:
+            others = sorted({o.supplier_sku for o in rows if o.ean != r.ean})
+            notes[r.id] = ("на этот же товар 1С ведёт " + ", ".join(f"«{s}»" for s in others)
+                           + " — остаток общий, в 1С уедет суммой")
+    return notes
+
+
+def _mark_shared_barcodes(supply: Supply) -> None:
+    for ean, skus in shared_barcodes(supply).items():
+        for r in supply.rows:
+            if r.ean == ean:
+                others = [s for s in skus if s != r.supplier_sku]
+                note = f"штрихкод {ean} стоит и у " + ", ".join(f"«{s}»" for s in others)
+                r.warnings = "; ".join(filter(None, [r.warnings, note]))
+
+
 def blocking_problems(supply: Supply) -> list[str]:
     """Что мешает отправить поставку в 1С."""
     out = []
@@ -262,6 +323,12 @@ def blocking_problems(supply: Supply) -> list[str]:
     no_cat = [r for r in supply.rows if not r.ean or r.price is None or r.price <= 0]
     if no_cat:
         out.append(f"строк без штрихкода или цены из справочника: {len(no_cat)}")
+    shared = shared_barcodes(supply)
+    if shared:
+        ean, skus = next(iter(shared.items()))
+        out.append(f"один штрихкод у разных артикулов ({len(shared)}): {ean} — "
+                   + ", ".join(f"«{s}»" for s in skus)
+                   + ". 1С различить их не может — исправьте штрихкод в каталоге Lamoda")
     return out
 
 

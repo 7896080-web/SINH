@@ -86,3 +86,20 @@ def test_check_file_format_matches_the_program():
 
 def test_module_version_is_reported():
     assert re.search(r'Возврат "mark-\d+";', _function("ВерсияМодуля"))
+
+
+def test_supply_barcode_lookup_follows_the_sync_admin_dictionary_rule():
+    """Товар поставки ищется тем же правилом, что справочник баркодов sync_admin:
+    только владелец-номенклатура, и штрихкод на двух товарах — отказ, а не
+    `ПЕРВЫЕ 1` наугад. Общая функция (по ней работает sync_admin) не тронута."""
+    f = _function("ТоварПоставкиПоШтрихкоду")
+    assert "ВЫБРАТЬ РАЗЛИЧНЫЕ ПЕРВЫЕ 2" in f
+    assert "Владелец ССЫЛКА Справочник.Номенклатура" in f
+    assert "Рез.Неоднозначно = Выборка.Следующий();" in f
+    parse = _function("РазобратьПозицииПоставки")
+    assert "ТоварПоставкиПоШтрихкоду(Поз.Баркод)" in parse
+    assert "НайтиНоменклатуруПоШтрихкоду" not in parse
+    assert 'Поз.Статус = "ambiguous"' in parse
+    # Позиция без однозначного товара в расчёт остатка не идёт (у неё нет ключа).
+    assert 'Если Поз.Статус <> "ok" Тогда' in parse
+    assert "ВЫБРАТЬ ПЕРВЫЕ 1" in _function("НайтиНоменклатуруПоШтрихкоду")

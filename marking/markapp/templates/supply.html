@@ -130,8 +130,8 @@
     <td>{{ r.onec_name }}{% if r.onec_size %} · {{ r.onec_size }}{% endif %}{% if r.onec_color %} · {{ r.onec_color }}{% endif %}</td>
     <td class="num">{{ r.onec_stock if r.onec_stock is not none else '' }}</td>
     <td class="{{ 'ok' if r.onec_status == 'ok' else ('bad' if r.onec_status else '') }}">
-      {{ {'ok': 'хватает', 'short': 'не хватает', 'not_found': 'не найден'}.get(r.onec_status, r.onec_status) }}</td>
-    <td class="warn">{{ r.warnings }}</td>
+      {{ {'ok': 'хватает', 'short': 'не хватает', 'not_found': 'не найден', 'ambiguous': 'штрихкод у нескольких товаров'}.get(r.onec_status, r.onec_status) }}</td>
+    <td class="warn">{{ '; '.join([r.warnings, onec_notes.get(r.id, '')]|select|list) }}</td>
   </tr>
   {% endfor %}
 </table>

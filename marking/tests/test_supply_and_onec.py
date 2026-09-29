@@ -294,3 +294,58 @@ def test_results_of_sync_admin_are_not_touched(db, exchange_dirs):
     onec.collect_results(db)
     assert theirs.exists()
     os.remove(theirs)
+
+
+# --- сопоставление по штрихкоду (правило sync_admin) ----------------------------
+
+def test_one_barcode_on_two_articles_blocks_the_supply(db, catalog):
+    """Штрихкод — ключ одного товара 1С. Два артикула Lamoda с одним штрихкодом
+    1С не различит: оба уедут одним товаром, а перемещение не отменяется."""
+    from markapp.models import CatalogItem
+    s = _supply(db)
+    # Типовая поставка чиста: каждый штрихкод у одного артикула.
+    assert not S.shared_barcodes(s) and not any("штрихкод" in p for p in S.blocking_problems(s))
+    a, b = s.rows[0], s.rows[1]
+    db.query(CatalogItem).filter(CatalogItem.supplier_sku == b.supplier_sku).one().ean = a.ean
+    db.commit()
+    S.refresh_from_catalog(db, s)
+    db.commit()
+    problems = S.blocking_problems(s)
+    assert any("один штрихкод у разных артикулов" in p and a.ean in p for p in problems)
+    assert f"«{b.supplier_sku}»" in a.warnings and f"«{a.supplier_sku}»" in b.warnings
+
+
+def test_two_barcodes_of_one_1c_item_are_noted_not_blocked(db, catalog, exchange_dirs):
+    """Разные штрихкоды одного товара 1С — альтернативные баркоды: остаток
+    общий, 1С сложит нужное. Замечание, а не отказ."""
+    _ready(db)
+    s = _supply(db)
+    task = onec.enqueue_check(db, s)
+    db.commit()
+    onec.publish_pending(db)
+    a, b = s.rows[0], s.rows[1]
+    check = _check_file(s).replace(f"|id-{b.position}|", f"|id-{a.position}|")
+    _answer(exchange_dirs, "mark_1", f"{task.order_id}|OK||SUPPLY_CHECK", check)
+    onec.collect_results(db)
+    db.refresh(s)
+    assert s.status == "checked"
+    notes = S.shared_onec_items(s)
+    assert set(notes) == {a.id, b.id}
+    assert b.supplier_sku in notes[a.id] and "суммой" in notes[a.id]
+
+
+def test_ambiguous_barcode_answer_is_shown(db, catalog, exchange_dirs):
+    _ready(db)
+    s = _supply(db)
+    task = onec.enqueue_check(db, s)
+    db.commit()
+    onec.publish_pending(db)
+    ean = s.rows[0].ean
+    check = _check_file(s).replace(
+        next(l for l in _check_file(s).splitlines() if l.startswith(ean)),
+        f"{ean}||||||0|{s.rows[0].qty}|ambiguous")
+    _answer(exchange_dirs, "mark_1",
+            f"{task.order_id}|ERROR|штрихкод {ean} записан на нескольких товарах 1С|SUPPLY_CHECK", check)
+    onec.collect_results(db)
+    db.refresh(s)
+    assert s.status == "draft" and s.rows[0].onec_status == "ambiguous"
