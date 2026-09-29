@@ -157,7 +157,7 @@ class SupplyRow(Base):
     extras = Column(JSON, nullable=False, default=list)
     warnings = Column(Text, nullable=False, default="")
     # Ответ 1С на SUPPLY_CHECK (построчно, из supplycheck_*.txt).
-    onec_status = Column(String(20), nullable=False, default="")   # ok | short | not_found
+    onec_status = Column(String(20), nullable=False, default="")   # ok | short | not_found | ambiguous
     onec_item_id = Column(String(64), nullable=False, default="")
     onec_article = Column(String(200), nullable=False, default="")
     onec_name = Column(String(500), nullable=False, default="")

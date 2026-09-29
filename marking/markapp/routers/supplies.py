@@ -120,7 +120,7 @@ def supply_detail(supply_id: int, request: Request, db: Session = Depends(get_db
                   epf_ready=onec.epf_ready(db), fbo=fbo, upd=upd, scheme=scheme,
                   scheme_warn=scheme_warn, sticker_warn=sticker_warn,
                   scheme_labels=U.SCHEME_LABELS, pending=pending, today=today_local(),
-                  gtins=gtins, cards=cards,
+                  gtins=gtins, cards=cards, onec_notes=S.shared_onec_items(supply),
                   no_gtin=len({r.supplier_sku for r in supply.rows if not gtins[r.id]}),
                   organizations=db.query(Organization).filter(Organization.is_active.is_(True)).all())
 
