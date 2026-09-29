@@ -30,8 +30,9 @@ from markapp.models import GtinPair, NkCard, NkRequest, Organization
 from markapp.timeutils import now_utc
 
 TRUE_API_URL = os.environ.get("MARKING_TRUE_API_URL", "https://markirovka.crpt.ru/api/v3/true-api")
-# Необязательный HTTP(S)-прокси до ЧЗ (ТЗ, 10.5): например, прокси с российским
-# адресом на машине с КриптоПро через SSH-туннель.
+# Необязательный HTTP(S)-прокси до ЧЗ (ТЗ, 10.5). С рабочего компьютера ЧЗ
+# доступен напрямую; прокси — на случай другой сети. CORS-прокси kiz-tool тут
+# не нужен: в ЧЗ ходит программа, а не страница браузера.
 CHZ_PROXY = os.environ.get("MARKING_CHZ_PROXY", "")
 
 MAX_GTINS_PER_REQUEST = 25
