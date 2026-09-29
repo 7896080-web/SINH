@@ -23,7 +23,15 @@ async def lifespan(app: FastAPI):
         ensure_defaults(db)
     finally:
         db.close()
+    # На рабочем компьютере службы-воркера нет — фоновая работа в этом же
+    # процессе. На сервере со службой marking_worker её выключают: MARKING_BACKGROUND=0.
+    background = os.environ.get("MARKING_BACKGROUND", "1") != "0"
+    if background:
+        from markapp.workers import background as bg
+        bg.start()
     yield
+    if background:
+        bg.stop()
 
 
 # Автодокументация выключена: она открыта без входа и отдаёт карту всех ручек.

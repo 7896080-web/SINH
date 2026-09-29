@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 
-from markapp import backup, nk, onec
+from markapp import backup, exchange, nk, onec
 from markapp.database import Base, SessionLocal, engine
 from markapp.settings import ensure_defaults
 from markapp.timeutils import now_utc
@@ -25,9 +25,14 @@ logger = logging.getLogger("marking.worker")
 def job_onec_exchange() -> None:
     db = SessionLocal()
     try:
-        sent = onec.publish_pending(db)
-        got = onec.collect_results(db)
         stuck = onec.mark_timeouts(db)
+        if not onec.has_work(db):
+            # Обмен — по факту работы с поставкой: нет заданий — сервер не трогаем.
+            beat(db, "onec_exchange", True, "")
+            return
+        with exchange.current() as ex:
+            sent = onec.publish_pending(db, ex)
+            got = onec.collect_results(db, ex)
         notes = []
         if got["unmatched"]:
             # Ответ, не легший ни на одно задание, уже в архиве и не вернётся.

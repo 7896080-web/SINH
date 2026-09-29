@@ -17,15 +17,13 @@
 """
 from __future__ import annotations
 
-import os
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from pathlib import Path
 
 from sqlalchemy.orm import Session
 
-from markapp import audit, config, settings
+from markapp import audit, config, exchange, settings
 from markapp.models import OnecTask, OnecTaskStatus, Supply, SupplyStatus
 from markapp.supplies import movement_problems
 from markapp.timeutils import now_utc, ru
@@ -133,7 +131,22 @@ def _task_filename(now: datetime) -> str:
     return f"task_mark_{now:%Y%m%d%H%M%S%f}.txt"
 
 
-def publish_pending(db: Session, tasks_dir: Path | None = None) -> int:
+def has_work(db: Session) -> bool:
+    """Есть ли зачем обращаться к 1С: задание ждёт отправки или ответа.
+
+    Обмен по факту работы с поставкой, а не постоянный опрос: пока заданий нет,
+    сервер не трогаем вовсе. Зависшие ждём ещё сутки — опоздавший ответ честнее
+    вечного «timeout» (AWAITING), но опрашивать их вечно незачем.
+    """
+    recent = now_utc() - timedelta(days=1)
+    return db.query(OnecTask).filter(
+        OnecTask.is_test.is_(False),
+        (OnecTask.status.in_((OnecTaskStatus.pending.value, OnecTaskStatus.sent.value)))
+        | ((OnecTask.status == OnecTaskStatus.timeout.value) & (OnecTask.sent_at > recent)),
+    ).first() is not None
+
+
+def publish_pending(db: Session, ex=None) -> int:
     """Кладёт все ждущие задания одним файлом. Возвращает число строк.
 
     Порядок «файл → коммит», а не наоборот (у sync_admin наоборот — из-за
@@ -142,7 +155,6 @@ def publish_pending(db: Session, tasks_dir: Path | None = None) -> int:
     Упади коммит после записи файла — задание уйдёт ещё раз, и это безопасно;
     при обратном порядке оно считалось бы отправленным, не будучи им.
     """
-    tasks_dir = Path(tasks_dir or config.ONEC_TASKS_DIR)
     pending = (db.query(OnecTask)
                .filter(OnecTask.status == OnecTaskStatus.pending.value,
                        OnecTask.is_test.is_(False))
@@ -157,16 +169,21 @@ def publish_pending(db: Session, tasks_dir: Path | None = None) -> int:
     pending = [t for t in pending if t.command != "SUPPLY_CHECK" or t is first_check]
     if not pending:
         return 0
-    tasks_dir.mkdir(parents=True, exist_ok=True)
+    if ex is None:
+        with exchange.current() as ex:
+            return _publish(db, ex, pending)
+    return _publish(db, ex, pending)
+
+
+def _publish(db: Session, ex, pending: list[OnecTask]) -> int:
     now = now_utc()
     name = _task_filename(now)
-    while (tasks_dir / name).exists():
+    while ex.task_exists(name):
         now += timedelta(microseconds=1)
         name = _task_filename(now)
-    tmp = tasks_dir / (name + ".part")
-    # 1С не должна увидеть недописанный файл: пишем под временным именем.
-    tmp.write_text("\n".join(t.line for t in pending), encoding="utf-8")
-    os.replace(tmp, tasks_dir / name)
+    # 1С не должна увидеть недописанный файл: транспорт пишет `.part` и
+    # переименовывает.
+    ex.put_task(name, "\n".join(t.line for t in pending))
     for t in pending:
         t.status = OnecTaskStatus.sent.value
         t.sent_at = now
@@ -298,8 +315,7 @@ def apply_result_text(db: Session, text: str, check_text: str = "") -> dict:
     return stats
 
 
-def collect_results(db: Session, results_dir: Path | None = None,
-                    archive_dir: Path | None = None) -> dict:
+def collect_results(db: Session, ex=None) -> dict:
     """Разбирает `result_mark_*.txt` из своего подкаталога.
 
     Файл архивируется ПОСЛЕ коммита разбора: архивирование первым делом
@@ -307,32 +323,35 @@ def collect_results(db: Session, results_dir: Path | None = None,
     1С его не пришлёт. Разбор идемпотентен (закрытое задание второй раз не
     найдётся), поэтому перечитать тот же файл безопасно.
     """
-    results_dir = Path(results_dir or config.ONEC_RESULTS_DIR)
-    archive_dir = Path(archive_dir or config.ONEC_ARCHIVE_DIR)
+    if ex is None:
+        with exchange.current() as ex:
+            return _collect(db, ex)
+    return _collect(db, ex)
+
+
+def _collect(db: Session, ex) -> dict:
     total = {"files": 0, "ok": 0, "error": 0, "unmatched": 0, "failed_files": []}
-    if not results_dir.exists():
-        return total
-    for path in sorted(results_dir.glob("result_mark_*.txt")):
-        label = path.name[len("result_"):-len(".txt")]
-        check_path = results_dir / f"supplycheck_{label}.txt"
+    for name in ex.result_names():
+        label = name[len("result_"):-len(".txt")]
+        check_name = f"supplycheck_{label}.txt"
         # Файл, который не разбирается, НЕ останавливает остальные: раньше
         # исключение уходило наверх, и каждый цикл спотыкался об один и тот же
         # первый по имени файл — ответы за ним не применялись никогда, а зависшие
         # задания не отмечались. Сломанный файл остаётся на месте (повторно 1С
         # его не пришлёт) и называется в отметке задания.
         try:
-            text = path.read_text(encoding="utf-8-sig")
-            check_text = check_path.read_text(encoding="utf-8-sig") if check_path.exists() else ""
+            text = ex.read_result(name)
+            if text is None:
+                continue
+            check_text = ex.read_result(check_name) or ""
             stats = apply_result_text(db, text, check_text)
             db.commit()
         except Exception as e:
             db.rollback()
-            total["failed_files"].append(f"{path.name}: {type(e).__name__}: {e}"[:300])
+            total["failed_files"].append(f"{name}: {type(e).__name__}: {e}"[:300])
             continue
-        archive_dir.mkdir(parents=True, exist_ok=True)
-        os.replace(path, archive_dir / path.name)
-        if check_path.exists():
-            os.replace(check_path, archive_dir / check_path.name)
+        ex.archive_result(name)
+        ex.archive_result(check_name)
         total["files"] += 1
         for k in ("ok", "error", "unmatched"):
             total[k] += stats[k]

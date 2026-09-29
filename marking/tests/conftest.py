@@ -18,6 +18,9 @@ os.environ["MARKING_ONEC_RESULTS_DIR"] = str(_TMP / "sync" / "results" / "markin
 os.environ["MARKING_ONEC_ARCHIVE_DIR"] = str(_TMP / "sync" / "archive" / "marking")
 os.environ["MARKING_BACKUP_DIR"] = str(_TMP / "backups")
 os.environ["MARKING_RCLONE_REMOTE"] = ""
+# Фоновый поток в тестах не нужен: задания зовутся из тестов явно.
+os.environ["MARKING_BACKGROUND"] = "0"
+os.environ["MARKING_ONEC_SFTP_HOST"] = ""
 
 import pytest  # noqa: E402
 
