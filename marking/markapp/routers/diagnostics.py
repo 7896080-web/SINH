@@ -1,5 +1,7 @@
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import RedirectResponse
+from pathlib import Path
+
+from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.orm import Session
 
 from markapp import audit, backup, config, onec, settings
@@ -38,6 +40,17 @@ def _dirs() -> dict:
     return {"обмен с 1С": "локальные папки", "задания": config.ONEC_TASKS_DIR,
             "ответы": config.ONEC_RESULTS_DIR, "архив": config.ONEC_ARCHIVE_DIR,
             "копии": config.BACKUP_DIR}
+
+
+PLUGIN_CHECK = Path(__file__).resolve().parents[2] / "tools" / "plugin_check.html"
+
+
+@router.get("/diagnostics/plugin-check")
+def plugin_check(user: User = Depends(get_current_user)):
+    """Проверка плагина КриптоПро — с ТОГО ЖЕ адреса, что и программа: доверие
+    плагина зависит от адреса страницы, и проверка с file:// или другого порта
+    ничего не сказала бы о работе программы."""
+    return HTMLResponse(PLUGIN_CHECK.read_text(encoding="utf-8"))
 
 
 @router.post("/diagnostics/ping")
