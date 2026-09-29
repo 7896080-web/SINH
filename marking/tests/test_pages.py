@@ -200,3 +200,20 @@ def test_numbering_cannot_go_below_a_taken_number(client, db):
     assert "меньше уже выданного 12560" in r.text
     db.expire_all()
     assert settings.get(db, settings.SUPPLY_LAST_NUMBER) == "12560"
+
+
+def test_upd_number_always_equals_supply_number(client, db):
+    """Правило Lamoda: номер поставки = номер УПД. Отдельно его не задать ни при
+    создании, ни правкой шапки, и смена номера тянет номер УПД за собой."""
+    _upload_catalog(client)
+    client.post("/supplies/new", data={"number": "12560", "doc_number": "ДРУГОЙ", "supply_date": "2026-10-02"},
+                files={"file": ("in.xlsx", fixture_bytes("lamoda_shipment_input_typical.xlsx"), XLSX)})
+    s = db.query(Supply).one()
+    assert s.doc_number == s.number == "12560"
+    client.post(f"/supplies/{s.id}/header", data={"number": "12570", "doc_number": "X-1",
+                                                  "supply_date": "2026-10-02", "scheme_choice": "auto"})
+    db.expire_all()
+    s = db.query(Supply).one()
+    assert s.doc_number == s.number == "12570"
+    from markapp import supplies as S
+    assert any("не равен номеру поставки" in e for e in S.validate_numbers(db, "1", "2"))
