@@ -86,7 +86,7 @@ def test_the_scanner_would_actually_catch_the_arrow():
 
 
 @pytest.mark.parametrize("name", ["probe_zero_sends.py", "catalog_diff.py",
-                                  "probe_offset.py"])
+                                  "probe_offset.py", "probe_order.py"])
 def test_scripts_that_print_foreign_data_do_not_die_on_it(name):
     """Свои строки мы держим в кодировке, чужие — не можем.
 
