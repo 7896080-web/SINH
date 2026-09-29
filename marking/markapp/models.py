@@ -236,3 +236,56 @@ class WorkerHeartbeat(Base):
     last_run_at = Column(DateTime, nullable=True)
     last_success = Column(Boolean, nullable=False, default=True)
     last_error = Column(Text, nullable=False, default="")
+
+
+class GtinPair(Base):
+    """Справочник «размерный артикул ↔ GTIN» (ТЗ, 5.3). Строго один к одному.
+
+    `exported_at` пусто — пару Lamoda ещё не получала (её надо выгрузить в
+    `product_gtin`). Пары, пришедшие из файлов `product_gtin`, по определению
+    уже у Lamoda.
+    """
+    __tablename__ = "gtin_pairs"
+    id = Column(Integer, primary_key=True)
+    supplier_sku = Column(String(300), nullable=False, unique=True)
+    gtin = Column(String(14), nullable=False, unique=True)
+    source = Column(String(20), nullable=False)          # product_gtin | fbo | manual
+    source_name = Column(String(300), nullable=False, default="")
+    exported_at = Column(DateTime, nullable=True)
+    created_by = Column(String(64), nullable=False, default="")
+    created_at = Column(DateTime, nullable=False, default=now_utc)
+
+
+class NkCard(Base):
+    """Кэш карточки Национального каталога по GTIN.
+
+    Лимит `/nk/product` жёсткий (10 запросов за 5 минут), поэтому этикетки и
+    проверки читают этот кэш, а не сеть. Сырой ответ хранится целиком: имена
+    атрибутов одежды документация показывает только на примере сметаны, и
+    разбор настраивается по живому ответу.
+    """
+    __tablename__ = "nk_cards"
+    gtin = Column(String(14), primary_key=True)
+    status = Column(String(20), nullable=False, default="pending")  # pending | ok | not_found | error
+    good_id = Column(String(32), nullable=False, default="")
+    name = Column(String(500), nullable=False, default="")
+    card_status = Column(String(64), nullable=False, default="")
+    color = Column(String(200), nullable=False, default="")
+    size = Column(String(100), nullable=False, default="")
+    tn_ved = Column(String(20), nullable=False, default="")
+    attrs = Column(JSON, nullable=False, default=list)
+    raw = Column(Text, nullable=False, default="")
+    error = Column(Text, nullable=False, default="")
+    organization_id = Column(Integer, ForeignKey("organizations.id"), nullable=True)
+    requested_at = Column(DateTime, nullable=False, default=now_utc)
+    fetched_at = Column(DateTime, nullable=True)
+
+
+class NkRequest(Base):
+    """Отметки запросов к Нацкаталогу — для ограничителя. В базе, а не в памяти:
+    веб (кнопка «обновить») и воркер — два процесса."""
+    __tablename__ = "nk_requests"
+    id = Column(Integer, primary_key=True)
+    organization_id = Column(Integer, ForeignKey("organizations.id"), nullable=False, index=True)
+    at = Column(DateTime, nullable=False, default=now_utc, index=True)
+    http_status = Column(Integer, nullable=True)

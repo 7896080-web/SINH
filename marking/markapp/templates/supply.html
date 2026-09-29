@@ -10,6 +10,7 @@
     <span>Строк: <b>{{ totals.rows }}</b></span>
     <span>Штук: <b>{{ totals.units }}</b></span>
     <span>Сумма с НДС: <b>{{ totals.money|money }}</b></span>
+    <span>Без GTIN: <b class="{{ 'warn' if no_gtin else '' }}">{{ no_gtin }}</b> арт.</span>
     <span>Файл: {{ supply.source_filename }}</span>
     {% if supply.onec_document %}<span>Документ 1С: <b>{{ supply.onec_document }}</b></span>{% endif %}
   </div>
@@ -113,7 +114,7 @@
 <table>
   <tr><th>#</th><th>Размерный артикул</th><th class="num">Кол-во</th><th class="num">Цена</th><th>EAN</th>
     {% for h in supply.extra_headers %}<th>{{ h }}</th>{% endfor %}
-    <th>1С: товар</th><th class="num">Остаток ЦС</th><th>1С</th><th>Замечания</th></tr>
+    <th>GTIN</th><th>НК: цвет / размер</th><th>1С: товар</th><th class="num">Остаток ЦС</th><th>1С</th><th>Замечания</th></tr>
   {% for r in supply.rows %}
   <tr>
     <td>{{ r.position }}</td>
@@ -123,6 +124,9 @@
     <td class="num">{{ r.price|money }}</td>
     <td>{{ r.ean }}</td>
     {% for v in r.extras %}<td>{{ v }}</td>{% endfor %}
+    {% set g = gtins[r.id] %}{% set c = cards.get(g) %}
+    <td>{% if g %}<a href="/gtin/card/{{ g }}">{{ g }}</a>{% else %}<span class="warn">нет GTIN</span>{% endif %}</td>
+    <td>{% if c and c.status == 'ok' %}{{ c.color or '—' }} / {{ c.size or '—' }}{% elif c %}<span class="muted">{{ {'pending': 'ждёт НК', 'not_found': 'нет в НК', 'error': 'ошибка НК'}.get(c.status, '') }}</span>{% endif %}</td>
     <td>{{ r.onec_name }}{% if r.onec_size %} · {{ r.onec_size }}{% endif %}{% if r.onec_color %} · {{ r.onec_color }}{% endif %}</td>
     <td class="num">{{ r.onec_stock if r.onec_stock is not none else '' }}</td>
     <td class="{{ 'ok' if r.onec_status == 'ok' else ('bad' if r.onec_status else '') }}">

@@ -12,11 +12,22 @@ LAMODA_ORG = "lamoda_org_id"
 SUPPLY_LAST_NUMBER = "supply_last_number"
 SUPPLY_STEP = "supply_step"
 AGENCY_FROM = "agency_from"          # дата перехода на агентский договор, ДД.ММ.ГГГГ
+# Нацкаталог: лимит запросов (70% от документных 10 за 5 минут) и имена
+# атрибутов карточки через «;» — в порядке приоритета. Имена — по живому ответу.
+NK_LIMIT = "nk_limit_per_5min"
+NK_BLOCKED_UNTIL = "nk_blocked_until"
+NK_ATTR_COLOR = "nk_attr_color"
+NK_ATTR_SIZE = "nk_attr_size"
+NK_ATTR_TNVED = "nk_attr_tnved"
 
 DEFAULTS = {
     SUPPLY_LAST_NUMBER: "12550",
     SUPPLY_STEP: "10",
     AGENCY_FROM: "01.10.2026",
+    NK_LIMIT: "7",
+    NK_ATTR_COLOR: "Цвет",
+    NK_ATTR_SIZE: "Размер одежды; Размер изделия; Размер; Российский размер",
+    NK_ATTR_TNVED: "Код ТН ВЭД; ТН ВЭД; Код ТНВЭД; ТНВЭД",
 }
 
 # Реквизиты ИП Яворской — из upd-constructor (источник истины — принятые УПД).

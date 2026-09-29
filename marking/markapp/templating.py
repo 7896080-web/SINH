@@ -21,6 +21,7 @@ templates.env.filters["money"] = money
 NAV = [
     ("supplies", "/supplies", "Поставки Lamoda"),
     ("catalog", "/catalog", "Одежда полный"),
+    ("gtin", "/gtin", "Справочник GTIN"),
     ("organizations", "/organizations", "Организации"),
     ("diagnostics", "/diagnostics", "Диагностика"),
 ]

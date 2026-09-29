@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
 from fastapi.responses import RedirectResponse, Response
 from sqlalchemy.orm import Session
 
-from markapp import audit, onec, settings, stickers, supplies as S, upd_service as U
+from markapp import audit, gtin as G, nk, onec, settings, stickers, supplies as S, upd_service as U
 from markapp.database import get_db
 from markapp.deps import get_current_user
 from markapp.flash import flash
@@ -110,12 +110,18 @@ def supply_detail(supply_id: int, request: Request, db: Session = Depends(get_db
             sticker_warn = (f"УПД выпущен по схеме «{U.SCHEME_LABELS[upd.scheme]}», а по плановой дате "
                             f"стикеры печатались бы как «{U.SCHEME_LABELS[planned]}». Перепечатайте стикеры.")
     pending = [t for t in tasks if t.status in ("pending", "sent")]
+    gmap = G.gtin_map(db)
+    gtins = {r.id: gmap.get(r.supplier_sku, "") for r in supply.rows}
+    from markapp.models import NkCard
+    cards = {c.gtin: c for c in db.query(NkCard).filter(NkCard.gtin.in_([g for g in gtins.values() if g])).all()}
     return render(request, "supply.html", user, "supplies", supply=supply, tasks=tasks,
                   totals=S.totals(supply), problems=S.blocking_problems(supply),
                   editable=supply.status in [s.value for s in EDITABLE_STATUSES],
                   epf_ready=onec.epf_ready(db), fbo=fbo, upd=upd, scheme=scheme,
                   scheme_warn=scheme_warn, sticker_warn=sticker_warn,
                   scheme_labels=U.SCHEME_LABELS, pending=pending, today=today_local(),
+                  gtins=gtins, cards=cards,
+                  no_gtin=len({r.supplier_sku for r in supply.rows if not gtins[r.id]}),
                   organizations=db.query(Organization).filter(Organization.is_active.is_(True)).all())
 
 
@@ -292,9 +298,19 @@ async def supply_fbo(supply_id: int, request: Request, file: UploadFile = File(.
         report = "\n".join(res.problems + getattr(res, "_diffs", []) + res.notes)
         db.add(FboUpload(supply_id=supply.id, filename=file.filename or "", content=data,
                          ok=res.ok, report=report, username=user.username))
+        pairs_note = ""
+        if res.ok:
+            # Выгрузка — полный источник связки артикул ↔ GTIN (GTIN из кода строки).
+            added = G.import_fbo_pairs(db, U.read_fbo(data).rows, file.filename or "", user.username)
+            nk.queue_missing(db)
+            pairs_note = f" Справочник GTIN: новых пар {added.added}"
+            if added.conflicts:
+                pairs_note += f", КОНФЛИКТОВ {len(added.conflicts)}: " + "; ".join(added.conflicts[:2])
+            pairs_note += "."
         db.commit()
         if res.ok:
-            flash(request, f"Выгрузка сверена с поставкой: {res.rows} строк, {res.units} шт. Можно выпускать УПД.", "ok")
+            flash(request, f"Выгрузка сверена с поставкой: {res.rows} строк, {res.units} шт. Можно выпускать УПД."
+                  + pairs_note, "warn" if "КОНФЛИКТ" in pairs_note else "ok")
         else:
             flash(request, "Выгрузка НЕ сходится с поставкой: " + "; ".join(res.problems), "error")
     except S.SupplyError as e:
