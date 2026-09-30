@@ -350,8 +350,16 @@ def _collect(db: Session, ex) -> dict:
             db.rollback()
             total["failed_files"].append(f"{name}: {type(e).__name__}: {e}"[:300])
             continue
-        ex.archive_result(name)
-        ex.archive_result(check_name)
+        # Разбор уже закоммичен. Не удался перенос в архив (права на сервере,
+        # занятый файл) — ответ не теряется и не применяется второй раз (задание
+        # закрыто), но файл останется лежать и будет виден: называем его, а не
+        # роняем обмен, иначе следующие ответы за ним не разобрались бы вовсе.
+        try:
+            ex.archive_result(name)
+            ex.archive_result(check_name)
+        except Exception as e:
+            total["failed_files"].append(f"{name}: разобран, но не перенесён в архив: "
+                                         f"{type(e).__name__}: {e}"[:300])
         total["files"] += 1
         for k in ("ok", "error", "unmatched"):
             total[k] += stats[k]

@@ -25,12 +25,16 @@
    Скрипт создаёт venv и `.env` со своими секретами, ключ SFTP, записывает
    ключ сервера, прогоняет миграции и тесты, заводит первого пользователя и
    кладёт ярлык «Маркировка» на рабочий стол.
-4. **Сервер** — по `SFTP_1C.md`: учётная запись `marking_sftp`, открытый ключ
-   из вывода установщика, сверка отпечатка ключа сервера.
+4. **Сервер** — OpenSSH Server и `server_sftp_setup.ps1` с открытым ключом из
+   вывода установщика (`SFTP_1C.md`, «Коротко»). Затем **ещё раз** запустить
+   установщик: он запишет ключ сервера и напечатает отпечаток — сверить с
+   тем, что напечатал сервер.
 5. **Ключ шифрования.** Перенесите `MARKING_SECRETS_KEY` из `C:\marking\.env`
    туда, где храните пароли. **Не** на Яндекс.Диск рядом с копиями.
 6. **Обработка 1С** — по `C:\marking\1c\ОБНОВЛЕНИЕ_ОБРАБОТКИ.md`, с проверкой
-   на копии базы. Затем в программе: «Диагностика» → «Отправить PING».
+   на копии базы (в `C:\sync_test`, не в `C:\sync`). Текст модуля — в
+   репозитории `1c/ОбменССайтом_МодульОбъекта.txt` (в `C:\marking` его нет:
+   каталог `1c/` корня репозитория в программу не входит). Затем в программе: «Диагностика» → «Отправить PING».
 7. **Справочники и организация.**
    - «Одежда полный» — загрузить выгрузку каталога Lamoda Seller.
    - «Организации» — проверить реквизиты ИП Яворской и номер последней
@@ -67,9 +71,7 @@
    C:\marking\tools\rclone.exe --config C:\marking\rclone.conf config
    ```
    Выберите: `n` → имя `yandex` → **Yandex Disk** → `client_id` и
-   `client_secret` пустые → авторизация. Если браузер на сервере не
-   открывается, выполните `rclone authorize "yandex"` на своём компьютере и
-   вставьте полученный токен.
+   `client_secret` пустые → авторизация в открывшемся браузере.
 3. Создайте папку в облаке:
    ```powershell
    C:\marking\tools\rclone.exe --config C:\marking\rclone.conf mkdir yandex:marking_backups
@@ -88,14 +90,17 @@
 Сначала остановить программу (как в `update_workstation.ps1`):
 ```powershell
 Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object { $_.CommandLine -like "*markapp.main:app*" } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
-# Прежнюю базу вместе со спутниками -wal/-shm отложить, а не удалять:
-Rename-Item C:\marking\marking.db marking.db.before-restore
-Remove-Item C:\marking\marking.db-wal, C:\marking\marking.db-shm -ErrorAction SilentlyContinue
+# Прежнюю базу ВМЕСТЕ со спутниками -wal/-shm отложить, а не удалять:
+$stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+foreach ($s in @("", "-wal", "-shm")) {
+    if (Test-Path "C:\marking\marking.db$s") { Rename-Item "C:\marking\marking.db$s" "marking.db$s.before-restore-$stamp" }
+}
 Copy-Item C:\marking\backups\marking-ГГГГММДД-ЧЧММСС.db C:\marking\marking.db
 ```
 Затем запустить ярлыком «Маркировка».
-`-wal` и `-shm` удалять **обязательно**: иначе SQLite при первом открытии
-накатит их поверх копии со страницами прежней базы.
+Спутники `-wal` и `-shm` убрать от новой базы **обязательно**: иначе SQLite
+при первом открытии накатит их поверх копии со страницами прежней базы. Их
+переименование выше и есть это «убрать», а прежняя база остаётся целой рядом.
 
 ## Запасной вариант: программа на сервере
 
