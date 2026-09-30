@@ -103,3 +103,14 @@ def test_supply_barcode_lookup_follows_the_sync_admin_dictionary_rule():
     # Позиция без однозначного товара в расчёт остатка не идёт (у неё нет ключа).
     assert 'Если Поз.Статус <> "ok" Тогда' in parse
     assert "ВЫБРАТЬ ПЕРВЫЕ 1" in _function("НайтиНоменклатуруПоШтрихкоду")
+
+
+def test_repository_module_uses_the_production_exchange_folders():
+    """Проверка на копии базы идёт тестовой сборкой с `C:\\sync_test`
+    (1c/ОБНОВЛЕНИЕ_ОБРАБОТКИ.md, шаг 4). В репозиторий обязан попадать модуль с
+    БОЕВЫМИ путями: собранная из него обработка с `C:\\sync_test` читала бы на бою
+    пустую папку, и sync_admin молча перестал бы получать ответы 1С."""
+    f = _function("ПараметрыОбмена")
+    for d in ("tasks", "results", "archive"):
+        assert f'"C:\\sync\\{d}"' in f, d
+    assert "sync_test" not in _text()
