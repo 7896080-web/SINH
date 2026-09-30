@@ -30,8 +30,8 @@
   </div>
   <div class="card">
     <h2>Нацкаталог</h2>
-    {% if not has_key %}<p class="warn">Нет API-ключа Нацкаталога у ИП для Lamoda ({{ org.name if org else '—' }}) — карточки не запрашиваются.
-      Ключ вводится на странице организации.</p>{% endif %}
+    {% if not has_token %}<p class="warn">Нужен вход в ЧЗ ({{ org.name if org else 'ИП для Lamoda не выбран' }}) — без него карточки не запрашиваются.
+      {% if org %}<a href="/organizations/{{ org.id }}/chz-login">Войти в ЧЗ</a>{% endif %}</p>{% endif %}
     <p>Карточки: получено <b>{{ counts.ok }}</b>, ждут <b>{{ counts.pending }}</b>, нет в НК <b>{{ counts.not_found }}</b>, ошибок <b>{{ counts.error }}</b>.</p>
     <p class="muted">Лимит НК — 10 запросов за 5 минут по 25 GTIN; работаем на {{ nk_limit }}. Воркер забирает очередь сам.</p>
   </div>

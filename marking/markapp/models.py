@@ -49,6 +49,11 @@ class Organization(Base):
     connection_id = Column(String(64), nullable=True)
     nk_api_key_enc = Column(Text, nullable=True)
     cert_thumbprint = Column(String(64), nullable=True)
+    # Токены входа сертификатом (chz_auth), зашифрованы; срок — UTC.
+    chz_token_enc = Column(Text, nullable=True)
+    chz_token_until = Column(DateTime, nullable=True)
+    suz_token_enc = Column(Text, nullable=True)
+    suz_token_until = Column(DateTime, nullable=True)
     is_active = Column(Boolean, nullable=False, default=True)
     created_at = Column(DateTime, nullable=False, default=now_utc)
 

@@ -7,7 +7,7 @@ import pytest
 
 from conftest import FIXTURES, fixture_bytes
 from markapp import gtin as G
-from markapp import nk, settings
+from markapp import chz_auth, nk, settings
 from markapp.crypto import decrypt_value
 from markapp.models import GtinPair, NkCard, NkRequest
 from markapp.upd_service import read_fbo
@@ -168,6 +168,7 @@ def fake_nk(db):
     _FakeClient.calls, _FakeClient.status, _FakeClient.missing = [], 200, set()
     org = settings.lamoda_org(db)
     nk.set_api_key(db, org, "KEY-123")
+    chz_auth.store(db, org, "true_api", "TOKEN-123")
     db.commit()
     return _FakeClient
 
@@ -225,18 +226,30 @@ def test_429_pauses_and_keeps_cards_waiting(db, fake_nk):
     assert nk.fetch_due(db, fake_nk)["requests"] == 0      # пауза держится
 
 
-def test_rejected_key_is_named(db, fake_nk):
+def test_fetch_goes_with_the_login_token(db, fake_nk):
     _pairs(db, 1)
+    nk.fetch_due(db, fake_nk)
+    assert fake_nk.calls[0][0] == "TOKEN-123"
+
+
+def test_rejected_token_is_forgotten_and_cards_wait_for_login(db, fake_nk):
+    """401 — токен отозван: карточки не «ошибка», а ждут; дальше — новый вход."""
+    _pairs(db, 2)
     fake_nk.status = 401
     stats = nk.fetch_due(db, fake_nk)
-    assert "ключ Нацкаталога не принят" in stats["note"]
+    assert "нужен вход в ЧЗ" in stats["note"]
+    assert db.query(NkCard).filter(NkCard.status == "pending").count() == 2
+    assert chz_auth.token(settings.lamoda_org(db)) is None
+    assert nk.fetch_due(db, fake_nk)["requests"] == 0
 
 
-def test_without_key_nothing_is_requested_but_it_is_said(db):
+def test_without_login_nothing_is_requested_but_it_is_said(db):
+    """Одного API-ключа мало: True API без токена отвечает 401 (30.09.2026)."""
     _pairs(db, 2)
+    nk.set_api_key(db, settings.lamoda_org(db), "KEY-123")
     _FakeClient.calls = []
     stats = nk.fetch_due(db, _FakeClient)
-    assert _FakeClient.calls == [] and "нет API-ключа" in stats["note"]
+    assert _FakeClient.calls == [] and "нужен вход в ЧЗ" in stats["note"]
 
 
 def test_reparse_after_changing_attribute_names(db, fake_nk):
@@ -254,7 +267,7 @@ def test_real_client_never_sends_key_and_token_together(monkeypatch):
         seen.update(url=url, params=params, headers=headers)
         return _Resp(200, {"result": []})
     monkeypatch.setattr(nk.requests, "get", fake_get)
-    nk.NkClient("K").product(["04620180403734", "04630688318072"])
+    nk.NkClient("T").product(["04620180403734", "04630688318072"])
     assert seen["url"].endswith("/nk/product")
-    assert seen["params"] == {"gtins": "04620180403734;04630688318072", "apikey": "K"}
-    assert "Authorization" not in seen["headers"]
+    assert seen["params"] == {"gtins": "04620180403734;04630688318072"}
+    assert seen["headers"]["Authorization"] == "Bearer T"

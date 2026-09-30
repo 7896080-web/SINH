@@ -25,4 +25,13 @@
   <button>Сохранить</button>
 </form>
 </div>
+{% if org.id %}
+<div class="card">
+  <h2>Вход в Честный знак</h2>
+  <p>True API: {% if chz_until %}<b class="ok">вошли до {{ chz_until|local_time }}</b>{% else %}<b class="warn">нужен вход</b>{% endif %}
+     · СУЗ: {% if suz_until %}<b class="ok">вошли до {{ suz_until|local_time }}</b>{% elif org.connection_id %}<b class="warn">нужен вход</b>{% else %}<span class="muted">нет ID соединения</span>{% endif %}</p>
+  <p class="muted">Вход — сертификатом этого ИП через плагин КриптоПро, действует ~10 часов. Без него карточки Нацкаталога не запрашиваются.</p>
+  <p><a class="btn" href="/organizations/{{ org.id }}/chz-login">Войти в ЧЗ</a></p>
+</div>
+{% endif %}
 {% endblock %}

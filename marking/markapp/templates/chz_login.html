@@ -1,0 +1,135 @@
+{% extends "base.html" %}
+{% block title %}Вход в ЧЗ — {{ org.name }}{% endblock %}
+{% block content %}
+<h1>Вход в Честный знак — {{ org.name }}</h1>
+<div class="card">
+  <p>ИНН организации: <b>{{ org.inn }}</b>.
+     True API: {% if chz_until %}<b class="ok">вошли до {{ chz_until|local_time }}</b>{% else %}<b class="warn">нужен вход</b>{% endif %}
+     · СУЗ: {% if suz_until %}<b class="ok">вошли до {{ suz_until|local_time }}</b>{% elif org.connection_id %}<b class="warn">нужен вход</b>{% else %}<span class="muted">нет ID соединения — только True API</span>{% endif %}</p>
+  <p>Плагин: <b id="status">загрузка…</b></p>
+  <table id="certs" hidden>
+    <thead><tr><th></th><th>Владелец</th><th>ИНН</th><th>Действует до</th></tr></thead>
+    <tbody></tbody>
+  </table>
+  <p><button id="loginBtn" disabled>Войти выбранным сертификатом</button>
+     <a class="btn secondary" href="/organizations/{{ org.id }}">К организации</a></p>
+  <p class="muted">Строку для подписи программа берёт у ЧЗ сама; страница только подписывает её плагином (может спросить PIN).
+     Выбрать можно лишь действующий сертификат с ИНН {{ org.inn }}.</p>
+  <div id="log"></div>
+</div>
+
+<script src="https://www.cryptopro.ru/sites/default/files/products/cades/cadesplugin_api.js"></script>
+<script>
+  var ORG_ID = {{ org.id }}, ORG_INN = {{ org.inn|tojson }}, WITH_SUZ = {{ 'true' if org.connection_id else 'false' }};
+  var certs = [];
+  function $(id) { return document.getElementById(id); }
+  function log(text, cls) {
+    var d = document.createElement('div');
+    d.textContent = new Date().toLocaleTimeString('ru-RU') + '  ' + text;
+    if (cls) d.className = cls;
+    $('log').appendChild(d);
+  }
+  function setStatus(text, cls) { $('status').textContent = text; $('status').className = cls; }
+  function errText(e) { return (window.cadesplugin && cadesplugin.getLastError) ? cadesplugin.getLastError(e) : String(e); }
+  // Как в plugin_check.html: ИНН в субъекте — «ИНН=», «INN=» или OID; у ФНС бывает дополнен нулями до 12.
+  function innOf(subject) {
+    var m = subject.match(/(?:^|,\s*)(?:ИНН|INN|OID\.1\.2\.643\.3\.131\.1\.1)=\s*"?(\d{10,12})/);
+    return m ? m[1] : '';
+  }
+  function sameInn(a, b) { return !!a && !!b && (a === b || ('00' + a).slice(-12) === ('00' + b).slice(-12)); }
+  function cnOf(subject) {
+    var m = subject.match(/(?:^|,\s*)CN=\s*"?([^",]+)/);
+    return m ? m[1] : subject.split(',')[0];
+  }
+
+  if (!window.cadesplugin) {
+    setStatus('не найден', 'bad');
+    log('Скрипт плагина не загрузился или расширение КриптоПро выключено.', 'bad');
+  } else {
+    cadesplugin.then(function () { setStatus('активен', 'ok'); listCerts(); },
+                     function (e) { setStatus('не инициализировался', 'bad'); log(errText(e), 'bad'); });
+  }
+
+  function listCerts() {
+    cadesplugin.async_spawn(function* () {
+      try {
+        var store = yield cadesplugin.CreateObjectAsync('CAdESCOM.Store');
+        yield store.Open(cadesplugin.CAPICOM_CURRENT_USER_STORE, cadesplugin.CAPICOM_MY_STORE,
+                         cadesplugin.CAPICOM_STORE_OPEN_MAXIMUM_ALLOWED);
+        var coll = yield store.Certificates;
+        var n = yield coll.Count, usable = 0, body = $('certs').querySelector('tbody');
+        for (var i = 1; i <= n; i++) {
+          var c = yield coll.Item(i);
+          var subj = yield c.SubjectName, to = new Date(yield c.ValidToDate);
+          var inn = innOf(subj), expired = to < new Date(), ok = sameInn(inn, ORG_INN) && !expired;
+          if (!inn) continue;
+          certs.push(c);
+          var tr = document.createElement('tr');
+          tr.innerHTML = '<td><input type="radio" name="cert" value="' + (certs.length - 1) + '"'
+            + (ok ? (usable === 0 ? ' checked' : '') : ' disabled') + '></td><td></td><td></td><td></td>';
+          tr.children[1].textContent = cnOf(subj);
+          tr.children[2].textContent = inn;
+          tr.children[3].textContent = to.toLocaleDateString('ru-RU') + (expired ? ' (истёк)' : '');
+          if (!ok) tr.className = 'muted';
+          body.appendChild(tr);
+          if (ok) usable++;
+        }
+        yield store.Close();
+        $('certs').hidden = certs.length === 0;
+        if (usable) { $('loginBtn').disabled = false; log('Действующих сертификатов с ИНН ' + ORG_INN + ': ' + usable + '.', 'ok'); }
+        else log('Нет действующего сертификата с ИНН ' + ORG_INN + ' — войти нельзя.', 'bad');
+      } catch (e) { log('Не удалось прочитать сертификаты: ' + errText(e), 'bad'); }
+    });
+  }
+
+  function sign(cert, data) {
+    return new Promise(function (resolve, reject) {
+      cadesplugin.async_spawn(function* () {
+        try {
+          var signer = yield cadesplugin.CreateObjectAsync('CAdESCOM.CPSigner');
+          yield signer.propset_Certificate(cert);
+          yield signer.propset_CheckCertificate(true);
+          var sd = yield cadesplugin.CreateObjectAsync('CAdESCOM.CadesSignedData');
+          yield sd.propset_ContentEncoding(cadesplugin.CADESCOM_BASE64_TO_BINARY);
+          yield sd.propset_Content(btoa(unescape(encodeURIComponent(data))));
+          // Прикреплённая CAdES-BES; переносы строк ЧЗ не разбирает — убираем.
+          var sig = yield sd.SignCades(signer, cadesplugin.CADESCOM_CADES_BES, false);
+          resolve(String(sig).replace(/\s+/g, ''));
+        } catch (e) { reject(new Error(errText(e))); }
+      });
+    });
+  }
+
+  async function post(url, body) {
+    var r = await fetch(url, {method: 'POST', headers: {'Content-Type': 'application/json'},
+                              body: body ? JSON.stringify(body) : '{}'});
+    var j = {};
+    try { j = await r.json(); } catch (e) {}
+    if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    return j;
+  }
+
+  async function loginOne(kind, label, cert) {
+    var ch = await post('/organizations/' + ORG_ID + '/chz-login/challenge');
+    log('[' + label + '] строка для подписи получена, подписываю…');
+    var signature = await sign(cert, ch.data);
+    var res = await post('/organizations/' + ORG_ID + '/chz-login/token', {kind: kind, uuid: ch.uuid, signature: signature});
+    log('[' + label + '] вход выполнен, действует до ' + res.until, 'ok');
+  }
+
+  $('loginBtn').onclick = async function () {
+    var sel = document.querySelector('input[name=cert]:checked');
+    if (!sel) return;
+    var cert = certs[+sel.value];
+    $('loginBtn').disabled = true;
+    try {
+      await loginOne('true_api', 'True API', cert);
+      if (WITH_SUZ) await loginOne('suz', 'СУЗ', cert);
+      log('Готово. Карточки Нацкаталога программа запросит сама в течение минуты.', 'ok');
+    } catch (e) {
+      log('Вход не выполнен: ' + e.message, 'bad');
+    }
+    $('loginBtn').disabled = false;
+  };
+</script>
+{% endblock %}

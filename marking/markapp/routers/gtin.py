@@ -7,7 +7,7 @@ from fastapi.responses import RedirectResponse, Response
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
-from markapp import audit, gtin as G, nk, settings
+from markapp import audit, chz_auth, gtin as G, nk, settings
 from markapp.catalog import norm_sku
 from markapp.database import get_db
 from markapp.deps import get_current_user
@@ -49,7 +49,7 @@ def gtin_page(request: Request, q: str = "", only: str = "", db: Session = Depen
     return render(request, "gtin.html", user, "gtin", pairs=pairs, cards=cards, total=total, q=q,
                   only=only, limit=PAGE_LIMIT, all_count=db.query(GtinPair).count(),
                   pending_export=len(G.pending_export(db)), counts=counts,
-                  has_key=bool(org and org.nk_api_key_enc), org=org,
+                  has_token=chz_auth.token(org) is not None, org=org,
                   attr_color=settings.get(db, settings.NK_ATTR_COLOR),
                   attr_size=settings.get(db, settings.NK_ATTR_SIZE),
                   attr_tnved=settings.get(db, settings.NK_ATTR_TNVED),
