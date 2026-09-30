@@ -1,3 +1,4 @@
+from datetime import timezone
 from pathlib import Path
 
 from fastapi.templating import Jinja2Templates
@@ -17,6 +18,16 @@ def money(v) -> str:
 
 
 templates.env.filters["money"] = money
+
+
+def local_time(moment_utc) -> str:
+    """Отметка UTC из базы — местным временем, «30.09.2026 23:40»."""
+    if moment_utc is None:
+        return ""
+    return moment_utc.replace(tzinfo=timezone.utc).astimezone().strftime("%d.%m.%Y %H:%M")
+
+
+templates.env.filters["local_time"] = local_time
 
 NAV = [
     ("supplies", "/supplies", "Поставки Lamoda"),

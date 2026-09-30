@@ -1,8 +1,10 @@
-from fastapi import APIRouter, Depends, Form, Request
-from fastapi.responses import RedirectResponse
+from datetime import timezone
+
+from fastapi import APIRouter, Body, Depends, Form, Request
+from fastapi.responses import JSONResponse, RedirectResponse
 from sqlalchemy.orm import Session
 
-from markapp import audit, settings
+from markapp import audit, chz_auth, settings
 from markapp.database import get_db
 from markapp.deps import get_current_user
 from markapp.flash import flash
@@ -33,7 +35,9 @@ def org_edit(org_id: int, request: Request, db: Session = Depends(get_db),
                                                                      contract_number="б/н")
     if org is None:
         return RedirectResponse("/organizations", status_code=303)
-    return render(request, "organization.html", user, "organizations", org=org, fields=FIELDS)
+    return render(request, "organization.html", user, "organizations", org=org, fields=FIELDS,
+                  chz_until=org.chz_token_until if chz_auth.token(org, "true_api") else None,
+                  suz_until=org.suz_token_until if chz_auth.token(org, "suz") else None)
 
 
 @router.post("/organizations/{org_id}")
@@ -82,6 +86,58 @@ def org_save(org_id: int, request: Request, db: Session = Depends(get_db),
     db.commit()
     flash(request, f"Сохранено: {org.name}.", "ok")
     return RedirectResponse("/organizations", status_code=303)
+
+
+@router.get("/organizations/{org_id}/chz-login")
+def chz_login_page(org_id: int, request: Request, db: Session = Depends(get_db),
+                   user: User = Depends(get_current_user)):
+    org = db.get(Organization, org_id)
+    if org is None:
+        return RedirectResponse("/organizations", status_code=303)
+    return render(request, "chz_login.html", user, "organizations", org=org,
+                  chz_until=org.chz_token_until if chz_auth.token(org, "true_api") else None,
+                  suz_until=org.suz_token_until if chz_auth.token(org, "suz") else None)
+
+
+@router.post("/organizations/{org_id}/chz-login/challenge")
+def chz_login_challenge(org_id: int, db: Session = Depends(get_db),
+                        user: User = Depends(get_current_user)):
+    """Строка для подписи. Для True API и СУЗ — отдельные: uuid одноразовый."""
+    if db.get(Organization, org_id) is None:
+        return JSONResponse({"error": "Организация не найдена"}, status_code=404)
+    try:
+        return chz_auth.challenge()
+    except chz_auth.ChzAuthError as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
+@router.post("/organizations/{org_id}/chz-login/token")
+def chz_login_token(org_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user),
+                    kind: str = Body(...), uuid: str = Body(...), signature: str = Body(...)):
+    org = db.get(Organization, org_id)
+    if org is None:
+        return JSONResponse({"error": "Организация не найдена"}, status_code=404)
+    if kind not in chz_auth.KINDS:
+        return JSONResponse({"error": f"неизвестный вход: {kind}"}, status_code=400)
+    if kind == "suz" and not org.connection_id:
+        return JSONResponse({"error": "Не задан ID соединения СУЗ у организации"}, status_code=400)
+    # Страница уже сверила ИНН, но решает здесь: сертификат берётся из самой подписи.
+    inn = chz_auth.signer_inn(signature)
+    if inn is not None and not chz_auth.inn_matches(org.inn, inn):
+        audit.log(db, user.username, "chz_login_refused", org.name, f"ИНН сертификата {inn} ≠ {org.inn}")
+        db.commit()
+        return JSONResponse({"error": f"Сертификат ИНН {inn}, а у организации {org.inn} — вход не выполнен"},
+                            status_code=400)
+    try:
+        token = chz_auth.sign_in(uuid, signature, org.connection_id if kind == "suz" else None)
+    except chz_auth.ChzAuthError as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+    until = chz_auth.store(db, org, kind, token)
+    audit.log(db, user.username, "chz_login", org.name,
+              f"{chz_auth.KINDS[kind]}, ИНН сертификата {inn or 'не разобран'}")
+    db.commit()
+    local = until.replace(tzinfo=timezone.utc).astimezone()
+    return {"ok": True, "until": local.strftime("%d.%m.%Y %H:%M")}
 
 
 @router.post("/lamoda-settings")

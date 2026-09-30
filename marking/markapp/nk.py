@@ -1,7 +1,10 @@
 """Национальный каталог: карточки по GTIN (ТЗ, 5.3).
 
-`GET <True API>/nk/product?gtins=a;b;…&apikey=…` — по API-ключу, без подписи,
-значит фоном из воркера. Лимит жёсткий: 10 запросов за 5 минут и не больше 25
+`GET <True API>/nk/product?gtins=a;b;…` с токеном True API (Bearer). Одного
+API-ключа True API не принимает — отвечает 401 «Токен не действителен»
+(30.09.2026), поэтому нужен вход сертификатом (`chz_auth`, ~10 ч); дальше
+воркер ходит фоном сам, а без токена очередь стоит с пометкой «нужен вход».
+Лимит жёсткий: 10 запросов за 5 минут и не больше 25
 GTIN в запросе. Работаем на 70% (7 за 5 минут, настройка) через ограничитель в
 базе — веб и воркер два процесса. Этикетки и проверки читают кэш (`NkCard`).
 
@@ -25,7 +28,6 @@ import requests
 from sqlalchemy.orm import Session
 
 from markapp import settings
-from markapp.crypto import decrypt_value
 from markapp.models import GtinPair, NkCard, NkRequest, Organization
 from markapp.timeutils import now_utc
 
@@ -152,17 +154,18 @@ def _due(db: Session, limit: int) -> list[NkCard]:
 
 
 class NkClient:
-    def __init__(self, api_key: str, base_url: str = TRUE_API_URL, proxy: str = CHZ_PROXY):
-        self.api_key = api_key
+    def __init__(self, token: str, base_url: str = TRUE_API_URL, proxy: str = CHZ_PROXY):
+        self.token = token
         self.base_url = base_url.rstrip("/")
         self.proxies = {"http": proxy, "https": proxy} if proxy else None
 
     def product(self, gtins: list[str]) -> requests.Response:
-        # Ключ — в параметре apikey; токен в заголовке НЕ передаём: методы НК
-        # отвечают 400, если указаны оба.
+        # Токен — в заголовке; apikey в URL НЕ передаём: методы НК отвечают
+        # 400, если указаны оба.
         return requests.get(f"{self.base_url}/nk/product",
-                            params={"gtins": ";".join(gtins), "apikey": self.api_key},
-                            headers={"accept": "application/json"},
+                            params={"gtins": ";".join(gtins)},
+                            headers={"accept": "application/json",
+                                     "Authorization": f"Bearer {self.token}"},
                             proxies=self.proxies, timeout=30)
 
 
@@ -171,13 +174,16 @@ def fetch_due(db: Session, client_factory=NkClient) -> dict:
     stats = {"requests": 0, "ok": 0, "not_found": 0, "error": 0, "note": ""}
     queue_missing(db)
     db.commit()
+    from markapp import chz_auth
     org = settings.lamoda_org(db)
-    if org is None or not org.nk_api_key_enc:
+    token = chz_auth.token(org)
+    if token is None:
         waiting = db.query(NkCard).filter(NkCard.status == "pending").count()
         if waiting:
-            stats["note"] = f"нет API-ключа Нацкаталога у ИП для Lamoda — ждут карточки: {waiting}"
+            who = org.name if org else "ИП для Lamoda"
+            stats["note"] = f"нужен вход в ЧЗ ({who}) — ждут карточки: {waiting}"
         return stats
-    client = client_factory(decrypt_value(org.nk_api_key_enc))
+    client = client_factory(token)
     while budget(db, org.id) > 0:
         batch = _due(db, MAX_GTINS_PER_REQUEST)
         if not batch:
@@ -230,10 +236,17 @@ def fetch_due(db: Session, client_factory=NkClient) -> dict:
             stats["note"] = "НК ответил 429 — пауза 5 минут"
             db.commit()
             break
+        elif status == 401:
+            # Токен отозван или истёк раньше срока: карточки ни при чём —
+            # обратно в очередь, токен забыть, ждать нового входа.
+            chz_auth.forget(org)
+            for c in batch:
+                c.status, c.error = "pending", "нужен вход в ЧЗ"
+            stats["note"] = f"ЧЗ не принял токен — нужен вход в ЧЗ ({org.name})"
+            db.commit()
+            break
         else:
             text = err if status is None else f"HTTP {status}: {resp.text[:200]}"
-            if status in (401, 403):
-                text = f"HTTP {status}: ключ Нацкаталога не принят — проверьте его на странице организации"
             for c in batch:
                 c.status, c.error = "error", text
             stats["error"] += len(batch)
