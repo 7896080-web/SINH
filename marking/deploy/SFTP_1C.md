@@ -157,13 +157,15 @@ Restart-Service sshd
 
 На рабочем компьютере:
 ```powershell
-sftp -P 443 -i C:\marking\ssh\id_ed25519 -o UserKnownHostsFile=C:\marking\ssh\known_hosts marking_sftp@136.243.92.95
+sftp -P 443 -o KexAlgorithms=curve25519-sha256 -i C:\marking\ssh\id_ed25519 -o UserKnownHostsFile=C:\marking\ssh\known_hosts marking_sftp@136.243.92.95
 ```
 В приглашении `sftp>`: `ls` показывает `tasks`, `results`, `archive`
-(и другое содержимое `C:\sync`) — `bye`.
+(и другое содержимое `C:\sync`) — `bye`. `KexAlgorithms` нужен встроенному в
+Windows клиенту 9.5: без него он не договаривается с OpenSSH 10 на сервере
+(«unsupported KEX method»). Программе он не нужен — она ходит через paramiko.
 
 Лишнего не открыто:
-- `ssh -p 443 -i C:\marking\ssh\id_ed25519 marking_sftp@136.243.92.95` —
+- `ssh -p 443 -o KexAlgorithms=curve25519-sha256 -i C:\marking\ssh\id_ed25519 -o UserKnownHostsFile=C:\marking\ssh\known_hosts marking_sftp@136.243.92.95` —
   «This service allows sftp connections only», командной строки нет.
 
 В программе: ярлык «Маркировка» → «Диагностика» → «Отправить PING». Ответ

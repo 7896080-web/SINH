@@ -11,7 +11,7 @@
     2. Создаёт C:\marking\.venv и ставит зависимости.
     3. Создаёт .env со СВОИМИ секретами и адресом сервера (если .env нет).
     4. Создаёт ключ SFTP (ssh\id_ed25519) и печатает открытую часть для сервера.
-    5. Записывает ключ сервера в ssh\known_hosts и печатает его отпечаток —
+    5. Записывает ключ сервера в ssh\known_hosts (deploy\fetch_host_key.py) и печатает его отпечаток —
        сверить с сервером ОБЯЗАТЕЛЬНО (deploy\SFTP_1C.md, шаг 5).
     6. Прогоняет миграции и тесты, заводит первого пользователя.
     7. Кладёт ярлык «Маркировка» на рабочий стол (и в автозапуск с -Autostart).
@@ -123,9 +123,12 @@ Write-Host ""
 $known = Join-Path $sshDir "known_hosts"
 if (-not (Test-Path $known)) {
     Info "Спрашиваю ключ сервера $Server`:$SshPort"
-    $scan = & ssh-keyscan -p $SshPort -t ed25519 $Server 2>$null
-    if (-not $scan) {
-        Warn "Сервер не ответил на $SshPort — known_hosts не создан. Запустите установку снова, когда SSH на сервере будет готов."
+    # Не ssh-keyscan: встроенный в Windows клиент 9.5 не договаривается с
+    # OpenSSH 10 на сервере, а его вывод в stderr здесь валит скрипт (Stop).
+    $scan = & $venvPy (Join-Path $PSScriptRoot "fetch_host_key.py") $Server $SshPort
+    if ($LASTEXITCODE -ne 0) {
+        Warn "$scan"
+        Warn "known_hosts не создан. Запустите установку снова, когда SSH на сервере будет готов."
     } else {
         Set-Content -Path $known -Value $scan -Encoding ascii
         Write-Host "Отпечаток ключа сервера — СВЕРЬТЕ с тем, что показал сервер (SFTP_1C.md, шаг 5):" -ForegroundColor Yellow

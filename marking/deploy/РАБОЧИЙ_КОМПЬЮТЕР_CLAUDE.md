@@ -103,13 +103,16 @@ powershell -ExecutionPolicy Bypass -File C:\marking\deploy\install_workstation.p
 ## Шаг 4. Проверка SFTP — только чтение
 
 ```powershell
-sftp -P 443 -i C:\marking\ssh\id_ed25519 -o UserKnownHostsFile=C:\marking\ssh\known_hosts -o StrictHostKeyChecking=yes marking_sftp@136.243.92.95
+sftp -P 443 -o KexAlgorithms=curve25519-sha256 -i C:\marking\ssh\id_ed25519 -o UserKnownHostsFile=C:\marking\ssh\known_hosts -o StrictHostKeyChecking=yes marking_sftp@136.243.92.95
 ```
 В `sftp>` только `ls` (ожидается `tasks`, `results`, `archive` и прочее
-содержимое `C:\sync`), потом `bye`. Никаких `put`, `rm`, `rename`.
+содержимое `C:\sync`), потом `bye`. Никаких `put`, `rm`, `rename`. Без
+терминала — `sftp -b <файл с одной строкой ls> …`. `KexAlgorithms` нужен
+клиенту Windows 9.5 против OpenSSH 10 на сервере («unsupported KEX method»).
 
-Проверка, что лишнего не открыто: `ssh -p 443 -i C:\marking\ssh\id_ed25519
-marking_sftp@136.243.92.95` должен сразу закрыться («only sftp»). Если
+Проверка, что лишнего не открыто: `ssh -T -p 443 -o KexAlgorithms=curve25519-sha256
+-i C:\marking\ssh\id_ed25519 -o UserKnownHostsFile=C:\marking\ssh\known_hosts
+marking_sftp@136.243.92.95 whoami` должен ответить «only sftp» и закрыться. Если
 открылась командная строка — **немедленно выйти** и сказать человеку: сервер
 настроен не по инструкции.
 
