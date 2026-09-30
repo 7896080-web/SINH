@@ -1,0 +1,217 @@
+{% extends "base.html" %}
+{% block title %}Коды ЧЗ — поставка {{ supply.number }}{% endblock %}
+{% block content %}
+<h1>Коды ЧЗ — поставка {{ supply.number }}</h1>
+<p><a href="/supplies/{{ supply.id }}">← к поставке</a> · {{ org.name }}, ИНН {{ org.inn }} · статус поставки: {{ status_label(supply.status) }}</p>
+
+<div class="card">
+  <h2>Итог ввода в оборот:
+    {% if total.done %}<span class="ok">все {{ total.need }} шт. в обороте ✔</span>
+    {% else %}<span class="{{ 'warn' if total.introduced else '' }}">в обороте {{ total.introduced }} из {{ total.need }}</span>{% endif %}</h2>
+  <p>Кодов получено {{ total.codes }} из {{ total.need }}{% if total.codes %}:
+    {% for st, n in total.statuses.most_common() %}{{ status_ru.get(st, st) }} — {{ n }}{{ ', ' if not loop.last }}{% endfor %}{% endif %}.
+    Готово к вводу (нанесены): <b>{{ ready }}</b>.</p>
+  <p>Вход: True API {% if chz_ok %}<span class="ok">есть</span>{% else %}<span class="warn">нужен</span>{% endif %},
+     СУЗ {% if suz_ok %}<span class="ok">есть</span>{% else %}<span class="warn">нужен</span>{% endif %}
+     — <a href="/organizations/{{ org.id }}/chz-login">войти в ЧЗ</a>.
+     {% if not org.connection_id %}<span class="bad">У организации нет ID соединения СУЗ — заказ невозможен.</span>{% endif %}</p>
+  {% if supply.is_test %}<p class="warn">Тестовая поставка: настоящие коды под неё не заказываются.</p>
+  {% elif not can_order %}<p class="warn">Коды заказываются после перемещения в 1С: до него состав поставки может измениться.</p>{% endif %}
+</div>
+
+<div class="card">
+  <h2>Действия</h2>
+  <p>Сертификат: <select id="cert" disabled><option>загрузка плагина…</option></select> <span id="plugin" class="muted"></span></p>
+  <p class="row">
+    <button id="btnOrder" disabled>1. Заказать недостающие коды</button>
+    <button id="btnGet" disabled class="secondary">2. Получить коды ({{ steps }} заказ.)</button>
+    <button id="btnIntro" disabled class="secondary">3. Ввести в оборот нанесённые ({{ ready }})</button>
+  </p>
+  <form method="post" action="/supplies/{{ supply.id }}/codes/refresh" style="display:inline"><button class="secondary">Обновить статусы кодов сейчас</button></form>
+  <p class="muted">Каждый запрос в СУЗ подписывается (может спросить PIN) — держите страницу открытой, пока идёт получение.
+    Статусы кодов программа обновляет сама раз в минуту; «Нанесён» ЧЗ ставит сам, время нестабильно.</p>
+  <div id="log"></div>
+</div>
+
+<div class="card">
+  <h2>По артикулам</h2>
+  <table>
+    <tr><th>Размерный артикул</th><th>GTIN</th><th>Нужно</th><th>Заказ</th><th>Получено</th><th>Статусы кодов</th><th>Состояние</th></tr>
+    {% for l in lines %}
+    <tr>
+      <td>{{ l.supplier_sku }}</td>
+      <td>{{ l.gtin or '—' }}</td>
+      <td>{{ l.need }}</td>
+      <td>{% for o in l.orders %}<div class="{{ 'bad' if o.status in ('rejected','error') else '' }}" title="{{ o.error }}">{{ o.quantity }} шт. — {{ order_ru.get(o.status, o.status) }}{% if o.received %} ({{ o.received }}){% endif %}</div>{% else %}—{% endfor %}</td>
+      <td>{{ l.codes }}</td>
+      <td>{% for st, n in l.statuses.most_common() %}{{ status_ru.get(st, st) }} {{ n }}{{ ', ' if not loop.last }}{% endfor %}</td>
+      <td class="{{ 'ok' if l.state == 'в обороте' else ('bad' if 'ошибка' in l.state or 'нет GTIN' in l.state else 'warn') }}">{{ l.state }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+
+<details class="card" {{ 'open' if not intro.tnved and not intro.cert_number }}>
+  <summary><b>Данные документа «Ввод в оборот»</b> — если их нет в колонках файла поставки</summary>
+  <p class="muted">Порядок: колонки файла поставки («ТНВЭД», «Номер разрешительного документа», «Дата начала действия») → ТН ВЭД из карточки НК → значения ниже.</p>
+  <form method="post" action="/supplies/{{ supply.id }}/codes/attrs" class="row">
+    <label>ТН ВЭД<input name="tnved" value="{{ intro.tnved }}" size="12"></label>
+    <label>Тип документа<select name="cert_type"><option value="">—</option>
+      {% for k, v in cert_types.items() %}<option value="{{ k }}" {{ 'selected' if intro.cert_type == k }}>{{ v }}</option>{% endfor %}</select></label>
+    <label>Номер документа<input name="cert_number" value="{{ intro.cert_number }}" size="30"></label>
+    <label>Дата документа<input type="date" name="cert_date" value="{{ intro.cert_date }}"></label>
+    <label>Дата производства<input type="date" name="production_date" value="{{ intro.production_date }}"></label>
+    <button>Сохранить</button>
+  </form>
+</details>
+
+{% if docs %}
+<div class="card">
+  <h2>Документы ввода в оборот</h2>
+  <table>
+    <tr><th>#</th><th>Кодов</th><th>Статус</th><th>Номер в ЧЗ</th><th>Отправлен</th><th>Ошибка</th></tr>
+    {% for d in docs %}
+    <tr><td>{{ d.id }}</td><td>{{ d.codes_count }}</td>
+      <td class="{{ 'ok' if d.status == 'CHECKED_OK' else ('bad' if d.status in ('CHECKED_NOT_OK','error') else 'warn') }}">{{ {'new':'ждёт подписи','sent':'проверяется ЧЗ','CHECKED_OK':'принят','CHECKED_NOT_OK':'отклонён','error':'не отправлен'}.get(d.status, d.status) }}</td>
+      <td>{{ d.doc_id }}</td><td>{{ d.sent_at|local_time }}</td><td><small>{{ d.error[:300] }}</small></td></tr>
+    {% endfor %}
+  </table>
+</div>
+{% endif %}
+
+<script src="https://www.cryptopro.ru/sites/default/files/products/cades/cadesplugin_api.js"></script>
+<script>
+  var BASE = '/supplies/{{ supply.id }}/codes', ORG_INN = {{ org.inn|tojson }};
+  var CAN_ORDER = {{ 'true' if can_order else 'false' }}, STEPS = {{ steps }}, READY = {{ ready }};
+  var certs = [], busy = false;
+  function $(id) { return document.getElementById(id); }
+  function log(text, cls) {
+    var d = document.createElement('div');
+    d.textContent = new Date().toLocaleTimeString('ru-RU') + '  ' + text;
+    if (cls) d.className = cls;
+    $('log').appendChild(d);
+  }
+  function errText(e) { return (window.cadesplugin && cadesplugin.getLastError) ? cadesplugin.getLastError(e) : String(e); }
+  function innOf(s) { var m = s.match(/(?:^|,\s*)(?:ИНН|INN|OID\.1\.2\.643\.3\.131\.1\.1)=\s*"?(\d{10,12})/); return m ? m[1] : ''; }
+  function sameInn(a, b) { return !!a && !!b && ('00' + a).slice(-12) === ('00' + b).slice(-12); }
+  function cnOf(s) { var m = s.match(/(?:^|,\s*)CN=\s*"?([^",]+)/); return m ? m[1] : s.split(',')[0]; }
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+  function enable() {
+    var ok = certs.length > 0 && !busy;
+    $('btnOrder').disabled = !(ok && CAN_ORDER);
+    $('btnGet').disabled = !(ok && STEPS > 0);
+    $('btnIntro').disabled = !(ok && READY > 0);
+  }
+
+  if (!window.cadesplugin) { $('plugin').textContent = 'плагин не найден'; }
+  else cadesplugin.then(function () {
+    cadesplugin.async_spawn(function* () {
+      try {
+        var store = yield cadesplugin.CreateObjectAsync('CAdESCOM.Store');
+        yield store.Open(cadesplugin.CAPICOM_CURRENT_USER_STORE, cadesplugin.CAPICOM_MY_STORE,
+                         cadesplugin.CAPICOM_STORE_OPEN_MAXIMUM_ALLOWED);
+        var coll = yield store.Certificates, n = yield coll.Count, sel = $('cert');
+        sel.innerHTML = '';
+        for (var i = 1; i <= n; i++) {
+          var c = yield coll.Item(i), subj = yield c.SubjectName, to = new Date(yield c.ValidToDate);
+          if (!sameInn(innOf(subj), ORG_INN) || to < new Date()) continue;
+          certs.push(c);
+          var o = document.createElement('option');
+          o.value = certs.length - 1;
+          o.textContent = cnOf(subj) + ' — до ' + to.toLocaleDateString('ru-RU');
+          sel.appendChild(o);
+        }
+        yield store.Close();
+        if (certs.length) { sel.disabled = false; $('plugin').textContent = ''; }
+        else { sel.innerHTML = '<option>нет действующего сертификата с ИНН ' + ORG_INN + '</option>'; }
+        enable();
+      } catch (e) { $('plugin').textContent = 'сертификаты не прочитаны: ' + errText(e); }
+    });
+  }, function (e) { $('plugin').textContent = 'плагин не инициализировался: ' + errText(e); });
+
+  // Откреплённая (СУЗ) или прикреплённая (документ ввода) CAdES-BES; base64 без переносов.
+  function sign(text, detached, isBase64) {
+    var cert = certs[+$('cert').value];
+    return new Promise(function (resolve, reject) {
+      cadesplugin.async_spawn(function* () {
+        try {
+          var signer = yield cadesplugin.CreateObjectAsync('CAdESCOM.CPSigner');
+          yield signer.propset_Certificate(cert);
+          yield signer.propset_CheckCertificate(true);
+          var sd = yield cadesplugin.CreateObjectAsync('CAdESCOM.CadesSignedData');
+          yield sd.propset_ContentEncoding(cadesplugin.CADESCOM_BASE64_TO_BINARY);
+          yield sd.propset_Content(isBase64 ? text : btoa(unescape(encodeURIComponent(text))));
+          var sig = yield sd.SignCades(signer, cadesplugin.CADESCOM_CADES_BES, detached);
+          resolve(String(sig).replace(/\s+/g, ''));
+        } catch (e) { reject(new Error(errText(e))); }
+      });
+    });
+  }
+
+  async function post(url, body) {
+    var r = await fetch(BASE + url, {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                     body: JSON.stringify(body || {})});
+    var j = {};
+    try { j = await r.json(); } catch (e) {}
+    if (!r.ok) throw new Error(j.error || j.detail || ('HTTP ' + r.status));
+    return j;
+  }
+
+  async function run(fn) {
+    busy = true; enable();
+    try { await fn(); } catch (e) { log(e.message, 'bad'); }
+    busy = false;
+    log('Обновляю страницу…');
+    setTimeout(function () { location.reload(); }, 1500);
+  }
+
+  async function getCodes() {
+    // Опрос до готовности: статус заказа → коды. Каждый запрос подписан.
+    for (var round = 0; round < 120; round++) {
+      var st = (await post('/steps')).steps;
+      if (!st.length) { log('Все заказы обработаны.', 'ok'); return; }
+      var waiting = 0;
+      for (var i = 0; i < st.length; i++) {
+        var s = st[i];
+        try {
+          var res = await post('/step', {order_id: s.order_id, action: s.action, path: s.path,
+                                         signature: await sign(s.sign, true, false)});
+          if (s.action === 'codes') log(s.sku + ': получено ' + res.received + ' из ' + res.quantity, 'ok');
+          else if (res.status === 'ready') log(s.sku + ': коды готовы, забираю…');
+          else if (res.status === 'rejected' || res.status === 'error') log(s.sku + ': ' + res.error, 'bad');
+          else waiting++;
+        } catch (e) { log(e.message, 'bad'); }
+      }
+      if (waiting) { log('СУЗ ещё готовит коды (' + waiting + ' заказ.), жду 5 с…'); await sleep(5000); }
+    }
+    log('Коды готовятся дольше 10 минут — нажмите «Получить коды» позже.', 'warn');
+  }
+
+  $('btnOrder').onclick = function () {
+    if (!confirm('Заказать в СУЗ недостающие коды по всем артикулам поставки {{ supply.number }}? Заказ настоящий.')) return;
+    run(async function () {
+      var orders = (await post('/order-prepare')).orders;
+      if (!orders.length) { log('Заказывать нечего: коды есть или уже заказаны.'); }
+      for (var i = 0; i < orders.length; i++) {
+        var o = orders[i];
+        try {
+          var r = await post('/order-send', {order_id: o.id, signature: await sign(o.body, true, false)});
+          log(o.sku + ': заказ ' + o.quantity + ' шт. принят СУЗ (' + r.suz_order_id + ')', 'ok');
+        } catch (e) { log(e.message, 'bad'); }
+      }
+      await getCodes();
+    });
+  };
+  $('btnGet').onclick = function () { run(getCodes); };
+  $('btnIntro').onclick = function () {
+    if (!confirm('Отправить документ «Ввод в оборот» по ' + READY + ' нанесённым кодам?')) return;
+    run(async function () {
+      var d = await post('/intro-prepare');
+      log('Документ на ' + d.count + ' кодов собран, подписываю…');
+      var r = await post('/intro-send', {doc_id: d.doc_id, signature: await sign(d.document, false, true)});
+      log('Документ принят ЧЗ' + (r.doc_id ? ' (' + r.doc_id + ')' : '') + '. Итог и статусы кодов придут в течение минут.', 'ok');
+    });
+  };
+</script>
+{% endblock %}

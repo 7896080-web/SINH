@@ -138,6 +138,10 @@ class Supply(Base):
     # Заголовки дополнительных колонок входного файла (например «ТНВЭД»):
     # они копируются в каждую строку при развёртке.
     extra_headers = Column(JSON, nullable=False, default=list)
+    # Данные документа «Ввод в оборот» по умолчанию для поставки (ТН ВЭД,
+    # разрешительный документ, дата производства). Колонки файла поставки и
+    # карточка НК по строке — важнее (codes.intro_attrs).
+    intro_attrs = Column(JSON, nullable=True)
     onec_document = Column(String(50), nullable=False, default="")
     moved_at = Column(DateTime, nullable=True)
     is_test = Column(Boolean, nullable=False, default=False)
@@ -297,3 +301,73 @@ class NkRequest(Base):
     organization_id = Column(Integer, ForeignKey("organizations.id"), nullable=False, index=True)
     at = Column(DateTime, nullable=False, default=now_utc, index=True)
     http_status = Column(Integer, nullable=True)
+
+
+class CodeOrder(Base):
+    """Заказ кодов в СУЗ под строку поставки (ТЗ, 7.1).
+
+    Пишется в базу ДО отправки: тело хранится ровно тем, что подписано
+    (подпись откреплённая — один байт разницы, и СУЗ её не примет). Номер
+    заказа СУЗ — сразу после ответа; коды — по мере получения. Сбой на
+    середине ничего не теряет: повтор продолжает с места остановки.
+    """
+    __tablename__ = "code_orders"
+    id = Column(Integer, primary_key=True)
+    supply_id = Column(Integer, ForeignKey("supplies.id"), nullable=False, index=True)
+    organization_id = Column(Integer, ForeignKey("organizations.id"), nullable=False)
+    supplier_sku = Column(String(300), nullable=False)
+    gtin = Column(String(14), nullable=False)
+    quantity = Column(Integer, nullable=False)
+    body = Column(Text, nullable=False)
+    # new — записан, не отправлен; sent — СУЗ дал номер, коды не готовы;
+    # ready — коды можно забирать; done — все получены; rejected / error.
+    status = Column(String(20), nullable=False, default="new", index=True)
+    suz_order_id = Column(String(64), nullable=False, default="")
+    received = Column(Integer, nullable=False, default=0)
+    error = Column(Text, nullable=False, default="")
+    created_by = Column(String(64), nullable=False, default="")
+    created_at = Column(DateTime, nullable=False, default=now_utc)
+    updated_at = Column(DateTime, nullable=False, default=now_utc)
+
+
+class MarkCode(Base):
+    """Код маркировки, закреплённый за поставкой навсегда (ТЗ, 4 и 3.2).
+
+    Короткий КИ (`01…21…`, 31 символ) — открыто, по нему спрашивают статус и
+    вводят в оборот. Полный код (с криптохвостом) — только зашифрованным:
+    по нему печатается этикетка, это секрет.
+    """
+    __tablename__ = "mark_codes"
+    id = Column(Integer, primary_key=True)
+    cis = Column(String(40), nullable=False, unique=True)
+    full_enc = Column(Text, nullable=False)
+    gtin = Column(String(14), nullable=False, index=True)
+    supplier_sku = Column(String(300), nullable=False, default="")
+    supply_id = Column(Integer, ForeignKey("supplies.id"), nullable=False, index=True)
+    order_id = Column(Integer, ForeignKey("code_orders.id"), nullable=True, index=True)
+    # Статус ГИС МТ по /cises/info: EMITTED, APPLIED, INTRODUCED, …; пусто — не спрашивали.
+    status = Column(String(30), nullable=False, default="", index=True)
+    status_at = Column(DateTime, nullable=True)
+    applied_at = Column(DateTime, nullable=True)
+    introduce_doc_id = Column(Integer, ForeignKey("introduce_docs.id"), nullable=True)
+    received_at = Column(DateTime, nullable=False, default=now_utc)
+
+
+class IntroduceDoc(Base):
+    """Документ «Ввод в оборот» (LP_INTRODUCE_GOODS), отправленный в ГИС МТ."""
+    __tablename__ = "introduce_docs"
+    id = Column(Integer, primary_key=True)
+    supply_id = Column(Integer, ForeignKey("supplies.id"), nullable=False, index=True)
+    organization_id = Column(Integer, ForeignKey("organizations.id"), nullable=False)
+    # base64 JSON документа — ровно то, что подписано (прикреплённая подпись).
+    document = Column(Text, nullable=False)
+    codes_count = Column(Integer, nullable=False)
+    # new — подготовлен, ждёт подписи; sent — принят ЧЗ, идёт проверка;
+    # CHECKED_OK / CHECKED_NOT_OK — итог ЧЗ; error — не отправлен.
+    status = Column(String(20), nullable=False, default="new", index=True)
+    doc_id = Column(String(64), nullable=False, default="")
+    error = Column(Text, nullable=False, default="")
+    created_by = Column(String(64), nullable=False, default="")
+    created_at = Column(DateTime, nullable=False, default=now_utc)
+    sent_at = Column(DateTime, nullable=True)
+    checked_at = Column(DateTime, nullable=True)
