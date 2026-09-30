@@ -17,6 +17,7 @@ from markapp.timeutils import now_utc
 EXPECTED = {
     "onec_exchange": (180, True),          # каждые 30 с
     "nk_fetch": (300, True),               # каждую минуту
+    "codes_status": (300, True),           # каждую минуту
     "backup": (2 * 26 * 3600, False),      # раз в сутки; первый прогон — через 10 мин после старта
 }
 

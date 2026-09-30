@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 
-from markapp import backup, exchange, nk, onec
+from markapp import backup, codes, exchange, nk, onec
 from markapp.database import Base, SessionLocal, engine
 from markapp.settings import ensure_defaults
 from markapp.timeutils import now_utc
@@ -67,6 +67,22 @@ def job_nk_fetch() -> None:
         db.close()
 
 
+def job_codes_status() -> None:
+    """Статусы кодов поставок и итог документов ввода — по токену, без подписи (ТЗ, 7.2)."""
+    db = SessionLocal()
+    try:
+        stats = codes.refresh_statuses(db)
+        docs = codes.refresh_documents(db)
+        db.commit()
+        beat(db, "codes_status", True, stats.get("note") or docs.get("note", ""))
+    except Exception as e:
+        db.rollback()
+        logger.exception("коды: опрос статусов упал")
+        beat(db, "codes_status", False, f"{type(e).__name__}: {e}")
+    finally:
+        db.close()
+
+
 def job_backup() -> None:
     db = SessionLocal()
     try:
@@ -99,6 +115,8 @@ def main() -> None:
                   next_run_time=datetime.now(), **common)
     sched.add_job(job_nk_fetch, "interval", seconds=60, id="nk_fetch",
                   next_run_time=datetime.now() + timedelta(seconds=20), **common)
+    sched.add_job(job_codes_status, "interval", seconds=60, id="codes_status",
+                  next_run_time=datetime.now() + timedelta(seconds=40), **common)
     sched.add_job(job_backup, "interval", hours=24, id="backup",
                   next_run_time=datetime.now() + timedelta(minutes=10), **common)
     logger.info("воркер маркировки запущен")
