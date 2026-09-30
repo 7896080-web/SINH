@@ -160,3 +160,26 @@ def test_real_client_rejects_unknown_host_keys(tmp_path, monkeypatch):
     host, kw = seen["connect"]
     assert host == "srv" and kw["port"] == 443 and kw["username"] == "marking_sftp"
     assert kw["look_for_keys"] is False and kw["allow_agent"] is False
+
+
+def test_archive_failure_is_named_and_does_not_stop_the_exchange(db, server):
+    """Разбор закоммичен, а перенести ответ в архив сервер не дал (права,
+    занятый файл): задание всё равно закрыто, сбой назван, обмен не падает."""
+    root, sftp, ex, _, _ = server
+    task = onec.enqueue_ping(db)
+    db.commit()
+    with ex:
+        onec.publish_pending(db, ex)
+    (root / "results/marking" / "result_mark_1.txt").write_text(
+        f"{task.order_id}|OK|mark-1|PING", encoding="utf-8-sig")
+    real_rename = sftp.rename
+
+    def no_archive(a, b):
+        if b.startswith("/archive/"):
+            raise PermissionError("Access denied")
+        return real_rename(a, b)
+    sftp.rename = no_archive
+    with ex:
+        stats = onec.collect_results(db, ex)
+    assert onec.epf_ready(db)
+    assert any("не перенесён в архив" in f for f in stats["failed_files"])

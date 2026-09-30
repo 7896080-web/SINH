@@ -109,6 +109,11 @@ if (-not (Test-Path $keyFile)) {
     if ($LASTEXITCODE -ne 0) { Fail "ключ не создан" }
     Ok "Ключ SFTP создан"
 }
+# Закрытый ключ — только владельцу. C:\marking наследует права корня диска
+# («Пользователи» читают), и клиент OpenSSH отвергает такой ключ как «too open» —
+# ручная проверка sftp не прошла бы. Да и читать его другим незачем.
+& icacls $keyFile /inheritance:r /grant:r "$($env:USERNAME):F" /grant:r "*S-1-5-18:F" | Out-Null
+if ($LASTEXITCODE -ne 0) { Warn "не удалось ограничить права на $keyFile — проверьте вручную" }
 Write-Host ""
 Write-Host "Открытый ключ — одна строка, её кладут на сервер (SFTP_1C.md, шаг 4):" -ForegroundColor Cyan
 Get-Content "$keyFile.pub"

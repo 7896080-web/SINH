@@ -21,8 +21,20 @@ def _imports(path: Path) -> set[str]:
     return out
 
 
+# Каталоги, где лежит НЕ наш код. На рабочем компьютере программа стоит в
+# C:\marking вместе с .venv: без исключения тест разбирал бы тысячи чужих файлов,
+# и один файл пакета в не-UTF-8 кодировке делал бы установку красной на ровном месте.
+FOREIGN = {".venv", "venv", "site-packages", "__pycache__", "backups", "logs", "tools"}
+
+
+def _own_py_files():
+    for p in MARKING.rglob("*.py"):
+        if not FOREIGN & set(p.relative_to(MARKING).parts):
+            yield p
+
+
 def test_marking_does_not_import_sync_admin():
-    bad = [str(p.relative_to(MARKING)) for p in MARKING.rglob("*.py")
+    bad = [str(p.relative_to(MARKING)) for p in _own_py_files()
            if "app" in _imports(p)]
     assert not bad, f"импорт sync_admin из маркировки: {bad}"
 
