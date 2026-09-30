@@ -13,6 +13,9 @@
   {% endfor %}
   <p><label>НДС, %<br><input type="number" name="vat_rate" value="{{ org.vat_rate or 5 }}" min="0" max="22"></label></p>
   <h2>Честный знак</h2>
+  <p class="warn">Вход в ЧЗ по сертификату, заказ кодов и ввод в оборот — этап 4, в этой версии их ещё нет.
+  OMS ID и connectionId можно заполнить заранее: они понадобятся входу. API-ключ уже используется —
+  для карточек Нацкаталога.</p>
   <p><label>OMS ID (СУЗ)<br><input name="oms_id" value="{{ org.oms_id or '' }}" size="40"></label></p>
   <p><label>ID соединения СУЗ (connectionId)<br><input name="connection_id" value="{{ org.connection_id or '' }}" size="40"></label></p>
   <p><label>API-ключ (один для СУЗ и Нацкаталога)<br>
