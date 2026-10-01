@@ -150,17 +150,47 @@ def test_parse_wb_and_ozon_prices():
     assert oz == {"A-1": CurrentPrice(4699, 4699)}
 
 
-def test_lamoda_is_honest():
-    c = build_client("lamoda", {"client_id": "x", "client_secret": "y"})
-    assert isinstance(c, LamodaClient)
+class _Resp:
+    def __init__(self, code, data):
+        self.status_code, self._data, self.text = code, data, str(data)
+
+    def json(self):
+        return self._data
+
+    def raise_for_status(self):
+        import requests
+        if self.status_code >= 400:
+            raise requests.HTTPError(response=self)
+
+
+class _Session:
+    def __init__(self, resp):
+        self.resp, self.calls = resp, []
+
+    def post(self, url, **kw):
+        self.calls.append((url, kw.get("json")))
+        return self.resp
+
+
+def test_lamoda_checks_keys_by_token_and_refuses_the_rest():
+    s = _Session(_Resp(200, {"access_token": "abc", "expires_in": 3600, "token_type": "Bearer"}))
+    c = LamodaClient("cid", "secret", session=s)
     ok, msg = c.test_connection()
-    assert not ok and "не подключён" in msg
-    try:
-        c.get_catalog()
-        raise AssertionError("должно отказать")
-    except PlatformError:
-        pass
+    assert ok and "ключи действительны" in msg
+    url, body = s.calls[0]
+    assert url == "https://public-api-seller.lamoda.ru/api/v2/auth-token"
+    assert body == {"grant_type": "client_credentials", "client_id": "cid", "client_secret": "secret"}
+    ok, msg = LamodaClient("cid", "bad", session=_Session(_Resp(401, {"error": "invalid_client"}))).test_connection()
+    assert not ok and "не приняты" in msg
+    assert not LamodaClient("c", "s", session=_Session(_Resp(200, {}))).test_connection()[0]
+    for call in (c.get_catalog, c.get_prices):
+        try:
+            call()
+            raise AssertionError("должно отказать")
+        except PlatformError as e:
+            assert "OAS" in str(e)
     assert c.push_prices([platforms.PriceItem("b1", 100)])["ok"] == []
+    assert isinstance(build_client("lamoda", {"client_id": "x", "client_secret": "y"}), LamodaClient)
 
 
 class FakePrices:
