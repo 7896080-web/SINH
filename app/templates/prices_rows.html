@@ -1,0 +1,127 @@
+{% if view == 'products' %}
+    {% if rows %}
+    <table>
+        <thead>
+            <tr>
+                <th>Товар</th>
+                <th style="text-align:right;">Себестоимость</th>
+                {% for a in accounts %}
+                <th>{{ account_label(a) }}</th>
+                {% endfor %}
+            </tr>
+        </thead>
+        <tbody>
+            {% for row in rows %}
+            {% set p = row.product %}
+            <tr>
+                <td>
+                    <div>{{ p.name or '—' }}</div>
+                    <div class="mono help-text">{{ p.article or '—' }}{% if p.size %} · {{ p.size }}{% endif %}{% if p.color %} · {{ p.color }}{% endif %}</div>
+                </td>
+                <td class="mono" style="text-align:right;">
+                    {% if p.cost_price is not none %}{{ p.cost_price }} ₽{% else %}<span class="badge badge--warn">нет из 1С</span>{% endif %}
+                </td>
+                {% for cell in row.cells %}
+                <td>
+                    {% if cell.enabled %}
+                    <div class="mono">
+                        {% if cell.target is not none %}
+                            расчёт {{ cell.target }} ₽
+                            {% if cell.block_reason == BLOCK_FLOOR %}<span class="badge badge--bad">ниже пола</span>
+                            {% elif cell.block_reason == BLOCK_MAX_CHANGE %}<span class="badge badge--warn">большой шаг</span>{% endif %}
+                        {% else %}—{% endif %}
+                    </div>
+                    <div class="help-text">на площадке: {{ cell.last_sent ~ ' ₽' if cell.last_sent is not none else 'не отправляли' }}</div>
+                    <form method="post" action="/prices/{{ p.uid_1c }}/{{ cell.account.id }}/manual" style="display:flex; gap:4px; margin-top:4px;">
+                        <input type="hidden" name="q" value="{{ q }}">
+                        <input type="text" inputmode="numeric" name="value" value="{{ cell.manual if cell.manual is not none else '' }}"
+                               placeholder="ручная" style="width:80px;" title="Ручная цена, ₽. Пусто — считать по правилу.">
+                        <button type="submit" class="btn">OK</button>
+                    </form>
+                    {% else %}
+                    <span class="help-text">не ведётся</span>
+                    {% endif %}
+                </td>
+                {% endfor %}
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    <div class="help-text" style="padding:10px 14px;">
+        {% if total > rows|length %}Показаны первые {{ rows|length }} из {{ total }} — полный список в Excel.
+        {% else %}Товаров: {{ total }}, с себестоимостью из 1С: {{ with_cost }}.{% endif %}
+    </div>
+    {% else %}
+    <div class="empty-state">Нет товаров с включённой синхронизацией — включите их на странице «Товары и остатки».</div>
+    {% endif %}
+
+{% else %}
+    {% if changes %}
+    {% if view == 'proposals' %}<form method="post" id="decide-form">
+        <input type="hidden" name="account_id" value="{{ account_id }}">
+    {% endif %}
+    <table>
+        <thead>
+            <tr>
+                {% if view == 'proposals' %}<th><input type="checkbox" onclick="document.querySelectorAll('input[name=ids]').forEach(function(c){c.checked=this.checked}.bind(this))"></th>{% endif %}
+                <th>Товар</th>
+                <th>Кабинет</th>
+                <th style="text-align:right;">Себест.</th>
+                <th style="text-align:right;">Было</th>
+                <th style="text-align:right;">Станет</th>
+                <th style="text-align:right;">Изм.</th>
+                <th>Статус</th>
+                {% if view == 'log' %}<th>Когда</th>{% endif %}
+            </tr>
+        </thead>
+        <tbody>
+            {% for c in changes %}
+            {% set pct = change_percent(c.old_price, c.new_price) %}
+            <tr>
+                {% if view == 'proposals' %}
+                <td>{% if c.block_reason != BLOCK_FLOOR %}<input type="checkbox" name="ids" value="{{ c.id }}">{% endif %}</td>
+                {% endif %}
+                <td>
+                    <div>{{ c.product.name or '—' }}</div>
+                    <div class="mono help-text">{{ c.product.article or '—' }}{% if c.product.size %} · {{ c.product.size }}{% endif %}{% if c.product.color %} · {{ c.product.color }}{% endif %}</div>
+                </td>
+                <td>{{ account_label(c.account) }}</td>
+                <td class="mono" style="text-align:right;">{{ c.cost_price if c.cost_price is not none else '—' }}</td>
+                <td class="mono" style="text-align:right;">{{ c.old_price if c.old_price is not none else '—' }}</td>
+                <td class="mono" style="text-align:right;"><strong>{{ c.new_price }}</strong>{% if c.source == 'manual' %} <span class="help-text">ручная</span>{% endif %}</td>
+                <td class="mono" style="text-align:right;">{{ '%+.1f%%'|format(pct) if pct is not none else 'новая' }}</td>
+                <td>
+                    {% if c.status.value in ('sent',) %}<span class="badge badge--good">{{ status_labels[c.status] }}</span>
+                    {% elif c.status.value in ('blocked', 'error') %}<span class="badge badge--bad">{{ status_labels[c.status] }}</span>
+                    {% else %}<span class="badge badge--warn">{{ status_labels[c.status] }}</span>{% endif %}
+                    {% if c.block_reason %}<div class="help-text">{{ block_labels[c.block_reason] }}</div>{% endif %}
+                    {% if c.note %}<div class="help-text">{{ c.note }}</div>{% endif %}
+                    {% if c.last_error %}<div class="help-text">{{ c.last_error }}</div>{% endif %}
+                </td>
+                {% if view == 'log' %}
+                <td class="help-text">{{ (c.sent_at or c.decided_at or c.created_at).strftime('%d.%m.%Y %H:%M') }}{% if c.decided_by %}<br>{{ c.decided_by }}{% endif %}</td>
+                {% endif %}
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% if view == 'proposals' %}
+    <div class="toolbar" style="padding:10px 14px; flex-wrap:wrap;">
+        <label class="checkbox-inline">
+            <input type="checkbox" name="confirm_large" value="true">
+            Подтверждаю изменения больше лимита
+        </label>
+        <button type="submit" formaction="/prices/approve" class="btn btn-primary">Отправить выбранные на площадки</button>
+        <button type="submit" formaction="/prices/reject" class="btn">Отклонить выбранные</button>
+    </div>
+    </form>
+    {% endif %}
+    <div class="help-text" style="padding:0 14px 10px;">
+        {% if total > changes|length %}Показаны первые {{ changes|length }} из {{ total }} — полный список в Excel.{% else %}Всего: {{ total }}.{% endif %}
+    </div>
+    {% else %}
+    <div class="empty-state">
+        {% if view == 'proposals' %}Предложений нет — нажмите «Рассчитать».{% else %}Журнал пуст.{% endif %}
+    </div>
+    {% endif %}
+{% endif %}

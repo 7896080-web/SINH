@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from datetime import date, datetime, timedelta, timezone
 from app.timeutils import now_utc
@@ -11,7 +12,7 @@ from app.returns import (RETURN_COMMAND, RETURN_COMMANDS, SCRAP_COMMAND,
                          apply_1c_result)
 
 from app.models import (FtpTask, FtpTaskStatus, OrderProcessStatus, Platform,
-                        ProcessedOrder, StockDateRow, StockDateSnapshot,
+                        ProcessedOrder, Product, StockDateRow, StockDateSnapshot,
                         StockDateStatus, StockDeltaDocument)
 
 logger = logging.getLogger("sync_worker")
@@ -88,6 +89,9 @@ STOCK_ON_DATE_TIMEOUT_MINUTES = 180
 # Сколько выгрузок храним: это справка, а не данные системы, и полный снимок
 # склада за каждое число быстро раздул бы базу.
 STOCK_ON_DATE_KEEP = 10
+
+# Себестоимость для репрайсера: команда в task_*.txt и ответ cost_*.txt.
+COST_EXPORT_COMMAND = "EXPORT_COST_PRICES"
 
 
 class LocalExchange:
@@ -170,6 +174,12 @@ class LocalExchange:
         # fromtimestamp без пояса вернул бы ЛОКАЛЬНОЕ время: на сервере UTC+3 это
         # сдвинуло бы сравнение со временем запроса на три часа.
         return datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc).replace(tzinfo=None)
+
+    def list_cost_files(self) -> list[str]:
+        """Себестоимость для репрайсера (cost_*.txt, команда EXPORT_COST_PRICES)."""
+        if not self.dir_results.exists():
+            return []
+        return sorted(p.name for p in self.dir_results.glob("cost_*.txt"))
 
     def list_barcode_files(self) -> list[str]:
         if not self.dir_results.exists():
@@ -281,7 +291,7 @@ def _unique_task_filename(exchange: "LocalExchange | None" = None) -> str:
 
 
 def build_task_batch(db: Session, max_lines: int = 500, request_stock_export: bool = False,
-                     request_barcode_export: bool = False,
+                     request_barcode_export: bool = False, request_cost_export: bool = False,
                      exchange: "LocalExchange | None" = None) -> tuple[str, str] | None:
     """Собирает файл-задание из накопившихся FtpTask со статусом pending.
     Возвращает (имя_файла, содержимое) или None, если отправлять нечего.
@@ -310,7 +320,8 @@ def build_task_batch(db: Session, max_lines: int = 500, request_stock_export: bo
     # иначе запрос остатков оказался бы проглочен, сверка встала бы на час, и мы
     # починили бы одно, сломав другое. Повторы уедут следующим минутным файлом.
     reposts = [t for t in tasks if (t.repost_count or 0) > 0]
-    asking_export = request_stock_export or request_barcode_export
+    # Запрос себестоимости — такой же запрос выгрузки: повторы с ним не едут.
+    asking_export = request_stock_export or request_barcode_export or request_cost_export
     if reposts and not asking_export:
         tasks = reposts[:REPOST_BATCH_LINES]
         date_requests_allowed = False
@@ -326,7 +337,8 @@ def build_task_batch(db: Session, max_lines: int = 500, request_stock_export: bo
     ).order_by(StockDateSnapshot.id.asc()).limit(MAX_DATE_REQUESTS_PER_BATCH).all() \
         if date_requests_allowed else []
 
-    if not tasks and not date_requests and not request_stock_export and not request_barcode_export:
+    if (not tasks and not date_requests and not request_stock_export and not request_barcode_export
+            and not request_cost_export):
         return None
 
     filename = _unique_task_filename(exchange)
@@ -335,6 +347,10 @@ def build_task_batch(db: Session, max_lines: int = 500, request_stock_export: bo
         lines.append("EXPORT_STOCK_ON_HAND")
     if request_barcode_export:
         lines.append("EXPORT_BARCODES")
+    if request_cost_export:
+        # Себестоимость для репрайсера. Обработка 1С без поддержки команды её
+        # просто пропустит — остальной обмен от этой строки не зависит.
+        lines.append(COST_EXPORT_COMMAND)
 
     # Причины утилизации — ОДНИМ запросом на пачку, а не по строке. Их в файле
     # единицы, но правило общее: подзапрос на строку у нас уже стоил 134,9 с
@@ -651,6 +667,53 @@ def fetch_stock_export_rows(exchange: "LocalExchange", not_older_than: datetime 
     не нужно (разовые скрипты, тесты разбора)."""
     rows, _ = fetch_stock_export_snapshot(exchange, not_older_than=not_older_than)
     return rows
+
+
+def parse_cost_export(content: str) -> dict[str, Decimal]:
+    """Разбор cost_*.txt: 'uid_1c|себестоимость' (дробная часть через точку или
+    запятую). Строки с мусором и неположительной себестоимостью пропускаются:
+    нулевая себестоимость дала бы нулевую цену на площадке."""
+    result = {}
+    for line in content.splitlines():
+        parts = line.strip().split("|")
+        if len(parts) < 2 or not parts[0].strip():
+            continue
+        raw = parts[1].strip().replace("\u00a0", "").replace(" ", "").replace(",", ".")
+        try:
+            value = Decimal(raw)
+        except InvalidOperation:
+            continue
+        if not value.is_finite() or value <= 0:
+            continue
+        result[parts[0].strip()] = value.quantize(Decimal("0.01"))
+    return result
+
+
+def apply_cost_export_files(db: Session, exchange: "LocalExchange") -> dict:
+    """Забирает cost_*.txt и обновляет Product.cost_price. Только себестоимость:
+    цены на площадках отсюда НЕ меняются — это делает оператор на странице
+    «Цены» (расчёт → подтверждение → отправка). Товар, которого нет в файле,
+    сохраняет прежнюю себестоимость: пропуск в выгрузке — не повод обнулять базу
+    расчёта. Файлы применяются по порядку имени, поэтому побеждает самый свежий."""
+    stats = {"files": 0, "updated": 0, "unknown": 0}
+    for filename in exchange.list_cost_files():
+        costs = parse_cost_export(exchange.download_and_archive_result(filename))
+        stats["files"] += 1
+        if not costs:
+            continue
+        products = {p.uid_1c: p for p in db.query(Product).filter(Product.uid_1c.in_(list(costs)))}
+        now = now_utc()
+        for uid, value in costs.items():
+            product = products.get(uid)
+            if product is None:
+                stats["unknown"] += 1
+                continue
+            if product.cost_price is None or Decimal(str(product.cost_price)) != value:
+                product.cost_price = value
+                stats["updated"] += 1
+            product.cost_price_updated_at = now
+    db.commit()
+    return stats
 
 
 def parse_stock_on_date_filename(filename: str) -> "date | None":

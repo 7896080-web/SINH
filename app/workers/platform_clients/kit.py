@@ -528,6 +528,15 @@ class KitClient(PlatformClient):
         except requests.RequestException:
             return False
 
+    def push_prices(self, items):
+        """Метод цен Kit в разобранной спеке не подтверждён, поэтому цена на Kit
+        НЕ отправляется: предложения по Kit-кабинету получают ошибку с этим
+        текстом и видны в журнале «Цены». Включить — когда метод будет сверен
+        со спекой и живым API (как это сделано для остатков)."""
+        return {"ok": [], "sent_prices": {},
+                "errors": [{"detail": "Kit: метод обновления цен ещё не сверен со спекой API — "
+                                      "цена не отправлена", "items": [i.barcode for i in items]}]}
+
     def get_catalog_items(self) -> list[CatalogItem]:
         """Каталог кабинета постранично.
 

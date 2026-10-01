@@ -27,8 +27,9 @@ from app.workers.ftp_channel import (
     detect_timed_out_tasks, repost_stuck_movements, finalize_stock_delta,
     fetch_stock_export_files, fetch_stock_export_snapshot, fetch_barcode_dict_files,
     apply_stock_on_date_files, detect_timed_out_stock_date_requests,
-    prune_stock_date_snapshots,
+    prune_stock_date_snapshots, apply_cost_export_files,
 )
+from app.workers.price_dispatch import run_price_dispatch
 from app.workers.reconciliation import run_reconciliation, import_product_master, import_barcode_dict
 
 # Время в строке лога — МЕСТНОЕ (так его ставит logging, так же 1С называет свои
@@ -250,13 +251,36 @@ def job_dispatch():
         db.close()
 
 
+def job_price_dispatch():
+    """Отправка цен, ПОДТВЕРЖДЁННЫХ оператором на странице «Цены». Сам ничего не
+    рассчитывает и неподтверждённого не трогает."""
+    db = SessionLocal()
+    try:
+        accounts = _active_accounts(db)
+        clients = {}
+        for account in accounts:
+            try:
+                clients[account.id] = build_client(db, account.id)
+            except CredentialsMissing:
+                continue
+        stats = run_price_dispatch(db, clients, accounts)
+        if stats:
+            logger.info("price_dispatch: %s", stats)
+        _heartbeat(db, "price_dispatch", True)
+    except Exception as e:
+        logger.exception("price_dispatch failed")
+        _heartbeat(db, "price_dispatch", False, str(e))
+    finally:
+        db.close()
+
+
 # Замок на все три расписания `job_ftp_send`: см. его докстроку. Ставится на
 # уровне модуля, потому что расписания живут в одном процессе воркера.
 _FTP_SEND_LOCK = threading.Lock()
 
 
 def job_ftp_send(request_stock_export: bool = False, request_barcode_export: bool = False,
-                 heartbeat_name: str = "ftp_send"):
+                 heartbeat_name: str = "ftp_send", request_cost_export: bool = False):
     """Отправка накопленных заданий в 1С. Три расписания зовут эту же функцию:
     минутное (только задания), часовое (плюс запрос выгрузки остатков) и суточное
     (плюс запрос справочника баркодов). Каждое пишет СВОЙ heartbeat: под общим
@@ -283,11 +307,12 @@ def job_ftp_send(request_stock_export: bool = False, request_barcode_export: boo
     паузы воркера все просроченные задания уходят в пул ОДНОВРЕМЕННО.
     """
     with _FTP_SEND_LOCK:
-        _job_ftp_send_locked(request_stock_export, request_barcode_export, heartbeat_name)
+        _job_ftp_send_locked(request_stock_export, request_barcode_export, heartbeat_name,
+                             request_cost_export=request_cost_export)
 
 
 def _job_ftp_send_locked(request_stock_export: bool, request_barcode_export: bool,
-                         heartbeat_name: str):
+                         heartbeat_name: str, request_cost_export: bool = False):
     db = SessionLocal()
     try:
         exchange = _build_ftp_exchange()
@@ -299,6 +324,7 @@ def _job_ftp_send_locked(request_stock_export: bool, request_barcode_export: boo
             logger.info("ftp_send: перепроведение зависших %s", repost_stats)
         batch = build_task_batch(db, request_stock_export=request_stock_export,
                                  request_barcode_export=request_barcode_export,
+                                 request_cost_export=request_cost_export,
                                  exchange=exchange)
         if batch:
             filename, content = batch
@@ -378,6 +404,18 @@ def job_ftp_receive():
         if on_date["files"] or on_date["unmatched"]:
             logger.info("ftp_receive: остатки на дату -> %s", on_date)
         prune_stock_date_snapshots(db)
+
+        # Себестоимость для репрайсера: обновляет только базу расчёта, цены на
+        # площадках отсюда не меняются. СВОЯ обработка ошибок: это добавка к
+        # каналу, а не его часть — её сбой не должен ронять приём ответов 1С
+        # (heartbeat `ftp_receive` красный = «канал 1С стоит», а он не стоит).
+        try:
+            costs = apply_cost_export_files(db, exchange)
+            if costs["files"]:
+                logger.info("ftp_receive: себестоимость -> %s", costs)
+        except Exception:
+            db.rollback()
+            logger.exception("ftp_receive: приём себестоимости не удался — остальной приём продолжается")
 
         timed_out = detect_timed_out_tasks(db)
         if timed_out:
@@ -1054,13 +1092,15 @@ def build_scheduler() -> BlockingScheduler:
         db.close()
 
     sched.add_job(job_dispatch, "interval", seconds=45, id="dispatch", max_instances=1)
+    sched.add_job(job_price_dispatch, "interval", minutes=2, id="price_dispatch", max_instances=1)
     sched.add_job(job_ftp_send, "interval", minutes=1, id="ftp_send", max_instances=1)
     sched.add_job(job_ftp_receive, "interval", minutes=1, id="ftp_receive", max_instances=1)
     # Часовые задания: первый прогон сразу после старта, а не через час. Иначе каждый
     # рестарт воркера (деплой) сдвигает запрос выгрузки и сверку на час, и остаток ЦС
     # в приложении отстаёт от 1С до часа дольше, чем должен.
     start = now_utc()
-    sched.add_job(lambda: job_ftp_send(request_stock_export=True,
+    # Вместе с остатками раз в час просим и себестоимость (база репрайсера).
+    sched.add_job(lambda: job_ftp_send(request_stock_export=True, request_cost_export=True,
                                        heartbeat_name="ftp_send_export_request"), "interval",
                   hours=1, id="ftp_send_export_request", max_instances=1,
                   next_run_time=start + timedelta(seconds=20))

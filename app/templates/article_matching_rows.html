@@ -1,0 +1,57 @@
+<div class="help-text" style="padding:10px 14px;">
+    {% for k, v in status_labels.items() %}{{ v }}: <strong>{{ counts[k] }}</strong>{% if not loop.last %} · {% endif %}{% endfor %}
+</div>
+{% if rows %}
+<form method="post" action="/article-matching/confirm">
+    <input type="hidden" name="account_id" value="{{ account_id }}">
+    <table>
+        <thead>
+            <tr>
+                <th><input type="checkbox" title="Выбрать все однозначные" onclick="document.querySelectorAll('input[name=pick]').forEach(function(c){c.checked=this.checked}.bind(this))"></th>
+                <th>Товар на площадке</th>
+                <th>Баркод</th>
+                <th>Товар 1С</th>
+                <th>Правило</th>
+                <th>Результат</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for c in rows %}
+            <tr>
+                <td>{% if c.status == 'unique' %}<input type="checkbox" name="pick" value="{{ c.item.barcode }}|{{ c.products[0].uid_1c }}">{% endif %}</td>
+                <td>
+                    <div class="mono">{{ c.item.article or '—' }}{% if c.item.size %} <span class="help-text">[{{ c.item.size }}]</span>{% endif %}</div>
+                    <div class="help-text">{{ c.item.name or '' }}</div>
+                </td>
+                <td class="mono">{{ c.item.barcode }}</td>
+                <td>
+                    {% for p in c.products[:5] %}
+                    <div><span class="mono">{{ p.article or '—' }}</span>{% if p.size %} · {{ p.size }}{% endif %}{% if p.color %} · {{ p.color }}{% endif %}
+                        <span class="help-text">{{ p.name or '' }}</span></div>
+                    {% endfor %}
+                    {% if c.products|length > 5 %}<div class="help-text">и ещё {{ c.products|length - 5 }}</div>{% endif %}
+                    {% if not c.products %}—{% endif %}
+                </td>
+                <td class="help-text">{% for k in c.kinds %}{{ kind_labels[k] }}{% if not loop.last %}<br>{% endif %}{% endfor %}</td>
+                <td>
+                    {% if c.status == 'unique' %}<span class="badge badge--good">{{ status_labels[c.status] }}</span>
+                    {% elif c.status == 'none' %}<span class="badge badge--bad">{{ status_labels[c.status] }}</span>
+                    {% else %}<span class="badge badge--warn">{{ status_labels[c.status] }}</span>{% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    <div class="toolbar" style="padding:10px 14px;">
+        <button type="submit" class="btn btn-primary">Сопоставить выбранные</button>
+        <span class="help-text">
+            {% if total > rows|length %}Показаны первые {{ rows|length }} из {{ total }}. {% endif %}
+            Неоднозначные — через «Экспорт в Excel»: проставьте ID_1С и загрузите на странице «Мэппинг».
+        </span>
+    </div>
+</form>
+{% else %}
+<div class="empty-state">
+    {% if account %}Несопоставленных баркодов в каталоге кабинета нет (или по фильтру пусто). Каталог обновляется на «Мэппинге» → «Загрузить спецификацию».{% else %}Нет кабинетов.{% endif %}
+</div>
+{% endif %}

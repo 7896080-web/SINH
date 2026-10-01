@@ -2,7 +2,8 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 
-from app.workers.platform_clients.base import PlatformClient, PlatformOrder, StockPushItem, CatalogItem
+from app.workers.platform_clients.base import (PlatformClient, PlatformOrder, StockPushItem, CatalogItem,
+                                               PricePushItem)
 from app.workers.http_retry import with_retry
 
 BASE_URL = "https://api-seller.ozon.ru"
@@ -335,6 +336,35 @@ class OzonClient(PlatformClient):
             except requests.HTTPError as e:
                 errors.append({"detail": str(e), "items": [it.barcode for it in chunk]})
         return {"ok": ok, "errors": errors}
+
+    def push_prices(self, items: list[PricePushItem]) -> dict:
+        """POST /v1/product/import/prices — до 1000 товаров за запрос, товар по
+        offer_id (артикулу продавца, как и у остатков). old_price (зачёркнутую)
+        и min_price не передаём — их настройки в кабинете Ozon не трогаем.
+        НЕ ПРОВЕРЕНО на живом API — по документации."""
+        ok, errors, sent = [], [], {}
+        for start in range(0, len(items), 1000):
+            chunk = items[start:start + 1000]
+            offer_to_item = {(it.article or it.barcode): it for it in chunk}
+            body = {"prices": [
+                {"offer_id": offer, "price": str(it.price), "currency_code": "RUB"}
+                for offer, it in offer_to_item.items()
+            ]}
+            try:
+                resp = self._post("/v1/product/import/prices", body)
+            except requests.RequestException as e:
+                errors.append({"detail": str(e), "items": [it.barcode for it in chunk]})
+                continue
+            for result in resp.get("result", []):
+                it = offer_to_item.get(result.get("offer_id"))
+                if it is None:
+                    continue
+                if result.get("updated"):
+                    ok.append(it.barcode)
+                    sent[it.barcode] = it.price
+                else:
+                    errors.append({"detail": result.get("errors"), "items": [it.barcode]})
+        return {"ok": ok, "errors": errors, "sent_prices": sent}
 
     def get_catalog_items(self) -> list[CatalogItem]:
         """/v3/product/list отдаёт только offer_id/product_id без баркода —
