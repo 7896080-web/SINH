@@ -126,3 +126,17 @@ def test_barcode_dict_goes_to_its_own_folder_before_the_answer():
     assert 'ОпубликоватьФайл(КаталогДляОтветов, "barcodes_" + Метка' in text
     assert text.index('"barcodes_" + Метка') < text.index('"result_" + Метка')
     assert int(re.search(r'Возврат "mark-(\d+)";', _function("ВерсияМодуля")).group(1)) >= onec.MIN_VERSION["BARCODE_DICT"]
+
+
+def test_movement_takes_stock_from_the_checked_warehouse():
+    """Документ списывает с того склада, по которому сверялся остаток (поле 2)."""
+    text = _text()
+    assert "ПереместитьПоставку(ИдЗаказа, Поля[2], Поля[3]," in text
+    f = _function("ПереместитьПоставку")
+    assert "СкладОткуда = НайтиСклад(ИмяСкладаОткуда);" in f
+    assert "СкладЦС" not in f
+
+
+def test_supply_quantity_must_be_a_positive_integer():
+    f = _function("РазобратьПозицииПоставки")
+    assert "Поз.Нужно <= 0 ИЛИ Поз.Нужно <> Цел(Поз.Нужно)" in f
