@@ -120,13 +120,43 @@ function Set-Global($name, $value) {
     }
     $script:lines.Insert($script:globalEnd, "$name $value"); $script:globalEnd++
 }
-Set-Global "Port" $Port
-Set-Global "PasswordAuthentication" "no"
+# Пользуется ли SSH на этом сервере кто-то ещё. 30.09 на боевом сервере так и
+# было: администратор Sergey заходил по ключу на порт 22, а скрипт заменил порт
+# на 443 и пустил только marking_sftp — доступ у него пропал. Признак — чужие
+# authorized_keys; тогда прежние порт, пароли и список пользователей не трогаем.
+$foreignKeys = @()
+if (Test-Path (Join-Path $cfgDir "administrators_authorized_keys")) { $foreignKeys += Join-Path $cfgDir "administrators_authorized_keys" }
+$foreignKeys += @(Get-ChildItem "C:\Users\*\.ssh\authorized_keys" -ErrorAction SilentlyContinue | % FullName)
+$inUse = $foreignKeys.Count -gt 0
+if ($inUse) { Warn ("SSH на этом сервере уже используется (" + ($foreignKeys -join ", ") + ") — прежние порт, пароли и пользователи сохраняются.") }
+
+$ports = @()
+for ($i = 0; $i -lt $globalEnd; $i++) { if ($lines[$i] -match '^\s*Port\s+(\d+)') { $ports += [int]$Matches[1] } }
+if ($ports.Count -eq 0 -and $inUse) {
+    # Строки Port нет — значит, слушает 22. Им пользуются: 22 остаётся, наш порт добавляется.
+    Set-Global "Port" 22
+    $lines.Insert($globalEnd, "Port $Port"); $globalEnd++
+} elseif ($ports.Count -eq 0) {
+    Set-Global "Port" $Port
+} elseif ($ports -notcontains $Port) {
+    $lines.Insert($globalEnd, "Port $Port"); $globalEnd++
+}
+if ($inUse) {
+    $pwAuth = $null
+    for ($i = 0; $i -lt $globalEnd; $i++) { if ($lines[$i] -match '^\s*PasswordAuthentication\s+(\w+)') { $pwAuth = $Matches[1] } }
+    if ($pwAuth -ne "no") { Warn "Вход по паролю на этом сервере не выключен (им могут пользоваться) — не трогаю. Пароли для SSH лучше выключить, когда все перейдут на ключи." }
+} else {
+    Set-Global "PasswordAuthentication" "no"
+}
 
 $allowIdx = -1
 for ($i = 0; $i -lt $globalEnd; $i++) { if ($lines[$i] -match '^\s*AllowUsers\s') { $allowIdx = $i; break } }
 if ($allowIdx -ge 0) {
     if ($lines[$allowIdx] -notmatch "(\s|^)$User(\s|$)") { $lines[$allowIdx] = $lines[$allowIdx].TrimEnd() + " $User" }
+} elseif ($inUse) {
+    # Список не заводим: он отрезал бы тех, кто уже входит. marking_sftp и без
+    # него заперт блоком Match (только SFTP, только C:\sync).
+    Warn "AllowUsers не добавлен: SSH здесь уже используется, а список отрезал бы прежних пользователей."
 } else {
     # AllowUsers впервые: SSH на этом сервере пускает ТОЛЬКО перечисленных.
     $lines.Insert($globalEnd, "AllowUsers $User"); $globalEnd++
