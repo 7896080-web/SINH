@@ -9,6 +9,7 @@ import io
 from urllib.parse import quote
 
 import openpyxl
+from openpyxl.cell import WriteOnlyCell
 from fastapi import APIRouter, Depends, File, Request, UploadFile
 from fastapi.responses import RedirectResponse, Response
 from sqlalchemy.orm import Session
@@ -52,10 +53,18 @@ def mapping_export(status: str = "", q: str = "", db: Session = Depends(get_db),
     ws.append(["Размерный артикул Lamoda", "EAN", "Размер Lamoda", "Цвет Lamoda", "Статус",
                "ID товара 1С", "Артикул 1С", "Наименование 1С", "Размер 1С", "Цвет 1С",
                "Пул штрихкодов 1С", "Конфликт с", "GTIN", "НК: цвет", "НК: размер"])
+    def text_cell(v):
+        # Всё — текст. openpyxl превращает строку на «=» в ФОРМУЛУ: наименование
+        # из 1С или артикул на «=» стал бы исполняемой формулой в файле, а
+        # штрихкод-число потерял бы ведущий ноль.
+        c = WriteOnlyCell(ws, value=v)
+        c.data_type = "s"
+        return c
     for r in chosen:
-        ws.append([r.supplier_sku, r.ean, r.lamoda_size, r.lamoda_color, r.label, r.item_id,
-                   r.onec_article, r.onec_name, r.onec_size, r.onec_color, ", ".join(r.pool),
-                   "; ".join(r.others), r.gtin, r.nk_color, r.nk_size])
+        ws.append([text_cell(v) for v in (
+            r.supplier_sku, r.ean, r.lamoda_size, r.lamoda_color, r.label, r.item_id,
+            r.onec_article, r.onec_name, r.onec_size, r.onec_color, ", ".join(r.pool),
+            "; ".join(r.others), r.gtin, r.nk_color, r.nk_size)])
     buf = io.BytesIO()
     wb.save(buf)
     name = f"сопоставление_{today_local():%Y-%m-%d}.xlsx"
