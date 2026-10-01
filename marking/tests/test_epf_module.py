@@ -114,3 +114,15 @@ def test_repository_module_uses_the_production_exchange_folders():
     for d in ("tasks", "results", "archive"):
         assert f'"C:\\sync\\{d}"' in f, d
     assert "sync_test" not in _text()
+
+
+def test_barcode_dict_goes_to_its_own_folder_before_the_answer():
+    """BARCODE_DICT: справочник — файлом barcodes_<метка> в папку ответов задания
+    (для mark_ это results\\marking) и РАНЬШЕ ответа: увидев result, программа
+    сразу читает справочник. EXPORT_BARCODES sync_admin кладёт файл в общий
+    results — его забрало бы приложение синхронизации."""
+    text = _text()
+    assert 'Команда = "BARCODE_DICT"' in text
+    assert 'ОпубликоватьФайл(КаталогДляОтветов, "barcodes_" + Метка' in text
+    assert text.index('"barcodes_" + Метка') < text.index('"result_" + Метка')
+    assert int(re.search(r'Возврат "mark-(\d+)";', _function("ВерсияМодуля")).group(1)) >= onec.MIN_VERSION["BARCODE_DICT"]
