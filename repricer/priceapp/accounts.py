@@ -68,3 +68,29 @@ def load_catalog(db: Session, account: Account, client) -> dict:
                             "пропавшие строки не удалены" if truncated else "")
     db.commit()
     return {"rows": len(seen), "removed": removed, "truncated": truncated}
+
+
+def load_prices(db: Session, account: Account, client) -> dict:
+    """Текущие цены площадки на строки каталога кабинета. Строки, о которых
+    площадка не сказала, получают NULL — но ТОЛЬКО при полной выдаче: огрызок
+    стёр бы цены у половины каталога и показал бы их «неизвестными»."""
+    got = client.get_prices()
+    truncated = bool(getattr(client, "last_truncated", False))
+    now = now_utc()
+    updated = missing = 0
+    for item in db.query(PlatformItem).filter(PlatformItem.account_id == account.id):
+        cur = got.get(client.price_key(item))
+        if cur is not None:
+            item.current_price, item.current_sale_price = cur.price, cur.sale_price
+            item.price_loaded_at = now
+            updated += 1
+        else:
+            missing += 1
+            if not truncated:
+                item.current_price = item.current_sale_price = None
+                item.price_loaded_at = now
+    account.prices_loaded_at = now
+    account.prices_note = ("ВЫГРУЗКА ЦЕН НЕПОЛНАЯ: площадка не отдала её до конца, "
+                           "прежние цены у пропавших строк оставлены" if truncated else "")
+    db.commit()
+    return {"updated": updated, "missing": missing, "truncated": truncated}

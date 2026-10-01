@@ -17,6 +17,11 @@
   * ЛИМИТ ШАГА — изменение больше `max_change_percent` от последней ПРИНЯТОЙ
     площадкой цены — только отдельным подтверждением.
   * Цена никогда не уходит сама: расчёт только предлагает.
+
+Правило — у ПЛОЩАДКИ, общее для всех её кабинетов (`PlatformRule`). Цена может
+браться и от другой площадки: расчётная цена базы × коэффициент (Ozon = WB × 1,1).
+База считается ПО СВОЕМУ ПРАВИЛУ, без ручных цен: ручная цена живёт в кабинете, а
+у базы их бывает несколько (у WB три ИП) — какая из них «та самая», сказать нельзя.
 """
 from __future__ import annotations
 
@@ -27,7 +32,7 @@ from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal
 from sqlalchemy.orm import Session
 
 from priceapp import rates
-from priceapp.models import (Account, OnecCost, PriceChange, PriceChangeStatus, PriceRule,
+from priceapp.models import (Account, OnecCost, PlatformRule, PriceChange, PriceChangeStatus,
                              ProductPrice)
 from priceapp.timeutils import now_utc
 
@@ -79,7 +84,7 @@ def price_for_coef(cost_rub: Decimal, coef, commission_percent) -> Decimal:
     return _dec(cost_rub) * _dec(coef) / (1 - _dec(commission_percent) / 100)
 
 
-def floor_price(cost_rub: Decimal, rule: PriceRule, commission_percent) -> int:
+def floor_price(cost_rub: Decimal, rule: PlatformRule, commission_percent) -> int:
     """Минимально допустимая цена, ₽ (вверх до рубля)."""
     return math.ceil(price_for_coef(cost_rub, rule.min_markup_coef, commission_percent))
 
@@ -106,11 +111,31 @@ class Decision:
     note: str = ""
 
 
-def decide(cost_usd, usd_rub, commission_percent, rule: PriceRule,
-           manual_price: int | None, last_sent_price: int | None) -> Decision:
-    """Какую цену предложить и пропускают ли её ограничители."""
+def rule_price(cost_rub: Decimal | None, rule: PlatformRule | None) -> tuple[int | None, str]:
+    """Цена площадки по её СОБСТВЕННОМУ правилу (без базы и ручных цен) — так
+    считается базовая площадка для тех, кто берёт цену от неё."""
+    if rule is None:
+        return None, "нет правила площадки"
+    if rule.commission_percent is None:
+        return None, "у площадки не задана комиссия"
+    c = _dec(rule.commission_percent)
+    if c < 0 or c >= 100:
+        return None, f"комиссия {c}% вне 0–99,99"
+    if cost_rub is None:
+        return None, "нет себестоимости из 1С"
+    if _dec(rule.markup_coef) <= 1:
+        # Правило по умолчанию — это «не настроено», а не «продавать по себестоимости».
+        return None, "правило площадки не настроено (коэффициент 1)"
+    return round_price(price_for_coef(cost_rub, rule.markup_coef, c), rule.round_step, rule.round_minus), ""
+
+
+def decide(cost_usd, usd_rub, commission_percent, rule: PlatformRule,
+           manual_price: int | None, last_sent_price: int | None,
+           base_rule: PlatformRule | None = None) -> Decision:
+    """Какую цену предложить и пропускают ли её ограничители. `base_rule` —
+    правило базовой площадки, если цена берётся от неё."""
     if commission_percent is None:
-        return Decision(None, note="у кабинета не задана комиссия")
+        return Decision(None, note="у площадки не задана комиссия")
     c = _dec(commission_percent)
     if c < 0 or c >= 100:
         return Decision(None, note=f"комиссия {c}% вне 0–99,99")
@@ -124,9 +149,16 @@ def decide(cost_usd, usd_rub, commission_percent, rule: PriceRule,
         d = Decision(int(manual_price), cost_rub=cost_rub, source="manual")
     elif cost_rub is None:
         return Decision(None, note="нет себестоимости из 1С")
+    elif rule.base_platform:
+        base, why = rule_price(cost_rub, base_rule)
+        if base is None:
+            return Decision(None, cost_rub=cost_rub, note=f"базовая площадка: {why}")
+        coef = _dec(rule.base_coef or 1)
+        d = Decision(round_price(_dec(base) * coef, rule.round_step, rule.round_minus),
+                     cost_rub=cost_rub, source="base")
+        d.note = f"от базовой {base} ₽ × {_ru(coef)}"
     elif _dec(rule.markup_coef) <= 1:
-        # Правило по умолчанию — это «не настроено», а не «продавать по себестоимости».
-        return Decision(None, cost_rub=cost_rub, note="правило кабинета не настроено (коэффициент 1)")
+        return Decision(None, cost_rub=cost_rub, note="правило площадки не настроено (коэффициент 1)")
     else:
         d = Decision(round_price(price_for_coef(cost_rub, rule.markup_coef, c),
                                  rule.round_step, rule.round_minus), cost_rub=cost_rub)
@@ -147,18 +179,24 @@ def decide(cost_usd, usd_rub, commission_percent, rule: PriceRule,
     pct = change_percent(last_sent_price, d.new_price)
     if pct is not None and abs(pct) > float(_dec(rule.max_change_percent)):
         d.block_reason = BLOCK_MAX_CHANGE
-        d.note = f"изменение {pct:+.1f}% при лимите {rule.max_change_percent}%"
+        d.note = "; ".join(x for x in (d.note, f"изменение {pct:+.1f}% при лимите {rule.max_change_percent}%") if x)
     return d
 
 
-def get_or_create_rule(db: Session, account_id: int) -> PriceRule:
-    rule = db.query(PriceRule).filter(PriceRule.account_id == account_id).first()
+def get_rule(db: Session, platform: str) -> PlatformRule:
+    rule = db.query(PlatformRule).filter(PlatformRule.platform == platform).first()
     if rule is None:
-        rule = PriceRule(account_id=account_id, markup_coef=1, round_step=1, round_minus=0,
-                         min_markup_coef=1, max_change_percent=20)
+        rule = PlatformRule(platform=platform, markup_coef=1, round_step=1, round_minus=0,
+                            min_markup_coef=1, max_change_percent=20)
         db.add(rule)
-        db.flush()
+        db.flush()   # autoflush выключен: второй вызов иначе завёл бы дубль
     return rule
+
+
+def rules_for(db: Session, platform: str) -> tuple[PlatformRule, PlatformRule | None]:
+    """(правило площадки, правило её базы или None)."""
+    rule = get_rule(db, platform)
+    return rule, (get_rule(db, rule.base_platform) if rule.base_platform else None)
 
 
 @dataclass
@@ -175,14 +213,14 @@ class Stats:
 
 
 def recalculate_account(db: Session, account: Account, is_test: bool = False) -> Stats:
-    """Пересчёт предложений по кабинету — по всем SKU 1С, сопоставленным с его
+    """Пересчёт предложений по кабинету (правило — его площадки) — по всем SKU 1С, сопоставленным с его
     каталогом (`mapping.account_items`). Прежние нерешённые предложения
     вытесняются; подтверждённые и ещё не отправленные не трогаются. Цена, равная
     последней принятой, предложения не получает."""
     from priceapp import mapping
 
     stats = Stats()
-    rule = get_or_create_rule(db, account.id)
+    rule, base_rule = rules_for(db, account.platform)
     rate = rates.current(db)
     for old in db.query(PriceChange).filter(PriceChange.account_id == account.id,
                                             PriceChange.is_test.is_(is_test),
@@ -198,7 +236,7 @@ def recalculate_account(db: Session, account: Account, is_test: bool = False) ->
         last = pp.last_sent_price if pp else None
         cost = costs.get(item_id)
         d = decide(cost.cost_usd if cost else None, rate.usd_rub if rate else None,
-                   account.commission_percent, rule, pp.manual_price if pp else None, last)
+                   rule.commission_percent, rule, pp.manual_price if pp else None, last, base_rule)
         if d.new_price is None:
             stats.skip(d.note)
             continue
@@ -208,7 +246,7 @@ def recalculate_account(db: Session, account: Account, is_test: bool = False) ->
         db.add(PriceChange(
             item_id=item_id, account_id=account.id, barcode=rows[0].barcode,
             cost_usd=cost.cost_usd if cost else None, usd_rub=rate.usd_rub if rate else None,
-            cost_rub=d.cost_rub, commission_percent=account.commission_percent,
+            cost_rub=d.cost_rub, commission_percent=rule.commission_percent,
             old_price=last, new_price=d.new_price, markup_rub=d.markup_rub,
             markup_coef=d.markup_coef, source=d.source,
             status=PriceChangeStatus.blocked.value if d.block_reason else PriceChangeStatus.proposed.value,

@@ -61,20 +61,21 @@ class WorkerHeartbeat(Base):
 
 class Account(Base):
     """Кабинет площадки. У WB их может быть несколько (разные ИП) — со своими
-    ключами и СВОЕЙ комиссией: от неё считается наценка."""
+    ключами и каталогом. Правила цены и комиссия — у ПЛОЩАДКИ (`PlatformRule`),
+    общие для всех её кабинетов."""
     __tablename__ = "accounts"
     id = Column(Integer, primary_key=True)
-    platform = Column(String(8), nullable=False)          # wb / ozon / kit
+    platform = Column(String(8), nullable=False)          # wb / ozon / kit / lamoda
     name = Column(String(128), nullable=False)
     is_active = Column(Boolean, nullable=False, default=True)
-    # Комиссия площадки, % от цены. NULL — не задана: расчёт по кабинету не идёт
-    # (ноль — тоже значение, но его ставят явно).
-    commission_percent = Column(Numeric(6, 2), nullable=True)
     last_check_at = Column(DateTime, nullable=True)
     last_check_ok = Column(Boolean, nullable=True)
     last_check_message = Column(Text, nullable=False, default="")
     catalog_loaded_at = Column(DateTime, nullable=True)
     catalog_note = Column(Text, nullable=False, default="")
+    # Текущие цены с площадки (`accounts.load_prices`): когда и с какой оговоркой.
+    prices_loaded_at = Column(DateTime, nullable=True)
+    prices_note = Column(Text, nullable=False, default="")
     created_at = Column(DateTime, nullable=False, default=now_utc)
 
     credentials = relationship("ApiCredential", back_populates="account",
@@ -109,6 +110,13 @@ class PlatformItem(Base):
     name = Column(String(500), nullable=False, default="")
     size = Column(String(64), nullable=False, default="")
     fetched_at = Column(DateTime, nullable=False, default=now_utc)
+    # Цена, которая СЕЙЧАС стоит на площадке (`accounts.load_prices`). NULL — не
+    # загружали или площадка о ней не сказала. `current_price` — то же поле, что мы
+    # отправляем (у WB цена до скидки), `current_sale_price` — что платит
+    # покупатель (у WB с учётом скидки продавца): наценку по текущей считаем от неё.
+    current_price = Column(Integer, nullable=True)
+    current_sale_price = Column(Integer, nullable=True)
+    price_loaded_at = Column(DateTime, nullable=True)
 
 
 # --- 1С: справочник баркодов, себестоимость, задания ------------------------------
@@ -205,22 +213,31 @@ class ArticleMatchRule(Base):
 
 # --- Цены ---------------------------------------------------------------------------
 
-class PriceRule(Base):
-    """Правило цены кабинета. Наценка — КОЭФФИЦИЕНТОМ к себестоимости (так её
-    считает заказчик: 2 = +100%, 2,5 = +150%, 3 = +200%). Цена = себестоимость ₽ ×
-    коэффициент / (1 − комиссия%), вверх до шага с «красивым» окончанием."""
-    __tablename__ = "price_rules"
+class PlatformRule(Base):
+    """Правило цены ПЛОЩАДКИ — одно на все её кабинеты (у WB три ИП, условия у
+    них одни). Наценка — КОЭФФИЦИЕНТОМ к себестоимости (2 = +100%, 2,5 = +150%,
+    3 = +200%). Цена = себестоимость ₽ × коэффициент / (1 − комиссия%), вверх до
+    шага с «красивым» окончанием.
+
+    Или — от ДРУГОЙ площадки: при заданной `base_platform` цена = расчётная цена
+    базовой площадки × `base_coef` (Ozon = WB × 1,1). Цепочек нет: база сама
+    базы не имеет. Пол наценки проверяется по СВОЕЙ комиссии всегда."""
+    __tablename__ = "platform_rules"
     id = Column(Integer, primary_key=True)
-    account_id = Column(Integer, ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False,
-                        unique=True)
+    platform = Column(String(8), nullable=False, unique=True)
+    # Комиссия площадки, % от цены. NULL — не задана: расчёт по площадке не идёт
+    # (ноль — тоже значение, но его ставят явно).
+    commission_percent = Column(Numeric(6, 2), nullable=True)
     # 1 — наценки нет: правило не настроено, расчёт по нему не идёт.
     markup_coef = Column(Numeric(7, 3), nullable=False, default=1)
     round_step = Column(Integer, nullable=False, default=1)
     round_minus = Column(Integer, nullable=False, default=0)
     # Пол: к получению не меньше себестоимости × этот коэффициент — ни расчётом,
-    # ни ручной ценой. 1 — «не в убыток».
+    # ни ручной ценой, ни ценой от базовой площадки. 1 — «не в убыток».
     min_markup_coef = Column(Numeric(7, 3), nullable=False, default=1)
     max_change_percent = Column(Numeric(7, 2), nullable=False, default=20)
+    base_platform = Column(String(8), nullable=True)
+    base_coef = Column(Numeric(7, 3), nullable=True)
     updated_at = Column(DateTime, nullable=False, default=now_utc, onupdate=now_utc)
 
 
@@ -261,7 +278,7 @@ class PriceChange(Base):
     new_price = Column(Integer, nullable=False)
     markup_rub = Column(Numeric(12, 2), nullable=True)
     markup_coef = Column(Numeric(8, 2), nullable=True)     # к получению / себестоимость
-    source = Column(String(16), nullable=False, default="rule")   # rule / manual
+    source = Column(String(16), nullable=False, default="rule")   # rule / manual / base
     status = Column(String(16), nullable=False, default=PriceChangeStatus.proposed.value, index=True)
     block_reason = Column(String(16), nullable=True)
     note = Column(String(255), nullable=True)

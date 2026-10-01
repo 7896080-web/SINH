@@ -1,12 +1,14 @@
 from decimal import Decimal
 
-from priceapp.models import Account, OnecBarcode, OnecCost, PlatformItem, PriceRule
+from priceapp.models import Account, OnecBarcode, OnecCost, PlatformItem
 
 
 def account(db, platform="wb", name="ИП Тест", commission=25):
-    a = Account(platform=platform, name=name,
-                commission_percent=Decimal(str(commission)) if commission is not None else None)
+    """Кабинет; комиссия ложится в правило ПЛОЩАДКИ (общее на её кабинеты)."""
+    from priceapp.pricing import get_rule
+    a = Account(platform=platform, name=name)
     db.add(a)
+    get_rule(db, platform).commission_percent = Decimal(str(commission)) if commission is not None else None
     db.commit()
     return a
 
@@ -26,11 +28,14 @@ def item(db, acc, barcode, article="", external_id="", size="", name="на пл�
 
 
 def rule(db, acc, **kw):
+    """Правило площадки кабинета `acc`."""
+    from priceapp.pricing import get_rule
     base = dict(markup_coef=2, round_step=10, round_minus=1, min_markup_coef="1.3",
                 max_change_percent=20)
     base.update(kw)
-    r = PriceRule(account_id=acc.id, **base)
-    db.add(r)
+    r = get_rule(db, acc.platform)
+    for k, v in base.items():
+        setattr(r, k, Decimal(str(v)) if isinstance(v, str) else v)
     db.commit()
     return r
 
