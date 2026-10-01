@@ -13,8 +13,8 @@ Ozon /v3/product/list + /v3/product/info/list, Kit /v1/variants с total_count).
   * Ozon — `POST /v1/product/import/prices` по offer_id (артикулу продавца);
     old_price и min_price не передаём.
   * Kit — метод цен в спеке не сверен: честный отказ, ничего не отправляется.
-  * Lamoda — проверка ключей получением токена (`POST /v2/auth-token`, сверено
-    со спекой); каталог и цены — честный отказ, пока нет схем методов.
+  * Lamoda — `POST /v2/nomenclatures-prices` по parentSku (карточке), в копейках,
+    `force: false` (из акции товар не убираем). Сверено с OAS-файлом.
 
 **Чтение текущих цен вживую НЕ проверялось** — тоже по документации:
   * WB — `GET discounts-prices-api.wildberries.ru/api/v2/list/goods/filter`
@@ -23,7 +23,9 @@ Ozon /v3/product/list + /v3/product/info/list, Kit /v1/variants с total_count).
     покупатель.
   * Ozon — `POST /v5/product/info/prices` (cursor, limit до 1000) по offer_id:
     `price.price` — цена продажи.
-  * Kit, Lamoda — не читаем (`get_prices` бросает PlatformError).
+  * Lamoda — `GET /v2/nomenclatures-sell-values`: `price` и `salePrice` (пока
+    скидка действует) по parentSku, страна RU.
+  * Kit — не читаем (`get_prices` бросает PlatformError).
 """
 from __future__ import annotations
 
@@ -37,14 +39,15 @@ PLATFORMS = {"wb": "Wildberries", "ozon": "Ozon", "kit": "Яндекс KIT", "la
 
 # Где умеем читать текущие цены (`get_prices`). У остальных метод честно
 # отказывает; суточное обновление и кнопка их пропускают, называя причину.
-READS_PRICES = {"wb", "ozon"}
+READS_PRICES = {"wb", "ozon", "lamoda"}
 
 # Какие ключи у кабинета: (имя поля, подпись).
 CREDENTIAL_FIELDS = {
     "wb": [("token", "Токен (категории «Контент» и «Цены и скидки»)")],
     "ozon": [("client_id", "Client-Id"), ("api_key", "Api-Key")],
     "kit": [("token", "Токен")],
-    "lamoda": [("client_id", "Client ID"), ("client_secret", "Client Secret")],
+    "lamoda": [("client_id", "Client ID"), ("client_secret", "Client Secret"),
+               ("seller_id", "Seller ID (идентификатор продавца)")],
 }
 
 
@@ -415,30 +418,44 @@ def parse_kit_variants(data: dict) -> list[CatalogRow]:
 
 # --- Lamoda ------------------------------------------------------------------------
 #
-# Lamoda Seller Partner API v2 (academy.lamoda.ru/articles/api/spec/10_v2_spec/,
-# OAS-файл /upload/iblock/c17/5jpdwa8k7gqtz7v0hwwt56669um0kncn.yaml). Из
-# сохранённой страницы спецификации известно ТОЛЬКО: сервер
-# `https://public-api-seller.lamoda.ru/api`, `POST /v2/auth-token` с полями
-# `grant_type`, `client_id`, `client_secret` и ответ `access_token`, `expires_in`,
-# `token_type`, `scope`. Значение `grant_type` на странице не раскрыто — берём
-# стандартное для OAuth2 `client_credentials`; это единственная догадка, и цена
-# её ошибки — отказ в проверке ключей, а не неверная цена. Схемы методов цен
-# (`/v2/nomenclatures-prices`, `/v2/nomenclatures-sell-values`) и каталога
-# (`/v2/nomenclatures`) на странице свёрнуты — без них каталог и цены честно
-# отказывают: вслепую цены на площадку не пишутся.
+# Lamoda Seller Partner API v2 — сверено с OAS-файлом спецификации
+# (academy.lamoda.ru/upload/iblock/c17/5jpdwa8k7gqtz7v0hwwt56669um0kncn.yaml,
+# снимок 02.10.2026). Вживую НЕ проверялось. Главное из спеки:
+#   * токен — `POST /v2/auth-token` {grant_type: client_credentials, client_id,
+#     client_secret} -> 201 {access_token, expires_in}; дальше `Authorization: Bearer`;
+#   * `sellerId` ОБЯЗАТЕЛЕН в каждом запросе — третий ключ кабинета;
+#   * суммы — в КОПЕЙКАХ (`amount` целое, `currency` RUB);
+#   * каталог — `GET /v2/nomenclatures` (country обязателен, limit до 25, конец —
+#     `meta.totalPages`): строка = размерный `sku` со своим `barcode`;
+#   * текущие цены — `GET /v2/nomenclatures-sell-values` (без sku — весь каталог);
+#   * цена ставится на КАРТОЧКУ (`parentSku`), а не на размер: как у WB, при разных
+#     ценах размеров уходит наибольшая — меньшая могла бы оказаться ниже пола;
+#   * `POST /v2/nomenclatures-prices` с `force: false` ВСЕГДА. Если цена нарушает
+#     условия акции, `force: true` УБРАЛ БЫ товар из акции — это коммерческое
+#     решение, его принимает человек в кабинете Lamoda, а не программа. Такая
+#     позиция возвращается ошибкой со словами, что делать.
 
 LAMODA = "https://public-api-seller.lamoda.ru/api"
-LAMODA_NOT_READY = ("Lamoda: каталог и цены ещё не подключены — в сохранённой спецификации нет схем "
-                    "методов, нужен OAS-файл (ключи сохранены, ничего не отправляется)")
+LAMODA_COUNTRY = "RU"
+LAMODA_PAGE = 25            # NomenclaturesLimitQuery: maximum 25
+LAMODA_MAX_PAGES = 8000
+LAMODA_PUSH_CHUNK = 100     # предел пачки спека не называет — берём осторожно
+
+
+def lamoda_parent(external_id: str) -> str:
+    """`external_id` строки каталога Lamoda — `parentSku:sku`."""
+    return (external_id or "").split(":")[0]
 
 
 class LamodaClient:
     platform = "lamoda"
 
-    def __init__(self, client_id: str, client_secret: str, session: requests.Session | None = None):
-        self.client_id, self.client_secret = client_id, client_secret
+    def __init__(self, client_id: str, client_secret: str, seller_id: str,
+                 session: requests.Session | None = None):
+        self.client_id, self.client_secret, self.seller_id = client_id, client_secret, str(seller_id)
         self.session = session or requests.Session()
         self.last_truncated = False
+        self._token = None
 
     def get_token(self) -> str:
         r = self.session.post(f"{LAMODA}/v2/auth-token", timeout=30, json={
@@ -450,9 +467,39 @@ class LamodaClient:
             raise PlatformError("Lamoda: в ответе на запрос токена нет access_token")
         return token
 
+    def _auth(self) -> dict:
+        if self._token is None:
+            self._token = self.get_token()
+        return {"Authorization": f"Bearer {self._token}"}
+
+    def _get(self, path: str, params: dict):
+        def call():
+            r = self.session.get(f"{LAMODA}{path}", params={"sellerId": self.seller_id, **params},
+                                 headers=self._auth(), timeout=30)
+            r.raise_for_status()
+            return r.json()
+        return with_retry(call)
+
+    def _post(self, path: str, body: dict):
+        def call():
+            r = self.session.post(f"{LAMODA}{path}", json={"sellerId": self.seller_id, **body},
+                                  headers=self._auth(), timeout=30)
+            r.raise_for_status()
+            return r.json() if r.content else {}
+        return with_retry(call)
+
+    def _pages(self, path: str, params: dict, key: str):
+        """Все страницы списка. Конец — `meta.totalPages`, а не короткая страница."""
+        self.last_truncated = False
+        for page in range(1, LAMODA_MAX_PAGES + 1):
+            data = self._get(path, {**params, "page": page, "limit": LAMODA_PAGE})
+            yield data.get(key) or []
+            total = (data.get("meta") or {}).get("totalPages")
+            if not isinstance(total, int) or page >= total:
+                return
+        self.last_truncated = True
+
     def test_connection(self) -> tuple[bool, str]:
-        """Ключи проверяются получением токена — единственный метод, сверенный со
-        спекой целиком. Каталог и цены после этого всё равно не подключены."""
         try:
             self.get_token()
         except requests.HTTPError as e:
@@ -465,21 +512,143 @@ class LamodaClient:
             return False, f"Lamoda: не удалось связаться ({e})"
         except PlatformError as e:
             return False, str(e)
-        return True, ("Токен Lamoda получен — ключи действительны. Каталог и цены Lamoda ещё "
-                      "не подключены (нужен OAS-файл спецификации).")
+        try:
+            self._get("/v2/nomenclatures-sell-values", {"page": 1, "limit": 1})
+        except requests.HTTPError as e:
+            code = e.response.status_code if e.response is not None else "?"
+            return False, (f"Lamoda: токен получен, но запрос по Seller ID {self.seller_id} отклонён ({code}) — "
+                           "проверьте Seller ID.")
+        except requests.RequestException as e:
+            return False, f"Lamoda: токен получен, запрос цен не прошёл ({e})"
+        return True, "Токен получен, Seller ID принят — ключи действительны."
 
     def get_catalog(self) -> list[CatalogRow]:
-        raise PlatformError(LAMODA_NOT_READY)
+        result = []
+        for chunk in self._pages("/v2/nomenclatures", {"country": LAMODA_COUNTRY}, "nomenclatures"):
+            result.extend(parse_lamoda_nomenclatures({"nomenclatures": chunk}))
+        return result
 
     def price_key(self, item) -> str:
-        return item.external_id or ""
+        return lamoda_parent(item.external_id)
 
     def get_prices(self) -> dict[str, CurrentPrice]:
-        raise PlatformError(LAMODA_NOT_READY)
+        out: dict[str, CurrentPrice] = {}
+        for chunk in self._pages("/v2/nomenclatures-sell-values", {}, "nomenclatures"):
+            for parent, cur in parse_lamoda_sell_values({"nomenclatures": chunk}).items():
+                if parent not in out or cur.price > out[parent].price:
+                    out[parent] = cur
+        return out
 
     def push_prices(self, items: list[PriceItem]) -> dict:
-        return {"ok": [], "sent_prices": {},
-                "errors": [{"detail": LAMODA_NOT_READY, "items": [i.barcode for i in items]}]}
+        by_parent: dict[str, list[PriceItem]] = {}
+        errors = []
+        for it in items:
+            parent = lamoda_parent(it.external_id)
+            if not parent:
+                errors.append({"detail": "нет parentSku — обновите каталог кабинета", "items": [it.barcode]})
+                continue
+            by_parent.setdefault(parent, []).append(it)
+        price_of = {p: max(i.price for i in g) for p, g in by_parent.items()}
+        ok, sent = [], {}
+        parents = list(price_of)
+        for start in range(0, len(parents), LAMODA_PUSH_CHUNK):
+            chunk = parents[start:start + LAMODA_PUSH_CHUNK]
+            body = {"country": LAMODA_COUNTRY, "force": False,
+                    "prices": [{"parentSku": p, "price": {"amount": price_of[p] * 100, "currency": "RUB"}}
+                               for p in chunk]}
+            try:
+                resp = self._post("/v2/nomenclatures-prices", body)
+            except requests.RequestException as e:
+                errors.append({"detail": str(e), "items": [i.barcode for p in chunk for i in by_parent[p]]})
+                continue
+            failed, unattributed = lamoda_push_failures(resp, chunk)
+            if unattributed:
+                # Ошибку без parentSku не к кому привязать — считаем неуспешной всю
+                # пачку: повтор той же цены безвреден, а «отправлено» неправдой — нет.
+                failed.update({p: unattributed for p in chunk if p not in failed})
+            for p in chunk:
+                if p in failed:
+                    errors.append({"detail": failed[p], "items": [i.barcode for i in by_parent[p]]})
+                else:
+                    for i in by_parent[p]:
+                        ok.append(i.barcode)
+                        sent[i.barcode] = price_of[p]
+        return {"ok": ok, "errors": errors, "sent_prices": sent}
+
+
+def _lamoda_rub(price: dict | None) -> int | None:
+    if not isinstance(price, dict) or price.get("currency") not in (None, "RUB"):
+        return None
+    amount = price.get("amount")
+    if not isinstance(amount, int) or amount <= 0:
+        return None
+    return int(round(amount / 100))
+
+
+def parse_lamoda_nomenclatures(data: dict) -> list[CatalogRow]:
+    result = []
+    for n in data.get("nomenclatures") or []:
+        if not n.get("barcode") or not n.get("parentSku"):
+            continue
+        result.append(CatalogRow(f"{n['parentSku']}:{n.get('sku') or ''}", n["barcode"],
+                                 n.get("externalParentSku") or n.get("externalSku") or "",
+                                 n.get("name") or "", n.get("externalSize") or ""))
+    return result
+
+
+def parse_lamoda_sell_values(data: dict, now=None) -> dict[str, CurrentPrice]:
+    """parentSku -> цена (RU). Цена продажи — `salePrice`, только пока скидка
+    действует (`saleStart`..`saleEnd`); без дат — действует."""
+    from datetime import datetime, timezone
+    now = now or datetime.now(timezone.utc)
+
+    def when(v):
+        try:
+            return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+    out = {}
+    for n in data.get("nomenclatures") or []:
+        for sv in n.get("sellValues") or []:
+            if sv.get("country") != LAMODA_COUNTRY:
+                continue
+            price = _lamoda_rub(sv.get("price"))
+            if not price or not n.get("parentSku"):
+                continue
+            sale = _lamoda_rub(sv.get("salePrice"))
+            start, end = when(sv.get("saleStart")), when(sv.get("saleEnd"))
+            if sale and ((start and now < start) or (end and now > end)):
+                sale = None
+            cur = CurrentPrice(price, sale or price)
+            if n["parentSku"] not in out or cur.price > out[n["parentSku"]].price:
+                out[n["parentSku"]] = cur
+    return out
+
+
+def lamoda_push_failures(resp: dict, chunk: list[str]) -> tuple[dict[str, str], str]:
+    """({parentSku: причина}, причина без адресата). Ошибка приходит с `sku`
+    (может быть пустым), отказ по акции — с `parentSku` в `fraudValidationResults`."""
+    failed, unattributed = {}, ""
+    known = set(chunk)
+    for e in resp.get("errors") or []:
+        sku = str(e.get("sku") or "")
+        text = f"{e.get('code', '')}: {'; '.join(e.get('messages') or [])}".strip(": ")
+        parent = sku if sku in known else next((p for p in known if sku and sku.startswith(p)), "")
+        if parent:
+            failed[parent] = f"Lamoda отклонила цену — {text}"
+        else:
+            unattributed = f"Lamoda: ошибка без указания товара — {text}"
+    for fr in resp.get("fraudValidationResults") or []:
+        p = fr.get("parentSku")
+        if p in known:
+            how = ("изменить цену можно только после окончания акции" if fr.get("status") == "RESTRICTION"
+                   else "чтобы применить, уберите товар из акции в кабинете Lamoda")
+            names = ", ".join(str(x.get("name")) for x in fr.get("promotions") or [] if x.get("name"))
+            failed[p] = (f"Lamoda: цена нарушает условия акции{' «' + names + '»' if names else ''} "
+                         f"({fr.get('invalidValue')}) — {how}")
+    if not failed and not unattributed and resp.get("errorCount"):
+        unattributed = f"Lamoda: ошибок {resp.get('errorCount')}, но без подробностей"
+    return failed, unattributed
 
 
 def build_client(platform: str, creds: dict):
@@ -493,5 +662,5 @@ def build_client(platform: str, creds: dict):
     if platform == "kit":
         return KitClient(creds["token"])
     if platform == "lamoda":
-        return LamodaClient(creds["client_id"], creds["client_secret"])
+        return LamodaClient(creds["client_id"], creds["client_secret"], creds["seller_id"])
     raise PlatformError(platform)
