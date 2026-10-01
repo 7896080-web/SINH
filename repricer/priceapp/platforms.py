@@ -13,8 +13,8 @@ Ozon /v3/product/list + /v3/product/info/list, Kit /v1/variants с total_count).
   * Ozon — `POST /v1/product/import/prices` по offer_id (артикулу продавца);
     old_price и min_price не передаём.
   * Kit — метод цен в спеке не сверен: честный отказ, ничего не отправляется.
-  * Lamoda — ключи хранятся, но API не подключён (нет сверенной документации):
-    проверка, каталог, цены — честный отказ, ничего не отправляется.
+  * Lamoda — проверка ключей получением токена (`POST /v2/auth-token`, сверено
+    со спекой); каталог и цены — честный отказ, пока нет схем методов.
 
 **Чтение текущих цен вживую НЕ проверялось** — тоже по документации:
   * WB — `GET discounts-prices-api.wildberries.ru/api/v2/list/goods/filter`
@@ -414,22 +414,59 @@ def parse_kit_variants(data: dict) -> list[CatalogRow]:
 
 
 # --- Lamoda ------------------------------------------------------------------------
+#
+# Lamoda Seller Partner API v2 (academy.lamoda.ru/articles/api/spec/10_v2_spec/,
+# OAS-файл /upload/iblock/c17/5jpdwa8k7gqtz7v0hwwt56669um0kncn.yaml). Из
+# сохранённой страницы спецификации известно ТОЛЬКО: сервер
+# `https://public-api-seller.lamoda.ru/api`, `POST /v2/auth-token` с полями
+# `grant_type`, `client_id`, `client_secret` и ответ `access_token`, `expires_in`,
+# `token_type`, `scope`. Значение `grant_type` на странице не раскрыто — берём
+# стандартное для OAuth2 `client_credentials`; это единственная догадка, и цена
+# её ошибки — отказ в проверке ключей, а не неверная цена. Схемы методов цен
+# (`/v2/nomenclatures-prices`, `/v2/nomenclatures-sell-values`) и каталога
+# (`/v2/nomenclatures`) на странице свёрнуты — без них каталог и цены честно
+# отказывают: вслепую цены на площадку не пишутся.
 
-LAMODA_NOT_READY = ("Lamoda: API ещё не подключён — нужна документация API продавца "
-                    "(ключи сохранены, ничего не отправляется)")
+LAMODA = "https://public-api-seller.lamoda.ru/api"
+LAMODA_NOT_READY = ("Lamoda: каталог и цены ещё не подключены — в сохранённой спецификации нет схем "
+                    "методов, нужен OAS-файл (ключи сохранены, ничего не отправляется)")
 
 
 class LamodaClient:
-    """Заготовка: ключи кабинета хранятся, но обращаться к площадке вслепую
-    нельзя — каждый метод честно отказывает."""
     platform = "lamoda"
 
-    def __init__(self, client_id: str, client_secret: str):
+    def __init__(self, client_id: str, client_secret: str, session: requests.Session | None = None):
         self.client_id, self.client_secret = client_id, client_secret
+        self.session = session or requests.Session()
         self.last_truncated = False
 
+    def get_token(self) -> str:
+        r = self.session.post(f"{LAMODA}/v2/auth-token", timeout=30, json={
+            "grant_type": "client_credentials", "client_id": self.client_id,
+            "client_secret": self.client_secret})
+        r.raise_for_status()
+        token = (r.json() or {}).get("access_token")
+        if not token:
+            raise PlatformError("Lamoda: в ответе на запрос токена нет access_token")
+        return token
+
     def test_connection(self) -> tuple[bool, str]:
-        return False, LAMODA_NOT_READY
+        """Ключи проверяются получением токена — единственный метод, сверенный со
+        спекой целиком. Каталог и цены после этого всё равно не подключены."""
+        try:
+            self.get_token()
+        except requests.HTTPError as e:
+            code = e.response.status_code if e.response is not None else "?"
+            body = (e.response.text[:200] if e.response is not None else "")
+            if code in (400, 401, 403):
+                return False, f"Lamoda: {code} — Client ID / Client Secret не приняты. {body}".strip()
+            return False, f"Lamoda: ошибка {code} при получении токена. {body}".strip()
+        except requests.RequestException as e:
+            return False, f"Lamoda: не удалось связаться ({e})"
+        except PlatformError as e:
+            return False, str(e)
+        return True, ("Токен Lamoda получен — ключи действительны. Каталог и цены Lamoda ещё "
+                      "не подключены (нужен OAS-файл спецификации).")
 
     def get_catalog(self) -> list[CatalogRow]:
         raise PlatformError(LAMODA_NOT_READY)
