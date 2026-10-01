@@ -178,6 +178,15 @@ if ($AllowFrom) {
     Get-NetFirewallRule -DisplayName $rule -ErrorAction SilentlyContinue |
         Set-NetFirewallAddressFilter -RemoteAddress $AllowFrom
     Ok "Брандмауэр: порт $Port — только с $AllowFrom"
+    # Ограничение одного правила ничего не стоит, если тот же порт открывает
+    # другое: брандмауэр пропускает, когда разрешает ХОТЯ БЫ ОДНО правило. На
+    # боевом сервере так и было — 443 держало для всех правило IIS «Службы
+    # Интернета (входящий трафик HTTPS)», оставшееся от роли веб-сервера.
+    $others = Get-NetFirewallPortFilter | ? { $_.LocalPort -eq "$Port" } | Get-NetFirewallRule |
+        ? { $_.DisplayName -ne $rule -and $_.Enabled -eq 'True' -and $_.Direction -eq 'Inbound' -and $_.Action -eq 'Allow' }
+    foreach ($o in $others) {
+        Warn "Порт $Port открывает и правило «$($o.DisplayName)» — ограничение по адресу не сработает, пока оно включено. Выключить: Get-NetFirewallRule -DisplayName '$($o.DisplayName)' | Disable-NetFirewallRule"
+    }
 } else {
     Warn "Порт $Port открыт для всего интернета (вход только по ключу). Сузить: запустить снова с -AllowFrom <внешний адрес рабочего компьютера>."
 }
