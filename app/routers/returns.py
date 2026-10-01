@@ -705,21 +705,35 @@ def box_page(request: Request, db: Session = Depends(get_db),
 
 
 @router.post("/returns/box/mode")
-def box_mode(request: Request, mode: str = Form("sale"), reason: str = Form(""),
-             warehouse: str = Form(""), user=Depends(get_current_user)):
+def box_mode(request: Request, mode: str | None = Form(None),
+             reason: str | None = Form(None), warehouse: str | None = Form(None),
+             user=Depends(get_current_user)):
     """Склад, действие и причина для этой коробки.
 
     Живёт в сессии браузера, а не в базе: это не состояние установки, а выбор
     текущего человека за текущей коробкой, и потерять его вместе с cookie не
     страшно — страницу видно целиком.
+
+    **Применяется ТОЛЬКО то, что прислали, и это главное здесь.** Полей три, а
+    форм на странице тоже три: склад, действие, причина — каждое применяется
+    своим списком сразу при выборе, без отдельной кнопки. Считай обработчик
+    отсутствующее поле пустым (а `Form("sale")` именно так и делал), выбор
+    склада молча переключал бы утилизацию на возврат в продажу: форма склада
+    поля `mode` не несёт вовсе, и умолчание выиграло бы у сессии.
+
+    Пустая строка при этом — ЗНАЧЕНИЕ: «— выберите причину —» снимает причину, и
+    спутать её с «поле не прислали» нельзя.
     """
-    request.session["returns_box_mode"] = "scrap" if mode == "scrap" else "sale"
-    request.session["returns_box_reason"] = reason if reason else ""
-    # Склад принимаем ТОЛЬКО из карты: имя уезжает в 1С строкой, и чужое там
-    # означало бы документ, который либо не проведётся, либо вернёт товар не
-    # оттуда. Незнакомое значит «не выбран», а не «запишем как есть».
-    request.session["returns_box_warehouse"] = (
-        warehouse if R.platform_of_warehouse(warehouse) else "")
+    if mode is not None:
+        request.session["returns_box_mode"] = "scrap" if mode == "scrap" else "sale"
+    if reason is not None:
+        request.session["returns_box_reason"] = reason or ""
+    if warehouse is not None:
+        # Склад принимаем ТОЛЬКО из карты: имя уезжает в 1С строкой, и чужое там
+        # означало бы документ, который либо не проведётся, либо вернёт товар не
+        # оттуда. Незнакомое значит «не выбран», а не «запишем как есть».
+        request.session["returns_box_warehouse"] = (
+            warehouse if R.platform_of_warehouse(warehouse) else "")
     return RedirectResponse("/returns/box", status_code=303)
 
 

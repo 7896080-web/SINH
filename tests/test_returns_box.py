@@ -527,3 +527,98 @@ def test_the_warehouse_list_is_the_one_used_when_the_order_shipped(web_db):
     assert R.warehouse_choices() == PENDING_WAREHOUSE_NAME
     assert R.platform_of_warehouse(WB_WH) is Platform.wb
     assert R.platform_of_warehouse("чужое") is None
+
+
+# ------------------------------------------- выбор склада, режима и причины
+
+def test_choosing_a_warehouse_alone_does_not_switch_the_mode(logged_in_client, web_db):
+    """Три списка — три формы, и каждая правит ТОЛЬКО своё поле.
+
+    Пока форма была одна, выпадающий список сам по себе на сервер ничего не
+    отправлял: человек выбирал склад, поле скана оставалось погашенным, и
+    применить выбор можно было лишь нажав соседнюю кнопку — а звались соседние
+    кнопки действиями. Теперь список применяется сразу, и форма склада поля
+    `mode` не несёт вовсе. Считай обработчик отсутствующее поле пустым (а
+    умолчание `Form("sale")` именно так и делало), выбор склада МОЛЧА
+    переключал бы утилизацию на возврат в продажу — и коробка уехала бы в
+    оборот вместо утиля.
+    """
+    _mode(logged_in_client, "scrap", ScrapReason.defect.value, OZON_WH)
+
+    logged_in_client.post("/returns/box/mode", data={"warehouse": WB_WH})
+    page = logged_in_client.get("/returns/box").text
+
+    assert "УТИЛИЗАЦИЯ" in page, page[:400]
+    assert WB_WH in page
+    assert "ВОЗВРАТ В ПРОДАЖУ" not in page
+
+
+def test_choosing_a_reason_alone_keeps_the_warehouse(logged_in_client, web_db):
+    """Зеркальное: форма причины не несёт склада, и терять его ей нечем.
+
+    Потеряйся он здесь, поле скана гасло бы посреди коробки — ровно в тот
+    момент, когда человек уточнил причину.
+    """
+    _mode(logged_in_client, "scrap", "", WB_WH)
+
+    logged_in_client.post("/returns/box/mode",
+                          data={"reason": ScrapReason.swapped.value})
+    page = logged_in_client.get("/returns/box").text
+
+    assert WB_WH in page, page[:400]
+    assert "склад не выбран" not in page
+
+
+def test_an_empty_reason_still_clears_it(logged_in_client, web_db):
+    """Пустая строка — ЗНАЧЕНИЕ, а не «поле не прислали».
+
+    «— выберите причину —» обязана снимать причину: иначе ошибочно выбранную
+    не отменить ничем, а передача уедет не с той статьёй затрат.
+    """
+    _mode(logged_in_client, "scrap", ScrapReason.defect.value, WB_WH)
+
+    logged_in_client.post("/returns/box/mode", data={"reason": ""})
+    page = logged_in_client.get("/returns/box").text
+
+    assert "Причина не выбрана" in page, page[:400]
+
+
+def test_each_list_applies_on_choice_without_a_button(logged_in_client, web_db):
+    """Выбор в списке и есть ответ на вопрос — отдельная кнопка это лишний шаг.
+
+    На нём всё и застревало: склад выбран на экране, а на сервере его нет, и
+    поле скана погашено. Проверяем РАЗМЕТКУ, потому что предмет правки — то,
+    что делает браузер, а не то, что считает обработчик.
+    """
+    page = logged_in_client.get("/returns/box").text
+
+    for field in ("warehouse", "reason"):
+        chunk = page.split(f'name="{field}"', 1)[1][:200]
+        assert "this.form.submit()" in chunk, f"список {field} не применяется сам"
+
+
+def test_the_mode_button_is_a_choice_and_sends_nothing(logged_in_client, web_db, goods):
+    """«Вернуть в продажу» читается как команда, а переключает режим.
+
+    Человек жмёт её и ждёт, что вещи уедут; поэтому страница говорит это
+    словами, а тест стережёт само поведение: в 1С не уходит НИЧЕГО, и пачка
+    остаётся целой.
+    """
+    _mode(logged_in_client, "scrap", ScrapReason.defect.value, WB_WH)
+    _scan(logged_in_client, "2000000000017")
+
+    logged_in_client.post("/returns/box/mode", data={"mode": "sale"})
+
+    assert web_db.query(FtpTask).count() == 0
+    assert web_db.query(ReturnBatchEntry).count() == 1
+    assert web_db.query(ReturnItem).one().status is ReturnStatus.accepted
+
+
+def test_the_reason_warning_is_silent_when_returning_to_sale(logged_in_client, web_db):
+    """Требовать причину там, где она ни на что не влияет, — способ научить
+    человека не читать предупреждения вовсе."""
+    _mode(logged_in_client, "sale", "", WB_WH)
+
+    page = logged_in_client.get("/returns/box").text
+
+    assert "Причина не выбрана" not in page, page[:400]

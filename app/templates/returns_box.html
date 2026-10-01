@@ -23,7 +23,9 @@
         <li>Выберите <strong>склад</strong>, с которого привезли коробку. 1С перенесёт
             вещи с него на «{{ target_warehouse }}» и уже там вернёт в оборот или спишет.</li>
         <li>Выберите <strong>действие</strong> — вернуть в продажу или утилизировать.
-            Для утиля сразу выберите <strong>причину</strong>: она уйдёт в 1С у всей пачки.</li>
+            Это ВЫБОР режима, а не команда: вещи уедут только от кнопки
+            «Передать в 1С» внизу. Для утиля сразу выберите <strong>причину</strong>:
+            она уйдёт в 1С у всей пачки.</li>
         <li><strong>Сканируйте баркоды</strong> вещей прямо из коробки. Скан ЗАВОДИТ
             вещь — через приёмку их проводить не нужно. Каждый скан — ОДНА вещь:
             три одинаковых свитшота дают три скана и три записи.</li>
@@ -44,17 +46,27 @@
     </p>
 </details>
 
-{# Действие и причина — РАНЬШЕ сканов и на виду всё время. Уехав не с той
-   причиной, вещи лягут не на ту статью затрат в 1С, а претензию площадке пишут
-   именно по этому полю: увидят расхождение в отчётах через месяц. #}
-<form method="post" action="/returns/box/mode" class="card" style="margin-bottom:14px">
+{# Склад, действие и причина — ТРИ ОТДЕЛЬНЫЕ формы, и это не оформление.
+   Раньше они жили в одной, а выпадающий список сам по себе на сервер ничего не
+   отправляет: человек выбирал склад, поле скана оставалось погашенным, и
+   применить выбор можно было только нажав соседнюю кнопку — а звались соседние
+   кнопки ДЕЙСТВИЯМИ («Вернуть в продажу»). То есть единственный способ включить
+   сканирование выглядел как «выполни решение по коробке», заодно переключая
+   режим: нажал, страница перезагрузилась, курсор в поле скана, а сверху горит
+   «причина не выбрана». Теперь каждый список применяется сразу при выборе и
+   правит ТОЛЬКО своё поле. #}
+<div class="card" style="margin-bottom:14px">
     {# Склад — ПЕРВЫМ и на виду: он решает, откуда 1С заберёт вещь, а имя уезжает
        туда строкой. Список ровно тот, на который товар уехал при продаже. #}
-    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px">
+    <form method="post" action="/returns/box/mode"
+          style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px">
         <label for="warehouse" style="font-size:13px;color:var(--ink-soft)">
-            СКЛАД, С КОТОРОГО ПРИШЛА КОРОБКА
+            1. СКЛАД, С КОТОРОГО ПРИШЛА КОРОБКА
         </label>
-        <select id="warehouse" name="warehouse" style="padding:9px 12px;font-size:15px;min-width:280px">
+        {# Применяется сразу: выбор в списке и есть ответ на вопрос, отдельная
+           кнопка тут лишний шаг, на котором всё и застревало. #}
+        <select id="warehouse" name="warehouse" onchange="this.form.submit()"
+                style="padding:9px 12px;font-size:15px;min-width:280px">
             <option value="">— выберите склад —</option>
             {% for p, w in warehouses.items() %}
             <option value="{{ w }}" {% if warehouse == w %}selected{% endif %}>
@@ -63,26 +75,46 @@
             {% endfor %}
         </select>
         <span style="color:var(--ink-soft)">→ «{{ target_warehouse }}»</span>
-    </div>
-    <div style="display:flex;gap:10px;margin-bottom:12px">
-        <button type="submit" name="mode" value="sale"
-                style="flex-grow:1;padding:13px 0;font-size:16px;border-radius:var(--radius);cursor:pointer;
-                       {% if mode != 'scrap' %}font-weight:600;color:#fff;background:#2f7d4f;border:2px solid #2f7d4f
-                       {% else %}color:var(--ink-soft);background:var(--surface);border:2px solid var(--line){% endif %}">
-            Вернуть в продажу
-        </button>
-        <button type="submit" name="mode" value="scrap"
-                style="flex-grow:1;padding:13px 0;font-size:16px;border-radius:var(--radius);cursor:pointer;
-                       {% if mode == 'scrap' %}font-weight:600;color:#fff;background:#9c3a3a;border:2px solid #9c3a3a
-                       {% else %}color:var(--ink-soft);background:var(--surface);border:2px solid var(--line){% endif %}">
-            Утилизировать
-        </button>
-    </div>
-    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        {# Запасной путь: если браузер не выполняет скрипты, выбор иначе не
+           уедет вовсе, и страница снова станет неработающей молча. #}
+        <noscript><button type="submit" class="btn btn--small">Применить</button></noscript>
+    </form>
+
+    {# Эти две кнопки — ВЫБОР, а не действие над коробкой. Передаёт её одна
+       кнопка внизу страницы, и сказать это надо здесь: «Вернуть в продажу»
+       читается как команда, человек жмёт её и ждёт, что вещи уедут. #}
+    <form method="post" action="/returns/box/mode" style="margin-bottom:14px">
+        <div style="font-size:13px;color:var(--ink-soft);margin-bottom:6px">
+            2. ЧТО СДЕЛАЕМ СО ВСЕЙ КОРОБКОЙ — выбор режима, вещи пока никуда не уходят
+        </div>
+        <div style="display:flex;gap:10px">
+            <button type="submit" name="mode" value="sale"
+                    style="flex-grow:1;padding:13px 0;font-size:16px;border-radius:var(--radius);cursor:pointer;
+                           {% if mode != 'scrap' %}font-weight:600;color:#fff;background:#2f7d4f;border:2px solid #2f7d4f
+                           {% else %}color:var(--ink-soft);background:var(--surface);border:2px solid var(--line){% endif %}">
+                Вернуть в продажу
+            </button>
+            <button type="submit" name="mode" value="scrap"
+                    style="flex-grow:1;padding:13px 0;font-size:16px;border-radius:var(--radius);cursor:pointer;
+                           {% if mode == 'scrap' %}font-weight:600;color:#fff;background:#9c3a3a;border:2px solid #9c3a3a
+                           {% else %}color:var(--ink-soft);background:var(--surface);border:2px solid var(--line){% endif %}">
+                Утилизировать
+            </button>
+        </div>
+    </form>
+
+    {# Причина нужна только утилизации, и при возврате в продажу блок приглушён:
+       требовать её там, где она ни на что не влияет, — верный способ научить
+       человека не читать предупреждения вовсе. #}
+    <form method="post" action="/returns/box/mode"
+          style="display:flex;align-items:center;gap:10px;flex-wrap:wrap
+                 {% if mode != 'scrap' %};opacity:0.55{% endif %}">
         <label for="reason" style="font-size:13px;color:var(--ink-soft)">
-            ПРИЧИНА УТИЛИЗАЦИИ — ОДНА НА ВСЮ ПАЧКУ
+            3. ПРИЧИНА УТИЛИЗАЦИИ — ОДНА НА ВСЮ ПАЧКУ
+            {% if mode != 'scrap' %}(для возврата в продажу не нужна){% endif %}
         </label>
-        <select id="reason" name="reason" style="padding:9px 12px;font-size:15px;min-width:260px">
+        <select id="reason" name="reason" onchange="this.form.submit()"
+                style="padding:9px 12px;font-size:15px;min-width:260px">
             <option value="">— выберите причину —</option>
             {% for r in scrap_reasons %}
             <option value="{{ r.value }}" {% if reason == r.value %}selected{% endif %}>
@@ -90,9 +122,9 @@
             </option>
             {% endfor %}
         </select>
-        <button type="submit" name="mode" value="{{ mode }}" class="btn btn--small">Запомнить</button>
-    </div>
-</form>
+        <noscript><button type="submit" class="btn btn--small">Применить</button></noscript>
+    </form>
+</div>
 
 {% set scrapping = mode == 'scrap' %}
 {% set bar = '#9c3a3a' if scrapping else '#2f7d4f' %}
