@@ -153,6 +153,7 @@ def test_parse_wb_and_ozon_prices():
 class _Resp:
     def __init__(self, code, data):
         self.status_code, self._data, self.text = code, data, str(data)
+        self.content = b"x"
 
     def json(self):
         return self._data
@@ -163,34 +164,104 @@ class _Resp:
             raise requests.HTTPError(response=self)
 
 
-class _Session:
-    def __init__(self, resp):
-        self.resp, self.calls = resp, []
+class _LamodaSession:
+    """Отвечает по адресу, как площадка по спеке; запоминает запросы."""
+    def __init__(self, token_code=201, pages=None, sell=None, push=None):
+        self.token_code, self.pages, self.sell, self.push = token_code, pages or [], sell or [], push or {}
+        self.calls = []
 
-    def post(self, url, **kw):
-        self.calls.append((url, kw.get("json")))
-        return self.resp
+    def post(self, url, json=None, headers=None, timeout=None):
+        self.calls.append(("POST", url, json, headers))
+        if url.endswith("/v2/auth-token"):
+            return _Resp(self.token_code, {"access_token": "tok", "expires_in": 3600}
+                         if self.token_code < 400 else {"error": {"code": "UNAUTHORIZED"}})
+        return _Resp(200, self.push)
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        self.calls.append(("GET", url, params, headers))
+        pages = self.pages if url.endswith("/v2/nomenclatures") else self.sell
+        page = params.get("page", 1)
+        return _Resp(200, {"nomenclatures": pages[page - 1] if page <= len(pages) else [],
+                           "meta": {"page": page, "limit": 25, "total": 0, "totalPages": len(pages)}})
 
 
-def test_lamoda_checks_keys_by_token_and_refuses_the_rest():
-    s = _Session(_Resp(200, {"access_token": "abc", "expires_in": 3600, "token_type": "Bearer"}))
-    c = LamodaClient("cid", "secret", session=s)
-    ok, msg = c.test_connection()
-    assert ok and "ключи действительны" in msg
-    url, body = s.calls[0]
-    assert url == "https://public-api-seller.lamoda.ru/api/v2/auth-token"
+def _nom(parent, sku, barcode, size="M"):
+    return {"parentSku": parent, "sku": sku, "barcode": barcode, "externalParentSku": "39681",
+            "externalSku": "39681-" + size, "externalSize": size, "name": "Свитшот"}
+
+
+def test_lamoda_token_seller_id_and_catalog_pages():
+    s = _LamodaSession(pages=[[_nom("MP1", "MP1S1", "b1", "S")], [_nom("MP1", "MP1S2", "b2", "M"),
+                                                                    {"parentSku": "MP2", "barcode": None}]])
+    c = LamodaClient("cid", "secret", "242541217", session=s)
+    rows = c.get_catalog()
+    assert [(r.external_id, r.barcode, r.article, r.size) for r in rows] == \
+        [("MP1:MP1S1", "b1", "39681", "S"), ("MP1:MP1S2", "b2", "39681", "M")]
+    assert not c.last_truncated
+    method, url, body, _ = s.calls[0]
+    assert url.endswith("/api/v2/auth-token")
     assert body == {"grant_type": "client_credentials", "client_id": "cid", "client_secret": "secret"}
-    ok, msg = LamodaClient("cid", "bad", session=_Session(_Resp(401, {"error": "invalid_client"}))).test_connection()
+    gets = [c_ for c_ in s.calls if c_[0] == "GET"]
+    assert len(gets) == 2 and gets[0][2] == {"sellerId": "242541217", "country": "RU", "page": 1, "limit": 25}
+    assert gets[0][3] == {"Authorization": "Bearer tok"}
+    assert sum(1 for c_ in s.calls if c_[1].endswith("auth-token")) == 1      # токен один на клиента
+
+
+def test_lamoda_connection_check():
+    ok, msg = LamodaClient("c", "s", "1", session=_LamodaSession()).test_connection()
+    assert ok and "Seller ID принят" in msg
+    ok, msg = LamodaClient("c", "bad", "1", session=_LamodaSession(token_code=401)).test_connection()
     assert not ok and "не приняты" in msg
-    assert not LamodaClient("c", "s", session=_Session(_Resp(200, {}))).test_connection()[0]
-    for call in (c.get_catalog, c.get_prices):
-        try:
-            call()
-            raise AssertionError("должно отказать")
-        except PlatformError as e:
-            assert "OAS" in str(e)
-    assert c.push_prices([platforms.PriceItem("b1", 100)])["ok"] == []
-    assert isinstance(build_client("lamoda", {"client_id": "x", "client_secret": "y"}), LamodaClient)
+
+
+def test_lamoda_current_prices_kopecks_and_sale_window():
+    from datetime import datetime, timezone
+    data = {"nomenclatures": [
+        {"parentSku": "MP1", "sellValues": [
+            {"country": "RU", "price": {"amount": 1499000, "currency": "RUB"},
+             "salePrice": {"amount": 1249200, "currency": "RUB"},
+             "saleStart": "2026-09-01T00:00:00.000Z", "saleEnd": "2026-10-31T00:00:00.000Z"},
+            {"country": "KZ", "price": {"amount": 7759444, "currency": "KZT"}}]},
+        {"parentSku": "MP2", "sellValues": [
+            {"country": "RU", "price": {"amount": 299900, "currency": "RUB"},
+             "salePrice": {"amount": 199900, "currency": "RUB"},
+             "saleStart": "2025-06-01T00:00:00.000Z", "saleEnd": "2025-06-30T23:59:59.000Z"}]}]}
+    got = platforms.parse_lamoda_sell_values(data, now=datetime(2026, 10, 2, tzinfo=timezone.utc))
+    assert got == {"MP1": CurrentPrice(14990, 12492), "MP2": CurrentPrice(2999, 2999)}   # скидка MP2 кончилась
+
+
+def test_lamoda_push_by_parent_in_kopecks_never_forced():
+    resp = {"successCount": 1, "errorCount": 1,
+            "errors": [{"sku": "MP2", "code": "VALIDATION_ERROR", "messages": ["Validation error"]}],
+            "fraudValidationResults": [{"parentSku": "MP3", "invalidValue": "BLACK_PRICE", "status": "WARNING",
+                                        "promotions": [{"name": "Осень"}]}]}
+    s = _LamodaSession(push=resp)
+    c = LamodaClient("c", "s", "777", session=s)
+    out = c.push_prices([platforms.PriceItem("b1", 3499, "MP1:MP1S1"), platforms.PriceItem("b1b", 3599, "MP1:MP1S2"),
+                         platforms.PriceItem("b2", 1999, "MP2:MP2S1"), platforms.PriceItem("b3", 999, "MP3:x"),
+                         platforms.PriceItem("b4", 500, "")])
+    body = [c_ for c_ in s.calls if c_[1].endswith("nomenclatures-prices")][0][2]
+    assert body["sellerId"] == "777" and body["country"] == "RU" and body["force"] is False
+    assert {p["parentSku"]: p["price"] for p in body["prices"]}["MP1"] == {"amount": 359900, "currency": "RUB"}
+    assert sorted(out["ok"]) == ["b1", "b1b"] and out["sent_prices"]["b1"] == 3599
+    details = " ".join(str(e["detail"]) for e in out["errors"])
+    assert "VALIDATION_ERROR" in details and "Осень" in details and "уберите товар из акции" in details
+    assert "нет parentSku" in details
+    # ошибка без адресата — неуспешна вся пачка
+    s2 = _LamodaSession(push={"successCount": 0, "errorCount": 1, "fraudValidationResults": [],
+                              "errors": [{"sku": "", "code": "VALIDATION_ERROR", "messages": ["not found"]}]})
+    out2 = LamodaClient("c", "s", "1", session=s2).push_prices([platforms.PriceItem("b1", 100, "MP1:1")])
+    assert out2["ok"] == [] and "без указания товара" in str(out2["errors"])
+
+
+def test_lamoda_needs_seller_id():
+    try:
+        build_client("lamoda", {"client_id": "x", "client_secret": "y"})
+        raise AssertionError("без Seller ID клиент собираться не должен")
+    except PlatformError as e:
+        assert "seller_id" in str(e)
+    assert isinstance(build_client("lamoda", {"client_id": "x", "client_secret": "y", "seller_id": "1"}),
+                      LamodaClient)
 
 
 class FakePrices:
