@@ -47,7 +47,7 @@ def _error_text(resp: requests.Response) -> str:
     try:
         body = resp.json()
         msg = body.get("error_message") or body.get("message") or body.get("error_description")
-    except ValueError:
+    except (ValueError, AttributeError):
         msg = None
     return f"HTTP {resp.status_code}: {msg or resp.text[:200]}"
 
@@ -61,8 +61,11 @@ def challenge(base_url: str = TRUE_API_URL) -> dict:
         raise ChzAuthError(f"ЧЗ недоступен: {type(e).__name__}")
     if resp.status_code != 200:
         raise ChzAuthError(f"ЧЗ не выдал строку для подписи — {_error_text(resp)}")
-    body = resp.json()
-    if not body.get("uuid") or not body.get("data"):
+    try:
+        body = resp.json()
+    except ValueError:
+        raise ChzAuthError(f"ЧЗ ответил не JSON: {resp.text[:200]}")
+    if not isinstance(body, dict) or not body.get("uuid") or not body.get("data"):
         raise ChzAuthError("ЧЗ ответил без uuid/data")
     return {"uuid": body["uuid"], "data": body["data"]}
 
@@ -80,7 +83,10 @@ def sign_in(uuid: str, signature: str, connection_id: str | None = None,
         raise ChzAuthError(f"ЧЗ недоступен: {type(e).__name__}")
     if resp.status_code != 200:
         raise ChzAuthError(f"ЧЗ не принял подпись — {_error_text(resp)}")
-    token = (resp.json() or {}).get("token")
+    try:
+        token = (resp.json() or {}).get("token")
+    except (ValueError, AttributeError):
+        token = None
     if not token:
         raise ChzAuthError("ЧЗ ответил без токена")
     return token
@@ -108,16 +114,30 @@ def signer_inn(signature: str) -> str | None:
     заказ не от того ИП — самая дорогая ошибка (ТЗ, 10.4).
     """
     try:
+        from cryptography import x509
         from cryptography.hazmat.primitives.serialization import pkcs7
         der = base64.b64decode(re.sub(r"\s+", "", signature))
-        for cert in pkcs7.load_der_pkcs7_certificates(der):
-            for attr in cert.subject:
-                if attr.oid.dotted_string == INN_OID:
-                    value = re.sub(r"\D", "", str(attr.value))
-                    # ИНН физлица в сертификатах ФНС бывает дополнен нулями до 12.
-                    return value[-12:] if len(value) > 12 else value
+        certs = pkcs7.load_der_pkcs7_certificates(der)
     except Exception:
         return None
+    # В подписи бывает и цепочка (УЦ). Подписант — конечный сертификат: не УЦ
+    # и не издатель ни одного другого из набора. Порядок в наборе — сортировка
+    # DER, «первый с ИНН» мог бы оказаться УЦ.
+    def is_ca(cert) -> bool:
+        try:
+            return bool(cert.extensions.get_extension_for_class(x509.BasicConstraints).value.ca)
+        except Exception:
+            return False
+    issuers = {c.issuer.rfc4514_string() for c in certs}
+    leaves = [c for c in certs if not is_ca(c) and c.subject.rfc4514_string() not in issuers - {
+        c.issuer.rfc4514_string()}]
+    if len(leaves) != 1:
+        return None
+    for attr in leaves[0].subject:
+        if attr.oid.dotted_string == INN_OID:
+            value = re.sub(r"\D", "", str(attr.value))
+            # ИНН физлица в сертификатах ФНС бывает дополнен нулями до 12.
+            return value[-12:] if len(value) > 12 else value
     return None
 
 
@@ -151,8 +171,14 @@ def token(org: Organization | None, kind: str = "true_api") -> str | None:
     return decrypt_value(enc)
 
 
-def forget(org: Organization, kind: str = "true_api") -> None:
-    """ЧЗ отверг токен до срока — дальше только новый вход."""
+def forget(org: Organization, kind: str = "true_api", rejected: str | None = None) -> None:
+    """ЧЗ отверг токен до срока — дальше только новый вход.
+
+    `rejected` — тот токен, с которым шёл запрос: человек мог за это время
+    войти заново, и новый токен стирать нельзя.
+    """
+    if rejected is not None and token(org, kind) not in (None, rejected):
+        return
     if kind == "true_api":
         org.chz_token_enc, org.chz_token_until = None, None
     else:

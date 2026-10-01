@@ -44,10 +44,11 @@ def check_digit_ok(gtin: str) -> bool:
 
 
 def normalize_gtin(value) -> str:
-    """GTIN из ячейки: число теряет ведущий ноль, 13 знаков дополняем до 14."""
+    """GTIN из ячейки: число теряет ведущие нули — дополняем до 14 (GTIN-8/12/13
+    и GTIN-14 с несколькими нулями впереди, записанный числом)."""
     text = cell_text(value)
-    if text.isdigit() and len(text) == 13:
-        text = "0" + text
+    if text.isdigit() and 8 <= len(text) < 14:
+        text = text.zfill(14)
     return text
 
 

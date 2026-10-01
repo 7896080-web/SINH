@@ -10,6 +10,7 @@ Lamoda УПД собирались ровно так, и сумма сходит
 from __future__ import annotations
 
 import io
+import re
 import os
 import tempfile
 from collections import defaultdict
@@ -80,9 +81,14 @@ def read_fbo(data: bytes):
     return read_supply(io.BytesIO(data))
 
 
-def check_fbo_against_supply(data: bytes, supply: Supply) -> FboCheck:
+def check_fbo_against_supply(data: bytes, supply: Supply, db=None) -> FboCheck:
     """Выгрузка должна описывать ЭТУ поставку: иначе УПД уйдёт не с теми
-    строками, а Lamoda отвергнет его по связке «артикул + код»."""
+    строками, а Lamoda отвергнет его по связке «артикул + код».
+
+    Сверяются не только итоги по артикулу, но и КОДЫ: перепутанные между
+    размерами коды дают те же итоги, но неверный УПД и — через пары из
+    выгрузки — неверный справочник GTIN, по которому потом заказываются коды.
+    """
     fbo = read_fbo(data)
     res = FboCheck(number=fbo.number, date=fbo.date, rows=len(fbo.rows))
     res.problems.extend(fbo.problems)
@@ -119,10 +125,52 @@ def check_fbo_against_supply(data: bytes, supply: Supply) -> FboCheck:
                          + ", ".join(str(p) for p in sorted(b["prices"])))
         if a["ean"] and b["eans"] != {a["ean"]}:
             diffs.append(f"{sku}: EAN в поставке {a['ean']}, в выгрузке " + ", ".join(sorted(b["eans"])))
+    diffs.extend(_kiz_problems(fbo.rows, supply, db))
     if diffs:
         res.problems.append(f"выгрузка расходится с поставкой ({len(diffs)}): " + "; ".join(diffs[:5]))
         res._diffs = diffs  # полный список — для страницы
     return res
+
+
+SHORT_KI = re.compile(r"^01(\d{14})21[\x21-\x7e]{13}$")
+
+
+def _kiz_problems(rows, supply: Supply, db) -> list[str]:
+    """Коды выгрузки: формат короткого КИ (ТЗ 7.4), один GTIN на артикул,
+    согласие со справочником GTIN и — если коды заказаны программой — что
+    каждый код закреплён за этой поставкой и этим артикулом."""
+    from markapp.gtin import check_digit_ok
+    out = []
+    gtins: dict[str, set] = defaultdict(set)
+    for n, r in enumerate(rows, 1):
+        m = SHORT_KI.match(r.kiz or "")
+        if not m or not check_digit_ok(m.group(1)):
+            out.append(f"строка {n} ({r.name.strip()}): код «{(r.kiz or '')[:40]}» — не короткий КИ")
+            continue
+        gtins[r.name.strip()].add(m.group(1))
+    for sku, gs in sorted(gtins.items()):
+        if len(gs) > 1:
+            out.append(f"{sku}: в выгрузке коды разных GTIN ({', '.join(sorted(gs))}) — коды перепутаны")
+    if db is None:
+        return out
+    from markapp.models import GtinPair, MarkCode
+    by_sku = {p.supplier_sku: p.gtin for p in db.query(GtinPair).all()}
+    by_gtin = {g: s for s, g in by_sku.items()}
+    for sku, gs in sorted(gtins.items()):
+        for g in gs:
+            if sku in by_sku and by_sku[sku] != g:
+                out.append(f"{sku}: в выгрузке GTIN {g}, в справочнике {by_sku[sku]}")
+            elif by_gtin.get(g, sku) != sku:
+                out.append(f"{sku}: GTIN {g} в справочнике у артикула «{by_gtin[g]}»")
+    ours = {c.cis: c.supplier_sku for c in db.query(MarkCode).filter(MarkCode.supply_id == supply.id).all()}
+    if ours:
+        for r in rows:
+            sku = ours.get((r.kiz or "").strip())
+            if sku is None:
+                out.append(f"{r.name.strip()}: код {(r.kiz or '')[:31]} не закреплён за этой поставкой")
+            elif sku != r.name.strip():
+                out.append(f"{r.name.strip()}: код {r.kiz[:31]} заказан для «{sku}»")
+    return out
 
 
 # --- Сборка УПД ---------------------------------------------------------------

@@ -110,7 +110,7 @@ def test_full_cycle_order_codes_statuses_introduce(db, supply, fake):
     code = db.query(MarkCode).filter(MarkCode.gtin == GTIN_A).first()
     assert code.cis == f"01{GTIN_A}21{1:013d}" and GS not in code.cis
     assert decrypt_value(code.full_enc) == full(GTIN_A, 1) and "EE10" not in code.full_enc
-    assert calls["backups"]                                    # внеочередная копия
+    # Внеочередная копия запускается маршрутом ПОСЛЕ коммита — test_audit_fixes.
     assert C.steps(db, supply) == []
 
     # Нанесение ещё не пришло — ввести нечего.

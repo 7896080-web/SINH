@@ -53,7 +53,17 @@ def org_save(org_id: int, request: Request, db: Session = Depends(get_db),
     if not (inn.isdigit() and len(inn) in (10, 12)):
         flash(request, "ИНН — 10 или 12 цифр.", "error")
         return RedirectResponse(f"/organizations/{org_id}", status_code=303)
+    if not 0 <= vat_rate <= 22:
+        flash(request, "НДС — от 0 до 22 %.", "error")
+        return RedirectResponse(f"/organizations/{org_id}", status_code=303)
     org = db.get(Organization, org_id) if org_id else None
+    if org_id and org is None:
+        flash(request, "Организация не найдена.", "error")
+        return RedirectResponse("/organizations", status_code=303)
+    if org is not None and org.inn != inn:
+        # Токены входа выданы сертификату прежнего ИНН — с новым ИНН они чужие.
+        chz_auth.forget(org, "true_api")
+        chz_auth.forget(org, "suz")
     if org is None:
         org = Organization()
         db.add(org)
@@ -113,7 +123,8 @@ def chz_login_challenge(org_id: int, db: Session = Depends(get_db),
 
 @router.post("/organizations/{org_id}/chz-login/token")
 def chz_login_token(org_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user),
-                    kind: str = Body(...), uuid: str = Body(...), signature: str = Body(...)):
+                    kind: str = Body(...), uuid: str = Body(...), signature: str = Body(...),
+                    cert_inn: str = Body("")):
     org = db.get(Organization, org_id)
     if org is None:
         return JSONResponse({"error": "Организация не найдена"}, status_code=404)
@@ -121,9 +132,17 @@ def chz_login_token(org_id: int, db: Session = Depends(get_db), user: User = Dep
         return JSONResponse({"error": f"неизвестный вход: {kind}"}, status_code=400)
     if kind == "suz" and not org.connection_id:
         return JSONResponse({"error": "Не задан ID соединения СУЗ у организации"}, status_code=400)
-    # Страница уже сверила ИНН, но решает здесь: сертификат берётся из самой подписи.
+    # Страница уже сверила ИНН, но решает здесь: сертификат подписанта берётся
+    # из самой подписи. Не разобрался (формат CAdES плагина) — ИНН, который
+    # страница прочла у выбранного сертификата. Нет ни того, ни другого — отказ:
+    # вход «без сверки» и есть самая дорогая ошибка (ТЗ, 10.4).
     inn = chz_auth.signer_inn(signature)
-    if inn is not None and not chz_auth.inn_matches(org.inn, inn):
+    source = "из подписи"
+    if inn is None:
+        inn, source = "".join(ch for ch in cert_inn if ch.isdigit()) or None, "со страницы"
+    if inn is None:
+        return JSONResponse({"error": "ИНН сертификата не прочитан — вход не выполнен"}, status_code=400)
+    if not chz_auth.inn_matches(org.inn, inn):
         audit.log(db, user.username, "chz_login_refused", org.name, f"ИНН сертификата {inn} ≠ {org.inn}")
         db.commit()
         return JSONResponse({"error": f"Сертификат ИНН {inn}, а у организации {org.inn} — вход не выполнен"},
@@ -134,7 +153,7 @@ def chz_login_token(org_id: int, db: Session = Depends(get_db), user: User = Dep
         return JSONResponse({"error": str(e)}, status_code=502)
     until = chz_auth.store(db, org, kind, token)
     audit.log(db, user.username, "chz_login", org.name,
-              f"{chz_auth.KINDS[kind]}, ИНН сертификата {inn or 'не разобран'}")
+              f"{chz_auth.KINDS[kind]}, ИНН сертификата {inn} ({source})")
     db.commit()
     local = until.replace(tzinfo=timezone.utc).astimezone()
     return {"ok": True, "until": local.strftime("%d.%m.%Y %H:%M")}

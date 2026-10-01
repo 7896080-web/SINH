@@ -25,7 +25,7 @@ class User(Base):
 
 
 class Organization(Base):
-    """ИП. Реквизиты для УПД и (с этапа 4) доступ к Честному знаку."""
+    """ИП. Реквизиты для УПД и доступ к Честному знаку (вход — chz_auth)."""
     __tablename__ = "organizations"
     id = Column(Integer, primary_key=True)
     name = Column(String(200), nullable=False)          # «ИП Яворская Т.Н.» — для экрана
@@ -43,7 +43,7 @@ class Organization(Base):
     sticker_sender = Column(String(200), nullable=False, default="")
     # Идентификатор участника ЭДО (часть ИдФайл УПД).
     edo_sender_id = Column(String(100), nullable=False, default="")
-    # --- Честный знак (этап 4) ---
+    # --- Честный знак ---
     chz_contour = Column(String(20), nullable=False, default="production")
     oms_id = Column(String(64), nullable=True)
     connection_id = Column(String(64), nullable=True)
@@ -319,10 +319,18 @@ class CodeOrder(Base):
     gtin = Column(String(14), nullable=False)
     quantity = Column(Integer, nullable=False)
     body = Column(Text, nullable=False)
-    # new — записан, не отправлен; sent — СУЗ дал номер, коды не готовы;
-    # ready — коды можно забирать; done — все получены; rejected / error.
+    # new — записан, не отправлен; sending — уходит прямо сейчас (захвачен
+    # одной вкладкой); unknown — ответа СУЗ нет (таймаут, 5xx): заказ МОГ
+    # создаться, повторять нельзя до решения человека; sent — СУЗ дал номер,
+    # коды не готовы; ready — коды можно забирать; done — все получены;
+    # rejected / error — заказа нет или он отклонён.
     status = Column(String(20), nullable=False, default="new", index=True)
     suz_order_id = Column(String(64), nullable=False, default="")
+    # OMS ID на момент заказа: путь статуса и кодов строится по нему, а не по
+    # текущему значению у организации (его могли поменять между шагами).
+    oms_id = Column(String(64), nullable=True)
+    # Сколько кодов СУЗ сообщил готовыми (availableCodes) — больше не просим.
+    available = Column(Integer, nullable=True)
     received = Column(Integer, nullable=False, default=0)
     error = Column(Text, nullable=False, default="")
     created_by = Column(String(64), nullable=False, default="")
@@ -362,8 +370,10 @@ class IntroduceDoc(Base):
     # base64 JSON документа — ровно то, что подписано (прикреплённая подпись).
     document = Column(Text, nullable=False)
     codes_count = Column(Integer, nullable=False)
-    # new — подготовлен, ждёт подписи; sent — принят ЧЗ, идёт проверка;
-    # CHECKED_OK / CHECKED_NOT_OK — итог ЧЗ; error — не отправлен.
+    # new — подготовлен, ждёт подписи; sending — уходит; unknown — ответа ЧЗ
+    # нет или он без номера: документ МОГ уйти, коды заняты до решения;
+    # sent — принят ЧЗ, идёт проверка; CHECKED_OK / CHECKED_NOT_OK — итог ЧЗ;
+    # error — не отправлен.
     status = Column(String(20), nullable=False, default="new", index=True)
     doc_id = Column(String(64), nullable=False, default="")
     error = Column(Text, nullable=False, default="")

@@ -26,9 +26,17 @@ CISES_PER_REQUEST = 1000
 
 
 class ChzApiError(Exception):
-    def __init__(self, text: str, status: int | None = None):
+    """`status` None — ответа нет (сеть, таймаут): запрос МОГ дойти."""
+
+    def __init__(self, text: str, status: int | None = None, retry_after: int | None = None):
         super().__init__(text)
         self.status = status
+        self.retry_after = retry_after
+
+    @property
+    def outcome_unknown(self) -> bool:
+        """Сервер мог выполнить запрос: ответа нет или он 5xx."""
+        return self.status is None or self.status >= 500
 
 
 def _proxies():
@@ -47,7 +55,9 @@ def _check(resp: requests.Response, what: str):
                or body.get("globalErrors") or body.get("fieldErrors") or body)
     except (ValueError, AttributeError):
         msg = resp.text[:300]
-    raise ChzApiError(f"{what}: HTTP {resp.status_code}: {str(msg)[:400]}", resp.status_code)
+    retry = resp.headers.get("Retry-After", "") if resp.status_code == 429 else ""
+    raise ChzApiError(f"{what}: HTTP {resp.status_code}: {str(msg)[:400]}", resp.status_code,
+                      int(retry) if retry.isdigit() else None)
 
 
 # --- СУЗ ----------------------------------------------------------------------
@@ -119,11 +129,15 @@ def cises_info(short_codes: list[str], token: str) -> dict[str, str]:
     except requests.RequestException as e:
         raise ChzApiError(f"True API недоступен: {type(e).__name__}")
     data = _check(resp, "статусы кодов")
-    items = data if isinstance(data, list) else (data or {}).get("results") or (data or {}).get("items") or []
+    items = (data if isinstance(data, list) else
+             next((data.get(k) for k in ("results", "items", "cises", "list") if isinstance(data, dict)
+                   and isinstance(data.get(k), list)), None))
+    if items is None:
+        raise ChzApiError(f"ответ /cises/info не распознан: {str(data)[:300]}")
     out = {}
     for item in items:
         info = (item or {}).get("cisInfo") or item or {}
-        key = info.get("requestedCis") or info.get("cis") or info.get("uit")
+        key = info.get("requestedCis") or info.get("cis") or info.get("uit") or info.get("code")
         if key:
             out[str(key).split("\x1d")[0]] = info.get("status") or info.get("statusEx") or "UNKNOWN"
     return out
