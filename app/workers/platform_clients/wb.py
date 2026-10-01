@@ -1,16 +1,12 @@
 import requests
 
-from app.workers.platform_clients.base import (PlatformClient, PlatformOrder, StockPushItem, CatalogItem,
-                                               PricePushItem)
+from app.workers.platform_clients.base import PlatformClient, PlatformOrder, StockPushItem, CatalogItem
 from app.workers.http_retry import with_retry
 
 BASE_URL = "https://marketplace-api.wildberries.ru"
 # Контентные методы (карточки товаров) WB отдаёт на отдельном хосте
 # content-api, не на marketplace-api (подтверждено на живом API).
 CONTENT_BASE_URL = "https://content-api.wildberries.ru"
-# Цены и скидки — третий хост WB, и токену нужна категория «Цены и скидки»
-# (отдельно от Marketplace). НЕ ПРОВЕРЕНО на живом API — по документации.
-PRICES_BASE_URL = "https://discounts-prices-api.wildberries.ru"
 
 # Заказы WB: supplierStatus мы двигаем сами, wbStatus двигает площадка.
 # 'new' = ожидает подтверждения (раздел 5 спецификации).
@@ -701,57 +697,6 @@ class WbClient(PlatformClient):
             out.update(part)
         return out
 
-    def push_prices(self, items: list[PricePushItem]) -> dict:
-        """POST /api/v2/upload/task — цена на КАРТОЧКУ (nmID), не на размер.
-
-        Если размерам одной карточки рассчитаны разные цены, отправляется
-        наибольшая: меньшая могла бы оказаться ниже пола минимальной наценки у
-        дорогого размера. Фактически отправленная цена возвращается в
-        sent_prices, чтобы журнал не врал.
-
-        Скидку продавца (discount) не передаём и не трогаем: покупатель платит
-        цену минус скидку карточки, это видно в кабинете WB.
-
-        Площадка принимает задание асинхронно; ответ 200 значит «задание
-        принято», а не «цена уже применена». НЕ ПРОВЕРЕНО на живом API."""
-        by_nm: dict[int, list[PricePushItem]] = {}
-        errors = []
-        for it in items:
-            nm_raw = (it.external_id or "").split(":")[0]
-            if not nm_raw.isdigit():
-                errors.append({"detail": "нет nmID — загрузите спецификацию кабинета", "items": [it.barcode]})
-                continue
-            by_nm.setdefault(int(nm_raw), []).append(it)
-        if not by_nm:
-            return {"ok": [], "errors": errors, "sent_prices": {}}
-
-        nm_price = {nm: max(i.price for i in group) for nm, group in by_nm.items()}
-        ok, sent = [], {}
-        nm_ids = list(nm_price)
-        for start in range(0, len(nm_ids), 1000):          # до 1000 карточек за запрос
-            chunk = nm_ids[start:start + 1000]
-            body = {"data": [{"nmID": nm, "price": nm_price[nm]} for nm in chunk]}
-
-            def call():
-                r = self.session.post(f"{PRICES_BASE_URL}/api/v2/upload/task", json=body, timeout=30)
-                r.raise_for_status()
-                return r.json() if r.content else {}
-
-            try:
-                data = with_retry(call)
-            except requests.RequestException as e:
-                errors.append({"detail": str(e), "items": [i.barcode for nm in chunk for i in by_nm[nm]]})
-                continue
-            if isinstance(data, dict) and data.get("error"):
-                errors.append({"detail": data.get("errorText") or "WB вернул error=true",
-                               "items": [i.barcode for nm in chunk for i in by_nm[nm]]})
-                continue
-            for nm in chunk:
-                for i in by_nm[nm]:
-                    ok.append(i.barcode)
-                    sent[i.barcode] = nm_price[nm]
-        return {"ok": ok, "errors": errors, "sent_prices": sent}
-
     def get_catalog_items(self) -> list[CatalogItem]:
         """Список карточек — content-api, метод v2 (`/content/v2/get/cards/list`).
         Старый `/content/v1/cards/cursor/list` на marketplace-api удалён WB (404).
@@ -815,9 +760,6 @@ def _parse_wb_cards(data: dict) -> list[CatalogItem]:
             # а не карточки: пул баркодов принадлежит размер-цвету. Один размер
             # может иметь несколько баркодов (skus) — это его пул.
             sku_id = f"{nm_id}:{size.get('chrtID', '')}"
-            # techSize — размер продавца («48», «M»); wbSize — российский размер WB.
-            size_name = str(size.get("techSize") or size.get("wbSize") or "").strip()
             for sku in size.get("skus", []):
-                result.append(CatalogItem(external_id=sku_id, barcode=sku, article=article, name=name,
-                                          size=size_name))
+                result.append(CatalogItem(external_id=sku_id, barcode=sku, article=article, name=name))
     return result

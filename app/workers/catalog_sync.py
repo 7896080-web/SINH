@@ -86,7 +86,6 @@ def load_platform_catalog(db: Session, client: PlatformClient, account: Platform
         row.external_id = item.external_id
         row.article = item.article
         row.name = item.name
-        row.size = (getattr(item, "size", "") or "")[:64] or None
         row.fetched_at = now_utc()
 
         existing_barcode = db.query(Barcode).filter(Barcode.barcode == item.barcode).first()

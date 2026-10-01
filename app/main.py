@@ -16,7 +16,7 @@ from app.dependencies import Forbidden, NotAuthenticated
 from app.routers import (
     auth, api_keys, mapping, products, anomalies, health, diagnostics, testing,
     platform_matching, stock_on_date, report, missing_cards, notifications,
-    discrepancies, returns, prices, article_matching,
+    discrepancies, returns,
 )
 
 
@@ -72,8 +72,6 @@ app.include_router(returns.router)
 app.include_router(testing.router)
 app.include_router(stock_on_date.router)
 app.include_router(notifications.router)
-app.include_router(prices.router)
-app.include_router(article_matching.router)
 
 
 @app.exception_handler(NotAuthenticated)

@@ -16,7 +16,6 @@ router = APIRouter()
 # Имена глобальных воркеров — точное совпадение.
 EXPECTED_INTERVAL_SECONDS = {
     "dispatch": 45 * 3,
-    "price_dispatch": 120 * 3,
     "ftp_send": 60 * 3,
     "ftp_receive": 60 * 3,
     "ftp_send_export_request": 3600 * 3,
@@ -84,7 +83,6 @@ SCHEDULER_START_MARKER = "scheduler_start"
 # до этого срока отсутствие воркера не считается проблемой.
 REQUIRED_WORKERS = {
     "dispatch": 300,
-    "price_dispatch": 600,
     "ftp_send": 300,
     "ftp_receive": 300,
     "ftp_send_export_request": 600,

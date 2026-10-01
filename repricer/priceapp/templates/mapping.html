@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %}Сопоставление{% endblock %}
+{% block content %}
+<h1>Сопоставление каталога с 1С</h1>
+<p class="muted">Правила sync_admin: ключ — штрихкод; баркод сопоставлен, если он есть в справочнике 1С ровно у одного
+SKU (размер-цвет); у двух SKU — «неоднозначно», цену по нему не считаем. Остальные баркоды того же размера на площадке
+идут «по пулу». Баркоды, которых в 1С нет, можно сопоставить по правилам артикулов — только подтверждением.
+Справочник 1С: {% if dict_at %}{{ dict_rows }} строк, загружен {{ dict_at }} UTC{% else %}<span class="warn">не загружен</span> — «Диагностика» → «Запросить справочник»{% endif %}.</p>
+
+{% if not accounts %}<div class="card">Нет активных кабинетов — «API-ключи».</div>{% else %}
+<div class="tabs">
+  {% for v, t in (('status','Статус'),('analysis','Разбор правил артикулов'),('candidates','Кандидаты')) %}
+  <a class="btn {{ '' if view == v else 'secondary' }}" href="/mapping?view={{ v }}&account_id={{ account.id }}">{{ t }}</a>{% endfor %}
+</div>
+<form method="get" class="row card"><input type="hidden" name="view" value="{{ view }}">
+  <label>Кабинет<select name="account_id" onchange="this.form.submit()">{% for a in accounts %}<option value="{{ a.id }}" {% if a.id == account.id %}selected{% endif %}>{{ label(a) }}</option>{% endfor %}</select></label>
+  {% if view != 'analysis' %}<label>Отбор<select name="status" onchange="this.form.submit()"><option value="">все</option>
+    {% for k, v in (status_labels if view == 'status' else cand_labels).items() %}<option value="{{ k }}" {% if status == k %}selected{% endif %}>{{ v }} ({{ counts[k] }})</option>{% endfor %}</select></label>{% endif %}
+  {% if view == 'status' %}<a class="btn secondary" href="/mapping/export/{{ account.id }}">Экспорт в Excel</a>{% endif %}
+</form>
+
+{% if view == 'status' %}
+<div class="scroll"><table><tr><th>Баркод</th><th>Артикул площадки</th><th>Размер</th><th>Название</th><th>Статус</th><th>SKU 1С</th></tr>
+{% for r in rows %}<tr><td>{{ r.item.barcode }}</td><td>{{ r.item.article }}</td><td>{{ r.item.size }}</td><td>{{ r.item.name }}</td>
+<td><span class="badge {{ 'ok' if r.status in ('ok','pool','manual') else ('bad' if r.status == 'ambiguous' else 'warn') }}">{{ r.label }}</span></td>
+<td class="muted">{{ r.item_id or r.others|join(', ') }}</td></tr>
+{% else %}<tr><td colspan="6" class="muted">Каталог кабинета пуст — «API-ключи» → «Загрузить каталог».</td></tr>{% endfor %}</table></div>
+<p class="muted">Показано {{ rows|length }} из {{ total }}.</p>
+
+{% elif view == 'analysis' %}
+<p class="muted">Правила выводятся из данных: по парам, уже сопоставленным по баркоду, видно, как в этом кабинете артикул
+площадки соотносится с артикулом 1С. Регистр, пробелы и разделители не важны, кириллические двойники латиницы (А/A, Н/H) равны.
+Сопоставлено пар: {{ an.total }}, баркодов «нет в 1С»: {{ an.unmatched }}.</p>
+{% if an.total %}<table><tr><th>Как соотносятся</th><th class="num">Пар</th><th class="num">Доля</th><th>Примеры (площадка → 1С)</th></tr>
+{% for kind, n in an.counts.most_common() %}<tr><td>{{ kind_labels[kind] }}{% if kind in an.suggested_kinds %} <span class="badge ok">предлагается</span>{% endif %}</td>
+<td class="num">{{ n }}</td><td class="num">{{ '%.0f'|format(n * 100 / an.total) }}%</td>
+<td class="muted">{% for e in an.examples[kind] %}{{ e.platform or '—' }}{% if e.platform_size %} [{{ e.platform_size }}]{% endif %} → {{ e.article_1c }}{% if e.size %} · {{ e.size }}{% endif %}{% if e.color %} · {{ e.color }}{% endif %}<br>{% endfor %}</td></tr>{% endfor %}
+</table>{% if an.prefixes or an.suffixes %}<p class="muted">Приставки: {% for v, n in an.prefixes.most_common(5) %}{{ v }} ({{ n }}) {% endfor %} Окончания: {% for v, n in an.suffixes.most_common(5) %}{{ v }} ({{ n }}) {% endfor %}</p>{% endif %}{% endif %}
+<form method="post" action="/mapping/rules/{{ account.id }}" class="card">
+  <p style="margin-top:0"><b>Правило кабинета</b>{% if an.suggested_kinds %} — по данным предлагается: {% for k in an.suggested_kinds %}«{{ kind_labels[k] }}» {% endfor %}{% if an.suggested_prefix %}, приставка «{{ an.suggested_prefix }}»{% endif %}{% if an.suggested_suffix %}, окончание «{{ an.suggested_suffix }}»{% endif %}{% endif %}</p>
+  <div class="row">{% for k in kinds %}<label style="flex-direction:row;gap:5px;align-items:center"><input type="checkbox" name="kinds" value="{{ k }}" {% if k in enabled %}checked{% endif %}> {{ kind_labels[k] }}</label>{% endfor %}</div>
+  <div class="row" style="margin-top:8px"><label>Срезать приставку<input name="strip_prefix" value="{{ rule.strip_prefix or '' }}" placeholder="{{ an.suggested_prefix }}"></label>
+  <label>Срезать окончание<input name="strip_suffix" value="{{ rule.strip_suffix or '' }}" placeholder="{{ an.suggested_suffix }}"></label><button>Сохранить</button></div>
+</form>
+
+{% else %}
+{% if cands %}<form method="post" action="/mapping/confirm/{{ account.id }}">
+<div class="scroll"><table><tr><th><input type="checkbox" onclick="document.querySelectorAll('input[name=pick]').forEach(c => c.checked = this.checked)"></th><th>На площадке</th><th>Баркод</th><th>SKU 1С</th><th>Правило</th><th>Результат</th></tr>
+{% for c in cands %}<tr><td>{% if c.status == 'unique' %}<input type="checkbox" name="pick" value="{{ c.item.barcode }}|{{ c.products[0].uid_1c }}">{% endif %}</td>
+<td>{{ c.item.article }}{% if c.item.size %} [{{ c.item.size }}]{% endif %}<div class="muted">{{ c.item.name }}</div></td><td>{{ c.item.barcode }}</td>
+<td>{% for p in c.products[:5] %}<div>{{ p.article }}{% if p.size %} · {{ p.size }}{% endif %}{% if p.color %} · {{ p.color }}{% endif %} <span class="muted">{{ p.name }}</span></div>{% endfor %}{% if not c.products %}—{% endif %}</td>
+<td class="muted">{% for k in c.kinds %}{{ kind_labels[k] }}<br>{% endfor %}</td>
+<td><span class="badge {{ 'ok' if c.status == 'unique' else ('bad' if c.status == 'none' else 'warn') }}">{{ cand_labels[c.status] }}</span></td></tr>{% endfor %}
+</table></div><p><button>Сопоставить выбранные</button> <span class="muted">Показано {{ cands|length }} из {{ total }}.</span></p></form>
+{% else %}<div class="card muted">Баркодов «нет в 1С» нет (или по отбору пусто).</div>{% endif %}
+{% endif %}
+{% endif %}
+{% endblock %}
