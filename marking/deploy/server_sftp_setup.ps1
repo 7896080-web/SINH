@@ -31,7 +31,11 @@ param(
     [Parameter(Mandatory = $true)][string]$PublicKey,
     [string]$SyncRoot = "C:\sync",
     [int]$Port = 443,
-    [string]$User = "marking_sftp"
+    [string]$User = "marking_sftp",
+    # Внешний адрес (или подсеть) рабочего компьютера с КриптоПро, например
+    # 203.0.113.7 или 203.0.113.0/24. Задан — SSH на этом порту пускает только
+    # его; не задан — весь интернет (вход всё равно только по ключу).
+    [string]$AllowFrom = ""
 )
 $ErrorActionPreference = "Stop"
 function Info($m) { Write-Host "[*] $m" -ForegroundColor Cyan }
@@ -170,6 +174,14 @@ if (-not (Get-NetFirewallRule -DisplayName $rule -ErrorAction SilentlyContinue) 
 } else {
     Ok "Брандмауэр: правило на $Port уже есть"
 }
+if ($AllowFrom) {
+    Get-NetFirewallRule -DisplayName $rule -ErrorAction SilentlyContinue |
+        Set-NetFirewallAddressFilter -RemoteAddress $AllowFrom
+    Ok "Брандмауэр: порт $Port — только с $AllowFrom"
+} else {
+    Warn "Порт $Port открыт для всего интернета (вход только по ключу). Сузить: запустить снова с -AllowFrom <внешний адрес рабочего компьютера>."
+}
+Warn "Если на сервере включён брандмауэр Hetzner (robot.hetzner.com -> сервер -> Firewall), порт $Port нужно разрешить и там (deploy\SFTP_1C.md)."
 Set-Service sshd -StartupType Automatic
 Restart-Service sshd
 Start-Sleep -Seconds 2
