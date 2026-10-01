@@ -54,6 +54,24 @@ def cell_text(v) -> str:
     return str(v).strip()
 
 
+def ean_from_cell(v) -> str:
+    """Штрихкод из ячейки. Ячейка-ЧИСЛО теряет ведущие нули: EAN-13
+    «0460123456789» читается как 460123456789 — двенадцать цифр, и такой артикул
+    молча не находился бы в 1С (а в поставку и перемещение уехал бы неверный
+    штрихкод). Число дополняем нулями до 13 знаков, только если так получается
+    штрихкод с верной контрольной цифрой; иначе оставляем как есть — догадка
+    хуже честного «нет в 1С»."""
+    text = cell_text(v)
+    if isinstance(v, (int, float)) and not isinstance(v, bool) and text.isdigit() and len(text) < 13:
+        padded = text.zfill(13)
+        digits = [int(c) for c in padded]
+        check = (10 - sum(d * (3 if i % 2 == 0 else 1)
+                          for i, d in enumerate(reversed(digits[:-1]))) % 10) % 10
+        if check == digits[-1]:
+            return padded
+    return text
+
+
 def to_price(v) -> Decimal | None:
     if v in (None, ""):
         return None
@@ -106,6 +124,7 @@ def parse_catalog(data: bytes) -> CatalogParse:
             continue
         seen[sku] = excel_row
         rec = {field_: cell_text(get(code)) for code, field_ in COLUMNS.items() if field_ != "price"}
+        rec["ean"] = ean_from_cell(get("product_identifier"))
         rec["supplier_sku"] = sku
         rec["price"] = to_price(get("price"))
         rec["_row"] = excel_row

@@ -16,11 +16,16 @@
       <button {{ 'disabled' if (not can_request or pending) }}
         title="{{ '' if can_request else 'нужна обработка 1С версии mark-2' }}">Запросить справочник из 1С</button>
     </form>
+    {% if not can_request %}<span class="muted">Кнопка заработает с обработкой 1С версии mark-2: после её
+    установки — «Диагностика» → «Отправить PING».</span>{% endif %}
     <form method="post" action="/mapping/import" enctype="multipart/form-data" class="row">
       <label>или файл barcodes_*.txt (формат sync_admin)<input type="file" name="file" accept=".txt" required></label>
       <button class="secondary">Загрузить файл</button>
     </form>
   </div>
+  <p class="muted" style="margin-bottom:0">Полный справочник 1С выгружает несколько минут, и всё это время
+  обработка не берёт задания sync_admin — заказы с площадок встанут в очередь. Запрашивать, когда
+  справочник действительно устарел (завели новые товары или штрихкоды), а не на каждый просмотр.</p>
 </div>
 
 <div class="row" style="margin-bottom:10px">

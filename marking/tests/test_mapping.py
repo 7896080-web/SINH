@@ -150,3 +150,27 @@ def test_request_button_refuses_old_epf(client, db):
     r = client.post("/mapping/request")
     assert "mark-2" in r.text
     assert db.query(OnecTask).count() == 0
+
+
+def test_unknown_status_in_the_address_does_not_break_the_page(client, db, dictionary):
+    r = client.get("/mapping?status=чтото")
+    assert r.status_code == 200 and "найдено 0" in r.text
+
+
+def test_export_never_turns_text_into_a_formula(client, db, catalog):
+    from markapp.models import CatalogItem
+    item = db.query(CatalogItem).first()
+    M.load_dictionary(db, M.parse_barcode_dict(f"u1|=1+1|=HYPERLINK('x')|{item.ean}|M|Синий"), "тест")
+    db.commit()
+    r = client.get("/mapping/export")
+    ws = openpyxl.load_workbook(io.BytesIO(r.content)).active
+    cells = [c for row in ws.iter_rows() for c in row if isinstance(c.value, str) and c.value.startswith("=")]
+    assert cells and all(c.data_type == "s" for c in cells)
+
+
+def test_numeric_ean_cell_keeps_its_leading_zero():
+    from markapp.catalog import ean_from_cell
+    assert ean_from_cell(460123456786) == "0460123456786"     # верная контрольная цифра
+    assert ean_from_cell(2000932309880) == "2000932309880"
+    assert ean_from_cell(460123456789) == "460123456789"      # не EAN — без догадки
+    assert ean_from_cell("0460123456789") == "0460123456789"
