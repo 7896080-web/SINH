@@ -138,3 +138,58 @@ def test_a_missing_file_is_refused_plainly(tmp_path):
 
     assert code == 2
     assert "Файла нет" in out
+
+
+def test_a_module_saved_in_cp1251_is_read_and_passes(tmp_path):
+    """Файл выгружает человек, и кодировку он не выбирает.
+
+    1С кладёт модуль в UTF-8 с BOM, а блокнот и часть сборок Конфигуратора — в
+    cp1251. Читай скрипт только UTF-8, самый обычный случай давал бы
+    `UnicodeDecodeError` трассировкой вместо отчёта — то есть он не работал бы
+    ровно там, где его запускают, и это тот же класс, что уже стоил наката
+    26.09.
+    """
+    text = LIVE.read_text(encoding="utf-8-sig")
+    path = tmp_path / "module.txt"
+    # errors="replace" — в модуле есть «→», которой в cp1251 нет; на проверки
+    # это не влияет, они смотрят на русские имена и латиницу.
+    path.write_bytes(text.encode("cp1251", "replace"))
+
+    code, out = _run(path)
+
+    assert code == 0, out
+    assert "прочитан как cp1251" in out, out
+    assert "нужный нам функционал на месте" in out
+
+
+def test_the_encoding_is_named_out_loud():
+    """Кодировку приходится угадывать, и названа она не из опрятности.
+
+    cp1251 декодирует ЛЮБЫЕ байты без отказа: прочитанный ею UTF-8 превратился
+    бы в мусор, в котором не нашлось бы ни одного русского имени, — и отчёт
+    объявил бы потерянным ВСЁ. Строка «прочитан как cp1251» рядом с пятнадцатью
+    «НЕТ» читается как вопрос к файлу, а не к обработке.
+    """
+    code, out = _run(LIVE)
+
+    assert code == 0, out
+    assert "прочитан как utf-8-sig" in out, out
+
+
+def test_the_epf_itself_is_refused_with_the_way_out(tmp_path):
+    """Указать саму `.epf` — самая естественная ошибка: она у человека на
+    руках, а текста модуля нет.
+
+    Распаковать её нам нечем, поэтому отказ обязан НАЗЫВАТЬ выход. Трассировка
+    `UnicodeDecodeError` на первой же строке выглядит как поломка скрипта, и
+    человек отложит проверку вовсе — то есть доработанная обработка уедет на
+    бой непроверенной.
+    """
+    path = tmp_path / "ОбменССайтом.epf"
+    path.write_bytes(b"\x89\x00\x01\x02PK\x03\x04binary container\x00")
+
+    code, out = _run(path)
+
+    assert code == 2
+    assert "двоичный файл" in out, out
+    assert "Модуль объекта" in out, out
