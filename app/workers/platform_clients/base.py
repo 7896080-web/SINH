@@ -33,6 +33,17 @@ class StockPushItem:
 
 
 @dataclass
+class PricePushItem:
+    """Цена товара для отправки на площадку (репрайсер). Идентификаторы — те же,
+    что у остатков (заполняет price_dispatch из каталога кабинета):
+    WB — nmID из external_id ('nmID:chrtID'), Ozon — offer_id = article."""
+    barcode: str
+    price: int                      # ₽, целое
+    external_id: str = ""
+    article: str = ""
+
+
+@dataclass
 class CatalogItem:
     """Строка каталога площадки — для страницы «Мэппинг»."""
     external_id: str
@@ -48,6 +59,9 @@ class CatalogItem:
     # тридцати трёх позиций, ушедших с баркодом вместо variant_id, — падение
     # на баркод «а вдруг поймёт» стоило кабинету всей рассылки.
     stock_key: str = "barcode"
+    # Размер на площадке (WB techSize). Нужен сопоставлению артикулов: у WB
+    # артикул продавца — на карточку, и отличить размеры можно только по нему.
+    size: str = ""
 
 
 class PlatformClient(ABC):
@@ -153,6 +167,18 @@ class PlatformClient(ABC):
     def publish_stock_key(self, key: str) -> bool:
         """Вернуть карточку на витрину. True — площадка подтвердила."""
         return False
+
+    def push_prices(self, items: list[PricePushItem]) -> dict:
+        """Отправка цен. Возвращает {'ok': [баркоды], 'errors': [...],
+        'sent_prices': {баркод: фактически отправленная цена}} — последнее нужно
+        там, где площадка не умеет цену на размер (WB: одна цена на карточку).
+
+        По умолчанию НЕ реализовано: ничего не отправляет и возвращает ошибку по
+        каждому товару — лучше честный отказ, чем угаданный эндпоинт с реальными
+        деньгами."""
+        return {"ok": [], "sent_prices": {},
+                "errors": [{"detail": f"{self.name}: отправка цен не реализована",
+                            "items": [i.barcode for i in items]}]}
 
     @abstractmethod
     def get_catalog_items(self) -> list[CatalogItem]:

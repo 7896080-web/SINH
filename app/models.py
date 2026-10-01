@@ -5,7 +5,7 @@ from app.timeutils import now_utc
 
 from sqlalchemy import (
     Column, String, Boolean, Integer, DateTime, Date, Enum, ForeignKey,
-    Index, UniqueConstraint, Text,
+    Index, UniqueConstraint, Text, Numeric,
 )
 from sqlalchemy.orm import relationship
 
@@ -249,6 +249,11 @@ class Product(Base):
     broadcast_requested_at = Column(DateTime, nullable=True)
     # Дата «активно с» — для аудита и backfill (подтягивание отгрузок с даты).
     broadcast_active_since = Column(Date, nullable=True)
+    # Себестоимость единицы из 1С (выгрузка cost_*.txt, команда EXPORT_COST_PRICES) —
+    # база для репрайсера (app/pricing.py). NULL = 1С себестоимость не прислала,
+    # цену от неё не считаем. Копейки сохраняем: округление — дело правила цены.
+    cost_price = Column(Numeric(12, 2), nullable=True)
+    cost_price_updated_at = Column(DateTime, nullable=True)
     updated_at = Column(DateTime, default=now_utc, onupdate=now_utc)
 
     barcodes = relationship("Barcode", back_populates="product", cascade="all, delete-orphan")
@@ -687,6 +692,9 @@ class PlatformCatalogItem(Base):
     barcode = Column(String(64), nullable=True, index=True)
     article = Column(String(128), nullable=True)
     name = Column(String(255), nullable=True)
+    # Размер на площадке (WB techSize) — для сопоставления артикулов: артикул
+    # WB один на карточку, размер различает SKU. У Ozon/Kit пока пусто.
+    size = Column(String(64), nullable=True)
     fetched_at = Column(DateTime, default=now_utc, onupdate=now_utc)
 
     account = relationship("PlatformAccount")
@@ -1056,3 +1064,123 @@ class ReturnItemLog(Base):
     note = Column(String(255), nullable=True)
 
     item = relationship("ReturnItem", back_populates="events")
+
+
+# ---------------------------------------------------------------------------
+# Репрайсер: цена на площадке = себестоимость 1С × наценка кабинета.
+#
+# Условия у каждого кабинета СВОИ (у площадок разные комиссии и логистика),
+# поэтому правило — на кабинет, а не общее. Цена никогда не уходит на площадку
+# сама: расчёт создаёт ПРЕДЛОЖЕНИЯ (PriceChange в статусе proposed), оператор
+# подтверждает их на странице «Цены», и только подтверждённые забирает воркер
+# app/workers/price_dispatch.py.
+# ---------------------------------------------------------------------------
+
+class PriceRule(Base):
+    __tablename__ = "price_rules"
+
+    id = Column(Integer, primary_key=True)
+    account_id = Column(Integer, ForeignKey("platform_accounts.id"), nullable=False, unique=True)
+    # Наценка к себестоимости, %: 150 → цена = себестоимость × 2,5.
+    markup_percent = Column(Numeric(7, 2), default=0, nullable=False)
+    # Фиксированная надбавка, ₽ (логистика, упаковка) — прибавляется после наценки.
+    fixed_add = Column(Integer, default=0, nullable=False)
+    # Округление ВВЕРХ до шага (1, 10, 50, 100 ₽) и «красивое» окончание:
+    # шаг 100 и минус 1 дают 1299 вместо 1300.
+    round_step = Column(Integer, default=1, nullable=False)
+    round_minus = Column(Integer, default=0, nullable=False)
+    # Минимальная наценка, % — ЖЁСТКИЙ пол: цену ниже себестоимость × (1 + мин%)
+    # отправить нельзя ни расчётом, ни ручной ценой.
+    min_margin_percent = Column(Numeric(7, 2), default=0, nullable=False)
+    # Наибольшее изменение за раз, % от последней отправленной цены. Больше —
+    # предложение блокируется и уходит только с отдельным подтверждением оператора.
+    max_change_percent = Column(Numeric(7, 2), default=20, nullable=False)
+    updated_at = Column(DateTime, default=now_utc, onupdate=now_utc)
+
+    account = relationship("PlatformAccount")
+
+
+class ProductPrice(Base):
+    """Цена товара в конкретном кабинете: ручная цена (если оператор хочет
+    обойти правило) и последняя цена, которую площадка ПРИНЯЛА от нас."""
+    __tablename__ = "product_prices"
+    __table_args__ = (UniqueConstraint("uid_1c", "account_id", name="uq_price_product_account"),)
+
+    id = Column(Integer, primary_key=True)
+    uid_1c = Column(String(36), ForeignKey("products.uid_1c"), nullable=False)
+    account_id = Column(Integer, ForeignKey("platform_accounts.id"), nullable=False)
+    # Ручная цена, ₽. Задана — расчёт по правилу не делается, но пол
+    # минимальной наценки и лимит изменения проверяются так же.
+    manual_price = Column(Integer, nullable=True)
+    last_sent_price = Column(Integer, nullable=True)
+    last_sent_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, default=now_utc, onupdate=now_utc)
+
+    product = relationship("Product")
+    account = relationship("PlatformAccount")
+
+
+class PriceChangeStatus(str, enum.Enum):
+    proposed = "proposed"    # рассчитано, ждёт решения оператора
+    blocked = "blocked"      # нарушает ограничитель (пол / лимит изменения) — см. block_reason
+    approved = "approved"    # подтверждено оператором, ждёт отправки воркером
+    sent = "sent"            # площадка приняла
+    error = "error"          # площадка отказала за все попытки
+    rejected = "rejected"    # отклонено оператором или вытеснено новым расчётом
+
+
+class PriceChange(Base):
+    """Одно предложение изменить цену товара в кабинете — и его судьба."""
+    __tablename__ = "price_changes"
+
+    id = Column(Integer, primary_key=True)
+    uid_1c = Column(String(36), ForeignKey("products.uid_1c"), nullable=False, index=True)
+    account_id = Column(Integer, ForeignKey("platform_accounts.id"), nullable=False)
+    cost_price = Column(Numeric(12, 2), nullable=True)   # себестоимость на момент расчёта
+    old_price = Column(Integer, nullable=True)           # последняя отправленная (NULL — ещё не отправляли)
+    new_price = Column(Integer, nullable=False)
+    source = Column(String(16), nullable=False, default="rule")   # rule / manual
+    status = Column(Enum(PriceChangeStatus), default=PriceChangeStatus.proposed, nullable=False)
+    # Ограничитель, который не пропустил цену: 'floor' (ниже минимальной наценки,
+    # отправить нельзя) или 'max_change' (слишком большой шаг, можно отправить
+    # только с отдельным подтверждением).
+    block_reason = Column(String(16), nullable=True)
+    note = Column(String(255), nullable=True)
+    created_at = Column(DateTime, default=now_utc)
+    decided_by = Column(String(64), nullable=True)
+    decided_at = Column(DateTime, nullable=True)
+    attempts = Column(Integer, default=0, nullable=False)
+    next_attempt_at = Column(DateTime, nullable=True)
+    last_error = Column(Text, nullable=True)
+    sent_at = Column(DateTime, nullable=True)
+    # Как у остатков: запись со страницы тестирования НИКОГДА не уходит на
+    # площадку — price_dispatch явно исключает is_test=True.
+    is_test = Column(Boolean, default=False, nullable=False)
+
+    product = relationship("Product")
+    account = relationship("PlatformAccount")
+
+
+# ---------------------------------------------------------------------------
+# Сопоставление по АРТИКУЛАМ (страница «Сопоставление артикулов»).
+#
+# Основной путь сопоставления — баркод. Правила артикулов закрывают товары
+# площадки, чьих баркодов в 1С нет: по ним система ПРЕДЛАГАЕТ товар 1С, а связь
+# баркод → товар (таблица «Баркоды») создаётся только подтверждением оператора.
+# Правила у каждого кабинета свои — продавцы по-разному заводят артикулы.
+# ---------------------------------------------------------------------------
+
+class ArticleMatchRule(Base):
+    __tablename__ = "article_match_rules"
+
+    id = Column(Integer, primary_key=True)
+    account_id = Column(Integer, ForeignKey("platform_accounts.id"), nullable=False, unique=True)
+    # Включённые виды соответствия через запятую (см. app/article_matching.KINDS).
+    kinds = Column(String(128), nullable=False, default="exact,size")
+    # Постоянная приставка/окончание артикула площадки, которых нет в 1С
+    # (например «WB-» или «-NEW»). Срезаются перед сравнением.
+    strip_prefix = Column(String(64), nullable=True)
+    strip_suffix = Column(String(64), nullable=True)
+    updated_at = Column(DateTime, default=now_utc, onupdate=now_utc)
+
+    account = relationship("PlatformAccount")

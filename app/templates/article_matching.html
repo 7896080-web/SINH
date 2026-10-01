@@ -1,0 +1,139 @@
+{% extends "base.html" %}
+{% block title %}Сопоставление артикулов{% endblock %}
+{% block content %}
+
+<div class="page-header">
+    <div>
+        <h1>Сопоставление артикулов</h1>
+        <p>Товары площадки, чьих баркодов нет в 1С, — подбор товара 1С по правилам артикулов кабинета</p>
+    </div>
+    {% if view == 'candidates' and account %}
+    <div class="toolbar">
+        <a id="export-link" class="btn" href="/article-matching/export?account_id={{ account_id }}&status={{ status }}">Экспорт в Excel</a>
+    </div>
+    {% endif %}
+</div>
+
+<div style="margin-bottom: 14px;">
+    <a href="/article-matching?view=analysis" class="btn {% if view == 'analysis' %}btn-primary{% endif %}">Разбор правил</a>
+    <a href="/article-matching?view=candidates" class="btn {% if view == 'candidates' %}btn-primary{% endif %}">Кандидаты</a>
+</div>
+
+{% if not accounts %}
+<div class="card"><div class="empty-state">Нет активных кабинетов — добавьте их на странице «API-ключи».</div></div>
+{% elif view == 'analysis' %}
+<p class="help-text" style="margin: -8px 0 14px;">
+    Правила выводятся из данных: для каждой пары, уже сопоставленной по баркоду, смотрим, как артикул площадки
+    соотносится с артикулом 1С. Сравнение без учёта регистра, пробелов и разделителей, кириллические двойники
+    латиницы (А/A, С/C, Н/H…) считаются одинаковыми. Пар мало — загрузите спецификацию кабинета на «Мэппинге».
+</p>
+{% for b in blocks %}
+{% set an = b.analysis %}
+<div class="card">
+    <h2>{{ label(b.account) }}</h2>
+    <p class="help-text">Сопоставлено по баркоду: {{ an.total }} SKU. Без связи (кандидаты для правил): {{ an.unmatched }} баркодов.</p>
+    {% if an.total %}
+    <table>
+        <thead><tr><th>Как соотносятся артикулы</th><th style="text-align:right;">Пар</th><th style="text-align:right;">Доля</th><th>Примеры (площадка → 1С)</th></tr></thead>
+        <tbody>
+        {% for kind, n in an.counts.most_common() %}
+            <tr>
+                <td>{{ kind_labels[kind] }}{% if kind in an.suggested_kinds %} <span class="badge badge--good">предлагается</span>{% endif %}</td>
+                <td class="mono" style="text-align:right;">{{ n }}</td>
+                <td class="mono" style="text-align:right;">{{ '%.0f'|format(n * 100 / an.total) }}%</td>
+                <td class="help-text mono">
+                    {% for e in an.examples[kind] %}
+                    {{ e.platform or '—' }}{% if e.platform_size %} [{{ e.platform_size }}]{% endif %} → {{ e.article_1c }}{% if e.size %} · {{ e.size }}{% endif %}{% if e.color %} · {{ e.color }}{% endif %}<br>
+                    {% endfor %}
+                </td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% if an.prefixes or an.suffixes %}
+    <p class="help-text">
+        {% if an.prefixes %}Приставки: {% for v, n in an.prefixes.most_common(5) %}<span class="mono">{{ v }}</span> ({{ n }}){% if not loop.last %}, {% endif %}{% endfor %}.{% endif %}
+        {% if an.suffixes %}Окончания: {% for v, n in an.suffixes.most_common(5) %}<span class="mono">{{ v }}</span> ({{ n }}){% if not loop.last %}, {% endif %}{% endfor %}.{% endif %}
+    </p>
+    {% endif %}
+    {% endif %}
+
+    <form method="post" action="/article-matching/rules/{{ b.account.id }}" class="filters" style="align-items:flex-end; margin-top:10px;">
+        <div class="field">
+            <label>Включённые правила кабинета</label>
+            <div style="display:flex; gap:12px; flex-wrap:wrap;">
+            {% for kind in kinds %}
+                <label class="checkbox-inline">
+                    <input type="checkbox" name="kinds" value="{{ kind }}" {% if kind in b.enabled %}checked{% endif %}>
+                    {{ kind_labels[kind] }}
+                </label>
+            {% endfor %}
+            </div>
+        </div>
+        <div class="field">
+            <label for="pfx-{{ b.account.id }}">Срезать приставку</label>
+            <input type="text" id="pfx-{{ b.account.id }}" name="strip_prefix" value="{{ b.rule.strip_prefix or '' }}"
+                   placeholder="{{ an.suggested_prefix }}" style="width:120px;">
+        </div>
+        <div class="field">
+            <label for="sfx-{{ b.account.id }}">Срезать окончание</label>
+            <input type="text" id="sfx-{{ b.account.id }}" name="strip_suffix" value="{{ b.rule.strip_suffix or '' }}"
+                   placeholder="{{ an.suggested_suffix }}" style="width:120px;">
+        </div>
+        <div class="field">
+            <label>&nbsp;</label>
+            <button type="submit" class="btn btn-primary">Сохранить</button>
+        </div>
+    </form>
+    {% if an.total and (an.suggested_kinds|sort != b.enabled|sort or (an.suggested_prefix and an.suggested_prefix != (b.rule.strip_prefix or '')) or (an.suggested_suffix and an.suggested_suffix != (b.rule.strip_suffix or ''))) %}
+    <p class="help-text">
+        По данным предлагается: {% for k in an.suggested_kinds %}«{{ kind_labels[k] }}»{% if not loop.last %}, {% endif %}{% endfor %}
+        {% if an.suggested_prefix %}, приставка «{{ an.suggested_prefix }}»{% endif %}{% if an.suggested_suffix %}, окончание «{{ an.suggested_suffix }}»{% endif %}
+        — отметьте и сохраните.
+    </p>
+    {% endif %}
+</div>
+{% endfor %}
+
+{% else %}
+<form class="filters"
+      hx-get="/article-matching/rows"
+      hx-target="#am-table"
+      hx-trigger="change from:select"
+      hx-include="this">
+    <div class="field">
+        <label for="account_id">Кабинет</label>
+        <select id="account_id" name="account_id">
+            {% for a in accounts %}
+            <option value="{{ a.id }}" {% if account and account.id == a.id %}selected{% endif %}>{{ label(a) }}</option>
+            {% endfor %}
+        </select>
+    </div>
+    <div class="field">
+        <label for="status">Результат</label>
+        <select id="status" name="status">
+            <option value="">Все</option>
+            {% for k, v in status_labels.items() %}
+            <option value="{{ k }}" {% if status == k %}selected{% endif %}>{{ v }}</option>
+            {% endfor %}
+        </select>
+    </div>
+</form>
+
+<div class="card" style="padding:0; overflow-x:auto;">
+    <div id="am-table">
+        {% include "article_matching_rows.html" %}
+    </div>
+</div>
+
+<script>
+    document.querySelector('.filters[hx-get]').addEventListener('change', function () {
+        var link = document.getElementById('export-link');
+        if (!link) { return; }
+        link.href = '/article-matching/export?account_id=' + encodeURIComponent(document.getElementById('account_id').value) +
+                    '&status=' + encodeURIComponent(document.getElementById('status').value);
+    });
+</script>
+{% endif %}
+
+{% endblock %}

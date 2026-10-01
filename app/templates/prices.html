@@ -1,0 +1,145 @@
+{% extends "base.html" %}
+{% block title %}Цены{% endblock %}
+{% block content %}
+
+<div class="page-header">
+    <div>
+        <h1>Цены</h1>
+        <p>Цена на площадке = себестоимость из 1С × наценка кабинета. Ничего не уходит на площадку без подтверждения.</p>
+    </div>
+    {% if view != 'rules' %}
+    <div class="toolbar">
+        <a id="export-link" href="/prices/export?view={{ view }}&q={{ q }}&account_id={{ account_id }}" class="btn">Экспорт в Excel</a>
+        {% if view == 'products' %}
+        <form method="post" action="/prices/import" enctype="multipart/form-data" style="display:inline;">
+            <label class="btn file-upload-btn">
+                Импорт ручных цен
+                <input type="file" name="file" accept=".xlsx" onchange="this.form.submit()">
+            </label>
+        </form>
+        {% endif %}
+    </div>
+    {% endif %}
+</div>
+
+<div style="margin-bottom: 14px;">
+    <a href="/prices?view=rules" class="btn {% if view == 'rules' %}btn-primary{% endif %}">Правила</a>
+    <a href="/prices?view=products" class="btn {% if view == 'products' %}btn-primary{% endif %}">Цены товаров</a>
+    <a href="/prices?view=proposals" class="btn {% if view == 'proposals' %}btn-primary{% endif %}">
+        Предложения{% if open_count %} ({{ open_count }}){% endif %}
+    </a>
+    <a href="/prices?view=log" class="btn {% if view == 'log' %}btn-primary{% endif %}">Журнал</a>
+</div>
+
+{% if view == 'rules' %}
+<p class="help-text" style="margin: -8px 0 14px;">
+    У каждого кабинета свои условия. Цена = себестоимость × (1 + наценка%) + надбавка, затем округление
+    вверх до шага и «красивое» окончание (шаг 100, минус 1 → 1299). Пол: цену ниже
+    себестоимость × (1 + мин. наценка%) отправить нельзя никак. Изменение больше лимита от последней
+    отправленной цены требует отдельного подтверждения. Сохранение правила цены не меняет —
+    нужен расчёт на вкладке «Предложения».
+</p>
+{% if not accounts %}
+<div class="card"><div class="empty-state">Нет активных кабинетов — добавьте их на странице «API-ключи».</div></div>
+{% endif %}
+{% for platform in platforms %}
+<div class="card">
+    <h2>{{ platform.value|upper }}</h2>
+    {% for a in accounts if a.platform == platform %}
+    {% set rule = rules[a.id] %}
+    <form method="post" action="/prices/rules/{{ a.id }}" class="filters" style="align-items:flex-end;">
+        <div class="field" style="min-width:160px;">
+            <label>Кабинет</label>
+            <div><strong>{{ a.name }}</strong></div>
+        </div>
+        {% for name, label, kind, lo, hi in rule_fields %}
+        <div class="field">
+            <label for="{{ name }}-{{ a.id }}">{{ label }}</label>
+            <input type="text" inputmode="decimal" id="{{ name }}-{{ a.id }}" name="{{ name }}"
+                   value="{{ rule[name] }}" style="width:110px;" required>
+        </div>
+        {% endfor %}
+        <div class="field">
+            <label>&nbsp;</label>
+            <button type="submit" class="btn btn-primary">Сохранить</button>
+        </div>
+    </form>
+    {% endfor %}
+    {% if platform.value == 'kit' %}
+    <p class="help-text">Kit: метод обновления цен ещё не сверен со спекой API — правило и расчёт работают,
+        но отправка вернёт ошибку и ничего не изменит на площадке.</p>
+    {% elif platform.value == 'wb' %}
+    <p class="help-text">WB: цена ставится на карточку (все размеры одинаково) — при разных расчётных ценах
+        размеров уходит наибольшая. Скидку карточки система не трогает: покупатель платит цену минус скидку.
+        Токену кабинета нужна категория «Цены и скидки».</p>
+    {% endif %}
+</div>
+{% endfor %}
+
+{% else %}
+
+{% if view == 'proposals' %}
+<div class="card">
+    <form method="post" action="/prices/recalculate" class="filters" style="align-items:flex-end;">
+        <div class="field">
+            <label for="recalc-account">Рассчитать для</label>
+            <select id="recalc-account" name="account_id">
+                <option value="">Все кабинеты</option>
+                {% for a in accounts %}
+                <option value="{{ a.id }}" {% if account_id == a.id|string %}selected{% endif %}>{{ account_label(a) }}</option>
+                {% endfor %}
+            </select>
+        </div>
+        <div class="field">
+            <label>&nbsp;</label>
+            <button type="submit" class="btn btn-primary">Рассчитать</button>
+        </div>
+    </form>
+    <p class="help-text">Расчёт заменяет прежние нерешённые предложения новыми и ничего не отправляет.
+        Считаются только товары с включённой синхронизацией в кабинете.</p>
+</div>
+{% endif %}
+
+<form class="filters"
+      hx-get="/prices/rows"
+      hx-target="#prices-table"
+      hx-trigger="keyup changed delay:400ms from:input[type=search], change from:select"
+      hx-include="this">
+    <input type="hidden" name="view" value="{{ view }}">
+    {% if view == 'products' %}
+    <div class="field">
+        <label for="q">Поиск</label>
+        <input type="search" id="q" name="q" value="{{ q }}" placeholder="артикул, наименование">
+    </div>
+    {% else %}
+    <div class="field">
+        <label for="account_id">Кабинет</label>
+        <select id="account_id" name="account_id">
+            <option value="">Все</option>
+            {% for a in accounts %}
+            <option value="{{ a.id }}" {% if account_id == a.id|string %}selected{% endif %}>{{ account_label(a) }}</option>
+            {% endfor %}
+        </select>
+    </div>
+    {% endif %}
+</form>
+
+<div class="card" style="padding:0; overflow-x:auto;">
+    <div id="prices-table">
+        {% include "prices_rows.html" %}
+    </div>
+</div>
+
+<script>
+    document.querySelector('.filters[hx-get]').addEventListener('input', function () {
+        var link = document.getElementById('export-link');
+        if (!link) { return; }
+        var q = document.getElementById('q');
+        var acc = document.getElementById('account_id');
+        link.href = '/prices/export?view={{ view }}&q=' + encodeURIComponent(q ? q.value : '') +
+                    '&account_id=' + encodeURIComponent(acc ? acc.value : '');
+    });
+</script>
+{% endif %}
+
+{% endblock %}
