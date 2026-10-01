@@ -292,3 +292,20 @@ class NkRequest(Base):
     organization_id = Column(Integer, ForeignKey("organizations.id"), nullable=False, index=True)
     at = Column(DateTime, nullable=False, default=now_utc, index=True)
     http_status = Column(Integer, nullable=True)
+
+
+class OnecBarcode(Base):
+    """Справочник баркодов 1С — снимок, тот же, что у sync_admin (barcodes_*.txt):
+    строка на баркод, `item_id` — цветоразмерный SKU (характеристика, иначе
+    номенклатура). У SKU пул баркодов; баркод обязан принадлежать одному SKU —
+    две строки с одним баркодом и разными SKU и есть нарушение, которое страница
+    сопоставления показывает. Загрузка заменяет снимок целиком (`mapping.py`)."""
+    __tablename__ = "onec_barcodes"
+    __table_args__ = (UniqueConstraint("barcode", "item_id", name="uq_onec_barcode_item"),)
+    id = Column(Integer, primary_key=True)
+    barcode = Column(String(64), nullable=False, index=True)
+    item_id = Column(String(64), nullable=False, index=True)
+    article = Column(String(200), nullable=False, default="")
+    name = Column(String(500), nullable=False, default="")
+    size = Column(String(100), nullable=False, default="")
+    color = Column(String(100), nullable=False, default="")

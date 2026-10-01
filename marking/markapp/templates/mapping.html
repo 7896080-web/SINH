@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}Мэппинг{% endblock %}
+{% block content %}
+<h1>Сопоставление артикулов Lamoda с товарами 1С</h1>
+<div class="card">
+  <p style="margin-top:0"><b>Правило — как в sync_admin.</b> Ключ — штрихкод, не название и не артикул.
+  У цветоразмерного SKU 1С пул штрихкодов, принадлежащих только ему; артикул Lamoda сопоставлен,
+  если его EAN совпал с <i>любым</i> штрихкодом пула. Строго один к одному: один SKU 1С — один
+  артикул Lamoda. Догадок нет: не нашлось — так и показано. Исправляют в карточке Lamoda или в 1С.</p>
+  <p class="muted">Справочник 1С:
+    {% if info.loaded_at %}загружен {{ info.loaded_at.replace('T', ' ') }} UTC ({{ info.source }}), строк {{ info.rows }}.
+    {% else %}<span class="warn">ещё не загружен — все артикулы будут «нет в 1С».</span>{% endif %}
+    {% if pending %}<span class="warn">Запрос в 1С отправлен, ждём ответа.</span>{% endif %}</p>
+  <div class="row">
+    <form method="post" action="/mapping/request">
+      <button {{ 'disabled' if (not can_request or pending) }}
+        title="{{ '' if can_request else 'нужна обработка 1С версии mark-2' }}">Запросить справочник из 1С</button>
+    </form>
+    <form method="post" action="/mapping/import" enctype="multipart/form-data" class="row">
+      <label>или файл barcodes_*.txt (формат sync_admin)<input type="file" name="file" accept=".txt" required></label>
+      <button class="secondary">Загрузить файл</button>
+    </form>
+  </div>
+</div>
+
+<div class="row" style="margin-bottom:10px">
+  <a class="btn {{ '' if not status else 'secondary' }}" href="/mapping?q={{ q|urlencode }}">все {{ all_count }}</a>
+  <a class="btn {{ '' if status == 'problems' else 'secondary' }}" href="/mapping?status=problems&q={{ q|urlencode }}">с проблемами {{ all_count - counts.ok }}</a>
+  {% for s, label in labels.items() %}
+  <a class="btn {{ '' if status == s else 'secondary' }}" href="/mapping?status={{ s }}&q={{ q|urlencode }}" title="{{ hints[s] }}">{{ label }} {{ counts[s] }}</a>
+  {% endfor %}
+</div>
+{% if status and status != 'problems' %}<p class="muted">{{ hints[status] }}</p>{% endif %}
+<form class="row" method="get" action="/mapping" style="margin-bottom:10px">
+  <input type="hidden" name="status" value="{{ status }}">
+  <input name="q" value="{{ q }}" placeholder="артикул, штрихкод, артикул 1С, GTIN" size="40">
+  <button class="secondary">Найти</button>
+  <a class="btn secondary" href="/mapping/export?status={{ status }}&q={{ q|urlencode }}">Выгрузить отбор в Excel ({{ total }})</a>
+  <span class="muted">найдено {{ total }}{% if total > limit %}, показаны первые {{ limit }} — в Excel уходит весь отбор{% endif %}</span>
+</form>
+<div class="scroll">
+<table>
+  <tr><th>Артикул Lamoda</th><th>EAN</th><th>Статус</th><th>Товар 1С</th><th>Размер / цвет 1С</th>
+      <th>Пул штрихкодов 1С</th><th>Конфликт с</th><th>GTIN</th><th>НК: цвет / размер</th></tr>
+  {% for r in rows %}
+  <tr>
+    <td>{{ r.supplier_sku }}</td>
+    <td>{{ r.ean }}</td>
+    <td class="{{ 'ok' if r.status == 'ok' else 'bad' }}" title="{{ hints[r.status] }}">{{ r.label }}</td>
+    <td>{{ r.onec_article }}{% if r.onec_name %}<br><span class="muted">{{ r.onec_name }}</span>{% endif %}</td>
+    <td>{{ r.onec_size }}{% if r.onec_color %} / {{ r.onec_color }}{% endif %}</td>
+    <td>{{ r.pool|join(', ') }}</td>
+    <td class="warn">{{ r.others|join('; ') }}</td>
+    <td>{% if r.gtin %}<a href="/gtin/card/{{ r.gtin }}">{{ r.gtin }}</a>{% else %}<span class="muted">—</span>{% endif %}</td>
+    <td>{{ r.nk_color }}{% if r.nk_size %} / {{ r.nk_size }}{% endif %}</td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+{% endblock %}

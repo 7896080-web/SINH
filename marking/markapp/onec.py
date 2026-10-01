@@ -28,7 +28,10 @@ from markapp.models import OnecTask, OnecTaskStatus, Supply, SupplyStatus
 from markapp.supplies import movement_problems
 from markapp.timeutils import now_utc, ru
 
-COMMANDS = ("PING", "SUPPLY_CHECK", "SUPPLY_MOVEMENT")
+COMMANDS = ("PING", "SUPPLY_CHECK", "SUPPLY_MOVEMENT", "BARCODE_DICT")
+# Какая версия части маркировки в обработке 1С умеет команду. Старая на
+# незнакомую молчит — задание висело бы без ответа, поэтому не шлём.
+MIN_VERSION = {"BARCODE_DICT": 2}
 FINAL = (OnecTaskStatus.done.value, OnecTaskStatus.failed.value)
 # Ответ можно применить и к заданию, объявленному зависшим: опоздавший ответ
 # честнее, чем вечное «timeout».
@@ -107,6 +110,28 @@ def enqueue_check(db: Session, supply: Supply) -> OnecTask:
 def enqueue_movement(db: Session, supply: Supply) -> OnecTask:
     oid = movement_order_id(supply)
     return enqueue(db, "SUPPLY_MOVEMENT", oid, supply_line("SUPPLY_MOVEMENT", oid, supply), supply)
+
+
+def epf_version(db: Session) -> int:
+    """Номер версии части маркировки по ответу на PING: «mark-2» -> 2, нет — 0."""
+    raw = settings.get(db, EPF_VERSION)
+    try:
+        return int(raw.rsplit("-", 1)[-1])
+    except (ValueError, AttributeError):
+        return 0
+
+
+def enqueue_barcode_dict(db: Session) -> OnecTask:
+    """Справочник баркодов 1С для страницы сопоставления (`mapping.py`)."""
+    need = MIN_VERSION["BARCODE_DICT"]
+    if epf_version(db) < need:
+        raise OnecError(f"обработка 1С не умеет выгружать справочник для маркировки — нужна версия "
+                        f"mark-{need} (сейчас: {settings.get(db, EPF_VERSION) or 'нет ответа на PING'}). "
+                        "Пока можно загрузить файл справочника вручную")
+    task = enqueue(db, "BARCODE_DICT", "tmp", "tmp")
+    task.order_id = f"dict-{task.id}"
+    task.line = f"BARCODE_DICT|{task.order_id}"
+    return task
 
 
 def enqueue_ping(db: Session) -> OnecTask:
@@ -284,7 +309,7 @@ def _apply_movement(db: Session, task: OnecTask, res: ResultLine) -> None:
         supply.status = SupplyStatus.draft.value
 
 
-def apply_result_text(db: Session, text: str, check_text: str = "") -> dict:
+def apply_result_text(db: Session, text: str, check_text: str = "", dict_text: str = "") -> dict:
     """Применяет файл ответа. Возвращает счётчики. Не коммитит."""
     stats = {"ok": 0, "error": 0, "unmatched": 0}
     check = parse_check_file(check_text) if check_text else {}
@@ -312,6 +337,16 @@ def apply_result_text(db: Session, text: str, check_text: str = "") -> dict:
             _apply_check(db, task, res, check)
         elif task.command == "SUPPLY_MOVEMENT":
             _apply_movement(db, task, res)
+        elif task.command == "BARCODE_DICT" and ok:
+            from markapp import mapping
+            try:
+                st = mapping.load_dictionary(db, mapping.parse_barcode_dict(dict_text),
+                                             f"1С, задание {task.order_id}")
+                task.result_detail = f"строк {st['rows']}, SKU {st['items']}"
+            except mapping.MappingError as e:
+                # 1С ответила OK, а файла нет или он пуст — прежний снимок не трогаем.
+                task.status = OnecTaskStatus.failed.value
+                task.result_detail = f"справочник не принят: {e}"
     return stats
 
 
@@ -334,6 +369,7 @@ def _collect(db: Session, ex) -> dict:
     for name in ex.result_names():
         label = name[len("result_"):-len(".txt")]
         check_name = f"supplycheck_{label}.txt"
+        dict_name = f"barcodes_{label}.txt"
         # Файл, который не разбирается, НЕ останавливает остальные: раньше
         # исключение уходило наверх, и каждый цикл спотыкался об один и тот же
         # первый по имени файл — ответы за ним не применялись никогда, а зависшие
@@ -344,7 +380,8 @@ def _collect(db: Session, ex) -> dict:
             if text is None:
                 continue
             check_text = ex.read_result(check_name) or ""
-            stats = apply_result_text(db, text, check_text)
+            dict_text = ex.read_result(dict_name) or ""
+            stats = apply_result_text(db, text, check_text, dict_text)
             db.commit()
         except Exception as e:
             db.rollback()
@@ -357,6 +394,7 @@ def _collect(db: Session, ex) -> dict:
         try:
             ex.archive_result(name)
             ex.archive_result(check_name)
+            ex.archive_result(dict_name)
         except Exception as e:
             total["failed_files"].append(f"{name}: разобран, но не перенесён в архив: "
                                          f"{type(e).__name__}: {e}"[:300])
