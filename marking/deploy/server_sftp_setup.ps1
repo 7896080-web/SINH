@@ -174,6 +174,13 @@ if (-not (Get-NetFirewallRule -DisplayName $rule -ErrorAction SilentlyContinue) 
 } else {
     Ok "Брандмауэр: правило на $Port уже есть"
 }
+# Установщик OpenSSH заводит своё правило на порт 22 («OpenSSH SSH Server…»).
+# SSH теперь слушает только $Port, и открытое правило на 22 — лишняя дверь.
+$stock = Get-NetFirewallRule -DisplayName "OpenSSH*" -ErrorAction SilentlyContinue | ? Enabled -eq True
+if ($stock) {
+    $stock | Disable-NetFirewallRule
+    Ok "Правило установщика OpenSSH (порт 22) выключено"
+}
 if ($AllowFrom) {
     Get-NetFirewallRule -DisplayName $rule -ErrorAction SilentlyContinue |
         Set-NetFirewallAddressFilter -RemoteAddress $AllowFrom
