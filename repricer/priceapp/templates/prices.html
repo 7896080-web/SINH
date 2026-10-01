@@ -1,0 +1,123 @@
+{% extends "base.html" %}
+{% block title %}Цены{% endblock %}
+{% block content %}
+<h1>Цены</h1>
+<p class="muted">Себестоимость, ₽ = себестоимость 1С, $ × курс. К получению = цена × (1 − комиссия площадки).
+Наценка = к получению − себестоимость, ₽; коэффициент = к получению / себестоимость (2 = +100%, 2,5 = +150%, 3 = +200%). Ничего не уходит на площадку без подтверждения.
+{% if rate %}Курс: <b>{{ rate.usd_rub|money(4) }} ₽</b> ({{ rate.label }}).{% else %}<span class="bad">Курса нет — расчёт невозможен (страница «Курс $»).</span>{% endif %}</p>
+
+<div class="tabs">
+  <a class="btn {{ '' if view == 'rules' else 'secondary' }}" href="/prices?view=rules">Правила</a>
+  <a class="btn {{ '' if view == 'proposals' else 'secondary' }}" href="/prices?view=proposals">Предложения{% if open_count %} ({{ open_count }}){% endif %}</a>
+  <a class="btn {{ '' if view == 'products' else 'secondary' }}" href="/prices?view=products">Товары</a>
+  <a class="btn {{ '' if view == 'log' else 'secondary' }}" href="/prices?view=log">Журнал</a>
+</div>
+
+{% if not accounts %}
+<div class="card">Нет активных кабинетов — заведите их на странице «API-ключи».</div>
+
+{% elif view == 'rules' %}
+<p class="muted">У каждого кабинета свои условия. Цена = себестоимость ₽ × коэффициент / (1 − комиссия%), округление
+вверх до шага и «красивое» окончание (шаг 100, минус 1 → 1299). Коэффициент 2 = наценка 100%, 2,5 = 150%, 3 = 200%.
+Цену с коэффициентом ниже минимального отправить нельзя никак (1 — «не в убыток»). Изменение больше лимита от последней
+отправленной цены — только с отдельной галочкой. Пока коэффициент 1 — правило не настроено, расчёт по нему не идёт.</p>
+{% for a in accounts %}{% set rule = rules[a.id] %}
+<div class="card">
+  <h2 style="margin-top:0">{{ label(a) }}</h2>
+  <form method="post" action="/prices/rules/{{ a.id }}" class="row">
+    <label>Комиссия площадки, %<input name="commission_percent" value="{{ a.commission_percent if a.commission_percent is not none else '' }}" inputmode="decimal" style="width:110px" required></label>
+    {% for name, title, lo, hi in rule_fields %}
+    <label>{{ title }}<input name="{{ name }}" value="{{ rule[name]|plain }}" inputmode="decimal" style="width:110px" required></label>
+    {% endfor %}
+    <button type="submit">Сохранить</button>
+  </form>
+  {% if a.commission_percent is none %}<p class="warn" style="margin-bottom:0">Комиссия не задана — по кабинету не считаем.</p>{% endif %}
+</div>
+{% endfor %}
+
+{% elif view == 'products' %}
+<form method="get" action="/prices" class="row card">
+  <input type="hidden" name="view" value="products">
+  <label>Кабинет<select name="account_id" onchange="this.form.submit()">
+    {% for a in accounts %}<option value="{{ a.id }}" {% if account and account.id == a.id %}selected{% endif %}>{{ label(a) }}</option>{% endfor %}</select></label>
+  <label>Поиск<input name="q" value="{{ q }}" placeholder="артикул, наименование, баркод"></label>
+  <button class="secondary">Показать</button>
+  {% if account %}<a class="btn secondary" href="/prices/export/{{ account.id }}?q={{ q }}">Экспорт в Excel</a>{% endif %}
+</form>
+{% if account %}
+<form method="post" action="/prices/import/{{ account.id }}" enctype="multipart/form-data" class="row" style="margin-bottom:10px">
+  <label>Ручные цены из Excel (колонка «Ручная цена, ₽»)<input type="file" name="file" accept=".xlsx" required></label>
+  <button class="secondary">Загрузить</button>
+</form>
+<p class="muted">Комиссия кабинета: {{ account.commission_percent if account.commission_percent is not none else 'не задана' }}%. Товаров: {{ total }}{% if total > rows|length %}, показаны первые {{ rows|length }} — полный список в Excel{% endif %}.</p>
+<div class="scroll"><table class="econ">
+<tr><th>Товар 1С</th><th>На площадке</th><th class="num">Себест., $</th><th class="num">Себест., ₽</th><th class="num">Цена, ₽</th><th class="num">К получению</th><th class="num">Наценка, ₽</th><th class="num">Коэфф.</th><th class="num">Отправлено</th><th>Ручная цена</th></tr>
+{% for r in rows %}
+<tr>
+  <td>{{ r.sku.article if r.sku else r.item_id }}{% if r.sku and r.sku.size %} · {{ r.sku.size }}{% endif %}{% if r.sku and r.sku.color %} · {{ r.sku.color }}{% endif %}<div class="muted">{{ r.sku.name if r.sku else '' }}</div></td>
+  <td>{{ r.platform.article }}<div class="muted">{{ r.platform.barcode }}</div></td>
+  <td class="num">{{ r.cost_usd|money }}</td>
+  <td class="num">{{ r.cost_rub|money }}</td>
+  <td class="num"><b>{{ r.price if r.price is not none else '—' }}</b>{% if r.source == 'manual' %}<div class="muted">ручная</div>{% endif %}</td>
+  <td class="num">{{ r.payout|money }}</td>
+  <td class="num {{ 'bad' if r.markup_rub is not none and r.markup_rub < 0 else '' }}">{{ r.markup_rub|money }}</td>
+  <td class="num">{{ r.markup_coef|money }}{% if r.block_reason == BLOCK_FLOOR %}<div class="badge bad">ниже пола</div>{% elif r.block_reason == BLOCK_MAX_CHANGE %}<div class="badge warn">большой шаг</div>{% endif %}
+    {% if r.note and r.price is none %}<div class="muted">{{ r.note }}</div>{% endif %}</td>
+  <td class="num">{{ r.last_sent if r.last_sent is not none else '—' }}</td>
+  <td><form method="post" action="/prices/manual/{{ account.id }}" style="display:flex;gap:4px">
+    <input type="hidden" name="item_id" value="{{ r.item_id }}"><input type="hidden" name="q" value="{{ q }}">
+    <input name="value" value="{{ r.manual if r.manual is not none else '' }}" style="width:80px" placeholder="—">
+    <button class="secondary">OK</button></form></td>
+</tr>
+{% else %}<tr><td colspan="10" class="muted">Нет сопоставленных товаров: загрузите каталог кабинета («API-ключи») и справочник 1С («Диагностика»).</td></tr>{% endfor %}
+</table></div>
+{% endif %}
+
+{% else %}
+{% if view == 'proposals' %}
+<form method="post" action="/prices/recalculate" class="row card">
+  <label>Рассчитать для<select name="account_id"><option value="">все кабинеты</option>
+    {% for a in accounts %}<option value="{{ a.id }}" {% if account_id == a.id|string %}selected{% endif %}>{{ label(a) }}</option>{% endfor %}</select></label>
+  <button type="submit">Рассчитать</button>
+  <span class="muted">Расчёт заменяет прежние нерешённые предложения и ничего не отправляет.</span>
+</form>
+{% endif %}
+<form method="get" action="/prices" class="row" style="margin-bottom:8px">
+  <input type="hidden" name="view" value="{{ view }}">
+  <label>Кабинет<select name="account_id" onchange="this.form.submit()"><option value="">все</option>
+    {% for a in accounts %}<option value="{{ a.id }}" {% if account_id == a.id|string %}selected{% endif %}>{{ label(a) }}</option>{% endfor %}</select></label>
+</form>
+{% if changes %}
+{% if view == 'proposals' %}<form method="post"><input type="hidden" name="account_id" value="{{ account_id }}">{% endif %}
+<div class="scroll"><table class="econ">
+<tr>{% if view == 'proposals' %}<th><input type="checkbox" onclick="document.querySelectorAll('input[name=ids]').forEach(c => c.checked = this.checked)"></th>{% endif %}
+<th>Товар</th><th>Кабинет</th><th class="num">Себест. $ × курс</th><th class="num">Себест., ₽</th><th class="num">Было</th><th class="num">Станет</th><th class="num">Изм.</th><th class="num">Наценка</th><th>Статус</th>{% if view == 'log' %}<th>Когда</th>{% endif %}</tr>
+{% for c in changes %}{% set pct = change_percent(c.old_price, c.new_price) %}{% set s = skus.get(c.item_id) %}
+<tr>
+  {% if view == 'proposals' %}<td>{% if c.block_reason != BLOCK_FLOOR %}<input type="checkbox" name="ids" value="{{ c.id }}">{% endif %}</td>{% endif %}
+  <td>{{ s.article if s else c.item_id }}{% if s and s.size %} · {{ s.size }}{% endif %}<div class="muted">{{ s.name if s else '' }}</div></td>
+  <td>{{ label(c.account) }}<div class="muted">комиссия {{ c.commission_percent|money }}%</div></td>
+  <td class="num">{{ c.cost_usd|money }} × {{ c.usd_rub|money(4) }}</td>
+  <td class="num">{{ c.cost_rub|money }}</td>
+  <td class="num">{{ c.old_price if c.old_price is not none else '—' }}</td>
+  <td class="num"><b>{{ c.new_price }}</b>{% if c.source == 'manual' %}<div class="muted">ручная</div>{% endif %}</td>
+  <td class="num">{{ '%+.1f%%'|format(pct) if pct is not none else 'новая' }}</td>
+  <td class="num {{ 'bad' if c.markup_rub is not none and c.markup_rub < 0 else '' }}">{{ c.markup_rub|money }} ₽<div class="muted">коэфф. {{ c.markup_coef|money }}</div></td>
+  <td><span class="badge {{ 'ok' if c.status == 'sent' else ('bad' if c.status in ('blocked','error') else 'warn') }}">{{ status_labels[c.status] }}</span>
+    {% if c.block_reason %}<div class="muted">{{ block_labels[c.block_reason] }}</div>{% endif %}
+    {% if c.note %}<div class="muted">{{ c.note }}</div>{% endif %}{% if c.last_error %}<div class="muted">{{ c.last_error }}</div>{% endif %}</td>
+  {% if view == 'log' %}<td class="muted">{{ (c.sent_at or c.decided_at or c.created_at).strftime('%d.%m %H:%M') }}{% if c.decided_by %}<br>{{ c.decided_by }}{% endif %}</td>{% endif %}
+</tr>{% endfor %}
+</table></div>
+{% if view == 'proposals' %}
+<div class="row" style="margin-top:10px">
+  <label style="flex-direction:row;gap:6px;align-items:center"><input type="checkbox" name="confirm_large" value="true"> Подтверждаю изменения больше лимита</label>
+  <button type="submit" formaction="/prices/approve">Отправить выбранные на площадки</button>
+  <button type="submit" formaction="/prices/reject" class="secondary">Отклонить выбранные</button>
+</div></form>{% endif %}
+<p class="muted">{% if total > changes|length %}Показаны первые {{ changes|length }} из {{ total }}.{% else %}Всего: {{ total }}.{% endif %}</p>
+{% else %}
+<div class="card muted">{% if view == 'proposals' %}Предложений нет — нажмите «Рассчитать».{% else %}Журнал пуст.{% endif %}</div>
+{% endif %}
+{% endif %}
+{% endblock %}

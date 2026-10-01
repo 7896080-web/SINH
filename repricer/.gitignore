@@ -1,0 +1,11 @@
+.env
+*.db
+*.db-wal
+*.db-shm
+.venv/
+venv/
+backups/
+logs/
+ssh/
+onec_archive/
+__pycache__/

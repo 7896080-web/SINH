@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}API-ключи{% endblock %}
+{% block content %}
+<h1>API-ключи площадок</h1>
+<p class="muted">Ключи хранятся зашифрованными и на экран не выводятся — видна только маска. Пустое поле при сохранении
+ключ не меняет. Комиссия площадки задаётся на странице «Цены» → «Правила».</p>
+
+{% for r in rows %}{% set a = r.account %}
+<div class="card">
+  <h2 style="margin-top:0">{{ a.name }} <span class="badge">{{ platforms[a.platform] }}</span>
+    {% if not a.is_active %}<span class="badge bad">выключен</span>{% endif %}</h2>
+  <form method="post" action="/api-keys/{{ a.id }}" class="row">
+    <label>Название<input name="name" value="{{ a.name }}"></label>
+    {% for f, label, masked in r.fields %}
+    <label>{{ label }}<input name="{{ f }}" type="password" autocomplete="off" placeholder="{{ masked or 'не задан' }}" style="width:260px"></label>
+    {% endfor %}
+    <label>Активен<select name="is_active"><option value="1" {% if a.is_active %}selected{% endif %}>да</option><option value="0" {% if not a.is_active %}selected{% endif %}>нет</option></select></label>
+    <button type="submit">Сохранить</button>
+  </form>
+  <div class="row" style="margin-top:10px">
+    <form method="post" action="/api-keys/{{ a.id }}/check"><button class="secondary">Проверить подключение</button></form>
+    <form method="post" action="/api-keys/{{ a.id }}/catalog"><button class="secondary">Загрузить каталог</button></form>
+  </div>
+  <p class="muted" style="margin-bottom:0">
+    Проверка: {% if a.last_check_at %}<span class="{{ 'ok' if a.last_check_ok else 'bad' }}">{{ a.last_check_message }}</span> ({{ a.last_check_at.strftime('%d.%m %H:%M') }} UTC){% else %}не проводилась{% endif %}.
+    Каталог: {{ r['items'] }} баркодов{% if a.catalog_loaded_at %}, загружен {{ a.catalog_loaded_at.strftime('%d.%m %H:%M') }} UTC{% endif %}.
+    {% if a.catalog_note %}<span class="warn">{{ a.catalog_note }}</span>{% endif %}
+  </p>
+</div>
+{% endfor %}
+
+<div class="card">
+  <h2 style="margin-top:0">Добавить кабинет</h2>
+  <form method="post" action="/api-keys/new" class="row">
+    <label>Площадка<select name="platform">{% for k, v in platforms.items() %}<option value="{{ k }}">{{ v }}</option>{% endfor %}</select></label>
+    <label>Название (например, «ИП Яворская»)<input name="name" required></label>
+    <button type="submit">Добавить</button>
+  </form>
+  <p class="muted" style="margin-bottom:0">WB: токену нужны категории «Контент» (каталог) и «Цены и скидки» (отправка цен).
+  Kit: цены пока не отправляются — метод API не сверен.</p>
+</div>
+{% endblock %}

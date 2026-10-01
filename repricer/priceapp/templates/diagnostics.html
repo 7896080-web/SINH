@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}Диагностика{% endblock %}
+{% block content %}
+<h1>Диагностика</h1>
+{% if stale %}<div class="flash error">Фоновые задания не отвечают: {{ stale|join('; ') }}</div>{% endif %}
+
+<div class="card">
+  <h2 style="margin-top:0">Обработка 1С</h2>
+  {% if ready_at %}
+  <p class="ok">Обновлена до mark-3 — подтверждено ответом на запрос себестоимости {{ ready_at }} UTC.</p>
+  {% else %}
+  <p class="warn">Версия mark-3 ещё не подтверждена. Первым уходит запрос себестоимости: старая обработка (mark-2) его
+  молча пропускает, и задание уйдёт в «нет ответа» — значит, обработку надо обновить (модуль — <code>1c/ОбменССайтом_МодульОбъекта.txt</code>
+  репозитория). Справочник и PING до подтверждения не шлём: ответ старой обработки упал бы в общую папку sync_admin.</p>
+  {% endif %}
+  <p>Себестоимость ($): {{ cost_rows }} SKU{% if cost_at %}, обновлена {{ cost_at }} UTC{% endif %}.
+     Справочник баркодов: {% if dict_at %}{{ dict_rows }} строк, {{ dict_at }} UTC{% else %}не загружен{% endif %}.</p>
+  <div class="row">
+    <form method="post" action="/diagnostics/request/cost"><button class="secondary">Запросить себестоимость</button></form>
+    <form method="post" action="/diagnostics/request/dict"><button class="secondary" {% if not ready_at %}disabled{% endif %}>Запросить справочник</button></form>
+    <form method="post" action="/diagnostics/request/ping"><button class="secondary" {% if not ready_at %}disabled{% endif %}>PING</button></form>
+  </div>
+  <form method="post" action="/diagnostics/upload" enctype="multipart/form-data" class="row" style="margin-top:10px">
+    <label>Или файлом из 1С<select name="kind"><option value="cost">себестоимость (cost_*.txt)</option><option value="dict">справочник (barcodes_*.txt)</option></select></label>
+    <input type="file" name="file" required><button class="secondary">Загрузить</button>
+  </form>
+  <p class="muted" style="margin-bottom:0">К 1С программа обращается только при заданиях, ждущих отправки или ответа; себестоимость
+  сама обновляется раз в сутки. {% for k, v in dirs.items() %}{{ k }} — <code>{{ v }}</code>{{ '; ' if not loop.last }}{% endfor %}</p>
+</div>
+
+<div class="card"><h2 style="margin-top:0">Копия базы</h2>
+  <p style="margin-bottom:0">Последняя: {% if last_backup %}<b>{{ last_backup.strftime('%d.%m.%Y %H:%M') }} UTC</b>{% else %}<span class="warn">ещё не снималась</span>{% endif %}.
+  <span class="muted">Ключ шифрования (<code>REPRICER_SECRETS_KEY</code>) хранится отдельно от копий.</span></p></div>
+
+<h2>Фоновые задания</h2>
+<table><tr><th>Задание</th><th>Последний прогон (UTC)</th><th>Итог</th><th>Сообщение</th></tr>
+{% for b in beats %}<tr><td>{{ b.name }}</td><td>{{ b.last_run_at.strftime('%d.%m %H:%M:%S') if b.last_run_at else '' }}</td>
+<td class="{{ 'ok' if b.last_success and not b.last_error else ('warn' if b.last_success else 'bad') }}">{{ 'ок' if b.last_success and not b.last_error else ('с оговоркой' if b.last_success else 'ошибка') }}</td><td>{{ b.last_error }}</td></tr>{% endfor %}
+</table>
+
+<h2>Задания 1С (последние 50)</h2>
+<table><tr><th>#</th><th>Команда</th><th>order_id</th><th>Статус</th><th>Ответ</th><th>Файл</th><th>Создано (UTC)</th></tr>
+{% for t in tasks %}<tr><td>{{ t.id }}</td><td>{{ t.command }}</td><td>{{ t.order_id }}</td>
+<td class="{{ 'ok' if t.status == 'done' else ('bad' if t.status in ('failed','timeout') else '') }}">{{ t.status }}</td><td>{{ t.result_detail }}</td><td>{{ t.filename }}</td><td>{{ t.created_at.strftime('%d.%m %H:%M') }}</td></tr>{% endfor %}
+</table>
+
+<h2>Журнал (последние 50)</h2>
+<table><tr><th>Когда (UTC)</th><th>Кто</th><th>Действие</th><th>Объект</th><th>Подробности</th></tr>
+{% for l in log %}<tr><td>{{ l.at.strftime('%d.%m %H:%M') }}</td><td>{{ l.username }}</td><td>{{ l.action }}</td><td>{{ l.object }}</td><td>{{ l.details }}</td></tr>{% endfor %}
+</table>
+{% endblock %}
