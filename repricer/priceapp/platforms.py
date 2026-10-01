@@ -13,6 +13,17 @@ Ozon /v3/product/list + /v3/product/info/list, Kit /v1/variants с total_count).
   * Ozon — `POST /v1/product/import/prices` по offer_id (артикулу продавца);
     old_price и min_price не передаём.
   * Kit — метод цен в спеке не сверен: честный отказ, ничего не отправляется.
+  * Lamoda — ключи хранятся, но API не подключён (нет сверенной документации):
+    проверка, каталог, цены — честный отказ, ничего не отправляется.
+
+**Чтение текущих цен вживую НЕ проверялось** — тоже по документации:
+  * WB — `GET discounts-prices-api.wildberries.ru/api/v2/list/goods/filter`
+    (limit до 1000, offset): цена и скидка по КАРТОЧКЕ (nmID). `price` — до
+    скидки, то же поле, что мы отправляем; `discountedPrice` — что платит
+    покупатель.
+  * Ozon — `POST /v5/product/info/prices` (cursor, limit до 1000) по offer_id:
+    `price.price` — цена продажи.
+  * Kit, Lamoda — не читаем (`get_prices` бросает PlatformError).
 """
 from __future__ import annotations
 
@@ -22,13 +33,18 @@ import requests
 
 from priceapp.http_retry import with_retry
 
-PLATFORMS = {"wb": "Wildberries", "ozon": "Ozon", "kit": "Яндекс KIT"}
+PLATFORMS = {"wb": "Wildberries", "ozon": "Ozon", "kit": "Яндекс KIT", "lamoda": "Lamoda"}
+
+# Где умеем читать текущие цены (`get_prices`). У остальных метод честно
+# отказывает; суточное обновление и кнопка их пропускают, называя причину.
+READS_PRICES = {"wb", "ozon"}
 
 # Какие ключи у кабинета: (имя поля, подпись).
 CREDENTIAL_FIELDS = {
     "wb": [("token", "Токен (категории «Контент» и «Цены и скидки»)")],
     "ozon": [("client_id", "Client-Id"), ("api_key", "Api-Key")],
     "kit": [("token", "Токен")],
+    "lamoda": [("client_id", "Client ID"), ("client_secret", "Client Secret")],
 }
 
 
@@ -49,8 +65,22 @@ class PriceItem:
     article: str = ""
 
 
+@dataclass
+class CurrentPrice:
+    price: int              # то же поле, что мы отправляем
+    sale_price: int         # что платит покупатель (после скидки продавца)
+
+
 class PlatformError(RuntimeError):
     pass
+
+
+def _int_price(v) -> int | None:
+    try:
+        n = float(str(v).replace(",", "."))
+    except (TypeError, ValueError):
+        return None
+    return int(round(n)) if n > 0 else None
 
 
 # --- Wildberries -----------------------------------------------------------------
@@ -59,6 +89,8 @@ WB_CONTENT = "https://content-api.wildberries.ru"
 WB_PRICES = "https://discounts-prices-api.wildberries.ru"
 WB_PAGE = 100            # по спеке WB у cursor.limit maximum: 100
 WB_MAX_PAGES = 2000
+WB_PRICE_PAGE = 1000      # limit у /api/v2/list/goods/filter — до 1000
+WB_PRICE_MAX_PAGES = 500
 
 
 class WbClient:
@@ -110,6 +142,27 @@ class WbClient:
             self.last_truncated = True
         return result
 
+    def price_key(self, item) -> str:
+        """Чем адресуется цена строки каталога: у WB — nmID (цена на карточку)."""
+        return (item.external_id or "").split(":")[0]
+
+    def get_prices(self) -> dict[str, CurrentPrice]:
+        out: dict[str, CurrentPrice] = {}
+        self.last_truncated = False
+        for page in range(WB_PRICE_MAX_PAGES):
+            def call(offset=page * WB_PRICE_PAGE):
+                r = self.session.get(f"{WB_PRICES}/api/v2/list/goods/filter",
+                                     params={"limit": WB_PRICE_PAGE, "offset": offset}, timeout=30)
+                r.raise_for_status()
+                return r.json()
+            data = with_retry(call)
+            goods = (data.get("data") or {}).get("listGoods") or []
+            if not goods:
+                return out
+            out.update(parse_wb_prices(data))
+        self.last_truncated = True
+        return out
+
     def push_prices(self, items: list[PriceItem]) -> dict:
         by_nm: dict[int, list[PriceItem]] = {}
         errors = []
@@ -139,6 +192,19 @@ class WbClient:
                     ok.append(i.barcode)
                     sent[i.barcode] = nm_price[nm]
         return {"ok": ok, "errors": errors, "sent_prices": sent}
+
+
+def parse_wb_prices(data: dict) -> dict[str, CurrentPrice]:
+    """nmID -> цена. Размеры с разной ценой (editableSizePrice) — наибольшая:
+    отправляем мы тоже наибольшую по карточке."""
+    out = {}
+    for g in (data.get("data") or {}).get("listGoods") or []:
+        pairs = [(_int_price(sz.get("price")), _int_price(sz.get("discountedPrice")))
+                 for sz in g.get("sizes") or []]
+        pairs = [(p, s or p) for p, s in pairs if p]
+        if pairs and str(g.get("nmID", "")).isdigit():
+            out[str(g["nmID"])] = CurrentPrice(*max(pairs))
+    return out
 
 
 def parse_wb_cards(data: dict) -> list[CatalogRow]:
@@ -209,6 +275,25 @@ class OzonClient:
             self.last_truncated = True
         return result
 
+    def price_key(self, item) -> str:
+        """У Ozon цена — на offer_id (артикул продавца)."""
+        return item.article or ""
+
+    def get_prices(self) -> dict[str, CurrentPrice]:
+        out: dict[str, CurrentPrice] = {}
+        cursor = ""
+        self.last_truncated = False
+        for _ in range(OZON_MAX_PAGES):
+            data = self._post("/v5/product/info/prices",
+                              {"cursor": cursor, "filter": {"visibility": "ALL"}, "limit": OZON_PAGE})
+            items = data.get("items") or []
+            out.update(parse_ozon_prices(data))
+            cursor = data.get("cursor") or ""
+            if not items or not cursor:
+                return out
+        self.last_truncated = True
+        return out
+
     def push_prices(self, items: list[PriceItem]) -> dict:
         ok, errors, sent = [], [], {}
         # Два SKU 1С на одном offer_id — уходит большая цена: меньшая могла бы
@@ -238,6 +323,15 @@ class OzonClient:
                 else:
                     errors.append({"detail": res.get("errors"), "items": [i.barcode for i in group]})
         return {"ok": ok, "errors": errors, "sent_prices": sent}
+
+
+def parse_ozon_prices(data: dict) -> dict[str, CurrentPrice]:
+    out = {}
+    for it in data.get("items") or []:
+        p = _int_price((it.get("price") or {}).get("price"))
+        if p and it.get("offer_id"):
+            out[str(it["offer_id"])] = CurrentPrice(p, p)
+    return out
 
 
 def parse_ozon_info(data: dict) -> list[CatalogRow]:
@@ -297,6 +391,12 @@ class KitClient:
         self.last_truncated = True
         return result
 
+    def price_key(self, item) -> str:
+        return item.external_id or ""
+
+    def get_prices(self) -> dict[str, CurrentPrice]:
+        raise PlatformError("Kit: чтение цен ещё не сверено со спекой API — текущие цены не загружены")
+
     def push_prices(self, items: list[PriceItem]) -> dict:
         """Метод цен Kit не сверен со спекой — цена не отправляется."""
         return {"ok": [], "sent_prices": {},
@@ -313,6 +413,38 @@ def parse_kit_variants(data: dict) -> list[CatalogRow]:
     return result
 
 
+# --- Lamoda ------------------------------------------------------------------------
+
+LAMODA_NOT_READY = ("Lamoda: API ещё не подключён — нужна документация API продавца "
+                    "(ключи сохранены, ничего не отправляется)")
+
+
+class LamodaClient:
+    """Заготовка: ключи кабинета хранятся, но обращаться к площадке вслепую
+    нельзя — каждый метод честно отказывает."""
+    platform = "lamoda"
+
+    def __init__(self, client_id: str, client_secret: str):
+        self.client_id, self.client_secret = client_id, client_secret
+        self.last_truncated = False
+
+    def test_connection(self) -> tuple[bool, str]:
+        return False, LAMODA_NOT_READY
+
+    def get_catalog(self) -> list[CatalogRow]:
+        raise PlatformError(LAMODA_NOT_READY)
+
+    def price_key(self, item) -> str:
+        return item.external_id or ""
+
+    def get_prices(self) -> dict[str, CurrentPrice]:
+        raise PlatformError(LAMODA_NOT_READY)
+
+    def push_prices(self, items: list[PriceItem]) -> dict:
+        return {"ok": [], "sent_prices": {},
+                "errors": [{"detail": LAMODA_NOT_READY, "items": [i.barcode for i in items]}]}
+
+
 def build_client(platform: str, creds: dict):
     missing = [f for f, _ in CREDENTIAL_FIELDS[platform] if not creds.get(f)]
     if missing:
@@ -323,4 +455,6 @@ def build_client(platform: str, creds: dict):
         return OzonClient(creds["client_id"], creds["api_key"])
     if platform == "kit":
         return KitClient(creds["token"])
+    if platform == "lamoda":
+        return LamodaClient(creds["client_id"], creds["client_secret"])
     raise PlatformError(platform)

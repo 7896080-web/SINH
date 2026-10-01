@@ -6,7 +6,7 @@ from decimal import Decimal
 from openpyxl import load_workbook
 
 from priceapp.crypto import decrypt_value
-from priceapp.models import Account, ApiCredential, OnecCost, PlatformItem, PriceChange, PriceRule
+from priceapp.models import Account, ApiCredential, OnecCost, PlatformItem, PlatformRule, PriceChange
 from priceapp.platforms import CatalogRow
 from tests import factories as f
 
@@ -69,15 +69,15 @@ def test_check_and_catalog_with_fake_client(client, db, monkeypatch):
 
 
 def test_rules_save_commission_and_validate(client, db):
-    acc = f.account(db, commission=None)
-    client.post(f"/prices/rules/{acc.id}", data=RULE)
+    f.account(db, commission=None)
+    client.post("/prices/rules/wb", data=RULE)
     db.expire_all()
-    assert db.get(Account, acc.id).commission_percent == Decimal("25")
-    assert db.query(PriceRule).one().markup_coef == Decimal("2")
+    rule = db.query(PlatformRule).one()
+    assert rule.commission_percent == Decimal("25") and rule.markup_coef == Decimal("2")
     assert 'value="1,3"' in client.get("/prices?view=rules").text
-    r = client.post(f"/prices/rules/{acc.id}", data={**RULE, "commission_percent": "100"})
+    r = client.post("/prices/rules/wb", data={**RULE, "commission_percent": "100"})
     assert "не сохранено" in r.text
-    r = client.post(f"/prices/rules/{acc.id}", data={**RULE, "min_markup_coef": "3"})
+    r = client.post("/prices/rules/wb", data={**RULE, "min_markup_coef": "3"})
     assert "не сохранено" in r.text
 
 
@@ -89,7 +89,7 @@ def test_rate_manual_mode(client, db):
 
 def _priced(client, db):
     acc = f.account(db, commission=None)
-    client.post(f"/prices/rules/{acc.id}", data=RULE)
+    client.post("/prices/rules/wb", data=RULE)
     client.post("/rate/mode", data={"mode": "manual", "manual": "81.5"})
     f.sku(db, "u1", "39681", "L", barcodes=["b1"], cost_usd="16.24", name="Свитшот")
     f.item(db, acc, "b1", "39681-L", external_id="5:1")
@@ -129,7 +129,7 @@ def test_excel_roundtrip_manual_price(client, db):
     wb = load_workbook(io.BytesIO(r.content))
     ws = wb.active
     headers = [c.value for c in ws[1]]
-    assert ws.cell(row=2, column=headers.index("Наценка, ₽") + 1).value == 1330.69
+    assert ws.cell(row=2, column=headers.index("Наценка по расчётной, ₽") + 1).value == 1330.69
     ws.cell(row=2, column=headers.index("Ручная цена, ₽") + 1, value=3999)
     buf = io.BytesIO()
     wb.save(buf)

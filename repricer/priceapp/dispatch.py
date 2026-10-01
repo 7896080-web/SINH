@@ -16,7 +16,7 @@ from priceapp import accounts, rates
 from priceapp.models import (Account, OnecCost, PlatformItem, PriceChange, PriceChangeStatus,
                              ProductPrice)
 from priceapp.platforms import PriceItem
-from priceapp.pricing import BLOCK_FLOOR, floor_price, get_or_create_rule
+from priceapp.pricing import BLOCK_FLOOR, floor_price, get_rule
 from priceapp.timeutils import now_utc
 
 MAX_ATTEMPTS = 5
@@ -54,7 +54,8 @@ def run_account(db: Session, account: Account, client) -> dict:
             prev.note = "вытеснено более новой подтверждённой ценой"
         latest[ch.item_id] = ch
 
-    rule = get_or_create_rule(db, account.id)
+    rule = get_rule(db, account.platform)
+    commission = rule.commission_percent
     rate = rates.current(db)
     costs = {c.item_id: c for c in db.query(OnecCost).filter(OnecCost.item_id.in_(list(latest)))}
     now = now_utc()
@@ -63,14 +64,14 @@ def run_account(db: Session, account: Account, client) -> dict:
         if ch.next_attempt_at is not None and ch.next_attempt_at > now:
             continue
         cost = costs.get(item_id)
-        if cost is not None and rate is not None and account.commission_percent is not None:
+        if cost is not None and rate is not None and commission is not None:
             cost_rub = Decimal(str(cost.cost_usd)) * rate.usd_rub
-            floor = floor_price(cost_rub, rule, account.commission_percent)
+            floor = floor_price(cost_rub, rule, commission)
             if ch.new_price < floor:
                 ch.status = PriceChangeStatus.blocked.value
                 ch.block_reason = BLOCK_FLOOR
                 ch.note = (f"при отправке: минимум {floor} ₽ (курс {rate.usd_rub}, "
-                           f"себестоимость {cost.cost_usd} $, комиссия {account.commission_percent}%)")
+                           f"себестоимость {cost.cost_usd} $, комиссия {commission}%)")
                 floored += 1
                 continue
         row = (db.query(PlatformItem).filter(PlatformItem.account_id == account.id,

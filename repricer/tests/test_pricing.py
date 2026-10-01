@@ -5,7 +5,7 @@
 """
 from decimal import Decimal
 
-from priceapp.models import PriceChange, PriceRule, ProductPrice
+from priceapp.models import PlatformRule, PriceChange, ProductPrice
 from priceapp.pricing import (BLOCK_FLOOR, BLOCK_MAX_CHANGE, approve, decide, markup, payout,
                               recalculate_account, round_price)
 from tests import factories as f
@@ -17,7 +17,7 @@ def _rule(**kw):
     base = dict(markup_coef=2, round_step=10, round_minus=1, min_markup_coef=Decimal("1.3"),
                 max_change_percent=20)
     base.update(kw)
-    return PriceRule(**base)
+    return PlatformRule(**base)
 
 
 def test_customer_example_sweatshirt_16_24_usd():

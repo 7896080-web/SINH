@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta
 
-from priceapp import accounts, backup, dispatch, onec, rates, settings
+from priceapp import accounts, backup, dispatch, onec, platforms, rates, settings
 from priceapp.database import SessionLocal
 from priceapp.models import Account, ApiCredential, OnecTask, OnecTaskStatus
 from priceapp.timeutils import now_utc, today_local
@@ -78,7 +78,7 @@ def _older_than(raw: str, age: timedelta) -> bool:
 
 
 def job_daily_refresh(client_factory=None) -> None:
-    """Раз в сутки: себестоимость из 1С и каталоги кабинетов с ключами."""
+    """Раз в сутки: себестоимость из 1С, каталоги и текущие цены кабинетов с ключами."""
     db = SessionLocal()
     notes = []
     try:
@@ -86,17 +86,25 @@ def job_daily_refresh(client_factory=None) -> None:
             onec.enqueue_cost(db)
             db.commit()
         for acc in db.query(Account).filter(Account.is_active.is_(True)):
-            if acc.catalog_loaded_at and now_utc() - acc.catalog_loaded_at < REFRESH_EVERY:
-                continue
             if db.query(ApiCredential.id).filter(ApiCredential.account_id == acc.id).first() is None:
                 continue
-            try:
-                st = accounts.load_catalog(db, acc, accounts.client_for(db, acc, client_factory))
-                if st["truncated"]:
-                    notes.append(f"{acc.name}: каталог выгружен не полностью")
-            except Exception as e:
-                db.rollback()
-                notes.append(f"{acc.name}: каталог не загружен — {e}"[:200])
+            if not acc.catalog_loaded_at or now_utc() - acc.catalog_loaded_at >= REFRESH_EVERY:
+                try:
+                    st = accounts.load_catalog(db, acc, accounts.client_for(db, acc, client_factory))
+                    if st["truncated"]:
+                        notes.append(f"{acc.name}: каталог выгружен не полностью")
+                except Exception as e:
+                    db.rollback()
+                    notes.append(f"{acc.name}: каталог не загружен — {e}"[:200])
+            if acc.platform in platforms.READS_PRICES and (
+                    not acc.prices_loaded_at or now_utc() - acc.prices_loaded_at >= REFRESH_EVERY):
+                try:
+                    st = accounts.load_prices(db, acc, accounts.client_for(db, acc, client_factory))
+                    if st["truncated"]:
+                        notes.append(f"{acc.name}: цены выгружены не полностью")
+                except Exception as e:
+                    db.rollback()
+                    notes.append(f"{acc.name}: цены не загружены — {e}"[:200])
         beat(db, "daily_refresh", True, "; ".join(notes))
     except Exception as e:
         logger.exception("суточное обновление упало")
