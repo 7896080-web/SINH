@@ -55,7 +55,7 @@ def test_movement_is_dated_now_and_not_marked_sync():
 
 def test_movement_checks_idempotency_before_stock():
     f = _function("ПереместитьПоставку")
-    assert f.index("НайтиПроведённоеПеремещение") < f.index("Разбор.Ошибки.Количество()")
+    assert f.index("ПроведённаяПоставка(") < f.index("Разбор.Ошибки.Количество()")
     assert f.index("Разбор.Ошибки.Количество()") < f.index("СоздатьДокумент()")
 
 
@@ -133,8 +133,25 @@ def test_movement_takes_stock_from_the_checked_warehouse():
     text = _text()
     assert "ПереместитьПоставку(ИдЗаказа, Поля[2], Поля[3]," in text
     f = _function("ПереместитьПоставку")
-    assert "СкладОткуда = НайтиСклад(ИмяСкладаОткуда);" in f
+    assert "СкладОткуда = НайтиСкладПоКоду(КодСкладаОткуда);" in f
     assert "СкладЦС" not in f
+
+
+def test_supply_finds_warehouses_by_code_only():
+    """Поставка не зовёт НайтиСклад (наименование) — только по коду; общую
+    функцию sync_admin не трогаем."""
+    text = _text()
+    for name in ("РазобратьПозицииПоставки", "ПереместитьПоставку", "ПроведённаяПоставка"):
+        assert "НайтиСклад(" not in _function(name), name
+    f = _function("НайтиСкладПоКоду")
+    assert "Склады.Код = &Код" in f and "ПЕРВЫЕ 2" in f
+    assert f.count("ВызватьИсключение") == 3
+    assert 'Функция НайтиСклад(Имя)\n\tСклад = Справочники.Склады.НайтиПоНаименованию(Имя, Истина);' in text
+
+
+def test_supply_idempotency_ignores_reverses():
+    f = _function("ПроведённаяПоставка")
+    assert '"mark order_id=" + ИдЗаказа + " %"' in f
 
 
 def test_supply_quantity_must_be_a_positive_integer():

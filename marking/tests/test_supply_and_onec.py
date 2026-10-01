@@ -89,7 +89,7 @@ def test_movement_line_has_no_date_and_aggregates_barcodes(db, catalog):
     s = _supply(db)
     line = onec.supply_line("SUPPLY_MOVEMENT", onec.movement_order_id(s), s)
     parts = line.split("|")
-    assert parts[:4] == ["SUPPLY_MOVEMENT", "lamoda-12560", "ЦС Склад", "Lamaoda_Склад"]
+    assert parts[:4] == ["SUPPLY_MOVEMENT", "lamoda-12560", "ЦБ0000012", "ЦБ0000017"]
     assert len(parts) == 6
     positions = dict(p.split(":") for p in parts[4].split(";"))
     assert sum(int(q) for q in positions.values()) == 338

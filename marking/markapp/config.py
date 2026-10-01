@@ -39,12 +39,13 @@ ONEC_SFTP_ARCHIVE = os.environ.get("MARKING_ONEC_SFTP_ARCHIVE", "/archive/markin
 # запускается по расписанию; штатный ответ у sync_admin приходит за 4-7 минут.
 ONEC_TIMEOUT_MINUTES = int(os.environ.get("MARKING_ONEC_TIMEOUT_MINUTES", "15"))
 
-# Имена складов в 1С (п. 6.2 ТЗ) — ПОСИМВОЛЬНО как в справочнике «Склады»:
-# обработка ищет склад по точному наименованию (НайтиСклад) и на любом
-# расхождении отказывает. В боевой базе склад магазина Lamoda называется
-# «Lamaoda_Склад» — с опечаткой, так он заведён (снимок справочника 02.10.2026).
-# Пишем как в базе: переименование в 1С тронуло бы всё, что к нему привязано.
-ONEC_WAREHOUSE_FROM = os.environ.get("MARKING_WAREHOUSE_FROM", "ЦС Склад")
-ONEC_WAREHOUSE_TO = os.environ.get("MARKING_WAREHOUSE_TO", "Lamaoda_Склад")
+# Склады в 1С (п. 6.2 ТЗ) — КОДАМИ справочника «Склады», а не наименованиями:
+# наименование правят руками (склад Lamoda в боевой базе заведён как
+# «Lamaoda_Склад»), код — нет. Обработка ищет склад по коду
+# (НайтиСкладПоКоду) и называет его наименование в ответе на проверку.
+# Снимок справочника 02.10.2026: ЦБ0000012 «ЦС Склад» (магазин ЦС_МСК),
+# ЦБ0000017 «Lamaoda_Склад» (магазин Lamoda).
+ONEC_WAREHOUSE_FROM = os.environ.get("MARKING_WAREHOUSE_FROM_CODE", "ЦБ0000012")
+ONEC_WAREHOUSE_TO = os.environ.get("MARKING_WAREHOUSE_TO_CODE", "ЦБ0000017")
 
 BACKUP_DIR = _path("MARKING_BACKUP_DIR", str(BASE_DIR / "backups"))

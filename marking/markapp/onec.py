@@ -67,7 +67,7 @@ def positions_of(supply: Supply) -> "OrderedDict[str, int]":
 
 def supply_line(command: str, order_id: str, supply: Supply) -> str:
     """SUPPLY_CHECK / SUPPLY_MOVEMENT:
-    команда|order_id|склад откуда|склад куда|баркод:кол;…|комментарий-дополнение
+    команда|order_id|код склада откуда|код склада куда|баркод:кол;…|комментарий-дополнение
 
     Поля даты нет намеренно (см. модуль). В комментарий документа обработка
     пишет `mark order_id=<order_id> lamoda <дополнение>` — НЕ на `sync`: иначе
