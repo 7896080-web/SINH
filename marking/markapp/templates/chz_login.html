@@ -21,7 +21,7 @@
 <script src="https://www.cryptopro.ru/sites/default/files/products/cades/cadesplugin_api.js"></script>
 <script>
   var ORG_ID = {{ org.id }}, ORG_INN = {{ org.inn|tojson }}, WITH_SUZ = {{ 'true' if org.connection_id else 'false' }};
-  var certs = [];
+  var certs = [], certInns = [];
   function $(id) { return document.getElementById(id); }
   function log(text, cls) {
     var d = document.createElement('div');
@@ -63,7 +63,7 @@
           var subj = yield c.SubjectName, to = new Date(yield c.ValidToDate);
           var inn = innOf(subj), expired = to < new Date(), ok = sameInn(inn, ORG_INN) && !expired;
           if (!inn) continue;
-          certs.push(c);
+          certs.push(c); certInns.push(inn);
           var tr = document.createElement('tr');
           tr.innerHTML = '<td><input type="radio" name="cert" value="' + (certs.length - 1) + '"'
             + (ok ? (usable === 0 ? ' checked' : '') : ' disabled') + '></td><td></td><td></td><td></td>';
@@ -105,26 +105,27 @@
                               body: body ? JSON.stringify(body) : '{}'});
     var j = {};
     try { j = await r.json(); } catch (e) {}
+    if (r.redirected || r.status === 401) throw new Error('сессия программы истекла — войдите заново и повторите');
     if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
     return j;
   }
 
-  async function loginOne(kind, label, cert) {
+  async function loginOne(kind, label, cert, certInn) {
     var ch = await post('/organizations/' + ORG_ID + '/chz-login/challenge');
     log('[' + label + '] строка для подписи получена, подписываю…');
     var signature = await sign(cert, ch.data);
-    var res = await post('/organizations/' + ORG_ID + '/chz-login/token', {kind: kind, uuid: ch.uuid, signature: signature});
+    var res = await post('/organizations/' + ORG_ID + '/chz-login/token', {kind: kind, uuid: ch.uuid, signature: signature, cert_inn: certInn});
     log('[' + label + '] вход выполнен, действует до ' + res.until, 'ok');
   }
 
   $('loginBtn').onclick = async function () {
     var sel = document.querySelector('input[name=cert]:checked');
     if (!sel) return;
-    var cert = certs[+sel.value];
+    var cert = certs[+sel.value], certInn = certInns[+sel.value];
     $('loginBtn').disabled = true;
     try {
-      await loginOne('true_api', 'True API', cert);
-      if (WITH_SUZ) await loginOne('suz', 'СУЗ', cert);
+      await loginOne('true_api', 'True API', cert, certInn);
+      if (WITH_SUZ) await loginOne('suz', 'СУЗ', cert, certInn);
       log('Готово. Карточки Нацкаталога программа запросит сама в течение минуты.', 'ok');
     } catch (e) {
       log('Вход не выполнен: ' + e.message, 'bad');

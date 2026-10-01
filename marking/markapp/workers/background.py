@@ -36,14 +36,24 @@ def _loop() -> None:
     last_nk = 0.0
     while not _stop.is_set():
         now = time.monotonic()
-        scheduler.job_onec_exchange()
+        _safe(scheduler.job_onec_exchange)
         if now - last_nk >= NK_EVERY:
-            scheduler.job_nk_fetch()
-            scheduler.job_codes_status()
+            _safe(scheduler.job_nk_fetch)
+            _safe(scheduler.job_codes_status)
             last_nk = now
         if now - started >= BACKUP_FIRST_AFTER:
-            scheduler.job_backup()      # сам пропустит, если копия моложе суток
+            _safe(scheduler.job_backup)      # сам пропустит, если копия моложе суток
         _stop.wait(TICK)
+
+
+def _safe(job) -> None:
+    """Задание ловит свои ошибки само, но и его `beat` может упасть (база занята,
+    диск). Исключение, вышедшее из цикла, убило бы поток насовсем: обмен с 1С,
+    статусы кодов и копии встали бы до перезапуска программы."""
+    try:
+        job()
+    except Exception:
+        logger.exception("фоновое задание %s упало", getattr(job, "__name__", job))
 
 
 def start() -> None:

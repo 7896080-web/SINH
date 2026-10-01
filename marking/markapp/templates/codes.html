@@ -15,6 +15,9 @@
      СУЗ {% if suz_ok %}<span class="ok">есть</span>{% else %}<span class="warn">нужен</span>{% endif %}
      — <a href="/organizations/{{ org.id }}/chz-login">войти в ЧЗ</a>.
      {% if not org.connection_id %}<span class="bad">У организации нет ID соединения СУЗ — заказ невозможен.</span>{% endif %}</p>
+  {% if not backup.covered %}<p class="bad">Последние коды поставки ({{ backup.last_code|local_time }}) ещё не попали в копию базы
+    (последняя копия: {{ backup.last_backup|local_time or 'нет' }}){% if backup.error %} — ошибка копии: {{ backup.error }}{% endif %}.
+    СУЗ коды повторно не выдаёт: проверьте «Диагностику».</p>{% endif %}
   {% if supply.is_test %}<p class="warn">Тестовая поставка: настоящие коды под неё не заказываются.</p>
   {% elif not can_order %}<p class="warn">Коды заказываются после перемещения в 1С: до него состав поставки может измениться.</p>{% endif %}
 </div>
@@ -28,10 +31,37 @@
     <button id="btnIntro" disabled class="secondary">3. Ввести в оборот нанесённые ({{ ready }})</button>
   </p>
   <form method="post" action="/supplies/{{ supply.id }}/codes/refresh" style="display:inline"><button class="secondary">Обновить статусы кодов сейчас</button></form>
+  {% if total.codes %}
+  <form method="post" action="/supplies/{{ supply.id }}/codes/labels" style="display:inline"><button class="secondary">Этикетки по кодам поставки (PDF)</button></form>
+  <form method="post" action="/supplies/{{ supply.id }}/codes/txt" style="display:inline"><button class="secondary" {{ '' if total.done else 'disabled title="только когда все коды в обороте"' }}>Коды поставки (.txt)</button></form>
+  {% endif %}
   <p class="muted">Каждый запрос в СУЗ подписывается (может спросить PIN) — держите страницу открытой, пока идёт получение.
     Статусы кодов программа обновляет сама раз в минуту; «Нанесён» ЧЗ ставит сам, время нестабильно.</p>
   <div id="log"></div>
 </div>
+
+{% set unknown = orders|selectattr('status', 'equalto', 'unknown')|list %}
+{% if unknown %}
+<div class="card">
+  <h2 class="bad">Заказы с неизвестным исходом</h2>
+  <p>СУЗ не ответил на заказ (таймаут, сбой). Заказ МОГ создаться — повторно он не отправляется.
+    Найдите его в личном кабинете СУЗ по GTIN и времени: есть — впишите номер заказа, нет — нажмите «Заказа нет».</p>
+  <table>
+    <tr><th>Артикул</th><th>GTIN</th><th>Шт.</th><th>Когда</th><th>Ошибка</th><th>Решение</th></tr>
+    {% for o in unknown %}
+    <tr><td>{{ o.supplier_sku }}</td><td>{{ o.gtin }}</td><td>{{ o.quantity }}</td><td>{{ o.updated_at|local_time }}</td>
+      <td><small>{{ o.error[:200] }}</small></td>
+      <td><form method="post" action="/supplies/{{ supply.id }}/codes/order-resolve" class="row">
+          <input type="hidden" name="order_id" value="{{ o.id }}">
+          <input name="suz_order_id" placeholder="номер заказа СУЗ" size="38">
+          <button>Заказ есть</button></form>
+        <form method="post" action="/supplies/{{ supply.id }}/codes/order-resolve"
+              onsubmit="return confirm('Подтверждаете, что в СУЗ этого заказа НЕТ? Иначе недостающие коды будут заказаны второй раз.')">
+          <input type="hidden" name="order_id" value="{{ o.id }}"><button class="secondary">Заказа нет</button></form></td></tr>
+    {% endfor %}
+  </table>
+</div>
+{% endif %}
 
 <div class="card">
   <h2>По артикулам</h2>
@@ -72,8 +102,11 @@
     <tr><th>#</th><th>Кодов</th><th>Статус</th><th>Номер в ЧЗ</th><th>Отправлен</th><th>Ошибка</th></tr>
     {% for d in docs %}
     <tr><td>{{ d.id }}</td><td>{{ d.codes_count }}</td>
-      <td class="{{ 'ok' if d.status == 'CHECKED_OK' else ('bad' if d.status in ('CHECKED_NOT_OK','error') else 'warn') }}">{{ {'new':'ждёт подписи','sent':'проверяется ЧЗ','CHECKED_OK':'принят','CHECKED_NOT_OK':'отклонён','error':'не отправлен'}.get(d.status, d.status) }}</td>
-      <td>{{ d.doc_id }}</td><td>{{ d.sent_at|local_time }}</td><td><small>{{ d.error[:300] }}</small></td></tr>
+      <td class="{{ 'ok' if d.status == 'CHECKED_OK' else ('bad' if d.status in ('CHECKED_NOT_OK','error','unknown') else 'warn') }}">{{ doc_ru.get(d.status, d.status) }}</td>
+      <td>{{ d.doc_id }}</td><td>{{ d.sent_at|local_time }}</td><td><small>{{ d.error[:300] }}</small>
+      {% if d.status == 'unknown' %}<form method="post" action="/supplies/{{ supply.id }}/codes/doc-release"
+        onsubmit="return confirm('Подтверждаете, что в личном кабинете ЧЗ этого документа НЕТ? Коды уйдут в следующий документ.')">
+        <input type="hidden" name="doc_id" value="{{ d.id }}"><button class="secondary">Документа в ЧЗ нет — освободить коды</button></form>{% endif %}</td></tr>
     {% endfor %}
   </table>
 </div>
@@ -154,6 +187,7 @@
                                      body: JSON.stringify(body || {})});
     var j = {};
     try { j = await r.json(); } catch (e) {}
+    if (r.redirected || r.status === 401) throw new Error('сессия программы истекла — войдите заново и повторите');
     if (!r.ok) throw new Error(j.error || j.detail || ('HTTP ' + r.status));
     return j;
   }
@@ -166,24 +200,35 @@
     setTimeout(function () { location.reload(); }, 1500);
   }
 
+  function fatal(msg) { return /HTTP 401|HTTP 429|нужен вход|сессия программы/i.test(msg); }
+
   async function getCodes() {
     // Опрос до готовности: статус заказа → коды. Каждый запрос подписан.
+    // На ошибках — пауза с ростом; 401/429 и пять ошибок подряд — стоп.
+    var errors = 0;
     for (var round = 0; round < 120; round++) {
       var st = (await post('/steps')).steps;
       if (!st.length) { log('Все заказы обработаны.', 'ok'); return; }
-      var waiting = 0;
+      var waiting = 0, failed = 0;
       for (var i = 0; i < st.length; i++) {
         var s = st[i];
         try {
           var res = await post('/step', {order_id: s.order_id, action: s.action, path: s.path,
                                          signature: await sign(s.sign, true, false)});
-          if (s.action === 'codes') log(s.sku + ': получено ' + res.received + ' из ' + res.quantity, 'ok');
+          errors = 0;
+          if (s.action === 'codes') log(s.sku + ': получено ' + res.received + ' из ' + res.quantity
+                                        + (res.error ? ' — ' + res.error : ''), res.error ? 'bad' : 'ok');
           else if (res.status === 'ready') log(s.sku + ': коды готовы, забираю…');
           else if (res.status === 'rejected' || res.status === 'error') log(s.sku + ': ' + res.error, 'bad');
           else waiting++;
-        } catch (e) { log(e.message, 'bad'); }
+        } catch (e) {
+          log(e.message, 'bad'); failed++; errors++;
+          if (fatal(e.message)) { log('Остановлено: нужен вход или ЧЗ просит паузу.', 'warn'); return; }
+          if (errors >= 5) { log('Пять ошибок подряд — остановлено. Нажмите «Получить коды» позже.', 'warn'); return; }
+        }
       }
-      if (waiting) { log('СУЗ ещё готовит коды (' + waiting + ' заказ.), жду 5 с…'); await sleep(5000); }
+      if (failed) { await sleep(Math.min(60000, 5000 * Math.pow(2, errors))); }
+      else if (waiting) { log('СУЗ ещё готовит коды (' + waiting + ' заказ.), жду 5 с…'); await sleep(5000); }
     }
     log('Коды готовятся дольше 10 минут — нажмите «Получить коды» позже.', 'warn');
   }

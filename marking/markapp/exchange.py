@@ -155,8 +155,10 @@ class SftpExchange:
         try:
             with self._sftp.open(self._p(self.results, name), "rb") as f:
                 data = f.read()
-        except OSError:
+        except FileNotFoundError:
             return None
+        # Прочие ошибки чтения — наверх: «файла нет» и «не прочитался» —
+        # разные вещи, второе нельзя разбирать как отсутствие подробностей.
         return data.decode("utf-8-sig")
 
     def archive_result(self, name: str) -> None:
