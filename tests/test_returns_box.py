@@ -622,3 +622,155 @@ def test_the_reason_warning_is_silent_when_returning_to_sale(logged_in_client, w
     page = logged_in_client.get("/returns/box").text
 
     assert "Причина не выбрана" not in page, page[:400]
+
+
+# ------------------------------------------- страница не скачет под сканером
+
+HX = {"HX-Request": "true"}
+
+
+def _scan_hx(client, code):
+    """Скан так, как его шлёт браузер: ответом ждут КУСОК страницы."""
+    return client.post("/returns/box/scan", data={"code": code}, headers=HX)
+
+
+def test_a_scan_answers_with_the_batch_alone_not_the_whole_page(
+        logged_in_client, web_db, goods):
+    """Скан перерисовывает только пачку — иначе экран уезжает в начало.
+
+    Раньше каждый скан был POST с редиректом, то есть полной перезагрузкой:
+    браузер ставил прокрутку в начало, а поле скана лежит посередине страницы.
+    Кладовщик гонит коробку сканером и на экран смотрит краем глаза — страница,
+    прыгающая под руками, заставляет искать поле после КАЖДОЙ вещи.
+
+    Проверяем следствием, а не наличием атрибута: ответ 200 и в нём пачка, но
+    НЕ целая страница. Редирект здесь — главная из возможных ошибок: htmx
+    проходит его насквозь и подменил бы кусок страницей вместе с шапкой и меню,
+    то есть страница сложилась бы сама в себя.
+    """
+    _mode(logged_in_client, warehouse=WB_WH)
+
+    r = _scan_hx(logged_in_client, "2000000000017")
+
+    assert r.status_code == 200, "редирект htmx пройдёт насквозь — нужен кусок"
+    body = r.text
+    assert 'id="box-live"' in body, "кусок обязан нести свой якорь подмены"
+    assert "<html" not in body.lower(), "это кусок, а не страница целиком"
+    assert "Что делать на этой странице" not in body, "шапки и инструкции в куске нет"
+    assert R.label_number(web_db.query(ReturnItem).one()) in body
+
+
+def test_the_piece_carries_the_fresh_count(logged_in_client, web_db, goods):
+    """Счёт в куске — тот же, что на странице: он здесь единственное, что важно.
+
+    Контекст у куска и у страницы ОДИН намеренно (`_box_live`). Разойдись они,
+    после скана счёт показывал бы одно, а после перезагрузки другое, и человек
+    пересканировал бы вещь — то есть завёл бы лишнюю.
+    """
+    _mode(logged_in_client, warehouse=WB_WH)
+
+    _scan_hx(logged_in_client, "2000000000017")
+    piece = _scan_hx(logged_in_client, "2000000000024").text
+    page = logged_in_client.get("/returns/box").text
+
+    assert web_db.query(ReturnBatchEntry).count() == 2
+    for body in (piece, page):
+        assert "в пачке:" in body
+        assert ">2<" in body.replace(" ", "").replace("\n", "")
+
+
+def test_a_refusal_comes_back_inside_the_piece_word_for_word(
+        logged_in_client, web_db, goods):
+    """Отказ едет В КУСКЕ, а не флешем: флеш рисует `base.html`, которого тут нет.
+
+    Поставь обработчик флеш и ответь куском — сообщение ушло бы в никуда, и
+    выглядело бы это как «скан прошёл»: экран не меняется, вещи нет. Ровно тот
+    немой отказ, с которым весь раздел и воюет.
+    """
+    _mode(logged_in_client, warehouse=WB_WH)
+
+    r = _scan_hx(logged_in_client, "   ")
+
+    assert r.status_code == 200
+    assert "Пустой баркод" in r.text
+    assert web_db.query(ReturnItem).count() == 0
+
+
+def test_a_refusal_shown_in_the_piece_does_not_surface_later(
+        logged_in_client, web_db, goods):
+    """Показанный отказ не оседает во флеше — иначе он всплывёт ни к чему.
+
+    Сообщение уже прочитано в куске; поставь его ещё и во флеш, и при ближайшей
+    перезагрузке страница объявила бы отказ по скану, которого человек минуту
+    назад не делал.
+    """
+    _mode(logged_in_client, warehouse=WB_WH)
+    _scan_hx(logged_in_client, "")
+
+    assert "Пустой баркод" not in logged_in_client.get("/returns/box").text
+
+
+def test_the_piece_does_not_eat_a_message_meant_for_the_page(
+        logged_in_client, web_db, goods):
+    """Кусок флеш НЕ снимает: `pop_flash` его съедает, а рисует кусок не его.
+
+    Последовательность живая: человек очистил пачку (сообщение поставлено) и
+    тут же сканирует следующую коробку. Сними кусок флеш по дороге — итог
+    очистки исчез бы молча, и в 1С «не ушло ничего» никто бы не прочитал.
+    """
+    _mode(logged_in_client, warehouse=WB_WH)
+    _scan(logged_in_client, "2000000000017")
+    logged_in_client.post("/returns/box/clear", follow_redirects=False)
+
+    _scan_hx(logged_in_client, "2000000000024")
+
+    assert "Пачка очищена" in logged_in_client.get("/returns/box").text
+
+
+def test_without_htmx_the_scan_works_as_before(logged_in_client, web_db, goods):
+    """Запасной путь цел: без htmx скан уходит обычным POST и ставит флеш.
+
+    Браузер складской машины может не выполнить скрипты (ярлык открылся не тем
+    браузером — это уже закрыто отдельно, но полагаться на одно средство
+    нельзя). Отказ при этом обязан доехать, а не исчезнуть.
+    """
+    _mode(logged_in_client, warehouse=WB_WH)
+
+    r = logged_in_client.post("/returns/box/scan", data={"code": ""},
+                              follow_redirects=False)
+
+    assert r.status_code == 303
+    assert "Пустой баркод" in logged_in_client.get("/returns/box").text
+
+
+def test_removing_a_row_redraws_the_same_piece(logged_in_client, web_db, goods):
+    """«Убрать» — та же беда и то же лекарство.
+
+    Кнопка стоит в списке пачки, то есть внизу страницы: полная перезагрузка
+    уносила бы прокрутку в начало ровно тогда, когда человек разбирает список.
+    """
+    _mode(logged_in_client, warehouse=WB_WH)
+    _scan(logged_in_client, "2000000000017")
+    item = web_db.query(ReturnItem).one()
+
+    r = logged_in_client.post(f"/returns/box/drop/{item.id}", headers=HX)
+
+    assert r.status_code == 200
+    assert 'id="box-live"' in r.text
+    assert "<html" not in r.text.lower()
+    assert web_db.query(ReturnBatchEntry).count() == 0
+
+
+def test_the_scan_form_points_at_the_piece_that_exists(logged_in_client, web_db):
+    """Подмена в несуществующий якорь — немой отказ: htmx просто ничего не делает.
+
+    И второе: `hx-post` обязан совпадать с `action`. Разойдись они, без htmx
+    скан уходил бы по другому адресу — то есть запасной путь ломался бы молча,
+    а проверить его на машине, где htmx работает, нельзя вовсе.
+    """
+    body = logged_in_client.get("/returns/box").text
+
+    assert body.count('id="box-live"') == 1, "якорь подмены обязан быть ровно один"
+    assert 'hx-target="#box-live"' in body
+    assert 'hx-post="/returns/box/scan"' in body
+    assert 'action="/returns/box/scan"' in body

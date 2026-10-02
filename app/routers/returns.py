@@ -55,13 +55,17 @@ def _products(db: Session, items) -> dict:
     return {p.uid_1c: p for p in db.query(Product).filter(Product.uid_1c.in_(uids)).all()}
 
 
-def _base(request: Request, user, db: Session) -> dict:
+def _base(request: Request, user, db: Session, *, flash: bool = True) -> dict:
     # Флеш достаём ЗДЕСЬ, один раз на весь раздел. Без этого `base.html` рисует
     # пустоту, а `set_flash` из обработчиков пропадает молча: человек нажимает
     # «Вернуть в продажу», отказ уходит в никуда, экран не меняется — и это
     # ровно тот немой отказ, с которым весь проект и воюет.
+    #
+    # `flash=False` — для КУСКА страницы (htmx): `base.html` там не рисуется
+    # вовсе, а `pop_flash` сообщение СНИМАЕТ. Сними его кусок — поставленное
+    # другим обработчиком исчезло бы молча, не показавшись никому.
     return {"request": request, "current_user": user, "active_page": "returns",
-            "flash": pop_flash(request),
+            "flash": pop_flash(request) if flash else None,
             "labels": R.RETURN_LABELS, "scrap_labels": R.SCRAP_LABELS,
             "hints": R.RETURN_HINTS, "scrap_operations": R.SCRAP_OPERATION,
             # Режим спрашивается на КАЖДОЙ странице раздела, а не только на
@@ -667,6 +671,46 @@ def label(request: Request, item_id: int, db: Session = Depends(get_db),
 
 # ------------------------------------------------------- коробка возвратов
 
+def _box_live(request: Request, db: Session, error: str = "") -> dict:
+    """Контекст перерисовываемого куска страницы коробки — и её самой.
+
+    Функция ОДНА намеренно: скан подменяет только кусок, и разойдись два
+    контекста, после скана страница показывала бы не то, что после
+    перезагрузки, — а счёт в пачке тут единственное, что важно.
+    """
+    items = R.batch_entries(db)
+    warehouse = request.session.get("returns_box_warehouse") or ""
+    return {
+        "batch": items, "products": _products(db, items),
+        "totals": R.batch_totals(db, items, warehouse),
+        "mode": request.session.get("returns_box_mode") or "sale",
+        "reason": request.session.get("returns_box_reason") or "",
+        "warehouse": warehouse,
+        "warehouse_platform": R.platform_of_warehouse(warehouse),
+        "scrap_reasons": list(ScrapReason),
+        "max_batch": R.MAX_BATCH, "target_warehouse": R.TARGET_WAREHOUSE,
+        # Отказ скана едет В КУСКЕ: флеш рисует `base.html`, которого в подмене
+        # нет, и сообщение ушло бы в никуда.
+        "error": error,
+    }
+
+
+def _box_fragment(request: Request, user, db: Session, error: str = ""):
+    ctx = _base(request, user, db, flash=False)
+    ctx.update(_box_live(request, db, error=error))
+    return templates.TemplateResponse(request, "returns_box_live.html", ctx)
+
+
+def _wants_fragment(request: Request) -> bool:
+    """Запрос пришёл от htmx, то есть ответом ждут кусок, а не редирект.
+
+    Редирект htmx проходит НАСКВОЗЬ и подменил бы кусок целой страницей вместе
+    с шапкой и меню — то есть страница сложилась бы сама в себя. Поэтому ветка
+    обязательна, а не украшение.
+    """
+    return request.headers.get("hx-request") == "true"
+
+
 @router.get("/returns/box", response_class=HTMLResponse)
 def box_page(request: Request, db: Session = Depends(get_db),
              user=Depends(get_current_user)):
@@ -685,21 +729,15 @@ def box_page(request: Request, db: Session = Depends(get_db),
     и уехав не с той, вещи лягут не на ту статью затрат, а претензию площадке
     пишут именно по этому полю — увидят расхождение в отчётах через месяц.
     """
-    items = R.batch_entries(db)
-    warehouse = request.session.get("returns_box_warehouse") or ""
     ctx = _base(request, user, db)
+    ctx.update(_box_live(request, db))
     ctx.update({
         # Свой пункт меню, а не подсветка «Возвратов»: меню, утверждающее, что
         # ты в другом разделе, читается как «ссылка не сработала».
         "active_page": "box",
-        "batch": items, "products": _products(db, items),
-        "totals": R.batch_totals(db, items, warehouse),
-        "mode": request.session.get("returns_box_mode") or "sale",
-        "reason": request.session.get("returns_box_reason") or "",
-        "warehouse": warehouse, "warehouses": R.warehouse_choices(),
-        "warehouse_platform": R.platform_of_warehouse(warehouse),
-        "scrap_reasons": list(ScrapReason),
-        "max_batch": R.MAX_BATCH, "target_warehouse": R.TARGET_WAREHOUSE,
+        # Список складов нужен только форме выбора, а она вне перерисовываемого
+        # куска — коробку выбирают один раз, сканируют сотню раз.
+        "warehouses": R.warehouse_choices(),
     })
     return templates.TemplateResponse(request, "returns_box.html", ctx)
 
@@ -754,6 +792,7 @@ def box_scan(request: Request, code: str = Form(""), db: Session = Depends(get_d
     number = R.parse_label(code)
     to_scrap = (request.session.get("returns_box_mode") or "sale") == "scrap"
     target = ReturnStatus.awaiting_scrap if to_scrap else ReturnStatus.awaiting_1c
+    error = ""
     try:
         if number is not None:
             R.pick_by_label(db, number, target)
@@ -762,9 +801,21 @@ def box_scan(request: Request, code: str = Form(""), db: Session = Depends(get_d
                             request.session.get("returns_box_warehouse") or "",
                             is_test=R.test_mode(db))
     except R.ReturnError as e:
-        set_flash(request, str(e), "warn")
-        return RedirectResponse("/returns/box", status_code=303)
-    db.commit()
+        # Откат обязателен: отказ может прилететь после того, как в сессию уже
+        # что-то добавлено, а дальше мы этой же сессией читаем пачку для ответа.
+        # Раньше обработчик уходил редиректом и сессию закрывал `get_db`.
+        db.rollback()
+        error = str(e)
+    else:
+        db.commit()
+
+    # Ответом идёт КУСОК страницы, а не редирект: перезагрузка на каждый скан
+    # ставила прокрутку в начало, и экран уезжал вверх от каждой вещи — поле
+    # скана лежит посередине. Без htmx ветка ниже работает как раньше.
+    if _wants_fragment(request):
+        return _box_fragment(request, user, db, error=error)
+    if error:
+        set_flash(request, error, "warn")
     return RedirectResponse("/returns/box", status_code=303)
 
 
@@ -780,6 +831,8 @@ def box_drop(request: Request, item_id: int, db: Session = Depends(get_db),
     """
     R.drop_from_batch(db, item_id)
     db.commit()
+    if _wants_fragment(request):
+        return _box_fragment(request, user, db)
     return RedirectResponse("/returns/box", status_code=303)
 
 
