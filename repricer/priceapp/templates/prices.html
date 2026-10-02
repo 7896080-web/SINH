@@ -65,9 +65,9 @@
     при комиссии {{ (rule.commission_percent + rule.commission_extra)|plain }}% без скидки маржинальность ≈ {{ ru(((rule.base_coef * (100 - rule.commission_percent - rule.commission_extra) / 100) | round(2))) }}, пол — {{ ru(rule.min_markup_coef) }}.{% endif %}</p>
   {% if rule.commission_percent is none %}<p class="warn" style="margin-bottom:0">Комиссия не задана — по площадке не считаем.</p>{% endif %}
   <h3 style="margin:14px 0 6px;font-size:15px">Диапазон безопасности акций — по кабинетам</h3>
-  <p class="muted" style="margin:0 0 6px">Маржинальность по ТЕКУЩЕЙ цене на площадке (со скидкой продавца и акцией). Ниже «от» —
+  {% if loop.first %}<p class="muted" style="margin:0 0 6px">Маржинальность по ТЕКУЩЕЙ цене на площадке (со скидкой продавца и акцией). Ниже «от» —
   программа сама возвращает цену по наценке кабинета; если цена и так наша, а маржинальность съедает скидка или акция —
-  пишет об этом на «Внимании». Выше «до» — пометка. Проверка — при запуске программы и раз в сутки, после загрузки текущих цен.</p>
+  пишет об этом на «Внимании». Выше «до» — пометка. Проверка — при запуске программы и раз в сутки, после загрузки текущих цен.</p>{% endif %}
   {% for a in cabinets[p] %}<form method="post" action="/prices/guard/{{ a.id }}" class="row" style="margin-bottom:6px">
     <span style="min-width:150px;align-self:center"><b>{{ a.name }}</b></span>
     <label>от<input name="guard_min_margin" value="{{ a.guard_min_margin|plain if a.guard_min_margin is not none else '' }}" inputmode="decimal" style="width:80px" placeholder="—"></label>
