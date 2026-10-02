@@ -40,3 +40,8 @@ pre { white-space:pre-wrap; background:#f3f4f7; padding:8px; border-radius:6px; 
 .badge.ok { background:#e3f4e6; color:var(--ok); } .badge.warn { background:#fff3d6; color:var(--warn); }
 .badge.bad { background:#fdecea; color:var(--bad); }
 .econ td { white-space:nowrap; }
+.chip { display:inline-flex; align-items:center; gap:4px; padding:2px 4px 2px 10px; border:1px solid var(--line); border-radius:14px; background:var(--card); }
+.chip a { text-decoration:none; color:var(--accent); }
+.chip-x { background:none; border:none; color:var(--muted); padding:0 6px; cursor:pointer; font-size:15px; }
+.summary span { display:inline-block; margin-left:6px; }
+table.attention td { vertical-align:middle; }

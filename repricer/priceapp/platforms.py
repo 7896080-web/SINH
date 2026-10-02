@@ -72,6 +72,7 @@ class PriceItem:
 class CurrentPrice:
     price: int              # то же поле, что мы отправляем
     sale_price: int         # что платит покупатель (после скидки продавца)
+    status: str = ""        # что площадка говорит о цене (Lamoda: OK/PROCESSING/ERROR/QUARANTINE)
 
 
 class PlatformError(RuntimeError):
@@ -539,6 +540,16 @@ class LamodaClient:
                     out[parent] = cur
         return out
 
+    def get_min_prices(self) -> dict[str, int]:
+        """parentSku -> минимальная цена Lamoda, ₽. Два прохода: правила
+        (`/v2/minimal-prices`) и категории товаров (`/v2/nomenclatures`)."""
+        minimal = [m for chunk in self._pages("/v2/minimal-prices", {}, "minimalPrices") for m in chunk]
+        truncated = self.last_truncated
+        noms = [n for chunk in self._pages("/v2/nomenclatures", {"country": LAMODA_COUNTRY}, "nomenclatures")
+                for n in chunk]
+        self.last_truncated = truncated or self.last_truncated
+        return parse_lamoda_min_prices(minimal, noms)
+
     def push_prices(self, items: list[PriceItem]) -> dict:
         by_parent: dict[str, list[PriceItem]] = {}
         errors = []
@@ -619,9 +630,53 @@ def parse_lamoda_sell_values(data: dict, now=None) -> dict[str, CurrentPrice]:
             start, end = when(sv.get("saleStart")), when(sv.get("saleEnd"))
             if sale and ((start and now < start) or (end and now > end)):
                 sale = None
-            cur = CurrentPrice(price, sale or price)
-            if n["parentSku"] not in out or cur.price > out[n["parentSku"]].price:
-                out[n["parentSku"]] = cur
+            cur = CurrentPrice(price, sale or price, str(sv.get("priceUpdateStatus") or ""))
+            prev = out.get(n["parentSku"])
+            if prev is None or cur.price > prev.price:
+                status = _worse_status(prev.status if prev else "", cur.status)
+                out[n["parentSku"]] = CurrentPrice(cur.price, cur.sale_price, status)
+            else:
+                prev.status = _worse_status(prev.status, cur.status)
+    return out
+
+
+# Худший из статусов размеров карточки: карантин у одного размера — карантин карточки.
+_STATUS_RANK = {"": 0, "OK": 1, "PROCESSING": 2, "ERROR": 3, "QUARANTINE": 4}
+
+
+def _worse_status(a: str, b: str) -> str:
+    return a if _STATUS_RANK.get(a, 0) >= _STATUS_RANK.get(b, 0) else b
+
+
+def parse_lamoda_min_prices(minimal: list[dict], nomenclatures: list[dict]) -> dict[str, int]:
+    """parentSku -> минимальная цена Lamoda, ₽ (RU).
+
+    Правила заданы ПО КАТЕГОРИИ (`categoryName`/`subcategoryName`, иногда с
+    `brand`), а не по товару. Сопоставляем с уровнями 1 и 2 категорий товара на
+    английском (`categoryLevels`, language EN) — в примерах спеки и те и другие
+    записаны кодами вроде FOOTWEAR/ACCESSORIES. Это ДОГАДКА по схеме, поэтому
+    минимальная цена в программе только предупреждает и ничего не блокирует.
+    Подходит несколько правил — берём наибольшую: предупредить лишний раз
+    дешевле, чем промолчать."""
+    rules = []
+    for m in minimal:
+        rub = next((_lamoda_rub(p.get("price")) for p in m.get("prices") or []
+                    if p.get("country") == LAMODA_COUNTRY), None)
+        if rub:
+            rules.append((str(m.get("categoryName") or "").upper(), str(m.get("subcategoryName") or "").upper(),
+                          (m.get("brand") or "").strip().lower(), rub))
+    out: dict[str, int] = {}
+    for n in nomenclatures:
+        parent = n.get("parentSku")
+        if not parent:
+            continue
+        levels = {lv.get("level"): str(lv.get("name") or "").upper()
+                  for lv in n.get("categoryLevels") or [] if lv.get("language") == "EN"}
+        brand = (n.get("brand") or "").strip().lower()
+        hits = [rub for cat, sub, rb, rub in rules
+                if cat == levels.get(1) and sub == levels.get(2) and (not rb or rb == brand)]
+        if hits:
+            out[parent] = max(hits + [out.get(parent, 0)])
     return out
 
 

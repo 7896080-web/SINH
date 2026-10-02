@@ -3,7 +3,9 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 
-from priceapp import audit, rates, settings
+from decimal import Decimal, InvalidOperation
+
+from priceapp import audit, overview, rates, settings
 from priceapp.database import get_db
 from priceapp.deps import get_current_user
 from priceapp.flash import flash
@@ -19,6 +21,7 @@ def page(request: Request, db: Session = Depends(get_db), user: User = Depends(g
     return render(request, "rate.html", user, "rate",
                   current=rates.current(db), mode=settings.get(db, settings.RATE_MODE),
                   manual=settings.get(db, settings.RATE_MANUAL), cbr=rates.latest_cbr(db),
+                  alert=settings.get(db, settings.RATE_ALERT_PERCENT), shift=overview.rate_shift(db),
                   history=db.query(ExchangeRate).order_by(ExchangeRate.rate_date.desc(),
                                                           ExchangeRate.id.desc()).limit(30).all())
 
@@ -52,4 +55,25 @@ async def set_mode(request: Request, db: Session = Depends(get_db), user: User =
     db.commit()
     flash(request, ("Считаем по ручному курсу " + manual + " ₽." if mode == "manual"
                     else "Считаем по курсу ЦБ.") + " Цены не изменились — нужен пересчёт на странице «Цены».", "ok")
+    return RedirectResponse("/rate", status_code=303)
+
+
+
+@router.post("/rate/alert")
+async def set_alert(request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Порог предупреждения «курс ушёл от курса последнего расчёта». Только
+    предупреждает: цены программа сама не пересчитывает и не отправляет."""
+    form = await request.form()
+    raw = str(form.get("alert") or "").strip().replace(",", ".")
+    try:
+        value = Decimal(raw)
+        if not value.is_finite() or value <= 0 or value > 50:
+            raise InvalidOperation
+    except InvalidOperation:
+        flash(request, f"Порог «{raw}» не принят: число процентов от 0 до 50.", "warn")
+        return RedirectResponse("/rate", status_code=303)
+    settings.put(db, settings.RATE_ALERT_PERCENT, f"{value.normalize():f}")
+    audit.log(db, user.username, "rate_alert", str(value))
+    db.commit()
+    flash(request, f"Предупреждать, если курс ушёл от курса расчёта больше чем на {value.normalize():f}%.", "ok")
     return RedirectResponse("/rate", status_code=303)

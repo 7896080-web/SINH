@@ -29,6 +29,7 @@ def plain(v) -> str:
 templates.env.filters["plain"] = plain
 
 NAV = [
+    ("attention", "/attention", "Внимание"),
     ("prices", "/prices", "Цены"),
     ("mapping", "/mapping", "Сопоставление"),
     ("rate", "/rate", "Курс $"),

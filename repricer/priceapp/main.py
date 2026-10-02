@@ -9,7 +9,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from priceapp.database import Base, SessionLocal, engine
 from priceapp.deps import NotAuthenticated
-from priceapp.routers import accounts, auth, diagnostics, health, mapping, prices, rate
+from priceapp.routers import accounts, attention, auth, diagnostics, health, mapping, prices, rate
 from priceapp.settings import ensure_defaults
 
 
@@ -46,7 +46,7 @@ app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET, same_site="lax"
 app.mount("/static", StaticFiles(directory=str(Path(__file__).resolve().parent / "static")),
           name="static")
 
-for r in (auth, prices, mapping, rate, accounts, diagnostics, health):
+for r in (auth, attention, prices, mapping, rate, accounts, diagnostics, health):
     app.include_router(r.router)
 
 
@@ -57,4 +57,4 @@ def handle_not_authenticated(request: Request, exc: NotAuthenticated):
 
 @app.get("/")
 def root():
-    return RedirectResponse("/prices", status_code=303)
+    return RedirectResponse("/attention", status_code=303)

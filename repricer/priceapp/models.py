@@ -117,6 +117,12 @@ class PlatformItem(Base):
     current_price = Column(Integer, nullable=True)
     current_sale_price = Column(Integer, nullable=True)
     price_loaded_at = Column(DateTime, nullable=True)
+    # Что площадка говорит о цене: OK / PROCESSING / ERROR / QUARANTINE (сейчас
+    # сообщает только Lamoda). NULL — площадка статуса не даёт.
+    price_status = Column(String(16), nullable=True)
+    # Минимальная цена площадки для этой позиции, ₽ (Lamoda: по категории и
+    # бренду). Только ПРЕДУПРЕЖДЕНИЕ: сопоставление категорий — по названиям.
+    min_price = Column(Integer, nullable=True)
 
 
 # --- 1С: справочник баркодов, себестоимость, задания ------------------------------
@@ -293,3 +299,14 @@ class PriceChange(Base):
     is_test = Column(Boolean, nullable=False, default=False)
 
     account = relationship("Account")
+
+
+class SavedFilter(Base):
+    """Сохранённый отбор — ссылка на страницу с параметрами. Одна на установку:
+    отборы общие для всех операторов."""
+    __tablename__ = "saved_filters"
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100), nullable=False)
+    url = Column(String(1000), nullable=False)
+    created_by = Column(String(64), nullable=False, default="")
+    created_at = Column(DateTime, nullable=False, default=now_utc)

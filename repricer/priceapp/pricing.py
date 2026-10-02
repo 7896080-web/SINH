@@ -240,6 +240,9 @@ def recalculate_account(db: Session, account: Account, is_test: bool = False) ->
         if d.new_price is None:
             stats.skip(d.note)
             continue
+        min_price = max((r.min_price for r in rows if r.min_price), default=None)
+        if min_price and d.new_price < min_price:
+            d.note = "; ".join(x for x in (d.note, f"ниже минимальной цены площадки {min_price} ₽") if x)
         if last == d.new_price:
             stats.unchanged += 1
             continue
@@ -273,3 +276,98 @@ def approve(change: PriceChange, actor: str, confirm_large: bool = False) -> str
     change.decided_by = actor
     change.decided_at = now_utc()
     return None
+
+
+def propose_price(db: Session, account: Account, item_id: str, price: int, source: str,
+                  note: str, actor: str = "") -> PriceChange | None:
+    """Предложение с заданной ценой (откат к прежней). Идёт через `decide`, то есть
+    через пол и лимит шага, как ручная цена, и само НИЧЕГО не отправляет: дальше
+    обычное подтверждение. Прежнее нерешённое по этой паре вытесняется."""
+    from priceapp import mapping
+    rows = mapping.account_items(db, account.id).get(item_id)
+    if not rows:
+        return None
+    rule, base_rule = rules_for(db, account.platform)
+    rate = rates.current(db)
+    cost = db.get(OnecCost, item_id)
+    pp = db.query(ProductPrice).filter(ProductPrice.item_id == item_id,
+                                       ProductPrice.account_id == account.id).first()
+    last = pp.last_sent_price if pp else None
+    d = decide(cost.cost_usd if cost else None, rate.usd_rub if rate else None, rule.commission_percent,
+               rule, price, last, base_rule)
+    if d.new_price is None:
+        return None
+    for old in db.query(PriceChange).filter(PriceChange.account_id == account.id, PriceChange.item_id == item_id,
+                                            PriceChange.is_test.is_(False), PriceChange.status.in_(OPEN)):
+        old.status = PriceChangeStatus.rejected.value
+        old.note = "вытеснено предложением вернуть прежнюю цену"
+    ch = PriceChange(item_id=item_id, account_id=account.id, barcode=rows[0].barcode,
+                     cost_usd=cost.cost_usd if cost else None, usd_rub=rate.usd_rub if rate else None,
+                     cost_rub=d.cost_rub, commission_percent=rule.commission_percent, old_price=last,
+                     new_price=d.new_price, markup_rub=d.markup_rub, markup_coef=d.markup_coef, source=source,
+                     status=PriceChangeStatus.blocked.value if d.block_reason else PriceChangeStatus.proposed.value,
+                     block_reason=d.block_reason, note="; ".join(x for x in (note, d.note) if x)[:255])
+    db.add(ch)
+    db.flush()
+    return ch
+
+
+@dataclass
+class Preview:
+    platform: str
+    accounts: int = 0
+    priced_before: int = 0
+    priced_after: int = 0
+    changed: int = 0
+    up: int = 0
+    down: int = 0
+    floor: int = 0
+    big_step: int = 0
+    avg_change: float | None = None
+
+
+def preview_rule(db: Session, platform: str, values: dict) -> list[Preview]:
+    """«Что будет, если» сохранить правило `values` для площадки: по всем её
+    кабинетам и по площадкам, которые берут цену от неё. Ничего не пишет:
+    новое правило — несохранённый объект вне сессии."""
+    from priceapp import mapping
+    new = PlatformRule(platform=platform, **values)
+    rate = rates.current(db)
+    usd = rate.usd_rub if rate else None
+    out = []
+    affected = [platform] + [r.platform for r in db.query(PlatformRule).filter(PlatformRule.base_platform == platform)]
+    for p in affected:
+        own_old, base_old = rules_for(db, p)
+        own_new, base_new = (new, (get_rule(db, new.base_platform) if new.base_platform else None)) \
+            if p == platform else (own_old, new)
+        pv = Preview(platform=p)
+        pcts = []
+        for acc in db.query(Account).filter(Account.platform == p, Account.is_active.is_(True)):
+            pv.accounts += 1
+            items = mapping.account_items(db, acc.id)
+            costs = {c.item_id: c for c in db.query(OnecCost).filter(OnecCost.item_id.in_(list(items)))}
+            prices = {x.item_id: x for x in db.query(ProductPrice).filter(ProductPrice.account_id == acc.id)}
+            for item_id in items:
+                cost, pp = costs.get(item_id), prices.get(item_id)
+                args = (cost.cost_usd if cost else None, usd)
+                manual, last = (pp.manual_price if pp else None), (pp.last_sent_price if pp else None)
+                a = decide(*args, own_old.commission_percent, own_old, manual, last, base_old)
+                b = decide(*args, own_new.commission_percent, own_new, manual, last, base_new)
+                pv.priced_before += a.new_price is not None
+                pv.priced_after += b.new_price is not None
+                if b.new_price is None:
+                    continue
+                if b.block_reason == BLOCK_FLOOR:
+                    pv.floor += 1
+                elif b.block_reason == BLOCK_MAX_CHANGE:
+                    pv.big_step += 1
+                if a.new_price != b.new_price:
+                    pv.changed += 1
+                    if a.new_price:
+                        pv.up += b.new_price > a.new_price
+                        pv.down += b.new_price < a.new_price
+                        pcts.append((b.new_price - a.new_price) * 100.0 / a.new_price)
+        pv.avg_change = sum(pcts) / len(pcts) if pcts else None
+        out.append(pv)
+    db.expunge(new) if new in db else None
+    return out
