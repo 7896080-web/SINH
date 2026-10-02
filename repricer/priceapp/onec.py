@@ -79,13 +79,27 @@ def enqueue_ping(db: Session) -> OnecTask:
     return _enqueue(db, "PING", "ping")
 
 
+_last_timeout_poll = None
+TIMEOUT_POLL = timedelta(minutes=10)
+
+
 def has_work(db: Session) -> bool:
-    """Обращаемся к 1С, только если задание ждёт отправки или ответа (зависшие — ещё сутки)."""
+    """Обращаемся к 1С, только если задание ждёт отправки или ответа. Зависшие
+    (timeout) ещё сутки проверяем на поздний ответ — но раз в 10 минут, а не на
+    каждом такте: иначе одно зависшее задание сутки дёргало бы сервер по SFTP
+    каждые 30 секунд."""
+    global _last_timeout_poll
+    if db.query(OnecTask).filter(OnecTask.status.in_((OnecTaskStatus.pending.value,
+                                                       OnecTaskStatus.sent.value))).first() is not None:
+        return True
     recent = now_utc() - timedelta(days=1)
-    return db.query(OnecTask).filter(
-        (OnecTask.status.in_((OnecTaskStatus.pending.value, OnecTaskStatus.sent.value)))
-        | ((OnecTask.status == OnecTaskStatus.timeout.value) & (OnecTask.sent_at > recent)),
-    ).first() is not None
+    if db.query(OnecTask).filter(OnecTask.status == OnecTaskStatus.timeout.value,
+                                 OnecTask.sent_at > recent).first() is None:
+        return False
+    if _last_timeout_poll is not None and now_utc() - _last_timeout_poll < TIMEOUT_POLL:
+        return False
+    _last_timeout_poll = now_utc()
+    return True
 
 
 def _task_filename(now: datetime) -> str:

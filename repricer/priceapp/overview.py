@@ -328,7 +328,8 @@ def _health(db: Session, a: Attention) -> None:
         if at is None:
             a.add("warn", f"{what} ещё не загружались", "/diagnostics")
         elif now_utc() - at > STALE:
-            a.add("warn", f"{what} не обновлялись больше суток (последний раз {at:%d.%m %H:%M} UTC)",
+            from priceapp.templating import local
+            a.add("warn", f"{what} не обновлялись больше суток (последний раз {local(at)})",
                   "/diagnostics")
 
 

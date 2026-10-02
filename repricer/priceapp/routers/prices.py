@@ -668,9 +668,9 @@ def load_current(request: Request, account_id: str = Form(""), back: str = Form(
 PRODUCT_HEADERS = ["ID_1С", "Артикул 1С", "Наименование", "Размер", "Цвет", "Баркод площадки",
                    "Артикул площадки", "Себестоимость, $", "Себестоимость, ₽", "Комиссия, %",
                    "Текущая цена, ₽", "Текущая цена продажи, ₽", "К получению по текущей, ₽",
-                   "Наценка по текущей, ₽", "Коэффициент по текущей",
+                   "Прибыль по текущей, ₽", "Маржинальность по текущей",
                    "Расчётная цена, ₽", "Как посчитана", "К получению по расчётной, ₽",
-                   "Наценка по расчётной, ₽", "Коэффициент по расчётной",
+                   "Прибыль по расчётной, ₽", "Маржинальность по расчётной",
                    "Отправлено нами, ₽", "Ручная цена, ₽"]
 MANUAL_COL = "Ручная цена, ₽"
 
@@ -682,12 +682,11 @@ def export(account_id: int, q: str = Query(""), flt: str = Query(""), coef_min: 
     if a is None:
         return _back("products")
     rows = product_rows(db, a, q, flt, coef_min, coef_max)
-    commission = get_rule(db, a.platform).commission_percent
     db.commit()
     data = [[r["item_id"], r["sku"].article if r["sku"] else "", r["sku"].name if r["sku"] else "",
              r["sku"].size if r["sku"] else "", r["sku"].color if r["sku"] else "",
              r["platform"].barcode, r["platform"].article, _f(r["cost_usd"]), _f(r["cost_rub"]),
-             _f(commission), r["current"], r["current_sale"], _f(r["current_payout"]),
+             _f(r["commission"]), r["current"], r["current_sale"], _f(r["current_payout"]),
              _f(r["current_markup_rub"]), _f(r["current_coef"]),
              r["price"], SOURCE_LABELS.get(r["source"], "") if r["price"] else r["note"],
              _f(r["payout"]), _f(r["markup_rub"]), _f(r["markup_coef"]), r["last_sent"], r["manual"]]
@@ -754,7 +753,7 @@ def _changes_query(db: Session, view: str, account_id: str, status: str = "", q:
 
 CHANGE_HEADERS = ["ID предложения", "Кабинет", "ID_1С", "Артикул 1С", "Наименование", "Размер",
                   "Баркод", "Себестоимость, $", "Курс", "Себестоимость, ₽", "Комиссия, %",
-                  "Было, ₽", "Станет, ₽", "Изменение, %", "Наценка, ₽", "Коэффициент",
+                  "Было, ₽", "Станет, ₽", "Изменение, %", "Прибыль, ₽", "Маржинальность",
                   "Как посчитана", "Статус", "Причина / примечание"]
 DECISION_COL = "Решение (Да / Нет)"
 LARGE_COL = "Подтверждаю большой шаг (Да)"
@@ -1014,7 +1013,7 @@ def export_compare(q: str = Query(""), flt: str = Query(""), db: Session = Depen
     db.commit()
     headers = ["ID_1С", "Артикул 1С", "Наименование", "Размер", "Цвет", "Разброс текущих, %"]
     for a in cols:
-        headers += [f"{a.name}: текущая, ₽", f"{a.name}: коэфф. по текущей", f"{a.name}: расчётная, ₽"]
+        headers += [f"{a.name}: текущая, ₽", f"{a.name}: маржинальность по текущей", f"{a.name}: расчётная, ₽"]
     data = []
     for r in rows:
         s = r["sku"]

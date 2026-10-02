@@ -141,13 +141,23 @@ def job_daily_refresh(client_factory=None, force_prices: bool = False) -> None:
         db.close()
 
 
+_backup_failed_at = None
+BACKUP_RETRY = timedelta(minutes=30)
+
+
 def job_backup() -> None:
+    global _backup_failed_at
     db = SessionLocal()
     try:
         last = backup.last_backup()
         if last is not None and now_utc() - last < backup.MIN_GAP:
             return   # heartbeat не трогаем: иначе каждый перезапуск сдвигал бы срок
+        # Не снялась — следующая попытка через полчаса, а не на каждом такте в 30 с
+        # (полный диск иначе грузили бы копированием непрерывно).
+        if _backup_failed_at is not None and now_utc() - _backup_failed_at < BACKUP_RETRY:
+            return
         err = backup.make_backup()
+        _backup_failed_at = now_utc() if err else None
         beat(db, "backup", not err, err)
     except Exception as e:
         logger.exception("копия базы упала")

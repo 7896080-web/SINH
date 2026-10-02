@@ -393,7 +393,15 @@ class OzonClient:
                         ok.append(i.barcode)
                         sent[i.barcode] = price_of[res.get("offer_id")]
                 else:
-                    errors.append({"detail": res.get("errors"), "items": [i.barcode for i in group]})
+                    errs = res.get("errors")
+                    text = str(errs)
+                    if "old_price" in text.lower():
+                        # Повтор не поможет: цена упирается в зачёркнутую. Говорим, что делать.
+                        errors.append({"detail": f"Ozon: цена выше зачёркнутой (old_price) или слишком близко к ней — "
+                                                 f"поправьте зачёркнутую цену в кабинете Ozon. {text}"[:400],
+                                       "items": [i.barcode for i in group], "terminal": True})
+                    else:
+                        errors.append({"detail": errs, "items": [i.barcode for i in group]})
         return {"ok": ok, "errors": errors, "sent_prices": sent}
 
 

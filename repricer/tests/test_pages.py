@@ -145,7 +145,7 @@ def test_excel_roundtrip_manual_price(client, db):
     wb = load_workbook(io.BytesIO(r.content))
     ws = wb.active
     headers = [c.value for c in ws[1]]
-    assert ws.cell(row=2, column=headers.index("Наценка по расчётной, ₽") + 1).value == 1330.69
+    assert ws.cell(row=2, column=headers.index("Прибыль по расчётной, ₽") + 1).value == 1330.69
     ws.cell(row=2, column=headers.index("Ручная цена, ₽") + 1, value=3999)
     buf = io.BytesIO()
     wb.save(buf)
