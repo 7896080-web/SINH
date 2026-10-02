@@ -23,7 +23,7 @@ def test_add_card_prompt_does_not_swallow_expense(env):
     [confirm] = flow.on_text(CHAT, "3500 доставка СДЭК вчера")
     assert confirm.text.startswith("Добавить карту") and len(db.cards()) == before
     rec.payments.append(payment(amount="3500"))
-    [saved] = flow.on_button(CHAT, "m:notit")
+    [saved] = flow.on_button(CHAT, buttons(confirm)[1])     # «Нет — это не карта»
     assert saved.text.startswith("✅ Записано") and len(db.cards()) == before
 
 

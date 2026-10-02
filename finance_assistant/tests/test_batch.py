@@ -39,7 +39,11 @@ def test_batch_summary_and_questions(env):
     assert "⚠️ Не распознано: 1 (сервис распознавания перегружен)" in head.text
     # Три записались сразу, одной сводкой с номерами.
     assert summary.text.startswith("✅ Записано как бизнес: 3 на 7 000,00 ₽")
-    assert "№2 20.09  1 000,00 ₽  Сбер" in summary.text and "/fix" in summary.text
+    assert "№2 20.09  1 000,00 ₽  Сбер" in summary.text
+    assert summary.buttons == [[("✏️ Поправить запись", "m:fixlist")]]
+    [pick] = flow.on_button(CHAT, "m:fixlist")              # записи этой сводки кнопками
+    assert "e:keep:2" in str(pick.buttons)
+    assert flow.on_button(CHAT, "e:keep:2")[0].text.startswith("✅ Записано №2")
     # По четвёртой — вопрос о карте, с номером операции в кнопках.
     assert "С какой карты" in question.text
     assert len(rec.calls) == 1 + 6   # повторы в Claude не отправлялись
@@ -54,9 +58,9 @@ def test_batch_several_questions_numbered(env):
     for s in shots:
         rec.by_file[s[0]] = payment(amount=str(len(rec.by_file) + 1) + "00", card_last4="", bank="")
     replies = flow.on_batch(CHAT, [item(s) for s in shots])
-    assert replies[-1].text.startswith("❓ Вопрос 1 из 3")
+    assert replies[-1].text.startswith("❓ Осталось вопросов: 3")
     replies = answer(flow, f"d:card:{db.cards()[0].id}")
-    assert replies[-1].text.startswith("❓ Вопрос 1 из 2")   # осталось два
+    assert replies[-1].text.startswith("❓ Осталось вопросов: 2")
     answer(flow, f"d:card:{db.cards()[0].id}")
     replies = answer(flow, f"d:card:{db.cards()[0].id}")
     assert replies[-1].text.startswith("✅ Записано как бизнес: 1")
@@ -117,7 +121,7 @@ def test_statement_batch_parallel_one_summary(env):
         pages[2][0]: statement([op("2026-09-04", "400")], last4="9999"),
     })
     [r] = flow.on_batch(CHAT, [item(p) for p in pages])
-    assert r.text.startswith("📥 Пачка выписки по карте Сбер ·1111: 3 файлов")
+    assert r.text.startswith("📥 Пачка выписки по карте Сбер ·1111: 3 файла")
     assert "• 1: Принято операций: 2" in r.text and "• 3: Принято операций: 1" in r.text
     assert "⚠️ В документе карта …9999" in r.text
     assert len(db.statement(db.cards()[0].id, "2026-09")[1]) == 4
