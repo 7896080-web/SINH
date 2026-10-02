@@ -75,3 +75,46 @@ def test_cost_command_checks_field_count_and_answers_with_its_name():
     block = block[:block.index("ИначеЕсли", 10)]
     assert "Поля.Количество() < 2" in block
     assert block.count("|EXPORT_COST_PRICES\"") == 2
+
+
+# --- значок и ярлык -------------------------------------------------------------
+
+def _gen_icon():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("gen_icon", HERE / "scripts" / "gen_icon.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_icons_are_rebuilt_byte_for_byte_from_the_generator():
+    """Значок — арифметика в scripts/gen_icon.py; лежащий файл обязан ей совпадать,
+    иначе правка генератора молча не дошла бы до ярлыка."""
+    gen = _gen_icon()
+    for path, sizes in gen.OUTPUTS:
+        assert Path(path).read_bytes() == gen.icon_bytes(sizes), path
+
+
+def test_icon_has_the_frames_windows_needs():
+    import struct
+    data = (DEPLOY / "repricer.ico").read_bytes()
+    reserved, kind, count = struct.unpack("<HHH", data[:6])
+    assert (reserved, kind, count) == (0, 1, 4)
+    sizes = sorted(256 if data[6 + 16 * i] == 0 else data[6 + 16 * i] for i in range(count))
+    assert sizes == [16, 32, 48, 256]
+
+
+def test_shortcut_uses_own_icon_and_silent_launcher():
+    s = (DEPLOY / "create_shortcut.ps1").read_text(encoding="utf-8-sig")
+    assert "repricer.ico" in s and "IconLocation" in s and "wscript.exe" in s and "launch_repricer.vbs" in s
+    for name in ("install_workstation.ps1", "update_workstation.ps1"):
+        assert "create_shortcut.ps1" in (DEPLOY / name).read_text(encoding="utf-8-sig"), name
+    assert "-RefreshOnly" in (DEPLOY / "update_workstation.ps1").read_text(encoding="utf-8-sig")
+    vbs = (DEPLOY / "launch_repricer.vbs").read_bytes()
+    vbs.decode("ascii")      # wscript читает .vbs в ANSI-кодировке — только ASCII
+    assert b"run_repricer.ps1" in vbs and b", 0, False" in vbs
+
+
+def test_favicon_is_served_and_linked(client):
+    assert client.get("/static/favicon.ico").status_code == 200
+    assert 'href="/static/favicon.ico"' in client.get("/attention").text

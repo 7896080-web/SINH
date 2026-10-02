@@ -162,20 +162,9 @@ if ($count -eq "0") {
 }
 
 # --- 7. Ярлык ---
-$run = Join-Path $Root "deploy\run_repricer.ps1"
-$shell = New-Object -ComObject WScript.Shell
-function New-Shortcut($path) {
-    $s = $shell.CreateShortcut($path)
-    $s.TargetPath = "powershell.exe"
-    $s.Arguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$run`" -Port $WebPort"
-    $s.WorkingDirectory = $Root
-    $s.Description = "Репрайсер"
-    $s.Save()
-}
-New-Shortcut (Join-Path ([Environment]::GetFolderPath("Desktop")) "Репрайсер.lnk")
-Ok "Ярлык «Репрайсер» на рабочем столе"
-if ($Autostart) {
-    New-Shortcut (Join-Path ([Environment]::GetFolderPath("Startup")) "Репрайсер.lnk")
-    Ok "Программа будет запускаться при входе в Windows"
-}
+$shortcutArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $Root "deploy\create_shortcut.ps1"), "-Port", $WebPort)
+if ($Autostart) { $shortcutArgs += "-Autostart" }
+& powershell @shortcutArgs
+if ($LASTEXITCODE -ne 0) { Fail "Ярлык не создан" }
+Ok "Ярлык «Репрайсер» на рабочем столе$(if ($Autostart) { ' и в автозагрузке' })"
 Ok "Готово. Дальше: ключ на сервер, обработка 1С mark-3, затем в программе «API-ключи», «Курс $» и «Диагностика» -> «Запросить себестоимость»."
