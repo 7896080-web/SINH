@@ -84,17 +84,28 @@ def clean_env_value(value: str) -> str:
     return value
 
 
+def _decode_env(raw: bytes) -> str:
+    """Файл могли поправить Блокнотом: он пишет с BOM или в кодировке Windows.
+    Расшифровываем построчно: один испорченный байт не портит остальные
+    строки (например, путь с русскими буквами)."""
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+    lines = []
+    for line in raw.split(b"\n"):
+        try:
+            lines.append(line.decode("utf-8"))
+        except UnicodeDecodeError:
+            lines.append(line.decode("cp1251", errors="replace"))
+    return "\n".join(lines)
+
+
 def read_env(path: str) -> dict[str, str]:
     values: dict[str, str] = {}
     if not os.path.exists(path):
         return values
     with open(path, "rb") as fh:
         raw = fh.read()
-    # Файл могли поправить Блокнотом: он пишет с BOM или в кодировке Windows.
-    try:
-        text = raw.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        text = raw.decode("cp1251", errors="replace")
+    text = _decode_env(raw)
     for line in text.replace("\r\n", "\n").split("\n"):
         line = line.strip()
         if line and not line.startswith("#") and "=" in line:
@@ -109,10 +120,7 @@ def write_env(path: str, updates: dict[str, str], group: str | None = None):
     if os.path.exists(path):
         with open(path, "rb") as fh:
             raw = fh.read()
-        try:
-            text = raw.decode("utf-8-sig")
-        except UnicodeDecodeError:
-            text = raw.decode("cp1251", errors="replace")
+        text = _decode_env(raw)
         # split("\n"), а не splitlines(): тот режет и по \u2028, \x85 и т.п.
         lines = text.replace("\r\n", "\n").split("\n")
         if lines and lines[-1] == "":

@@ -10,8 +10,11 @@ import csv
 import io
 import json
 import logging
+import time
+from datetime import date
 
 import anthropic
+import httpx2
 
 log = logging.getLogger(__name__)
 
@@ -21,6 +24,16 @@ DEFAULT_MODEL = "claude-opus-5"
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
 
 IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+
+
+ASK_ATTEMPTS = 2
+RETRY_PAUSE = 5  # сек
+
+
+class _Retryable(Exception):
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
 
 
 class RecognitionError(RuntimeError):
@@ -106,10 +119,12 @@ PAYMENT_PROMPT = """\
 - is_payment: false, если это не одна банковская операция/чек. Экран истории \
 со списком операций или итогами месяца — тоже false.
 - direction: "out" — списание/оплата/перевод с карты, "in" — поступление на карту.
-- amount: сумма в валюте операции, число с точкой без пробелов ("1234.50"); "" если не видно.
+- amount: сумма в валюте операции, без знака минус, число с точкой без пробелов \
+("1234.50"); "" если не видно.
 - currency: код валюты (RUB, USD…), по умолчанию RUB.
-- date: дата операции ГГГГ-ММ-ДД; если год не указан — ближайшая прошедшая дата; \
-"сегодня"/"вчера"/"позавчера" переводи в дату; "" если даты нет.
+- date: дата операции ГГГГ-ММ-ДД, не позже {today}; если год не указан — тот год, \
+при котором дата не позже {today}; "сегодня"/"вчера"/"позавчера" переводи в дату \
+относительно {today}; "" если даты нет.
 - card_last4: последние 4 цифры карты ИЛИ счёта, по которому прошла операция \
 (для зачисления — счёта зачисления); для списания это карта/счёт списания («Карта списания •1234», \
 «Счет списания 4081…9012», «Мастер-счет •5678» → 1234, 9012, 5678). \
@@ -144,12 +159,14 @@ PAYMENT_PROMPT = """\
 
 STATEMENT_PROMPT = """\
 Это выписка (или её часть/скриншот) по личной банковской карте за {period}. \
-Выписка может охватывать несколько месяцев. Карты владельца: {cards}.
+Выписка может охватывать несколько месяцев. Сегодня {today}. Карты владельца: {cards}.
 {bank_hints}
 Владелец — предприниматель (продажи на маркетплейсах) и иногда оплачивает \
 расходы бизнеса с этой личной карты.
 Извлеки ВСЕ операции, ни одной не пропуская:
-- date ГГГГ-ММ-ДД; time — время ЧЧ:ММ, если указано, иначе "";
+- date ГГГГ-ММ-ДД, не позже {today}; если год не указан — тот год, при котором дата \
+не позже {today}; «Сегодня»/«Вчера» — относительно {today}; time — время ЧЧ:ММ, \
+если указано, иначе "";
 - amount — положительное число с точкой ("1234.50");
 - direction: "out" — списание, "in" — зачисление;
 - description — как в выписке, коротко (получатель, если указан);
@@ -261,9 +278,10 @@ class ClaudeRecognizer:
         return self._ask(file_blocks(files), prompt, _payment_schema(categories),
                          effort="medium", max_tokens=16000)
 
-    def parse_statement(self, files, text, *, period, cards, categories) -> dict:
+    def parse_statement(self, files, text, *, period, cards, categories, today="") -> dict:
         prompt = STATEMENT_PROMPT.format(period=period, cards=_cards_text(cards),
-                                         bank_hints=BANK_HINTS)
+                                         bank_hints=BANK_HINTS,
+                                         today=today or date.today().isoformat())
         if text:
             prompt += f'\n\nТекст от владельца: "{text}"'
         # Выписка за полгода — сотни строк; даём модели максимум вывода.
@@ -272,6 +290,21 @@ class ClaudeRecognizer:
 
     def _ask(self, blocks, prompt, schema, *, effort, max_tokens) -> dict:
         content = blocks + [{"type": "text", "text": prompt}]
+        # Сбой посреди ответа (обрыв связи, «перегружено» внутри потока) SDK сам
+        # не повторяет — повторяем один раз: длинную выписку жалко терять.
+        for attempt in range(ASK_ATTEMPTS):
+            try:
+                message = self._stream(content, schema, effort=effort, max_tokens=max_tokens)
+                break
+            except _Retryable as exc:
+                log.warning("Сбой распознавания (%s), попытка %d из %d",
+                            exc.reason, attempt + 1, ASK_ATTEMPTS)
+                if attempt + 1 == ASK_ATTEMPTS:
+                    raise RecognitionError(exc.reason) from None
+                time.sleep(RETRY_PAUSE)
+        return self._parse(message)
+
+    def _stream(self, content, schema, *, effort, max_tokens):
         try:
             # Потоковый режим: длинная выписка может отвечаться долго, а
             # обычный запрос с большим max_tokens упрётся в HTTP-таймаут.
@@ -284,18 +317,22 @@ class ClaudeRecognizer:
                                "format": {"type": "json_schema", "schema": schema}},
                 messages=[{"role": "user", "content": content}],
             ) as stream:
-                message = stream.get_final_message()
+                return stream.get_final_message()
         except anthropic.RateLimitError:
             raise RecognitionError("сервис распознавания перегружен, пришлите ещё раз через минуту") from None
         except anthropic.APIStatusError as exc:
+            if exc.status_code in (200, 500, 502, 503, 504, 529):
+                # 200 — ошибка пришла внутри уже открытого потока (обычно «перегружено»).
+                raise _Retryable("сервис распознавания перегружен, пришлите ещё раз через минуту") from None
             log.exception("Claude API error")
             raise RecognitionError(f"ошибка сервиса распознавания ({exc.status_code})") from None
-        except anthropic.APIConnectionError:
-            raise RecognitionError("нет связи с сервисом распознавания") from None
+        except (anthropic.APIConnectionError, httpx2.HTTPError):
+            raise _Retryable("связь с сервисом распознавания прервалась, пришлите ещё раз") from None
 
+    def _parse(self, message) -> dict:
         if message.stop_reason == "refusal":
             raise RecognitionError("модель отказалась обрабатывать это изображение")
-        if message.stop_reason == "max_tokens":
+        if message.stop_reason in ("max_tokens", "model_context_window_exceeded"):
             raise RecognitionError("документ слишком большой — пришлите его частями")
         # После блока fallback (если резервная модель подхватила ответ) идёт
         # итоговый текст; берём текстовые блоки после последнего такого блока.

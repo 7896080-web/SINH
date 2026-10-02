@@ -42,7 +42,10 @@ def _mirror(src: str, dst: str) -> int:
         os.makedirs(target_dir, exist_ok=True)
         for name in files:
             source, target = os.path.join(root, name), os.path.join(target_dir, name)
-            st = os.stat(source)
+            try:
+                st = os.stat(source)
+            except FileNotFoundError:
+                continue  # файл как раз перенесли/удалили — возьмём в следующий раз
             if os.path.exists(target) and os.path.getsize(target) == st.st_size:
                 continue
             tmp = target + ".part"
@@ -71,24 +74,32 @@ def backup(data: str, dest: str, keep_days: int = 30, stamp: str | None = None,
            env_file: str | None = None) -> int:
     stamp = stamp or time.strftime("%Y%m%d-%H%M")
     os.makedirs(dest, exist_ok=True)
-    _prune(dest, keep_days)  # сначала место, потом новые копии
-    for leftover in glob.glob(os.path.join(dest, "*.part")):
-        os.remove(leftover)  # недоделанное от прошлого неудачного запуска
-    count = 0
     dbs = sorted(glob.glob(os.path.join(data, "users", "*", "finance.db")))
     legacy = os.path.join(data, "finance.db")
     if os.path.exists(legacy):
         dbs.append(legacy)
+    if not dbs:
+        # Не та папка данных — старые копии не трогаем: возможно, только они и остались.
+        raise RuntimeError(f"в {data} нет ни одной базы — бэкап не сделан, старые копии не тронуты")
+    _prune(dest, keep_days)  # сначала место, потом новые копии
+    for leftover in glob.glob(os.path.join(dest, "*.part")):
+        os.remove(leftover)  # недоделанное от прошлого неудачного запуска
+    count, errors = 0, []
     for db in dbs:
         folder = os.path.dirname(db)
         owner = "shared" if db == legacy else os.path.basename(folder)
-        _copy_db(db, os.path.join(dest, f"finance-{owner}-{stamp}.db"))
-        receipts = os.path.join(folder, "receipts")
-        if os.path.isdir(receipts):
-            _mirror(receipts, os.path.join(dest, f"receipts-{owner}"))
-        count += 1
+        try:  # сбой у одного пользователя не оставляет без копии остальных
+            _copy_db(db, os.path.join(dest, f"finance-{owner}-{stamp}.db"))
+            receipts = os.path.join(folder, "receipts")
+            if os.path.isdir(receipts):
+                _mirror(receipts, os.path.join(dest, f"receipts-{owner}"))
+            count += 1
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{owner}: {exc}")
     if env_file and os.path.exists(env_file):
         shutil.copy2(env_file, os.path.join(dest, "env-latest.txt"))
+    if errors:
+        raise RuntimeError("бэкап сделан не для всех: " + "; ".join(errors))
     return count
 
 

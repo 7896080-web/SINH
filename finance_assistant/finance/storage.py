@@ -248,7 +248,11 @@ class Storage:
         self.conn.execute("PRAGMA foreign_keys = OFF")
         try:
             with self.conn:
+                # Всё в одной транзакции (CREATE TABLE сам её не открывает): сбой
+                # посередине откатывается целиком и не оставляет «table__new».
+                self.conn.execute("BEGIN")
                 for table in todo:
+                    self.conn.execute(f"DROP TABLE IF EXISTS {table}__new")  # от прежнего сбоя
                     columns = [r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")]
                     create = wanted[table].replace(f"IF NOT EXISTS {table} (", f"{table}__new (", 1)
                     self.conn.execute(create)

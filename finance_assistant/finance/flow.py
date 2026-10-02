@@ -12,6 +12,7 @@ import hashlib
 import logging
 import os
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -197,6 +198,14 @@ def _parse_date(text: str, today: date) -> str | None:
         if d <= today:
             return d.isoformat()
     return None
+
+
+def _not_future(iso: str | None, today: date) -> str | None:
+    """Дата из ответа модели позже завтрашнего дня — ошибка распознавания (например,
+    «30 декабря» в январе прочитано как будущий декабрь): лучше переспросить."""
+    if iso and date.fromisoformat(iso) > today + timedelta(days=1):
+        return None
+    return iso
 
 
 def _last4(text: str) -> str:
@@ -424,12 +433,13 @@ class Flow:
             else:
                 jobs.append((item, keys))
         period = month_name(st["month"]) if st["month"] else "несколько месяцев"
+        today = self.today().isoformat()
         cards = self.db.cards()
         categories = [c["name"] for c in self.db.categories()]
         parsed = self._run_parallel(
             lambda job: self.recognizer.parse_statement(
                 job[0]["files"], job[0].get("caption", ""), period=period, cards=cards,
-                categories=categories),
+                categories=categories, today=today),
             jobs)
         lines = [f"📥 Пачка выписки по карте {card.label}: {len(items)} "
                  f"{_plural(len(items), 'файл', 'файла', 'файлов')}"]
@@ -525,7 +535,9 @@ class Flow:
         ext = {"image/png": "png", "image/webp": "webp"}.get(mime, "jpg")
         folder = os.path.join(self.receipts_dir, self.today().strftime("%Y-%m"))
         os.makedirs(folder, exist_ok=True)
-        name = datetime.now().strftime("%Y%m%d-%H%M%S-%f") + "." + ext
+        # Время + случайная часть: на Windows часы грубые (до 15 мс), а альбом
+        # сохраняет скриншоты подряд — одинаковое имя перезаписало бы файл.
+        name = datetime.now().strftime("%Y%m%d-%H%M%S-%f") + f"-{uuid.uuid4().hex[:8]}.{ext}"
         path = os.path.join(folder, name)
         with open(path, "wb") as fh:
             fh.write(data)
@@ -566,7 +578,7 @@ class Flow:
             amount = None  # спросим, сколько списали в рублях
         draft = {
             "amount": amount,
-            "date": _parse_date(info.get("date") or "", self.today()),
+            "date": _not_future(_parse_date(info.get("date") or "", self.today()), self.today()),
             "card_id": None,
             "card_hint": (info.get("card_last4") or "", info.get("bank") or ""),
             "kind": EXPENSE if info.get("direction") != "in" else None,
@@ -1564,7 +1576,8 @@ class Flow:
                 raise parsed
             data = parsed if parsed is not None else self.recognizer.parse_statement(
                 files, text, period=period, cards=self.db.cards(),
-                categories=[c["name"] for c in self.db.categories()])
+                categories=[c["name"] for c in self.db.categories()],
+                today=self.today().isoformat())
         except RecognitionError as exc:
             return [Reply(f"Не получилось разобрать: {exc}.")]
         if not data.get("is_statement"):
@@ -1579,7 +1592,7 @@ class Flow:
         skipped = far_month = 0
         for op in data.get("operations", []):
             amount = _amount_or_none(op.get("amount", "").lstrip("-+"))
-            op_date = _parse_date(op.get("date", ""), self.today())
+            op_date = _not_future(_parse_date(op.get("date", ""), self.today()), self.today())
             if amount is None or op_date is None:
                 skipped += 1
                 continue

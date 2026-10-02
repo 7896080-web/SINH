@@ -43,7 +43,10 @@ MODULES = ("finance", "finance.settings_web")
 # PYTHONPATH, вписанный в .env) не передаётся.
 ENV_KEYS = ("TELEGRAM_BOT_TOKEN", "TELEGRAM_BOT_TOKEN_TEST", "ANTHROPIC_API_KEY",
             "ALLOWED_USER_IDS", "TEST_USER_IDS", "FINANCE_DATA_DIR", "FINANCE_TEST_DATA_DIR",
-            "TZ", "FINANCE_TZ", "CLAUDE_MODEL")
+            "TZ", "FINANCE_TZ", "CLAUDE_MODEL",
+            # Прокси для выхода к api.anthropic.com / api.telegram.org, если нужен.
+            "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY",
+            "https_proxy", "http_proxy", "all_proxy", "no_proxy")
 
 
 @dataclass
