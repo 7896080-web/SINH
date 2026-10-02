@@ -493,3 +493,31 @@ def preview_rule(db: Session, platform: str, values: dict) -> list[Preview]:
                     pcts.append((b.new_price - a.new_price) * 100.0 / a.new_price)
     pv.avg_change = sum(pcts) / len(pcts) if pcts else None
     return [pv]
+
+
+def default_below_floor(db: Session, platform: str, rule: PlatformRule | None = None) -> tuple[int, int]:
+    """(ниже пола, всего) — товары площадки, чья цена идёт от УМОЛЧАНИЯ правила,
+    по реальным тарифам и скидкам каждого. Проверка «умолчание × (1 − комиссия)
+    против пола» одним числом с тарифами по категориям смысла не имеет: у
+    свитшотов 15,5%, у курток 25% — одно умолчание бывает выше пола у одних и
+    ниже у других."""
+    from priceapp import mapping
+    inp = load_inputs(db, platform, rule)
+    rate = rates.current(db)
+    usd = rate.usd_rub if rate else None
+    below = total = 0
+    for acc in db.query(Account).filter(Account.platform == platform, Account.is_active.is_(True)):
+        items = mapping.account_items(db, acc.id)
+        costs = {c.item_id: c for c in db.query(OnecCost).filter(OnecCost.item_id.in_(list(items)))}
+        for item_id, rows in items.items():
+            facts = item_facts(inp.rule, rows)
+            t = target_for(inp, item_id, acc.id, facts.category)
+            if t is None or t.source != SRC_DEFAULT:
+                continue
+            cost = costs.get(item_id)
+            d = decide(cost.cost_usd if cost else None, usd, inp.rule, t, None, None, facts)
+            if d.new_price is None:
+                continue
+            total += 1
+            below += d.block_reason == BLOCK_FLOOR
+    return below, total

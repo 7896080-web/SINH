@@ -245,8 +245,11 @@ def test_guard_restores_when_platform_lowered_price_and_flags_eaten(client, db):
 
 def test_guard_never_below_floor_and_validation(client, db):
     a1, _ = _wb(client, db)
-    # умолчание 1,5 при комиссии 25% — маржинальность 1,13, ниже пола 1,3: правило не сохраняется
-    assert "не сохранено" in client.post("/prices/rules/wb", data={**RULE, "base_coef": "1,5"}).text
+    # WB: комиссия по тарифам категорий, одним числом не проверить — правило сохраняется, а
+    # программа говорит, сколько товаров на умолчании окажутся ниже пола по их тарифам
+    r = client.post("/prices/rules/wb", data={**RULE, "base_coef": "1,5"})
+    assert "не сохранено" not in r.text and "ниже пола окажутся 6" in r.text      # u1, u2, u3 × 2 кабинета
+    client.post("/prices/rules/wb", data=RULE)
     assert "«от» больше «до»" in client.post(f"/prices/guard/{a1.id}", data={"guard_min_margin": "3",
                                                                               "guard_max_margin": "2"}).text
     client.post(f"/prices/guard/{a1.id}", data={"guard_min_margin": "1,5", "guard_max_margin": ""})
@@ -592,3 +595,17 @@ def test_category_view_says_whose_markup(client, db):
                                           "arts": ["39681"]})
     t = client.get("/sku-prices?scope=wb&by=category").text.split("<table", 1)[1]
     assert "у 1 из 1 арт. своя наценка" in t and "у категории своей нет" in t
+
+
+
+def test_rule_default_check_by_tariffs_and_kit_still_blocked(client, db):
+    _wb(client, db)
+    # 2,5 при тарифе свитшотов 15,5% — 2,11 (выше пола); у джемперов тарифа нет — 25%: 1,88 — тоже выше
+    r = client.post("/prices/rules/wb", data={**RULE, "base_coef": "1,6", "min_markup_coef": "1,3"})
+    # 1,6 × 0,845 = 1,35 (свитшоты, выше пола 1,3), 1,6 × 0,75 = 1,2 (джемперы, ниже)
+    assert "не сохранено" not in r.text and "ниже пола окажутся 2 " in r.text
+    r = client.post("/prices/rules/wb/preview", data={**RULE, "base_coef": "1,6"})
+    assert "На умолчании ниже пола окажутся 2 из 6" in r.text
+    f.account(db, "kit", "КИТ", commission=20)
+    r = client.post("/prices/rules/kit", data={**RULE, "commission_percent": "20", "base_coef": "1,5"})
+    assert "не сохранено" in r.text                          # у Kit комиссия из правила и есть настоящая

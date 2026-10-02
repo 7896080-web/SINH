@@ -211,8 +211,11 @@ def validate_rule(db: Session, platform: str, raw: dict) -> tuple[dict, list[str
             errors.append(f"«{COEF_TITLE}»: {e}")
     if "round_step" in values and "round_minus" in values and values["round_minus"] >= values["round_step"]:
         errors.append("«Окончание: минус» должно быть меньше шага округления")
-    if (values.get("base_coef") is not None and "commission_percent" in values and "min_markup_coef" in values
-            and "commission_extra" in values):
+    # Одним числом проверяем только там, где комиссия из правила и есть настоящая
+    # (Kit, Lamoda). У WB и Ozon комиссия своя у каждой категории — там считаем
+    # по товарам после сохранения (`_default_floor_note`).
+    if (platform not in HAS_TARIFFS and values.get("base_coef") is not None and "commission_percent" in values
+            and "min_markup_coef" in values and "commission_extra" in values):
         margin = values["base_coef"] * (1 - (values["commission_percent"] + values["commission_extra"]) / 100)
         if margin < values["min_markup_coef"]:
             errors.append(f"при коэффициенте по умолчанию {_ru(values['base_coef'])} и комиссии "
@@ -251,9 +254,23 @@ async def save_rule(platform: str, request: Request, db: Session = Depends(get_d
         return _back("rules")
     _apply_rule(db, user, platform, values)
     db.commit()
+    note = _default_floor_note(db, platform)
     flash(request, f"Правило {PLATFORMS[platform]} сохранено для всех её кабинетов. "
-                   "На площадки ничего не отправлено — новые цены и маржинальность видны на «Цены товаров».", "ok")
+                   "На площадки ничего не отправлено — новые цены и маржинальность видны на «Цены товаров»." + note,
+          "warn" if note else "ok")
     return _back("rules")
+
+
+def _default_floor_note(db: Session, platform: str, rule=None) -> str:
+    """Сколько товаров на умолчании окажутся ниже пола — по их тарифам и скидкам."""
+    if platform not in HAS_TARIFFS or get_rule(db, platform).base_coef is None and rule is None:
+        return ""
+    below, total = pricing.default_below_floor(db, platform, rule)
+    if not below:
+        return ""
+    return (f" Внимание: из {total} товаров, чья цена идёт от умолчания, ниже пола окажутся {below} "
+            "(по их тарифам и скидкам) — эти цены не уйдут. Поднимите умолчание или задайте наценку их "
+            "категориям на «Ценах товаров» (отбор «ниже пола»).")
 
 
 RULE_HEADERS = ["Площадка (код)", "Площадка", "Кабинеты", "Комиссия, %", COEF_TITLE,
@@ -302,7 +319,8 @@ def import_rules(request: Request, file: UploadFile = File(...), db: Session = D
         if _apply_rule(db, user, p, values):
             changed += 1
     db.commit()
-    _import_flash(request, f"Правил изменено: {changed}. На площадки ничего не отправлено.", errors)
+    notes = "".join(_default_floor_note(db, p) for p in _platforms(_accounts(db)))
+    _import_flash(request, f"Правил изменено: {changed}. На площадки ничего не отправлено." + notes, errors)
     return _back("rules")
 
 
@@ -1082,6 +1100,12 @@ async def preview(platform: str, request: Request, db: Session = Depends(get_db)
         flash(request, f"{PLATFORMS[platform]}: проверить нельзя — " + "; ".join(errors), "warn")
         return _back("rules")
     result = preview_rule(db, platform, values)
+    note = ""
+    if platform in HAS_TARIFFS and values.get("base_coef") is not None:
+        from priceapp.models import PlatformRule as _R
+        below, total = pricing.default_below_floor(db, platform, _R(platform=platform, **values))
+        if below:
+            note = f" На умолчании ниже пола окажутся {below} из {total} (по тарифам и скидкам товаров)."
     db.rollback()        # проверка ничего не пишет, даже заведённые по ходу правила
     parts = []
     for pv in result:
@@ -1089,7 +1113,7 @@ async def preview(platform: str, request: Request, db: Session = Depends(get_db)
         parts.append(f"{PLATFORMS[pv.platform]} ({pv.accounts} каб.): посчитается {pv.priced_after} цен "
                      f"(сейчас {pv.priced_before}), изменится {pv.changed} — выше {pv.up}, ниже {pv.down}{avg}; "
                      f"упрётся в пол {pv.floor}, большой шаг {pv.big_step}")
-    flash(request, "Если сохранить: " + " | ".join(parts) + ". Ничего не сохранено.", "info")
+    flash(request, "Если сохранить: " + " | ".join(parts) + "." + note + " Ничего не сохранено.", "info")
     return _back("rules")
 
 

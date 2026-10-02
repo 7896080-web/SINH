@@ -93,8 +93,10 @@ def test_rules_save_commission_and_validate(client, db):
     assert 'value="1,3"' in client.get("/prices?view=rules").text
     r = client.post("/prices/rules/wb", data={**RULE, "commission_percent": "100"})
     assert "не сохранено" in r.text
+    # Пол выше умолчания: у WB одним числом не проверяется (комиссия своя у каждой
+    # категории) — правило сохраняется, а о товарах ниже пола говорит подсчёт по ним.
     r = client.post("/prices/rules/wb", data={**RULE, "min_markup_coef": "3"})
-    assert "не сохранено" in r.text
+    assert "не сохранено" not in r.text and "сохранено" in r.text
 
 
 def test_rate_manual_mode(client, db):
