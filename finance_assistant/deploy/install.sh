@@ -56,14 +56,14 @@ find "$APP/finance.new" -name '__pycache__' -prune -exec rm -rf {} +
 rm -rf "$APP/finance" "$APP/deploy"
 mv "$APP/finance.new" "$APP/finance"
 mv "$APP/deploy.new" "$APP/deploy"
-cp "$SRC/requirements.txt" "$APP/requirements.txt"
+cp "$SRC/requirements.txt" "$SRC/constraints.txt" "$APP/"
 [ -f "$SRC/README.md" ] && cp "$SRC/README.md" "$APP/README.md"
 chmod +x "$APP/deploy/"*.sh
 
 say "Ставлю зависимости (виртуальное окружение $APP/venv)"
 [ -x "$APP/venv/bin/python" ] || python3 -m venv "$APP/venv"
 "$APP/venv/bin/pip" install --quiet --upgrade pip
-"$APP/venv/bin/pip" install --quiet -r "$APP/requirements.txt"
+"$APP/venv/bin/pip" install --quiet -r "$APP/requirements.txt" -c "$APP/constraints.txt"
 (cd "$APP" && "$APP/venv/bin/python" -c "import finance.bot") \
     || fail "код не импортируется — см. ошибку выше"
 
@@ -75,7 +75,7 @@ if [ ! -f "$APP/.env" ]; then
 fi
 if [ "$SKIP_USER" != 1 ]; then
     # Код и настройки — root (служба их не меняет), данные — только служба.
-    chown -R root:root "$APP/finance" "$APP/deploy" "$APP/venv" "$APP/requirements.txt"
+    chown -R root:root "$APP/finance" "$APP/deploy" "$APP/venv" "$APP/requirements.txt" "$APP/constraints.txt"
     if id finance-settings >/dev/null 2>&1; then
         # Включена страница настроек — .env меняет она (см. deploy/settings.sh).
         chown finance-settings:"$SERVICE_USER" "$APP/.env"

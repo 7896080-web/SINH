@@ -118,3 +118,44 @@ def test_personal_marked_shown_without_statement(env):
     s = summarize(db, "2026-09")
     assert s.personal == 120_000
     assert "записано вами 1 200,00 ₽" in month_text(s)
+
+
+def test_interrupted_batch_is_reported_after_restart(env, monkeypatch):
+    db, rec, flow = env
+    rec.payments += [payment(amount="100"), payment(amount="200")]
+
+    def killed(*a, **k):
+        raise SystemExit("процесс убит")
+    monkeypatch.setattr(flow, "_on_batch", killed)
+    try:
+        flow.on_batch(CHAT, items(2))
+    except SystemExit:
+        pass
+    # finally снял отметку — при жёстком убийстве finally не выполнился бы:
+    state = db.get_state(CHAT)
+    state["batch_running"] = 2
+    db.set_state(CHAT, state)
+    assert flow.take_interrupted(CHAT) == 2 and flow.take_interrupted(CHAT) == 0
+
+
+def test_bot_tells_user_about_interrupted_batch():
+    import asyncio
+    from types import SimpleNamespace
+    from finance.bot import build_app
+
+    sent = []
+
+    class F:
+        def take_interrupted(self, uid):
+            return 7
+    app = build_app("123:ABC", lambda uid: F(), {42})
+
+    async def send_message(chat_id, text, **kw):
+        sent.append((chat_id, text))
+
+    async def commands(*a, **k):
+        return None
+    object.__setattr__(app, "bot", SimpleNamespace(send_message=send_message,
+                                                     set_my_commands=commands))
+    asyncio.run(app.post_init(app))
+    assert sent and sent[0][0] == 42 and "(7)" in sent[0][1]

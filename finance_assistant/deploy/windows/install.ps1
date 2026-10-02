@@ -22,7 +22,7 @@ function Fail($text) {
     Write-Host "`nОшибка: $text" -ForegroundColor Red
     if ($Stopped) {
         Write-Host "Бот сейчас остановлен. Исправьте причину и запустите установку снова" -ForegroundColor Yellow
-        Write-Host "(или запустите прежнюю версию: Start-ScheduledTask FinanceBot)." -ForegroundColor Yellow
+        Write-Host "(или запустите прежнюю версию: deploy\windows\stop.ps1 -Start)." -ForegroundColor Yellow
     }
     exit 1
 }
@@ -78,6 +78,9 @@ function Get-BotProcesses {
 }
 
 function Stop-Bot {
+    # Отключаем задание: иначе его проверка раз в 5 минут запустила бы бота
+    # посреди обновления (на наполовину скопированном коде).
+    Disable-ScheduledTask -TaskName $Task -ErrorAction SilentlyContinue | Out-Null
     Stop-ScheduledTask -TaskName $Task -ErrorAction SilentlyContinue
     # Процессы, запущенные заданием, при его остановке сами не завершаются.
     for ($i = 0; $i -lt 15; $i++) {
@@ -155,7 +158,7 @@ foreach ($dir in $(if ($SameFolder) { @() } else { "finance", "deploy" })) {
 }
 Get-ChildItem (Join-Path $App "finance") -Recurse -Directory -Filter "__pycache__" | Remove-Item -Recurse -Force
 if (-not $SameFolder) {
-    Copy-Item (Join-Path $Src "requirements.txt"), (Join-Path $Src ".env.example") $App -Force
+    Copy-Item (Join-Path $Src "requirements.txt"), (Join-Path $Src "constraints.txt"), (Join-Path $Src ".env.example") $App -Force
     foreach ($doc in "README.md", "УСТАНОВКА-WINDOWS.md") {
         if (Test-Path (Join-Path $Src $doc)) { Copy-Item (Join-Path $Src $doc) $App -Force }
     }
@@ -172,7 +175,8 @@ if (-not (Test-Path $VPy)) {
     if ($LASTEXITCODE -ne 0) { Fail "не удалось создать виртуальное окружение" }
 }
 & $VPy -m pip install --quiet --disable-pip-version-check --upgrade pip
-& $VPy -m pip install --quiet --disable-pip-version-check -r (Join-Path $App "requirements.txt")
+& $VPy -m pip install --quiet --disable-pip-version-check -r (Join-Path $App "requirements.txt") `
+    -c (Join-Path $App "constraints.txt")
 if ($LASTEXITCODE -ne 0) { Fail "не удалось поставить зависимости — см. ошибку выше (нужен доступ в интернет)" }
 Push-Location $App
 & $VPy -c "import finance.bot, finance.supervise, finance.windows, finance.backup, psutil, cryptography, tzdata"
@@ -208,7 +212,7 @@ try {
 } catch { Fail "не удалось создать задание $Task : $($_.Exception.Message)" }
 
 $backupAction = New-ScheduledTaskAction -Execute $VPy -WorkingDirectory $App `
-    -Argument "-m finance.backup --data `"$App\data`" --dest `"$App\backups`""
+    -Argument "-m finance.backup --data `"$App\data`" --dest `"$App\backups`" --env `"$App\.env`""
 $backupSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 1)
 try {
@@ -217,7 +221,16 @@ try {
         -ErrorAction Stop -Description "Финансовый помощник: ежедневный бэкап баз" | Out-Null
 } catch { Fail "не удалось создать задание $BackupTask : $($_.Exception.Message)" }
 
+# Сертификат страницы настроек живёт 2 года — при обновлении продлеваем заранее.
+if (Test-Path (Join-Path $App "settings\enabled")) {
+    Push-Location $App
+    $certOut = "$(& $VPy -m finance.windows cert (Join-Path $App "settings"))"
+    Pop-Location
+    if ($certOut -match "Создан") { Write-Host "   сертификат страницы настроек обновлён" }
+}
+
 Say "Запускаю"
+Enable-ScheduledTask -TaskName $Task -ErrorAction SilentlyContinue | Out-Null
 Start-ScheduledTask -TaskName $Task
 Start-Sleep -Seconds 5
 $state = (Get-ScheduledTask -TaskName $Task).State

@@ -331,6 +331,27 @@ class Flow:
         self._forget_menu_input(chat_id)
         if len(items) == 1:
             return self.on_files(chat_id, **items[0])
+        # Отметка «идёт разбор пачки»: если процесс убьют посередине (обновление,
+        # перезагрузка Windows), после запуска бот скажет прислать файлы снова.
+        state = self.db.get_state(chat_id)
+        state["batch_running"] = len(items)
+        self.db.set_state(chat_id, state)
+        try:
+            return self._on_batch(chat_id, items)
+        finally:
+            state = self.db.get_state(chat_id)
+            state.pop("batch_running", None)
+            self.db.set_state(chat_id, state)
+
+    def take_interrupted(self, chat_id) -> int:
+        """Сколько файлов разбиралось, когда процесс прервали (и снять отметку)."""
+        state = self.db.get_state(chat_id)
+        n = state.pop("batch_running", 0)
+        if n:
+            self.db.set_state(chat_id, state)
+        return n
+
+    def _on_batch(self, chat_id: int, items: list[dict]) -> list[Reply]:
         state = self.db.get_state(chat_id)
         closed = self._close_idle_statement(chat_id, state)
         if "statement" in state:
@@ -750,7 +771,10 @@ class Flow:
         """Скриншот, из которого не получилось записи, не храним."""
         path = d.get("receipt")
         if path and os.path.exists(path) and os.path.dirname(os.path.dirname(path)) == self.receipts_dir:
-            os.remove(path)
+            try:
+                os.remove(path)
+            except OSError as exc:  # Windows: файл как раз читает бэкап — не страшно
+                log.warning("Не удалил скриншот %s: %s", path, exc)
 
     def _file_receipt(self, path: str, op_date: str) -> str:
         """Скриншот лежит в папке месяца, когда его прислали; переносим в месяц оплаты."""
@@ -761,7 +785,11 @@ class Flow:
             return path
         os.makedirs(folder, exist_ok=True)
         target = os.path.join(folder, os.path.basename(path))
-        os.replace(path, target)
+        try:
+            os.replace(path, target)
+        except OSError as exc:  # Windows: файл занят (бэкап) — оставим, где лежит
+            log.warning("Не перенёс скриншот %s: %s", path, exc)
+            return path
         return target
 
     @staticmethod

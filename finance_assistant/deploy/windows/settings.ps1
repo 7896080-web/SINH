@@ -45,10 +45,12 @@ if ($Password -or -not (Test-Path (Join-Path $Dir "password"))) {
     if ($LASTEXITCODE -ne 0) { Pop-Location; Fail "пароль не сохранён" }
     Stop-Page
 }
-& $VPy -m finance.windows cert $Dir
+$certOut = "$(& $VPy -m finance.windows cert $Dir)"
 $rc = $LASTEXITCODE
 Pop-Location
 if ($rc -ne 0) { Fail "не удалось создать сертификат страницы" }
+Write-Host $certOut
+if ($certOut -match "Создан") { Stop-Page }   # работающая страница возьмёт новый сертификат
 
 [IO.File]::WriteAllText((Join-Path $Dir "enabled"), "$Port")
 Get-NetFirewallRule -DisplayName $Rule -ErrorAction SilentlyContinue | Remove-NetFirewallRule
@@ -56,7 +58,12 @@ New-NetFirewallRule -DisplayName $Rule -Direction Inbound -Protocol TCP -LocalPo
     -Action Allow -Profile Any | Out-Null
 Write-Host "Порт $Port открыт в брандмауэре Windows."
 
-if ("$((Get-ScheduledTask -TaskName FinanceBot -ErrorAction SilentlyContinue).State)" -ne "Running") {
+$taskState = "$((Get-ScheduledTask -TaskName FinanceBot -ErrorAction SilentlyContinue).State)"
+if ($taskState -eq "Disabled") {
+    Write-Host "Бот был остановлен через stop.ps1 — запускаю снова." -ForegroundColor Yellow
+    Enable-ScheduledTask -TaskName FinanceBot | Out-Null
+}
+if ($taskState -ne "Running") {
     Start-ScheduledTask -TaskName FinanceBot -ErrorAction SilentlyContinue
 }
 Write-Host "Жду запуска страницы…"
