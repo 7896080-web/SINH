@@ -12,7 +12,7 @@
   <form method="post" action="/api-keys/{{ a.id }}" class="row">
     <label>Название<input name="name" value="{{ a.name }}"></label>
     {% for f, label, masked in r.fields %}
-    <label>{{ label }}<input name="{{ f }}" type="password" autocomplete="off" placeholder="{{ masked or 'не задан' }}" style="width:260px"></label>
+    <label>{{ label }}<input name="{{ f }}" type="password" autocomplete="new-password" data-lpignore="true" data-1p-ignore placeholder="{{ masked or 'не задан' }}" style="width:260px"></label>
     {% endfor %}
     <label>Активен<select name="is_active"><option value="1" {% if a.is_active %}selected{% endif %}>да</option><option value="0" {% if not a.is_active %}selected{% endif %}>нет</option></select></label>
     <button type="submit">Сохранить</button>
