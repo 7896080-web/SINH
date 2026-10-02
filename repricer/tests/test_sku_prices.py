@@ -148,3 +148,28 @@ def test_excel_roundtrip_empty_changes_nothing(client, db):
 
 def test_nav_has_page(client, db):
     assert 'href="/sku-prices"' in client.get("/attention").text
+
+
+def test_platform_without_catalog_still_has_a_column(client, db):
+    _setup(client, db)
+    f.account(db, "kit", "КИТ", commission=20)
+    page = client.get("/sku-prices").text
+    assert "Яндекс KIT" in page and "каталог не загружен" in page
+
+
+def test_terminal_platform_refusal_closes_at_once(db):
+    from priceapp import dispatch
+
+    class Refuses:
+        def push_prices(self, items):
+            return {"ok": [], "sent_prices": {},
+                    "errors": [{"detail": "Kit: INVALID_PRICE", "terminal": True, "items": [i.barcode for i in items]}]}
+    f.manual_rate(db)
+    acc = f.account(db, "kit", "КИТ", commission=20)
+    f.sku(db, "u1", "39681", barcodes=["b1"], cost_usd="16.24")
+    f.item(db, acc, "b1", "39681", external_id="v1")
+    db.add(PriceChange(item_id="u1", account_id=acc.id, barcode="b1", new_price=9999, status="approved"))
+    db.commit()
+    dispatch.run_account(db, acc, Refuses())
+    ch = db.query(PriceChange).one()
+    assert ch.status == "error" and ch.attempts == 1 and "INVALID_PRICE" in ch.last_error

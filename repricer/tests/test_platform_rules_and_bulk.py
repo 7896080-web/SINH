@@ -315,7 +315,7 @@ def test_load_current_button_and_markup_by_current(client, db, monkeypatch):
     monkeypatch.setattr(r, "CLIENT_FACTORY", lambda platform, creds: FakePrices(
         {"5": CurrentPrice(2000, 1600), "6": CurrentPrice(4000, 4000)}))
     page = client.post("/prices/load-current", data={"account_id": str(a1.id)}).text
-    assert "ИП Яворская — 2" in page and "ИП Ребрик — 2" in page and "чтение цен не подключено" in page
+    assert "ИП Яворская — 2" in page and "ИП Ребрик — 2" in page and "КИТ: нет ключей" in page
     # 1600 × 0,75 = 1200; 1200 − 1323,56 = −123,56; коэфф. 0,91 — ниже пола 1,3
     page = client.get(f"/prices?view=products&account_id={a1.id}&flt=below_floor_now").text
     assert "−123,56" in page or "-123,56" in page

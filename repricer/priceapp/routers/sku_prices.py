@@ -77,10 +77,6 @@ def build(db: Session, art: str = "", barcode: str = "", color: str = "", size: 
         acc = next((a for a in accs if a.id == pp.account_id), None)
         if acc:
             own_manual[(pp.item_id, acc.platform)] = own_manual.get((pp.item_id, acc.platform), 0) + 1
-    # Колонка — только площадка, где есть хоть один товар: пустая колонка (кабинет
-    # без каталога) только занимает место и выглядит как «цен нет».
-    present = set().union(*on_platform.values()) if on_platform else set()
-    plats = [p for p in plats if p in present]
     base = {b.item_id: b.price for b in db.query(BasePrice)}
     item_ids = set(on_platform) | set(base)
     info: dict[str, OnecBarcode] = {}
@@ -143,10 +139,14 @@ def page(request: Request, art: str = Query(""), barcode: str = Query(""), color
          user: User = Depends(get_current_user)):
     rows, plats = build(db, art, barcode, color, size, flt)
     rules = {p: load_inputs(db, p).rule for p in plats}
+    # Колонка есть у каждой площадки с активным кабинетом; если каталог пуст —
+    # так и написано в заголовке, а не молча «нет на площадке» во всех строках.
+    with_items = {p for r in rows for p, c in r["cells"].items() if c}
+    empty = {p: [a.name for a in _accounts(db) if a.platform == p] for p in plats if p not in with_items}
     db.commit()
     keep = {"art": art, "barcode": barcode, "color": color, "size": size, "flt": flt}
     return render(request, "sku_prices.html", user, "sku_prices", rows=rows[:ROWS_LIMIT], total=len(rows),
-                  plats=plats, names=PLATFORMS, rules=rules, filters=FILTERS, actions=ACTIONS, ru=_ru,
+                  plats=plats, names=PLATFORMS, rules=rules, empty=empty, filters=FILTERS, actions=ACTIONS, ru=_ru,
                   rate=rates.current(db), export_qs=urlencode(keep), **keep)
 
 

@@ -12,7 +12,8 @@ Ozon /v3/product/list + /v3/product/info/list, Kit /v1/variants с total_count).
     покупатель платит цену минус скидку, и это видно в кабинете WB.
   * Ozon — `POST /v1/product/import/prices` по offer_id (артикулу продавца);
     old_price и min_price не передаём.
-  * Kit — метод цен в спеке не сверен: честный отказ, ничего не отправляется.
+  * Kit — `POST /v1/variants/prices/bulk_update` по variant_id (размеру), рубли
+    строкой; сверено со спекой из `.claude/skills/yandex-kit-cabinet`.
   * Lamoda — `POST /v2/nomenclatures-prices` по parentSku (карточке), в копейках,
     `force: false` (из акции товар не убираем). Сверено с OAS-файлом.
 
@@ -25,7 +26,7 @@ Ozon /v3/product/list + /v3/product/info/list, Kit /v1/variants с total_count).
     `price.price` — цена продажи.
   * Lamoda — `GET /v2/nomenclatures-sell-values`: `price` и `salePrice` (пока
     скидка действует) по parentSku, страна RU.
-  * Kit — не читаем (`get_prices` бросает PlatformError).
+  * Kit — `pricing` вариантов из `GET /v1/variants`: `price` и `final_price`.
 """
 from __future__ import annotations
 
@@ -39,7 +40,7 @@ PLATFORMS = {"wb": "Wildberries", "ozon": "Ozon", "kit": "Яндекс KIT", "la
 
 # Где умеем читать текущие цены (`get_prices`). У остальных метод честно
 # отказывает; суточное обновление и кнопка их пропускают, называя причину.
-READS_PRICES = {"wb", "ozon", "lamoda"}
+READS_PRICES = {"wb", "ozon", "lamoda", "kit"}
 
 # Какие ключи у кабинета: (имя поля, подпись).
 CREDENTIAL_FIELDS = {
@@ -352,6 +353,7 @@ def parse_ozon_info(data: dict) -> list[CatalogRow]:
 
 KIT = "https://api.kit.yandex.net"
 KIT_MAX_PAGES = 200
+KIT_PUSH_CHUNK = 1000      # спека разрешает до 5000 за запрос
 
 
 class KitClient:
@@ -379,33 +381,130 @@ class KitClient:
         except requests.RequestException as e:
             return False, f"Не удалось связаться с Kit: {e}"
 
-    def get_catalog(self) -> list[CatalogRow]:
-        result, collected = [], 0
+    def _variants(self):
+        """Все страницы `/v1/variants`. Конец — `total_count`, а не короткая
+        страница (короткая страница концом не считается — правило sync_admin)."""
+        collected = 0
         self.last_truncated = False
         for page in range(1, KIT_MAX_PAGES + 1):
             data = self._get("/v1/variants", params={"page": page, "per_page": 100})
             variants = data.get("variants", [])
             if not variants:
-                return result
-            result.extend(parse_kit_variants(data))
+                return
+            yield data
             collected += len(variants)
             total = data.get("total_count")
             if isinstance(total, int) and collected >= total:
-                return result
+                return
         self.last_truncated = True
+
+    def get_catalog(self) -> list[CatalogRow]:
+        result = []
+        for data in self._variants():
+            result.extend(parse_kit_variants(data))
         return result
 
     def price_key(self, item) -> str:
+        """Цена у Kit — на ВАРИАНТ (размер), ключ — variant_id."""
         return item.external_id or ""
 
     def get_prices(self) -> dict[str, CurrentPrice]:
-        raise PlatformError("Kit: чтение цен ещё не сверено со спекой API — текущие цены не загружены")
+        out: dict[str, CurrentPrice] = {}
+        for data in self._variants():
+            out.update(parse_kit_prices(data))
+        return out
+
+    def _post(self, path: str, body: dict):
+        """POST без повтора 4xx: 400 у bulk_update — это отказ по позициям с
+        их списком, его разбирает `push_prices`, а не повтор."""
+        def call():
+            r = self.session.post(f"{KIT}{path}", json=body, timeout=60)
+            if r.status_code == 400:
+                return r
+            r.raise_for_status()
+            return r
+        return with_retry(call)
 
     def push_prices(self, items: list[PriceItem]) -> dict:
-        """Метод цен Kit не сверен со спекой — цена не отправляется."""
-        return {"ok": [], "sent_prices": {},
-                "errors": [{"detail": "Kit: метод обновления цен ещё не сверен со спекой API — "
-                                      "цена не отправлена", "items": [i.barcode for i in items]}]}
+        """`POST /v1/variants/prices/bulk_update` — сверено со спекой
+        (`.claude/skills/yandex-kit-cabinet/references/openapi.json`), вживую не
+        проверено. Цена — `price` (до скидки), строкой в рублях. Запрос АТОМАРНЫЙ:
+        одна невалидная позиция бракует всю пачку с 400 и списком виновных
+        (`errors[].variant_id`, `code`) — их вынимаем и досылаем остальное, иначе
+        одна позиция держала бы всю пачку вечно. Цену со скидкой
+        (`manual_discount_price`) не трогаем: если она выше новой цены, Kit
+        отклоняет позицию `INVALID_PRICE` — снять скидку решает человек."""
+        by_variant: dict[str, list[PriceItem]] = {}
+        errors = []
+        for it in items:
+            if not it.external_id:
+                errors.append({"detail": "нет variant_id — обновите каталог кабинета", "items": [it.barcode]})
+                continue
+            by_variant.setdefault(it.external_id, []).append(it)
+        # Два SKU 1С на одном варианте: повтор варианта Kit бракует (DUPLICATE_ITEM) —
+        # уходит один, с большей ценой.
+        price_of = {v: max(i.price for i in g) for v, g in by_variant.items()}
+        ok, sent = [], {}
+        variants = list(price_of)
+        for start in range(0, len(variants), KIT_PUSH_CHUNK):
+            pending = variants[start:start + KIT_PUSH_CHUNK]
+            for _ in range(3):          # отказ по позициям -> вынуть виновных и дослать
+                if not pending:
+                    break
+                body = {"items": [{"variant_id": v, "price": str(price_of[v])} for v in pending]}
+                try:
+                    r = self._post("/v1/variants/prices/bulk_update", body)
+                except requests.RequestException as e:
+                    errors.append({"detail": str(e), "items": [i.barcode for v in pending for i in by_variant[v]]})
+                    pending = []
+                    break
+                if r.status_code != 400:
+                    for v in pending:
+                        for i in by_variant[v]:
+                            ok.append(i.barcode)
+                            sent[i.barcode] = price_of[v]
+                    pending = []
+                    break
+                bad = parse_kit_bulk_errors(r)
+                culprits = {v for v in bad if v in price_of and v in pending}
+                if not culprits:
+                    errors.append({"detail": f"Kit отклонил пачку: {r.text[:300]}",
+                                   "items": [i.barcode for v in pending for i in by_variant[v]]})
+                    pending = []
+                    break
+                for v in culprits:
+                    code, msg = bad[v]
+                    hint = (" — у товара в Kit цена со скидкой выше новой цены; снимите или поправьте скидку "
+                            "в кабинете Kit" if code == "INVALID_PRICE" else "")
+                    errors.append({"detail": f"Kit: {code} {msg}{hint}".strip(), "terminal": True,
+                                   "items": [i.barcode for i in by_variant[v]]})
+                pending = [v for v in pending if v not in culprits]
+            if pending:
+                errors.append({"detail": "Kit отклонял пачку трижды подряд — не отправлено",
+                               "items": [i.barcode for v in pending for i in by_variant[v]]})
+        return {"ok": ok, "errors": errors, "sent_prices": sent}
+
+
+def parse_kit_bulk_errors(resp) -> dict[str, tuple[str, str]]:
+    """variant_id -> (код, сообщение) из `BulkOperationError.errors`."""
+    try:
+        data = resp.json() or {}
+    except ValueError:
+        return {}
+    return {str(e.get("variant_id")): (str(e.get("code") or ""), str(e.get("message") or ""))
+            for e in data.get("errors") or [] if e.get("variant_id")}
+
+
+def parse_kit_prices(data: dict) -> dict[str, CurrentPrice]:
+    """variant_id -> цена. `price` — до скидки (то же поле, что мы отправляем),
+    `final_price` — итоговая с учётом скидки и акции: её платит покупатель."""
+    out = {}
+    for v in data.get("variants") or []:
+        pr = v.get("pricing") or {}
+        price = _int_price(pr.get("price"))
+        if price and v.get("id"):
+            out[str(v["id"])] = CurrentPrice(price, _int_price(pr.get("final_price")) or price)
+    return out
 
 
 def parse_kit_variants(data: dict) -> list[CatalogRow]:
