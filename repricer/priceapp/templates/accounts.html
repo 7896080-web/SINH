@@ -22,8 +22,8 @@
     <form method="post" action="/api-keys/{{ a.id }}/catalog"><button class="secondary">Загрузить каталог</button></form>
   </div>
   <p class="muted" style="margin-bottom:0">
-    Проверка: {% if a.last_check_at %}<span class="{{ 'ok' if a.last_check_ok else 'bad' }}">{{ a.last_check_message }}</span> ({{ a.last_check_at.strftime('%d.%m %H:%M') }} UTC){% else %}не проводилась{% endif %}.
-    Каталог: {{ r['items'] }} баркодов{% if a.catalog_loaded_at %}, загружен {{ a.catalog_loaded_at.strftime('%d.%m %H:%M') }} UTC{% endif %}.
+    Проверка: {% if a.last_check_at %}<span class="{{ 'ok' if a.last_check_ok else 'bad' }}">{{ a.last_check_message }}</span> ({{ a.last_check_at|local('%d.%m %H:%M') }}){% else %}не проводилась{% endif %}.
+    Каталог: {{ r['items'] }} баркодов{% if a.catalog_loaded_at %}, загружен {{ a.catalog_loaded_at|local('%d.%m %H:%M') }}{% endif %}.
     {% if a.catalog_note %}<span class="warn">{{ a.catalog_note }}</span>{% endif %}
   </p>
 </div>

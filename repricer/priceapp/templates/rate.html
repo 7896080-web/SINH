@@ -39,8 +39,8 @@
 </div>
 
 <h2>Курсы ЦБ и ручные</h2>
-<table><tr><th>Дата</th><th class="num">₽ за $1</th><th>Источник</th><th>Получен (UTC)</th></tr>
-{% for r in history %}<tr><td>{{ r.rate_date|ru }}</td><td class="num">{{ r.usd_rub|money(4) }}</td><td>{{ 'ЦБ' if r.source == 'cbr' else 'вручную' }}</td><td>{{ r.fetched_at.strftime('%d.%m %H:%M') }}</td></tr>
+<table><tr><th>Дата</th><th class="num">₽ за $1</th><th>Источник</th><th>Получен</th></tr>
+{% for r in history %}<tr><td>{{ r.rate_date|ru }}</td><td class="num">{{ r.usd_rub|money(4) }}</td><td>{{ 'ЦБ' if r.source == 'cbr' else 'вручную' }}</td><td>{{ r.fetched_at|local('%d.%m %H:%M') }}</td></tr>
 {% else %}<tr><td colspan="4" class="muted">Курсов ещё нет.</td></tr>{% endfor %}
 </table>
 {% endblock %}

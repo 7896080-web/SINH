@@ -547,3 +547,48 @@ def test_sftp_read_error_is_not_mistaken_for_missing_file():
             raise FileNotFoundError(2, "No such file")
     ex._sftp = Missing()
     assert ex.read_result("cost_x.txt") is None
+
+
+# --- мелкие расхождения ----------------------------------------------------------------------
+
+def test_times_are_local_not_utc(client, db):
+    from datetime import datetime
+    from priceapp.templating import local
+    assert local(datetime(2026, 10, 2, 13, 21)) == datetime(2026, 10, 2, 13, 21).replace(
+        tzinfo=__import__("datetime").timezone.utc).astimezone().strftime("%d.%m %H:%M")
+    assert local("2026-10-02T12:00:00", "%d.%m.%Y") == "02.10.2026"      # полдень UTC — тот же день в любом поясе России
+    assert local(None) == "" and local("не дата") == "не дата"
+    _wb(client, db)
+    for url in ("/api-keys", "/diagnostics", "/prices?view=log", "/mapping"):
+        assert " UTC" not in client.get(url).text, url
+
+
+def test_ozon_old_price_refusal_is_terminal_with_hint():
+    from priceapp.platforms import OzonClient, PriceItem
+
+    class S:
+        headers = {}
+
+        def post(self, url, json=None, timeout=0):
+            return _Resp({"result": [{"offer_id": "A-1", "updated": False,
+                                      "errors": [{"code": "PRICE_INCORRECT", "message": "price must be less than old_price"}]}]})
+    out = OzonClient("1", "k", session=S()).push_prices([PriceItem("b1", 5000, "7", "A-1")])
+    e = out["errors"][0]
+    assert e["terminal"] and "зачёркнутую цену" in e["detail"]
+
+
+def test_products_export_commission_is_items_tariff(client, db):
+    a1, _ = _wb(client, db, commission_extra="3")
+    ws = load_workbook(io.BytesIO(client.get(f"/prices/export/{a1.id}").content)).active
+    h = [c.value for c in ws[1]]
+    got = {ws.cell(row=i, column=1).value: ws.cell(row=i, column=h.index("Комиссия, %") + 1).value
+           for i in range(2, ws.max_row + 1)}
+    assert got["u1"] == 18.5 and got["u3"] == 28                 # тариф 15,5 + 3; без тарифа 25 + 3
+
+
+def test_category_view_says_whose_markup(client, db):
+    _wb(client, db)
+    client.post("/sku-prices/coef", data={"scope": "wb", "action": "set", "kind": "coef", "value": "2,6",
+                                          "arts": ["39681"]})
+    t = client.get("/sku-prices?scope=wb&by=category").text.split("<table", 1)[1]
+    assert "у 1 из 1 арт. своя наценка" in t and "у категории своей нет" in t

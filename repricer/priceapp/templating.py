@@ -28,6 +28,25 @@ def plain(v) -> str:
 
 templates.env.filters["plain"] = plain
 
+
+def local(v, fmt: str = "%d.%m %H:%M") -> str:
+    """Отметка времени (UTC, наивная, или ISO-строка) — по МЕСТНОМУ времени. Оператор
+    живёт по часам своего компьютера; «16:21 UTC» для него — загадка на три часа."""
+    from datetime import datetime, timezone
+    if not v:
+        return ""
+    if isinstance(v, str):
+        try:
+            v = datetime.fromisoformat(v)
+        except ValueError:
+            return v
+    if v.tzinfo is None:
+        v = v.replace(tzinfo=timezone.utc)
+    return v.astimezone().strftime(fmt)
+
+
+templates.env.filters["local"] = local
+
 NAV = [
     ("attention", "/attention", "Внимание"),
     ("sku_prices", "/sku-prices", "Цены товаров"),

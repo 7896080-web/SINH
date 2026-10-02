@@ -79,7 +79,8 @@ def run_account(db: Session, account: Account, client) -> dict:
         decided = ch.decided_at or ch.created_at
         if decided is not None and now - decided > STALE_AFTER:
             ch.status = PriceChangeStatus.rejected.value
-            ch.note = (f"устарело: подтверждено {decided.strftime('%d.%m %H:%M')} UTC и не ушло за сутки — "
+            from priceapp.templating import local
+            ch.note = (f"устарело: подтверждено {local(decided)} и не ушло за сутки — "
                        "пересчитайте и подтвердите заново")[:255]
             del latest[item_id]
     if not latest:

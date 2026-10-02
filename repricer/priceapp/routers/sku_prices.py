@@ -136,7 +136,7 @@ def span(values, money: bool = False) -> str:
 def target_text(kind: str | None, value) -> str:
     if value is None:
         return "—"
-    return ("м " if kind == KIND_MARGIN else "× ") + _ru(value)
+    return (f"маржинальность {_ru(value)}" if kind == KIND_MARGIN else f"× {_ru(value)} от базовой")
 
 
 # --- строки --------------------------------------------------------------------------
@@ -251,6 +251,11 @@ def summarize(rows: list[dict]) -> dict:
         "tariff_missing": any(c["tariff_missing"] for c in cells),
         "discount": span(c["discount"] for c in cells),
         "pct": change_percent(cur_max, new_max) if new_max else None,
+        # Изменение по КАЖДОЙ позиции: «+0,3%» по максимумам рядом с «больше лимита»
+        # (у одного размера +21%) сбивало с толку.
+        "pct_span": _pct_span([change_percent(c["current"], c["price"]) for c in cells
+                               if c["price"] and c["current"]]),
+        "card_price": new_max,
         "floor": any(c["floor"] for c in cells), "big_step": any(c["big_step"] for c in cells),
         "changes": any(c["price"] and c["price"] != c["current"] for c in cells),
         "no_cost": any(r["cost_usd"] is None for r in rows),
@@ -261,6 +266,15 @@ def summarize(rows: list[dict]) -> dict:
         "own_cabinets": sorted({c["account"].name for c in cells if c["own_cabinet"]}),
         "note": next((r["note"] for r in rows if r["note"]), ""),
     }
+
+
+def _pct_span(values) -> str:
+    vals = [v for v in values if v is not None]
+    if not vals:
+        return ""
+    f = lambda v: f"{v:+.1f}".replace(".", ",") + "%"  # noqa: E731
+    lo, hi = min(vals), max(vals)
+    return f(lo) if abs(hi - lo) < 0.05 else f"{f(lo)} … {f(hi)}"
 
 
 LAST_LABELS = {"approved": "в очереди", "sent": "ушло", "error": "не принято", "blocked": "не ушло: пол"}
@@ -346,6 +360,7 @@ def build(db: Session, sc: dict, art: str = "", barcode: str = "", color: str = 
         if by_category:
             own = category_target(db, sc["platform"], sc["account_id"], key) if key != NO_CATEGORY else None
             g["own_kind"], g["own_value"] = own if own else (None, None)
+            g["articles_own"] = len({r["article"] for r in rows if r["source"] in ("article", SRC_CABINET)})
         out.append(g)
     return out
 
