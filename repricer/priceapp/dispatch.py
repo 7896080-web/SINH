@@ -87,8 +87,17 @@ def run_account(db: Session, account: Account, client) -> dict:
     ok = set(result.get("ok", []))
     sent_prices = result.get("sent_prices") or {}
     errors_text = str(result.get("errors"))[:400]
+    # Отказ, который не переживёт повтор (площадка назвала позицию и причину), —
+    # закрываем сразу: пять попыток в заведомо тот же ответ только оттянут момент,
+    # когда человек узнает.
+    terminal = {b: e.get("detail", "") for e in result.get("errors", []) if e.get("terminal")
+                for b in e.get("items", [])}
     for barcode, ch in by_barcode.items():
         ch.attempts += 1
+        if barcode in terminal and barcode not in ok:
+            ch.status = PriceChangeStatus.error.value
+            ch.last_error = str(terminal[barcode])[:400]
+            continue
         if barcode in ok:
             price = int(sent_prices.get(barcode, ch.new_price))
             ch.status = PriceChangeStatus.sent.value

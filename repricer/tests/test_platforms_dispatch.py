@@ -54,10 +54,55 @@ def test_ozon_by_offer_id_highest_on_shared_offer():
     assert set(res["ok"]) == {"b1", "b2"}
 
 
-def test_kit_refuses_without_network():
-    s = _Session(lambda body: {})
-    res = platforms.KitClient("t", s).push_prices([PriceItem("b1", 1)])
-    assert s.calls == [] and res["ok"] == [] and "Kit" in res["errors"][0]["detail"]
+class _KitResp:
+    def __init__(self, code, data=None):
+        self.status_code, self._data = code, data or {}
+        self.text = str(self._data)
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            import requests
+            raise requests.HTTPError(response=self)
+
+    def json(self):
+        return self._data
+
+
+class _KitSession:
+    """Kit по спеке: 204 — применено; 400 — пачка отвергнута целиком, виновные в errors[]."""
+    def __init__(self, bad):
+        self.headers, self.calls, self.bad = {}, [], bad
+
+    def post(self, url, json=None, timeout=0):
+        self.calls.append((url, json))
+        culprits = [i["variant_id"] for i in json["items"] if i["variant_id"] in self.bad]
+        if culprits:
+            return _KitResp(400, {"code": "VALIDATION_ERROR", "errors": [
+                {"variant_id": v, "code": self.bad[v], "message": "плохо"} for v in culprits]})
+        return _KitResp(204)
+
+
+def test_kit_push_prices_per_variant_and_pulls_out_culprits():
+    s = _KitSession({"v2": "INVALID_PRICE"})
+    res = platforms.KitClient("t", s).push_prices([
+        PriceItem("b1", 1990, "v1"), PriceItem("b1x", 2090, "v1"),      # два SKU на одном варианте
+        PriceItem("b2", 990, "v2"), PriceItem("b3", 500, "")])
+    url, body = s.calls[0]
+    assert url.endswith("/v1/variants/prices/bulk_update")
+    assert body == {"items": [{"variant_id": "v1", "price": "2090"}, {"variant_id": "v2", "price": "990"}]}
+    assert s.calls[1][1] == {"items": [{"variant_id": "v1", "price": "2090"}]}     # дослали без виновного
+    assert sorted(res["ok"]) == ["b1", "b1x"] and res["sent_prices"]["b1"] == 2090
+    bad = [e for e in res["errors"] if e["items"] == ["b2"]][0]
+    assert bad["terminal"] and "цена со скидкой выше" in bad["detail"]
+    assert any("нет variant_id" in e["detail"] for e in res["errors"])
+
+
+def test_kit_current_prices_from_variants():
+    got = platforms.parse_kit_prices({"variants": [
+        {"id": "v1", "pricing": {"price": "1990.00", "manual_discount_price": "1790", "final_price": "1690"}},
+        {"id": "v2", "pricing": {}}]})
+    assert got == {"v1": platforms.CurrentPrice(1990, 1690)}
+    assert "kit" in platforms.READS_PRICES
 
 
 def test_build_client_requires_keys():
