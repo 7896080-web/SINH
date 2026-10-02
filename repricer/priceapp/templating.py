@@ -36,5 +36,6 @@ NAV = [
     ("rate", "/rate", "Курс $"),
     ("accounts", "/api-keys", "API-ключи"),
     ("diagnostics", "/diagnostics", "Диагностика"),
+    ("help", "/help/prices", "Справка"),
 ]
 templates.env.globals["nav_items"] = NAV

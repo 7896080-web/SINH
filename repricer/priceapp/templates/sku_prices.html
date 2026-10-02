@@ -6,12 +6,15 @@
 .art-table td.art { white-space:normal; min-width:180px; max-width:260px; }
 .art-table td.art .muted { font-size:12px; }
 .art-table tr.size td { font-size:13px; background:var(--th, #f6f7f9); }
+.kind { font-size:12px; padding:3px 4px; }
 </style>
 <h1>Цены товаров</h1>
-<p class="muted">Цена = <b>базовая цена × коэффициент</b>. Базовая = себестоимость 1С, $ × курс ЦБ — руками не правится.
-Коэффициент задаётся на артикул — сразу на все его размеры — по площадке или по отдельному кабинету (кабинет главнее
-площадки, у артикула без своего — коэффициент площадки по умолчанию из «Цены» → «Правила»). Маржинальность = к получению /
-себестоимость ₽, к получению = цена × (1 − комиссия), с учётом скидки продавца, если она стоит на площадке.
+<p class="muted">Базовая цена = себестоимость 1С, $ × курс ЦБ — руками не правится. Наценка задаётся <b>коэффициентом от
+базовой</b> (цена = базовая × k) или <b>маржинальностью</b> (цена такая, чтобы к получению / себестоимость = m при текущих
+комиссии и скидке продавца — площадка сменит тариф, цена пересчитается сама). Задаётся на артикул (все его размеры) или на
+категорию — в кабинете или на всю площадку; главнее артикул, затем категория, затем умолчание площадки.
+Маржинальность считается по цене, которую платит покупатель: цена × (1 − скидка продавца) × (1 − комиссия) / себестоимость.
+<a href="/help/prices">Типы цен — подробно</a>.
 {% if rate %}Курс: <b>{{ rate.usd_rub|money(4) }} ₽</b>.{% else %}<span class="bad">Курса нет — базовая цена не считается.</span>{% endif %}</p>
 
 {% if not sc %}<p class="warn">Нет ни одного активного кабинета — заведите их на «API-ключах».</p>{% else %}
@@ -19,66 +22,75 @@
   <div class="row">
     <label>Где<select name="scope" onchange="this.form.submit()" style="font-weight:600">
       {% for s in scopes %}<option value="{{ s.key }}" {% if s.key == sc.key %}selected{% endif %}>{{ s.label }}</option>{% endfor %}</select></label>
-    <label>Артикул или название<input name="art" value="{{ art }}" placeholder="39681" style="width:130px"></label>
-    <label>Штрихкод<input name="barcode" value="{{ barcode }}" placeholder="2000932…" style="width:140px"></label>
-    <label>Цвет<input name="color" value="{{ color }}" style="width:90px"></label>
-    <label>Размер<input name="size" value="{{ size }}" style="width:60px"></label>
+    <label>Вид<select name="by" onchange="this.form.submit()">{% for k, v in views.items() %}<option value="{{ k }}" {% if by == k %}selected{% endif %}>{{ v }}</option>{% endfor %}</select></label>
+    <label>Категория<select name="cat"><option value="">все</option>{% for c in categories %}<option value="{{ c }}" {% if cat == c %}selected{% endif %}>{{ c }}</option>{% endfor %}</select></label>
+    <label>Артикул или название<input name="art" value="{{ art }}" placeholder="39681" style="width:120px"></label>
+    <label>Штрихкод<input name="barcode" value="{{ barcode }}" placeholder="2000932…" style="width:130px"></label>
+    <label>Цвет<input name="color" value="{{ color }}" style="width:80px"></label>
+    <label>Размер<input name="size" value="{{ size }}" style="width:56px"></label>
     <label>Отбор<select name="flt">{% for k, v in filters.items() %}<option value="{{ k }}" {% if flt == k %}selected{% endif %}>{{ v }}</option>{% endfor %}</select></label>
-    <label>Новая маржинальность от<input name="mmin" value="{{ mmin }}" inputmode="decimal" style="width:60px"></label>
-    <label>до<input name="mmax" value="{{ mmax }}" inputmode="decimal" style="width:60px"></label>
-    <label style="flex-direction:row;gap:6px;align-items:center"><input type="checkbox" name="by" value="sku" {% if by == 'sku' %}checked{% endif %}> показать размеры</label>
+    <label>Маржин. от<input name="mmin" value="{{ mmin }}" inputmode="decimal" style="width:56px"></label>
+    <label>до<input name="mmax" value="{{ mmax }}" inputmode="decimal" style="width:56px"></label>
     <button class="secondary">Показать</button>
-    <a class="btn secondary" href="/sku-prices?scope={{ sc.key }}">Сбросить</a>
+    <a class="btn secondary" href="/sku-prices?scope={{ sc.key }}{% if by %}&amp;by={{ by }}{% endif %}">Сбросить</a>
   </div>
-  <p class="muted" style="margin-bottom:0">{{ names[sc.platform] }}: комиссия {{ rule.commission_percent|plain if rule.commission_percent is not none else '— не задана' }}%,
-  коэффициент по умолчанию {{ ru(rule.base_coef) if rule.base_coef is not none else '— не задан' }}, пол маржинальности {{ ru(rule.min_markup_coef) }},
+  <p class="muted" style="margin-bottom:0">{{ names[sc.platform] }}: комиссия — тариф площадки по категории товара или {{ rule.commission_percent|plain if rule.commission_percent is not none else '—' }}%,
+  + {{ rule.commission_extra|plain }} п.п.; по умолчанию {{ ru(rule.base_coef) if rule.base_coef is not none else '— не задано' }}; пол маржинальности {{ ru(rule.min_markup_coef) }};
   лимит шага {{ rule.max_change_percent|plain }}% — <a href="/prices?view=rules">правила площадки</a>.
-  {% if sc.account_id %}Коэффициент, заданный здесь, — только для этого кабинета.{% elif sc.accounts|length > 1 %}Коэффициент, заданный здесь, — для всех {{ sc.accounts|length }} кабинетов; у кабинета со своим коэффициентом действует свой.{% endif %}</p>
+  {% if sc.account_id %}Наценка, заданная здесь, — только для этого кабинета.{% elif sc.accounts|length > 1 %}Наценка, заданная здесь, — для всех {{ sc.accounts|length }} кабинетов; у кабинета со своей действует своя.{% endif %}</p>
 </form>
 
 <div class="row" style="margin-bottom:10px">
-  <a class="btn secondary" href="/sku-prices/export?{{ export_qs }}">Экспорт отбора в Excel</a>
+  <a class="btn secondary" href="/sku-prices/export?{{ export_qs }}" title="Ровно то, что отобрано на странице">Экспорт отбора в Excel</a>
   <form method="post" action="/sku-prices/import" enctype="multipart/form-data" class="row">
-    <label>Импорт коэффициентов (колонка «Коэффициент от базовой»; пусто — без изменений, «-» — снять)<input type="file" name="file" accept=".xlsx" required></label>
+    <label>Импорт наценок (колонки «Вид наценки» и «Наценка»; пусто — без изменений, «-» — снять)<input type="file" name="file" accept=".xlsx" required></label>
     <button class="secondary">Импорт из Excel</button>
   </form>
 </div>
 
 <form method="post" action="/sku-prices/coef" id="bulk">
-  {% for k, v in (('scope', sc.key), ('art', art), ('barcode', barcode), ('color', color), ('size', size), ('flt', flt), ('mmin', mmin), ('mmax', mmax), ('by', by)) %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
+  {% for k, v in (('scope', sc.key), ('art', art), ('barcode', barcode), ('color', color), ('size', size), ('cat', cat), ('flt', flt), ('mmin', mmin), ('mmax', mmax), ('by', by)) %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
   <div class="card">
     <div class="row">
-      <label style="flex-direction:row;gap:6px;align-items:center"><input type="checkbox" name="all_filtered" value="1" id="all-filtered"> весь отбор — {{ total }} арт.</label>
-      <label>1. Коэффициент<select name="action">{% for k, v in actions.items() %}<option value="{{ k }}">{{ v }}</option>{% endfor %}</select></label>
-      <label>значение<input name="value" inputmode="decimal" style="width:80px" placeholder="2,5"></label>
-      <button type="submit" onclick="return check('Установить коэффициент')">Установить</button>
-      <span style="width:24px"></span>
+      <label style="flex-direction:row;gap:6px;align-items:center"><input type="checkbox" name="all_filtered" value="1" id="all-filtered"> весь отбор — {{ total }} {{ 'кат.' if by == 'category' else 'арт.' }}</label>
+      <label>1. Наценка {{ 'категории' if by == 'category' else 'артикула' }}<select name="action">{% for k, v in actions.items() %}<option value="{{ k }}">{{ v }}</option>{% endfor %}</select></label>
+      <label>вид<select name="kind">{% for k, v in kinds.items() %}<option value="{{ k }}" {% if (by == 'category') == (k == KIND_MARGIN) %}selected{% endif %}>{{ v }}</option>{% endfor %}</select></label>
+      <label>значение<input name="value" inputmode="decimal" style="width:70px" placeholder="{{ '1,8' if by == 'category' else '2,5' }}"></label>
+      <button type="submit" onclick="return check('Установить наценку')">Установить</button>
+      <span style="width:16px"></span>
       <label style="flex-direction:row;gap:6px;align-items:center"><input type="checkbox" name="confirm_large" value="1"> включая изменения больше лимита</label>
       <button type="submit" formaction="/sku-prices/send" onclick="return check('ПЕРЕДАТЬ НОВЫЕ ЦЕНЫ на площадку «{{ sc.label }}»')">2. Передать на площадки</button>
     </div>
-    <p class="muted" style="margin-bottom:0">Сначала коэффициент — новая цена и маржинальность сразу видны в таблице, на площадки при этом ничего
-    не уходит. Затем «Передать»: цены встают в очередь отправки во все кабинеты «{{ sc.label }}». Ниже пола не уходит никогда;
-    цена, которая уже стоит на площадке, повторно не отправляется.
-    Найдено: {{ total }} артикулов ({{ skus }} размеров){% if total > groups|length %}, показаны первые {{ groups|length }} — галочка «весь отбор» берёт все, полный список — в Excel{% endif %}.</p>
+    <p class="muted" style="margin-bottom:0">Сначала наценка — новая цена и маржинальность сразу видны в таблице, на площадки ничего не уходит.
+    Затем «Передать»: цены встают в очередь отправки во все кабинеты «{{ sc.label }}». Ниже пола не уходит никогда; цена,
+    которая уже стоит на площадке, повторно не отправляется.
+    Найдено: {{ total }} {{ 'категорий' if by == 'category' else 'артикулов' }} ({{ skus }} размеров){% if total > groups|length %}, показаны первые {{ groups|length }} — галочка «весь отбор» берёт все, полный список — в Excel{% endif %}.</p>
   </div>
 
 <div class="scroll"><table class="art-table">
 <tr><th><input type="checkbox" onclick="document.querySelectorAll('input[name=arts]').forEach(c => c.checked = this.checked)"></th>
-<th>Артикул</th><th class="num">Себест., $</th><th class="num">Базовая, ₽</th><th>Коэффициент</th>
+<th>{{ 'Категория' if by == 'category' else 'Артикул' }}</th>{% if by != 'category' %}<th class="num">Себест., $</th><th class="num">Базовая, ₽</th>{% else %}<th class="num">Комиссия, %</th>{% endif %}<th>Наценка</th>
 <th class="num">Новая цена<div class="muted">маржинальность</div></th><th class="num">Текущая цена<div class="muted">маржинальность</div></th>
 <th class="num">Изменение</th></tr>
 {% for g in groups %}{% set n = loop.index %}<tr>
-  <td><input type="checkbox" name="arts" value="{{ g.article }}"></td>
-  <td class="art"><b>{{ g.article }}</b><div class="muted">{{ g.name }}</div>
-    <div class="muted">{% if g.colors %}{{ g.colors|join(', ') }} · {% endif %}{{ g.rows|length }} разм.{% if g.sizes and g.sizes|length <= 8 %}: {{ g.sizes|join(', ') }}{% endif %}</div></td>
+  <td><input type="checkbox" name="arts" value="{{ g.key }}"></td>
+  {% if by == 'category' %}
+  <td class="art"><b>{{ g.key }}</b><div class="muted">{{ g.articles|length }} арт. · {{ g.rows|length }} разм.</div></td>
+  <td class="num">{{ g.commission }}<div class="muted">{{ 'по тарифу' if g.tariff_known else 'из правила' }}</div></td>
+  <td>{% if g.key != '(без категории)' %}<select form="row{{ n }}" name="kind" class="kind">{% for k, v in kinds.items() %}<option value="{{ k }}" {% if (g.own_kind or KIND_MARGIN) == k %}selected{% endif %}>{{ 'маржин.' if k == KIND_MARGIN else 'коэфф.' }}</option>{% endfor %}</select><input form="row{{ n }}" name="value" value="{{ ru(g.own_value) if g.own_value is not none else '' }}" placeholder="—" inputmode="decimal" style="width:56px"><button form="row{{ n }}" class="secondary" style="padding:4px 8px">ok</button>{% endif %}
+    <div class="muted">действует: {{ target_text(g.kind, g.coef) }}{% if g.source %} ({{ sources.get(g.source) }}){% else %} (разные: у части артикулов своя){% endif %}</div></td>
+  {% else %}
+  <td class="art"><b>{{ g.key }}</b><div class="muted">{{ g.name }}</div>
+    <div class="muted">{% if g.category %}{{ g.category }} · {% endif %}{% if g.colors %}{{ g.colors|join(', ') }} · {% endif %}{{ g.rows|length }} разм.{% if g.sizes and g.sizes|length <= 8 %}: {{ g.sizes|join(', ') }}{% endif %}</div></td>
   <td class="num">{{ g.cost }}</td>
   <td class="num">{{ g.base }}</td>
-  <td><input form="row{{ n }}" name="value" value="{{ ru(g.coef) if g.coef is not none and g.source in ('article', 'cabinet') else '' }}"
-      placeholder="{{ ru(g.coef) if g.coef is not none else '—' }}" inputmode="decimal" style="width:64px"
-      title="Пусто — коэффициент площадки по умолчанию"><button form="row{{ n }}" class="secondary" style="padding:4px 8px">ok</button>
-    <div class="muted">{{ sources.get(g.source, 'разные') }}</div>
-    {% if g.own_cabinets and not sc.account_id %}<div class="muted" title="У этих кабинетов свой коэффициент — он главнее площадочного">свой у: {{ g.own_cabinets|join(', ') }}</div>{% endif %}
-    {% if g.manual %}<div class="warn" title="Ручная цена кабинета («Цены» → «Товары») главнее коэффициента">есть ручная цена</div>{% endif %}</td>
+  <td><select form="row{{ n }}" name="kind" class="kind">{% for k, v in kinds.items() %}<option value="{{ k }}" {% if (g.kind or 'coef') == k %}selected{% endif %}>{{ 'маржин.' if k == KIND_MARGIN else 'коэфф.' }}</option>{% endfor %}</select><input form="row{{ n }}" name="value" value="{{ ru(g.coef) if g.coef is not none and g.source in ('article', 'cabinet') else '' }}"
+      placeholder="{{ ru(g.coef) if g.coef is not none else '—' }}" inputmode="decimal" style="width:56px"
+      title="Пусто — наценка категории или умолчание площадки"><button form="row{{ n }}" class="secondary" style="padding:4px 8px">ok</button>
+    <div class="muted">{{ target_text(g.kind, g.coef) }} · {{ sources.get(g.source, 'разные') }}</div>
+    {% if g.own_cabinets and not sc.account_id %}<div class="muted" title="У этих кабинетов своя наценка — она главнее площадочной">своя у: {{ g.own_cabinets|join(', ') }}</div>{% endif %}
+    {% if g.manual %}<div class="warn" title="Ручная цена кабинета («Цены» → «Товары») главнее наценки">есть ручная цена</div>{% endif %}</td>
+  {% endif %}
   <td class="num"><b>{{ g.price }}</b><div class="{{ 'bad' if g.floor else 'muted' }}">{{ g.margin }}</div>
     {% if g.price == '—' and g.note %}<div class="muted" style="white-space:normal;max-width:220px">{{ g.note }}</div>{% endif %}</td>
   <td class="num">{{ g.current }}<div class="muted">{{ g.cur_margin }}{% if g.discount != '—' %} · скидка {{ g.discount }}%{% endif %}</div></td>
@@ -88,7 +100,7 @@
 {% for d in g.sizes_detail %}<tr class="size muted">
   <td></td>
   <td class="art" style="padding-left:22px">{{ d.row.sku.color if d.row.sku else '' }} {{ d.row.sku.size if d.row.sku else d.row.item_id }}<div>{{ d.row.barcodes|join(', ') }}</div></td>
-  <td class="num">{{ d.cost }}</td><td class="num">{{ d.base }}</td><td></td>
+  <td class="num">{{ d.cost }}</td><td class="num">{{ d.base }}</td><td class="muted">комиссия {{ d.commission }}%</td>
   <td class="num">{{ d.price }}<div class="{{ 'bad' if d.floor else '' }}">{{ d.margin }}</div></td>
   <td class="num">{{ d.current }}<div>{{ d.cur_margin }}</div></td>
   <td class="num">{% if d.pct is not none %}{{ ('%+.1f'|format(d.pct)).replace('.', ',') }}%{% endif %}</td>
@@ -96,14 +108,14 @@
 {% else %}<tr><td colspan="8" class="muted">Нет товаров: загрузите каталоги кабинетов («API-ключи») и справочник 1С («Диагностика») или ослабьте отбор.</td></tr>{% endfor %}
 </table></div>
 </form>
-{% for g in groups %}<form id="row{{ loop.index }}" method="post" action="/sku-prices/coef"><input type="hidden" name="row" value="{{ g.article }}">
-  {% for k, v in (('scope', sc.key), ('art', art), ('barcode', barcode), ('color', color), ('size', size), ('flt', flt), ('mmin', mmin), ('mmax', mmax), ('by', by)) %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}</form>{% endfor %}
+{% for g in groups %}<form id="row{{ loop.index }}" method="post" action="/sku-prices/coef"><input type="hidden" name="row" value="{{ g.key }}">
+  {% for k, v in (('scope', sc.key), ('art', art), ('barcode', barcode), ('color', color), ('size', size), ('cat', cat), ('flt', flt), ('mmin', mmin), ('mmax', mmax), ('by', by)) %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}</form>{% endfor %}
 <script>
 function check(what) {
   var all = document.getElementById('all-filtered').checked;
   var n = all ? {{ total }} : document.querySelectorAll('input[name=arts]:checked').length;
   if (!n) { alert('Ничего не отмечено.'); return false; }
-  return confirm(what + ': ' + n + ' артикулов (все их размеры)?' + (all ? ' Это ВЕСЬ отбор, включая строки вне экрана.' : ''));
+  return confirm(what + ': ' + n + ' {{ "категорий" if by == "category" else "артикулов" }} (все их размеры)?' + (all ? ' Это ВЕСЬ отбор, включая строки вне экрана.' : ''));
 }
 </script>
 {% endif %}

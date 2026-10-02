@@ -94,11 +94,15 @@ async def confirm(account_id: int, request: Request, db: Session = Depends(get_d
 
 
 @router.get("/mapping/export/{account_id}")
-def export(account_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+def export(account_id: int, status: str = Query(""), db: Session = Depends(get_db),
+           user: User = Depends(get_current_user)):
+    """Выгружается то же, что отобрано на странице: отбор по статусу сохраняется."""
     a = db.get(Account, account_id)
     if a is None:
         return RedirectResponse("/mapping", status_code=303)
     rows = mapping.build(db, a.id)
+    if status in mapping.STATUS_LABELS:
+        rows = [r for r in rows if r.status == status]
     data = [[r.item.barcode, r.item.article, r.item.size, r.item.name, r.label, r.item_id,
              ", ".join(r.others)] for r in rows]
     return xlsx_response(["Баркод", "Артикул площадки", "Размер", "Название", "Статус", "ID_1С",

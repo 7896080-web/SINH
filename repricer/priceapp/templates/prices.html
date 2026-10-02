@@ -28,16 +28,17 @@
 <div class="card">Нет активных кабинетов — заведите их на странице «API-ключи».</div>
 
 {% elif view == 'rules' %}
-<p class="muted">Правило — у ПЛОЩАДКИ и действует во всех её кабинетах (у WB — для всех ИП сразу).
-Цена = <b>базовая цена × коэффициент</b>, где базовая = себестоимость 1С, $ × курс ЦБ (руками не правится), затем округление
-вверх до шага и «красивое» окончание (шаг 100, минус 1 → 1299). Коэффициент задаётся на артикул — по площадке или по
-кабинету — на странице <a href="/sku-prices">«Цены товаров»</a>; здесь — коэффициент площадки по умолчанию для артикулов,
-у которых своего нет (пусто — у таких артикулов цены нет). Маржинальность = к получению / себестоимость ₽, где
-к получению = цена × (1 − комиссия): пол и лимит шага проверяются всегда, по комиссии площадки.</p>
+<p class="muted">Правило — у ПЛОЩАДКИ и действует во всех её кабинетах (у WB — для всех ИП сразу). Что такое базовая
+цена, цена на площадке, скидка продавца, к получению и маржинальность — в <a href="/help/prices">справке по типам цен</a>.
+Цена = базовая цена × коэффициент (или такая, чтобы вышла заданная маржинальность); наценку задают на артикул или
+категорию на странице <a href="/sku-prices">«Цены товаров»</a>, здесь — умолчание площадки для товаров без своей.
+<b>Комиссия</b> = тариф площадки по категории товара (WB и Ozon — из их тарифов, подтягиваются с каталогом и ценами) или,
+если тариф неизвестен, комиссия из правила, — плюс надбавка: «тариф 15,5% + 3 п.п.» — то, что площадка удерживает сверх
+процента (логистика, эквайринг). Пол и лимит шага проверяются всегда — с комиссией товара и текущей скидкой продавца.</p>
 <div class="row card">
   <a class="btn secondary" href="/prices/rules-export">Экспорт правил в Excel</a>
   <form method="post" action="/prices/rules-import" enctype="multipart/form-data" class="row">
-    <label>Импорт правил (пустая ячейка не меняет ничего, «-» снимает цену от другой площадки)<input type="file" name="file" accept=".xlsx" required></label>
+    <label>Импорт правил (пустая ячейка не меняет ничего, «-» снимает коэффициент по умолчанию)<input type="file" name="file" accept=".xlsx" required></label>
     <button class="secondary">Импорт из Excel</button>
   </form>
 </div>
@@ -46,7 +47,8 @@
   <h2 style="margin-top:0">{{ platform_names[p] }}</h2>
   <p class="muted" style="margin-top:0">Кабинеты: {% for a in cabinets[p] %}{{ a.name }}{{ ', ' if not loop.last }}{% endfor %}</p>
   <form method="post" action="/prices/rules/{{ p }}" class="row">
-    <label>Комиссия площадки, %<input name="commission_percent" value="{{ rule.commission_percent|plain }}" inputmode="decimal" style="width:110px" required></label>
+    <label>{{ 'Комиссия, если тариф неизвестен, %' if p in has_tariffs else 'Комиссия площадки, %' }}<input name="commission_percent" value="{{ rule.commission_percent|plain }}" inputmode="decimal" style="width:110px" required></label>
+    {% if p in has_tariffs %}<label>Тариф<select name="tariff_model">{% for k, v in tariff_models.items() %}<option value="{{ k }}" {% if (rule.tariff_model or 'fbs') == k %}selected{% endif %}>{{ v }}</option>{% endfor %}</select></label>{% else %}<input type="hidden" name="tariff_model" value="fbs">{% endif %}
     <label>{{ coef_title }}<input name="base_coef" value="{{ rule.base_coef|plain }}" inputmode="decimal" style="width:110px" placeholder="не задан"></label>
     {% for name, title, lo, hi in rule_fields %}
     <label>{{ title }}<input name="{{ name }}" value="{{ rule[name]|plain }}" inputmode="decimal" style="width:110px" required></label>
@@ -54,10 +56,34 @@
     <button type="submit" formaction="/prices/rules/{{ p }}/preview" class="secondary" title="Посчитать, сколько цен изменится, ничего не сохраняя">Что будет, если</button>
     <button type="submit">Сохранить</button>
   </form>
+  {% set tc = tariff_counts.get(p, (0, 0)) %}
+  <p class="muted" style="margin-bottom:0">Комиссия = {% if p in has_tariffs %}тариф {{ platform_names[p] }} по категории товара
+    (известен у {{ tc[1] }} из {{ tc[0] }} позиций{% if tc[0] and not tc[1] %} — загрузите каталог{% if p == 'ozon' %} и текущие цены{% endif %}{% endif %}),
+    иначе {{ rule.commission_percent|plain if rule.commission_percent is not none else '—' }}%{% else %}{{ rule.commission_percent|plain if rule.commission_percent is not none else '—' }}%{% endif %}
+    + {{ rule.commission_extra|plain }} п.п.
+    {% if rule.base_coef is not none and rule.commission_percent is not none %}По умолчанию: цена = базовая × {{ ru(rule.base_coef) }};
+    при комиссии {{ (rule.commission_percent + rule.commission_extra)|plain }}% без скидки маржинальность ≈ {{ ru(((rule.base_coef * (100 - rule.commission_percent - rule.commission_extra) / 100) | round(2))) }}, пол — {{ ru(rule.min_markup_coef) }}.{% endif %}</p>
   {% if rule.commission_percent is none %}<p class="warn" style="margin-bottom:0">Комиссия не задана — по площадке не считаем.</p>{% endif %}
-  {% if rule.base_coef is not none and rule.commission_percent is not none %}<p class="muted" style="margin-bottom:0">По умолчанию: цена = базовая × {{ ru(rule.base_coef) }}, маржинальность ≈ {{ ru(((rule.base_coef * (100 - rule.commission_percent) / 100) | round(2))) }} при комиссии {{ rule.commission_percent|plain }}%; пол — {{ ru(rule.min_markup_coef) }}.</p>{% endif %}
+  <h3 style="margin:14px 0 6px;font-size:15px">Диапазон безопасности акций — по кабинетам</h3>
+  <p class="muted" style="margin:0 0 6px">Маржинальность по ТЕКУЩЕЙ цене на площадке (со скидкой продавца и акцией). Ниже «от» —
+  программа сама возвращает цену по наценке кабинета; если цена и так наша, а маржинальность съедает скидка или акция —
+  пишет об этом на «Внимании». Выше «до» — пометка. Проверка — при запуске программы и раз в сутки, после загрузки текущих цен.</p>
+  {% for a in cabinets[p] %}<form method="post" action="/prices/guard/{{ a.id }}" class="row" style="margin-bottom:6px">
+    <span style="min-width:150px;align-self:center"><b>{{ a.name }}</b></span>
+    <label>от<input name="guard_min_margin" value="{{ a.guard_min_margin|plain if a.guard_min_margin is not none else '' }}" inputmode="decimal" style="width:80px" placeholder="—"></label>
+    <label>до<input name="guard_max_margin" value="{{ a.guard_max_margin|plain if a.guard_max_margin is not none else '' }}" inputmode="decimal" style="width:80px" placeholder="—"></label>
+    <button class="secondary">Сохранить</button>
+  </form>{% endfor %}
 </div>
 {% endfor %}
+<div class="row card">
+  <form method="post" action="/prices/guard-run"><button title="По уже загруженным текущим ценам — к площадкам не обращается">Проверить диапазоны сейчас</button></form>
+  <a class="btn secondary" href="/prices/guard-export">Экспорт диапазонов в Excel</a>
+  <form method="post" action="/prices/guard-import" enctype="multipart/form-data" class="row">
+    <label>Импорт диапазонов (пусто — без изменений, «-» — снять границу)<input type="file" name="file" accept=".xlsx" required></label>
+    <button class="secondary">Импорт из Excel</button>
+  </form>
+</div>
 
 {% elif view == 'products' %}
 <form method="get" action="/prices" class="row card">

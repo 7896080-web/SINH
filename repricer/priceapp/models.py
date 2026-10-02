@@ -76,6 +76,12 @@ class Account(Base):
     # Текущие цены с площадки (`accounts.load_prices`): когда и с какой оговоркой.
     prices_loaded_at = Column(DateTime, nullable=True)
     prices_note = Column(Text, nullable=False, default="")
+    # Диапазон безопасности для участия в акциях — маржинальность «от … до …»
+    # по ТЕКУЩЕЙ цене площадки (с её скидкой продавца). Ниже «от» — программа
+    # возвращает цену по коэффициенту кабинета (`guard.py`); выше «до» — только
+    # пометка. NULL — граница не задана.
+    guard_min_margin = Column(Numeric(7, 3), nullable=True)
+    guard_max_margin = Column(Numeric(7, 3), nullable=True)
     created_at = Column(DateTime, nullable=False, default=now_utc)
 
     credentials = relationship("ApiCredential", back_populates="account",
@@ -123,6 +129,18 @@ class PlatformItem(Base):
     # Минимальная цена площадки для этой позиции, ₽ (Lamoda: по категории и
     # бренду). Только ПРЕДУПРЕЖДЕНИЕ: сопоставление категорий — по названиям.
     min_price = Column(Integer, nullable=True)
+    # Категория товара на площадке (WB — предмет, Ozon — тип товара, Kit —
+    # категория витрины, Lamoda — нижний уровень категории). По ней группируют
+    # товары и задают маржинальность на категорию; пусто — площадка не сказала.
+    category = Column(String(200), nullable=False, default="")
+    category_id = Column(String(64), nullable=False, default="")
+    # Комиссия площадки по её ТАРИФУ для этой позиции, % (WB — по предмету из
+    # тарифной таблицы, Ozon — по товару из ответа о ценах). FBS — со своего
+    # склада, FBO — со склада площадки; какую брать, решает правило площадки.
+    # NULL — тариф неизвестен: берётся комиссия из правила.
+    tariff_fbs = Column(Numeric(6, 2), nullable=True)
+    tariff_fbo = Column(Numeric(6, 2), nullable=True)
+    tariff_loaded_at = Column(DateTime, nullable=True)
 
 
 # --- 1С: справочник баркодов, себестоимость, задания ------------------------------
@@ -247,6 +265,12 @@ class PlatformRule(Base):
     # ни ручной ценой. 1 — «не в убыток».
     min_markup_coef = Column(Numeric(7, 3), nullable=False, default=1)
     max_change_percent = Column(Numeric(7, 2), nullable=False, default=20)
+    # Надбавка к комиссии, процентных пунктов: «тариф 15,5% + 3» — логистика,
+    # эквайринг и прочее, что площадка удерживает сверх процента. Прибавляется
+    # и к тарифу, и к комиссии из правила.
+    commission_extra = Column(Numeric(6, 2), nullable=False, default=0)
+    # Какой тариф площадки брать: fbs (со своего склада) или fbo (со склада площадки).
+    tariff_model = Column(String(4), nullable=False, default="fbs")
     base_platform = Column(String(8), nullable=True)
     base_coef = Column(Numeric(7, 3), nullable=True)
     updated_at = Column(DateTime, nullable=False, default=now_utc, onupdate=now_utc)
@@ -318,10 +342,15 @@ class SavedFilter(Base):
 
 
 class ArticleCoef(Base):
-    """Коэффициент от базовой цены, заданный на АРТИКУЛ 1С — сразу для всех его
-    размеров (и цветов). `account_id` = 0 — на всю площадку (у WB — для всех
-    трёх ИП), иначе — только для этого кабинета, и он главнее площадочного.
-    Ноль, а не NULL: уникальность пары с NULL SQLite не проверяет."""
+    """Наценка, заданная на АРТИКУЛ 1С — сразу для всех его размеров (и цветов).
+    `account_id` = 0 — на всю площадку (у WB — для всех трёх ИП), иначе — только
+    для этого кабинета, и он главнее площадочного. Ноль, а не NULL: уникальность
+    пары с NULL SQLite не проверяет.
+
+    `kind` — что задано: `coef` — коэффициент от базовой (цена = базовая × k),
+    `margin` — маржинальность (цена такая, чтобы к получению / себестоимость = m
+    при ТЕКУЩЕЙ комиссии и скидке продавца: площадка сменила тариф — цена
+    пересчитается, маржинальность останется)."""
     __tablename__ = "article_coefs"
     __table_args__ = (UniqueConstraint("article", "platform", "account_id", name="uq_article_coef"),)
     id = Column(Integer, primary_key=True)
@@ -329,5 +358,22 @@ class ArticleCoef(Base):
     platform = Column(String(8), nullable=False)
     account_id = Column(Integer, nullable=False, default=0)
     coef = Column(Numeric(7, 3), nullable=False)
+    kind = Column(String(8), nullable=False, default="coef")
+    updated_at = Column(DateTime, nullable=False, default=now_utc, onupdate=now_utc)
+    updated_by = Column(String(64), nullable=False, default="")
+
+
+class CategoryTarget(Base):
+    """Наценка на КАТЕГОРИЮ площадки — по кабинету (`account_id`) или на всю
+    площадку (0). Слабее наценки артикула, сильнее умолчания площадки. `kind` —
+    как у `ArticleCoef`."""
+    __tablename__ = "category_targets"
+    __table_args__ = (UniqueConstraint("platform", "account_id", "category", name="uq_category_target"),)
+    id = Column(Integer, primary_key=True)
+    platform = Column(String(8), nullable=False)
+    account_id = Column(Integer, nullable=False, default=0)
+    category = Column(String(200), nullable=False)
+    kind = Column(String(8), nullable=False, default="margin")
+    value = Column(Numeric(7, 3), nullable=False)
     updated_at = Column(DateTime, nullable=False, default=now_utc, onupdate=now_utc)
     updated_by = Column(String(64), nullable=False, default="")

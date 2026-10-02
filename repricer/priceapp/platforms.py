@@ -59,6 +59,8 @@ class CatalogRow:
     article: str
     name: str
     size: str = ""
+    category: str = ""          # категория площадки (WB — предмет, Ozon — тип товара)
+    category_id: str = ""
 
 
 @dataclass
@@ -74,6 +76,14 @@ class CurrentPrice:
     price: int              # то же поле, что мы отправляем
     sale_price: int         # что платит покупатель (после скидки продавца)
     status: str = ""        # что площадка говорит о цене (Lamoda: OK/PROCESSING/ERROR/QUARANTINE)
+    tariff_fbs: float | None = None     # комиссия площадки по тарифу, % (Ozon — в ответе о ценах)
+    tariff_fbo: float | None = None
+
+
+@dataclass
+class Tariff:
+    fbs: float | None       # со своего склада (WB «Маркетплейс», Ozon FBS)
+    fbo: float | None       # со склада площадки (WB «Склад WB», Ozon FBO)
 
 
 class PlatformError(RuntimeError):
@@ -92,6 +102,7 @@ def _int_price(v) -> int | None:
 
 WB_CONTENT = "https://content-api.wildberries.ru"
 WB_PRICES = "https://discounts-prices-api.wildberries.ru"
+WB_COMMON = "https://common-api.wildberries.ru"
 WB_PAGE = 100            # по спеке WB у cursor.limit maximum: 100
 WB_MAX_PAGES = 2000
 WB_PRICE_PAGE = 1000      # limit у /api/v2/list/goods/filter — до 1000
@@ -146,6 +157,16 @@ class WbClient:
         else:
             self.last_truncated = True
         return result
+
+    def get_tariffs(self) -> dict[str, Tariff]:
+        """Комиссия WB по предметам — `GET /api/v1/tariffs/commission` (раздел
+        «Тарифы», по спеке подходит токен любой категории; лимит — запрос в минуту).
+        Ключ — subjectID, тот же, что у карточки в каталоге."""
+        def call():
+            r = self.session.get(f"{WB_COMMON}/api/v1/tariffs/commission", params={"locale": "ru"}, timeout=60)
+            r.raise_for_status()
+            return r.json()
+        return parse_wb_tariffs(with_retry(call))
 
     def price_key(self, item) -> str:
         """Чем адресуется цена строки каталога: у WB — nmID (цена на карточку)."""
@@ -212,17 +233,36 @@ def parse_wb_prices(data: dict) -> dict[str, CurrentPrice]:
     return out
 
 
+def _pct(v) -> float | None:
+    try:
+        n = float(v)
+    except (TypeError, ValueError):
+        return None
+    return n if 0 <= n < 100 else None
+
+
+def parse_wb_tariffs(data: dict) -> dict[str, Tariff]:
+    """subjectID -> комиссия: FBS — `kgvpMarketplace` (модель «Маркетплейс»),
+    FBO — `paidStorageKgvp` (модель «Склад WB»)."""
+    out = {}
+    for r in data.get("report") or []:
+        if r.get("subjectID") is not None:
+            out[str(r["subjectID"])] = Tariff(_pct(r.get("kgvpMarketplace")), _pct(r.get("paidStorageKgvp")))
+    return out
+
+
 def parse_wb_cards(data: dict) -> list[CatalogRow]:
     result = []
     for card in data.get("cards", data.get("data", {}).get("cards", [])):
         nm_id = str(card.get("nmID", ""))
         article = card.get("vendorCode", "")
         name = card.get("title") or card.get("subjectName") or article
+        subject, subject_id = str(card.get("subjectName") or ""), str(card.get("subjectID") or "")
         for size in card.get("sizes", []):
             sku_id = f"{nm_id}:{size.get('chrtID', '')}"
             size_name = str(size.get("techSize") or size.get("wbSize") or "").strip()
             for sku in size.get("skus", []):
-                result.append(CatalogRow(sku_id, sku, article, name, size_name))
+                result.append(CatalogRow(sku_id, sku, article, name, size_name, subject, subject_id))
     return result
 
 
@@ -278,7 +318,20 @@ class OzonClient:
                 break
         else:
             self.last_truncated = True
+        names = self._type_names()
+        for r in result:
+            r.category = names.get(r.category_id, r.category)
         return result
+
+    def _type_names(self) -> dict[str, str]:
+        """type_id -> название типа товара из дерева категорий Ozon
+        (`/v1/description-category/tree`). Не вышло — категории останутся кодами:
+        группировка от этого не ломается, просто читается хуже."""
+        try:
+            tree = self._post("/v1/description-category/tree", {"language": "DEFAULT"})
+        except Exception:
+            return {}
+        return parse_ozon_type_names(tree)
 
     def price_key(self, item) -> str:
         """У Ozon цена — на offer_id (артикул продавца)."""
@@ -331,22 +384,46 @@ class OzonClient:
 
 
 def parse_ozon_prices(data: dict) -> dict[str, CurrentPrice]:
+    """offer_id -> цена. `price.price` — цена продажи, её мы и ставим (у Ozon
+    «скидка продавца» — это зачёркнутая `old_price` над ней, на выручку не
+    влияет). Покупатель платит меньше, если товар в акции за счёт продавца, —
+    `marketing_seller_price`. Комиссия по тарифу — `commissions.sales_percent_fbs/fbo`."""
     out = {}
     for it in data.get("items") or []:
-        p = _int_price((it.get("price") or {}).get("price"))
+        pr = it.get("price") or {}
+        p = _int_price(pr.get("price"))
         if p and it.get("offer_id"):
-            out[str(it["offer_id"])] = CurrentPrice(p, p)
+            sale = _int_price(pr.get("marketing_seller_price"))
+            com = it.get("commissions") or {}
+            out[str(it["offer_id"])] = CurrentPrice(p, sale if sale and sale < p else p, "",
+                                                    _pct(com.get("sales_percent_fbs")),
+                                                    _pct(com.get("sales_percent_fbo")))
     return out
 
 
 def parse_ozon_info(data: dict) -> list[CatalogRow]:
+    """Категория — тип товара (`type_id`); название подставит `_type_names`."""
     result = []
     for item in data.get("items", data.get("result", {}).get("items", [])):
         barcodes = item.get("barcodes") or ([item["barcode"]] if item.get("barcode") else [])
+        type_id = str(item.get("type_id") or "")
         for b in [b for b in barcodes if b]:
             result.append(CatalogRow(str(item.get("id", "")), b, item.get("offer_id", ""),
-                                     item.get("name", "")))
+                                     item.get("name", ""), "", type_id, type_id))
     return result
+
+
+def parse_ozon_type_names(tree: dict) -> dict[str, str]:
+    """Обход дерева: узлы с `type_id` — типы товаров (листья)."""
+    out = {}
+
+    def walk(nodes):
+        for n in nodes or []:
+            if n.get("type_id"):
+                out[str(n["type_id"])] = str(n.get("type_name") or "")
+            walk(n.get("children"))
+    walk(tree.get("result"))
+    return out
 
 
 # --- Яндекс KIT ------------------------------------------------------------------
@@ -400,9 +477,43 @@ class KitClient:
 
     def get_catalog(self) -> list[CatalogRow]:
         result = []
+        product_of: dict[str, str] = {}
         for data in self._variants():
             result.extend(parse_kit_variants(data))
+            for v in data.get("variants") or []:
+                product_of[str(v.get("id", ""))] = str(v.get("product_id") or "")
+        truncated = self.last_truncated
+        try:
+            cats = self._product_categories()
+        except Exception:       # категория — для группировки; каталог важнее
+            cats = {}
+        self.last_truncated = truncated
+        for r in result:
+            cid, title = cats.get(product_of.get(r.external_id, ""), ("", ""))
+            r.category, r.category_id = title, cid
         return result
+
+    def _product_categories(self) -> dict[str, tuple[str, str]]:
+        """product_id -> (category_id, название): первая активная категория
+        продукта (`/v1/products`, `/v1/categories`; у категорий `status` обязателен)."""
+        titles = {}
+        for page in range(1, KIT_MAX_PAGES + 1):
+            data = self._get("/v1/categories", params={"page": page, "per_page": 100, "status": "ACTIVE"})
+            cats = data.get("categories") or []
+            for c in cats:
+                titles[str(c.get("id"))] = str(c.get("title") or "")
+            if not cats or len(titles) >= (data.get("total_count") or 0):
+                break
+        out = {}
+        for page in range(1, KIT_MAX_PAGES + 1):
+            prods = (self._get("/v1/products", params={"page": page, "per_page": 100}) or {}).get("products") or []
+            if not prods:
+                break
+            for p in prods:
+                ids = [str(c) for c in p.get("category_ids") or []]
+                if ids:
+                    out[str(p.get("id"))] = (ids[0], titles.get(ids[0], ids[0]))
+        return out
 
     def price_key(self, item) -> str:
         """Цена у Kit — на ВАРИАНТ (размер), ключ — variant_id."""
@@ -695,6 +806,17 @@ def _lamoda_rub(price: dict | None) -> int | None:
     return int(round(amount / 100))
 
 
+def _lamoda_category(n: dict) -> tuple[str, str]:
+    """Нижний уровень категории — по-русски, если есть, иначе по-английски."""
+    levels = n.get("categoryLevels") or []
+    for lang in ("RU", "EN"):
+        mine = [lv for lv in levels if lv.get("language") == lang and lv.get("name")]
+        if mine:
+            last = max(mine, key=lambda lv: lv.get("level") or 0)
+            return str(last["name"]), str(last.get("id") or last.get("level") or "")
+    return "", ""
+
+
 def parse_lamoda_nomenclatures(data: dict) -> list[CatalogRow]:
     result = []
     for n in data.get("nomenclatures") or []:
@@ -702,7 +824,7 @@ def parse_lamoda_nomenclatures(data: dict) -> list[CatalogRow]:
             continue
         result.append(CatalogRow(f"{n['parentSku']}:{n.get('sku') or ''}", n["barcode"],
                                  n.get("externalParentSku") or n.get("externalSku") or "",
-                                 n.get("name") or "", n.get("externalSize") or ""))
+                                 n.get("name") or "", n.get("externalSize") or "", *_lamoda_category(n)))
     return result
 
 

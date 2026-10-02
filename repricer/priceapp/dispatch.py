@@ -1,9 +1,10 @@
 """Отправка ПОДТВЕРЖДЁННЫХ цен на площадки.
 
 Уходит только `approved` и только не-тестовое. Перед отправкой пол наценки
-проверяется ЕЩЁ РАЗ — по текущему курсу, себестоимости и комиссии кабинета:
-между подтверждением и отправкой доллар мог вырасти, 1С прислать новую
-себестоимость, а оператор поменять комиссию или правило.
+проверяется ЕЩЁ РАЗ — по текущему курсу, себестоимости, комиссии товара (тариф
+площадки + надбавка) и ТЕКУЩЕЙ скидке продавца на площадке: между
+подтверждением и отправкой доллар мог вырасти, 1С прислать новую себестоимость,
+площадка — сменить тариф, а в кабинете могли поставить скидку под акцию.
 """
 from __future__ import annotations
 
@@ -16,7 +17,7 @@ from priceapp import accounts, rates
 from priceapp.models import (Account, OnecCost, PlatformItem, PriceChange, PriceChangeStatus,
                              ProductPrice)
 from priceapp.platforms import PriceItem
-from priceapp.pricing import BLOCK_FLOOR, floor_price, get_rule
+from priceapp.pricing import BLOCK_FLOOR, _ru, floor_price, get_rule, item_facts
 from priceapp.timeutils import now_utc
 
 MAX_ATTEMPTS = 5
@@ -55,7 +56,6 @@ def run_account(db: Session, account: Account, client) -> dict:
         latest[ch.item_id] = ch
 
     rule = get_rule(db, account.platform)
-    commission = rule.commission_percent
     rate = rates.current(db)
     costs = {c.item_id: c for c in db.query(OnecCost).filter(OnecCost.item_id.in_(list(latest)))}
     now = now_utc()
@@ -63,23 +63,26 @@ def run_account(db: Session, account: Account, client) -> dict:
     for item_id, ch in latest.items():
         if ch.next_attempt_at is not None and ch.next_attempt_at > now:
             continue
-        cost = costs.get(item_id)
-        if cost is not None and rate is not None and commission is not None:
-            cost_rub = Decimal(str(cost.cost_usd)) * rate.usd_rub
-            floor = floor_price(cost_rub, rule, commission)
-            if ch.new_price < floor:
-                ch.status = PriceChangeStatus.blocked.value
-                ch.block_reason = BLOCK_FLOOR
-                ch.note = (f"при отправке: минимум {floor} ₽ (курс {rate.usd_rub}, "
-                           f"себестоимость {cost.cost_usd} $, комиссия {commission}%)")
-                floored += 1
-                continue
         row = (db.query(PlatformItem).filter(PlatformItem.account_id == account.id,
                                              PlatformItem.barcode == ch.barcode).first())
         if row is None:
             ch.status = PriceChangeStatus.error.value
             ch.last_error = "баркода нет в каталоге кабинета — обновите каталог и пересчитайте"
             continue
+        cost = costs.get(item_id)
+        facts = item_facts(rule, [row])
+        if cost is not None and rate is not None and facts.commission is not None:
+            cost_rub = Decimal(str(cost.cost_usd)) * rate.usd_rub
+            floor = floor_price(cost_rub, rule, facts.commission, facts.discount)
+            if ch.new_price < floor:
+                ch.status = PriceChangeStatus.blocked.value
+                ch.block_reason = BLOCK_FLOOR
+                ch.note = (f"при отправке: минимум {floor} ₽ (курс {rate.usd_rub}, "
+                           f"себестоимость {cost.cost_usd} $, комиссия {_ru(facts.commission)}%"
+                           + (f", скидка продавца {_ru((facts.discount * 100).quantize(Decimal('1')))}%"
+                              if facts.discount else "") + ")")[:255]
+                floored += 1
+                continue
         items.append(PriceItem(row.barcode, ch.new_price, row.external_id, row.article))
         by_barcode[row.barcode] = ch
 
