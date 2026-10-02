@@ -37,9 +37,12 @@ def xlsx_bytes(headers: list[str], rows: list[list]) -> bytes:
 
 def xlsx_response(headers: list[str], rows: list[list], filename: str) -> StreamingResponse:
     disposition = f"attachment; filename=\"export.xlsx\"; filename*=UTF-8''{quote(filename)}"
-    return StreamingResponse(io.BytesIO(xlsx_bytes(headers, rows)),
-                             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                             headers={"Content-Disposition": disposition})
+    response = StreamingResponse(io.BytesIO(xlsx_bytes(headers, rows)),
+                                 media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                 headers={"Content-Disposition": disposition})
+    # Знак индикатору загрузки (static/busy.js): файл отдан, бегущую строку можно гасить.
+    response.set_cookie("download_done", "1", max_age=60, path="/", samesite="lax")
+    return response
 
 
 def read_xlsx_rows(data: bytes) -> list[dict]:
