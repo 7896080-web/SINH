@@ -23,6 +23,8 @@ import re
 
 import pytest
 
+from app.workers import ftp_channel
+
 ROOT = Path(__file__).resolve().parent.parent
 LIVE = ROOT / "1c" / "ОбменССайтом_МодульОбъекта.txt"
 SRC = ROOT / "1c" / "src" / "ОбменССайтом" / "Ext" / "ObjectModule.bsl"
@@ -216,3 +218,36 @@ def test_the_scrap_document_fills_every_required_field():
                        "СтрокаТовара.Коэффициент =", "СтрокаТовара.СтатьяЗатрат =",
                        "СтрокаТовара.КлючСтроки ="):
         assert assignment in block, f"в документе списания не заполняется {assignment}"
+
+
+@repository_only
+def test_our_task_names_do_not_route_answers_into_someone_elses_folder():
+    """Обработка кладёт ответ по ПРЕФИКСУ ИМЕНИ ЗАДАНИЯ, и это новая связь.
+
+    02.10 у обработки появились ещё два потребителя — «Маркировка и поставки»
+    (`task_mark_*`) и «Репрайсер» (`task_price_*`), — и ответы им уходят в
+    подкаталоги `results\\marking` и `results\\pricing`. Сделано верно: мы
+    забираем из `results` все `result_*.txt` БЕЗ захода вглубь и унесли бы чужой
+    ответ в архив как несопоставленный, а его программа не увидела бы вовсе.
+
+    Но у этого есть обратная сторона, которой раньше не было. Начнись НАША метка
+    с такого префикса — ответ уехал бы в чужую папку, мы бы его не прочитали
+    никогда, и КАЖДОЕ задание доживало бы до `timeout`: по созданиям остаток
+    занижен, по отменам завышен, то есть прямой оверселл, и всё это молча.
+
+    Префиксы берём ИЗ САМОГО МОДУЛЯ, а не списком рядом: появится третий
+    потребитель — проверка узнает о нём сама. Повтори мы их здесь, она молчала бы
+    ровно тогда, когда нужна.
+    """
+    text = LIVE.read_text(encoding="utf-8-sig")
+    prefixes = re.findall(r'СтрНачинаетсяС\(Метка,\s*"([^"]+)"\)', text)
+    assert prefixes, "в модуле не нашлось ни одной развилки по префиксу метки"
+
+    name = ftp_channel._unique_task_filename()
+    assert name.startswith("task_"), name
+    label = name[len("task_"):].removesuffix(".txt")
+    for prefix in prefixes:
+        assert not label.startswith(prefix), (
+            f"наша метка {label!r} начинается с {prefix!r} — обработка положит "
+            f"ответ в чужой подкаталог, мы его не прочитаем, и задание уйдёт "
+            f"в timeout")
