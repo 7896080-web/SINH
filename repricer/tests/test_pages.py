@@ -46,6 +46,22 @@ def test_api_keys_encrypted_and_masked(client, db):
     assert db.query(ApiCredential).count() == 2
 
 
+def test_browser_autofilled_login_password_never_becomes_a_platform_key(client, db):
+    """Браузер подставляет пароль входа в поле ключа сам; «Сохранить» ради галочки
+    «Активен» заменял им ключ Lamoda, и площадка отвечала invalid_client."""
+    client.post("/api-keys/new", data={"platform": "lamoda", "name": "Ламода"})
+    acc = db.query(Account).one()
+    client.post(f"/api-keys/{acc.id}", data={"name": "Ламода", "is_active": "1", "client_id": "real-client-id",
+                                             "client_secret": "real-secret", "seller_id": "777"})
+    r = client.post(f"/api-keys/{acc.id}", data={"name": "Ламода", "is_active": "1", "client_id": "password1",
+                                                 "client_secret": "", "seller_id": ""})
+    assert "браузер подставил ваш пароль" in r.text and "«Client ID»" in r.text
+    db.expire_all()
+    creds = {c.field_name: decrypt_value(c.encrypted_value) for c in db.query(ApiCredential)}
+    assert creds["client_id"] == "real-client-id"
+    assert 'autocomplete="new-password"' in client.get("/api-keys").text
+
+
 def test_check_and_catalog_with_fake_client(client, db, monkeypatch):
     from priceapp.routers import accounts as r
 
