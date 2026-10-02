@@ -441,3 +441,15 @@ def test_stale_approved_is_not_sent_and_deactivation_unapproves(client, db):
     client.post(f"/api-keys/{acc.id}", data={"name": acc.name, "is_active": "0"})
     db.expire_all()
     assert {c.status for c in db.query(PriceChange)} == {"rejected"}
+
+
+# --- индикатор загрузки --------------------------------------------------------------------
+
+def test_busy_indicator_on_every_page_and_file_signal(client, db):
+    _wb(client, db)
+    for url in ("/attention", "/sku-prices", "/prices?view=rules", "/mapping", "/api-keys", "/help/prices"):
+        assert '<script src="/static/busy.js" defer></script>' in client.get(url).text, url
+    js = client.get("/static/busy.js").text
+    assert "download_done" in js and "HTMLFormElement.prototype.submit" in js
+    r = client.get("/sku-prices/export?scope=wb")
+    assert "download_done=1" in r.headers.get("set-cookie", "")
