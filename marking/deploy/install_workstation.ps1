@@ -157,6 +157,10 @@ if ($count -eq "0") {
 
 # --- 7. Ярлык ---
 $run = Join-Path $Root "deploy\run_marking.ps1"
+# Своя иконка (deploy\marking.ico, рисует deploy\make_icon.py): ярлык на
+# powershell.exe без неё показывает синюю консоль — такую же, как у любого
+# скрипта, и на рабочем столе программу не найти.
+$icon = Join-Path $Root "deploy\marking.ico"
 $shell = New-Object -ComObject WScript.Shell
 function New-Shortcut($path) {
     $s = $shell.CreateShortcut($path)
@@ -164,6 +168,7 @@ function New-Shortcut($path) {
     $s.Arguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$run`" -Port $WebPort"
     $s.WorkingDirectory = $Root
     $s.Description = "Маркировка и поставки"
+    if (Test-Path $icon) { $s.IconLocation = "$icon,0" }
     $s.Save()
 }
 New-Shortcut (Join-Path ([Environment]::GetFolderPath("Desktop")) "Маркировка.lnk")
