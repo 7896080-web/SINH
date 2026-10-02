@@ -414,3 +414,30 @@ def test_mapping_export_keeps_status_filter(client, db):
     assert f"/mapping/export/{acc.id}?status=not_in_1c" in page
     ws = load_workbook(io.BytesIO(client.get(f"/mapping/export/{acc.id}?status=not_in_1c").content)).active
     assert [str(ws.cell(row=i, column=1).value) for i in range(2, ws.max_row + 1)] == ["4607001200000"]
+
+
+# --- лимит шага и устаревшее подтверждённое ------------------------------------------------
+
+def test_step_limit_counts_from_current_price_before_first_send(client, db):
+    a1, _ = _wb(client, db)
+    _prices(db, a1, b3=(1000, 1000))            # на площадке 1000, мы ещё ничего не отправляли
+    client.post("/prices/recalculate", data={"account_id": str(a1.id)})
+    ch = db.query(PriceChange).filter_by(account_id=a1.id, item_id="u3").one()
+    assert ch.status == "blocked" and ch.block_reason == "max_change"    # 2529 к 1000 — +153%
+
+
+def test_stale_approved_is_not_sent_and_deactivation_unapproves(client, db):
+    from datetime import timedelta
+    from priceapp.timeutils import now_utc
+    acc = _card(db, xl_last=4100)
+    ch = db.query(PriceChange).one()
+    ch.decided_at = now_utc() - timedelta(hours=30)
+    db.commit()
+    push = _Push()
+    dispatch.run_account(db, acc, push)
+    assert push.items == [] and db.query(PriceChange).one().status == "rejected"
+    db.add(PriceChange(item_id="s", account_id=acc.id, barcode="bs", new_price=4100, status="approved"))
+    db.commit()
+    client.post(f"/api-keys/{acc.id}", data={"name": acc.name, "is_active": "0"})
+    db.expire_all()
+    assert {c.status for c in db.query(PriceChange)} == {"rejected"}

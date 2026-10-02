@@ -308,7 +308,11 @@ def decide_for(inp: Inputs, item_id: str, account_id: int | None, cost_usd, usd_
     facts = item_facts(inp.rule, rows)
     manual = pp.manual_price if pp and pp.manual_price is not None else None
     target = target_for(inp, item_id, account_id, facts.category)
-    return decide(cost_usd, usd_rub, inp.rule, target, manual, pp.last_sent_price if pp else None, facts)
+    # Лимит шага — от последней принятой нами цены, а пока мы ничего не
+    # отправляли — от ТЕКУЩЕЙ на площадке: иначе первая же отправка (опечатка в
+    # наценке, ×10 в себестоимости 1С) ушла бы без всякой проверки шага.
+    last = (pp.last_sent_price if pp and pp.last_sent_price else None) or facts.current
+    return decide(cost_usd, usd_rub, inp.rule, target, manual, last, facts)
 
 
 @dataclass
