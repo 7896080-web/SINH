@@ -118,3 +118,22 @@ def test_shortcut_uses_own_icon_and_silent_launcher():
 def test_favicon_is_served_and_linked(client):
     assert client.get("/static/favicon.ico").status_code == 200
     assert 'href="/static/favicon.ico"' in client.get("/attention").text
+
+
+def test_no_drive_colon_trap_in_ps1():
+    """`"$User: текст"` PowerShell 5.1 разбирает как обращение к диску «User:» и
+    падает ДО первой команды. Здесь (Linux) это не видно ничем, кроме этого теста."""
+    bad = []
+    for p in DEPLOY.glob("*.ps1"):
+        for n, line in enumerate(p.read_text(encoding="utf-8-sig").splitlines(), 1):
+            for m in re.finditer(r'\$([A-Za-z_]\w*):', line):
+                if m.group(1).lower() not in ("env", "script", "global", "local", "private", "using"):
+                    bad.append(f"{p.name}:{n}: {line.strip()}")
+    assert not bad, bad
+
+
+def test_server_script_only_adds_folders_and_a_key():
+    s = (DEPLOY / "server_add_repricer.ps1").read_text(encoding="utf-8-sig")
+    assert r"results\pricing" in s and r"archive\pricing" in s and "AppendAllText" in s
+    assert "sshd_config" not in s.replace("sshd_config, порт", "")   # конфиг SSH не трогает
+    assert "Restart-Service" not in s and "WriteAllText" not in s      # ключ «Маркировки» не затирается
