@@ -70,7 +70,7 @@ def test_add_card_and_category_by_buttons(env):
     assert "Сбер 1234" in ask.text
     [confirm] = flow.on_text(CHAT, "ВТБ 4321 ВТБ")
     assert "Добавить карту: 💳 ВТБ · 4321 (ВТБ)?" == confirm.text
-    flow.on_button(CHAT, "m:yes")
+    flow.on_button(CHAT, buttons(confirm)[0])                # «✅ Да, добавить»
     assert any(c.name == "ВТБ" and "4321" in c.numbers for c in db.cards())
     # Следующее сообщение — снова обычное (как расход), а не карта.
     assert "Пришлите скриншот" in flow.on_text(CHAT, "привет")[-1].text
@@ -78,8 +78,12 @@ def test_add_card_and_category_by_buttons(env):
     [more] = flow.on_text(CHAT, MENU_MORE)
     assert "m:addcat" in buttons(more)
     flow.on_button(CHAT, "m:addcat")
-    flow.on_text(CHAT, "Реклама в Telegram")
-    flow.on_button(CHAT, "m:yes")
+    [confirm_cat] = flow.on_text(CHAT, "Реклама в Telegram")
+    assert flow.on_button(CHAT, buttons(confirm)[0]) and \
+        "Реклама в Telegram" not in [c["name"] for c in db.categories()]   # старая кнопка
+    flow.on_button(CHAT, "m:addcat")
+    [confirm_cat] = flow.on_text(CHAT, "Реклама в Telegram")
+    flow.on_button(CHAT, buttons(confirm_cat)[0])
     assert "Реклама в Telegram" in [c["name"] for c in db.categories()]
 
 

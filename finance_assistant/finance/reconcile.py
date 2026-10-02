@@ -218,8 +218,10 @@ class MonthSummary:
 
     @property
     def personal(self) -> int:
-        """Личные расходы по тем картам, где их можно посчитать."""
-        return sum(c.personal or 0 for c in self.cards)
+        """Личные расходы по тем картам, где их можно посчитать; по карте без
+        выписки — хотя бы то, что вы сами отметили как личное."""
+        return sum(c.personal if c.personal is not None else c.personal_marked
+                   for c in self.cards)
 
     @property
     def personal_incomplete(self) -> list[Card]:

@@ -354,6 +354,10 @@ class Flow:
             jobs)
         failed, not_payment, queued = [], 0, 0
         state = self.db.get_state(chat_id)
+        # Новые операции — в начало очереди: понятное из этого альбома записывается
+        # сразу, а не ждёт ответа на старый вопрос (его зададим снова, после).
+        waiting = state.get("drafts", [])
+        state["drafts"] = []
         for (item, keys, receipt), result in zip(jobs, results):
             if isinstance(result, RecognitionError):
                 self._discard_receipt({"receipt": receipt})
@@ -367,6 +371,11 @@ class Flow:
             draft["quiet"] = True
             self._enqueue(state, draft)
             queued += 1
+        state["drafts"] += waiting
+        if queued and waiting:
+            state.pop("ask", None)
+        if not state["drafts"]:
+            state.pop("drafts")
         self.db.set_state(chat_id, state)
 
         head.append(f"📥 Разобрал {len(items)} {_plural(len(items), 'файл', 'файла', 'файлов')}.")
@@ -422,7 +431,8 @@ class Flow:
                 job[0]["files"], job[0].get("caption", ""), period=period, cards=cards,
                 categories=categories),
             jobs)
-        lines = [f"📥 Пачка выписки по карте {card.label}: {len(items)} файлов"]
+        lines = [f"📥 Пачка выписки по карте {card.label}: {len(items)} "
+                 f"{_plural(len(items), 'файл', 'файла', 'файлов')}"]
         if already:
             lines.append(f"🔁 Уже загружены раньше: {already}")
         for n, ((item, keys), data) in enumerate(zip(jobs, parsed), start=1):
@@ -462,17 +472,26 @@ class Flow:
             state = self.db.get_state(chat_id)
         ask = state.get("ask")
         in_statement = "statement" in state
-        if state.get("drafts") and ask in ("amount", "date") and not (
-                in_statement and any(ch.isalpha() for ch in text)):
-            # Идёт и вопрос по операции, и загрузка выписки: число или дата —
-            # ответ на вопрос, текст со словами («пришло 120000…») — выписке.
-            return self._answer_text(chat_id, state, ask, text)
+        if state.get("drafts") and ask in ("amount", "date"):
+            # Идёт и вопрос по операции, и загрузка выписки: то, что читается как
+            # ответ (сумма / дата, «вчера», «1500 руб»), — ответ; остальное — выписке.
+            answers = (_amount_or_none(text, typed=True) if ask == "amount"
+                       else _parse_date(text, self.today()))
+            if not in_statement or answers is not None:
+                return self._answer_text(chat_id, state, ask, text)
+        if in_statement and text.strip().lower().strip(".!") in ("готово", "всё", "все", "done",
+                                                                  "конец", "закончить"):
+            return self._done(chat_id, "")
         closed = self._close_idle_statement(chat_id, state)
         if closed:
             return closed + self.on_text(chat_id, text)
         if "statement" in state:
             return self._statement_input(chat_id, state, [], text)
         if not any(ch.isdigit() for ch in text):
+            if state.get("drafts") and ask:
+                # Ждём ответа кнопкой — напомним вопрос, а не общую подсказку.
+                return [Reply("Ответьте, пожалуйста, на вопрос — кнопкой под ним:")] + \
+                    self._advance(chat_id)
             return [Reply("Пришлите скриншот оплаты или напишите расход текстом, "
                           "например: «3500 доставка СДЭК вчера». /help — подробнее.")]
         return self._recognize_payment(chat_id, [], text, "")
@@ -629,8 +648,8 @@ class Flow:
                 left = len(state["drafts"])
                 ask = self._tag_buttons(question[1], d["id"])
                 if left > 1:
-                    ask.text = f"❓ Вопрос 1 из {left}\n" + ask.text
-                return (replies + self._quiet_summary(quiet, quiet_moves, dropped) + [ask])
+                    ask.text = f"❓ Осталось вопросов: {left}\n" + ask.text
+                return (replies + self._quiet_summary(chat_id, quiet, quiet_moves, dropped) + [ask])
             if d.get("own_transfer"):
                 transfer_id = self.db.add_transfer(
                     op_date=d["date"], amount=d["amount"], from_card_id=d["transfer"]["from"],
@@ -668,9 +687,9 @@ class Flow:
                 quiet.append(expense_id)
             else:
                 replies.append(self._saved_reply(expense_id))
-        return replies + self._quiet_summary(quiet, quiet_moves, dropped)
+        return replies + self._quiet_summary(chat_id, quiet, quiet_moves, dropped)
 
-    def _quiet_summary(self, ids: list[int], moves: list[int] = (),
+    def _quiet_summary(self, chat_id, ids: list[int], moves: list[int] = (),
                        dropped: list[str] = ()) -> list[Reply]:
         """Сводка по пачке: итог, по статьям и каждая запись с номером для /fix."""
         if not ids and not moves and not dropped:
@@ -697,14 +716,23 @@ class Flow:
             for t in (self.db.transfer(i) for i in moves):
                 lines.append(f"П{t.id} {date.fromisoformat(t.op_date).strftime('%d.%m')}  "
                              f"{rub(t.amount)}  {t.route}")
+        merged = [t for t in dropped if "вторая сторона перевода" in t]
+        dropped = [t for t in dropped if t not in merged]
+        if merged:
+            lines.append("")
+            lines.append(f"🔁 Дополнены переводы (пришла их вторая сторона): {len(merged)}")
+            lines += [f"  • {text}" for text in merged]
         if dropped:
             lines.append("")
             lines.append(f"↩️ Не записано: {len(dropped)}")
             lines += [f"  • {text}" for text in dropped]
-        if items or moves:
-            lines.append("")
-            lines.append("Поправить запись: /fix номер (например /fix 12 или /fix П3)")
-        return [Reply("\n".join(lines).strip())]
+        if not (items or moves):
+            return [Reply("\n".join(lines).strip())]
+        # Номера записей этой сводки — для кнопки «Поправить запись».
+        state = self.db.get_state(chat_id)
+        state["last_saved"] = {"e": list(ids), "t": list(moves)}
+        self.db.set_state(chat_id, state)
+        return [Reply("\n".join(lines).strip(), [[("✏️ Поправить запись", "m:fixlist")]])]
 
     def _discard_receipt(self, d: dict):
         """Скриншот, из которого не получилось записи, не храним."""
@@ -1120,9 +1148,14 @@ class Flow:
             self.db.update_expense(expense_id, card_id=int(parts[2]))
             return [self._saved_reply(expense_id, "Исправлено: карта.")]
         elif action == "purpose":
-            self.db.update_expense(expense_id, purpose=parts[2])
+            if parts[2] == e.purpose:
+                return [self._saved_reply(expense_id, "Без изменений.")]
             if parts[2] == BUSINESS and not e.category:
-                return [Reply(f"Статья для №{e.id}:", self._category_buttons(f"e:cat:{e.id}:", None))]
+                # Сначала статья, потом «бизнес» (e:cat ставит и то и другое):
+                # передумал — запись остаётся как была.
+                return [Reply(f"Статья для №{e.id}:",
+                              self._category_buttons(f"e:cat:{e.id}:", None) + [keep])]
+            self.db.update_expense(expense_id, purpose=parts[2])
             return [self._saved_reply(expense_id, "Исправлено: " + (
                 "бизнес." if parts[2] == BUSINESS else "личное."))]
         else:
@@ -1166,16 +1199,22 @@ class Flow:
             question, other = f"Добавить статью «{text}»?", "Нет — это не статья"
         state = self.db.get_state(chat_id)
         state.pop("menu_input", None)
-        state["menu_confirm"] = {"what": what, "text": text}
+        state["seq"] = state.get("seq", 0) + 1
+        state["menu_confirm"] = {"what": what, "text": text, "id": state["seq"]}
         self.db.set_state(chat_id, state)
-        return [Reply(question, [[("✅ Да, добавить", "m:yes")], [(other, "m:notit")], [cancel[0]]])]
+        n = state["seq"]  # в кнопках: старая кнопка «Да» не сработает на новый вопрос
+        return [Reply(question, [[("✅ Да, добавить", f"m:yes:{n}")], [(other, f"m:notit:{n}")],
+                                 [cancel[0]]])]
 
     def _menu(self, chat_id, label):
         """Кнопка главного меню. Работает в любой момент, как команда."""
         self._forget_menu_input(chat_id)
         today = self.today()
         if label == MENU_RECORDS:
-            return self._menu_list(chat_id, _month(today))
+            month = _month(today)
+            if today.day <= 10 and not self.db.expenses(month) and not self.db.transfers(month):
+                month = _month(today, -1)  # в начале месяца обычно смотрят прошлый
+            return self._menu_list(chat_id, month)
         if label == MENU_ITOG:
             this, prev = _month(today), _month(today, -1)
             return [Reply("Итог за какой период?",
@@ -1202,15 +1241,18 @@ class Flow:
                        [("🔗 Правила", "m:rules"), ("🧐 Личные списания", "m:vypiska")],
                        [("❓ Помощь", "m:help"), ("✖️ Сбросить вопрос", "m:cancel")]])]
 
+    def _month_nav(self, kind: str, month: str) -> list[tuple[str, str]]:
+        """◀ прошлый / следующий ▶ месяц (в будущее не листаем)."""
+        nav = [("◀ " + _short_month(_month_shift(month, -1)), f"m:{kind}:{_month_shift(month, -1)}")]
+        if month < _month(self.today()):
+            nav.append((_short_month(_month_shift(month, 1)) + " ▶",
+                        f"m:{kind}:{_month_shift(month, 1)}"))
+        return nav
+
     def _menu_list(self, chat_id, month):
         replies = self._list(chat_id, month)
-        current = _month(self.today())
-        nav = [("◀ " + _short_month(_month_shift(month, -1)), f"m:list:{_month_shift(month, -1)}")]
-        if month < current:
-            nav.append((_short_month(_month_shift(month, 1)) + " ▶",
-                        f"m:list:{_month_shift(month, 1)}"))
         if not replies[-1].buttons:
-            replies[-1].buttons = [nav]
+            replies[-1].buttons = [self._month_nav("list", month)]
         return replies
 
     def _menu_button(self, chat_id, rest):
@@ -1218,16 +1260,32 @@ class Flow:
         confirm = self.db.get_state(chat_id).get("menu_confirm")
         self._forget_menu_input(chat_id)
         if what in ("yes", "notit"):
-            if not confirm:
+            if not confirm or str(confirm.get("id")) != value:
                 return []
             if what == "yes":
                 return self.on_command(chat_id, confirm["what"], confirm["text"])
             return self.on_text(chat_id, confirm["text"])  # обычное сообщение (например, расход)
         if what == "list" and _parse_month_arg(value):
             return self._menu_list(chat_id, value)
+        if what == "vypiska" or (what == "vyp" and _parse_month_arg(value)):
+            month = value if what == "vyp" else _month(self.today())
+            if what == "vypiska" and self.today().day <= 10:
+                month = _month(self.today(), -1)  # в начале месяца смотрят прошлый
+            replies = self._vypiska(chat_id, month)
+            replies[-1].buttons = replies[-1].buttons or [self._month_nav("vyp", month)]
+            return replies
         if what == "itog":
             return self._itog(chat_id, value)
-        if what in ("done", "sverka", "cats", "rules", "vypiska", "help", "cancel"):
+        if what == "cancel":
+            state = self.db.get_state(chat_id)
+            if len(state.get("drafts", [])) > 1 and state.get("ask"):
+                # В очереди ещё операции — сбрасываем только текущий вопрос.
+                d = state["drafts"][0]
+                self._discard_receipt(d)
+                self._pop_draft(state)
+                self.db.set_state(chat_id, state)
+                return [Reply("Эту операцию не записываю.")] + self._advance(chat_id)
+        if what in ("done", "sverka", "cats", "rules", "help", "cancel"):
             return self.on_command(chat_id, what)
         if what in ("addcard", "addcat"):
             state = self.db.get_state(chat_id)
@@ -1240,6 +1298,16 @@ class Flow:
                               [[("Отмена", "m:no")]])]
             return [Reply("Напишите название новой статьи расходов одним сообщением.",
                           [[("Отмена", "m:no")]])]
+        if what == "fixlist":
+            saved = self.db.get_state(chat_id).get("last_saved", {})
+            buttons = ([(f"№{e.id} {rub(e.amount)}", f"e:keep:{e.id}")
+                        for e in map(self.db.expense, saved.get("e", [])) if e]
+                       + [(f"П{t.id} {rub(t.amount)}", f"t:keep:{t.id}")
+                          for t in map(self.db.transfer, saved.get("t", [])) if t])[:90]
+            if not buttons:
+                return [Reply("Этих записей уже нет. Все записи месяца — 📋 Записи.")]
+            return [Reply("Какую запись поправить? Номера — как в сводке.",
+                          [buttons[i:i + 3] for i in range(0, len(buttons), 3)])]
         if what == "delpick":
             cards = self.db.cards()
             if not cards:
@@ -1263,7 +1331,11 @@ class Flow:
         # Счётчик номеров операций оставляем: иначе кнопки под старыми вопросами
         # совпали бы с номерами новых операций.
         self.db.set_state(chat_id, {"seq": state["seq"]} if "seq" in state else {})
-        return [Reply("Сбросил текущий вопрос и режим сверки.")]
+        dropped = len(state.get("drafts", []))
+        if dropped > 1:
+            return [Reply(f"Сбросил вопросы и режим сверки. Не записано операций: {dropped} — "
+                          "если они нужны, пришлите их скриншоты ещё раз.", menu=True)]
+        return [Reply("Сбросил текущий вопрос и режим сверки.", menu=True)]
 
     def _cards(self, chat_id, arg):
         cards = self.db.cards()
@@ -1379,7 +1451,8 @@ class Flow:
             lines += [f"П{t.id} {date.fromisoformat(t.op_date).strftime('%d.%m')}  {rub(t.amount)}"
                       f"  {t.route}" for t in moves]
         return [Reply(f"Записи за {month_name(month)}:\n" + "\n".join(lines)
-                      + f"\n\nБизнес итого: {rub(total)}\nИсправить: /fix 12 или /fix П3")]
+                      + f"\n\nБизнес по этим записям: {rub(total)} (по дате скриншота; итог месяца "
+                        f"по выписке и бизнес-счёту — 📊 Итог)\nИсправить: /fix 12 или /fix П3")]
 
     # --- сверка --------------------------------------------------------
 
@@ -1450,7 +1523,9 @@ class Flow:
         if what == "acc":
             # Кнопка от другого списка (например, по другой карте) — неактуальна.
             if not value.isdigit() or int(value) != state.get("review_id"):
-                return [Reply("Этот список уже неактуален — откройте сверку заново: /sverka")]
+                return [Reply("Этот список уже неактуален: он от другой сверки. Предложения "
+                              "по последней выписке — под её итогом.",
+                              [[("🧾 Сверка", "m:sverka")]])]
             return self._biz(chat_id, "все")
         st = state.get("statement", {})
         if what == "reset" and st.get("month") and value == f"{st['card_id']}:{st['month']}":
@@ -1615,7 +1690,8 @@ class Flow:
             replies.append(Reply(
                 suggestions_text(suggestions, "📋 Расходы с бизнес-счёта без статьи")
                 + "\n\nВ своде они уже входят в бизнес как «Без статьи». Кнопка разнесёт их "
-                  "по предложенным статьям (нераспознанные — в «Прочее»), поправить: /fix номер",
+                  "по предложенным статьям (нераспознанные — в «Прочее»); отдельную запись потом "
+                  "можно поправить кнопкой «✏️ Поправить запись» под сводкой.",
                 [[("✅ Разнести по статьям", acc)]]))
         elif suggestions:
             replies.append(Reply(suggestions_text(suggestions),
@@ -1625,7 +1701,7 @@ class Flow:
         elif unmatched:
             replies.append(Reply(
                 "Остальные списания считаются личными. Посмотреть их по месяцу "
-                "и отметить бизнес: /vypiska 2026-03"))
+                f"и отметить бизнес: /vypiska {months[0]}"))
 
         month = months[-1]
         rest = [c for c in summarize(self.db, month).cards if not c.has_statement]
@@ -1650,6 +1726,14 @@ class Flow:
         return [Reply(f"{month_name(month).capitalize()}:\n" + unmatched_text(lines))]
 
     def _itog(self, chat_id, arg):
+        replies = self._itog_reports(chat_id, arg)
+        waiting = len(self.db.get_state(chat_id).get("drafts", []))
+        if waiting and replies and replies[-1].file:
+            replies[-1].text += (f"\n\n⚠️ Ещё не записано операций: {waiting} — они ждут ответа "
+                                 "на вопрос и в итог не вошли.")
+        return replies
+
+    def _itog_reports(self, chat_id, arg):
         today = self.today()
         if not arg:
             # В начале месяца обычно подводят итог прошлого.

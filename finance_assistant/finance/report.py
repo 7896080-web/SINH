@@ -80,6 +80,9 @@ def card_text(cs: CardSummary, month: str) -> str:
     if cs.card.is_business:
         if cs.personal_marked:
             out.append(f"  на личное: {rub(cs.personal_marked)}")
+    elif cs.personal is None and cs.personal_marked:
+        out.append(f"  на личное: записано вами {rub(cs.personal_marked)} "
+                   "(всё личное — после выписки)")
     else:
         out.append(f"  на личное: {rub(cs.personal)}")
     if cs.has_statement and not cs.lines_checked:
@@ -140,7 +143,9 @@ def month_text(s: MonthSummary) -> str:
             if cs.own_in or cs.own_out:
                 out.append(f"  без переводов между своими: пришло {rub(cs.net_in)}"
                            f" · ушло {rub(cs.net_out)}")
-        out.append(f"  бизнес {rub(cs.business)} · личное {rub(cs.personal)}")
+        personal = (f"— (записано вами {rub(cs.personal_marked)})"
+                    if cs.personal is None and cs.personal_marked else rub(cs.personal))
+        out.append(f"  бизнес {rub(cs.business)} · личное {personal}")
         if cs.missing or cs.missing_transfers:
             out.append(f"  ⚠️ не найдено в выписке: {len(cs.missing) + len(cs.missing_transfers)}")
         if cs.overbooked:
@@ -221,9 +226,12 @@ def _finish(wb) -> bytes:
     return buf.getvalue()
 
 
-def _expenses_sheet(wb, expenses: list[Expense], dates: dict[int, str] | None = None):
+def _expenses_sheet(wb, expenses: list[Expense], dates: dict[int, str] | None = None,
+                    unassigned: list[tuple[str, str, int]] = ()):
     """dates — дата банка по выписке (как в /svod): запись, проведённую банком
-    1-го числа, показываем той датой, к месяцу которой она и отнесена."""
+    1-го числа, показываем той датой, к месяцу которой она и отнесена.
+    unassigned — (месяц, счёт, сумма) расходов бизнес-счёта без статьи: их нет
+    среди записей, но в «Ушло на бизнес» они входят — иначе лист не сходился бы."""
     dates = dates or {}
     ops = wb.create_sheet("Бизнес-расходы")
     ops.append(["№", "Дата", "Сумма", "Карта", "Статья", "Получатель", "Что оплачено", "Чек"])
@@ -231,8 +239,16 @@ def _expenses_sheet(wb, expenses: list[Expense], dates: dict[int, str] | None = 
     for e in expenses:
         ops.append([e.id, dates.get(e.id, e.op_date), _num(e.amount), e.card, e.category or "", e.merchant,
                     e.description, e.receipt_path])
+    for month, card, amount in unassigned:
+        ops.append(["", month, _num(amount), card, "Без статьи",
+                    "по выписке бизнес-счёта", "ещё не разнесено по статьям", ""])
     for col, width in zip("ABCDEFGH", (6, 12, 14, 18, 30, 26, 40, 30)):
         ops.column_dimensions[col].width = width
+
+
+def _unassigned(summaries) -> list[tuple[str, str, int]]:
+    return [(s.month, cs.card.name, cs.business - cs.business_recorded)
+            for s in summaries for cs in s.cards if cs.business > cs.business_recorded]
 
 
 def _missing_sheet(wb, missing: list[Expense]):
@@ -278,7 +294,8 @@ def month_xlsx(s: MonthSummary) -> bytes:
     for col in "BCDEFGHI":
         ws.column_dimensions[col].width = 16
     _expenses_sheet(wb, s.business_expenses,
-                    {k: v for c in s.cards for k, v in c.effective_dates.items()})
+                    {k: v for c in s.cards for k, v in c.effective_dates.items()},
+                    _unassigned([s]))
     _missing_sheet(wb, [e for cs in s.cards for e in cs.missing])
     return _finish(wb)
 
@@ -314,6 +331,7 @@ def period_xlsx(summaries: list[MonthSummary]) -> bytes:
     cats.column_dimensions["A"].width = 34
 
     _expenses_sheet(wb, [e for s in summaries for e in s.business_expenses],
-                    {k: v for s in summaries for c in s.cards for k, v in c.effective_dates.items()})
+                    {k: v for s in summaries for c in s.cards for k, v in c.effective_dates.items()},
+                    _unassigned(summaries))
     _missing_sheet(wb, [e for s in summaries for cs in s.cards for e in cs.missing])
     return _finish(wb)
