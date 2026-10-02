@@ -24,6 +24,28 @@ ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "check_1c_module.py"
 LIVE = ROOT / "1c" / "ОбменССайтом_МодульОбъекта.txt"
 
+# Всё, что читает `1c/`, на боевом сервере проверять НЕЛЬЗЯ — и это не
+# придирка, а уже случившийся отказ наката (02.10). Блоки наката каталог `1c/`
+# намеренно не везут: его копия на диске сервера на работу не влияет, а
+# разошедшийся sha развалил бы накат целиком. Значит там лежит модуль с ПЕРВОЙ
+# установки, то есть заведомо старый, — и тесты, которые вынимают из него
+# возможность и требуют, чтобы скрипт закричал, падают все разом. Падают они
+# ПЕРЕД перезапуском служб: накат встаёт на живом сервере, уже после копии базы
+# и миграций.
+#
+# Предмет этих тестов — согласованность скрипта с НАШИМ исходником, а не
+# установка. Про живую `.epf` отвечает сам скрипт, которому дают путь к
+# выгруженному модулю, и это ровно то, ради чего он написан.
+#
+# Признак «мы в репозитории» — каталог `.git`: на боевом сервере git не
+# установлен вовсе и файлы приносятся копированием.
+IN_REPOSITORY = (ROOT / ".git").exists()
+repository_only = pytest.mark.skipif(
+    not IN_REPOSITORY,
+    reason="тест читает 1c/ — каталог, который накат на сервер не везёт: "
+           "там лежит копия с первой установки",
+)
+
 
 def _run(path) -> tuple[int, str]:
     done = subprocess.run([sys.executable, str(SCRIPT), str(path)],
@@ -40,6 +62,7 @@ def _broken(tmp_path, old: str, new: str = "") -> Path:
     return path
 
 
+@repository_only
 def test_the_live_module_passes_everything():
     """Молчание на исправном входе — обязательное свойство.
 
@@ -53,6 +76,7 @@ def test_the_live_module_passes_everything():
     assert "нужный нам функционал на месте" in out
 
 
+@repository_only
 @pytest.mark.parametrize("old,new,expected", [
     # Своя команда, выброшенная чужой правкой: канал перестаёт работать молча.
     ('ИначеЕсли Команда = "SCRAP_RETURN"', 'ИначеЕсли Команда = "НЕТУ"',
@@ -94,6 +118,7 @@ def test_a_lost_capability_is_named(tmp_path, old, new, expected):
     assert "ПОТЕРЯНО ИЛИ ИЗМЕНЕНО" in out
 
 
+@repository_only
 def test_an_unbalanced_block_is_caught(tmp_path):
     """Лишний «КонецЕсли» глазами в семистах строках не заметить.
 
@@ -106,6 +131,7 @@ def test_an_unbalanced_block_is_caught(tmp_path):
     assert "баланс блоков" in out
 
 
+@repository_only
 def test_an_unclosed_transaction_is_caught(tmp_path):
     """Транзакция без отката оставит возврат проведённым, а списание — нет.
 
@@ -140,6 +166,7 @@ def test_a_missing_file_is_refused_plainly(tmp_path):
     assert "Файла нет" in out
 
 
+@repository_only
 def test_a_module_saved_in_cp1251_is_read_and_passes(tmp_path):
     """Файл выгружает человек, и кодировку он не выбирает.
 
@@ -162,6 +189,7 @@ def test_a_module_saved_in_cp1251_is_read_and_passes(tmp_path):
     assert "нужный нам функционал на месте" in out
 
 
+@repository_only
 def test_the_encoding_is_named_out_loud():
     """Кодировку приходится угадывать, и названа она не из опрятности.
 
