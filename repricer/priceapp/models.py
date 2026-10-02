@@ -284,7 +284,7 @@ class PriceChange(Base):
     new_price = Column(Integer, nullable=False)
     markup_rub = Column(Numeric(12, 2), nullable=True)
     markup_coef = Column(Numeric(8, 2), nullable=True)     # к получению / себестоимость
-    source = Column(String(16), nullable=False, default="rule")   # rule / manual / base
+    source = Column(String(16), nullable=False, default="rule")   # rule / manual / platform / base / rollback
     status = Column(String(16), nullable=False, default=PriceChangeStatus.proposed.value, index=True)
     block_reason = Column(String(16), nullable=True)
     note = Column(String(255), nullable=True)
@@ -310,3 +310,27 @@ class SavedFilter(Base):
     url = Column(String(1000), nullable=False)
     created_by = Column(String(64), nullable=False, default="")
     created_at = Column(DateTime, nullable=False, default=now_utc)
+
+
+class BasePrice(Base):
+    """Базовая цена SKU 1С, ₽ — одна на товар, без комиссии площадки. От неё
+    берёт цену площадка, у которой в правиле «цена от базовой × коэффициент»."""
+    __tablename__ = "base_prices"
+    item_id = Column(String(64), primary_key=True)
+    price = Column(Integer, nullable=False)
+    updated_at = Column(DateTime, nullable=False, default=now_utc, onupdate=now_utc)
+    updated_by = Column(String(64), nullable=False, default="")
+
+
+class PlatformPrice(Base):
+    """Цена SKU на ПЛОЩАДКЕ, заданная человеком, — сразу для всех её кабинетов
+    (у WB три ИП). Ручная цена кабинета (`ProductPrice.manual_price`) главнее неё;
+    пол наценки и подтверждение не обходит ни та, ни другая."""
+    __tablename__ = "platform_prices"
+    __table_args__ = (UniqueConstraint("item_id", "platform", name="uq_platform_price"),)
+    id = Column(Integer, primary_key=True)
+    item_id = Column(String(64), nullable=False, index=True)
+    platform = Column(String(8), nullable=False)
+    price = Column(Integer, nullable=False)
+    updated_at = Column(DateTime, nullable=False, default=now_utc, onupdate=now_utc)
+    updated_by = Column(String(64), nullable=False, default="")

@@ -30,7 +30,8 @@
 {% elif view == 'rules' %}
 <p class="muted">Правило — у ПЛОЩАДКИ и действует во всех её кабинетах (у Wildberries — для всех ИП сразу). Цена =
 себестоимость ₽ × коэффициент / (1 − комиссия%), округление вверх до шага и «красивое» окончание (шаг 100, минус 1 → 1299).
-Можно брать цену от другой площадки: «цена от Wildberries × 1,1» — тогда коэффициент наценки этой площадки не
+Можно брать цену от базовой цены товара («базовая × 1,15», базовая задаётся на странице «Цены товаров») или от другой
+площадки («цена от Wildberries × 1,1») — тогда коэффициент наценки этой площадки не
 используется, но минимальный коэффициент (пол) и лимит шага проверяются всегда, по её собственной комиссии.
 Пока коэффициент 1 и цена не от другой площадки — правило не настроено, расчёт по нему не идёт.</p>
 <div class="row card">
@@ -51,6 +52,7 @@
     {% endfor %}
     <label>Цена от площадки<select name="base_platform">
       <option value="">— своё правило —</option>
+      <option value="{{ BASE }}" {% if rule.base_platform == BASE %}selected{% endif %}>базовая цена товара</option>
       {% for k, v in platform_names.items() %}{% if k != p %}<option value="{{ k }}" {% if rule.base_platform == k %}selected{% endif %}>{{ v }}</option>{% endif %}{% endfor %}
     </select></label>
     <label>× коэффициент<input name="base_coef" value="{{ rule.base_coef|plain }}" inputmode="decimal" style="width:90px" placeholder="1,1"></label>
@@ -58,7 +60,7 @@
     <button type="submit">Сохранить</button>
   </form>
   {% if rule.commission_percent is none %}<p class="warn" style="margin-bottom:0">Комиссия не задана — по площадке не считаем.</p>{% endif %}
-  {% if rule.base_platform %}<p class="muted" style="margin-bottom:0">Цена = расчётная цена {{ platform_names[rule.base_platform] }} × {{ ru(rule.base_coef) }}, затем своё округление; пол — коэффициент {{ ru(rule.min_markup_coef) }} при комиссии {{ rule.commission_percent|plain }}%.</p>{% endif %}
+  {% if rule.base_platform %}<p class="muted" style="margin-bottom:0">Цена = {% if rule.base_platform == BASE %}базовая цена товара{% else %}расчётная цена {{ platform_names[rule.base_platform] }}{% endif %} × {{ ru(rule.base_coef) }}, затем своё округление; пол — коэффициент {{ ru(rule.min_markup_coef) }} при комиссии {{ rule.commission_percent|plain }}%.</p>{% endif %}
 </div>
 {% endfor %}
 
