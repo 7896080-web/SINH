@@ -51,16 +51,23 @@ if ($rc -ne 0) { Fail "Тесты красные — программу не з�
 # Иконка на уже созданных ярлыках. Ярлык заводит только установщик, и тем, кто
 # поставил программу до появления иконки, обновление иначе её не принесёт.
 # Меняем ТОЛЬКО иконку: путь запуска и порт в ярлыке не трогаем.
+# Сбой здесь (ярлык только для чтения, рабочий стол в OneDrive) — предупреждение,
+# а не отказ: при $ErrorActionPreference = "Stop" он оборвал бы обновление
+# ПОСЛЕ остановки программы, и она осталась бы не запущенной из-за иконки.
 $icon = Join-Path $Root "deploy\marking.ico"
 if (Test-Path $icon) {
-    $shell = New-Object -ComObject WScript.Shell
-    foreach ($dir in @([Environment]::GetFolderPath("Desktop"), [Environment]::GetFolderPath("Startup"))) {
-        $lnk = Join-Path $dir "Маркировка.lnk"
-        if (Test-Path $lnk) {
-            $s = $shell.CreateShortcut($lnk)
-            $s.IconLocation = "$icon,0"
-            $s.Save()
+    try {
+        $shell = New-Object -ComObject WScript.Shell
+        foreach ($dir in @([Environment]::GetFolderPath("Desktop"), [Environment]::GetFolderPath("Startup"))) {
+            $lnk = Join-Path $dir "Маркировка.lnk"
+            if (Test-Path $lnk) {
+                $s = $shell.CreateShortcut($lnk)
+                $s.IconLocation = "$icon,0"
+                $s.Save()
+            }
         }
+    } catch {
+        Write-Host "[!] Иконку ярлыка обновить не удалось: $($_.Exception.Message)" -ForegroundColor Yellow
     }
 }
 

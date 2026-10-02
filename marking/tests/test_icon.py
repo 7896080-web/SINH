@@ -48,3 +48,12 @@ def test_favicon_is_served_and_linked(client):
     assert (ROOT / "markapp" / "static" / "favicon.ico").read_bytes() == ICO.read_bytes()
     base = (ROOT / "markapp" / "templates" / "base.html").read_text(encoding="utf-8")
     assert '<link rel="icon" href="/static/favicon.ico">' in base
+
+
+def test_icon_refresh_cannot_abort_the_update():
+    """Сбой обновления иконки — предупреждение: при Stop он оборвал бы
+    обновление после остановки программы, и она осталась бы не запущенной."""
+    text = (ROOT / "deploy" / "update_workstation.ps1").read_text(encoding="utf-8-sig")
+    block = text[text.index("Иконка на уже созданных ярлыках"):text.index('Info "Запуск"')]
+    assert "try {" in block and "} catch {" in block
+    assert block.index("try {") < block.index("CreateShortcut")
