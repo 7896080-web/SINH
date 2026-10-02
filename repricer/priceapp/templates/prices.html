@@ -77,7 +77,8 @@
 </div>
 {% endfor %}
 <div class="row card">
-  <form method="post" action="/prices/guard-run"><button title="По уже загруженным текущим ценам — к площадкам не обращается">Проверить диапазоны сейчас</button></form>
+  <form method="post" action="/prices/guard-preview"><button class="secondary" title="Ничего не отправляет — только считает">Что вернётся по диапазонам</button></form>
+  <form method="post" action="/prices/guard-run" onsubmit="return confirm('Вернуть цены по диапазонам безопасности? Наши цены (только выше текущих) встанут в отправку на площадки.')"><button title="Ставит цены в отправку на площадки">Вернуть цены по диапазонам…</button></form>
   <a class="btn secondary" href="/prices/guard-export">Экспорт диапазонов в Excel</a>
   <form method="post" action="/prices/guard-import" enctype="multipart/form-data" class="row">
     <label>Импорт диапазонов (пусто — без изменений, «-» — снять границу)<input type="file" name="file" accept=".xlsx" required></label>
