@@ -133,7 +133,23 @@ def owners_of(db: Session, barcodes) -> dict[str, set[str]]:
 
 
 def build(db: Session, account_id: int) -> list[MapRow]:
-    """Статус каждой строки каталога кабинета."""
+    """Статус каждой строки каталога кабинета. Сборка дорогая (на кабинете в
+    150 тыс. строк — секунды), поэтому в пределах транзакции считается один раз
+    (`database.session_cache`); коммит, откат или `forget` кэш сбрасывают."""
+    from priceapp.database import session_cache
+    cache = session_cache(db)
+    if ("build", account_id) not in cache:
+        cache[("build", account_id)] = _build(db, account_id)
+    return cache[("build", account_id)]
+
+
+def forget(db: Session) -> None:
+    """Сбросить кэш сборки — после записи связей в ТОЙ ЖЕ транзакции."""
+    from priceapp.database import session_cache
+    session_cache(db).clear()
+
+
+def _build(db: Session, account_id: int) -> list[MapRow]:
     items = (db.query(PlatformItem).filter(PlatformItem.account_id == account_id)
              .order_by(PlatformItem.article, PlatformItem.size, PlatformItem.barcode).all())
     owners = owners_of(db, [i.barcode for i in items])
@@ -170,11 +186,16 @@ def build(db: Session, account_id: int) -> list[MapRow]:
 
 def account_items(db: Session, account_id: int) -> dict[str, list[PlatformItem]]:
     """SKU 1С -> строки каталога кабинета, которые на него ведут (для расчёта цены)."""
-    out: dict[str, list[PlatformItem]] = defaultdict(list)
-    for r in build(db, account_id):
-        if r.status in MAPPED:
-            out[r.item_id].append(r.item)
-    return dict(out)
+    from priceapp.database import session_cache
+    cache = session_cache(db)
+    key = ("items", account_id)
+    if key not in cache:
+        out: dict[str, list[PlatformItem]] = defaultdict(list)
+        for r in build(db, account_id):
+            if r.status in MAPPED:
+                out[r.item_id].append(r.item)
+        cache[key] = dict(out)
+    return cache[key]
 
 
 def link_manually(db: Session, account_id: int, pairs: list[tuple[str, str]], actor: str = "",
@@ -200,6 +221,8 @@ def link_manually(db: Session, account_id: int, pairs: list[tuple[str, str]], ac
         else:
             db.add(ManualLink(account_id=account_id, barcode=barcode, item_id=item_id,
                               source=source, created_by=actor))
+            from priceapp.database import session_cache
+            session_cache(db).clear()   # сборка в этой же транзакции должна увидеть связь
             status[barcode] = "manual"     # повтор баркода в файле — не второй INSERT
             created += 1
     db.flush()

@@ -239,12 +239,17 @@ def get_rule(db: Session, platform: str) -> PlatformRule:
 
 def article_map(db: Session) -> dict[str, str]:
     """SKU 1С -> артикул 1С. Коэффициент живёт на артикуле; SKU без артикула
-    отвечает сам за себя (ключ — его ID)."""
-    out: dict[str, str] = {}
-    for item_id, article in db.query(OnecBarcode.item_id, OnecBarcode.article):
-        if item_id not in out or (not out[item_id] and article):
-            out[item_id] = (article or "").strip()
-    return out
+    отвечает сам за себя (ключ — его ID). Справочник 1С читается целиком —
+    в пределах транзакции один раз."""
+    from priceapp.database import session_cache
+    cache = session_cache(db)
+    if "article_map" not in cache:
+        out: dict[str, str] = {}
+        for item_id, article in db.query(OnecBarcode.item_id, OnecBarcode.article):
+            if item_id not in out or (not out[item_id] and article):
+                out[item_id] = (article or "").strip()
+        cache["article_map"] = out
+    return cache["article_map"]
 
 
 def article_of(articles: dict[str, str], item_id: str) -> str:

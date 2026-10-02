@@ -18,6 +18,7 @@ EXPECTED = {
     "rate": (2 * 6 * 3600 + 600, True),    # раз в 6 часов
     "daily_refresh": (2 * 26 * 3600, False),
     "backup": (2 * 26 * 3600, False),
+    "attention": (3 * 600, False),          # раз в 10 минут, при правках — сразу
 }
 
 

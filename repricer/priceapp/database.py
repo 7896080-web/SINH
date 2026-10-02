@@ -27,6 +27,19 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 
+# Кэш тяжёлых чтений В ПРЕДЕЛАХ одной транзакции (сборка сопоставления, справочник
+# артикулов): страница «Внимание» собирала сопоставление каждого кабинета дважды.
+# Любой коммит или откат кэш стирает — записанное следующим чтением будет видно.
+def session_cache(db) -> dict:
+    return db.info.setdefault("cache", {})
+
+
+@event.listens_for(SessionLocal, "after_commit")
+@event.listens_for(SessionLocal, "after_rollback")
+def _drop_cache(session):
+    session.info.pop("cache", None)
+
+
 def get_db():
     db = SessionLocal()
     try:
