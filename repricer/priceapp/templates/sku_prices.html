@@ -93,6 +93,7 @@
       <button form="manual{{ n }}" class="secondary" style="padding:1px 6px;font-size:12px" onclick="return confirm('Снять ручную цену у «{{ g.key }}»? Тогда будет действовать наценка.')">снять</button></div>{% endif %}</td>
   {% endif %}
   <td class="num"><b>{{ g.price }}</b><div class="{{ 'bad' if g.floor else 'muted' }}">{{ g.margin }}</div>
+    {% if g.tariff_missing %}<div class="warn" style="font-size:12px" title="Комиссия взята из правила площадки: тариф для товара не загружен. Обновите каталог (WB) или текущие цены (Ozon).">тариф неизвестен</div>{% endif %}
     {% if g.price == '—' and g.note %}<div class="muted" style="white-space:normal;max-width:220px">{{ g.note }}</div>{% endif %}</td>
   <td class="num">{{ g.current }}<div class="muted">{{ g.cur_margin }}{% if g.discount != '—' %} · скидка {{ g.discount }}%{% endif %}</div></td>
   <td class="num">{% if g.pct is not none %}<span class="{{ 'bad' if g.big_step else '' }}">{{ ('%+.1f'|format(g.pct)).replace('.', ',') }}%</span>{% else %}—{% endif %}

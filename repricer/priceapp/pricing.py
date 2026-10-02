@@ -45,6 +45,8 @@ SOURCE_LABELS = {SRC_CABINET: "артикул, кабинет", SRC_ARTICLE: "а
                  SRC_CAT_CABINET: "категория, кабинет", SRC_CATEGORY: "категория, площадка",
                  SRC_DEFAULT: "по умолчанию площадки", SRC_MANUAL: "ручная цена кабинета"}
 KIND_COEF, KIND_MARGIN = "coef", "margin"
+# Площадки, чьи тарифы комиссий программа читает (WB — по предметам, Ozon — по товару).
+TARIFF_PLATFORMS = {"wb", "ozon"}
 KIND_LABELS = {KIND_COEF: "коэффициент от базовой", KIND_MARGIN: "маржинальность"}
 
 BLOCK_FLOOR = "floor"
@@ -137,6 +139,7 @@ class Facts:
     current: int | None = None
     sale: int | None = None
     category: str = ""
+    tariff_missing: bool = False     # площадка тарифы даёт, а для товара тарифа нет
 
 
 def item_facts(rule: PlatformRule, rows=None) -> Facts:
@@ -156,7 +159,8 @@ def item_facts(rule: PlatformRule, rows=None) -> Facts:
     sale = (cur.current_sale_price or current) if cur else None
     disc = (Decimal(1) - Decimal(sale) / Decimal(current)) if current and sale and sale < current else Decimal(0)
     cats = [r.category for r in rows if getattr(r, "category", "")]
-    return Facts(commission, tariff, disc, current, sale, cats[0] if cats else "")
+    return Facts(commission, tariff, disc, current, sale, cats[0] if cats else "",
+                 tariff is None and rule.platform in TARIFF_PLATFORMS and bool(rows))
 
 
 @dataclass
@@ -205,6 +209,10 @@ def decide(cost_usd, usd_rub, rule: PlatformRule, target: "Target | None",
         d = Decision(round_price(raw, rule.round_step, rule.round_minus), cost_rub=cost_rub,
                      coef=target.value, source=target.source, kind=target.kind)
     d.commission, d.discount = c, disc
+    if facts.tariff_missing:
+        # Не молчим: комиссия из правила может быть далека от тарифа, и по ней
+        # посчитаны и цена (при наценке маржинальностью), и пол.
+        d.note = "тариф площадки для товара неизвестен — комиссия из правила (обновите каталог и цены)"
 
     if d.new_price <= 0:
         return Decision(None, cost_rub=cost_rub, source=d.source, note="цена должна быть больше нуля")
@@ -365,7 +373,8 @@ def recalculate_account(db: Session, account: Account, is_test: bool = False) ->
         min_price = max((r.min_price for r in rows if r.min_price), default=None)
         if min_price and d.new_price < min_price:
             d.note = "; ".join(x for x in (d.note, f"ниже минимальной цены площадки {min_price} ₽") if x)
-        if last == d.new_price:
+        current = item_facts(rule, rows).current
+        if d.new_price == (current if current else last):
             stats.unchanged += 1
             continue
         db.add(PriceChange(
