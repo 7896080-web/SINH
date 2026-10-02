@@ -48,6 +48,10 @@ $rc = $LASTEXITCODE
 if ($saved) { $env:DATABASE_URL = $saved }
 if ($rc -ne 0) { Fail "Тесты красные — программу не запускаю" }
 
+Info "Ярлык (значок мог обновиться)"
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Root "deploy\create_shortcut.ps1") -Port $WebPort -RefreshOnly
+if ($LASTEXITCODE -ne 0) { Write-Host "[!] Ярлык не обновлён — программа работает, значок прежний" -ForegroundColor Yellow }
+
 Info "Запуск"
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Root "deploy\run_repricer.ps1") -Port $WebPort
 if ($LASTEXITCODE -ne 0) { Fail "Программа не запустилась — смотрите logs\repricer.err.log" }
