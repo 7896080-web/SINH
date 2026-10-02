@@ -480,3 +480,70 @@ def test_send_says_it_replaced_old_proposals_and_menu_has_one_main_path(client, 
     assert nav.index("Цены товаров") < nav.index("Правила и журнал")
     assert "Пересчёт всех цен" in client.get("/prices?view=proposals").text
     assert client.get("/prices").text.count("Правила площадок") >= 1
+
+
+# --- видимость и свежесть данных -----------------------------------------------------------
+
+def test_same_price_skip_follows_platform_not_our_last_send(client, db):
+    a1, _ = _wb(client, db)
+    db.add(ProductPrice(item_id="u3", account_id=a1.id, last_sent_price=2529))
+    db.commit()
+    _prices(db, a1, b3=(2200, 2200))           # площадка держит не то, что мы отправляли
+    r = client.post("/sku-prices/send", data={"scope": f"a{a1.id}", "arts": ["4033"]})
+    assert "передано на отправку 1 цен" in r.text
+
+
+def test_tariff_unknown_is_flagged(client, db):
+    _wb(client, db)
+    t = client.get("/sku-prices?scope=wb&art=4033").text.split("<table", 1)[1]
+    assert "тариф неизвестен" in t
+    t = client.get("/sku-prices?scope=wb&art=39681").text.split("<table", 1)[1]
+    assert "тариф неизвестен" not in t
+
+
+def test_attention_shows_jobs_1c_freshness_and_orphan_targets(client, db):
+    from priceapp.models import WorkerHeartbeat
+    from priceapp.timeutils import now_utc
+    _wb(client, db)
+    db.add(WorkerHeartbeat(name="daily_refresh", last_run_at=now_utc(), last_success=False,
+                           last_error="каталог не загружен"))
+    db.add(CategoryTarget(platform="wb", account_id=0, category="Старое название", kind="margin", value=Decimal("2")))
+    db.commit()
+    page = client.get("/attention").text
+    assert "суточное обновление" in page and "каталог не загружен" in page
+    assert "Себестоимость из 1С ещё не загружались" in page
+    assert "Старое название" in page
+
+
+def test_daily_refresh_requests_barcode_dict_once_mark3_confirmed(db):
+    from priceapp import settings
+    from priceapp.models import OnecTask
+    from priceapp.workers import jobs
+    jobs.job_daily_refresh(lambda p, c: None)
+    assert {t.command for t in db.query(OnecTask)} == {"EXPORT_COST_PRICES"}     # mark-3 не подтверждена
+    settings.put(db, settings.EPF_READY_AT, "2026-10-01T00:00:00")
+    db.commit()
+    jobs.job_daily_refresh(lambda p, c: None)
+    db.expire_all()
+    assert "BARCODE_DICT" in {t.command for t in db.query(OnecTask)}
+
+
+def test_sftp_read_error_is_not_mistaken_for_missing_file():
+    from priceapp.exchange import ExchangeError, SftpExchange
+
+    class Sftp:
+        def open(self, path, mode):
+            raise OSError(5, "Input/output error")
+    ex = SftpExchange.__new__(SftpExchange)
+    ex._sftp, ex.results = Sftp(), "/r"
+    try:
+        ex.read_result("cost_x.txt")
+        raise AssertionError("сбой чтения должен быть исключением, а не «файла нет»")
+    except ExchangeError:
+        pass
+
+    class Missing:
+        def open(self, path, mode):
+            raise FileNotFoundError(2, "No such file")
+    ex._sftp = Missing()
+    assert ex.read_result("cost_x.txt") is None

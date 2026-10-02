@@ -140,11 +140,16 @@ class SftpExchange:
         return sorted(n for n in names if n.startswith(RESULT_PREFIX) and n.endswith(".txt"))
 
     def read_result(self, name: str) -> str | None:
+        """None — файла нет. Любой ДРУГОЙ сбой чтения — исключение: иначе обрыв
+        связи выглядел бы как «1С не прислала себестоимость», задание закрывалось
+        бы отказом, а файлы с данными уезжали в архив, где их никто не перечитает."""
         try:
             with self._sftp.open(self._p(self.results, name), "rb") as f:
                 data = f.read()
-        except OSError:
-            return None
+        except OSError as e:
+            if isinstance(e, FileNotFoundError) or getattr(e, "errno", None) == 2:
+                return None
+            raise ExchangeError(f"не прочитан {name} на сервере: {e}") from e
         return data.decode("utf-8-sig")
 
     def archive_result(self, name: str) -> None:

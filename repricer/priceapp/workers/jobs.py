@@ -93,6 +93,13 @@ def job_daily_refresh(client_factory=None, force_prices: bool = False) -> None:
         if _older_than(settings.get(db, settings.COST_LOADED_AT), REFRESH_EVERY):
             onec.enqueue_cost(db)
             db.commit()
+        # Справочник баркодов — тоже раз в сутки: перевешенный в 1С баркод иначе
+        # считался бы от себестоимости прежнего товара, а новые — «нет в 1С».
+        # Только после подтверждения mark-3: старая обработка положила бы ответ в
+        # общую папку sync_admin.
+        if onec.epf_ready(db) and _older_than(settings.get(db, settings.DICT_LOADED_AT), REFRESH_EVERY):
+            onec.enqueue_dict(db)
+            db.commit()
         for acc in db.query(Account).filter(Account.is_active.is_(True)):
             if db.query(ApiCredential.id).filter(ApiCredential.account_id == acc.id).first() is None:
                 continue

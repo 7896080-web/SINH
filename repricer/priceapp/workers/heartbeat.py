@@ -49,3 +49,16 @@ def stale_workers(db: Session) -> list[str]:
         elif required and not row.last_success:
             out.append(f"{name}: ошибка — {row.last_error[:200]}")
     return out
+
+
+def failed_or_noted(db: Session) -> list[tuple[str, str, bool]]:
+    """(задание, текст, это ошибка) — у ЛЮБОГО задания последняя отметка неуспешна
+    или с оговоркой. Для «Внимания»: упавшие суточное обновление и копия базы
+    раньше были видны только в таблице «Диагностики»."""
+    out = []
+    for row in db.query(WorkerHeartbeat):
+        if not row.last_success:
+            out.append((row.name, row.last_error[:200], True))
+        elif row.last_error and row.name in ("daily_refresh", "onec_exchange", "price_dispatch", "backup"):
+            out.append((row.name, row.last_error[:200], False))
+    return out

@@ -198,6 +198,7 @@ def sku_rows(db: Session, scope: dict) -> list[dict]:
                           "current": facts.current, "sale": facts.sale,
                           "discount": int((facts.discount * 100).quantize(Decimal("1"))) if facts.discount else None,
                           "commission": facts.commission, "tariff": facts.tariff,
+                          "tariff_missing": facts.tariff_missing,
                           "margin": d.markup_coef, "cur_margin": cur_margin,
                           "floor": d.block_reason == BLOCK_FLOOR,
                           "big_step": d.block_reason == BLOCK_MAX_CHANGE,
@@ -247,6 +248,7 @@ def summarize(rows: list[dict]) -> dict:
         "min_margin": min((c["margin"] for c in cells if c["margin"] is not None), default=None),
         "commission": span(c["commission"] for c in cells),
         "tariff_known": any(c["tariff"] is not None for c in cells),
+        "tariff_missing": any(c["tariff_missing"] for c in cells),
         "discount": span(c["discount"] for c in cells),
         "pct": change_percent(cur_max, new_max) if new_max else None,
         "floor": any(c["floor"] for c in cells), "big_step": any(c["big_step"] for c in cells),
@@ -564,7 +566,10 @@ async def send(request: Request, db: Session = Depends(get_db), user: User = Dep
                 if d.block_reason == BLOCK_MAX_CHANGE and not confirm_large:
                     big += 1
                     continue
-                if d.new_price == c["last_sent"] or (c["last_sent"] is None and d.new_price == c["current"]):
+                # «Уже стоит» — по тому, что площадка держит СЕЙЧАС; не знаем, что
+                # держит, — по нашей последней отправке. Иначе цена, которую площадка
+                # сменила после нас, не исправлялась бы никогда.
+                if d.new_price == (c["current"] if c["current"] else c["last_sent"]):
                     same += 1
                     continue
                 for old in db.query(PriceChange).filter(

@@ -242,9 +242,37 @@ def _heavy(db: Session, product_rows) -> list[Item]:
     return a.items
 
 
+def _orphans(db: Session) -> list[Item]:
+    """Наценки, которые не находят ни одного товара: ключ — строка (артикул 1С,
+    название категории площадки), и переименование на той стороне молча роняет
+    товары на умолчание площадки."""
+    from priceapp.models import ArticleCoef, CategoryTarget
+    from priceapp.pricing import article_map
+    out = []
+    arts = db.query(ArticleCoef).all()
+    if arts:
+        known = set(article_map(db).values()) | set(article_map(db))
+        lost = sorted({c.article for c in arts if c.article not in known})
+        if lost:
+            out.append(Item("warn", "Наценки артикулов, которых больше нет в справочнике 1С: "
+                                    + ", ".join(lost[:10]) + (" …" if len(lost) > 10 else ""),
+                            "/sku-prices", len(lost)))
+    cats = db.query(CategoryTarget).all()
+    if cats:
+        present = {(p, c) for p, c in db.query(Account.platform, PlatformItem.category)
+                   .join(PlatformItem, PlatformItem.account_id == Account.id).distinct()}
+        lost = sorted({f"{platforms.PLATFORMS.get(c.platform, c.platform)}: {c.category}" for c in cats
+                       if (c.platform, c.category) not in present})
+        if lost:
+            out.append(Item("warn", "Наценки категорий, которых больше нет в каталогах (площадка переименовала?) — "
+                                    "товары ушли на умолчание: " + "; ".join(lost[:10]),
+                            "/sku-prices?by=category", len(lost)))
+    return out
+
+
 def refresh_heavy(db: Session, product_rows) -> None:
     import json
-    items = _heavy(db, product_rows)
+    items = _heavy(db, product_rows) + _orphans(db)
     settings.put(db, HEAVY_KEY, json.dumps({"at": now_utc().isoformat(),
                                             "items": [[i.level, i.text, i.link, i.count] for i in items]},
                                            ensure_ascii=False))
@@ -263,6 +291,45 @@ def heavy_cached(db: Session) -> tuple[list[Item] | None, str, bool]:
     except ValueError:
         return None, "", True
     return [Item(*x) for x in data.get("items", [])], data.get("at", ""), settings.get(db, DIRTY_KEY) == "1"
+
+
+JOB_NAMES = {"onec_exchange": "обмен с 1С", "price_dispatch": "отправка цен", "rate": "курс ЦБ",
+             "daily_refresh": "суточное обновление (каталоги, цены, диапазоны)", "backup": "копия базы",
+             "attention": "счётчики «Внимания»"}
+
+
+def _health(db: Session, a: Attention) -> None:
+    """Фоновые задания, 1С и свежесть данных из 1С — то, что раньше было видно только
+    на «Диагностике»: остановилась отправка цен — узнавали случайно."""
+    from priceapp.models import OnecTask, OnecTaskStatus
+    from priceapp.workers import heartbeat
+    for line in heartbeat.stale_workers(db):
+        name = line.split(":", 1)[0]
+        a.add("bad", f"Фоновое задание «{JOB_NAMES.get(name, name)}» не отвечает: {line.split(':', 1)[1].strip()}",
+              "/diagnostics")
+    stale = {line.split(":", 1)[0] for line in heartbeat.stale_workers(db)}
+    for name, text, is_error in heartbeat.failed_or_noted(db):
+        if name in stale:
+            continue
+        a.add("bad" if is_error else "warn",
+              f"«{JOB_NAMES.get(name, name)}»: {'ошибка' if is_error else 'оговорка'} — {text}", "/diagnostics")
+    bad = db.query(OnecTask).filter(OnecTask.status.in_((OnecTaskStatus.failed.value,
+                                                         OnecTaskStatus.timeout.value)),
+                                    OnecTask.created_at > now_utc() - timedelta(days=2)).count()
+    if bad:
+        a.add("warn", "Задания 1С без ответа или с отказом за двое суток", "/diagnostics", bad)
+    for key, what in ((settings.COST_LOADED_AT, "Себестоимость из 1С"), (settings.DICT_LOADED_AT, "Справочник баркодов 1С")):
+        raw = settings.get(db, key)
+        try:
+            from datetime import datetime
+            at = datetime.fromisoformat(raw) if raw else None
+        except ValueError:
+            at = None
+        if at is None:
+            a.add("warn", f"{what} ещё не загружались", "/diagnostics")
+        elif now_utc() - at > STALE:
+            a.add("warn", f"{what} не обновлялись больше суток (последний раз {at:%d.%m %H:%M} UTC)",
+                  "/diagnostics")
 
 
 def attention(db: Session, product_rows, background_alive: bool = False) -> Attention:
@@ -293,6 +360,7 @@ def attention(db: Session, product_rows, background_alive: bool = False) -> Atte
     if n:
         a.add("ok", "Подтверждено и ждёт отправки (уходит в течение пары минут)", "/prices?view=log&status=approved", n)
 
+    _health(db, a)
     now = now_utc()
     for acc in db.query(Account).filter(Account.is_active.is_(True)).order_by(Account.platform, Account.name):
         has_keys = db.query(ApiCredential.id).filter(ApiCredential.account_id == acc.id).first() is not None
