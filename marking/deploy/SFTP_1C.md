@@ -199,5 +199,12 @@ sftp -P 443 -i C:\marking\ssh\id_ed25519 -o UserKnownHostsFile=C:\marking\ssh\kn
   `Invoke-RestMethod https://api.ipify.org` на рабочем компьютере, затем на
   сервере: `Get-NetFirewallRule -DisplayName "SFTP marking 443" |
   Get-NetFirewallAddressFilter | Set-NetFirewallAddressFilter -RemoteAddress <адрес>`.
+- **ЧЗ или Нацкаталог «не отвечает» (`ReadTimeout`), задания 1С висят в
+  `pending`** — почти наверняка включён VPN. 02.10.2026 ровно так и было:
+  запросы к `crpt.ru` уходили через прокси VPN и молча висели (у PowerShell
+  тоже), а SFTP до сервера не пускает чужой адрес — правило открыто только для
+  `178.34.159.213`. Выключить VPN или внести в его исключения `crpt.ru`,
+  `*.crpt.ru` и `136.243.92.95`. Проверка — `check_workstation.ps1`: печатает
+  системный прокси и внешний адрес.
 - **«недоступен»** — сервер или интернет. Задания подождут: программа
   повторит отправку в следующий проход, ничего не теряется.

@@ -13,7 +13,9 @@
 #>
 param(
     [string]$Server = "136.243.92.95",
-    [int]$SshPort = 443
+    [int]$SshPort = 443,
+    # Сервер пускает SFTP только с этого адреса (правило «SFTP marking 443»).
+    [string]$OfficeIp = "178.34.159.213"
 )
 $ErrorActionPreference = "Continue"
 function Good($m) { Write-Host "[OK] $m" -ForegroundColor Green }
@@ -77,6 +79,22 @@ function Probe($name, $url) {
         else { Bad "$name : нет ответа ($($_.Exception.Message))" }
     }
 }
+# Прокси и VPN. 02.10 вход в ЧЗ висел ReadTimeout: был включён VPN, и запросы
+# к crpt.ru уходили через его прокси, где молча зависали — и у PowerShell, и у
+# Python программы. По самому таймауту причину не видно, поэтому печатаем, через
+# что компьютер ходит в интернет.
+$inet = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction SilentlyContinue
+if ($inet -and $inet.ProxyEnable -eq 1) { Note "в Windows включён прокси ($($inet.ProxyServer)) — если ЧЗ не отвечает, проверьте VPN" }
+elseif ($inet -and $inet.AutoConfigURL) { Note "в Windows задан скрипт прокси ($($inet.AutoConfigURL)) — если ЧЗ не отвечает, проверьте VPN" }
+else { Good "системного прокси нет" }
+foreach ($v in "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY") {
+    if ([Environment]::GetEnvironmentVariable($v)) { Note "задана переменная $v — Python программы пойдёт через неё" }
+}
+try {
+    $ip = (Invoke-RestMethod https://api.ipify.org -TimeoutSec 10)
+    if ($ip -eq $OfficeIp) { Good "внешний адрес $ip — адрес офиса, сервер его пропустит" }
+    else { Bad "внешний адрес $ip, а сервер пускает только $OfficeIp — выключите VPN или обновите правило на сервере (SFTP_1C.md)" }
+} catch { Note "внешний адрес узнать не удалось" }
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 Probe "True API auth/key" "https://markirovka.crpt.ru/api/v3/true-api/auth/key"
 Probe "СУЗ ping" "https://suzgrid.crpt.ru/api/v3/ping?omsId=00000000-0000-0000-0000-000000000000"

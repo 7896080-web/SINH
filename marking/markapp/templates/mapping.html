@@ -14,9 +14,9 @@
   <div class="row">
     <form method="post" action="/mapping/request">
       <button {{ 'disabled' if (not can_request or pending) }}
-        title="{{ '' if can_request else 'нужна обработка 1С версии mark-2' }}">Запросить справочник из 1С</button>
+        title="{{ '' if can_request else 'нужна обработка 1С версии mark-2 или новее' }}">Запросить справочник из 1С</button>
     </form>
-    {% if not can_request %}<span class="muted">Кнопка заработает с обработкой 1С версии mark-2: после её
+    {% if not can_request %}<span class="muted">Кнопка заработает с обработкой 1С версии mark-2 или новее: после её
     установки — «Диагностика» → «Отправить PING».</span>{% endif %}
     <form method="post" action="/mapping/import" enctype="multipart/form-data" class="row">
       <label>или файл barcodes_*.txt (формат sync_admin)<input type="file" name="file" accept=".txt" required></label>
