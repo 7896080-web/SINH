@@ -80,7 +80,8 @@ PRODUCT_FILTERS = {
     "manual": "с ручной ценой",
     "platform_status": "карантин или ошибка у площадки",
     "below_platform_min": "расчётная ниже минимальной площадки",
-    "guard_below": "ниже диапазона безопасности",
+    "guard_below": "ниже диапазона безопасности (все)",
+    "guard_stuck": "ниже диапазона, вернуть нечем",
     "guard_eaten": "ниже диапазона, цена наша — съедает скидка/акция",
     "guard_above": "выше диапазона безопасности",
 }
@@ -393,12 +394,25 @@ def import_guard(request: Request, file: UploadFile = File(...), db: Session = D
     return _back("rules")
 
 
+@router.post("/prices/guard-preview")
+def preview_guard(request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Сколько цен вернётся по диапазонам — ничего не пишет и не отправляет."""
+    from priceapp import guard
+    st = guard.preview(db, product_rows)
+    db.rollback()
+    flash(request, guard.summary(st, preview=True) + " Ничего не отправлено.", "info")
+    return _back("rules")
+
+
 @router.post("/prices/guard-run")
 def run_guard(request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    """Проверить диапазоны по уже загруженным текущим ценам — без запроса к площадкам."""
+    """Вернуть цены по диапазонам: по уже загруженным текущим ценам ставит наши
+    цены в ОТПРАВКУ (только вверх и только там, где они вернут маржинальность)."""
     from priceapp import guard
-    st = guard.run(db, actor=user.username)
-    flash(request, guard.summary(st), "warn" if st.get("eaten") or st.get("blocked") else "ok")
+    st = guard.run(db, product_rows, actor=user.username)
+    flash(request, guard.summary(st) + (" Возвращённые цены уйдут на площадки в течение пары минут."
+                                        if st.get("restored") else ""),
+          "warn" if st.get("eaten") or st.get("stuck") else "ok")
     return _back("rules")
 
 
@@ -474,7 +488,9 @@ def product_rows(db: Session, account: Account, q: str = "", flt: str = "",
         if flt.startswith("guard_"):
             from priceapp import guard
             kind = guard.classify(r, account)
-            if flt == "guard_below" and kind not in ("below", "eaten"):
+            if flt == "guard_below" and kind not in ("below", "eaten", "stuck"):
+                continue
+            if flt == "guard_stuck" and kind != "stuck":
                 continue
             if flt == "guard_eaten" and kind != "eaten":
                 continue

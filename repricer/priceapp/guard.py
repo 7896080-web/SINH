@@ -6,19 +6,19 @@
 маржинальности («от … до …», `Account.guard_*`) проверяется маржинальность по
 ТЕКУЩЕЙ цене — той, что платит покупатель:
 
-  * ниже «от», а на площадке стоит НЕ наша цена — возвращаем цену по наценке,
-    установленной на кабинет (артикул / категория / умолчание — тем же расчётом,
-    что и везде). Это подтверждение от имени программы: цена встаёт в очередь
-    отправки. Пол не обходится никогда; лимит шага — обходится, это возврат к уже
-    заданной наценке, а не новое решение;
-  * ниже «от», а цена на площадке и так наша — маржинальность съедает скидка
-    продавца или акция. Ценой это не исправить, а слать одно и то же каждый день
-    бессмысленно: такие товары показывает «Внимание» (решает человек — снять
-    скидку или выйти из акции);
-  * выше «до» — только пометка.
+  * ниже «от», на площадке стоит НАША цена (текущая = последней отправленной) —
+    маржинальность съедает скидка продавца или акция; ценой это не исправить —
+    «Внимание» (`eaten`);
+  * ниже «от», цена на площадке НЕ наша (площадка или акция её опустила), а наша
+    расчётная цена выше текущей и даёт маржинальность не ниже «от» при той же
+    скидке — программа сама ставит её в отправку (`below`). Только ВВЕРХ: опустить
+    цену без человека программа не вправе ни при каком раскладе;
+  * ниже «от», но вернуть нечем (расчётная не выше текущей, сама ниже «от» или
+    ниже пола, не считается) — «Внимание» (`stuck`);
+  * выше «до» — только пометка (`above`).
 
-Считается по `product_rows` — тому же, что показывает «Цены» → «Товары»: число
-здесь и строки там не разойдутся.
+Цена, подтверждённая человеком и ещё не ушедшая, не трогается: её решение главнее.
+Считается по `product_rows` — тому же, что показывает «Цены» → «Товары».
 """
 from __future__ import annotations
 
@@ -33,84 +33,95 @@ SOURCE = "guard"
 
 
 def classify(r: dict, a: Account) -> str | None:
-    """Строка «Товаров» относительно диапазона кабинета: below / eaten / above / None."""
+    """Строка «Товаров» относительно диапазона кабинета: below / eaten / stuck / above / None."""
     m = r.get("current_coef")
     if m is None:
         return None
-    if a.guard_min_margin is not None and m < _dec(a.guard_min_margin):
-        return "eaten" if r.get("price") and r["price"] == r.get("current") else "below"
+    lo = _dec(a.guard_min_margin) if a.guard_min_margin is not None else None
+    if lo is not None and m < lo:
+        if r.get("last_sent") and r.get("current") == r["last_sent"]:
+            return "eaten"
+        price, new_m = r.get("price"), r.get("markup_coef")
+        if (price and r.get("current") and price > r["current"] and new_m is not None and new_m >= lo
+                and r.get("block_reason") != BLOCK_FLOOR):
+            return "below"
+        return "stuck"
     if a.guard_max_margin is not None and m > _dec(a.guard_max_margin):
         return "above"
     return None
 
 
+COMMIT_EVERY = 500
+
+
 def run(db: Session, product_rows=None, actor: str = "программа") -> dict:
     """Проверить все кабинеты с диапазоном и вернуть цены, где можно. Только по
-    уже загруженным текущим ценам — к площадкам не обращается."""
+    уже загруженным текущим ценам — к площадкам не обращается. Коммит порциями:
+    одна транзакция на весь каталог держала бы базу заблокированной минутами."""
     if product_rows is None:
         from priceapp.routers.prices import product_rows
-    st = {"restored": 0, "eaten": 0, "above": 0, "blocked": 0, "unpriced": 0, "accounts": 0}
+    st = {"restored": 0, "eaten": 0, "stuck": 0, "above": 0, "accounts": 0}
     rate = rates.current(db)
     now = now_utc()
-    for a in db.query(Account).filter(Account.is_active.is_(True)):
+    for a in db.query(Account).filter(Account.is_active.is_(True)).all():
         if a.guard_min_margin is None and a.guard_max_margin is None:
             continue
         st["accounts"] += 1
+        busy = {i for (i,) in db.query(PriceChange.item_id).filter(
+            PriceChange.account_id == a.id, PriceChange.is_test.is_(False),
+            PriceChange.status == PriceChangeStatus.approved.value)}
         restored = 0
         for r in product_rows(db, a):
             kind = classify(r, a)
-            if kind == "above":
-                st["above"] += 1
-            if kind == "eaten":
-                st["eaten"] += 1
-            if kind != "below":
+            if kind in ("eaten", "stuck", "above"):
+                st[kind] += 1
+            if kind != "below" or r["item_id"] in busy:
                 continue
-            if not r["price"]:
-                st["unpriced"] += 1
-                continue
-            if r["block_reason"] == BLOCK_FLOOR:
-                st["blocked"] += 1
-                continue
-            pending = db.query(PriceChange).filter(
-                PriceChange.account_id == a.id, PriceChange.item_id == r["item_id"],
-                PriceChange.is_test.is_(False), PriceChange.status == PriceChangeStatus.approved.value,
-                PriceChange.new_price == r["price"]).first()
-            if pending is not None:
-                continue            # уже в очереди — второй раз не ставим
-            for old in db.query(PriceChange).filter(
-                    PriceChange.account_id == a.id, PriceChange.item_id == r["item_id"],
-                    PriceChange.is_test.is_(False),
-                    PriceChange.status.in_(OPEN + (PriceChangeStatus.approved.value,))):
-                old.status = PriceChangeStatus.rejected.value
-                old.note = "вытеснено возвратом по диапазону безопасности"
             db.add(PriceChange(
                 item_id=r["item_id"], account_id=a.id, barcode=r["platform"].barcode,
                 cost_usd=r["cost_usd"], usd_rub=rate.usd_rub if rate else None, cost_rub=r["cost_rub"],
                 commission_percent=r["commission"], old_price=r["current"], new_price=r["price"],
                 markup_rub=r["markup_rub"], markup_coef=r["markup_coef"], source=SOURCE,
                 status=PriceChangeStatus.approved.value,
-                note=(f"маржинальность по текущей {r['current_coef']} ниже диапазона «от» "
+                note=(f"площадка держит {r['current']} ₽, маржинальность {r['current_coef']} ниже «от» "
                       f"{_dec(a.guard_min_margin).normalize()} — возврат к наценке кабинета")[:255],
                 decided_by=actor, decided_at=now))
-            db.flush()
+            busy.add(r["item_id"])
             restored += 1
+            if restored % COMMIT_EVERY == 0:
+                db.commit()
         st["restored"] += restored
         if restored:
             audit.log(db, actor, "guard_restored", a.name, f"возвращено цен: {restored}")
-    db.commit()
+        db.commit()
     return st
 
 
-def summary(st: dict) -> str:
+def preview(db: Session, product_rows=None) -> dict:
+    """То же, что `run`, но ничего не пишет: сколько вернётся и сколько на «Внимание»."""
+    if product_rows is None:
+        from priceapp.routers.prices import product_rows
+    st = {"restored": 0, "eaten": 0, "stuck": 0, "above": 0, "accounts": 0}
+    for a in db.query(Account).filter(Account.is_active.is_(True)).all():
+        if a.guard_min_margin is None and a.guard_max_margin is None:
+            continue
+        st["accounts"] += 1
+        for r in product_rows(db, a):
+            kind = classify(r, a)
+            if kind:
+                st["restored" if kind == "below" else kind] += 1
+    return st
+
+
+def summary(st: dict, preview: bool = False) -> str:
     if not st.get("accounts"):
         return "Диапазон безопасности не задан ни у одного кабинета («Цены» → «Правила»)."
-    parts = [f"Диапазоны безопасности ({st['accounts']} каб.): возвращено цен — {st['restored']}"]
+    verb = "вернётся цен" if preview else "возвращено цен"
+    parts = [f"Диапазоны безопасности ({st['accounts']} каб.): {verb} — {st['restored']}"]
     if st["eaten"]:
-        parts.append(f"цена наша, маржинальность съедает скидка или акция — {st['eaten']} (см. «Внимание»)")
-    if st["blocked"]:
-        parts.append(f"наша цена тоже ниже пола, не отправлено — {st['blocked']}")
-    if st["unpriced"]:
-        parts.append(f"цена не считается — {st['unpriced']}")
+        parts.append(f"цена наша, маржинальность съедает скидка или акция — {st['eaten']}")
+    if st["stuck"]:
+        parts.append(f"ниже «от», а вернуть нечем (наша цена не выше текущей или сама ниже «от») — {st['stuck']}")
     if st["above"]:
         parts.append(f"выше «до» — {st['above']}")
     return "; ".join(parts) + "."

@@ -116,7 +116,7 @@ def job_daily_refresh(client_factory=None, force_prices: bool = False) -> None:
                 st = guard.run(db)
                 if st["accounts"]:
                     logger.info("%s", guard.summary(st))
-                    if st["eaten"] or st["blocked"]:
+                    if st["eaten"] or st["stuck"]:
                         notes.append(guard.summary(st))
             except Exception as e:
                 db.rollback()

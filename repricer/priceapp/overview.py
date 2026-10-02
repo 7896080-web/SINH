@@ -244,10 +244,15 @@ def attention(db: Session, product_rows) -> Attention:
                 a.add("bad", f"{name}: маржинальность ниже диапазона безопасности, а цена на площадке наша — "
                              "съедает скидка продавца или акция: снимите скидку или выйдите из акции",
                       f"{link}&flt=guard_eaten", eaten)
+            stuck = kinds.count("stuck")
+            if stuck:
+                a.add("bad", f"{name}: ниже диапазона безопасности, а вернуть нечем — наша расчётная цена не выше "
+                             "текущей или сама ниже «от»: поднимите наценку", f"{link}&flt=guard_stuck", stuck)
             below = kinds.count("below")
             if below:
-                a.add("warn", f"{name}: ниже диапазона безопасности — цена по наценке кабинета "
-                              "возвращается при запуске программы и раз в сутки", f"{link}&flt=guard_below", below)
+                a.add("warn", f"{name}: ниже диапазона безопасности — наша цена вернётся при запуске программы "
+                              "и раз в сутки (или «Вернуть цены по диапазонам» на «Правилах»)",
+                      f"{link}&flt=guard_below", below)
             above = kinds.count("above")
             if above:
                 a.add("ok", f"{name}: маржинальность выше диапазона безопасности", f"{link}&flt=guard_above", above)

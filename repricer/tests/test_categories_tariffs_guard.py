@@ -227,8 +227,9 @@ def test_guard_restores_when_platform_lowered_price_and_flags_eaten(client, db):
     r = client.post(f"/prices/guard/{a1.id}", data={"guard_min_margin": "1,5", "guard_max_margin": "3"})
     assert "диапазон безопасности сохранён" in r.text
     # b1: площадка опустила цену до 2000 (наша 3309) — маржинальность 2000 × 0,845 / 1323,56 = 1,28
-    # b3: цена наша (2529), но скидка 40% съела маржинальность — ценой не исправить
+    # b3: цена наша (2529 — её мы и отправляли), но скидка 40% съела маржинальность — ценой не исправить
     # b2: 9000 — маржинальность выше «до»
+    db.add(ProductPrice(item_id="u3", account_id=a1.id, last_sent_price=2529))
     _prices(db, a1, b1=(2000, 2000), b3=(2529, 1517), b2=(9000, 9000))
     st = guard.run(db)
     assert (st["restored"], st["eaten"], st["above"]) == (1, 1, 1)
@@ -253,7 +254,103 @@ def test_guard_never_below_floor_and_validation(client, db):
                                           "arts": ["39681"]})
     _prices(db, a1, b1=(1000, 1000))
     st = guard.run(db)
-    assert st["blocked"] == 1 and st["restored"] == 0 and db.query(PriceChange).count() == 0
+    assert st["stuck"] == 1 and st["restored"] == 0 and db.query(PriceChange).count() == 0
+    assert "вернуть нечем" in client.get("/attention").text
+
+
+def test_guard_never_lowers_price_and_keeps_human_decision(client, db):
+    """Площадка держит 4000 со скидкой 60% — маржинальность ниже «от», цена не наша. Наша
+    расчётная 3309 НИЖЕ текущей: опустить цену без человека программа не вправе."""
+    a1, _ = _wb(client, db)
+    client.post(f"/prices/guard/{a1.id}", data={"guard_min_margin": "1,5", "guard_max_margin": ""})
+    _prices(db, a1, b1=(4000, 1600))
+    st = guard.run(db)
+    assert st["restored"] == 0 and st["stuck"] >= 1 and db.query(PriceChange).count() == 0
+    # подтверждённое человеком не вытесняется
+    _prices(db, a1, b1=(2000, 2000))
+    db.add(PriceChange(item_id="u1", account_id=a1.id, barcode="b1", new_price=5000, status="approved",
+                       decided_by="op"))
+    db.commit()
+    guard.run(db)
+    assert [(c.new_price, c.status) for c in db.query(PriceChange).filter_by(item_id="u1")] == [(5000, "approved")]
+
+
+def test_guard_preview_writes_nothing_and_run_asks(client, db):
+    a1, _ = _wb(client, db)
+    client.post(f"/prices/guard/{a1.id}", data={"guard_min_margin": "1,5", "guard_max_margin": ""})
+    _prices(db, a1, b1=(2000, 2000))
+    r = client.post("/prices/guard-preview")
+    assert "вернётся цен — 1" in r.text and db.query(PriceChange).count() == 0
+    assert "Вернуть цены по диапазонам" in client.get("/prices?view=rules").text
+
+
+# --- карточка целиком при отправке -------------------------------------------------------
+
+class _Push:
+    def __init__(self):
+        self.items = []
+
+    def push_prices(self, items):
+        self.items += items
+        return {"ok": [i.barcode for i in items], "errors": [], "sent_prices": {}}
+
+
+def _card(db, xl_last=None, xl_cost="20"):
+    """Карточка WB nmID 5: S (себестоимость 10 $) и XL; комиссия 25%, пол 1,3."""
+    f.manual_rate(db)
+    acc = f.account(db, commission=25)
+    f.rule(db, acc)
+    f.sku(db, "s", "A1", "S", barcodes=["bs"], cost_usd="10")
+    f.sku(db, "xl", "A1", "XL", barcodes=["bxl"], cost_usd=xl_cost)
+    f.item(db, acc, "bs", "A1", external_id="5:1", size="S")
+    f.item(db, acc, "bxl", "A1", external_id="5:2", size="XL")
+    if xl_last:
+        db.add(ProductPrice(item_id="xl", account_id=acc.id, last_sent_price=xl_last))
+    db.add(PriceChange(item_id="s", account_id=acc.id, barcode="bs", new_price=1999, status="approved"))
+    db.commit()
+    return acc
+
+
+def test_card_goes_at_highest_price_of_all_its_sizes(db):
+    acc = _card(db, xl_last=4100)
+    push = _Push()
+    dispatch.run_account(db, acc, push)
+    assert [(i.barcode, i.price) for i in push.items] == [("bs", 4100)]     # XL держит карточку
+    ch = db.query(PriceChange).one()
+    assert ch.status == "sent" and "одна цена на карточку" in ch.note
+    sent = {p.item_id: p.last_sent_price for p in db.query(ProductPrice)}
+    assert sent == {"s": 4100, "xl": 4100}
+
+
+def test_card_price_below_floor_of_size_outside_queue_is_blocked(db):
+    # XL: себестоимость 20 $ × 81,5 = 1630; пол 1630 × 1,3 / 0,75 = 2825,3. Его прежняя цена 2000
+    # (2825,3 → 2826) ниже нового пола, S подтверждён за 1999 — карточка ушла бы по 2000, ниже пола XL.
+    acc = _card(db, xl_last=2000)
+    push = _Push()
+    dispatch.run_account(db, acc, push)
+    ch = db.query(PriceChange).one()
+    assert push.items == [] and ch.status == "blocked" and "A1 XL" in ch.note and "2826" in ch.note
+
+
+def test_no_rate_nothing_is_sent(db):
+    acc = _card(db, xl_last=4100)
+    from priceapp import settings
+    settings.put(db, settings.RATE_MANUAL, "")
+    db.commit()
+    push = _Push()
+    assert dispatch.run_account(db, acc, push)["reason"] == "нет курса"
+    assert push.items == [] and db.query(PriceChange).one().status == "approved"
+
+
+def test_commission_out_of_range_blocks_and_does_not_crash(db):
+    acc = _card(db, xl_last=4100)
+    from priceapp.pricing import get_rule
+    get_rule(db, "wb").commission_extra = Decimal("75")      # 25 + 75 = 100%
+    db.commit()
+    push = _Push()
+    dispatch.run_account(db, acc, push)
+    ch = db.query(PriceChange).one()
+    assert push.items == [] and ch.status == "blocked" and "вне 0–99,99" in ch.note
 
 
 def test_guard_excel_and_run_button(client, db):

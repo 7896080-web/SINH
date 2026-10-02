@@ -90,6 +90,20 @@ class PlatformError(RuntimeError):
     pass
 
 
+def card_key(platform: str, item) -> str:
+    """Чем площадка адресует ЦЕНУ строки каталога — то, на что ставится одна цена:
+    WB — карточка (nmID), Ozon — offer_id, Lamoda — карточка (parentSku), Kit —
+    вариант. Строки с одним ключом получают ОДНУ цену, наибольшую из желаемых."""
+    ext = item.external_id or ""
+    if platform == "wb":
+        return ext.split(":")[0]
+    if platform == "ozon":
+        return item.article or ""
+    if platform == "lamoda":
+        return ext.split(":")[0]
+    return ext
+
+
 def _int_price(v) -> int | None:
     try:
         n = float(str(v).replace(",", "."))
