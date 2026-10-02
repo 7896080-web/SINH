@@ -1,0 +1,247 @@
+"""То, что оператор должен видеть, не обходя все вкладки.
+
+* `card_key` / `change_context` — цена КАРТОЧКИ. У WB (nmID) и Lamoda (parentSku)
+  цена ставится на карточку, у Ozon — на offer_id: размеры с разными расчётными
+  ценами уходят одной, наибольшей (`platforms.*.push_prices`). Видно это было
+  только в журнале, после отправки; теперь — до подтверждения, тем же правилом.
+* `proposals_summary` — итог по отбору перед подтверждением.
+* `rate_shift` — насколько курс ушёл от того, по которому считали.
+* `attention` — список «что требует внимания» со ссылками прямо на строки.
+
+Модуль только читает.
+"""
+from __future__ import annotations
+
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import timedelta
+from decimal import Decimal
+
+from sqlalchemy.orm import Session
+
+from priceapp import platforms, rates, settings
+from priceapp.models import (Account, ApiCredential, PlatformItem, PriceChange, PriceChangeStatus)
+from priceapp.timeutils import now_utc
+
+PENDING = ("proposed", "blocked", "approved")
+STALE = timedelta(hours=26)
+
+
+def card_key(platform: str, item: PlatformItem | None) -> str:
+    """Чем площадка адресует цену — тем же правилом, что `push_prices`."""
+    if item is None:
+        return ""
+    if platform == "wb":
+        return (item.external_id or "").split(":")[0]
+    if platform == "lamoda":
+        return platforms.lamoda_parent(item.external_id)
+    if platform == "ozon":
+        return item.article or item.barcode
+    return item.external_id or item.barcode
+
+
+@dataclass
+class ChangeInfo:
+    card: str = ""
+    card_price: int | None = None     # что уйдёт на карточку, если подтвердить всё ждущее
+    card_size: int = 1                # сколько SKU карточки сейчас в предложениях
+    min_price: int | None = None      # минимальная цена площадки
+    price_status: str | None = None   # что площадка говорит о текущей цене
+
+
+def _items_by_barcode(db: Session, account_ids, barcodes) -> dict:
+    out = {}
+    barcodes = list(set(barcodes))
+    for i in range(0, len(barcodes), 500):
+        for it in db.query(PlatformItem).filter(PlatformItem.account_id.in_(list(account_ids)),
+                                                PlatformItem.barcode.in_(barcodes[i:i + 500])):
+            out[(it.account_id, it.barcode)] = it
+    return out
+
+
+def change_context(db: Session, changes: list[PriceChange]) -> dict[int, ChangeInfo]:
+    """Для показанных предложений: цена карточки, считая ВСЕ ждущие предложения
+    тех же кабинетов (на карточку уйдёт наибольшая из них, кроме заблокированных
+    полом), минимальная цена и статус площадки."""
+    if not changes:
+        return {}
+    accounts = {c.account_id for c in changes}
+    platform_of = {a.id: a.platform for a in db.query(Account).filter(Account.id.in_(list(accounts)))}
+    pending = (db.query(PriceChange).filter(PriceChange.account_id.in_(list(accounts)),
+                                            PriceChange.status.in_(PENDING),
+                                            PriceChange.is_test.is_(False)).all())
+    allc = {c.id: c for c in pending}
+    allc.update({c.id: c for c in changes})
+    items = _items_by_barcode(db, accounts, [c.barcode for c in allc.values()])
+    groups: dict[tuple, list[PriceChange]] = defaultdict(list)
+    keys = {}
+    for c in allc.values():
+        key = (c.account_id, card_key(platform_of.get(c.account_id, ""), items.get((c.account_id, c.barcode))))
+        keys[c.id] = key
+        if c.status in PENDING and c.block_reason != "floor" and key[1]:
+            groups[key].append(c)
+    out = {}
+    for c in changes:
+        key = keys[c.id]
+        group = groups.get(key, [])
+        it = items.get((c.account_id, c.barcode))
+        out[c.id] = ChangeInfo(card=key[1], card_price=max((g.new_price for g in group), default=None),
+                               card_size=len(group) or 1, min_price=it.min_price if it else None,
+                               price_status=it.price_status if it else None)
+    return out
+
+
+@dataclass
+class Summary:
+    total: int = 0
+    up: int = 0
+    down: int = 0
+    new: int = 0
+    floor: int = 0
+    big_step: int = 0
+    below_platform_min: int = 0
+    card_raised: int = 0
+    min_coef: Decimal | None = None
+    avg_coef: Decimal | None = None
+    avg_change: float | None = None
+
+
+def proposals_summary(db: Session, changes: list[PriceChange]) -> Summary:
+    s = Summary(total=len(changes))
+    ctx = change_context(db, changes)
+    coefs, pcts = [], []
+    for c in changes:
+        if c.old_price is None:
+            s.new += 1
+        elif c.new_price > c.old_price:
+            s.up += 1
+        elif c.new_price < c.old_price:
+            s.down += 1
+        if c.old_price:
+            pcts.append((c.new_price - c.old_price) * 100.0 / c.old_price)
+        if c.block_reason == "floor":
+            s.floor += 1
+        elif c.block_reason == "max_change":
+            s.big_step += 1
+        if c.markup_coef is not None:
+            coefs.append(Decimal(str(c.markup_coef)))
+        info = ctx.get(c.id)
+        if info and info.min_price and c.new_price < info.min_price:
+            s.below_platform_min += 1
+        if info and info.card_price and info.card_price != c.new_price and c.block_reason != "floor":
+            s.card_raised += 1
+    if coefs:
+        s.min_coef = min(coefs)
+        s.avg_coef = (sum(coefs) / len(coefs)).quantize(Decimal("0.01"))
+    if pcts:
+        s.avg_change = sum(pcts) / len(pcts)
+    return s
+
+
+def rate_alert_percent(db: Session) -> Decimal:
+    try:
+        return Decimal(settings.get(db, settings.RATE_ALERT_PERCENT).replace(",", "."))
+    except Exception:
+        return Decimal("2")
+
+
+def rate_shift(db: Session) -> dict | None:
+    """Курс сейчас против курса последнего расчёта. None — сравнивать не с чем
+    или сдвиг в пределах порога."""
+    cur = rates.current(db)
+    last = (db.query(PriceChange).filter(PriceChange.is_test.is_(False), PriceChange.usd_rub.isnot(None))
+            .order_by(PriceChange.id.desc()).first())
+    if cur is None or last is None:
+        return None
+    was = Decimal(str(last.usd_rub))
+    if was <= 0:
+        return None
+    pct = (cur.usd_rub - was) * 100 / was
+    limit = rate_alert_percent(db)
+    if abs(pct) < limit:
+        return None
+    return {"was": was, "now": cur.usd_rub, "pct": pct.quantize(Decimal("0.1")), "limit": limit,
+            "at": last.created_at}
+
+
+@dataclass
+class Item:
+    level: str           # bad / warn / ok
+    text: str
+    link: str = ""
+    count: int | None = None
+
+
+@dataclass
+class Attention:
+    items: list[Item] = field(default_factory=list)
+
+    def add(self, level, text, link="", count=None):
+        self.items.append(Item(level, text, link, count))
+
+
+def attention(db: Session, product_rows) -> Attention:
+    """Что требует внимания, по убыванию цены ошибки. `product_rows` передаётся
+    снаружи (живёт в роутере цен), чтобы считать ровно то же, что показывает
+    вкладка «Товары» — иначе число здесь и строки там однажды разошлись бы."""
+    a = Attention()
+    rate = rates.current(db)
+    if rate is None:
+        a.add("bad", "Курса доллара нет — цены не считаются", "/rate")
+    shift = rate_shift(db)
+    if shift:
+        a.add("warn", f"Курс изменился на {shift['pct']}% с последнего расчёта ({shift['was']:.2f} → "
+                      f"{shift['now']:.2f} ₽) — пересчитайте цены", "/prices?view=proposals")
+    base = PriceChange.is_test.is_(False)
+    n = db.query(PriceChange).filter(base, PriceChange.status == PriceChangeStatus.error.value).count()
+    if n:
+        a.add("bad", "Площадка не приняла цену", "/prices?view=log&status=error", n)
+    n = db.query(PriceChange).filter(base, PriceChange.status == "proposed").count()
+    if n:
+        a.add("warn", "Предложения ждут решения", "/prices?view=proposals&status=proposed", n)
+    n = db.query(PriceChange).filter(base, PriceChange.status == "blocked").count()
+    if n:
+        a.add("warn", "Заблокированные предложения (пол или большой шаг)", "/prices?view=proposals&status=blocked", n)
+    n = db.query(PriceChange).filter(base, PriceChange.status == "approved").count()
+    if n:
+        a.add("ok", "Подтверждено и ждёт отправки (уходит в течение пары минут)", "/prices?view=log&status=approved", n)
+
+    now = now_utc()
+    for acc in db.query(Account).filter(Account.is_active.is_(True)).order_by(Account.platform, Account.name):
+        has_keys = db.query(ApiCredential.id).filter(ApiCredential.account_id == acc.id).first() is not None
+        name = f"{acc.name} ({platforms.PLATFORMS.get(acc.platform, acc.platform)})"
+        if not has_keys:
+            # Без ключей молчат только проверки свежести — товары, цены и расхождения
+            # по уже загруженным данным смотрим всё равно.
+            a.add("warn", f"{name}: не заданы ключи", "/api-keys")
+        else:
+            if acc.last_check_ok is False:
+                a.add("bad", f"{name}: проверка ключей не прошла — {acc.last_check_message[:120]}", "/api-keys")
+            if not acc.catalog_loaded_at or now - acc.catalog_loaded_at > STALE:
+                a.add("warn", f"{name}: каталог не загружался больше суток", "/api-keys")
+            if acc.platform in platforms.READS_PRICES and (
+                    not acc.prices_loaded_at or now - acc.prices_loaded_at > STALE):
+                a.add("warn", f"{name}: текущие цены не загружались больше суток",
+                      f"/prices?view=products&account_id={acc.id}")
+        from priceapp import mapping
+        not_in_1c = mapping.counts(mapping.build(db, acc.id)).get("not_in_1c", 0)
+        if not_in_1c and acc.catalog_loaded_at:
+            a.add("warn", f"{name}: баркоды площадки, которых нет в 1С — цена по ним не считается",
+                  f"/mapping?view=status&account_id={acc.id}&status=not_in_1c", not_in_1c)
+        rows = product_rows(db, acc)
+        link = f"/prices?view=products&account_id={acc.id}"
+        below = sum(1 for r in rows if r["below_floor_now"])
+        if below:
+            a.add("bad", f"{name}: продаётся ниже пола по текущей цене", f"{link}&flt=below_floor_now", below)
+        no_cost = sum(1 for r in rows if r["cost_usd"] is None)
+        if no_cost:
+            a.add("warn", f"{name}: нет себестоимости из 1С — цена не считается", f"{link}&flt=no_cost", no_cost)
+        bad_status = sum(1 for r in rows if r["price_status"] in ("QUARANTINE", "ERROR"))
+        if bad_status:
+            a.add("bad", f"{name}: площадка держит цену на карантине или с ошибкой",
+                  f"{link}&flt=platform_status", bad_status)
+        under_min = sum(1 for r in rows if r["min_price"] and r["price"] and r["price"] < r["min_price"])
+        if under_min:
+            a.add("warn", f"{name}: расчётная цена ниже минимальной цены площадки",
+                  f"{link}&flt=below_platform_min", under_min)
+    return a

@@ -28,7 +28,7 @@ def login(request: Request, username: str = Form(...), password: str = Form(...)
                                           status_code=401)
     request.session.clear()
     request.session["user_id"] = user.id
-    return RedirectResponse("/prices", status_code=303)
+    return RedirectResponse("/attention", status_code=303)
 
 
 @router.post("/logout")

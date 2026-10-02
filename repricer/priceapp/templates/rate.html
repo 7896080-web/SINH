@@ -26,6 +26,18 @@
   </form>
 </div>
 
+<div class="card">
+  <h2 style="margin-top:0">Предупреждение о скачке курса</h2>
+  {% if shift %}<p class="warn" style="margin-top:0">Курс ушёл на {{ shift.pct }}% от курса последнего расчёта
+  ({{ shift.was|money(4) }} → {{ shift.now|money(4) }} ₽) — пересчитайте цены на странице «Цены».</p>{% endif %}
+  <form method="post" action="/rate/alert" class="row">
+    <label>Предупреждать, если курс ушёл от курса расчёта больше чем на, %<input name="alert" value="{{ alert }}" inputmode="decimal" style="width:90px"></label>
+    <button type="submit">Сохранить</button>
+  </form>
+  <p class="muted" style="margin-bottom:0">Предупреждение видно на «Внимании» и на «Ценах». Пересчитывает и отправляет цены
+  по-прежнему только человек.</p>
+</div>
+
 <h2>Курсы ЦБ и ручные</h2>
 <table><tr><th>Дата</th><th class="num">₽ за $1</th><th>Источник</th><th>Получен (UTC)</th></tr>
 {% for r in history %}<tr><td>{{ r.rate_date|ru }}</td><td class="num">{{ r.usd_rub|money(4) }}</td><td>{{ 'ЦБ' if r.source == 'cbr' else 'вручную' }}</td><td>{{ r.fetched_at.strftime('%d.%m %H:%M') }}</td></tr>

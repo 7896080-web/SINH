@@ -76,21 +76,32 @@ def load_prices(db: Session, account: Account, client) -> dict:
     стёр бы цены у половины каталога и показал бы их «неизвестными»."""
     got = client.get_prices()
     truncated = bool(getattr(client, "last_truncated", False))
+    mins, min_note = None, ""
+    if hasattr(client, "get_min_prices"):
+        try:
+            mins = client.get_min_prices()
+        except Exception as e:      # минимальные цены — предупреждение, цены важнее
+            min_note = f"минимальные цены не загружены: {e}"[:300]
     now = now_utc()
     updated = missing = 0
     for item in db.query(PlatformItem).filter(PlatformItem.account_id == account.id):
-        cur = got.get(client.price_key(item))
+        key = client.price_key(item)
+        cur = got.get(key)
+        if mins is not None:
+            item.min_price = mins.get(key)
         if cur is not None:
             item.current_price, item.current_sale_price = cur.price, cur.sale_price
+            item.price_status = getattr(cur, "status", "") or None
             item.price_loaded_at = now
             updated += 1
         else:
             missing += 1
             if not truncated:
-                item.current_price = item.current_sale_price = None
+                item.current_price = item.current_sale_price = item.price_status = None
                 item.price_loaded_at = now
     account.prices_loaded_at = now
-    account.prices_note = ("ВЫГРУЗКА ЦЕН НЕПОЛНАЯ: площадка не отдала её до конца, "
-                           "прежние цены у пропавших строк оставлены" if truncated else "")
+    account.prices_note = "; ".join(x for x in (
+        "ВЫГРУЗКА ЦЕН НЕПОЛНАЯ: площадка не отдала её до конца, прежние цены у пропавших строк оставлены"
+        if truncated else "", min_note) if x)
     db.commit()
     return {"updated": updated, "missing": missing, "truncated": truncated}

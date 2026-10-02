@@ -16,10 +16,13 @@ COST_LOADED_AT = "onec_cost_loaded_at"
 COST_ROWS = "onec_cost_rows"
 DICT_LOADED_AT = "onec_dict_loaded_at"
 DICT_ROWS = "onec_dict_rows"
+# Курс ушёл от курса последнего расчёта больше чем на столько % — предупреждаем.
+RATE_ALERT_PERCENT = "rate_alert_percent"
 
 DEFAULTS = {
     RATE_MODE: "cbr",
     RATE_MANUAL: "",
+    RATE_ALERT_PERCENT: "2",
 }
 
 

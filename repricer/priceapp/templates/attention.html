@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}Внимание{% endblock %}
+{% block content %}
+<h1>Что требует внимания</h1>
+<p class="muted">Всё, что ждёт решения или говорит о расхождении, — сначала самое дорогое. Каждая строка ведёт прямо к своим
+товарам. {% if rate %}Курс: <b>{{ rate.usd_rub|money(4) }} ₽</b> ({{ rate.label }}).{% endif %}</p>
+{% if items %}
+<table class="attention">
+{% for i in items %}<tr>
+  <td style="width:1%"><span class="badge {{ i.level }}">{{ {'bad': 'срочно', 'warn': 'внимание', 'ok': 'идёт'}[i.level] }}</span></td>
+  <td>{{ i.text }}</td>
+  <td class="num">{{ i.count if i.count is not none else '' }}</td>
+  <td style="width:1%;white-space:nowrap">{% if i.link %}<a class="btn secondary" href="{{ i.link }}">Разобрать →</a>{% endif %}</td>
+</tr>{% endfor %}
+</table>
+{% else %}
+<div class="card ok">Всё в порядке: предложений, ошибок и расхождений нет, курс, каталоги и цены свежие.</div>
+{% endif %}
+{% endblock %}

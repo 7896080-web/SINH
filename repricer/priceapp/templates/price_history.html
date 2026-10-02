@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}История цены{% endblock %}
+{% block content %}
+<h1>История цены</h1>
+<p><b>{{ sku.article if sku else item_id }}{% if sku and sku.size %} · {{ sku.size }}{% endif %}{% if sku and sku.color %} · {{ sku.color }}{% endif %}</b>
+<span class="muted">{{ sku.name if sku else '' }} · {{ label(account) }} · ID_1С {{ item_id }}</span></p>
+<p class="muted">Сейчас: отправлено нами {{ pp.last_sent_price if pp and pp.last_sent_price else '—' }} ₽{% if pp and pp.last_sent_at %} ({{ pp.last_sent_at.strftime('%d.%m.%Y %H:%M') }} UTC){% endif %},
+ручная цена {{ pp.manual_price if pp and pp.manual_price else 'не задана' }}.
+«Вернуть эту цену» создаёт обычное предложение — с проверкой пола и лимита шага по сегодняшнему курсу и себестоимости;
+на площадку оно уйдёт только после подтверждения.
+{% if others %}В других кабинетах площадки: {% for o in others %}<a href="/prices/history/{{ o.id }}/{{ item_id }}">{{ o.name }}</a>{{ ', ' if not loop.last }}{% endfor %}.{% endif %}</p>
+<div class="row" style="margin-bottom:10px"><a class="btn secondary" href="/prices?view=products&account_id={{ account.id }}">← к товарам кабинета</a></div>
+<div class="scroll"><table>
+<tr><th>Когда</th><th class="num">Курс</th><th class="num">Себест., ₽</th><th class="num">Было</th><th class="num">Цена</th><th class="num">Изм.</th><th class="num">Коэфф.</th><th>Как посчитана</th><th>Статус</th><th></th></tr>
+{% for c in changes %}{% set pct = change_percent(c.old_price, c.new_price) %}
+<tr>
+  <td class="muted">{{ (c.sent_at or c.decided_at or c.created_at).strftime('%d.%m.%Y %H:%M') }}{% if c.decided_by %}<br>{{ c.decided_by }}{% endif %}</td>
+  <td class="num">{{ c.usd_rub|money(2) }}</td>
+  <td class="num">{{ c.cost_rub|money }}</td>
+  <td class="num">{{ c.old_price if c.old_price is not none else '—' }}</td>
+  <td class="num"><b>{{ c.new_price }}</b></td>
+  <td class="num">{{ '%+.1f%%'|format(pct) if pct is not none else 'новая' }}</td>
+  <td class="num">{{ c.markup_coef|money }}</td>
+  <td>{{ source_labels.get(c.source, c.source) }}</td>
+  <td><span class="badge {{ 'ok' if c.status == 'sent' else ('bad' if c.status in ('blocked','error') else 'warn') }}">{{ status_labels[c.status] }}</span>
+    {% if c.block_reason %}<div class="muted">{{ block_labels[c.block_reason] }}</div>{% endif %}
+    {% if c.note %}<div class="muted">{{ c.note }}</div>{% endif %}</td>
+  <td>{% if c.status == 'sent' and (not pp or pp.last_sent_price != c.new_price) %}
+    <form method="post" action="/prices/rollback/{{ c.id }}"><button class="secondary">Вернуть эту цену</button></form>{% endif %}</td>
+</tr>
+{% else %}<tr><td colspan="10" class="muted">По этому товару в кабинете цен ещё не считали.</td></tr>{% endfor %}
+</table></div>
+{% endblock %}

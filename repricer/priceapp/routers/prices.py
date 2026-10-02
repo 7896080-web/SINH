@@ -23,31 +23,34 @@ from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 
-from priceapp import accounts as acc_mod, audit, mapping, platforms, rates
+from priceapp import accounts as acc_mod, audit, mapping, overview, platforms, rates, settings
 from priceapp.database import get_db
 from priceapp.deps import get_current_user
 from priceapp.excel import ExcelReadError, read_xlsx_rows, xlsx_response
 from priceapp.flash import flash
 from priceapp.models import (Account, ApiCredential, OnecBarcode, OnecCost, PlatformRule,
-                             PriceChange, PriceChangeStatus, ProductPrice, User)
+                             PriceChange, PriceChangeStatus, ProductPrice, SavedFilter, User)
 from priceapp.pages import render
 from priceapp.platforms import PLATFORMS
 from priceapp.pricing import (BLOCK_FLOOR, BLOCK_LABELS, BLOCK_MAX_CHANGE, OPEN, _ru, approve,
-                              change_percent, decide, get_rule, markup, payout, recalculate_account,
-                              round_price, rules_for)
+                              change_percent, decide, get_rule, markup, payout, preview_rule,
+                              propose_price, recalculate_account, round_price, rules_for)
 from priceapp.timeutils import now_utc
 
 router = APIRouter()
 
 ROWS_LIMIT = 500
 BULK_LIMIT = 20000
-VIEWS = ("rules", "proposals", "products", "log")
+VIEWS = ("rules", "proposals", "products", "compare", "log")
 CLEAR_CELL = "-"
 STATUS_LABELS = {
     "proposed": "ждёт решения", "blocked": "заблокировано", "approved": "подтверждено, ждёт отправки",
     "sent": "отправлено", "error": "площадка не приняла", "rejected": "отклонено",
 }
-SOURCE_LABELS = {"rule": "по правилу", "manual": "ручная", "base": "от базовой площадки"}
+SOURCE_LABELS = {"rule": "по правилу", "manual": "ручная", "base": "от базовой площадки",
+                 "rollback": "возврат прежней цены"}
+PRICE_STATUS_LABELS = {"QUARANTINE": "на карантине у площадки", "ERROR": "площадка: ошибка цены",
+                       "PROCESSING": "площадка обновляет цену"}
 # (поле, подпись, мин, макс)
 RULE_FIELDS = [
     ("markup_coef", "Коэффициент наценки (2 = +100%)", 1, 100),
@@ -67,6 +70,8 @@ PRODUCT_FILTERS = {
     "no_current": "нет текущей цены",
     "no_cost": "нет себестоимости",
     "manual": "с ручной ценой",
+    "platform_status": "карантин или ошибка у площадки",
+    "below_platform_min": "расчётная ниже минимальной площадки",
 }
 BULK_ACTIONS = {
     "set_manual": "Ручная цена = число",
@@ -333,6 +338,9 @@ def product_rows(db: Session, account: Account, q: str = "", flt: str = "",
         if cur_sale and d.cost_rub is not None and commission is not None:
             cur_rub, cur_coef = markup(cur_sale, d.cost_rub, commission)
         below_floor_now = cur_coef is not None and cur_coef < Decimal(str(rule.min_markup_coef))
+        statuses = [p.price_status for p in plat if p.price_status]
+        price_status = max(statuses, key=lambda x: platforms._STATUS_RANK.get(x, 0)) if statuses else None
+        min_price = max((p.min_price for p in plat if p.min_price), default=None)
         r = {
             "item_id": item_id, "sku": sku, "platform": plat[0], "cost_usd": cost.cost_usd if cost else None,
             "cost_rub": d.cost_rub, "price": d.new_price,
@@ -343,6 +351,7 @@ def product_rows(db: Session, account: Account, q: str = "", flt: str = "",
             "current": cur.current_price if cur else None, "current_sale": cur_sale,
             "current_payout": payout(cur_sale, commission) if cur_sale and commission is not None else None,
             "current_markup_rub": cur_rub, "current_coef": cur_coef, "below_floor_now": below_floor_now,
+            "price_status": price_status, "min_price": min_price,
         }
         if flt == "below_floor_now" and not below_floor_now:
             continue
@@ -353,6 +362,10 @@ def product_rows(db: Session, account: Account, q: str = "", flt: str = "",
         if flt == "no_cost" and r["cost_usd"] is not None:
             continue
         if flt == "manual" and r["manual"] is None:
+            continue
+        if flt == "platform_status" and price_status not in ("QUARANTINE", "ERROR"):
+            continue
+        if flt == "below_platform_min" and not (min_price and r["price"] and r["price"] < min_price):
             continue
         if lo is not None and (cur_coef is None or cur_coef < lo):
             continue
@@ -692,7 +705,10 @@ def page(request: Request, view: str = Query("proposals"), account_id: str = Que
                status_labels=STATUS_LABELS, block_labels=BLOCK_LABELS, BLOCK_FLOOR=BLOCK_FLOOR,
                BLOCK_MAX_CHANGE=BLOCK_MAX_CHANGE, rule_fields=RULE_FIELDS, platform_names=PLATFORMS,
                source_labels=SOURCE_LABELS, change_percent=change_percent, rate=rates.current(db),
-               rows_limit=ROWS_LIMIT, ru=_ru,
+               rows_limit=ROWS_LIMIT, ru=_ru, price_status_labels=PRICE_STATUS_LABELS,
+               saved_filters=db.query(SavedFilter).order_by(SavedFilter.name).all(),
+               current_url=str(request.url.path) + (f"?{request.url.query}" if request.url.query else ""),
+               rate_shift=overview.rate_shift(db),
                open_count=db.query(PriceChange).filter(PriceChange.status.in_(OPEN),
                                                        PriceChange.is_test.is_(False)).count())
     if view == "rules":
@@ -711,9 +727,19 @@ def page(request: Request, view: str = Query("proposals"), account_id: str = Que
                    reads_prices=platforms.READS_PRICES,
                    siblings=[a for a in accs if account and a.platform == account.platform],
                    export_qs=urlencode({"q": q, "flt": flt, "coef_min": coef_min, "coef_max": coef_max}))
+    elif view == "compare":
+        rows, cols = compare_rows(db, accs, q, flt)
+        ctx.update(rows=rows[:ROWS_LIMIT], total=len(rows), cols=cols, flt=flt,
+                   compare_filters=COMPARE_FILTERS, export_qs=urlencode({"q": q, "flt": flt}))
     else:
         query = _changes_query(db, view, account_id, status, q)
         changes = query.limit(ROWS_LIMIT).all()
+        if view == "proposals":
+            every = query.limit(BULK_LIMIT).all()
+            ctx.update(summary=overview.proposals_summary(db, every),
+                       info=overview.change_context(db, changes))
+        else:
+            ctx.update(info={})
         ctx.update(total=query.count(), changes=changes, status_choices=_statuses(view),
                    skus=_sku_info(db, {c.item_id for c in changes}),
                    export_qs=urlencode({"view": view, "account_id": account_id, "status": status, "q": q}))
@@ -758,6 +784,10 @@ async def approve_changes(request: Request, db: Session = Depends(get_db),
     form = await request.form()
     ids, account_id = _ids(form), str(form.get("account_id") or "")
     confirm_large = form.get("confirm_large") == "true"
+    if form.get("all_filtered") == "1":
+        # Весь отбор, а не 500 видимых строк: тот же запрос, что рисует страницу.
+        ids = [c.id for c in _changes_query(db, "proposals", account_id, str(form.get("status") or ""),
+                                            str(form.get("q") or "")).limit(BULK_LIMIT)]
     if not ids:
         flash(request, "Ничего не выбрано.", "warn")
         return _back("proposals", account_id=account_id)
@@ -783,6 +813,9 @@ async def reject_changes(request: Request, db: Session = Depends(get_db),
                          user: User = Depends(get_current_user)):
     form = await request.form()
     ids, account_id = _ids(form), str(form.get("account_id") or "")
+    if form.get("all_filtered") == "1":
+        ids = [c.id for c in _changes_query(db, "proposals", account_id, str(form.get("status") or ""),
+                                            str(form.get("q") or "")).limit(BULK_LIMIT)]
     n = 0
     for ch in db.query(PriceChange).filter(PriceChange.id.in_(ids), PriceChange.is_test.is_(False),
                                            PriceChange.status.in_(OPEN + ("approved",))):
@@ -793,3 +826,147 @@ async def reject_changes(request: Request, db: Session = Depends(get_db),
     db.commit()
     flash(request, f"Отклонено: {n}.", "ok" if n else "warn")
     return _back("proposals", account_id=account_id)
+
+
+
+# --- сравнение площадок: товар и все кабинеты в одной строке -------------------------
+
+COMPARE_FILTERS = {"": "все", "spread": "цены расходятся больше чем на 15%",
+                   "below_floor_now": "где-то ниже пола по текущей"}
+
+
+def compare_rows(db: Session, accs: list[Account], q: str = "", flt: str = "") -> tuple[list[dict], list[Account]]:
+    """SKU 1С -> по каждому кабинету: текущая и расчётная цена, коэффициент по
+    текущей. Считается ТЕМ ЖЕ `product_rows`, что и «Товары»: разойдись они,
+    сравнение показывало бы не те числа, что вкладка кабинета."""
+    per = {a.id: {r["item_id"]: r for r in product_rows(db, a, q)} for a in accs}
+    cols = [a for a in accs if per[a.id]]
+    items = sorted({i for a in cols for i in per[a.id]})
+    out = []
+    for item_id in items:
+        cells = {a.id: per[a.id].get(item_id) for a in cols}
+        present = [c for c in cells.values() if c]
+        sku = present[0]["sku"]
+        current = [c["current"] for c in present if c["current"]]
+        spread = (max(current) - min(current)) * 100.0 / min(current) if len(current) > 1 else 0.0
+        if flt == "spread" and spread <= 15:
+            continue
+        if flt == "below_floor_now" and not any(c["below_floor_now"] for c in present):
+            continue
+        out.append({"item_id": item_id, "sku": sku, "cells": cells, "spread": spread})
+    out.sort(key=lambda r: ((r["sku"].article if r["sku"] else ""), (r["sku"].size if r["sku"] else "")))
+    return out, cols
+
+
+@router.get("/prices/compare-export")
+def export_compare(q: str = Query(""), flt: str = Query(""), db: Session = Depends(get_db),
+                   user: User = Depends(get_current_user)):
+    rows, cols = compare_rows(db, _accounts(db), q, flt)
+    db.commit()
+    headers = ["ID_1С", "Артикул 1С", "Наименование", "Размер", "Цвет", "Разброс текущих, %"]
+    for a in cols:
+        headers += [f"{a.name}: текущая, ₽", f"{a.name}: коэфф. по текущей", f"{a.name}: расчётная, ₽"]
+    data = []
+    for r in rows:
+        s = r["sku"]
+        line = [r["item_id"], s.article if s else "", s.name if s else "", s.size if s else "",
+                s.color if s else "", round(r["spread"], 1)]
+        for a in cols:
+            c = r["cells"][a.id]
+            line += [c["current"], _f(c["current_coef"]), c["price"]] if c else [None, None, None]
+        data.append(line)
+    return xlsx_response(headers, data, "сравнение_площадок.xlsx")
+
+
+# --- история цены товара и возврат прежней ------------------------------------------
+
+@router.get("/prices/history/{account_id}/{item_id}")
+def history(account_id: int, item_id: str, request: Request, db: Session = Depends(get_db),
+            user: User = Depends(get_current_user)):
+    a = db.get(Account, account_id)
+    if a is None:
+        return _back("products")
+    changes = (db.query(PriceChange).filter(PriceChange.account_id == a.id, PriceChange.item_id == item_id,
+                                            PriceChange.is_test.is_(False))
+               .order_by(PriceChange.id.desc()).limit(200).all())
+    pp = db.query(ProductPrice).filter(ProductPrice.item_id == item_id, ProductPrice.account_id == a.id).first()
+    others = [x for x in _accounts(db) if x.platform == a.platform and x.id != a.id]
+    return render(request, "price_history.html", user, "prices", account=a, label=label, item_id=item_id,
+                  sku=_sku_info(db, [item_id]).get(item_id), changes=changes, pp=pp,
+                  status_labels=STATUS_LABELS, source_labels=SOURCE_LABELS, block_labels=BLOCK_LABELS,
+                  change_percent=change_percent, others=others)
+
+
+@router.post("/prices/rollback/{change_id}")
+def rollback(change_id: int, request: Request, db: Session = Depends(get_db),
+             user: User = Depends(get_current_user)):
+    """Вернуть цену, которую когда-то приняла площадка. Создаёт ОБЫЧНОЕ
+    предложение (пол, лимит шага, подтверждение) — сама ничего не отправляет."""
+    ch = db.get(PriceChange, change_id)
+    if ch is None or ch.is_test or ch.status != PriceChangeStatus.sent.value:
+        flash(request, "Вернуть можно только цену, которую площадка приняла.", "warn")
+        return _back("proposals")
+    a = db.get(Account, ch.account_id)
+    new = propose_price(db, a, ch.item_id, ch.new_price, "rollback",
+                        f"возврат цены от {ch.sent_at.strftime('%d.%m.%Y') if ch.sent_at else '—'}")
+    if new is None:
+        db.rollback()
+        flash(request, "Не получилось: товар больше не сопоставлен с каталогом кабинета или нет комиссии.", "warn")
+        return RedirectResponse(f"/prices/history/{ch.account_id}/{ch.item_id}", status_code=303)
+    audit.log(db, user.username, "price_rollback", label(a), f"{ch.item_id}: {ch.new_price} (из #{ch.id})")
+    db.commit()
+    flash(request, f"Предложение вернуть {ch.new_price} ₽ создано"
+                   + (f" — но оно заблокировано: {BLOCK_LABELS[new.block_reason]}" if new.block_reason else "")
+                   + ". На площадку уйдёт после подтверждения.", "warn" if new.block_reason else "ok")
+    return _back("proposals", account_id=ch.account_id)
+
+
+# --- «что будет, если» для правила --------------------------------------------------
+
+@router.post("/prices/rules/{platform}/preview")
+async def preview(platform: str, request: Request, db: Session = Depends(get_db),
+                  user: User = Depends(get_current_user)):
+    if platform not in PLATFORMS:
+        return _back("rules")
+    form = await request.form()
+    values, errors = validate_rule(db, platform, {k: form.get(k) for k in RULE_KEYS})
+    if errors:
+        flash(request, f"{PLATFORMS[platform]}: проверить нельзя — " + "; ".join(errors), "warn")
+        return _back("rules")
+    result = preview_rule(db, platform, values)
+    db.rollback()        # проверка ничего не пишет, даже заведённые по ходу правила
+    parts = []
+    for pv in result:
+        avg = f", в среднем {pv.avg_change:+.1f}%" if pv.avg_change is not None else ""
+        parts.append(f"{PLATFORMS[pv.platform]} ({pv.accounts} каб.): посчитается {pv.priced_after} цен "
+                     f"(сейчас {pv.priced_before}), изменится {pv.changed} — выше {pv.up}, ниже {pv.down}{avg}; "
+                     f"упрётся в пол {pv.floor}, большой шаг {pv.big_step}")
+    flash(request, "Если сохранить: " + " | ".join(parts) + ". Ничего не сохранено.", "info")
+    return _back("rules")
+
+
+# --- сохранённые отборы -------------------------------------------------------------
+
+@router.post("/filters/save")
+def save_filter(request: Request, name: str = Form(""), url: str = Form(""), db: Session = Depends(get_db),
+                user: User = Depends(get_current_user)):
+    name = name.strip()[:100]
+    # Только свои страницы: адрес из формы не должен уводить куда угодно.
+    if not name or not (url.startswith("/prices") or url.startswith("/mapping")) or "//" in url:
+        flash(request, "Дайте отбору имя.", "warn")
+        return RedirectResponse(url if url.startswith("/") and "//" not in url else "/prices", status_code=303)
+    db.add(SavedFilter(name=name, url=url[:1000], created_by=user.username))
+    db.commit()
+    flash(request, f"Отбор «{name}» сохранён — он над вкладками.", "ok")
+    return RedirectResponse(url, status_code=303)
+
+
+@router.post("/filters/{filter_id}/delete")
+def delete_filter(filter_id: int, request: Request, db: Session = Depends(get_db),
+                  user: User = Depends(get_current_user)):
+    f = db.get(SavedFilter, filter_id)
+    if f is not None:
+        db.delete(f)
+        db.commit()
+        flash(request, f"Отбор «{f.name}» удалён.", "ok")
+    return _back("proposals")
