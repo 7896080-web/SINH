@@ -1,27 +1,24 @@
 """Расчёт цены и ограничители.
 
 Экономика (задана заказчиком):
-    себестоимость, ₽  = себестоимость 1С, $ × курс
+    себестоимость, ₽  = себестоимость 1С, $ × курс ЦБ        — это и есть БАЗОВАЯ цена
+    цена, ₽           = базовая × коэффициент, вверх до шага с «красивым» окончанием
     к получению, ₽    = цена × (1 − комиссия%)
-    наценка, ₽        = к получению − себестоимость, ₽
-    коэффициент       = к получению / себестоимость, ₽   (2 = +100%, 2,5 = +150%, 3 = +200%)
+    маржинальность    = к получению / себестоимость, ₽   (2 = +100%)
 
-Правило кабинета задаёт желаемый коэффициент, отсюда цена:
-    цена = себестоимость ₽ × коэффициент / (1 − комиссия%)
-с округлением ВВЕРХ до шага и «красивым» окончанием (шаг 100, минус 1 → 1299).
+Базовая цена руками не правится: она меняется вместе с себестоимостью 1С и
+курсом. Человек задаёт только КОЭФФИЦИЕНТ — на артикул 1С (сразу для всех его
+размеров), по кабинету или по всей площадке; у артикула без своего — коэффициент
+площадки по умолчанию из её правила. Кабинет главнее площадки, площадка —
+умолчания (`coef_for`).
 
 Ограничители (обойти расчётом нельзя):
-  * ПОЛ — коэффициент не ниже `min_markup_coef`. Нарушение не отправляется ни
+  * ПОЛ — маржинальность не ниже `min_markup_coef`. Нарушение не отправляется ни
     подтверждением, ни ручной ценой, и перепроверяется при отправке по ТЕКУЩИМ
     курсу, себестоимости и комиссии.
   * ЛИМИТ ШАГА — изменение больше `max_change_percent` от последней ПРИНЯТОЙ
     площадкой цены — только отдельным подтверждением.
-  * Цена никогда не уходит сама: расчёт только предлагает.
-
-Правило — у ПЛОЩАДКИ, общее для всех её кабинетов (`PlatformRule`). Цена может
-браться и от другой площадки: расчётная цена базы × коэффициент (Ozon = WB × 1,1).
-База считается ПО СВОЕМУ ПРАВИЛУ, без ручных цен: ручная цена живёт в кабинете, а
-у базы их бывает несколько (у WB три ИП) — какая из них «та самая», сказать нельзя.
+  * Цена никогда не уходит сама: её передаёт человек.
 """
 from __future__ import annotations
 
@@ -32,13 +29,15 @@ from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal
 from sqlalchemy.orm import Session
 
 from priceapp import rates
-from priceapp.models import (Account, BasePrice, OnecCost, PlatformPrice, PlatformRule, PriceChange,
+from priceapp.models import (Account, ArticleCoef, OnecBarcode, OnecCost, PlatformRule, PriceChange,
                              PriceChangeStatus, ProductPrice)
 from priceapp.timeutils import now_utc
 
-# `base_platform` правила может указывать не на площадку, а на БАЗОВУЮ цену товара.
-BASE = "base"
-BASE_LABEL = "базовая цена"
+# Откуда взят коэффициент: свой у артикула в кабинете, у артикула на площадке,
+# умолчание площадки. И ручная цена кабинета — она главнее любого коэффициента.
+SRC_CABINET, SRC_ARTICLE, SRC_DEFAULT, SRC_MANUAL = "cabinet", "article", "rule", "manual"
+SOURCE_LABELS = {SRC_CABINET: "коэфф. кабинета", SRC_ARTICLE: "коэфф. артикула",
+                 SRC_DEFAULT: "по умолчанию площадки", SRC_MANUAL: "ручная цена кабинета"}
 
 BLOCK_FLOOR = "floor"
 BLOCK_MAX_CHANGE = "max_change"
@@ -104,73 +103,48 @@ def change_percent(old: int | None, new: int) -> float | None:
     return (new - old) * 100.0 / old
 
 
+def base_price(cost_usd, usd_rub) -> Decimal | None:
+    """Базовая цена, ₽ = себестоимость 1С × курс. None — нет одного из двух."""
+    if cost_usd is None or _dec(cost_usd) <= 0 or usd_rub is None:
+        return None
+    return (_dec(cost_usd) * _dec(usd_rub)).quantize(Decimal("0.01"))
+
+
 @dataclass
 class Decision:
     new_price: int | None              # None — посчитать нельзя (см. note)
-    cost_rub: Decimal | None = None
+    cost_rub: Decimal | None = None    # она же базовая цена
     markup_rub: Decimal | None = None
-    markup_coef: Decimal | None = None
-    source: str = "rule"               # rule / manual
+    markup_coef: Decimal | None = None  # маржинальность: к получению / себестоимость
+    coef: Decimal | None = None        # коэффициент от базовой, которым посчитано
+    source: str = SRC_DEFAULT
     block_reason: str | None = None
     note: str = ""
 
 
-def rule_price(cost_rub: Decimal | None, rule: PlatformRule | None) -> tuple[int | None, str]:
-    """Цена площадки по её СОБСТВЕННОМУ правилу (без базы и ручных цен) — так
-    считается базовая площадка для тех, кто берёт цену от неё."""
-    if rule is None:
-        return None, "нет правила площадки"
-    if rule.commission_percent is None:
-        return None, "у площадки не задана комиссия"
-    c = _dec(rule.commission_percent)
-    if c < 0 or c >= 100:
-        return None, f"комиссия {c}% вне 0–99,99"
-    if cost_rub is None:
-        return None, "нет себестоимости из 1С"
-    if _dec(rule.markup_coef) <= 1:
-        # Правило по умолчанию — это «не настроено», а не «продавать по себестоимости».
-        return None, "правило площадки не настроено (коэффициент 1)"
-    return round_price(price_for_coef(cost_rub, rule.markup_coef, c), rule.round_step, rule.round_minus), ""
-
-
-def decide(cost_usd, usd_rub, commission_percent, rule: PlatformRule,
-           manual_price: int | None, last_sent_price: int | None,
-           base_rule: PlatformRule | None = None, base_price: int | None = None) -> Decision:
-    """Какую цену предложить и пропускают ли её ограничители. `base_rule` —
-    правило базовой площадки, если цена берётся от неё; `base_price` — базовая
-    цена товара, если правило берёт цену от неё (`base_platform == BASE`)."""
+def decide(cost_usd, usd_rub, rule: PlatformRule, coef, source: str,
+           manual_price: int | None, last_sent_price: int | None) -> Decision:
+    """Какую цену предложить и пропускают ли её ограничители."""
+    commission_percent = rule.commission_percent
     if commission_percent is None:
         return Decision(None, note="у площадки не задана комиссия")
     c = _dec(commission_percent)
     if c < 0 or c >= 100:
         return Decision(None, note=f"комиссия {c}% вне 0–99,99")
-    cost_rub = None
-    if cost_usd is not None and _dec(cost_usd) > 0:
-        if usd_rub is None:
-            return Decision(None, note="нет курса доллара")
-        cost_rub = (_dec(cost_usd) * _dec(usd_rub)).quantize(Decimal("0.01"))
+    if cost_usd is not None and _dec(cost_usd) > 0 and usd_rub is None:
+        return Decision(None, note="нет курса доллара")
+    cost_rub = base_price(cost_usd, usd_rub)
 
     if manual_price is not None:
-        d = Decision(int(manual_price), cost_rub=cost_rub, source="manual")
+        d = Decision(int(manual_price), cost_rub=cost_rub, source=SRC_MANUAL)
     elif cost_rub is None:
         return Decision(None, note="нет себестоимости из 1С")
-    elif rule.base_platform:
-        if rule.base_platform == BASE:
-            base, why = base_price, "у товара не задана базовая цена"
-        else:
-            base, why = rule_price(cost_rub, base_rule)
-        if base is None:
-            what = "базовая цена" if rule.base_platform == BASE else "базовая площадка"
-            return Decision(None, cost_rub=cost_rub, note=f"{what}: {why}")
-        coef = _dec(rule.base_coef or 1)
-        d = Decision(round_price(_dec(base) * coef, rule.round_step, rule.round_minus),
-                     cost_rub=cost_rub, source="base")
-        d.note = f"от базовой {base} ₽ × {_ru(coef)}"
-    elif _dec(rule.markup_coef) <= 1:
-        return Decision(None, cost_rub=cost_rub, note="правило площадки не настроено (коэффициент 1)")
+    elif coef is None:
+        return Decision(None, cost_rub=cost_rub,
+                        note="коэффициент не задан ни у артикула, ни по умолчанию у площадки")
     else:
-        d = Decision(round_price(price_for_coef(cost_rub, rule.markup_coef, c),
-                                 rule.round_step, rule.round_minus), cost_rub=cost_rub)
+        d = Decision(round_price(cost_rub * _dec(coef), rule.round_step, rule.round_minus),
+                     cost_rub=cost_rub, coef=_dec(coef), source=source)
 
     if d.new_price <= 0:
         return Decision(None, cost_rub=cost_rub, source=d.source, note="цена должна быть больше нуля")
@@ -179,10 +153,10 @@ def decide(cost_usd, usd_rub, commission_percent, rule: PlatformRule,
         floor = floor_price(cost_rub, rule, c)
         if d.new_price < floor:
             d.block_reason = BLOCK_FLOOR
-            d.note = (f"минимум {floor} ₽: коэффициент {_ru(d.markup_coef)} при минимальном "
+            d.note = (f"минимум {floor} ₽: маржинальность {_ru(d.markup_coef)} при минимальной "
                       f"{_ru(rule.min_markup_coef)}")
             return d
-    elif d.source == "manual":
+    elif d.source == SRC_MANUAL:
         d.note = "себестоимости нет — пол не проверен"
 
     pct = change_percent(last_sent_price, d.new_price)
@@ -202,47 +176,58 @@ def get_rule(db: Session, platform: str) -> PlatformRule:
     return rule
 
 
-def rules_for(db: Session, platform: str) -> tuple[PlatformRule, PlatformRule | None]:
-    """(правило площадки, правило её базы или None)."""
-    rule = get_rule(db, platform)
-    if not rule.base_platform or rule.base_platform == BASE:
-        return rule, None
-    return rule, get_rule(db, rule.base_platform)
+def article_map(db: Session) -> dict[str, str]:
+    """SKU 1С -> артикул 1С. Коэффициент живёт на артикуле; SKU без артикула
+    отвечает сам за себя (ключ — его ID)."""
+    out: dict[str, str] = {}
+    for item_id, article in db.query(OnecBarcode.item_id, OnecBarcode.article):
+        if item_id not in out or (not out[item_id] and article):
+            out[item_id] = (article or "").strip()
+    return out
+
+
+def article_of(articles: dict[str, str], item_id: str) -> str:
+    return articles.get(item_id) or item_id
 
 
 @dataclass
 class Inputs:
-    """Всё, что нужно расчёту по площадке, кроме самого товара: правила и цены,
-    заданные человеком на уровне товара (базовая) и площадки. Один источник на
+    """Всё, что нужно расчёту по площадке, кроме самого товара. Один источник на
     все пути расчёта — разойдись они, страница показывала бы одну цену, а в
-    предложение уходила бы другая."""
+    предложение и на площадку уходила бы другая."""
     rule: PlatformRule
-    base_rule: PlatformRule | None
-    base_prices: dict
-    platform_prices: dict
+    coefs: dict          # (артикул, account_id | 0) -> коэффициент
+    articles: dict       # item_id -> артикул
 
 
 def load_inputs(db: Session, platform: str, rule: PlatformRule | None = None,
-                base_rule: PlatformRule | None = None) -> Inputs:
-    if rule is None:
-        rule, base_rule = rules_for(db, platform)
-    return Inputs(rule, base_rule,
-                  {b.item_id: b.price for b in db.query(BasePrice)},
-                  {p.item_id: p.price for p in db.query(PlatformPrice).filter(PlatformPrice.platform == platform)})
+                articles: dict | None = None) -> Inputs:
+    return Inputs(rule if rule is not None else get_rule(db, platform),
+                  {(c.article, c.account_id): _dec(c.coef)
+                   for c in db.query(ArticleCoef).filter(ArticleCoef.platform == platform)},
+                  articles if articles is not None else article_map(db))
 
 
-def decide_for(inp: Inputs, item_id: str, cost_usd, usd_rub, pp: "ProductPrice | None") -> Decision:
-    """Решение по товару в кабинете. Ручная цена КАБИНЕТА главнее цены
-    ПЛОЩАДКИ, та — правила; пол и лимит шага не обходит ни одна."""
+def coef_for(inp: Inputs, item_id: str, account_id: int | None) -> tuple[Decimal | None, str]:
+    """Коэффициент артикула: свой у кабинета, иначе у площадки, иначе умолчание.
+    `account_id` None — спрашиваем про площадку целиком (кабинет не учитывается)."""
+    art = article_of(inp.articles, item_id)
+    if account_id and (art, account_id) in inp.coefs:
+        return inp.coefs[(art, account_id)], SRC_CABINET
+    if (art, 0) in inp.coefs:
+        return inp.coefs[(art, 0)], SRC_ARTICLE
+    if inp.rule.base_coef is not None:
+        return _dec(inp.rule.base_coef), SRC_DEFAULT
+    return None, SRC_DEFAULT
+
+
+def decide_for(inp: Inputs, item_id: str, account_id: int | None, cost_usd, usd_rub,
+               pp: "ProductPrice | None") -> Decision:
+    """Решение по товару в кабинете. Ручная цена кабинета главнее коэффициента;
+    пол и лимит шага не обходит ни одна."""
     manual = pp.manual_price if pp and pp.manual_price is not None else None
-    from_platform = manual is None and item_id in inp.platform_prices
-    if from_platform:
-        manual = inp.platform_prices[item_id]
-    d = decide(cost_usd, usd_rub, inp.rule.commission_percent, inp.rule, manual,
-               pp.last_sent_price if pp else None, inp.base_rule, inp.base_prices.get(item_id))
-    if from_platform and d.source == "manual":
-        d.source = "platform"
-    return d
+    coef, source = coef_for(inp, item_id, account_id)
+    return decide(cost_usd, usd_rub, inp.rule, coef, source, manual, pp.last_sent_price if pp else None)
 
 
 @dataclass
@@ -282,7 +267,8 @@ def recalculate_account(db: Session, account: Account, is_test: bool = False) ->
         pp = prices.get(item_id)
         last = pp.last_sent_price if pp else None
         cost = costs.get(item_id)
-        d = decide_for(inp, item_id, cost.cost_usd if cost else None, rate.usd_rub if rate else None, pp)
+        d = decide_for(inp, item_id, account.id, cost.cost_usd if cost else None,
+                       rate.usd_rub if rate else None, pp)
         if d.new_price is None:
             stats.skip(d.note)
             continue
@@ -333,14 +319,14 @@ def propose_price(db: Session, account: Account, item_id: str, price: int, sourc
     rows = mapping.account_items(db, account.id).get(item_id)
     if not rows:
         return None
-    rule, base_rule = rules_for(db, account.platform)
+    rule = get_rule(db, account.platform)
     rate = rates.current(db)
     cost = db.get(OnecCost, item_id)
     pp = db.query(ProductPrice).filter(ProductPrice.item_id == item_id,
                                        ProductPrice.account_id == account.id).first()
     last = pp.last_sent_price if pp else None
-    d = decide(cost.cost_usd if cost else None, rate.usd_rub if rate else None, rule.commission_percent,
-               rule, price, last, base_rule)
+    d = decide(cost.cost_usd if cost else None, rate.usd_rub if rate else None, rule, None, SRC_MANUAL,
+               price, last)
     if d.new_price is None:
         return None
     for old in db.query(PriceChange).filter(PriceChange.account_id == account.id, PriceChange.item_id == item_id,
@@ -373,46 +359,38 @@ class Preview:
 
 
 def preview_rule(db: Session, platform: str, values: dict) -> list[Preview]:
-    """«Что будет, если» сохранить правило `values` для площадки: по всем её
-    кабинетам и по площадкам, которые берут цену от неё. Ничего не пишет:
-    новое правило — несохранённый объект вне сессии."""
+    """«Что будет, если» сохранить правило `values` для площадки — по всем её
+    кабинетам. Ничего не пишет: новое правило — несохранённый объект вне сессии."""
     from priceapp import mapping
     new = PlatformRule(platform=platform, **values)
-    new_base = (get_rule(db, new.base_platform) if new.base_platform and new.base_platform != BASE else None)
     rate = rates.current(db)
     usd = rate.usd_rub if rate else None
-    out = []
-    affected = [platform] + [r.platform for r in db.query(PlatformRule).filter(PlatformRule.base_platform == platform)]
-    for p in affected:
-        old_inp = load_inputs(db, p)
-        new_inp = (load_inputs(db, p, new, new_base) if p == platform
-                   else load_inputs(db, p, old_inp.rule, new))
-        pv = Preview(platform=p)
-        pcts = []
-        for acc in db.query(Account).filter(Account.platform == p, Account.is_active.is_(True)):
-            pv.accounts += 1
-            items = mapping.account_items(db, acc.id)
-            costs = {c.item_id: c for c in db.query(OnecCost).filter(OnecCost.item_id.in_(list(items)))}
-            prices = {x.item_id: x for x in db.query(ProductPrice).filter(ProductPrice.account_id == acc.id)}
-            for item_id in items:
-                cost, pp = costs.get(item_id), prices.get(item_id)
-                a = decide_for(old_inp, item_id, cost.cost_usd if cost else None, usd, pp)
-                b = decide_for(new_inp, item_id, cost.cost_usd if cost else None, usd, pp)
-                pv.priced_before += a.new_price is not None
-                pv.priced_after += b.new_price is not None
-                if b.new_price is None:
-                    continue
-                if b.block_reason == BLOCK_FLOOR:
-                    pv.floor += 1
-                elif b.block_reason == BLOCK_MAX_CHANGE:
-                    pv.big_step += 1
-                if a.new_price != b.new_price:
-                    pv.changed += 1
-                    if a.new_price:
-                        pv.up += b.new_price > a.new_price
-                        pv.down += b.new_price < a.new_price
-                        pcts.append((b.new_price - a.new_price) * 100.0 / a.new_price)
-        pv.avg_change = sum(pcts) / len(pcts) if pcts else None
-        out.append(pv)
-    db.expunge(new) if new in db else None
-    return out
+    old_inp = load_inputs(db, platform)
+    new_inp = Inputs(new, old_inp.coefs, old_inp.articles)
+    pv = Preview(platform=platform)
+    pcts = []
+    for acc in db.query(Account).filter(Account.platform == platform, Account.is_active.is_(True)):
+        pv.accounts += 1
+        items = mapping.account_items(db, acc.id)
+        costs = {c.item_id: c for c in db.query(OnecCost).filter(OnecCost.item_id.in_(list(items)))}
+        prices = {x.item_id: x for x in db.query(ProductPrice).filter(ProductPrice.account_id == acc.id)}
+        for item_id in items:
+            cost, pp = costs.get(item_id), prices.get(item_id)
+            a = decide_for(old_inp, item_id, acc.id, cost.cost_usd if cost else None, usd, pp)
+            b = decide_for(new_inp, item_id, acc.id, cost.cost_usd if cost else None, usd, pp)
+            pv.priced_before += a.new_price is not None
+            pv.priced_after += b.new_price is not None
+            if b.new_price is None:
+                continue
+            if b.block_reason == BLOCK_FLOOR:
+                pv.floor += 1
+            elif b.block_reason == BLOCK_MAX_CHANGE:
+                pv.big_step += 1
+            if a.new_price != b.new_price:
+                pv.changed += 1
+                if a.new_price:
+                    pv.up += b.new_price > a.new_price
+                    pv.down += b.new_price < a.new_price
+                    pcts.append((b.new_price - a.new_price) * 100.0 / a.new_price)
+    pv.avg_change = sum(pcts) / len(pcts) if pcts else None
+    return [pv]

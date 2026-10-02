@@ -1,5 +1,4 @@
-"""Правила площадки (одно на все её кабинеты), цена от другой площадки,
-текущие цены с площадок, отбор и массовая правка, Excel на вкладках «Цен»."""
+"""Правила площадки (одно на все её кабинеты), текущие цены с площадок, отбор и массовая правка, Excel на вкладках «Цен»."""
 import io
 import os
 import sqlite3
@@ -13,11 +12,11 @@ from openpyxl import load_workbook
 from priceapp import accounts as acc_mod, platforms
 from priceapp.models import Account, PlatformItem, PlatformRule, PriceChange, ProductPrice
 from priceapp.platforms import CurrentPrice, LamodaClient, PlatformError, build_client
-from priceapp.pricing import decide, get_rule, recalculate_account
+from priceapp.pricing import get_rule, recalculate_account
 from tests import factories as f
 
 RATE = Decimal("81.5")
-RULE = {"commission_percent": "25", "markup_coef": "2", "min_markup_coef": "1,3",
+RULE = {"commission_percent": "25", "base_coef": "2,5", "min_markup_coef": "1,3",
         "round_step": "10", "round_minus": "1", "max_change_percent": "20"}
 
 
@@ -33,41 +32,7 @@ def _save(wb) -> bytes:
     return buf.getvalue()
 
 
-# --- расчёт от базовой площадки ----------------------------------------------------
-
-def test_price_from_base_platform_times_coef(db):
-    wb = f.account(db, "wb", "ИП Яворская", commission=25)
-    f.rule(db, wb)
-    oz = f.account(db, "ozon", "Озон", commission=30)
-    rule = f.rule(db, oz, markup_coef=1)
-    rule.base_platform, rule.base_coef = "wb", Decimal("1.1")
-    db.commit()
-    # WB: 16,24 × 81,5 = 1323,56; × 2 / 0,75 = 3529,49 → 3539. Ozon: 3539 × 1,1 = 3892,9 → 3899.
-    d = decide(Decimal("16.24"), RATE, 30, rule, None, None, get_rule(db, "wb"))
-    assert d.new_price == 3899 and d.source == "base"
-    assert "3539" in d.note and "1,1" in d.note
-    # Пол — по СВОЕЙ комиссии: 3899 × 0,7 = 2729,3 / 1323,56 = 2,06
-    assert d.markup_coef == Decimal("2.06") and d.block_reason is None
-
-
-def test_base_price_still_checked_against_own_floor(db):
-    f.account(db, "wb", commission=25)
-    wb_rule = f.rule(db, Account(platform="wb"))
-    oz_rule = PlatformRule(platform="ozon", commission_percent=30, markup_coef=1, round_step=1, round_minus=0,
-                           min_markup_coef=Decimal("2.5"), max_change_percent=20,
-                           base_platform="wb", base_coef=Decimal("0.9"))
-    d = decide(Decimal("16.24"), RATE, 30, oz_rule, None, None, wb_rule)
-    assert d.block_reason == "floor"
-
-
-def test_unconfigured_base_gives_no_price(db):
-    base = PlatformRule(platform="wb", commission_percent=None, markup_coef=2, round_step=1, round_minus=0,
-                        min_markup_coef=1, max_change_percent=20)
-    oz = PlatformRule(platform="ozon", commission_percent=30, markup_coef=1, round_step=1, round_minus=0,
-                      min_markup_coef=1, max_change_percent=20, base_platform="wb", base_coef=Decimal("1.1"))
-    d = decide(Decimal("10"), RATE, 30, oz, None, None, base)
-    assert d.new_price is None and "базовая площадка" in d.note
-
+# --- одно правило на площадку ----------------------------------------------------
 
 def test_one_rule_serves_every_wb_cabinet(db):
     f.manual_rate(db)
@@ -77,7 +42,7 @@ def test_one_rule_serves_every_wb_cabinet(db):
     for a in accs:
         f.item(db, a, "b1", "39681-L", external_id="5:1")
         recalculate_account(db, a)
-    assert {c.new_price for c in db.query(PriceChange)} == {3539}
+    assert {c.new_price for c in db.query(PriceChange)} == {3309}       # 1323,56 × 2,5 → 3309
     assert db.query(PlatformRule).count() == 1
 
 
@@ -94,21 +59,19 @@ def test_rules_page_one_block_per_platform_with_all_cabinets(client, db):
     assert 'action="/prices/rules/lamoda"' in page
 
 
-def test_rule_with_base_and_chain_refused(client, db):
+def test_rule_default_coef_optional_and_validated(client, db):
     f.account(db, "wb")
-    f.account(db, "ozon", "Озон")
-    client.post("/prices/rules/wb", data=RULE)
-    r = client.post("/prices/rules/ozon", data={**RULE, "markup_coef": "1", "base_platform": "wb", "base_coef": "1,1"})
-    assert "сохранено" in r.text and "не сохранено" not in r.text
+    r = client.post("/prices/rules/wb", data={**RULE, "base_coef": ""})
+    assert "не сохранено" not in r.text
     db.expire_all()
-    assert get_rule(db, "ozon").base_coef == Decimal("1.1")
-    # цепочка: WB от Ozon, который сам от WB
-    r = client.post("/prices/rules/wb", data={**RULE, "base_platform": "ozon", "base_coef": "1"})
-    assert "цепочки не поддерживаются" in r.text
-    r = client.post("/prices/rules/ozon", data={**RULE, "base_platform": "ozon", "base_coef": "1"})
-    assert "сама от себя" in r.text
-    r = client.post("/prices/rules/ozon", data={**RULE, "base_platform": "wb", "base_coef": ""})
-    assert "Коэффициент к базовой" in r.text
+    assert get_rule(db, "wb").base_coef is None              # пусто — умолчания нет
+    r = client.post("/prices/rules/wb", data={**RULE, "base_coef": "abc"})
+    assert "не сохранено" in r.text and "по умолчанию" in r.text
+    client.post("/prices/rules/wb", data=RULE)
+    db.expire_all()
+    assert get_rule(db, "wb").base_coef == Decimal("2.5")
+    page = client.get("/prices?view=rules").text
+    assert "базовая цена × коэффициент" in page and "base_platform" not in page
 
 
 def test_rules_excel_roundtrip_empty_cell_changes_nothing(client, db):
@@ -120,22 +83,21 @@ def test_rules_excel_roundtrip_empty_cell_changes_nothing(client, db):
     rows = {ws.cell(row=i, column=1).value: i for i in range(2, ws.max_row + 1)}
     col = lambda name: headers.index(name) + 1  # noqa: E731
     ws.cell(row=rows["ozon"], column=col("Комиссия, %"), value=None)          # пусто — не трогать
-    ws.cell(row=rows["ozon"], column=col("Цена от площадки (код)"), value="wb")
-    ws.cell(row=rows["ozon"], column=col("Коэффициент к базовой"), value=1.15)
-    ws.cell(row=rows["wb"], column=col("Коэффициент наценки (2 = +100%)"), value=2.5)
+    ws.cell(row=rows["ozon"], column=col("Коэффициент от базовой по умолчанию"), value=2.75)
+    ws.cell(row=rows["wb"], column=col("Мин. маржинальность (пол)"), value=1.5)
     r = client.post("/prices/rules-import", files={"file": ("r.xlsx", _save(wb))})
     assert "Правил изменено: 2" in r.text
     db.expire_all()
     oz = get_rule(db, "ozon")
-    assert oz.commission_percent == Decimal("30") and oz.base_platform == "wb" and oz.base_coef == Decimal("1.15")
-    assert get_rule(db, "wb").markup_coef == Decimal("2.5")
-    # «-» снимает базу
+    assert oz.commission_percent == Decimal("30") and oz.base_coef == Decimal("2.75")
+    assert get_rule(db, "wb").min_markup_coef == Decimal("1.5")
+    # «-» снимает коэффициент по умолчанию
     wb2, ws2, h2 = _xlsx(client.get("/prices/rules-export").content)
     r2 = {ws2.cell(row=i, column=1).value: i for i in range(2, ws2.max_row + 1)}
-    ws2.cell(row=r2["ozon"], column=h2.index("Цена от площадки (код)") + 1, value="-")
+    ws2.cell(row=r2["ozon"], column=h2.index("Коэффициент от базовой по умолчанию") + 1, value="-")
     client.post("/prices/rules-import", files={"file": ("r.xlsx", _save(wb2))})
     db.expire_all()
-    assert get_rule(db, "ozon").base_platform is None and get_rule(db, "ozon").base_coef is None
+    assert get_rule(db, "ozon").base_coef is None
 
 
 # --- текущие цены ------------------------------------------------------------------
@@ -400,9 +362,11 @@ def test_migration_moves_rules_from_first_cabinet_to_platform(tmp_path):
     assert r.returncode == 0, r.stderr
     con = sqlite3.connect(db)
     rules = {row[0]: row[1:] for row in con.execute(
-        "SELECT platform, commission_percent, markup_coef FROM platform_rules")}
+        "SELECT platform, commission_percent, markup_coef, base_coef FROM platform_rules")}
     con.close()
-    assert rules == {"wb": (25, 2.1), "ozon": (30, 2.3)}
+    # Прежний коэффициент значил «к себестоимости с комиссией» — в коэффициент от
+    # базовой он не переносится: умолчание пусто, пока его не зададут.
+    assert rules == {"wb": (25, 2.1, None), "ozon": (30, 2.3, None)}
     assert run("check").returncode == 0
 
 

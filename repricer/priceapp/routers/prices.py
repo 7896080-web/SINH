@@ -2,8 +2,9 @@
 
 Вкладки:
   * «Правила» — ПО ПЛОЩАДКЕ, одно на все её кабинеты (у WB три ИП, условия у них
-    одни): комиссия, коэффициент наценки (2 = +100%), минимальный коэффициент,
-    округление, лимит шага — или цена от другой площадки с коэффициентом;
+    одни): комиссия, коэффициент от базовой цены по умолчанию, минимальная
+    маржинальность (пол), округление, лимит шага. Коэффициенты артикулов —
+    на странице «Цены товаров»;
   * «Предложения» — результат расчёта: подтвердить / отклонить;
   * «Товары» — экономика по SKU кабинета: себестоимость, ТЕКУЩАЯ цена площадки и
     наценка по ней, расчётная цена, ручная цена; отбор и массовая правка;
@@ -32,9 +33,10 @@ from priceapp.models import (Account, ApiCredential, OnecBarcode, OnecCost, Plat
                              PriceChange, PriceChangeStatus, ProductPrice, SavedFilter, User)
 from priceapp.pages import render
 from priceapp.platforms import PLATFORMS
-from priceapp.pricing import (BASE, BASE_LABEL, BLOCK_FLOOR, BLOCK_LABELS, BLOCK_MAX_CHANGE, OPEN, _ru, approve,
-                              change_percent, decide, decide_for, get_rule, load_inputs, markup, payout, preview_rule,
-                              propose_price, recalculate_account, round_price, rules_for)
+from priceapp import pricing
+from priceapp.pricing import (BLOCK_FLOOR, BLOCK_LABELS, BLOCK_MAX_CHANGE, OPEN, _ru, approve, change_percent,
+                              decide_for, get_rule, load_inputs, markup, payout, preview_rule, propose_price,
+                              recalculate_account, round_price)
 from priceapp.timeutils import now_utc
 
 router = APIRouter()
@@ -47,21 +49,21 @@ STATUS_LABELS = {
     "proposed": "ждёт решения", "blocked": "заблокировано", "approved": "подтверждено, ждёт отправки",
     "sent": "отправлено", "error": "площадка не приняла", "rejected": "отклонено",
 }
-SOURCE_LABELS = {"rule": "по правилу", "manual": "ручная (кабинет)", "platform": "ручная (площадка)",
-                 "base": "от базовой",
-                 "rollback": "возврат прежней цены"}
+SOURCE_LABELS = {**pricing.SOURCE_LABELS, "rollback": "возврат прежней цены",
+                 # прежние схемы — для старых строк журнала
+                 "platform": "цена площадки", "base": "от базовой"}
 PRICE_STATUS_LABELS = {"QUARANTINE": "на карантине у площадки", "ERROR": "площадка: ошибка цены",
                        "PROCESSING": "площадка обновляет цену"}
 # (поле, подпись, мин, макс)
 RULE_FIELDS = [
-    ("markup_coef", "Коэффициент наценки (2 = +100%)", 1, 100),
-    ("min_markup_coef", "Мин. коэффициент (пол)", 0, 100),
+    ("min_markup_coef", "Мин. маржинальность (пол)", 0, 100),
     ("round_step", "Округлять вверх до, ₽", 1, 10000),
     ("round_minus", "Окончание: минус, ₽", 0, 9999),
     ("max_change_percent", "Макс. изменение за раз, %", 0, 1000),
 ]
 INT_FIELDS = ("round_step", "round_minus")
-RULE_KEYS = ["commission_percent", *(n for n, *_ in RULE_FIELDS), "base_platform", "base_coef"]
+RULE_KEYS = ["commission_percent", "base_coef", *(n for n, *_ in RULE_FIELDS)]
+COEF_TITLE = "Коэффициент от базовой по умолчанию"
 
 # Отборы на «Товарах»: ключ -> подпись.
 PRODUCT_FILTERS = {
@@ -183,34 +185,22 @@ def validate_rule(db: Session, platform: str, raw: dict) -> tuple[dict, list[str
             values[name] = _num(raw.get(name), lo, hi, name in INT_FIELDS)
         except ValueError as e:
             errors.append(f"«{title}»: {e}")
-    base = _cell(raw.get("base_platform"))
-    values["base_platform"], values["base_coef"] = base or None, None
-    if base:
-        if base != BASE and base not in PLATFORMS:
-            errors.append(f"неизвестная базовая площадка «{base}»")
-        elif base == platform:
-            errors.append("площадка не может брать цену сама от себя")
-        else:
-            # Цепочек нет ни в какую сторону: расчётная цена базовой площадки
-            # считается по ЕЁ собственному правилу, без её базы.
-            if base != BASE:
-                other = db.query(PlatformRule).filter(PlatformRule.platform == base).first()
-                if other is not None and other.base_platform:
-                    errors.append(f"{PLATFORMS[base]} сама берёт цену от "
-                                  f"{PLATFORMS.get(other.base_platform, BASE_LABEL)} — цепочки не поддерживаются")
-            users = [r.platform for r in db.query(PlatformRule).filter(PlatformRule.base_platform == platform)]
-            if users:
-                errors.append(f"от {PLATFORMS[platform]} берут цену: "
-                              f"{', '.join(PLATFORMS.get(u, u) for u in users)} — цепочки не поддерживаются")
+    # Коэффициент по умолчанию необязателен: пусто — у артикулов без своего
+    # коэффициента цены нет (а не «как-нибудь посчитаем»).
+    values["base_coef"] = None
+    if _cell(raw.get("base_coef")):
         try:
-            values["base_coef"] = _num(raw.get("base_coef"), Decimal("0.1"), 10, False)
+            values["base_coef"] = _num(raw.get("base_coef"), Decimal("0.1"), 100, False)
         except ValueError as e:
-            errors.append(f"«Коэффициент к базовой»: {e}")
+            errors.append(f"«{COEF_TITLE}»: {e}")
     if "round_step" in values and "round_minus" in values and values["round_minus"] >= values["round_step"]:
         errors.append("«Окончание: минус» должно быть меньше шага округления")
-    if (not base and "min_markup_coef" in values and "markup_coef" in values
-            and values["min_markup_coef"] > values["markup_coef"]):
-        errors.append("минимальный коэффициент больше основного — все цены окажутся ниже пола")
+    if (values.get("base_coef") is not None and "commission_percent" in values and "min_markup_coef" in values):
+        margin = values["base_coef"] * (1 - values["commission_percent"] / 100)
+        if margin < values["min_markup_coef"]:
+            errors.append(f"при коэффициенте по умолчанию {_ru(values['base_coef'])} и комиссии "
+                          f"{_ru(values['commission_percent'])}% маржинальность {_ru(margin.quantize(Decimal('0.01')))} "
+                          f"ниже пола {_ru(values['min_markup_coef'])} — все такие цены окажутся ниже пола")
     return values, errors
 
 
@@ -228,9 +218,7 @@ def _apply_rule(db: Session, user: User, platform: str, values: dict) -> bool:
 
 
 def _rule_raw(rule: PlatformRule) -> dict:
-    raw = {n: (str(getattr(rule, n)) if getattr(rule, n) is not None else "") for n in RULE_KEYS}
-    raw["base_platform"] = rule.base_platform or ""
-    return raw
+    return {n: (str(getattr(rule, n)) if getattr(rule, n) is not None else "") for n in RULE_KEYS}
 
 
 @router.post("/prices/rules/{platform}")
@@ -247,14 +235,13 @@ async def save_rule(platform: str, request: Request, db: Session = Depends(get_d
     _apply_rule(db, user, platform, values)
     db.commit()
     flash(request, f"Правило {PLATFORMS[platform]} сохранено для всех её кабинетов. "
-                   "Цены не изменились — нажмите «Рассчитать».", "ok")
+                   "На площадки ничего не отправлено — новые цены и маржинальность видны на «Цены товаров».", "ok")
     return _back("rules")
 
 
-RULE_HEADERS = ["Площадка (код)", "Площадка", "Кабинеты", "Комиссия, %",
-                *(t for _, t, *_ in RULE_FIELDS), "Цена от площадки (код)", "Коэффициент к базовой"]
-RULE_COLS = {"Комиссия, %": "commission_percent", **{t: n for n, t, *_ in RULE_FIELDS},
-             "Цена от площадки (код)": "base_platform", "Коэффициент к базовой": "base_coef"}
+RULE_HEADERS = ["Площадка (код)", "Площадка", "Кабинеты", "Комиссия, %", COEF_TITLE,
+                *(t for _, t, *_ in RULE_FIELDS)]
+RULE_COLS = {"Комиссия, %": "commission_percent", COEF_TITLE: "base_coef", **{t: n for n, t, *_ in RULE_FIELDS}}
 
 
 @router.get("/prices/rules-export")
@@ -264,8 +251,7 @@ def export_rules(db: Session = Depends(get_db), user: User = Depends(get_current
     for p in _platforms(accs):
         r = get_rule(db, p)
         data.append([p, PLATFORMS[p], ", ".join(a.name for a in accs if a.platform == p),
-                     _f(r.commission_percent), *(_f(getattr(r, n)) for n, *_ in RULE_FIELDS),
-                     r.base_platform or "", _f(r.base_coef)])
+                     _f(r.commission_percent), _f(r.base_coef), *(_f(getattr(r, n)) for n, *_ in RULE_FIELDS)])
     db.commit()
     return xlsx_response(RULE_HEADERS, data, "правила_цен.xlsx")
 
@@ -290,17 +276,14 @@ def import_rules(request: Request, file: UploadFile = File(...), db: Session = D
             if v == "":
                 continue            # пустая ячейка ничего не меняет
             raw[name] = "" if v == CLEAR_CELL else v
-        if not raw["base_platform"]:
-            raw["base_coef"] = ""
         values, errs = validate_rule(db, p, raw)
         if errs:
             errors.append(f"строка {i} ({PLATFORMS[p]}): " + "; ".join(errs))
             continue
         if _apply_rule(db, user, p, values):
             changed += 1
-        db.flush()   # следующая строка проверяет цепочки по уже применённым
     db.commit()
-    _import_flash(request, f"Правил изменено: {changed}. Цены не пересчитаны — нажмите «Рассчитать».", errors)
+    _import_flash(request, f"Правил изменено: {changed}. На площадки ничего не отправлено.", errors)
     return _back("rules")
 
 
@@ -333,7 +316,8 @@ def product_rows(db: Session, account: Account, q: str = "", flt: str = "",
             continue
         pp = prices.get(item_id)
         cost = costs.get(item_id)
-        d = decide_for(inp, item_id, cost.cost_usd if cost else None, rate.usd_rub if rate else None, pp)
+        d = decide_for(inp, item_id, account.id, cost.cost_usd if cost else None,
+                       rate.usd_rub if rate else None, pp)
         with_price = [p for p in plat if p.current_price]
         cur = max(with_price, key=lambda p: p.current_price) if with_price else None
         cur_sale = (cur.current_sale_price or cur.current_price) if cur else None
@@ -709,7 +693,7 @@ def page(request: Request, view: str = Query("proposals"), account_id: str = Que
                BLOCK_MAX_CHANGE=BLOCK_MAX_CHANGE, rule_fields=RULE_FIELDS, platform_names=PLATFORMS,
                source_labels=SOURCE_LABELS, change_percent=change_percent, rate=rates.current(db),
                rows_limit=ROWS_LIMIT, ru=_ru, price_status_labels=PRICE_STATUS_LABELS,
-               base_names={**PLATFORMS, BASE: BASE_LABEL}, BASE=BASE,
+               coef_title=COEF_TITLE,
                saved_filters=db.query(SavedFilter).order_by(SavedFilter.name).all(),
                current_url=str(request.url.path) + (f"?{request.url.query}" if request.url.query else ""),
                rate_shift=overview.rate_shift(db),
