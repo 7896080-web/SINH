@@ -60,7 +60,10 @@ def test_transfer_sides_three_days_apart_are_one_transfer(env):
     rec.payments.append(payment(direction="in", date="2026-09-28", card_last4="2222",
                                 bank="Т-Банк", counterparty_last4="1111",
                                 counterparty_bank="Сбер", **common))
-    [r] = flow.on_files(CHAT, [png()], "")
+    [q] = flow.on_files(CHAT, [png()], "")
+    # Через 3 дня — спрашивает, та же ли это операция (может быть и второй перевод).
+    assert "Это его вторая сторона" in q.text and "d:2:side:1" in str(q.buttons)
+    [r] = flow.on_button(CHAT, "d:2:side:1")
     assert "вторая сторона перевода П1" in r.text
     assert len(db.transfers("2026-09")) == 1
     stmt(db, sber, "2026-09", [("2026-09-25", 10_000_000, "out", "Перевод на Т-Банк", True),
@@ -154,3 +157,77 @@ def test_excel_uses_bank_date(env):
     wb = openpyxl.load_workbook(io.BytesIO(month_xlsx(summarize(db, "2026-10"))))
     rows = list(wb["Бизнес-расходы"].iter_rows(min_row=2, values_only=True))
     assert rows[0][1] == "2026-10-01"
+
+
+def test_equal_transfers_days_apart_can_stay_separate(env):
+    """Еженедельные переводы одной суммы — разные переводы, если так ответить."""
+    db, rec, flow = env
+    common = dict(own_transfer=True, merchant="Перевод", category="", amount="10000.00")
+    rec.payments.append(payment(direction="out", date="2026-09-01", card_last4="1111", bank="Сбер",
+                                counterparty_last4="2222", counterparty_bank="Т-Банк", **common))
+    flow.on_files(CHAT, [png()], "")
+    rec.payments.append(payment(direction="in", date="2026-09-04", card_last4="2222", bank="Т-Банк",
+                                counterparty_last4="1111", counterparty_bank="Сбер", **common))
+    flow.on_files(CHAT, [png()], "")
+    flow.on_button(CHAT, "d:2:dup:ok")
+    assert len(db.transfers("2026-09")) == 2
+
+
+def test_totals_kept_when_only_boundary_line_from_previous_month(env):
+    db, rec, flow = env
+    sber = db.cards()[0].id
+    flow.on_button(CHAT, "s:m:2026-09")
+    flow.on_button(CHAT, f"s:c:{sber}")
+    rec.statements.append({"is_statement": True, "card_last4": "1111",
+                           "total_in": "0", "total_out": "50700", "operations": [
+                               {"date": "2026-08-31", "time": "", "amount": "700", "direction": "out",
+                                "description": "Проведено 01.09", "own_transfer": False},
+                               {"date": "2026-09-05", "time": "", "amount": "50000", "direction": "out",
+                                "description": "Магазин", "own_transfer": False}]})
+    [r] = flow.on_files(CHAT, [png()], "")
+    assert "Итоги документа не взял" not in r.text
+    assert card_summary(db, "2026-09", sber).total_out == 5_070_000
+
+
+def test_boundary_shift_allowed_from_totals_only_month(env):
+    db, _, _ = env
+    vtb = db.add_card("ВТБ", "4444", "ВТБ").id
+    db.add_expense(op_date="2026-09-30", amount=500_000, card_id=vtb, purpose=BUSINESS,
+                   category_id=db.category_id("Прочее"), merchant="VK")
+    stmt(db, vtb, "2026-09", [], tin=0, tout=10_000_000)
+    stmt(db, vtb, "2026-10", [("2026-10-01", 500_000, "out", "VK", False),
+                              ("2026-10-05", 1_000_000, "out", "Магазин", False)])
+    sep, octo = card_summary(db, "2026-09", vtb), card_summary(db, "2026-10", vtb)
+    assert (sep.business, sep.personal) == (0, 10_000_000)
+    assert (octo.business, octo.personal) == (500_000, 1_000_000)
+
+
+def test_small_total_difference_keeps_wrong_card_detection(env):
+    db, _, _ = env
+    sber = db.cards()[0].id
+    db.add_expense(op_date="2026-09-03", amount=1_000_000, card_id=sber, purpose=BUSINESS,
+                   category_id=db.category_id("Прочее"), merchant="X")
+    stmt(db, sber, "2026-09", [("2026-09-10", 5_000_000, "out", "Магазин", False)],
+         tout=5_011_000)                                            # +110 ₽ «в обработке»
+    cs = card_summary(db, "2026-09", sber)
+    assert [e.amount for e in cs.missing] == [1_000_000]
+
+
+def test_model_amounts_are_dot_decimal():
+    assert parse_amount("100.000", typed=False) == 10_000
+    assert parse_amount("1500.0000000000002", typed=False) == 150_000
+    assert parse_amount("12.500") == 1_250_000                      # набрано человеком
+
+
+def test_business_line_choice_is_idempotent(env):
+    db, rec, flow = env
+    psb = db.add_card("ПСБ", "4987", "ПСБ", kind=BUSINESS_ACCOUNT).id
+    stmt(db, psb, "2026-09", [("2026-09-10", 5_000_000, "out", "Перевод владельцу", False)])
+    line = db.card_lines(psb)[0].id
+    flow.on_button(CHAT, f"s:pers:{line}")
+    again = flow.on_button(CHAT, f"s:pers:{line}")              # второе нажатие
+    assert "уже связана с записью №1" in again[0].text
+    own = flow.on_button(CHAT, f"s:own:{line}")                  # передумал — не противоречит
+    assert "уже связана" in own[0].text
+    assert card_summary(db, "2026-09", psb).personal == 5_000_000
+    assert len(db.expenses("2026-09")) == 1

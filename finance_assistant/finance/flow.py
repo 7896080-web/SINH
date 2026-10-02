@@ -22,7 +22,7 @@ from .report import (MONTHS, card_text, expense_card, expense_line, month_name, 
                      month_xlsx, period_text, period_xlsx, rub,
                      suggestions_text, unmatched_text)
 from .pivot import business_items, parse_period, svod_text, svod_xlsx
-from .reconcile import summarize
+from .reconcile import match_card, summarize
 from .storage import BUSINESS, BUSINESS_ACCOUNT, EXPENSE, PERSONAL, PERSONAL_CARD, Storage
 
 log = logging.getLogger(__name__)
@@ -231,9 +231,13 @@ def _bank_key(name: str) -> str:
     return text
 
 
-def _amount_or_none(text: str) -> int | None:
+def _amount_or_none(text: str, typed: bool = False) -> int | None:
+    """typed=True — сумму набрал человек (см. parse_amount); иначе — из ответа модели
+    (знак отбрасываем: направление у модели отдельным полем)."""
+    if not typed:
+        text = (text or "").strip().lstrip("-−–+")
     try:
-        value = parse_amount(text) if text else None
+        value = parse_amount(text, typed=typed) if text else None
     except ValueError:
         return None
     return value if value and value > 0 else None
@@ -819,6 +823,17 @@ class Flow:
                                               from_card_id=t["from"], to_card_id=t["to"])
             if same:
                 my_side = "out" if outgoing else "in"
+                gap = abs((date.fromisoformat(same.op_date) - date.fromisoformat(d["date"])).days)
+                if (my_side not in self.db.transfer_seen_sides(same.id) and gap > 1
+                        and d.get("side_ok") != same.id):
+                    # Зачисление через 2–3 дня — скорее всего та же операция (выходные),
+                    # но может быть и второй такой же перевод: спрашиваем.
+                    return "dup", Reply(
+                        head + f"Есть перевод П{same.id} {same.route} на {rub(same.amount)} "
+                               f"от {date.fromisoformat(same.op_date).strftime('%d.%m')}. "
+                               "Это его вторая сторона (зачисление/списание)?",
+                        [[(f"Да, это П{same.id}", f"d:side:{same.id}")],
+                         [("Нет, это другой перевод", "d:dup:ok")]])
                 if my_side not in self.db.transfer_seen_sides(same.id):
                     # Прислали вторую сторону того же перевода (списание уже было,
                     # теперь зачисление) — дополняем запись, а не создаём новую.
@@ -866,7 +881,7 @@ class Flow:
     def _answer_text(self, chat_id, state, ask, text) -> list[Reply]:
         d = state["drafts"][0]
         if ask == "amount":
-            amount = _amount_or_none(text)
+            amount = _amount_or_none(text, typed=True)
             if amount is None:
                 return [Reply("Не понял сумму. Напишите числом, например 1250,50.")] + self._advance(chat_id)
             d["amount"] = amount
@@ -882,7 +897,7 @@ class Flow:
     # даже той же операции — неактуальна.
     _BUTTONS_FOR_ASK = {"amount": {"skip"}, "date": {"date", "skip"},
                         "card": {"card", "retry", "skip"}, "purpose": {"purpose", "skip"},
-                        "category": {"cat", "skip"}, "dup": {"skip", "dup"},
+                        "category": {"cat", "skip"}, "dup": {"skip", "dup", "side"},
                         "transfer": {"tr", "skip"}}
 
     @staticmethod
@@ -941,6 +956,8 @@ class Flow:
             d["learn_rule"] = not d.get("from_statement")
         elif what == "dup":
             d["dup_checked"] = True
+        elif what == "side":
+            d["side_ok"] = int(value)
         elif what == "tr":
             side = "to" if d["kind"] is not None else "from"
             d["transfer"][side] = int(value) or None
@@ -1484,7 +1501,7 @@ class Flow:
             warn = f"\n⚠️ В документе карта …{last4}, а сверяем {card.label}. Проверьте."
 
         by_month: dict[str, list[dict]] = {}
-        skipped = other_month = 0
+        skipped = far_month = 0
         for op in data.get("operations", []):
             amount = _amount_or_none(op.get("amount", "").lstrip("-+"))
             op_date = _parse_date(op.get("date", ""), self.today())
@@ -1493,7 +1510,13 @@ class Flow:
                 continue
             if st["month"] and op_date[:7] != st["month"]:
                 skipped += 1  # операции соседнего месяца в выписку этого месяца не берём
-                other_month += 1
+                # 31.08 в выписке за сентябрь — банк провёл 1-го: итоги документа
+                # всё равно сентябрьские. Дальше от границы — документ за два месяца.
+                first = date.fromisoformat(st["month"] + "-01")
+                last = (first + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+                when = date.fromisoformat(op_date)
+                if min(abs((when - first).days), abs((when - last).days)) > 3:
+                    far_month += 1
                 continue
             by_month.setdefault(op_date[:7], []).append({
                 "op_date": op_date, "op_time": _hhmm(op.get("time", "")), "amount": amount, "direction": op["direction"],
@@ -1506,7 +1529,7 @@ class Flow:
         total_in = _amount_or_none(data.get("total_in", ""))
         total_out = _amount_or_none(data.get("total_out", ""))
         totals_note = ""
-        if other_month and (total_in is not None or total_out is not None):
+        if far_month and (total_in is not None or total_out is not None):
             # Документ захватывает и соседний месяц: его итоги — не итоги этого
             # месяца. Считаем по строкам.
             total_in = total_out = None
@@ -1690,6 +1713,19 @@ class Flow:
         if not row:
             return [Reply("Этой строки выписки уже нет.")]
         card = self.db.card(row["card_id"])
+        # Строка уже связана с записью (нажали второй раз, или старая кнопка) —
+        # второй записи не создаём, а говорим, с чем она связана.
+        m = match_card(self.db, card)
+        linked_expense = next((e for e, ln in m.expense_line.items() if ln == row["id"]), None)
+        linked_transfer = next((t for t, ln in {**m.sent_line, **m.received_line}.items()
+                                if ln == row["id"]), None)
+        if linked_expense is not None:
+            e = self.db.expense(linked_expense)
+            return [Reply(f"Эта строка уже связана с записью №{e.id} "
+                          f"({'личное' if e.purpose == PERSONAL else 'бизнес'}). "
+                          "Поправить или удалить — кнопками под ней:"), self._saved_reply(e.id)]
+        if linked_transfer is not None or row["own_transfer"]:
+            return [Reply("Эта строка уже отмечена как перевод между своими счетами.")]
         if what == "keepbiz":
             return [Reply("Хорошо, остаётся расходом бизнеса («Без статьи»). Разнести по "
                           f"статье — /biz {row['id']}.")]

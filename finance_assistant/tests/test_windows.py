@@ -111,7 +111,10 @@ def test_supervisor_restarts_exited_child_and_logs(app, monkeypatch):
         assert _wait(lambda: sup.children["bot"].proc.poll() is not None)
         sup.tick()                                        # завершился — ждёт RESTART_DELAY
         assert sup.children["bot"].proc is None and counter.read_text() == "x"
-        clk.now += supervise.RESTART_DELAY
+        clk.now += supervise.RESTART_DELAY - 1
+        sup.tick()
+        assert counter.read_text() == "x"                 # упал сразу — пауза растёт
+        clk.now += supervise.RESTART_DELAY + 1
         sup.tick()
         assert _wait(lambda: counter.exists() and counter.read_text() == "xx")
         test_proc = sup.children["bot-test"].proc
@@ -176,15 +179,45 @@ def test_backup_copies_every_user_and_prunes_old(tmp_path):
     old = dest / "finance-111-20200101-0000.db"
     old.write_text("старый")
     os.utime(old, (0, 0))
-    assert backup.backup(str(data), str(dest), keep_days=30, stamp="20260926-0330") == 2
+    old_zip = dest / "receipts-111-20200101-0000.zip"           # архив прежней версии
+    old_zip.write_bytes(b"zip")
+    os.utime(old_zip, (0, 0))
+    env = tmp_path / ".env"
+    env.write_text("TELEGRAM_BOT_TOKEN=1:A\n", encoding="utf-8")
+    assert backup.backup(str(data), str(dest), keep_days=30, stamp="20260926-0330",
+                         env_file=str(env)) == 2
     names = sorted(os.listdir(dest))
-    assert names == ["finance-111-20260926-0330.db", "finance-222-20260926-0330.db",
-                     "receipts-111-20260926-0330.zip"]
+    assert names == ["env-latest.txt", "finance-111-20260926-0330.db",
+                     "finance-222-20260926-0330.db", "receipts-111"]
     copy = sqlite3.connect(dest / "finance-222-20260926-0330.db")
     assert copy.execute("SELECT name FROM cards").fetchone()[0] == "Сбер"
     copy.close()
-    with zipfile.ZipFile(dest / "receipts-111-20260926-0330.zip") as z:
-        assert "receipts/2026-09/a.png" in z.namelist()
+    mirrored = dest / "receipts-111" / "2026-09" / "a.png"
+    assert mirrored.read_bytes() == b"png"
+    # Следующий день: скриншоты не копируются заново, только новые.
+    (data / "users" / "111" / "receipts" / "2026-09" / "b.png").write_bytes(b"png2")
+    os.utime(mirrored, (0, 0))
+    backup.backup(str(data), str(dest), keep_days=30, stamp="20260927-0330")
+    assert (dest / "receipts-111" / "2026-09" / "b.png").exists()
+    assert os.path.getmtime(mirrored) == 0                       # старый не трогали
+
+
+def test_backup_frees_space_first(tmp_path, monkeypatch):
+    """Диск полон: копия падает, но старые копии к этому моменту уже удалены."""
+    data, dest = tmp_path / "data", tmp_path / "backups"
+    (data / "users" / "1").mkdir(parents=True)
+    Storage(str(data / "users" / "1" / "finance.db")).close()
+    dest.mkdir()
+    old = dest / "finance-1-20200101-0000.db"
+    old.write_text("x")
+    os.utime(old, (0, 0))
+
+    def full(*a, **k):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(backup, "_copy_db", full)
+    with pytest.raises(OSError):
+        backup.backup(str(data), str(dest))
+    assert not old.exists()
 
 
 # --- .env и сертификат -------------------------------------------------------
