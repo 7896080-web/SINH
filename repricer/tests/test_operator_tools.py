@@ -13,7 +13,7 @@ from priceapp.platforms import CurrentPrice
 from priceapp.pricing import get_rule
 from tests import factories as f
 
-RULE = {"commission_percent": "25", "markup_coef": "2", "min_markup_coef": "1,3",
+RULE = {"commission_percent": "25", "base_coef": "2,667", "min_markup_coef": "1,3",
         "round_step": "10", "round_minus": "1", "max_change_percent": "20"}
 
 
@@ -98,15 +98,11 @@ def test_compare_one_row_per_sku_across_cabinets(client, db):
 
 def test_rule_preview_counts_without_saving(client, db):
     _wb(client, db)
-    f.account(db, "ozon", "Озон", commission=30)
-    oz = get_rule(db, "ozon")
-    oz.base_platform, oz.base_coef, oz.round_step, oz.round_minus = "wb", Decimal("1.1"), 10, 1
-    db.commit()
-    r = client.post("/prices/rules/wb/preview", data={**RULE, "markup_coef": "2,5"})
+    r = client.post("/prices/rules/wb/preview", data={**RULE, "base_coef": "2,5"})
     assert "Если сохранить" in r.text and "Wildberries (1 каб.)" in r.text and "изменится 3" in r.text
-    assert "Ozon" in r.text and "Ничего не сохранено" in r.text
+    assert "ниже 3" in r.text and "Ничего не сохранено" in r.text
     db.expire_all()
-    assert get_rule(db, "wb").markup_coef == Decimal("2")
+    assert get_rule(db, "wb").base_coef == Decimal("2.667")
 
 
 # --- скачок курса -------------------------------------------------------------------

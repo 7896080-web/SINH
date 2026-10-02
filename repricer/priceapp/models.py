@@ -221,13 +221,18 @@ class ArticleMatchRule(Base):
 
 class PlatformRule(Base):
     """Правило цены ПЛОЩАДКИ — одно на все её кабинеты (у WB три ИП, условия у
-    них одни). Наценка — КОЭФФИЦИЕНТОМ к себестоимости (2 = +100%, 2,5 = +150%,
-    3 = +200%). Цена = себестоимость ₽ × коэффициент / (1 − комиссия%), вверх до
-    шага с «красивым» окончанием.
+    них одни).
 
-    Или — от ДРУГОЙ площадки: при заданной `base_platform` цена = расчётная цена
-    базовой площадки × `base_coef` (Ozon = WB × 1,1). Цепочек нет: база сама
-    базы не имеет. Пол наценки проверяется по СВОЕЙ комиссии всегда."""
+    Цена = БАЗОВАЯ цена × коэффициент, где базовая = себестоимость 1С, $ × курс ЦБ
+    (руками не правится — `pricing.base_price`). Коэффициент задаётся на АРТИКУЛ
+    по площадке или по кабинету (`ArticleCoef`); `base_coef` здесь — коэффициент
+    площадки ПО УМОЛЧАНИЮ для артикулов, у которых своего нет (NULL — не задан:
+    у таких артикулов цены нет). Дальше округление вверх до шага с «красивым»
+    окончанием; пол маржинальности и лимит шага — по своей комиссии всегда.
+
+    `markup_coef` и `base_platform` — от прежней схемы («себестоимость ×
+    коэффициент / (1 − комиссия)» и «цена от другой площадки»), расчётом больше
+    не читаются; колонки оставлены, чтобы не перестраивать таблицу."""
     __tablename__ = "platform_rules"
     id = Column(Integer, primary_key=True)
     platform = Column(String(8), nullable=False, unique=True)
@@ -239,7 +244,7 @@ class PlatformRule(Base):
     round_step = Column(Integer, nullable=False, default=1)
     round_minus = Column(Integer, nullable=False, default=0)
     # Пол: к получению не меньше себестоимости × этот коэффициент — ни расчётом,
-    # ни ручной ценой, ни ценой от базовой площадки. 1 — «не в убыток».
+    # ни ручной ценой. 1 — «не в убыток».
     min_markup_coef = Column(Numeric(7, 3), nullable=False, default=1)
     max_change_percent = Column(Numeric(7, 2), nullable=False, default=20)
     base_platform = Column(String(8), nullable=True)
@@ -312,25 +317,17 @@ class SavedFilter(Base):
     created_at = Column(DateTime, nullable=False, default=now_utc)
 
 
-class BasePrice(Base):
-    """Базовая цена SKU 1С, ₽ — одна на товар, без комиссии площадки. От неё
-    берёт цену площадка, у которой в правиле «цена от базовой × коэффициент»."""
-    __tablename__ = "base_prices"
-    item_id = Column(String(64), primary_key=True)
-    price = Column(Integer, nullable=False)
-    updated_at = Column(DateTime, nullable=False, default=now_utc, onupdate=now_utc)
-    updated_by = Column(String(64), nullable=False, default="")
-
-
-class PlatformPrice(Base):
-    """Цена SKU на ПЛОЩАДКЕ, заданная человеком, — сразу для всех её кабинетов
-    (у WB три ИП). Ручная цена кабинета (`ProductPrice.manual_price`) главнее неё;
-    пол наценки и подтверждение не обходит ни та, ни другая."""
-    __tablename__ = "platform_prices"
-    __table_args__ = (UniqueConstraint("item_id", "platform", name="uq_platform_price"),)
+class ArticleCoef(Base):
+    """Коэффициент от базовой цены, заданный на АРТИКУЛ 1С — сразу для всех его
+    размеров (и цветов). `account_id` = 0 — на всю площадку (у WB — для всех
+    трёх ИП), иначе — только для этого кабинета, и он главнее площадочного.
+    Ноль, а не NULL: уникальность пары с NULL SQLite не проверяет."""
+    __tablename__ = "article_coefs"
+    __table_args__ = (UniqueConstraint("article", "platform", "account_id", name="uq_article_coef"),)
     id = Column(Integer, primary_key=True)
-    item_id = Column(String(64), nullable=False, index=True)
+    article = Column(String(200), nullable=False, index=True)
     platform = Column(String(8), nullable=False)
-    price = Column(Integer, nullable=False)
+    account_id = Column(Integer, nullable=False, default=0)
+    coef = Column(Numeric(7, 3), nullable=False)
     updated_at = Column(DateTime, nullable=False, default=now_utc, onupdate=now_utc)
     updated_by = Column(String(64), nullable=False, default="")

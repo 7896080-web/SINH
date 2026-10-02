@@ -1,15 +1,18 @@
-"""«Цены товаров»: базовая цена и цена площадки на товар, отборы по артикулу и
-штрихкоду, ручная и массовая правка, Excel; и то, как это доходит до расчёта."""
+"""«Цены товаров»: цена = базовая (себестоимость × курс) × коэффициент артикула.
+
+Выбрали площадку или кабинет — задали коэффициент артикулу (сразу всем его
+размерам) — увидели новую цену и маржинальность рядом с текущими — передали."""
 import io
 from decimal import Decimal
 
 from openpyxl import load_workbook
 
-from priceapp.models import BasePrice, PlatformPrice, PriceChange, ProductPrice
-from priceapp.pricing import get_rule
+from priceapp import dispatch
+from priceapp.models import ArticleCoef, PlatformItem, PriceChange, ProductPrice
+from priceapp.pricing import load_inputs, coef_for
 from tests import factories as f
 
-RULE = {"commission_percent": "25", "markup_coef": "2", "min_markup_coef": "1,3",
+RULE = {"commission_percent": "25", "base_coef": "2,5", "min_markup_coef": "1,3",
         "round_step": "10", "round_minus": "1", "max_change_percent": "20"}
 
 
@@ -19,7 +22,7 @@ def _setup(client, db):
     wb2 = f.account(db, "wb", "ИП Ребрик")
     oz = f.account(db, "ozon", "Озон", commission=30)
     client.post("/prices/rules/wb", data=RULE)
-    client.post("/prices/rules/ozon", data={**RULE, "commission_percent": "30"})
+    client.post("/prices/rules/ozon", data={**RULE, "commission_percent": "30", "base_coef": "2,8"})
     f.sku(db, "u1", "39681", "L", color="GRI", barcodes=["2000932200000"], cost_usd="16.24", name="Свитшот")
     f.sku(db, "u2", "39681", "M", color="MAVI", barcodes=["2000932200001"], cost_usd="16.00", name="Свитшот")
     f.sku(db, "u3", "4033", "3XL", color="SIYAH", barcodes=["2000932200003"], cost_usd="12.40", name="Джемпер")
@@ -31,135 +34,152 @@ def _setup(client, db):
     return wb1, wb2, oz
 
 
-def test_page_columns_and_filters(client, db):
+def _table(page: str) -> str:
+    return page.split("<table", 1)[1]
+
+
+def test_rows_are_articles_base_is_cost_times_rate_and_not_editable(client, db):
     _setup(client, db)
-    page = client.get("/sku-prices").text
-    assert "Цены товаров" in page and "Wildberries" in page and "Ozon" in page
-    # 16,24 × 81,5 = 1323,56; WB: × 2 / 0,75 → 3539, коэфф. 2,01
-    assert "3539" in page and "×2,01" in page and "нет на площадке" in page
-    page = client.get("/sku-prices?art=4033").text
-    assert "SIYAH" in page and "MAVI" not in page
-    page = client.get("/sku-prices?barcode=2200001").text
-    assert "MAVI" in page and "SIYAH" not in page and "GRI" not in page.split("<table")[1]
-    assert "MAVI" not in client.get("/sku-prices?size=L").text.split("<table")[1]
+    page = client.get("/sku-prices?scope=wb").text
+    t = _table(page)
+    # 39681 — одна строка на два размера; 16,24 × 81,5 = 1323,56 и 16,00 × 81,5 = 1304,00
+    assert t.count('name="arts" value="39681"') == 1 and "2 разм." in t
+    assert "1 304,00–1 323,56" in t
+    # по умолчанию WB × 2,5: 1304 → 3269, 1323,56 → 3309; маржинальность 1,88
+    assert "3269–3309" in t and "1,88" in t
+    assert 'name="base"' not in page                          # базовая руками не правится
+    assert "Wildberries — все кабинеты (2)" in page and "Wildberries: ИП Ребрик" in page
+    # размеры раскрываются, коэффициент у них общий с артикулом
+    t = _table(client.get("/sku-prices?scope=wb&by=sku").text)
+    assert "MAVI M" in t and "GRI L" in t
 
 
-def test_bulk_coef_from_cost_for_base_and_platform(client, db):
+def test_filters_by_article_barcode_size_keep_whole_article(client, db):
     _setup(client, db)
-    # базовая = себестоимость ₽ × 2,5: 1323,56 × 2,5 = 3308,9 → 3309
-    r = client.post("/sku-prices/bulk", data={"target": "base", "action": "coef_cost", "value": "2,5",
-                                              "ids": ["u1"]})
-    assert "изменено 1" in r.text
-    assert db.get(BasePrice, "u1").price == 3309
-    # цена WB с маржинальностью 2,2 по всему отбору «39681»: 1323,56 × 2,2 / 0,75 = 3882,4 → 3889
-    r = client.post("/sku-prices/bulk", data={"target": "wb", "action": "coef_cost", "value": "2,2",
-                                              "all_filtered": "1", "art": "39681"})
-    assert "изменено 2" in r.text
-    got = {p.item_id: p.price for p in db.query(PlatformPrice).filter_by(platform="wb")}
-    assert got == {"u1": 3889, "u2": 3829}         # 1304 × 2,2 / 0,75 = 3825,07 → 3829
+    t = _table(client.get("/sku-prices?scope=wb&art=4033").text)
+    assert "4033" in t and "39681" not in t
+    t = _table(client.get("/sku-prices?scope=wb&barcode=2200001").text)
+    assert 'value="39681"' in t and "4033" not in t
+    t = _table(client.get("/sku-prices?scope=wb&size=l").text)
+    assert 'value="39681"' in t and "1 разм." in t
 
 
-def test_platform_price_reaches_proposals_for_all_cabinets_but_cabinet_manual_wins(client, db):
+def test_coef_for_platform_reaches_every_size_and_every_cabinet(client, db):
     wb1, wb2, _ = _setup(client, db)
-    client.post("/sku-prices/row/u1", data={"base": "", "p_wb": "3990"})
-    db.add(ProductPrice(item_id="u1", account_id=wb2.id, manual_price=4100))
-    db.commit()
+    r = client.post("/sku-prices/coef", data={"scope": "wb", "action": "set", "value": "2,2", "arts": ["39681"]})
+    assert "изменено 1" in r.text
+    assert [(c.article, c.platform, c.account_id, c.coef) for c in db.query(ArticleCoef)] == \
+        [("39681", "wb", 0, Decimal("2.2"))]
+    # 1323,56 × 2,2 = 2911,8 → 2919; 1304 × 2,2 = 2868,8 → 2869
+    assert "2869–2919" in _table(r.text)
     client.post("/prices/recalculate", data={})
-    got = {(c.account_id, c.item_id): (c.new_price, c.source) for c in db.query(PriceChange)}
-    assert got[(wb1.id, "u1")] == (3990, "platform")
-    assert got[(wb2.id, "u1")] == (4100, "manual")
-    assert got[(wb1.id, "u2")][1] == "rule"
-    # снять пустым полем — снова по правилу
-    client.post("/sku-prices/row/u1", data={"p_wb": ""})
-    assert db.query(PlatformPrice).count() == 0
+    got = {(c.account_id, c.item_id): c.new_price for c in db.query(PriceChange).filter_by(status="proposed")}
+    assert got[(wb1.id, "u1")] == got[(wb2.id, "u1")] == 2919 and got[(wb1.id, "u2")] == 2869
+    assert got[(wb1.id, "u3")] == 2529                        # 4033 — по умолчанию 2,5
 
 
-def test_rule_price_from_base_price(client, db):
+def test_cabinet_coef_beats_platform_and_row_clear_returns_default(client, db):
+    wb1, wb2, _ = _setup(client, db)
+    client.post("/sku-prices/coef", data={"scope": "wb", "action": "set", "value": "2,2", "all_filtered": "1"})
+    client.post("/sku-prices/coef", data={"scope": f"a{wb2.id}", "row": "39681", "value": "3"})
+    inp = load_inputs(db, "wb")
+    assert coef_for(inp, "u1", wb2.id) == (Decimal("3"), "cabinet")
+    assert coef_for(inp, "u1", wb1.id) == (Decimal("2.2"), "article")
+    page = client.get("/sku-prices?scope=wb").text
+    assert "свой у: ИП Ребрик" in page
+    # пустое поле в строке — снять: снова по умолчанию площадки
+    client.post("/sku-prices/coef", data={"scope": f"a{wb2.id}", "row": "39681", "value": ""})
+    assert coef_for(load_inputs(db, "wb"), "u1", wb2.id) == (Decimal("2.2"), "article")
+
+
+def test_mult_and_validation(client, db):
     _setup(client, db)
-    db.add(BasePrice(item_id="u1", price=3300))
+    client.post("/sku-prices/coef", data={"scope": "wb", "action": "set", "value": "2", "arts": ["39681"]})
+    client.post("/sku-prices/coef", data={"scope": "wb", "action": "mult", "value": "1,1", "arts": ["39681"]})
+    assert db.query(ArticleCoef).one().coef == Decimal("2.2")
+    assert "значение" in client.post("/sku-prices/coef", data={"scope": "wb", "action": "set", "value": "abc",
+                                                               "arts": ["39681"]}).text
+    assert "Ничего не отмечено" in client.post("/sku-prices/coef", data={"scope": "wb", "action": "clear"}).text
+
+
+def test_margin_uses_platform_discount_and_floor_badge(client, db):
+    wb1, wb2, _ = _setup(client, db)
+    for it in db.query(PlatformItem).filter(PlatformItem.barcode == "2000932200003"):
+        it.current_price, it.current_sale_price = 4000, 3000          # скидка продавца 25%
     db.commit()
-    r = client.post("/prices/rules/ozon", data={**RULE, "commission_percent": "30", "markup_coef": "1",
-                                                "base_platform": "base", "base_coef": "1,2"})
-    assert "не сохранено" not in r.text
-    client.post("/prices/recalculate", data={})
-    oz = db.query(PriceChange).join(PriceChange.account).filter_by(platform="ozon").one()
-    # 3300 × 1,2 = 3960 → вверх до 10, минус 1 → 3969
-    assert (oz.new_price, oz.source) == (3969, "base")
-    page = client.get("/sku-prices").text
-    assert "от базовой" in page
-    # цепочка: WB от Озона, который сам от базовой, — нельзя
-    r = client.post("/prices/rules/wb", data={**RULE, "base_platform": "ozon", "base_coef": "1"})
-    assert "цепочки не поддерживаются" in r.text
-    # и наоборот: от WB уже берут цену — WB от базовой нельзя
-    client.post("/prices/rules/ozon", data={**RULE, "commission_percent": "30", "base_platform": "wb",
-                                            "base_coef": "1,1"})
-    r = client.post("/prices/rules/wb", data={**RULE, "base_platform": "base", "base_coef": "1"})
-    assert "цепочки не поддерживаются" in r.text
+    t = _table(client.get("/sku-prices?scope=wb&art=4033").text)
+    # новая 2529 со скидкой 25% → 1896,75 × 0,75 / 1010,60 = 1,41; текущая 3000 × 0,75 / 1010,6 = 2,23
+    assert "скидка 25%" in t and "1,41" in t and "2,23" in t
+    client.post("/sku-prices/coef", data={"scope": "wb", "action": "set", "value": "2", "arts": ["4033"]})
+    # 2029 × 0,75 × 0,75 / 1010,6 = 1,13 — ниже пола 1,3 (а без скидки было бы 1,51)
+    t = _table(client.get("/sku-prices?scope=wb&flt=floor").text)
+    assert "4033" in t and "ниже пола" in t and "39681" not in t
 
 
-def test_base_missing_means_no_price_with_reason(client, db):
+def test_send_queues_approved_for_every_cabinet_and_respects_limits(client, db):
+    wb1, wb2, oz = _setup(client, db)
+    db.add(ProductPrice(item_id="u2", account_id=wb1.id, last_sent_price=3269))   # уже стоит
+    db.add(ProductPrice(item_id="u1", account_id=wb2.id, last_sent_price=2000))   # +65% — больше лимита
+    db.add(PriceChange(item_id="u1", account_id=wb1.id, barcode="2000932200000", new_price=1, status="proposed"))
+    db.commit()
+    r = client.post("/sku-prices/send", data={"scope": "wb", "arts": ["39681"]})
+    assert "передано на отправку 2 цен" in r.text and "уже стоит на площадке — 1" in r.text
+    assert "изменение больше лимита — 1" in r.text
+    q = {(c.account_id, c.item_id): c for c in db.query(PriceChange).filter_by(status="approved")}
+    assert set(q) == {(wb1.id, "u1"), (wb2.id, "u2")}
+    assert q[(wb1.id, "u1")].new_price == 3309 and q[(wb1.id, "u1")].decided_by == "op"
+    assert q[(wb1.id, "u1")].markup_coef == Decimal("1.88") and "× 2,5" in q[(wb1.id, "u1")].note
+    assert db.query(PriceChange).filter_by(status="proposed").count() == 0         # вытеснено
+    assert all(c.account.platform == "wb" for c in q.values())                    # Озон не тронут
+    r = client.post("/sku-prices/send", data={"scope": "wb", "arts": ["39681"], "confirm_large": "1"})
+    assert "передано на отправку 3 цен" in r.text       # большой шаг с галочкой + повтор двух прежних
+
+    class Ok:
+        def push_prices(self, items):
+            return {"ok": [i.barcode for i in items], "errors": [], "sent_prices": {}}
+    dispatch.run_account(db, wb1, Ok())
+    assert db.query(ProductPrice).filter_by(account_id=wb1.id, item_id="u1").one().last_sent_price == 3309
+
+
+def test_send_never_below_floor(client, db):
     _setup(client, db)
-    client.post("/prices/rules/ozon", data={**RULE, "commission_percent": "30", "markup_coef": "1",
-                                            "base_platform": "base", "base_coef": "1,2"})
-    page = client.get("/sku-prices").text
-    assert "у товара не задана базовая цена" in page
-
-
-def test_bulk_mult_from_base_clear_and_floor_badge(client, db):
-    _setup(client, db)
-    client.post("/sku-prices/row/u1", data={"base": "3000"})
-    r = client.post("/sku-prices/bulk", data={"target": "all", "action": "from_base", "value": "1,1",
-                                              "ids": ["u1", "u3"]})
-    # 3000 × 1,1 = 3300 → WB 3309 и Ozon 3309 (шаг 10, минус 1); у u3 нет базовой — пропуск
-    assert "изменено 2" in r.text and "нет базовой цены" in r.text
-    assert {(p.item_id, p.platform): p.price for p in db.query(PlatformPrice)} == \
-        {("u1", "wb"): 3309, ("u1", "ozon"): 3309}
-    client.post("/sku-prices/bulk", data={"target": "base", "action": "mult", "value": "1,05", "ids": ["u1"]})
-    assert db.get(BasePrice, "u1").price == 3150
-    client.post("/sku-prices/bulk", data={"target": "wb", "action": "set", "value": "1000", "ids": ["u1"]})
-    assert "ниже пола" in client.get("/sku-prices?art=39681").text
-    client.post("/sku-prices/bulk", data={"target": "all", "action": "clear", "all_filtered": "1"})
-    assert db.query(PlatformPrice).count() == 0
-    assert "Ничего не отмечено" in client.post("/sku-prices/bulk", data={"target": "wb", "action": "clear"}).text
-    assert "для цены площадки" in client.post("/sku-prices/bulk", data={
-        "target": "base", "action": "from_base", "value": "1", "ids": ["u1"]}).text
+    client.post("/sku-prices/coef", data={"scope": "wb", "action": "set", "value": "1,2", "arts": ["4033"]})
+    r = client.post("/sku-prices/send", data={"scope": "wb", "arts": ["4033"], "confirm_large": "1"})
+    assert "ниже пола, не отправлено — 2" in r.text and db.query(PriceChange).count() == 0
 
 
 def test_excel_roundtrip_empty_changes_nothing(client, db):
-    _setup(client, db)
-    client.post("/sku-prices/row/u1", data={"base": "3000", "p_wb": "3990"})
-    r = client.get("/sku-prices/export")
-    wb = load_workbook(io.BytesIO(r.content))
-    ws = wb.active
+    wb1, wb2, _ = _setup(client, db)
+    client.post("/sku-prices/coef", data={"scope": "wb", "action": "set", "value": "2,2", "arts": ["39681"]})
+    r = client.get("/sku-prices/export?scope=wb")
+    book = load_workbook(io.BytesIO(r.content))
+    ws = book.active
     h = [c.value for c in ws[1]]
-    assert "Базовая цена, ₽" in h and "Wildberries: цена на площадке, ₽" in h and "Ozon: коэффициент маржинальности" in h
-    rows = {ws.cell(row=i, column=1).value: i for i in range(2, ws.max_row + 1)}
-    ws.cell(row=rows["u1"], column=h.index("Базовая цена, ₽") + 1, value=None)        # не трогать
-    ws.cell(row=rows["u1"], column=h.index("Wildberries: цена на площадке, ₽") + 1, value="-")   # снять
-    ws.cell(row=rows["u3"], column=h.index("Базовая цена, ₽") + 1, value=2500)
-    ws.cell(row=rows["u3"], column=h.index("Ozon: цена на площадке, ₽") + 1, value=2999)        # u3 нет на Ozon
+    assert {"Где (код)", "Артикул", "Коэффициент от базовой", "Новая маржинальность", "Текущая цена, ₽"} <= set(h)
+    rows = {ws.cell(row=i, column=h.index("Артикул") + 1).value: i for i in range(2, ws.max_row + 1)}
+    col = h.index("Коэффициент от базовой") + 1
+    ws.cell(row=rows["39681"], column=col, value=None)                 # не трогать
+    ws.cell(row=rows["4033"], column=col, value=2.7)
+    ws.append([f"a{wb2.id}", "", "4033"] + [None] * (col - 4) + ["3"])   # свой у кабинета
+    ws.append(["nope", "", "4033"] + [None] * (col - 4) + ["3"])
     buf = io.BytesIO()
-    wb.save(buf)
-    r = client.post("/sku-prices/import", files={"file": ("p.xlsx", buf.getvalue())})
-    assert "Цен изменено: 2" in r.text and "нет на площадке Ozon" in r.text
-    assert db.get(BasePrice, "u1").price == 3000 and db.get(BasePrice, "u3").price == 2500
-    assert db.query(PlatformPrice).count() == 0
+    book.save(buf)
+    r = client.post("/sku-prices/import", files={"file": ("k.xlsx", buf.getvalue())})
+    assert "Коэффициентов изменено: 2" in r.text and "«nope» — нет такой площадки" in r.text
+    got = {(c.article, c.account_id): c.coef for c in db.query(ArticleCoef)}
+    assert got == {("39681", 0): Decimal("2.2"), ("4033", 0): Decimal("2.7"), ("4033", wb2.id): Decimal("3")}
+    ws.cell(row=rows["39681"], column=col, value="-")                  # снять
+    buf = io.BytesIO()
+    book.save(buf)
+    client.post("/sku-prices/import", files={"file": ("k.xlsx", buf.getvalue())})
+    assert db.query(ArticleCoef).filter_by(article="39681").count() == 0
 
 
 def test_nav_has_page(client, db):
     assert 'href="/sku-prices"' in client.get("/attention").text
 
 
-def test_platform_without_catalog_still_has_a_column(client, db):
-    _setup(client, db)
-    f.account(db, "kit", "КИТ", commission=20)
-    page = client.get("/sku-prices").text
-    assert "Яндекс KIT" in page and "каталог не загружен" in page
-
-
 def test_terminal_platform_refusal_closes_at_once(db):
-    from priceapp import dispatch
-
     class Refuses:
         def push_prices(self, items):
             return {"ok": [], "sent_prices": {},

@@ -10,7 +10,7 @@ from priceapp.models import Account, ApiCredential, OnecCost, PlatformItem, Plat
 from priceapp.platforms import CatalogRow
 from tests import factories as f
 
-RULE = {"commission_percent": "25", "markup_coef": "2", "min_markup_coef": "1,3",
+RULE = {"commission_percent": "25", "base_coef": "2,667", "min_markup_coef": "1,3",
         "round_step": "10", "round_minus": "1", "max_change_percent": "20"}
 
 
@@ -89,7 +89,7 @@ def test_rules_save_commission_and_validate(client, db):
     client.post("/prices/rules/wb", data=RULE)
     db.expire_all()
     rule = db.query(PlatformRule).one()
-    assert rule.commission_percent == Decimal("25") and rule.markup_coef == Decimal("2")
+    assert rule.commission_percent == Decimal("25") and rule.base_coef == Decimal("2.667")
     assert 'value="1,3"' in client.get("/prices?view=rules").text
     r = client.post("/prices/rules/wb", data={**RULE, "commission_percent": "100"})
     assert "не сохранено" in r.text
