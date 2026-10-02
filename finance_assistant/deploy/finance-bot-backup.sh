@@ -29,7 +29,8 @@ PY
     fi
     count=$((count + 1))
 done
-# Только свои файлы: копии баз и архивы скриншотов прежней версии.
-find "$DEST" -maxdepth 1 -type f \( -name 'finance-*.db' -o -name 'receipts-*.tar.gz' \) \
+# Только свои файлы: копии баз и архивы скриншотов прежней версии. Баз не нашли
+# (не та папка?) — старые копии не трогаем.
+[ "$count" -gt 0 ] && find "$DEST" -maxdepth 1 -type f \( -name 'finance-*.db' -o -name 'receipts-*.tar.gz' \) \
     -mtime +"$KEEP_DAYS" -delete
 echo "backup ok: $count баз(ы) в $DEST"

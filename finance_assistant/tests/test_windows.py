@@ -226,8 +226,7 @@ def test_backup_wrong_data_folder_keeps_old_copies(tmp_path):
     old = dest / "finance-1-20200101-0000.db"
     old.write_text("x")
     os.utime(old, (0, 0))
-    with pytest.raises(RuntimeError, match="нет ни одной базы"):
-        backup.backup(str(tmp_path / "нет-такой"), str(dest))
+    assert backup.backup(str(tmp_path / "нет-такой"), str(dest)) == 0
     assert old.exists()
 
 

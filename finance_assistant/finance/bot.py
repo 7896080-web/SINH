@@ -14,6 +14,7 @@ import time
 from telegram import (BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputFile,
                       KeyboardButton, ReplyKeyboardMarkup, Update)
 from telegram.constants import ChatAction, ChatType
+from telegram.error import Conflict, NetworkError
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes,
                           MessageHandler, filters)
 
@@ -147,6 +148,18 @@ def build_app(token: str, flow_for, allowed: set[int], env_file: str | None = No
     стереть данные пользователя (команда /reset есть только тогда).
     """
     async def on_start(application: Application):
+        for user_id in allowed:
+            # Процесс прервали посреди разбора пачки — честно сказать об этом.
+            try:
+                take = getattr(resolve(user_id), "take_interrupted", None)
+                n = await asyncio.to_thread(take, user_id) if take else 0
+                if n:
+                    await application.bot.send_message(user_id, _marked(
+                        f"⚠️ Бот перезапускался, пока разбирал ваши файлы ({n}). Часть могла "
+                        "не записаться — проверьте 📋 Записи и пришлите недостающие ещё раз.",
+                        label))
+            except Exception as exc:  # noqa: BLE001 — не мешаем запуску
+                log.warning("Не удалось проверить прерванный разбор у %s: %s", user_id, exc)
         try:
             await application.bot.set_my_commands([BotCommand(c, d) for c, d in BOT_COMMANDS])
         except Exception as exc:  # не критично: команды и так работают
@@ -379,8 +392,24 @@ def build_app(token: str, flow_for, allowed: set[int], env_file: str | None = No
             return
         await run(update, "on_button", query.data)
 
+    conflicts = {"n": 0}
+
     async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
-        log.exception("Ошибка при обработке апдейта", exc_info=context.error)
+        error = context.error
+        if update is None and isinstance(error, Conflict):
+            # Второй процесс опрашивает того же бота (не остановлен старый
+            # бот на другом сервере?) — сообщения делятся между ними.
+            conflicts["n"] += 1
+            if conflicts["n"] in (1, 10) or conflicts["n"] % 100 == 0:
+                log.error("Telegram: этого бота опрашивает ещё одна программа (%d раз). "
+                          "Остановите второй экземпляр — иначе часть сообщений уходит ему.",
+                          conflicts["n"])
+            return
+        if update is None and isinstance(error, NetworkError):
+            log.warning("Нет связи с Telegram: %s", error)  # опрос сам повторится
+            return
+        conflicts["n"] = 0
+        log.exception("Ошибка при обработке апдейта", exc_info=error)
         if isinstance(update, Update) and update.effective_chat:
             await say(update.effective_chat, 
                 "Что-то пошло не так — действие не выполнено. Попробуйте ещё раз; "
@@ -445,4 +474,5 @@ def main(argv=None):
              "ТЕСТОВЫЙ" if config.is_test else "боевой", len(config.user_ids), config.data_dir)
     build_app(config.token, spaces.flow, set(config.user_ids), env_file=env_file,
               label=config.label, reset=spaces.reset if config.is_test else None).run_polling(
-        allowed_updates=[Update.MESSAGE, Update.CALLBACK_QUERY])
+        allowed_updates=[Update.MESSAGE, Update.CALLBACK_QUERY],
+        bootstrap_retries=-1)  # после перезагрузки сеть может появиться не сразу

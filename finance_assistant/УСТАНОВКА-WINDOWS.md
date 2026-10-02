@@ -73,10 +73,38 @@
 | Выключить страницу и закрыть порт | `... settings.ps1 -Off` |
 | Другой порт | `... settings.ps1 -Port 9443` |
 | Остановить всё | `... stop.ps1` |
-| Запустить снова | `... stop.ps1 -Start` |
+| Запустить снова (и после перезагрузки бот остаётся остановленным, пока не запустите) | `... stop.ps1 -Start` |
 | Бэкап вручную | `Start-ScheduledTask FinanceBot-Backup` |
 
 (`...` — это `powershell -ExecutionPolicy Bypass -File C:\FinanceBot\deploy\windows\`)
+
+## Восстановление из бэкапа
+
+Бэкап лежит в `C:\FinanceBot\backups`: базы — `finance-<Telegram id>-<дата>.db`
+(30 дней), скриншоты — папка `receipts-<Telegram id>` (зеркало), настройки —
+`env-latest.txt`. Копию этой папки стоит регулярно уносить с сервера (флешка,
+облако): бэкап на том же диске не спасёт от поломки диска.
+
+Восстановить базу пользователя (PowerShell от имени администратора):
+```
+powershell -ExecutionPolicy Bypass -File C:\FinanceBot\deploy\windows\stop.ps1
+Copy-Item C:\FinanceBot\backups\finance-<id>-<дата>.db C:\FinanceBot\data\users\<id>\finance.db -Force
+Remove-Item C:\FinanceBot\data\users\<id>\finance.db-journal -ErrorAction SilentlyContinue
+Copy-Item C:\FinanceBot\backups\receipts-<id>\* C:\FinanceBot\data\users\<id>\receipts\ -Recurse -Force
+powershell -ExecutionPolicy Bypass -File C:\FinanceBot\deploy\windows\stop.ps1 -Start
+```
+Записи, сделанные после этого бэкапа, пропадут — пришлите их скриншоты ещё раз.
+Сервер новый: установите бота (шаги выше), затем верните `.env` из
+`env-latest.txt` (переименуйте в `C:\FinanceBot\.env`) и базы, как выше.
+
+## Если не пускает на страницу настроек
+
+- **Забыли пароль** или «вход закрыт на час» (кто-то из интернета перебирал
+  пароли): по удалённому рабочему столу выполните
+  `powershell -ExecutionPolicy Bypass -File C:\FinanceBot\deploy\windows\settings.ps1 -Password`
+  — новый пароль, страница перезапустится и блокировка снимется.
+- Страница не нужна постоянно — выключите её (`settings.ps1 -Off`) и включайте,
+  когда надо поменять настройки: так её никто не будет перебирать.
 
 **Обновление до новой версии**: распакуйте новый архив и снова выполните
 шаг 4. Перед заменой кода установщик сделает бэкап; данные и настройки не

@@ -79,8 +79,9 @@ def backup(data: str, dest: str, keep_days: int = 30, stamp: str | None = None,
     if os.path.exists(legacy):
         dbs.append(legacy)
     if not dbs:
-        # Не та папка данных — старые копии не трогаем: возможно, только они и остались.
-        raise RuntimeError(f"в {data} нет ни одной базы — бэкап не сделан, старые копии не тронуты")
+        # Баз ещё нет (никто не писал боту) или не та папка: копировать нечего,
+        # а старые копии не трогаем — возможно, только они и остались.
+        return 0
     _prune(dest, keep_days)  # сначала место, потом новые копии
     for leftover in glob.glob(os.path.join(dest, "*.part")):
         os.remove(leftover)  # недоделанное от прошлого неудачного запуска
