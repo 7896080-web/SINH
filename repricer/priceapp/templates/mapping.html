@@ -17,7 +17,19 @@ SKU (размер-цвет); у двух SKU — «неоднозначно», �
   {% if view != 'analysis' %}<label>Отбор<select name="status" onchange="this.form.submit()"><option value="">все</option>
     {% for k, v in (status_labels if view == 'status' else cand_labels).items() %}<option value="{{ k }}" {% if status == k %}selected{% endif %}>{{ v }} ({{ counts[k] }})</option>{% endfor %}</select></label>{% endif %}
   {% if view == 'status' %}<a class="btn secondary" href="/mapping/export/{{ account.id }}">Экспорт в Excel</a>{% endif %}
+  {% if view == 'candidates' %}<a class="btn secondary" href="/mapping/candidates-export/{{ account.id }}?status={{ status }}">Экспорт в Excel</a>{% endif %}
 </form>
+{% if view == 'status' %}
+<form method="post" action="/mapping/import/{{ account.id }}" enctype="multipart/form-data" class="row card">
+  <label>Импорт из Excel: у строк «нет в 1С» впишите ID_1С — будет ручная связь. Уже сопоставленные не перепривязываются, пустые ячейки ничего не меняют.<input type="file" name="file" accept=".xlsx" required></label>
+  <button class="secondary">Импорт из Excel</button>
+</form>
+{% elif view == 'candidates' %}
+<form method="post" action="/mapping/candidates-import/{{ account.id }}" enctype="multipart/form-data" class="row card">
+  <label>Импорт из Excel: «Да» в колонке «Подтвердить» — то же, что галочка; связывается только однозначное. Пусто — без изменений.<input type="file" name="file" accept=".xlsx" required></label>
+  <button class="secondary">Импорт из Excel</button>
+</form>
+{% endif %}
 
 {% if view == 'status' %}
 <div class="scroll"><table><tr><th>Баркод</th><th>Артикул площадки</th><th>Размер</th><th>Название</th><th>Статус</th><th>SKU 1С</th></tr>

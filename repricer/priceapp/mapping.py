@@ -177,6 +177,35 @@ def account_items(db: Session, account_id: int) -> dict[str, list[PlatformItem]]
     return dict(out)
 
 
+def link_manually(db: Session, account_id: int, pairs: list[tuple[str, str]], actor: str = "",
+                  source: str = "excel") -> tuple[int, dict]:
+    """Ручные связи баркод -> SKU 1С (файлом со страницы «Сопоставление»).
+
+    Связывается ТОЛЬКО баркод со статусом «нет в 1С» и только с SKU, который есть
+    в справочнике 1С. Уже сопоставленный (по баркоду, по пулу, вручную) не
+    перепривязывается никогда: связь меняет, с какой себестоимости считается цена,
+    и старый файл, залитый по ошибке, переразнёс бы каталог. Возвращает
+    (создано, {причина: n})."""
+    status = {r.item.barcode: r.status for r in build(db, account_id)}
+    known = {r[0] for r in db.query(OnecBarcode.item_id).distinct()}
+    created, refused = 0, defaultdict(int)
+    for barcode, item_id in pairs:
+        st = status.get(barcode)
+        if st is None:
+            refused["баркода нет в каталоге кабинета"] += 1
+        elif st != "not_in_1c":
+            refused[f"баркод уже {STATUS_LABELS[st]} — перепривязка не делается"] += 1
+        elif item_id not in known:
+            refused["ID_1С нет в справочнике 1С"] += 1
+        else:
+            db.add(ManualLink(account_id=account_id, barcode=barcode, item_id=item_id,
+                              source=source, created_by=actor))
+            status[barcode] = "manual"     # повтор баркода в файле — не второй INSERT
+            created += 1
+    db.flush()
+    return created, dict(refused)
+
+
 def counts(rows: list[MapRow]) -> dict[str, int]:
     c = {k: 0 for k in STATUS_LABELS}
     for r in rows:
