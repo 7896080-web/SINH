@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta
 
-from priceapp import accounts, backup, dispatch, onec, platforms, rates, settings
+from priceapp import accounts, backup, dispatch, guard, onec, platforms, rates, settings
 from priceapp.database import SessionLocal
 from priceapp.models import Account, ApiCredential, OnecTask, OnecTaskStatus
 from priceapp.timeutils import now_utc, today_local
@@ -77,10 +77,15 @@ def _older_than(raw: str, age: timedelta) -> bool:
         return True
 
 
-def job_daily_refresh(client_factory=None) -> None:
-    """Раз в сутки: себестоимость из 1С, каталоги и текущие цены кабинетов с ключами."""
+def job_daily_refresh(client_factory=None, force_prices: bool = False) -> None:
+    """Раз в сутки: себестоимость из 1С, каталоги и текущие цены кабинетов с
+    ключами, затем проверка диапазонов безопасности. `force_prices` — первый
+    прогон после запуска программы: текущие цены запрашиваются ВСЕГДА, даже если
+    загружались меньше суток назад, — площадка могла сменить цену или скидку, пока
+    программа была выключена."""
     db = SessionLocal()
     notes = []
+    prices_loaded = False
     try:
         if _older_than(settings.get(db, settings.COST_LOADED_AT), REFRESH_EVERY):
             onec.enqueue_cost(db)
@@ -97,14 +102,25 @@ def job_daily_refresh(client_factory=None) -> None:
                     db.rollback()
                     notes.append(f"{acc.name}: каталог не загружен — {e}"[:200])
             if acc.platform in platforms.READS_PRICES and (
-                    not acc.prices_loaded_at or now_utc() - acc.prices_loaded_at >= REFRESH_EVERY):
+                    force_prices or not acc.prices_loaded_at or now_utc() - acc.prices_loaded_at >= REFRESH_EVERY):
                 try:
                     st = accounts.load_prices(db, acc, accounts.client_for(db, acc, client_factory))
+                    prices_loaded = True
                     if st["truncated"]:
                         notes.append(f"{acc.name}: цены выгружены не полностью")
                 except Exception as e:
                     db.rollback()
                     notes.append(f"{acc.name}: цены не загружены — {e}"[:200])
+        if prices_loaded:
+            try:
+                st = guard.run(db)
+                if st["accounts"]:
+                    logger.info("%s", guard.summary(st))
+                    if st["eaten"] or st["blocked"]:
+                        notes.append(guard.summary(st))
+            except Exception as e:
+                db.rollback()
+                notes.append(f"диапазоны безопасности не проверены — {e}"[:200])
         beat(db, "daily_refresh", True, "; ".join(notes))
     except Exception as e:
         logger.exception("суточное обновление упало")

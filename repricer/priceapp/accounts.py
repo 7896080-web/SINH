@@ -31,6 +31,11 @@ def set_credential(db: Session, account: Account, field: str, value: str) -> boo
     return True
 
 
+def _dec_or_none(v):
+    from decimal import Decimal
+    return Decimal(str(v)).quantize(Decimal("0.01")) if v is not None else None
+
+
 def client_for(db: Session, account: Account, factory=None):
     return (factory or platforms.build_client)(account.platform, credentials(db, account))
 
@@ -41,6 +46,14 @@ def load_catalog(db: Session, account: Account, client) -> dict:
     но ТОЛЬКО если выгрузка полная: огрызок стёр бы половину сопоставления."""
     rows = client.get_catalog()
     truncated = bool(getattr(client, "last_truncated", False))
+    # Тарифы комиссий по категориям (у WB — отдельная таблица по предметам).
+    # Не загрузились — каталог всё равно сохраняется, прежние тарифы остаются.
+    tariffs, tariff_note = None, ""
+    if hasattr(client, "get_tariffs"):
+        try:
+            tariffs = client.get_tariffs()
+        except Exception as e:
+            tariff_note = f"тарифы комиссий не загружены: {e}"[:300]
     existing = {i.barcode: i for i in db.query(PlatformItem).filter(PlatformItem.account_id == account.id)}
     seen = set()
     now = now_utc()
@@ -56,6 +69,13 @@ def load_catalog(db: Session, account: Account, client) -> dict:
         item.article = (r.article or "")[:200]
         item.name = (r.name or "")[:500]
         item.size = (r.size or "")[:64]
+        item.category = (r.category or "")[:200]
+        item.category_id = (r.category_id or "")[:64]
+        if tariffs is not None:
+            t = tariffs.get(item.category_id)
+            item.tariff_fbs = _dec_or_none(t.fbs) if t else None
+            item.tariff_fbo = _dec_or_none(t.fbo) if t else None
+            item.tariff_loaded_at = now
         item.fetched_at = now
     removed = 0
     if not truncated:
@@ -64,8 +84,9 @@ def load_catalog(db: Session, account: Account, client) -> dict:
                 db.delete(item)
                 removed += 1
     account.catalog_loaded_at = now
-    account.catalog_note = ("ВЫГРУЗКА НЕПОЛНАЯ: площадка не отдала каталог до конца, "
-                            "пропавшие строки не удалены" if truncated else "")
+    account.catalog_note = "; ".join(x for x in (
+        "ВЫГРУЗКА НЕПОЛНАЯ: площадка не отдала каталог до конца, пропавшие строки не удалены"
+        if truncated else "", tariff_note) if x)
     db.commit()
     return {"rows": len(seen), "removed": removed, "truncated": truncated}
 
@@ -91,6 +112,11 @@ def load_prices(db: Session, account: Account, client) -> dict:
             item.min_price = mins.get(key)
         if cur is not None:
             item.current_price, item.current_sale_price = cur.price, cur.sale_price
+            # Тариф в ответе о ценах (Ozon) — свежее каталожного; WB его тут не даёт,
+            # и его тариф из каталога затирать нельзя.
+            if getattr(cur, "tariff_fbs", None) is not None or getattr(cur, "tariff_fbo", None) is not None:
+                item.tariff_fbs, item.tariff_fbo = _dec_or_none(cur.tariff_fbs), _dec_or_none(cur.tariff_fbo)
+                item.tariff_loaded_at = now
             item.price_status = getattr(cur, "status", "") or None
             item.price_loaded_at = now
             updated += 1

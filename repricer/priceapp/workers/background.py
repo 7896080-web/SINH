@@ -7,6 +7,9 @@
 - курс ЦБ — при запуске и раз в 6 часов;
 - себестоимость и каталоги — раз в сутки (через минуту после запуска: компьютер
   выключают на ночь, и «раз в сутки по расписанию» иначе не наступало бы);
+- текущие цены площадок — ПРИ КАЖДОМ запуске (площадка меняет цену сама не чаще
+  раза в сутки, но пока программа была выключена, могла поменять) и раз в сутки,
+  после них — проверка диапазонов безопасности акций;
 - копия базы — через 10 минут после запуска, не чаще раза в сутки.
 """
 import logging
@@ -42,7 +45,7 @@ def _loop() -> None:
             last["dispatch"] = now
         if now - started >= REFRESH_FIRST_AFTER and (
                 last["refresh"] is None or now - last["refresh"] >= REFRESH_EVERY):
-            jobs.job_daily_refresh()
+            jobs.job_daily_refresh(force_prices=last["refresh"] is None)
             last["refresh"] = now
         if now - started >= BACKUP_FIRST_AFTER:
             jobs.job_backup()

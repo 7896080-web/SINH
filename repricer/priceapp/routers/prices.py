@@ -29,7 +29,7 @@ from priceapp.database import get_db
 from priceapp.deps import get_current_user
 from priceapp.excel import ExcelReadError, read_xlsx_rows, xlsx_response
 from priceapp.flash import flash
-from priceapp.models import (Account, ApiCredential, OnecBarcode, OnecCost, PlatformRule,
+from priceapp.models import (Account, ApiCredential, OnecBarcode, OnecCost, PlatformItem, PlatformRule,
                              PriceChange, PriceChangeStatus, ProductPrice, SavedFilter, User)
 from priceapp.pages import render
 from priceapp.platforms import PLATFORMS
@@ -50,19 +50,24 @@ STATUS_LABELS = {
     "sent": "отправлено", "error": "площадка не приняла", "rejected": "отклонено",
 }
 SOURCE_LABELS = {**pricing.SOURCE_LABELS, "rollback": "возврат прежней цены",
+                 "guard": "возврат по диапазону безопасности",
                  # прежние схемы — для старых строк журнала
                  "platform": "цена площадки", "base": "от базовой"}
 PRICE_STATUS_LABELS = {"QUARANTINE": "на карантине у площадки", "ERROR": "площадка: ошибка цены",
                        "PROCESSING": "площадка обновляет цену"}
 # (поле, подпись, мин, макс)
 RULE_FIELDS = [
+    ("commission_extra", "Надбавка к комиссии, п.п.", 0, 50),
     ("min_markup_coef", "Мин. маржинальность (пол)", 0, 100),
     ("round_step", "Округлять вверх до, ₽", 1, 10000),
     ("round_minus", "Окончание: минус, ₽", 0, 9999),
     ("max_change_percent", "Макс. изменение за раз, %", 0, 1000),
 ]
 INT_FIELDS = ("round_step", "round_minus")
-RULE_KEYS = ["commission_percent", "base_coef", *(n for n, *_ in RULE_FIELDS)]
+RULE_KEYS = ["commission_percent", "base_coef", *(n for n, *_ in RULE_FIELDS), "tariff_model"]
+TARIFF_MODELS = {"fbs": "FBS — со своего склада", "fbo": "FBO — со склада площадки"}
+# Где тарифы площадки известны программе (WB — таблица по предметам, Ozon — по товару).
+HAS_TARIFFS = {"wb", "ozon"}
 COEF_TITLE = "Коэффициент от базовой по умолчанию"
 
 # Отборы на «Товарах»: ключ -> подпись.
@@ -75,6 +80,9 @@ PRODUCT_FILTERS = {
     "manual": "с ручной ценой",
     "platform_status": "карантин или ошибка у площадки",
     "below_platform_min": "расчётная ниже минимальной площадки",
+    "guard_below": "ниже диапазона безопасности",
+    "guard_eaten": "ниже диапазона, цена наша — съедает скидка/акция",
+    "guard_above": "выше диапазона безопасности",
 }
 BULK_ACTIONS = {
     "set_manual": "Ручная цена = число",
@@ -181,10 +189,17 @@ def validate_rule(db: Session, platform: str, raw: dict) -> tuple[dict, list[str
     except ValueError as e:
         errors.append(f"«Комиссия площадки»: {e}")
     for name, title, lo, hi in RULE_FIELDS:
+        if name == "commission_extra" and not _cell(raw.get(name)):
+            values[name] = Decimal(0)      # надбавки нет — это ноль, а не ошибка
+            continue
         try:
             values[name] = _num(raw.get(name), lo, hi, name in INT_FIELDS)
         except ValueError as e:
             errors.append(f"«{title}»: {e}")
+    tm = _cell(raw.get("tariff_model")).lower() or "fbs"
+    if tm not in TARIFF_MODELS:
+        errors.append(f"«Тариф»: «{tm}» — нужно fbs или fbo")
+    values["tariff_model"] = tm
     # Коэффициент по умолчанию необязателен: пусто — у артикулов без своего
     # коэффициента цены нет (а не «как-нибудь посчитаем»).
     values["base_coef"] = None
@@ -195,8 +210,9 @@ def validate_rule(db: Session, platform: str, raw: dict) -> tuple[dict, list[str
             errors.append(f"«{COEF_TITLE}»: {e}")
     if "round_step" in values and "round_minus" in values and values["round_minus"] >= values["round_step"]:
         errors.append("«Окончание: минус» должно быть меньше шага округления")
-    if (values.get("base_coef") is not None and "commission_percent" in values and "min_markup_coef" in values):
-        margin = values["base_coef"] * (1 - values["commission_percent"] / 100)
+    if (values.get("base_coef") is not None and "commission_percent" in values and "min_markup_coef" in values
+            and "commission_extra" in values):
+        margin = values["base_coef"] * (1 - (values["commission_percent"] + values["commission_extra"]) / 100)
         if margin < values["min_markup_coef"]:
             errors.append(f"при коэффициенте по умолчанию {_ru(values['base_coef'])} и комиссии "
                           f"{_ru(values['commission_percent'])}% маржинальность {_ru(margin.quantize(Decimal('0.01')))} "
@@ -240,8 +256,9 @@ async def save_rule(platform: str, request: Request, db: Session = Depends(get_d
 
 
 RULE_HEADERS = ["Площадка (код)", "Площадка", "Кабинеты", "Комиссия, %", COEF_TITLE,
-                *(t for _, t, *_ in RULE_FIELDS)]
-RULE_COLS = {"Комиссия, %": "commission_percent", COEF_TITLE: "base_coef", **{t: n for n, t, *_ in RULE_FIELDS}}
+                *(t for _, t, *_ in RULE_FIELDS), "Тариф (fbs / fbo)"]
+RULE_COLS = {"Комиссия, %": "commission_percent", COEF_TITLE: "base_coef", **{t: n for n, t, *_ in RULE_FIELDS},
+             "Тариф (fbs / fbo)": "tariff_model"}
 
 
 @router.get("/prices/rules-export")
@@ -251,7 +268,8 @@ def export_rules(db: Session = Depends(get_db), user: User = Depends(get_current
     for p in _platforms(accs):
         r = get_rule(db, p)
         data.append([p, PLATFORMS[p], ", ".join(a.name for a in accs if a.platform == p),
-                     _f(r.commission_percent), _f(r.base_coef), *(_f(getattr(r, n)) for n, *_ in RULE_FIELDS)])
+                     _f(r.commission_percent), _f(r.base_coef), *(_f(getattr(r, n)) for n, *_ in RULE_FIELDS),
+                     r.tariff_model or "fbs"])
     db.commit()
     return xlsx_response(RULE_HEADERS, data, "правила_цен.xlsx")
 
@@ -287,6 +305,103 @@ def import_rules(request: Request, file: UploadFile = File(...), db: Session = D
     return _back("rules")
 
 
+# --- диапазон безопасности акций (по кабинету) ---------------------------------------
+
+GUARD_HEADERS = ["Кабинет (код)", "Кабинет", "Площадка", "Маржинальность от", "Маржинальность до"]
+
+
+def validate_guard(raw_min, raw_max) -> tuple[dict, list[str]]:
+    """Границы диапазона: пусто — граница не задана. «от» не больше «до»."""
+    values, errors = {}, []
+    for key, raw, title in (("guard_min_margin", raw_min, "от"), ("guard_max_margin", raw_max, "до")):
+        if _cell(raw) in ("", CLEAR_CELL):
+            values[key] = None
+            continue
+        try:
+            values[key] = _num(raw, Decimal("0.1"), 100, False)
+        except ValueError as e:
+            errors.append(f"«{title}»: {e}")
+    if not errors and values["guard_min_margin"] is not None and values["guard_max_margin"] is not None \
+            and values["guard_min_margin"] > values["guard_max_margin"]:
+        errors.append("«от» больше «до»")
+    return values, errors
+
+
+def _apply_guard(db: Session, user: User, a: Account, values: dict) -> bool:
+    before = (a.guard_min_margin, a.guard_max_margin)
+    a.guard_min_margin, a.guard_max_margin = values["guard_min_margin"], values["guard_max_margin"]
+    if (str(before[0]), str(before[1])) == (str(a.guard_min_margin), str(a.guard_max_margin)):
+        return False
+    audit.log(db, user.username, "guard_saved", label(a), f"было {before}, стало "
+                                                         f"{(a.guard_min_margin, a.guard_max_margin)}")
+    return True
+
+
+@router.post("/prices/guard/{account_id}")
+async def save_guard(account_id: int, request: Request, db: Session = Depends(get_db),
+                     user: User = Depends(get_current_user)):
+    a = db.get(Account, account_id)
+    form = await request.form()
+    if a is None:
+        return _back("rules")
+    values, errors = validate_guard(form.get("guard_min_margin"), form.get("guard_max_margin"))
+    if errors:
+        flash(request, f"{a.name}: диапазон не сохранён — " + "; ".join(errors), "warn")
+        return _back("rules")
+    _apply_guard(db, user, a, values)
+    db.commit()
+    flash(request, f"{a.name}: диапазон безопасности сохранён. Проверка — при запуске программы и раз в сутки, "
+                   "после загрузки текущих цен; сейчас — кнопкой «Проверить диапазоны сейчас».", "ok")
+    return _back("rules")
+
+
+@router.get("/prices/guard-export")
+def export_guard(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    data = [[a.id, a.name, PLATFORMS.get(a.platform, a.platform), _f(a.guard_min_margin), _f(a.guard_max_margin)]
+            for a in _accounts(db)]
+    return xlsx_response(GUARD_HEADERS, data, "диапазоны_безопасности.xlsx")
+
+
+@router.post("/prices/guard-import")
+def import_guard(request: Request, file: UploadFile = File(...), db: Session = Depends(get_db),
+                 user: User = Depends(get_current_user)):
+    """Пустая ячейка ничего не меняет, «-» снимает границу."""
+    rows = _read_upload(request, file, "Кабинет (код)")
+    if rows is None:
+        return _back("rules")
+    changed, errors = 0, []
+    for i, row in enumerate(rows, start=2):
+        code = _cell(row.get("Кабинет (код)"))
+        if not code:
+            continue
+        a = db.get(Account, int(code)) if code.isdigit() else None
+        if a is None:
+            errors.append(f"строка {i}: кабинета «{code}» нет")
+            continue
+        raw = {"guard_min_margin": a.guard_min_margin, "guard_max_margin": a.guard_max_margin}
+        for col, key in (("Маржинальность от", "guard_min_margin"), ("Маржинальность до", "guard_max_margin")):
+            v = _cell(row.get(col))
+            if v != "":
+                raw[key] = v
+        values, errs = validate_guard(raw["guard_min_margin"], raw["guard_max_margin"])
+        if errs:
+            errors.append(f"строка {i} ({a.name}): " + "; ".join(errs))
+            continue
+        changed += _apply_guard(db, user, a, values)
+    db.commit()
+    _import_flash(request, f"Диапазонов изменено: {changed}.", errors)
+    return _back("rules")
+
+
+@router.post("/prices/guard-run")
+def run_guard(request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Проверить диапазоны по уже загруженным текущим ценам — без запроса к площадкам."""
+    from priceapp import guard
+    st = guard.run(db, actor=user.username)
+    flash(request, guard.summary(st), "warn" if st.get("eaten") or st.get("blocked") else "ok")
+    return _back("rules")
+
+
 # --- товары: экономика по SKU кабинета ----------------------------------------------
 
 def product_rows(db: Session, account: Account, q: str = "", flt: str = "",
@@ -299,7 +414,6 @@ def product_rows(db: Session, account: Account, q: str = "", flt: str = "",
     prices = {p.item_id: p for p in db.query(ProductPrice).filter(ProductPrice.account_id == account.id)}
     inp = load_inputs(db, account.platform)
     rule = inp.rule
-    commission = rule.commission_percent
     rate = rates.current(db)
     ql = q.strip().lower()
     try:
@@ -317,9 +431,10 @@ def product_rows(db: Session, account: Account, q: str = "", flt: str = "",
         pp = prices.get(item_id)
         cost = costs.get(item_id)
         d = decide_for(inp, item_id, account.id, cost.cost_usd if cost else None,
-                       rate.usd_rub if rate else None, pp)
-        with_price = [p for p in plat if p.current_price]
-        cur = max(with_price, key=lambda p: p.current_price) if with_price else None
+                       rate.usd_rub if rate else None, pp, plat)
+        facts = pricing.item_facts(rule, plat)
+        commission = facts.commission
+        cur = max((p for p in plat if p.current_price), key=lambda p: p.current_price, default=None)
         cur_sale = (cur.current_sale_price or cur.current_price) if cur else None
         cur_rub = cur_coef = None
         if cur_sale and d.cost_rub is not None and commission is not None:
@@ -331,7 +446,9 @@ def product_rows(db: Session, account: Account, q: str = "", flt: str = "",
         r = {
             "item_id": item_id, "sku": sku, "platform": plat[0], "cost_usd": cost.cost_usd if cost else None,
             "cost_rub": d.cost_rub, "price": d.new_price,
-            "payout": payout(d.new_price, commission) if d.new_price and commission is not None else None,
+            "payout": payout(d.new_price * (1 - facts.discount), commission)
+            if d.new_price and commission is not None else None,
+            "commission": commission, "tariff": facts.tariff, "category": facts.category,
             "markup_rub": d.markup_rub, "markup_coef": d.markup_coef,
             "block_reason": d.block_reason, "note": d.note, "source": d.source,
             "manual": pp.manual_price if pp else None, "last_sent": pp.last_sent_price if pp else None,
@@ -354,6 +471,15 @@ def product_rows(db: Session, account: Account, q: str = "", flt: str = "",
             continue
         if flt == "below_platform_min" and not (min_price and r["price"] and r["price"] < min_price):
             continue
+        if flt.startswith("guard_"):
+            from priceapp import guard
+            kind = guard.classify(r, account)
+            if flt == "guard_below" and kind not in ("below", "eaten"):
+                continue
+            if flt == "guard_eaten" and kind != "eaten":
+                continue
+            if flt == "guard_above" and kind != "above":
+                continue
         if lo is not None and (cur_coef is None or cur_coef < lo):
             continue
         if hi is not None and (cur_coef is None or cur_coef > hi):
@@ -512,6 +638,11 @@ def load_current(request: Request, account_id: str = Form(""), back: str = Form(
     audit.log(db, user.username, "prices_loaded", f"{len(done)} кабинетов", "; ".join(done + problems)[:2000])
     db.commit()
     msg = "Текущие цены загружены: " + ("; ".join(done) if done else "ни по одному кабинету") + "."
+    if done:
+        from priceapp import guard
+        st = guard.run(db, product_rows, user.username)
+        if st["accounts"]:
+            msg += " " + guard.summary(st)
     if problems:
         msg += " Не загружены: " + "; ".join(problems) + "."
     flash(request, msg, "warn" if problems else "ok")
@@ -702,7 +833,9 @@ def page(request: Request, view: str = Query("proposals"), account_id: str = Que
     if view == "rules":
         plats = _platforms(accs)
         ctx.update(plats=plats, rules={p: get_rule(db, p) for p in plats},
-                   cabinets={p: [a for a in accs if a.platform == p] for p in plats})
+                   cabinets={p: [a for a in accs if a.platform == p] for p in plats},
+                   tariff_models=TARIFF_MODELS, has_tariffs=HAS_TARIFFS,
+                   tariff_counts=_tariff_counts(db, accs))
         db.commit()
     elif view == "products":
         account = _pick(accs, account_id)
@@ -732,6 +865,18 @@ def page(request: Request, view: str = Query("proposals"), account_id: str = Que
                    skus=_sku_info(db, {c.item_id for c in changes}),
                    export_qs=urlencode({"view": view, "account_id": account_id, "status": status, "q": q}))
     return render(request, "prices.html", user, "prices", **ctx)
+
+
+def _tariff_counts(db: Session, accs) -> dict:
+    """Площадка -> (позиций с тарифом, всего позиций) — видно, подтянулись ли тарифы."""
+    from sqlalchemy import func
+    out = {}
+    for a in accs:
+        total, known = db.query(func.count(PlatformItem.id), func.count(PlatformItem.tariff_fbs)) \
+            .filter(PlatformItem.account_id == a.id).one()
+        t, k = out.get(a.platform, (0, 0))
+        out[a.platform] = (t + total, k + known)
+    return out
 
 
 @router.post("/prices/recalculate")

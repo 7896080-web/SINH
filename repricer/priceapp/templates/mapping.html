@@ -16,7 +16,7 @@ SKU (размер-цвет); у двух SKU — «неоднозначно», �
   <label>Кабинет<select name="account_id" onchange="this.form.submit()">{% for a in accounts %}<option value="{{ a.id }}" {% if a.id == account.id %}selected{% endif %}>{{ label(a) }}</option>{% endfor %}</select></label>
   {% if view != 'analysis' %}<label>Отбор<select name="status" onchange="this.form.submit()"><option value="">все</option>
     {% for k, v in (status_labels if view == 'status' else cand_labels).items() %}<option value="{{ k }}" {% if status == k %}selected{% endif %}>{{ v }} ({{ counts[k] }})</option>{% endfor %}</select></label>{% endif %}
-  {% if view == 'status' %}<a class="btn secondary" href="/mapping/export/{{ account.id }}">Экспорт в Excel</a>{% endif %}
+  {% if view == 'status' %}<a class="btn secondary" href="/mapping/export/{{ account.id }}?status={{ status }}">Экспорт отбора в Excel</a>{% endif %}
   {% if view == 'candidates' %}<a class="btn secondary" href="/mapping/candidates-export/{{ account.id }}?status={{ status }}">Экспорт в Excel</a>{% endif %}
 </form>
 {% if view == 'status' %}

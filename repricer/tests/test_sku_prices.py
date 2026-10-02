@@ -86,7 +86,7 @@ def test_cabinet_coef_beats_platform_and_row_clear_returns_default(client, db):
     assert coef_for(inp, "u1", wb2.id) == (Decimal("3"), "cabinet")
     assert coef_for(inp, "u1", wb1.id) == (Decimal("2.2"), "article")
     page = client.get("/sku-prices?scope=wb").text
-    assert "свой у: ИП Ребрик" in page
+    assert "своя у: ИП Ребрик" in page
     # пустое поле в строке — снять: снова по умолчанию площадки
     client.post("/sku-prices/coef", data={"scope": f"a{wb2.id}", "row": "39681", "value": ""})
     assert coef_for(load_inputs(db, "wb"), "u1", wb2.id) == (Decimal("2.2"), "article")
@@ -155,9 +155,9 @@ def test_excel_roundtrip_empty_changes_nothing(client, db):
     book = load_workbook(io.BytesIO(r.content))
     ws = book.active
     h = [c.value for c in ws[1]]
-    assert {"Где (код)", "Артикул", "Коэффициент от базовой", "Новая маржинальность", "Текущая цена, ₽"} <= set(h)
+    assert {"Где (код)", "Артикул", "Вид наценки", "Наценка", "Новая маржинальность", "Текущая цена, ₽"} <= set(h)
     rows = {ws.cell(row=i, column=h.index("Артикул") + 1).value: i for i in range(2, ws.max_row + 1)}
-    col = h.index("Коэффициент от базовой") + 1
+    col = h.index("Наценка") + 1
     ws.cell(row=rows["39681"], column=col, value=None)                 # не трогать
     ws.cell(row=rows["4033"], column=col, value=2.7)
     ws.append([f"a{wb2.id}", "", "4033"] + [None] * (col - 4) + ["3"])   # свой у кабинета
@@ -165,7 +165,7 @@ def test_excel_roundtrip_empty_changes_nothing(client, db):
     buf = io.BytesIO()
     book.save(buf)
     r = client.post("/sku-prices/import", files={"file": ("k.xlsx", buf.getvalue())})
-    assert "Коэффициентов изменено: 2" in r.text and "«nope» — нет такой площадки" in r.text
+    assert "Наценок изменено: 2" in r.text and "«nope» — нет такой площадки" in r.text
     got = {(c.article, c.account_id): c.coef for c in db.query(ArticleCoef)}
     assert got == {("39681", 0): Decimal("2.2"), ("4033", 0): Decimal("2.7"), ("4033", wb2.id): Decimal("3")}
     ws.cell(row=rows["39681"], column=col, value="-")                  # снять

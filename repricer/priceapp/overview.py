@@ -236,6 +236,21 @@ def attention(db: Session, product_rows) -> Attention:
         no_cost = sum(1 for r in rows if r["cost_usd"] is None)
         if no_cost:
             a.add("warn", f"{name}: нет себестоимости из 1С — цена не считается", f"{link}&flt=no_cost", no_cost)
+        if acc.guard_min_margin is not None or acc.guard_max_margin is not None:
+            from priceapp import guard
+            kinds = [guard.classify(r, acc) for r in rows]
+            eaten = kinds.count("eaten")
+            if eaten:
+                a.add("bad", f"{name}: маржинальность ниже диапазона безопасности, а цена на площадке наша — "
+                             "съедает скидка продавца или акция: снимите скидку или выйдите из акции",
+                      f"{link}&flt=guard_eaten", eaten)
+            below = kinds.count("below")
+            if below:
+                a.add("warn", f"{name}: ниже диапазона безопасности — цена по наценке кабинета "
+                              "возвращается при запуске программы и раз в сутки", f"{link}&flt=guard_below", below)
+            above = kinds.count("above")
+            if above:
+                a.add("ok", f"{name}: маржинальность выше диапазона безопасности", f"{link}&flt=guard_above", above)
         bad_status = sum(1 for r in rows if r["price_status"] in ("QUARANTINE", "ERROR"))
         if bad_status:
             a.add("bad", f"{name}: площадка держит цену на карантине или с ошибкой",
