@@ -32,8 +32,8 @@ from priceapp.models import (Account, ApiCredential, OnecBarcode, OnecCost, Plat
                              PriceChange, PriceChangeStatus, ProductPrice, SavedFilter, User)
 from priceapp.pages import render
 from priceapp.platforms import PLATFORMS
-from priceapp.pricing import (BLOCK_FLOOR, BLOCK_LABELS, BLOCK_MAX_CHANGE, OPEN, _ru, approve,
-                              change_percent, decide, get_rule, markup, payout, preview_rule,
+from priceapp.pricing import (BASE, BASE_LABEL, BLOCK_FLOOR, BLOCK_LABELS, BLOCK_MAX_CHANGE, OPEN, _ru, approve,
+                              change_percent, decide, decide_for, get_rule, load_inputs, markup, payout, preview_rule,
                               propose_price, recalculate_account, round_price, rules_for)
 from priceapp.timeutils import now_utc
 
@@ -47,7 +47,8 @@ STATUS_LABELS = {
     "proposed": "ждёт решения", "blocked": "заблокировано", "approved": "подтверждено, ждёт отправки",
     "sent": "отправлено", "error": "площадка не приняла", "rejected": "отклонено",
 }
-SOURCE_LABELS = {"rule": "по правилу", "manual": "ручная", "base": "от базовой площадки",
+SOURCE_LABELS = {"rule": "по правилу", "manual": "ручная (кабинет)", "platform": "ручная (площадка)",
+                 "base": "от базовой",
                  "rollback": "возврат прежней цены"}
 PRICE_STATUS_LABELS = {"QUARANTINE": "на карантине у площадки", "ERROR": "площадка: ошибка цены",
                        "PROCESSING": "площадка обновляет цену"}
@@ -185,15 +186,18 @@ def validate_rule(db: Session, platform: str, raw: dict) -> tuple[dict, list[str
     base = _cell(raw.get("base_platform"))
     values["base_platform"], values["base_coef"] = base or None, None
     if base:
-        if base not in PLATFORMS:
+        if base != BASE and base not in PLATFORMS:
             errors.append(f"неизвестная базовая площадка «{base}»")
         elif base == platform:
             errors.append("площадка не может брать цену сама от себя")
         else:
-            other = db.query(PlatformRule).filter(PlatformRule.platform == base).first()
-            if other is not None and other.base_platform:
-                errors.append(f"{PLATFORMS[base]} сама берёт цену от {PLATFORMS.get(other.base_platform)} — "
-                              "цепочки не поддерживаются")
+            # Цепочек нет ни в какую сторону: расчётная цена базовой площадки
+            # считается по ЕЁ собственному правилу, без её базы.
+            if base != BASE:
+                other = db.query(PlatformRule).filter(PlatformRule.platform == base).first()
+                if other is not None and other.base_platform:
+                    errors.append(f"{PLATFORMS[base]} сама берёт цену от "
+                                  f"{PLATFORMS.get(other.base_platform, BASE_LABEL)} — цепочки не поддерживаются")
             users = [r.platform for r in db.query(PlatformRule).filter(PlatformRule.base_platform == platform)]
             if users:
                 errors.append(f"от {PLATFORMS[platform]} берут цену: "
@@ -310,7 +314,8 @@ def product_rows(db: Session, account: Account, q: str = "", flt: str = "",
     info = _sku_info(db, items)
     costs = {c.item_id: c for c in db.query(OnecCost).filter(OnecCost.item_id.in_(list(items)))}
     prices = {p.item_id: p for p in db.query(ProductPrice).filter(ProductPrice.account_id == account.id)}
-    rule, base_rule = rules_for(db, account.platform)
+    inp = load_inputs(db, account.platform)
+    rule = inp.rule
     commission = rule.commission_percent
     rate = rates.current(db)
     ql = q.strip().lower()
@@ -328,9 +333,7 @@ def product_rows(db: Session, account: Account, q: str = "", flt: str = "",
             continue
         pp = prices.get(item_id)
         cost = costs.get(item_id)
-        d = decide(cost.cost_usd if cost else None, rate.usd_rub if rate else None,
-                   commission, rule, pp.manual_price if pp else None,
-                   pp.last_sent_price if pp else None, base_rule)
+        d = decide_for(inp, item_id, cost.cost_usd if cost else None, rate.usd_rub if rate else None, pp)
         with_price = [p for p in plat if p.current_price]
         cur = max(with_price, key=lambda p: p.current_price) if with_price else None
         cur_sale = (cur.current_sale_price or cur.current_price) if cur else None
@@ -706,6 +709,7 @@ def page(request: Request, view: str = Query("proposals"), account_id: str = Que
                BLOCK_MAX_CHANGE=BLOCK_MAX_CHANGE, rule_fields=RULE_FIELDS, platform_names=PLATFORMS,
                source_labels=SOURCE_LABELS, change_percent=change_percent, rate=rates.current(db),
                rows_limit=ROWS_LIMIT, ru=_ru, price_status_labels=PRICE_STATUS_LABELS,
+               base_names={**PLATFORMS, BASE: BASE_LABEL}, BASE=BASE,
                saved_filters=db.query(SavedFilter).order_by(SavedFilter.name).all(),
                current_url=str(request.url.path) + (f"?{request.url.query}" if request.url.query else ""),
                rate_shift=overview.rate_shift(db),

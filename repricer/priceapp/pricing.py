@@ -32,9 +32,13 @@ from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal
 from sqlalchemy.orm import Session
 
 from priceapp import rates
-from priceapp.models import (Account, OnecCost, PlatformRule, PriceChange, PriceChangeStatus,
-                             ProductPrice)
+from priceapp.models import (Account, BasePrice, OnecCost, PlatformPrice, PlatformRule, PriceChange,
+                             PriceChangeStatus, ProductPrice)
 from priceapp.timeutils import now_utc
+
+# `base_platform` правила может указывать не на площадку, а на БАЗОВУЮ цену товара.
+BASE = "base"
+BASE_LABEL = "базовая цена"
 
 BLOCK_FLOOR = "floor"
 BLOCK_MAX_CHANGE = "max_change"
@@ -131,9 +135,10 @@ def rule_price(cost_rub: Decimal | None, rule: PlatformRule | None) -> tuple[int
 
 def decide(cost_usd, usd_rub, commission_percent, rule: PlatformRule,
            manual_price: int | None, last_sent_price: int | None,
-           base_rule: PlatformRule | None = None) -> Decision:
+           base_rule: PlatformRule | None = None, base_price: int | None = None) -> Decision:
     """Какую цену предложить и пропускают ли её ограничители. `base_rule` —
-    правило базовой площадки, если цена берётся от неё."""
+    правило базовой площадки, если цена берётся от неё; `base_price` — базовая
+    цена товара, если правило берёт цену от неё (`base_platform == BASE`)."""
     if commission_percent is None:
         return Decision(None, note="у площадки не задана комиссия")
     c = _dec(commission_percent)
@@ -150,9 +155,13 @@ def decide(cost_usd, usd_rub, commission_percent, rule: PlatformRule,
     elif cost_rub is None:
         return Decision(None, note="нет себестоимости из 1С")
     elif rule.base_platform:
-        base, why = rule_price(cost_rub, base_rule)
+        if rule.base_platform == BASE:
+            base, why = base_price, "у товара не задана базовая цена"
+        else:
+            base, why = rule_price(cost_rub, base_rule)
         if base is None:
-            return Decision(None, cost_rub=cost_rub, note=f"базовая площадка: {why}")
+            what = "базовая цена" if rule.base_platform == BASE else "базовая площадка"
+            return Decision(None, cost_rub=cost_rub, note=f"{what}: {why}")
         coef = _dec(rule.base_coef or 1)
         d = Decision(round_price(_dec(base) * coef, rule.round_step, rule.round_minus),
                      cost_rub=cost_rub, source="base")
@@ -196,7 +205,44 @@ def get_rule(db: Session, platform: str) -> PlatformRule:
 def rules_for(db: Session, platform: str) -> tuple[PlatformRule, PlatformRule | None]:
     """(правило площадки, правило её базы или None)."""
     rule = get_rule(db, platform)
-    return rule, (get_rule(db, rule.base_platform) if rule.base_platform else None)
+    if not rule.base_platform or rule.base_platform == BASE:
+        return rule, None
+    return rule, get_rule(db, rule.base_platform)
+
+
+@dataclass
+class Inputs:
+    """Всё, что нужно расчёту по площадке, кроме самого товара: правила и цены,
+    заданные человеком на уровне товара (базовая) и площадки. Один источник на
+    все пути расчёта — разойдись они, страница показывала бы одну цену, а в
+    предложение уходила бы другая."""
+    rule: PlatformRule
+    base_rule: PlatformRule | None
+    base_prices: dict
+    platform_prices: dict
+
+
+def load_inputs(db: Session, platform: str, rule: PlatformRule | None = None,
+                base_rule: PlatformRule | None = None) -> Inputs:
+    if rule is None:
+        rule, base_rule = rules_for(db, platform)
+    return Inputs(rule, base_rule,
+                  {b.item_id: b.price for b in db.query(BasePrice)},
+                  {p.item_id: p.price for p in db.query(PlatformPrice).filter(PlatformPrice.platform == platform)})
+
+
+def decide_for(inp: Inputs, item_id: str, cost_usd, usd_rub, pp: "ProductPrice | None") -> Decision:
+    """Решение по товару в кабинете. Ручная цена КАБИНЕТА главнее цены
+    ПЛОЩАДКИ, та — правила; пол и лимит шага не обходит ни одна."""
+    manual = pp.manual_price if pp and pp.manual_price is not None else None
+    from_platform = manual is None and item_id in inp.platform_prices
+    if from_platform:
+        manual = inp.platform_prices[item_id]
+    d = decide(cost_usd, usd_rub, inp.rule.commission_percent, inp.rule, manual,
+               pp.last_sent_price if pp else None, inp.base_rule, inp.base_prices.get(item_id))
+    if from_platform and d.source == "manual":
+        d.source = "platform"
+    return d
 
 
 @dataclass
@@ -220,7 +266,8 @@ def recalculate_account(db: Session, account: Account, is_test: bool = False) ->
     from priceapp import mapping
 
     stats = Stats()
-    rule, base_rule = rules_for(db, account.platform)
+    inp = load_inputs(db, account.platform)
+    rule = inp.rule
     rate = rates.current(db)
     for old in db.query(PriceChange).filter(PriceChange.account_id == account.id,
                                             PriceChange.is_test.is_(is_test),
@@ -235,8 +282,7 @@ def recalculate_account(db: Session, account: Account, is_test: bool = False) ->
         pp = prices.get(item_id)
         last = pp.last_sent_price if pp else None
         cost = costs.get(item_id)
-        d = decide(cost.cost_usd if cost else None, rate.usd_rub if rate else None,
-                   rule.commission_percent, rule, pp.manual_price if pp else None, last, base_rule)
+        d = decide_for(inp, item_id, cost.cost_usd if cost else None, rate.usd_rub if rate else None, pp)
         if d.new_price is None:
             stats.skip(d.note)
             continue
@@ -332,14 +378,15 @@ def preview_rule(db: Session, platform: str, values: dict) -> list[Preview]:
     новое правило — несохранённый объект вне сессии."""
     from priceapp import mapping
     new = PlatformRule(platform=platform, **values)
+    new_base = (get_rule(db, new.base_platform) if new.base_platform and new.base_platform != BASE else None)
     rate = rates.current(db)
     usd = rate.usd_rub if rate else None
     out = []
     affected = [platform] + [r.platform for r in db.query(PlatformRule).filter(PlatformRule.base_platform == platform)]
     for p in affected:
-        own_old, base_old = rules_for(db, p)
-        own_new, base_new = (new, (get_rule(db, new.base_platform) if new.base_platform else None)) \
-            if p == platform else (own_old, new)
+        old_inp = load_inputs(db, p)
+        new_inp = (load_inputs(db, p, new, new_base) if p == platform
+                   else load_inputs(db, p, old_inp.rule, new))
         pv = Preview(platform=p)
         pcts = []
         for acc in db.query(Account).filter(Account.platform == p, Account.is_active.is_(True)):
@@ -349,10 +396,8 @@ def preview_rule(db: Session, platform: str, values: dict) -> list[Preview]:
             prices = {x.item_id: x for x in db.query(ProductPrice).filter(ProductPrice.account_id == acc.id)}
             for item_id in items:
                 cost, pp = costs.get(item_id), prices.get(item_id)
-                args = (cost.cost_usd if cost else None, usd)
-                manual, last = (pp.manual_price if pp else None), (pp.last_sent_price if pp else None)
-                a = decide(*args, own_old.commission_percent, own_old, manual, last, base_old)
-                b = decide(*args, own_new.commission_percent, own_new, manual, last, base_new)
+                a = decide_for(old_inp, item_id, cost.cost_usd if cost else None, usd, pp)
+                b = decide_for(new_inp, item_id, cost.cost_usd if cost else None, usd, pp)
                 pv.priced_before += a.new_price is not None
                 pv.priced_after += b.new_price is not None
                 if b.new_price is None:
