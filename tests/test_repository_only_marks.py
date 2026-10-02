@@ -57,6 +57,28 @@ def _referenced_names(func: ast.FunctionDef) -> set[str]:
     return {n.id for n in ast.walk(func) if isinstance(n, ast.Name)}
 
 
+def _runs_a_script_without_a_path(func: ast.FunctionDef) -> bool:
+    """Функция запускает наш скрипт, НЕ давая ему пути.
+
+    Тогда он берёт УМОЛЧАНИЕ, а умолчание у `check_1c_module.py` — путь внутрь
+    `1c/`. На сервере этого файла может не быть вовсе, и скрипт ответит «Файла
+    нет». 02.10 ровно так встал pm148, уже после починки пятнадцати соседей:
+    смотреть надо не на то, НАЗЫВАЕТ ли тест файл, а на то, доберётся ли до
+    него запуск.
+
+    Признак — список из двух элементов в `subprocess.run([...])`: интерпретатор
+    и сам скрипт, аргументов нет.
+    """
+    for node in ast.walk(func):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "run" and node.args):
+            continue
+        first = node.args[0]
+        if isinstance(first, ast.List) and len(first.elts) == 2:
+            return True
+    return False
+
+
 def _functions_touching_1c(tree: ast.AST) -> set[str]:
     """Функции файла, которые доберутся до `1c/` — сами или через помощника."""
     marked = _paths_into_1c(tree)
@@ -67,6 +89,8 @@ def _functions_touching_1c(tree: ast.AST) -> set[str]:
              if isinstance(n, ast.FunctionDef)}
 
     touching = {name for name, used in funcs.items() if used & marked}
+    touching |= {n.name for n in ast.walk(tree)
+                 if isinstance(n, ast.FunctionDef) and _runs_a_script_without_a_path(n)}
     # Транзитивное замыкание: тест зовёт помощника, помощник читает путь.
     changed = True
     while changed:
@@ -122,6 +146,9 @@ def test_the_scanner_sees_the_tests_it_is_written_for():
 
     assert "test_the_live_module_passes_everything" in touching
     assert "test_a_lost_capability_is_named" in touching      # через помощника
+    # Запуск БЕЗ пути берёт умолчание, то есть тот же `1c/` — pm148.
+    assert "test_without_an_argument_it_says_this_is_not_the_live_epf" in touching
+    # А эти дают путь явно и на сервере как раз работают — гасить их нельзя.
     assert "test_a_missing_file_is_refused_plainly" not in touching
     assert "test_the_epf_itself_is_refused_with_the_way_out" not in touching
 
