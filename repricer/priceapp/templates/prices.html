@@ -1,24 +1,25 @@
 {% extends "base.html" %}
-{% block title %}Цены{% endblock %}
+{% block title %}Правила и журнал{% endblock %}
 {% block content %}
-<h1>Цены</h1>
-<p class="muted">Себестоимость, ₽ = себестоимость 1С, $ × курс. К получению = цена × (1 − комиссия площадки).
-Наценка = к получению − себестоимость, ₽; коэффициент = к получению / себестоимость (2 = +100%, 2,5 = +150%, 3 = +200%). Ничего не уходит на площадку без подтверждения.
+<h1>Правила и журнал</h1>
+<p class="muted">Цены выставляют и передают на площадки на странице <a href="/sku-prices">«Цены товаров»</a> — это основной путь.
+Здесь — правила площадок, журнал отправок, текущие цены по кабинету и ручные цены, сравнение площадок и пересчёт всех цен разом.
+Маржинальность = к получению / себестоимость ₽ (со скидкой продавца); подробно — <a href="/help/prices">«Справка»</a>.
 {% if rate %}Курс: <b>{{ rate.usd_rub|money(4) }} ₽</b> ({{ rate.label }}).{% else %}<span class="bad">Курса нет — расчёт невозможен (страница «Курс $»).</span>{% endif %}</p>
 
 <div class="tabs">
-  <a class="btn {{ '' if view == 'rules' else 'secondary' }}" href="/prices?view=rules">Правила</a>
-  <a class="btn {{ '' if view == 'proposals' else 'secondary' }}" href="/prices?view=proposals">Предложения{% if open_count %} ({{ open_count }}){% endif %}</a>
-  <a class="btn {{ '' if view == 'products' else 'secondary' }}" href="/prices?view=products">Товары</a>
+  <a class="btn {{ '' if view == 'rules' else 'secondary' }}" href="/prices?view=rules">Правила площадок</a>
+  <a class="btn {{ '' if view == 'log' else 'secondary' }}" href="/prices?view=log">Журнал отправок</a>
+  <a class="btn {{ '' if view == 'products' else 'secondary' }}" href="/prices?view=products">Текущие и ручные цены</a>
   <a class="btn {{ '' if view == 'compare' else 'secondary' }}" href="/prices?view=compare">Сравнение площадок</a>
-  <a class="btn {{ '' if view == 'log' else 'secondary' }}" href="/prices?view=log">Журнал</a>
+  <a class="btn {{ '' if view == 'proposals' else 'secondary' }}" href="/prices?view=proposals">Пересчёт всех цен{% if open_count %} ({{ open_count }}){% endif %}</a>
 </div>
 {% if rate_shift %}<div class="flash warn">Курс ушёл на {{ rate_shift.pct }}% от курса последнего расчёта
-({{ rate_shift.was|money(4) }} → {{ rate_shift.now|money(4) }} ₽) — нажмите «Рассчитать» на вкладке «Предложения». Порог — на странице «Курс $».</div>{% endif %}
+({{ rate_shift.was|money(4) }} → {{ rate_shift.now|money(4) }} ₽) — новые цены видны на <a href="/sku-prices?flt=changes">«Ценах товаров»</a> (отбор «новая цена ≠ текущей»), там же их и передавать. Порог — на странице «Курс $».</div>{% endif %}
 <div class="row saved-filters" style="margin-bottom:10px">
-  {% for sf in saved_filters %}<span class="chip"><a href="{{ sf.url }}">{{ sf.name }}</a>
+  {% for sf in saved_filters if view != 'rules' %}<span class="chip"><a href="{{ sf.url }}">{{ sf.name }}</a>
     <form method="post" action="/filters/{{ sf.id }}/delete" style="display:inline"><button class="chip-x" title="Удалить отбор" onclick="return confirm('Удалить отбор «{{ sf.name }}»?')">×</button></form></span>{% endfor %}
-  {% if view != 'rules' %}<form method="post" action="/filters/save" class="row" style="gap:6px">
+  {% if view not in ('rules', 'compare') %}<form method="post" action="/filters/save" class="row" style="gap:6px">
     <input type="hidden" name="url" value="{{ current_url }}">
     <input name="name" placeholder="имя отбора" style="width:160px" required>
     <button class="secondary" title="Запомнить текущую вкладку с её отбором">Сохранить отбор</button></form>{% endif %}
@@ -191,7 +192,9 @@ function bulkConfirm() {
   <label>Рассчитать для<select name="account_id"><option value="">все кабинеты</option>
     {% for a in accounts %}<option value="{{ a.id }}" {% if account_id == a.id|string %}selected{% endif %}>{{ label(a) }}</option>{% endfor %}</select></label>
   <button type="submit">Рассчитать</button>
-  <span class="muted">Расчёт заменяет прежние нерешённые предложения и ничего не отправляет.</span>
+  <span class="muted">Пересчёт ВСЕХ цен разом — например, после смены курса или себестоимости: расчёт заменяет прежние
+  нерешённые предложения и ничего не отправляет, подтверждение — ниже. Обычная работа с ценами — на
+  <a href="/sku-prices">«Ценах товаров»</a>; «Передать» там снимает предложения по тем же товарам, чтобы не ушло два решения.</span>
 </form>
 {% endif %}
 <form method="get" action="/prices" class="row" style="margin-bottom:8px">
@@ -210,8 +213,9 @@ function bulkConfirm() {
   <button class="secondary">Импорт из Excel</button>
 </form>
 {% else %}
-<p class="muted">Журнал — история отправок: выгружается в Excel, но не импортируется — менять в прошлом нечего.
-Цены файлом меняются на вкладках «Товары» (ручные цены), «Предложения» (решения) и «Правила».</p>
+<p class="muted">Журнал — история отправок. «Отправлено» значит: площадка приняла запрос с новой ценой; применила ли она
+её (карантин цены, акция) — видно после следующей загрузки текущих цен (при запуске программы и раз в сутки, или кнопкой на
+«Текущих и ручных ценах»). Журнал выгружается в Excel, но не импортируется — менять в прошлом нечего.</p>
 {% endif %}
 {% if view == 'proposals' and summary and summary.total %}
 <div class="card summary">

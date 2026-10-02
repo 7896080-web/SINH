@@ -453,3 +453,30 @@ def test_busy_indicator_on_every_page_and_file_signal(client, db):
     assert "download_done" in js and "HTMLFormElement.prototype.submit" in js
     r = client.get("/sku-prices/export?scope=wb")
     assert "download_done=1" in r.headers.get("set-cookie", "")
+
+
+# --- один путь, ручная цена и последняя отправка в строке ----------------------------------
+
+def test_row_shows_last_send_and_manual_price_can_be_cleared(client, db):
+    a1, a2 = _wb(client, db)
+    db.add(ProductPrice(item_id="u3", account_id=a1.id, manual_price=1200))
+    db.add(PriceChange(item_id="u1", account_id=a1.id, barcode="b1", new_price=3309, status="error",
+                       last_error="WB: карточка в карантине"))
+    db.commit()
+    t = client.get("/sku-prices?scope=wb").text.split("<table", 1)[1]
+    assert "не принято" in t and "WB: карточка в карантине" in t and "ручная 1200 ₽" in t
+    r = client.post("/sku-prices/manual-clear", data={"scope": "wb", "row": "4033"})
+    assert "ручных цен снято — 1" in r.text
+    assert db.query(ProductPrice).filter_by(item_id="u3").one().manual_price is None
+
+
+def test_send_says_it_replaced_old_proposals_and_menu_has_one_main_path(client, db):
+    a1, _ = _wb(client, db)
+    client.post("/prices/recalculate", data={})
+    r = client.post("/sku-prices/send", data={"scope": "wb", "arts": ["39681"]})
+    assert "прежних предложений и подтверждений по этим товарам снято" in r.text
+    page = client.get("/attention").text
+    nav = page.split("<nav>", 1)[1].split("</nav>", 1)[0]
+    assert nav.index("Цены товаров") < nav.index("Правила и журнал")
+    assert "Пересчёт всех цен" in client.get("/prices?view=proposals").text
+    assert client.get("/prices").text.count("Правила площадок") >= 1

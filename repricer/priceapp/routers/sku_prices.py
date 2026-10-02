@@ -164,6 +164,14 @@ def sku_rows(db: Session, scope: dict) -> list[dict]:
             costs[c.item_id] = c
     pps = {(p.item_id, p.account_id): p
            for p in db.query(ProductPrice).filter(ProductPrice.account_id.in_(list(per_acc)))}
+    # Последнее решение по паре товар+кабинет, которое что-то значит для площадки:
+    # в очереди, ушло, не принято или заблокировано при отправке.
+    last_change: dict[tuple, PriceChange] = {}
+    for ch in (db.query(PriceChange)
+               .filter(PriceChange.account_id.in_(list(per_acc)), PriceChange.is_test.is_(False),
+                       PriceChange.status.in_(("approved", "sent", "error", "blocked")))
+               .order_by(PriceChange.id.desc())):
+        last_change.setdefault((ch.item_id, ch.account_id), ch)
     out = []
     for item_id in item_ids:
         cost = costs.get(item_id)
@@ -194,6 +202,8 @@ def sku_rows(db: Session, scope: dict) -> list[dict]:
                           "floor": d.block_reason == BLOCK_FLOOR,
                           "big_step": d.block_reason == BLOCK_MAX_CHANGE,
                           "last_sent": pp.last_sent_price if pp else None,
+                          "manual_price": pp.manual_price if pp else None,
+                          "last_change": last_change.get((item_id, acc.id)),
                           "own_cabinet": (art, acc.id) in inp.coefs or (category, acc.id) in inp.categories})
         out.append({"item_id": item_id, "article": art, "sku": info.get(item_id), "category": category,
                     "barcodes": barcodes.get(item_id, []), "plat_barcodes": [p.barcode for p in all_rows],
@@ -244,9 +254,29 @@ def summarize(rows: list[dict]) -> dict:
         "no_cost": any(r["cost_usd"] is None for r in rows),
         "no_price": any(c["price"] is None for c in cells) or not cells,
         "manual": any(c["decision"].source == SRC_MANUAL for c in cells),
+        "manual_prices": span(c["manual_price"] for c in cells),
+        "last": last_state([c["last_change"] for c in cells if c["last_change"]]),
         "own_cabinets": sorted({c["account"].name for c in cells if c["own_cabinet"]}),
         "note": next((r["note"] for r in rows if r["note"]), ""),
     }
+
+
+LAST_LABELS = {"approved": "в очереди", "sent": "ушло", "error": "не принято", "blocked": "не ушло: пол"}
+
+
+def last_state(changes: list) -> dict | None:
+    """Сводка последних решений по строке: худшее состояние, цены и время."""
+    if not changes:
+        return None
+    order = ["error", "blocked", "approved", "sent"]
+    worst = min(changes, key=lambda c: order.index(c.status))
+    same = [c for c in changes if c.status == worst.status]
+    when = max((c.sent_at or c.decided_at or c.created_at) for c in same)
+    from datetime import timezone
+    local = when.replace(tzinfo=timezone.utc).astimezone().strftime("%d.%m %H:%M") if when else ""
+    return {"status": worst.status, "label": LAST_LABELS[worst.status],
+            "price": span(c.new_price for c in same), "when": local,
+            "detail": (worst.last_error or worst.note or "")[:200]}
 
 
 def _group_passes(g: dict, flt: str, lo, hi) -> bool:
@@ -467,6 +497,32 @@ async def save_coef(request: Request, db: Session = Depends(get_db), user: User 
     return _back(**keep)
 
 
+@router.post("/sku-prices/manual-clear")
+async def manual_clear(request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Снять ручные цены кабинетов у строки — тогда действует наценка. Ручная цена
+    задаётся на «Правила и журнал» → «Текущие и ручные цены», а побеждает наценку:
+    без этой кнопки оператор задавал наценку и не понимал, почему уходит другое."""
+    form = await request.form()
+    keep = _keep(form)
+    sc = pick_scope(db, keep["scope"])
+    key = str(form.get("row") or "")
+    groups = [g for g in build(db, sc, **keep) if g["key"] == key] if sc else []
+    n = 0
+    for g in groups:
+        for r in g["rows"]:
+            for c in r["cells"]:
+                pp = db.query(ProductPrice).filter(ProductPrice.item_id == r["item_id"],
+                                                   ProductPrice.account_id == c["account"].id).first()
+                if pp is not None and pp.manual_price is not None:
+                    pp.manual_price = None
+                    n += 1
+    audit.log(db, user.username, "manual_price_cleared", key[:100], f"{sc['label'] if sc else ''}: снято {n}")
+    db.commit()
+    flash(request, f"«{key}»: ручных цен снято — {n}. Теперь действует наценка; на площадки ничего не отправлено.",
+          "ok" if n else "warn")
+    return _back(**keep)
+
+
 # --- передача на площадки ------------------------------------------------------------
 
 @router.post("/sku-prices/send")
@@ -494,7 +550,7 @@ async def send(request: Request, db: Session = Depends(get_db), user: User = Dep
         flash(request, f"В отборе {len(chosen)} строк — больше {BULK_LIMIT}. Сузьте отбор.", "warn")
         return _back(**keep)
     now = now_utc()
-    queued, same, floor, big, none = 0, 0, 0, 0, {}
+    queued, same, floor, big, none, superseded = 0, 0, 0, 0, {}, 0
     for g in chosen:
         for r in g["rows"]:
             for c in r["cells"]:
@@ -517,6 +573,7 @@ async def send(request: Request, db: Session = Depends(get_db), user: User = Dep
                         PriceChange.status.in_(OPEN + (PriceChangeStatus.approved.value,))):
                     old.status = PriceChangeStatus.rejected.value
                     old.note = "вытеснено передачей со страницы «Цены товаров»"
+                    superseded += 1
                 how = (f"маржинальность {_ru(d.coef)}" if d.kind == KIND_MARGIN else f"базовая {d.cost_rub} × "
                        f"{_ru(d.coef)}") if d.coef is not None else d.note
                 db.add(PriceChange(
@@ -537,6 +594,8 @@ async def send(request: Request, db: Session = Depends(get_db), user: User = Dep
              "минут, итог — «Цены» → «Журнал»"]
     if same:
         parts.append(f"уже стоит на площадке — {same}")
+    if superseded:
+        parts.append(f"прежних предложений и подтверждений по этим товарам снято — {superseded} (ушло одно решение, это)")
     if floor:
         parts.append(f"ниже пола, не отправлено — {floor}")
     if big:

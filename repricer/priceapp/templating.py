@@ -30,8 +30,8 @@ templates.env.filters["plain"] = plain
 
 NAV = [
     ("attention", "/attention", "Внимание"),
-    ("prices", "/prices", "Цены"),
     ("sku_prices", "/sku-prices", "Цены товаров"),
+    ("prices", "/prices?view=rules", "Правила и журнал"),
     ("mapping", "/mapping", "Сопоставление"),
     ("rate", "/rate", "Курс $"),
     ("accounts", "/api-keys", "API-ключи"),

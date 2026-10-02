@@ -277,17 +277,18 @@ def attention(db: Session, product_rows, background_alive: bool = False) -> Atte
     shift = rate_shift(db)
     if shift:
         a.add("warn", f"Курс изменился на {shift['pct']}% с последнего расчёта ({shift['was']:.2f} → "
-                      f"{shift['now']:.2f} ₽) — пересчитайте цены", "/prices?view=proposals")
+                      f"{shift['now']:.2f} ₽) — новые цены видны на «Ценах товаров», там их и передавать",
+              "/sku-prices?flt=changes")
     base = PriceChange.is_test.is_(False)
     n = db.query(PriceChange).filter(base, PriceChange.status == PriceChangeStatus.error.value).count()
     if n:
         a.add("bad", "Площадка не приняла цену", "/prices?view=log&status=error", n)
     n = db.query(PriceChange).filter(base, PriceChange.status == "proposed").count()
     if n:
-        a.add("warn", "Предложения ждут решения", "/prices?view=proposals&status=proposed", n)
+        a.add("warn", "Пересчёт всех цен: предложения ждут решения", "/prices?view=proposals&status=proposed", n)
     n = db.query(PriceChange).filter(base, PriceChange.status == "blocked").count()
     if n:
-        a.add("warn", "Заблокированные предложения (пол или большой шаг)", "/prices?view=proposals&status=blocked", n)
+        a.add("warn", "Пересчёт всех цен: заблокировано (пол или большой шаг)", "/prices?view=proposals&status=blocked", n)
     n = db.query(PriceChange).filter(base, PriceChange.status == "approved").count()
     if n:
         a.add("ok", "Подтверждено и ждёт отправки (уходит в течение пары минут)", "/prices?view=log&status=approved", n)

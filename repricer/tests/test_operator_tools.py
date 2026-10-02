@@ -47,7 +47,7 @@ def test_attention_lists_what_needs_a_decision_with_links(client, db):
         it.current_price = it.current_sale_price = 1000          # 750 к получению < 1010,6 — ниже пола
     db.commit()
     page = client.get("/attention").text
-    assert "Предложения ждут решения" in page and "/prices?view=proposals&amp;status=proposed" in page
+    assert "предложения ждут решения" in page and "/prices?view=proposals&amp;status=proposed" in page
     assert "ниже пола по текущей цене" in page and f"account_id={a.id}&amp;flt=below_floor_now" in page
     assert "не заданы ключи" in page
 

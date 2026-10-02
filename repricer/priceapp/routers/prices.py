@@ -830,10 +830,10 @@ def import_changes(request: Request, file: UploadFile = File(...), db: Session =
 
 
 @router.get("/prices")
-def page(request: Request, view: str = Query("proposals"), account_id: str = Query(""),
+def page(request: Request, view: str = Query("rules"), account_id: str = Query(""),
          q: str = Query(""), status: str = Query(""), flt: str = Query(""), coef_min: str = Query(""),
          coef_max: str = Query(""), db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    view = view if view in VIEWS else "proposals"
+    view = view if view in VIEWS else "rules"
     accs = _accounts(db)
     ctx = dict(view=view, accounts=accs, label=label, account_id=account_id, q=q, status=status,
                status_labels=STATUS_LABELS, block_labels=BLOCK_LABELS, BLOCK_FLOOR=BLOCK_FLOOR,
