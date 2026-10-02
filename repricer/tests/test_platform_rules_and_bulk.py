@@ -404,3 +404,42 @@ def test_migration_moves_rules_from_first_cabinet_to_platform(tmp_path):
     con.close()
     assert rules == {"wb": (25, 2.1), "ozon": (30, 2.3)}
     assert run("check").returncode == 0
+
+
+# --- импорт на «Сопоставлении» ------------------------------------------------------
+
+def test_mapping_status_import_links_only_not_in_1c(client, db):
+    from priceapp.models import ManualLink
+    acc = f.account(db)
+    f.sku(db, "u1", "39681", "L", barcodes=["b1"])
+    f.sku(db, "u2", "4033", "3XL", barcodes=["bx"])
+    f.item(db, acc, "b1", "39681-L", external_id="5:1")
+    f.item(db, acc, "4607001200000", "NEW", external_id="7:1")
+    wb, ws, headers = _xlsx(client.get(f"/mapping/export/{acc.id}").content)
+    rows = {str(ws.cell(row=i, column=1).value): i for i in range(2, ws.max_row + 1)}
+    col = headers.index("ID_1С") + 1
+    ws.cell(row=rows["4607001200000"], column=col, value="u2")     # «нет в 1С» -> ручная связь
+    ws.cell(row=rows["b1"], column=col, value="u2")                # уже сопоставлен -> отказ
+    r = client.post(f"/mapping/import/{acc.id}", files={"file": ("m.xlsx", _save(wb))})
+    assert "Ручных связей создано: 1" in r.text and "перепривязка не делается" in r.text
+    assert [(m.barcode, m.item_id) for m in db.query(ManualLink)] == [("4607001200000", "u2")]
+    assert "Импорт из Excel" in client.get(f"/mapping?view=status&account_id={acc.id}").text
+
+
+def test_mapping_candidates_export_import_confirms_through_confirm(client, db):
+    from priceapp.models import ManualLink
+    acc = f.account(db)
+    f.sku(db, "u1", "39681", "L", color="GRI", barcodes=["b1"])
+    f.sku(db, "u2", "39681", "M", color="GRI", barcodes=["b2"])
+    f.item(db, acc, "b1", "39681", external_id="5:1", size="L")
+    f.item(db, acc, "n2", "39681", external_id="5:2", size="M")
+    wb, ws, headers = _xlsx(client.get(f"/mapping/candidates-export/{acc.id}").content)
+    assert ws.max_row >= 2 and "Подтвердить (Да)" in headers
+    for i in range(2, ws.max_row + 1):
+        ws.cell(row=i, column=headers.index("Подтвердить (Да)") + 1, value="Да")
+    r = client.post(f"/mapping/candidates-import/{acc.id}", files={"file": ("c.xlsx", _save(wb))})
+    assert "Сопоставлено баркодов: 1" in r.text
+    assert [(m.barcode, m.item_id) for m in db.query(ManualLink)] == [("n2", "u2")]
+    # повтор того же файла: уже сопоставлено — отказ, второй связи нет
+    r = client.post(f"/mapping/candidates-import/{acc.id}", files={"file": ("c.xlsx", _save(wb))})
+    assert "уже сопоставлен" in r.text and db.query(ManualLink).count() == 1

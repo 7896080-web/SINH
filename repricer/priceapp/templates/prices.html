@@ -26,7 +26,7 @@
   <a class="btn secondary" href="/prices/rules-export">Экспорт правил в Excel</a>
   <form method="post" action="/prices/rules-import" enctype="multipart/form-data" class="row">
     <label>Импорт правил (пустая ячейка не меняет ничего, «-» снимает цену от другой площадки)<input type="file" name="file" accept=".xlsx" required></label>
-    <button class="secondary">Загрузить</button>
+    <button class="secondary">Импорт из Excel</button>
   </form>
 </div>
 {% for p in plats %}{% set rule = rules[p] %}
@@ -68,7 +68,7 @@
   <a class="btn secondary" href="/prices/export/{{ account.id }}?{{ export_qs }}">Экспорт отбора в Excel</a>
   <form method="post" action="/prices/import/{{ account.id }}" enctype="multipart/form-data" class="row">
     <label>Импорт ручных цен (колонка «Ручная цена, ₽»; пусто — без изменений, «-» — снять)<input type="file" name="file" accept=".xlsx" required></label>
-    <button class="secondary">Загрузить</button>
+    <button class="secondary">Импорт из Excel</button>
   </form>
 </div>
 <p class="muted">Площадка {{ platform_names[account.platform] }}: комиссия {{ rule.commission_percent|plain if rule.commission_percent is not none else 'не задана' }}%, пол — коэффициент {{ ru(rule.min_markup_coef) }}.
@@ -149,10 +149,11 @@ function bulkConfirm() {
 {% if view == 'proposals' %}
 <form method="post" action="/prices/changes-import" enctype="multipart/form-data" class="row" style="margin-bottom:10px">
   <label>Решения из Excel (колонка «Решение (Да / Нет)»; пусто — без изменений)<input type="file" name="file" accept=".xlsx" required></label>
-  <button class="secondary">Загрузить</button>
+  <button class="secondary">Импорт из Excel</button>
 </form>
 {% else %}
-<p class="muted">Журнал — история отправок: выгружается в Excel, но не импортируется.</p>
+<p class="muted">Журнал — история отправок: выгружается в Excel, но не импортируется — менять в прошлом нечего.
+Цены файлом меняются на вкладках «Товары» (ручные цены), «Предложения» (решения) и «Правила».</p>
 {% endif %}
 {% if changes %}
 {% if view == 'proposals' %}<form method="post"><input type="hidden" name="account_id" value="{{ account_id }}">{% endif %}
