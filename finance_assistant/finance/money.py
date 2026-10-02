@@ -12,9 +12,12 @@ MAX_KOPECKS = 100_000_000_000 * 100
 _SPACES = re.compile(r"[\s   '’]")
 
 
-def parse_amount(text: str) -> int:
+def parse_amount(text: str, typed: bool = True) -> int:
     """'1 234,50' / '1234.5' / '1.234,56' / '1,234.56' / '12.500' / '−110' -> копейки.
 
+    typed=True — сумма, набранная человеком: «12.500» — это 12 500 ₽ (разряды).
+    typed=False — сумма из ответа модели: её просят писать «1234.50», так что
+    одна точка/запятая — всегда копейки, лишние знаки округляются («150.0000001»).
     Бросает ValueError на мусоре, экспоненте и нереальных суммах.
     """
     cleaned = _SPACES.sub("", str(text)).replace("−", "-").replace("–", "-")
@@ -39,6 +42,8 @@ def parse_amount(text: str) -> int:
                 digits = "".join(parts)
             else:
                 raise ValueError(f"не похоже на сумму: {text!r}")
+        elif not typed:
+            digits = digits.replace(",", ".")
         elif len(parts) == 2 and len(parts[1]) == 3 and 1 <= len(parts[0].lstrip("0")) <= 3:
             # «12.500», «1,234» — разряды (у рублей копеек не бывает три знака).
             digits = "".join(parts)

@@ -18,6 +18,12 @@ from .storage import (BUSINESS, EXPENSE, PERSONAL, Card, Expense, StatementLine,
 
 # Банк может провести оплату на пару дней позже, чем она видна на скриншоте.
 MATCH_DAYS = 3
+# Месяц выписки «только итоги»: в соседний месяц запись уводим, только если
+# банк провёл её на 1–2 дня позже (30.09 → 01.10), а не дальше.
+BOUNDARY_DAYS = 2
+# Расхождение итога и суммы строк, при котором строки ещё считаются полными
+# (операция «в обработке», округление, комиссия внутри операции).
+COMPLETE_TOLERANCE = 50_000  # 500 ₽
 NO_CATEGORY = "Без статьи"
 
 
@@ -49,7 +55,9 @@ def match(records: list, lines: list[StatementLine], direction: str = "out",
         return [ln for ln in lines
                 if ln.id not in used and ln.direction == direction and ln.amount == r.amount
                 and _gap(ln.op_date, r.op_date) <= MATCH_DAYS
-                and (ln.op_date[:7] == r.op_date[:7] or r.op_date[:7] not in closed_months)]
+                and (ln.op_date[:7] == r.op_date[:7] or r.op_date[:7] not in closed_months
+                     # 30.09 → 01.10: банк провёл на следующий день — это та же оплата.
+                     or _gap(ln.op_date, r.op_date) <= BOUNDARY_DAYS)]
 
     pairs: dict[int, int] = {}
     pending = sorted(records, key=lambda r: (r.op_date, r.id))
@@ -261,8 +269,10 @@ def summarize(storage: Storage, month: str, cache: dict | None = None) -> MonthS
             # Экран «История» банка даёт итог месяца и только видимые строки:
             # расход, которого среди них нет, ещё не значит «не та карта».
             sum_out_lines = sum(ln.amount for ln in lines if ln.direction == "out")
-            lines_complete = bool(lines) and (head["total_out"] is None
-                                              or head["total_out"] == sum_out_lines)
+            lines_complete = bool(lines) and (
+                head["total_out"] is None
+                or abs(head["total_out"] - sum_out_lines)
+                <= max(COMPLETE_TOLERANCE, head["total_out"] // 50))  # до 2% итога
         for e in expenses:
             cs.effective_dates[e.id] = m.date_of(e.id, m.expense_line, e.op_date)
             unconfirmed = lines_complete and e.id not in m.expense_line

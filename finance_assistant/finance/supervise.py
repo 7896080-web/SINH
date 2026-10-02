@@ -34,6 +34,8 @@ from .setup_web import read_env
 log = logging.getLogger("finance.supervise")
 
 RESTART_DELAY = 10      # сек между перезапусками упавшего процесса
+MAX_DELAY = 300         # потолок паузы, если процесс падает сразу после запуска раз за разом
+QUICK_EXIT = 60         # прожил меньше — «упал сразу» (нет сети при загрузке, неверный токен)
 TICK = 1.0              # сек между проверками
 LOG_LIMIT = 5 * 1024 * 1024  # больше — старый журнал уходит в .1 при перезапуске
 MODULES = ("finance", "finance.settings_web")
@@ -50,6 +52,8 @@ class Child:
     args: list[str]
     proc: subprocess.Popen | None = None
     next_start: float = 0.0
+    started: float = 0.0
+    quick_fails: int = 0
     log_file: object = field(default=None, repr=False)
 
 
@@ -145,6 +149,12 @@ class Supervisor:
             child.log_file.close()
             child.log_file = None
 
+    def _log_too_big(self, child: Child) -> bool:
+        try:
+            return os.path.getsize(os.path.join(self.logs, f"{child.name}.log")) > LOG_LIMIT
+        except OSError:
+            return False
+
     def tick(self):
         now = self.clock()
         want = self.wanted()
@@ -158,13 +168,28 @@ class Supervisor:
             if child.proc is not None:
                 code = child.proc.poll()
                 if code is None:
-                    continue
-                log.warning("%s завершился (код %s) — перезапуск через %d с",
-                            name, code, RESTART_DELAY)
-                self.stop(child)
-                child.next_start = now + RESTART_DELAY
+                    if self._log_too_big(child):
+                        # Журнал процесса переоткрывается только при запуске:
+                        # перезапуск и есть ротация (бот теряет секунды, не данные).
+                        log.info("%s: журнал больше %d МБ — перезапуск для ротации",
+                                 name, LOG_LIMIT // 2**20)
+                        self.stop(child)
+                        child.next_start = now
+                    else:
+                        continue
+                else:
+                    # Падает сразу после запуска раз за разом — увеличиваем паузу,
+                    # чтобы не забивать журнал (сеть ещё не поднялась, токен отозван).
+                    child.quick_fails = (child.quick_fails + 1
+                                         if now - child.started < QUICK_EXIT else 0)
+                    delay = min(RESTART_DELAY * 2 ** child.quick_fails, MAX_DELAY)
+                    log.warning("%s завершился (код %s) — перезапуск через %d с",
+                                name, code, delay)
+                    self.stop(child)
+                    child.next_start = now + delay
             if now >= child.next_start:
                 try:
+                    child.started = now
                     self.start(child)
                 except Exception as exc:  # noqa: BLE001 — супервизор не должен падать
                     log.error("Не удалось запустить %s: %s", name, exc)
