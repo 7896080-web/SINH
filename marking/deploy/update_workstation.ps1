@@ -48,6 +48,22 @@ $rc = $LASTEXITCODE
 if ($saved) { $env:DATABASE_URL = $saved }
 if ($rc -ne 0) { Fail "Тесты красные — программу не запускаю" }
 
+# Иконка на уже созданных ярлыках. Ярлык заводит только установщик, и тем, кто
+# поставил программу до появления иконки, обновление иначе её не принесёт.
+# Меняем ТОЛЬКО иконку: путь запуска и порт в ярлыке не трогаем.
+$icon = Join-Path $Root "deploy\marking.ico"
+if (Test-Path $icon) {
+    $shell = New-Object -ComObject WScript.Shell
+    foreach ($dir in @([Environment]::GetFolderPath("Desktop"), [Environment]::GetFolderPath("Startup"))) {
+        $lnk = Join-Path $dir "Маркировка.lnk"
+        if (Test-Path $lnk) {
+            $s = $shell.CreateShortcut($lnk)
+            $s.IconLocation = "$icon,0"
+            $s.Save()
+        }
+    }
+}
+
 Info "Запуск"
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Root "deploy\run_marking.ps1") -Port $WebPort
 if ($LASTEXITCODE -ne 0) { Fail "Программа не запустилась — смотрите logs\marking.err.log" }
