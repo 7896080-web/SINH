@@ -66,7 +66,16 @@ async def save(account_id: int, request: Request, db: Session = Depends(get_db),
     name = str(form.get("name") or "").strip()[:128]
     if name and name != a.name:
         a.name = name
+    was_active = a.is_active
     a.is_active = form.get("is_active") == "1"
+    if was_active and not a.is_active:
+        # Подтверждённое, но не ушедшее, при выключении снимается: иначе оно
+        # уехало бы при включении через месяц — по месячной давности расчёту.
+        from priceapp.models import PriceChange, PriceChangeStatus
+        for ch in db.query(PriceChange).filter(PriceChange.account_id == a.id,
+                                               PriceChange.status == PriceChangeStatus.approved.value):
+            ch.status = PriceChangeStatus.rejected.value
+            ch.note = "кабинет выключен — подтверждение снято"
     # Браузер подставляет сохранённый пароль входа в поле ключа сам: у формы есть
     # текстовое поле и поле-пароль, она похожа на форму входа, а `autocomplete`
     # для паролей Chromium не уважает. Нажатие «Сохранить» ради галочки «Активен»

@@ -21,6 +21,10 @@ from priceapp.pricing import BLOCK_FLOOR, _ru, base_price, floor_price, get_rule
 from priceapp.timeutils import now_utc
 
 MAX_ATTEMPTS = 5
+# Подтверждённое, но не ушедшее дольше этого — устарело: курс, себестоимость,
+# решение человека могли смениться (кабинет был выключен, площадка не отвечала).
+# Такое не отправляется, а отклоняется с причиной — подтвердить заново.
+STALE_AFTER = timedelta(hours=24)
 RETRY_MINUTES = (1, 2, 5, 15)
 
 
@@ -71,6 +75,16 @@ def run_account(db: Session, account: Account, client) -> dict:
     rule = get_rule(db, account.platform)
     rate = rates.current(db)
     now = now_utc()
+    for item_id, ch in list(latest.items()):
+        decided = ch.decided_at or ch.created_at
+        if decided is not None and now - decided > STALE_AFTER:
+            ch.status = PriceChangeStatus.rejected.value
+            ch.note = (f"устарело: подтверждено {decided.strftime('%d.%m %H:%M')} UTC и не ушло за сутки — "
+                       "пересчитайте и подтвердите заново")[:255]
+            del latest[item_id]
+    if not latest:
+        db.commit()
+        return {"stale": True}
     if rate is None:
         # Без курса пол не проверить — не отправляем вовсе, ждём курса.
         for ch in latest.values():
