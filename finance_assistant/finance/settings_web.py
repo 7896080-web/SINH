@@ -101,6 +101,7 @@ class Guard:
         self.global_locked_until = 0.0
         self.sessions: dict[str, dict] = {}
         self.inflight: set[str] = set()      # адреса, чей пароль проверяется прямо сейчас
+        self.lock_set_by: str | None = None  # чья (заранее занятая) попытка закрыла вход
         self.trusted: dict[str, float] = {}  # адрес → когда с него входили верно
 
     def begin_attempt(self, ip: str) -> str | None:
@@ -121,7 +122,11 @@ class Guard:
         with self.lock:
             self.inflight.discard(ip)
             if ok:
-                if self.global_fails:
+                if self.lock_set_by == ip:
+                    # Общую блокировку включила попытка, которая оказалась верной.
+                    self.global_locked_until = 0.0
+                    self.lock_set_by = None
+                elif self.global_fails:
                     self.global_fails.pop()  # снимаем занятую заранее попытку
                 self.trusted[ip] = self.clock()
                 self.ip_locked.pop(ip, None)  # верный пароль пятой попыткой — не блокируем
@@ -153,6 +158,7 @@ class Guard:
             if len(self.global_fails) >= GLOBAL_FAILS:
                 self.global_locked_until = now + GLOBAL_WINDOW
                 self.global_fails = []
+                self.lock_set_by = ip
                 log.warning("Вход закрыт на час: %d неверных паролей за час", GLOBAL_FAILS)
 
     def succeeded(self, ip: str):

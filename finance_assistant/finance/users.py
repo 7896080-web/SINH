@@ -92,7 +92,7 @@ class UserSpaces:
                         old_db, owner)
             return None
         os.makedirs(folder, mode=0o700, exist_ok=True)
-        for suffix in ("", "-wal", "-shm"):
+        for suffix in ("", "-wal", "-shm", "-journal"):
             if os.path.exists(old_db + suffix):
                 shutil.move(old_db + suffix, new_db + suffix)
         old_receipts = os.path.join(self.data_dir, "receipts")

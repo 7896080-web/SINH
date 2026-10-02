@@ -54,10 +54,10 @@ def test_transfer_sides_three_days_apart_are_one_transfer(env):
     db, rec, flow = env
     sber, tb = db.cards()[0].id, db.cards()[1].id
     common = dict(own_transfer=True, merchant="Перевод", category="", amount="100000.00")
-    rec.payments.append(payment(direction="out", date="2026-09-25", card_last4="1111", bank="Сбер",
+    rec.payments.append(payment(direction="out", date="2026-09-22", card_last4="1111", bank="Сбер",
                                 counterparty_last4="2222", counterparty_bank="Т-Банк", **common))
     flow.on_files(CHAT, [png()], "")
-    rec.payments.append(payment(direction="in", date="2026-09-28", card_last4="2222",
+    rec.payments.append(payment(direction="in", date="2026-09-25", card_last4="2222",
                                 bank="Т-Банк", counterparty_last4="1111",
                                 counterparty_bank="Сбер", **common))
     [q] = flow.on_files(CHAT, [png()], "")
@@ -66,9 +66,9 @@ def test_transfer_sides_three_days_apart_are_one_transfer(env):
     [r] = flow.on_button(CHAT, "d:2:side:1")
     assert "вторая сторона перевода П1" in r.text
     assert len(db.transfers("2026-09")) == 1
-    stmt(db, sber, "2026-09", [("2026-09-25", 10_000_000, "out", "Перевод на Т-Банк", True),
+    stmt(db, sber, "2026-09", [("2026-09-22", 10_000_000, "out", "Перевод на Т-Банк", True),
                                ("2026-09-10", 3_000_000, "out", "Магазин", False)])
-    stmt(db, tb, "2026-09", [("2026-09-28", 10_000_000, "in", "Перевод из Сбера", True)])
+    stmt(db, tb, "2026-09", [("2026-09-25", 10_000_000, "in", "Перевод из Сбера", True)])
     s = summarize(db, "2026-09")
     assert card_summary(db, "2026-09", sber).personal == 3_000_000
     assert card_summary(db, "2026-09", tb).net_in == 0 and s.net_in == 0

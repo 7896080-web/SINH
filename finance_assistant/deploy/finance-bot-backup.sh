@@ -22,9 +22,14 @@ src.backup(dst)
 dst.close(); src.close()
 PY
     if [ -d "$(dirname "$db")/receipts" ]; then
-        tar -czf "$DEST/receipts-$owner-$stamp.tar.gz" -C "$(dirname "$db")" receipts
+        # Скриншоты — зеркалом: докопируются только новые (а не весь архив каждый день).
+        mkdir -p "$DEST/receipts-$owner"
+        cp -ru "$(dirname "$db")/receipts/." "$DEST/receipts-$owner/" \
+            || echo "предупреждение: не все скриншоты $owner скопированы" >&2
     fi
     count=$((count + 1))
 done
-find "$DEST" -type f -mtime +"$KEEP_DAYS" -delete
+# Только свои файлы: копии баз и архивы скриншотов прежней версии.
+find "$DEST" -maxdepth 1 -type f \( -name 'finance-*.db' -o -name 'receipts-*.tar.gz' \) \
+    -mtime +"$KEEP_DAYS" -delete
 echo "backup ok: $count баз(ы) в $DEST"

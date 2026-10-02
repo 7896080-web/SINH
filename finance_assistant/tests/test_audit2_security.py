@@ -103,3 +103,20 @@ def test_secrets_masked_in_logs():
     record = logging.LogRecord("t", logging.ERROR, "f", 1, "url %s", (f"bot{token}",), None)
     SecretFilter().filter(record)
     assert token not in record.getMessage()
+
+
+def test_correct_login_does_not_leave_global_lock():
+    g = Guard()
+    for i in range(19):
+        assert g.begin_attempt(f"66.0.0.{i}") is None
+        g.end_attempt(f"66.0.0.{i}", ok=False)
+    assert g.begin_attempt("10.0.0.1") is None          # 20-я попытка — и она верная
+    g.end_attempt("10.0.0.1", ok=True)
+    assert g.blocked("10.0.0.2") is None
+
+
+def test_one_bad_byte_does_not_spoil_env(tmp_path):
+    p = tmp_path / ".env"
+    p.write_bytes("FINANCE_DATA_DIR=C:\\Users\\Иван\\data\n# \xff\nA=1\n".encode("utf-8")
+                  .replace(b"# \xc3\xbf", b"# \xff"))
+    assert read_env(str(p))["FINANCE_DATA_DIR"] == "C:\\Users\\Иван\\data"

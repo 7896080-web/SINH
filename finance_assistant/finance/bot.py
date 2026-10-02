@@ -32,7 +32,8 @@ COMMANDS = ["start", "help", "cancel", "cards", "addcard", "delcard", "cats", "a
 BATCH_WAIT = 2.5  # сек тишины после последнего файла — пачка собрана
 MAX_TEXT = 4000  # лимит Telegram — 4096 единиц UTF-16 на сообщение
 MAX_FILE = 20 * 1024 * 1024  # больше бот скачать не может
-MAX_IMAGE = 5 * 1024 * 1024  # больше Claude API не примет одну картинку
+# Claude API принимает картинку до 5 МБ в base64 — это ~3,75 МБ самого файла.
+MAX_IMAGE = 5 * 1024 * 1024 * 3 // 4
 # Что умеем разбирать, присланное файлом (не фото).
 IMAGE_MIMES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
 DOC_MIMES = {"application/pdf", "text/csv", "text/plain",
@@ -345,7 +346,7 @@ def build_app(token: str, flow_for, allowed: set[int], env_file: str | None = No
             return
         if mime in IMAGE_MIMES and doc.file_size and doc.file_size > MAX_IMAGE:
             await say(update.effective_chat, 
-                "Картинка больше 5 МБ — пришлите её обычным фото (не файлом), "
+                "Картинка больше 3,5 МБ — пришлите её обычным фото (не файлом), "
                 "Telegram сам её уменьшит.")
             return
         tg_file = await doc.get_file()

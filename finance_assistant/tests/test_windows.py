@@ -215,9 +215,20 @@ def test_backup_frees_space_first(tmp_path, monkeypatch):
     def full(*a, **k):
         raise OSError(28, "No space left on device")
     monkeypatch.setattr(backup, "_copy_db", full)
-    with pytest.raises(OSError):
+    with pytest.raises(RuntimeError, match="не для всех"):
         backup.backup(str(data), str(dest))
     assert not old.exists()
+
+
+def test_backup_wrong_data_folder_keeps_old_copies(tmp_path):
+    dest = tmp_path / "backups"
+    dest.mkdir()
+    old = dest / "finance-1-20200101-0000.db"
+    old.write_text("x")
+    os.utime(old, (0, 0))
+    with pytest.raises(RuntimeError, match="нет ни одной базы"):
+        backup.backup(str(tmp_path / "нет-такой"), str(dest))
+    assert old.exists()
 
 
 # --- .env и сертификат -------------------------------------------------------
