@@ -4,6 +4,10 @@
 <h1>Что требует внимания</h1>
 <p class="muted">Всё, что ждёт решения или говорит о расхождении, — сначала самое дорогое. Каждая строка ведёт прямо к своим
 товарам. {% if rate %}Курс: <b>{{ rate.usd_rub|money(4) }} ₽</b> ({{ rate.label }}).{% endif %}</p>
+<form method="post" action="/attention/refresh" class="row" style="margin-bottom:10px">
+  <span class="muted" style="align-self:center">Счётчики по товарам посчитаны {{ heavy_at or '—' }}{% if heavy_dirty %} — с тех пор были правки, фон пересчитает в течение пары минут{% endif %}.</span>
+  <button class="secondary" title="На большом каталоге — до минуты">Пересчитать сейчас</button>
+</form>
 {% if items %}
 <table class="attention">
 {% for i in items %}<tr>

@@ -175,54 +175,29 @@ class Item:
 @dataclass
 class Attention:
     items: list[Item] = field(default_factory=list)
+    heavy_at: str = ""          # когда посчитаны счётчики по товарам (ISO UTC)
+    heavy_dirty: bool = False   # данные менялись после подсчёта
 
     def add(self, level, text, link="", count=None):
         self.items.append(Item(level, text, link, count))
 
 
-def attention(db: Session, product_rows) -> Attention:
-    """Что требует внимания, по убыванию цены ошибки. `product_rows` передаётся
-    снаружи (живёт в роутере цен), чтобы считать ровно то же, что показывает
-    вкладка «Товары» — иначе число здесь и строки там однажды разошлись бы."""
-    a = Attention()
-    rate = rates.current(db)
-    if rate is None:
-        a.add("bad", "Курса доллара нет — цены не считаются", "/rate")
-    shift = rate_shift(db)
-    if shift:
-        a.add("warn", f"Курс изменился на {shift['pct']}% с последнего расчёта ({shift['was']:.2f} → "
-                      f"{shift['now']:.2f} ₽) — пересчитайте цены", "/prices?view=proposals")
-    base = PriceChange.is_test.is_(False)
-    n = db.query(PriceChange).filter(base, PriceChange.status == PriceChangeStatus.error.value).count()
-    if n:
-        a.add("bad", "Площадка не приняла цену", "/prices?view=log&status=error", n)
-    n = db.query(PriceChange).filter(base, PriceChange.status == "proposed").count()
-    if n:
-        a.add("warn", "Предложения ждут решения", "/prices?view=proposals&status=proposed", n)
-    n = db.query(PriceChange).filter(base, PriceChange.status == "blocked").count()
-    if n:
-        a.add("warn", "Заблокированные предложения (пол или большой шаг)", "/prices?view=proposals&status=blocked", n)
-    n = db.query(PriceChange).filter(base, PriceChange.status == "approved").count()
-    if n:
-        a.add("ok", "Подтверждено и ждёт отправки (уходит в течение пары минут)", "/prices?view=log&status=approved", n)
+HEAVY_KEY = "attention_heavy"      # JSON: {"at": ISO UTC, "items": [[level, text, link, count], ...]}
+DIRTY_KEY = "attention_dirty"      # "1" — данные менялись после подсчёта, пора пересчитать
 
-    now = now_utc()
+
+def mark_dirty(db: Session) -> None:
+    """Пометить счётчики по товарам устаревшими (зовут после любых правок)."""
+    settings.put(db, DIRTY_KEY, "1")
+
+
+def _heavy(db: Session, product_rows) -> list[Item]:
+    """Счётчики ПО ТОВАРАМ — сборка сопоставления и расчёт цены по каждому
+    кабинету. На боевом каталоге это десятки секунд, поэтому их считает фон
+    (`refresh_heavy`), а страница показывает готовое."""
+    a = Attention()
     for acc in db.query(Account).filter(Account.is_active.is_(True)).order_by(Account.platform, Account.name):
-        has_keys = db.query(ApiCredential.id).filter(ApiCredential.account_id == acc.id).first() is not None
         name = f"{acc.name} ({platforms.PLATFORMS.get(acc.platform, acc.platform)})"
-        if not has_keys:
-            # Без ключей молчат только проверки свежести — товары, цены и расхождения
-            # по уже загруженным данным смотрим всё равно.
-            a.add("warn", f"{name}: не заданы ключи", "/api-keys")
-        else:
-            if acc.last_check_ok is False:
-                a.add("bad", f"{name}: проверка ключей не прошла — {acc.last_check_message[:120]}", "/api-keys")
-            if not acc.catalog_loaded_at or now - acc.catalog_loaded_at > STALE:
-                a.add("warn", f"{name}: каталог не загружался больше суток", "/api-keys")
-            if acc.platform in platforms.READS_PRICES and (
-                    not acc.prices_loaded_at or now - acc.prices_loaded_at > STALE):
-                a.add("warn", f"{name}: текущие цены не загружались больше суток",
-                      f"/prices?view=products&account_id={acc.id}")
         from priceapp import mapping
         not_in_1c = mapping.counts(mapping.build(db, acc.id)).get("not_in_1c", 0)
         if not_in_1c and acc.catalog_loaded_at:
@@ -264,4 +239,80 @@ def attention(db: Session, product_rows) -> Attention:
         if under_min:
             a.add("warn", f"{name}: расчётная цена ниже минимальной цены площадки",
                   f"{link}&flt=below_platform_min", under_min)
+    return a.items
+
+
+def refresh_heavy(db: Session, product_rows) -> None:
+    import json
+    items = _heavy(db, product_rows)
+    settings.put(db, HEAVY_KEY, json.dumps({"at": now_utc().isoformat(),
+                                            "items": [[i.level, i.text, i.link, i.count] for i in items]},
+                                           ensure_ascii=False))
+    settings.put(db, DIRTY_KEY, "")
+    db.commit()
+
+
+def heavy_cached(db: Session) -> tuple[list[Item] | None, str, bool]:
+    """(строки или None, когда посчитаны, устарели ли)."""
+    import json
+    raw = settings.get(db, HEAVY_KEY)
+    if not raw:
+        return None, "", True
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None, "", True
+    return [Item(*x) for x in data.get("items", [])], data.get("at", ""), settings.get(db, DIRTY_KEY) == "1"
+
+
+def attention(db: Session, product_rows, background_alive: bool = False) -> Attention:
+    """Что требует внимания, по убыванию цены ошибки. Лёгкое (курс, предложения,
+    свежесть данных, фоновые задания) — сразу; счётчики по товарам — из кэша, если
+    его обновляет фон, иначе (кэша нет или он устарел без фона) — тут же.
+    `product_rows` — из роутера цен: число здесь и строки на «Товарах» одни."""
+    a = Attention()
+    rate = rates.current(db)
+    if rate is None:
+        a.add("bad", "Курса доллара нет — цены не считаются", "/rate")
+    shift = rate_shift(db)
+    if shift:
+        a.add("warn", f"Курс изменился на {shift['pct']}% с последнего расчёта ({shift['was']:.2f} → "
+                      f"{shift['now']:.2f} ₽) — пересчитайте цены", "/prices?view=proposals")
+    base = PriceChange.is_test.is_(False)
+    n = db.query(PriceChange).filter(base, PriceChange.status == PriceChangeStatus.error.value).count()
+    if n:
+        a.add("bad", "Площадка не приняла цену", "/prices?view=log&status=error", n)
+    n = db.query(PriceChange).filter(base, PriceChange.status == "proposed").count()
+    if n:
+        a.add("warn", "Предложения ждут решения", "/prices?view=proposals&status=proposed", n)
+    n = db.query(PriceChange).filter(base, PriceChange.status == "blocked").count()
+    if n:
+        a.add("warn", "Заблокированные предложения (пол или большой шаг)", "/prices?view=proposals&status=blocked", n)
+    n = db.query(PriceChange).filter(base, PriceChange.status == "approved").count()
+    if n:
+        a.add("ok", "Подтверждено и ждёт отправки (уходит в течение пары минут)", "/prices?view=log&status=approved", n)
+
+    now = now_utc()
+    for acc in db.query(Account).filter(Account.is_active.is_(True)).order_by(Account.platform, Account.name):
+        has_keys = db.query(ApiCredential.id).filter(ApiCredential.account_id == acc.id).first() is not None
+        name = f"{acc.name} ({platforms.PLATFORMS.get(acc.platform, acc.platform)})"
+        if not has_keys:
+            # Без ключей молчат только проверки свежести — товары, цены и расхождения
+            # по уже загруженным данным смотрим всё равно.
+            a.add("warn", f"{name}: не заданы ключи", "/api-keys")
+        else:
+            if acc.last_check_ok is False:
+                a.add("bad", f"{name}: проверка ключей не прошла — {acc.last_check_message[:120]}", "/api-keys")
+            if not acc.catalog_loaded_at or now - acc.catalog_loaded_at > STALE:
+                a.add("warn", f"{name}: каталог не загружался больше суток", "/api-keys")
+            if acc.platform in platforms.READS_PRICES and (
+                    not acc.prices_loaded_at or now - acc.prices_loaded_at > STALE):
+                a.add("warn", f"{name}: текущие цены не загружались больше суток",
+                      f"/prices?view=products&account_id={acc.id}")
+    items, at, dirty = heavy_cached(db)
+    if items is None or (dirty and not background_alive):
+        refresh_heavy(db, product_rows)
+        items, at, dirty = heavy_cached(db)
+    a.items.extend(items or [])
+    a.heavy_at, a.heavy_dirty = at, dirty
     return a

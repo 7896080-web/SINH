@@ -277,6 +277,8 @@ def confirm(db: Session, account_id: int, pairs: list[tuple[str, str]], actor: s
         else:
             db.add(ManualLink(account_id=account_id, barcode=barcode, item_id=uid,
                               source=SOURCE_TAG, created_by=actor))
+            from priceapp.database import session_cache
+            session_cache(db).clear()   # сборка в этой же транзакции должна увидеть связь
             current.pop(barcode)
             created += 1
     db.flush()

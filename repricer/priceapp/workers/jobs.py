@@ -58,6 +58,9 @@ def job_price_dispatch(client_factory=None) -> None:
     try:
         stats = dispatch.run(db, client_factory)
         errors = [f"{k}: {v['error']}" for k, v in stats.items() if "error" in v]
+        if any(v.get("sent") for v in stats.values()):
+            from priceapp import overview
+            overview.mark_dirty(db)
         beat(db, "price_dispatch", True, "; ".join(errors))
         if stats:
             logger.info("цены: %s", stats)
@@ -121,6 +124,8 @@ def job_daily_refresh(client_factory=None, force_prices: bool = False) -> None:
             except Exception as e:
                 db.rollback()
                 notes.append(f"диапазоны безопасности не проверены — {e}"[:200])
+        from priceapp import overview
+        overview.mark_dirty(db)
         beat(db, "daily_refresh", True, "; ".join(notes))
     except Exception as e:
         logger.exception("суточное обновление упало")
@@ -140,5 +145,30 @@ def job_backup() -> None:
     except Exception as e:
         logger.exception("копия базы упала")
         beat(db, "backup", False, f"{type(e).__name__}: {e}")
+    finally:
+        db.close()
+
+
+def attention_dirty() -> bool:
+    db = SessionLocal()
+    try:
+        from priceapp import overview
+        return settings.get(db, overview.DIRTY_KEY) == "1"
+    finally:
+        db.close()
+
+
+def job_attention() -> None:
+    """Счётчики «Внимания» по товарам — в фоне: на боевом каталоге это десятки
+    секунд, страница их только показывает."""
+    db = SessionLocal()
+    try:
+        from priceapp import overview
+        from priceapp.routers.prices import product_rows
+        overview.refresh_heavy(db, product_rows)
+        beat(db, "attention", True, "")
+    except Exception as e:
+        logger.exception("счётчики «Внимания» упали")
+        beat(db, "attention", False, f"{type(e).__name__}: {e}")
     finally:
         db.close()
