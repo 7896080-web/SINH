@@ -4,8 +4,17 @@
     C:\\sync_admin\\.venv\\Scripts\\python.exe C:\\sync_admin\\scripts\\probe_movements.py "39681 SELIANIK"
     ... probe_movements.py 39681 M             # только размер M
     ... probe_movements.py 39681 M "MAVI MELANJ"   # размер И цвет
-    ... probe_movements.py 39681 "" "MAVI MELANJ"  # весь ряд одного цвета
+    ... probe_movements.py 39681 "MAVI MELANJ"     # весь ряд одного цвета
     ... probe_movements.py 2000932153711       # по баркоду (найдёт весь ряд)
+
+**Порядок уточнений не значит ничего**: про каждое скрипт спрашивает сам ряд —
+размер это или цвет. Раньше цвет стоял третьим, а «весь ряд одного цвета»
+требовал пустого второго аргумента, и 03.10 на бою это обернулось отказом
+«размера «MAVI MELANJ» среди них НЕТ»: **PowerShell не передаёт нативной
+программе пустые строковые аргументы вовсе**, так что цвет встал на место
+размера, а отказ соврал о причине. В bash тот же вызов работал — ровно тот
+класс «зелёно здесь, красно там», которым открывается `CLAUDE.md`. Плейсхолдер
+в интерфейсе скрипта на этом сервере не живёт, поэтому его тут и нет.
 
 **Артикул один не только на размеры, но и на ЦВЕТА.** 03.10 на бою по
 «39681 SELIANIK» вышло 45 строк: девять цветов на пять размеров. Человек при
@@ -101,7 +110,44 @@ def _size_key(product: Product):
         return (1, 0.0, raw.upper())
 
 
-def _find_rows(db, needle: str, wanted_size: str, wanted_color: str = ""):
+def _classify_filters(rows, filters: list[str]) -> tuple[str, str, str]:
+    """Про каждое уточнение спрашиваем РЯД: это размер или цвет.
+
+    Возвращает `(размер, цвет, ошибка)`. Выбор делает не позиция аргумента, а
+    то, что в ряду действительно есть: размеры сверяются точно, цвет — по куску
+    и без регистра (человек называет его так, как видит на витрине, а записан
+    он как придётся).
+
+    Неизвестное значение — ОТКАЗ, называющий И размеры, И цвета: сказать про
+    него «такого размера нет», не посмотрев в цвета, значит соврать о причине —
+    именно так 03.10 выглядел потерянный PowerShell-ом пустой аргумент.
+    """
+    sizes = {(p.size or "").strip().upper() for p in rows}
+    colors = [(p.color or "").strip().upper() for p in rows]
+    size, color = "", ""
+    for raw in filters:
+        value = raw.strip().upper()
+        if not value:
+            continue
+        if value in sizes:
+            if size and size != value:
+                return "", "", (f"указаны два размера — «{size}» и «{value}»; "
+                                f"оставьте один")
+            size = value
+        elif any(value in c for c in colors):
+            if color and color != value:
+                return "", "", (f"указаны два цвета — «{color}» и «{value}»; "
+                                f"оставьте один")
+            color = value
+        else:
+            return "", "", (
+                f"«{raw}» — это ни размер, ни цвет этого артикула.\n"
+                f"  размеры: " + ", ".join(sorted(sizes)) + "\n"
+                f"  цвета:   " + ", ".join(sorted(set(colors))))
+    return size, color, ""
+
+
+def _find_rows(db, needle: str, filters: list[str]):
     """Строки ряда: по ID_1С, баркоду, артикулу целиком и по куску артикула.
 
     Баркод обязателен, и не для удобства: артикул человек видит на площадке, а
@@ -133,31 +179,17 @@ def _find_rows(db, needle: str, wanted_size: str, wanted_color: str = ""):
             rows = db.query(Product).filter(
                 Product.article.ilike(f"%{needle}%")).all()
 
-    if wanted_size:
-        exact = [p for p in rows
-                 if (p.size or "").strip().upper() == wanted_size.upper()]
-        if not exact:
-            print(f"нашлось строк: {len(rows)}, а размера «{wanted_size}» среди "
-                  f"них НЕТ. Есть: "
-                  + ", ".join(sorted({(p.size or "-") for p in rows})))
+    if filters:
+        wanted_size, wanted_color, error = _classify_filters(rows, filters)
+        if error:
+            print(f"нашлось строк: {len(rows)}, но " + error)
             return []
-        rows = exact
-
-    if wanted_color:
-        # Цвет сверяем по КУСКУ и без регистра: человек называет его так, как
-        # видит на витрине («MAVI MELANJ»), а у нас он записан как придётся —
-        # «BEJ MEL/TAS MEL», лишние пробелы, другой регистр. Требуй точного
-        # совпадения, и самый обычный запрос отвечал бы «такого цвета нет» при
-        # том, что строка есть, — то есть отказ был бы НЕПРАВДОЙ.
-        needle_color = wanted_color.strip().upper()
-        exact = [p for p in rows
-                 if needle_color in (p.color or "").strip().upper()]
-        if not exact:
-            print(f"нашлось строк: {len(rows)}, а цвета «{wanted_color}» среди "
-                  f"них НЕТ. Есть: "
-                  + ", ".join(sorted({(p.color or "-") for p in rows})))
-            return []
-        rows = exact
+        if wanted_size:
+            rows = [p for p in rows
+                    if (p.size or "").strip().upper() == wanted_size]
+        if wanted_color:
+            rows = [p for p in rows
+                    if wanted_color in (p.color or "").strip().upper()]
 
     return sorted(rows, key=_size_key)
 
@@ -275,18 +307,22 @@ def _print_row(db, product: Product) -> dict:
 
 def main() -> int:
     if len(sys.argv) < 2:
-        print("укажите артикул, ID_1С или баркод; далее размер и цвет")
+        print("укажите артикул, ID_1С или баркод; далее размер и/или цвет")
         print('пример: probe_movements.py 39681 M "MAVI MELANJ"')
+        print('        probe_movements.py 39681 "MAVI MELANJ"')
         return 1
     needle = sys.argv[1].strip()
-    wanted_size = sys.argv[2].strip() if len(sys.argv) > 2 else ""
-    wanted_color = sys.argv[3].strip() if len(sys.argv) > 3 else ""
+    # Уточнения — СПИСКОМ, и порядок в нём не значит ничего: размер это или
+    # цвет, решает сам ряд. Пустые отбрасываем здесь же — в bash «""» доедет
+    # пустой строкой, в PowerShell не доедет вовсе, и ни то ни другое не должно
+    # менять смысл вызова.
+    filters = [a for a in (arg.strip() for arg in sys.argv[2:]) if a]
 
     db = SessionLocal()
     try:
-        rows = _find_rows(db, needle, wanted_size, wanted_color)
+        rows = _find_rows(db, needle, filters)
         if not rows:
-            if not wanted_size and not wanted_color:
+            if not filters:
                 print(f"не найдено ни по ID_1С, ни по баркоду, ни по артикулу: "
                       f"{needle}")
             return 1

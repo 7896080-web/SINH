@@ -186,7 +186,7 @@ def test_a_missing_size_is_refused_with_the_list(catalog):
     """Отказ называет, что есть: иначе человек решит, что товара нет вовсе."""
     out = _run(catalog, "39681", "62")
 
-    assert "размера «62» среди них НЕТ" in out, out
+    assert "ни размер, ни цвет" in out, out
     assert "44" in out and "56" in out
 
 
@@ -233,7 +233,7 @@ def test_a_color_narrows_the_run(catalog):
     session.close()
     engine.dispose()
 
-    out = _run(catalog, "39681", "", "MINT MELANJ")
+    out = _run(catalog, "39681", "MINT MELANJ")
 
     assert "Строк 1С: 2" in out, out
     assert "MINT MELANJ" in out
@@ -246,7 +246,7 @@ def test_a_color_matches_by_part_and_ignores_case(catalog):
     Требуй точного совпадения — и самый обычный запрос отвечал бы «такого цвета
     нет» при том, что строка есть: отказ был бы НЕПРАВДОЙ.
     """
-    out = _run(catalog, "39681", "", "mavi")
+    out = _run(catalog, "39681", "mavi")
 
     assert f"Строк 1С: {len(SIZES)}" in out, out
 
@@ -261,10 +261,11 @@ def test_size_and_color_together_find_one_row(catalog):
 
 def test_a_missing_color_is_refused_with_the_list(catalog):
     """Отказ называет, какие цвета есть: иначе человек решит, что товара нет."""
-    out = _run(catalog, "39681", "", "ЗЕЛЁНЫЙ")
+    out = _run(catalog, "39681", "ЗЕЛЁНЫЙ")
 
-    assert "цвета «ЗЕЛЁНЫЙ» среди них НЕТ" in out, out
-    assert "MAVI MELANJ" in out
+    assert "ни размер, ни цвет" in out, out
+    assert "MAVI MELANJ" in out, "отказ называет цвета, что есть\n" + out
+    assert "44" in out, "и размеры тоже: причину он не угадывает\n" + out
 
 
 def test_the_header_lists_sizes_and_colors_without_repeats(catalog):
@@ -288,3 +289,49 @@ def test_the_header_lists_sizes_and_colors_without_repeats(catalog):
     assert f"Строк 1С: {len(SIZES) * 2}" in out, out
     assert f"размеров {len(SIZES)}: " + ", ".join(SIZES) in out, out
     assert "цветов 2: MAVI MELANJ, MINT MELANJ" in out, out
+
+
+def test_a_color_works_in_the_second_place_too(catalog):
+    """Порядок уточнений не значит ничего — и это про PowerShell.
+
+    03.10 на бою вызов `probe_movements.py 39681 "" "MAVI MELANJ"` ответил
+    «размера «MAVI MELANJ» среди них НЕТ»: PowerShell не передаёт нативной
+    программе пустые строковые аргументы ВОВСЕ, поэтому цвет встал на место
+    размера, а отказ соврал о причине. В bash тот же вызов работал — то есть
+    поймать это здесь можно было только так, как ловим теперь: убрав из
+    интерфейса плейсхолдер и спрашивая про каждое уточнение сам ряд.
+    """
+    out = _run(catalog, "39681", "MAVI MELANJ")
+
+    assert f"Строк 1С: {len(SIZES)}" in out, out
+    assert "ни размер, ни цвет" not in out, out
+
+
+def test_the_order_of_the_two_filters_does_not_matter(catalog):
+    """Размер и цвет можно назвать в любом порядке: решает ряд, не позиция."""
+    straight = _run(catalog, "39681", "50", "MAVI MELANJ")
+    reversed_ = _run(catalog, "39681", "MAVI MELANJ", "50")
+
+    assert "Строк 1С: 1" in straight, straight
+    assert "Строк 1С: 1" in reversed_, reversed_
+    assert "РАЗМЕР 50" in reversed_
+
+
+def test_an_empty_placeholder_changes_nothing(catalog):
+    """В bash «""» доедет пустой строкой, в PowerShell не доедет вовсе.
+
+    Ни то ни другое не должно менять смысл вызова, иначе одна и та же команда
+    из инструкции делает на двух системах разное — а инструкции пишутся здесь,
+    а исполняются там.
+    """
+    out = _run(catalog, "39681", "", "MAVI MELANJ")
+
+    assert f"Строк 1С: {len(SIZES)}" in out, out
+
+
+def test_two_sizes_at_once_are_refused(catalog):
+    """Два размера в уточнениях — скорее опечатка, чем просьба; молча взять
+    последний значило бы ответить не про то, о чём спросили."""
+    out = _run(catalog, "39681", "50", "52")
+
+    assert "указаны два размера" in out, out
