@@ -212,3 +212,79 @@ def test_the_output_warns_that_movements_hang_on_barcodes(catalog):
     out = _run(catalog, "39681")
 
     assert "ПО БАРКОДАМ" in out, out
+
+
+# ------------------------------------------------- артикул ещё и по цветам
+
+def test_a_color_narrows_the_run(catalog):
+    """Артикул один не только на размеры, но и на ЦВЕТА.
+
+    03.10 на бою по «39681 SELIANIK» вышло 45 строк: девять цветов на пять
+    размеров. Человек при этом называет товар ЦВЕТОМ — так он выглядит на
+    витрине, — и получал простыню, в которой нужные пять строк искал глазами.
+    """
+    engine = create_engine(catalog, connect_args={"check_same_thread": False})
+    session = sessionmaker(bind=engine, autoflush=False)()
+    for size in ("44", "46"):
+        session.add(Product(uid_1c=f"mint-{size}", article=ARTICLE,
+                            name="Свитшот MINT MELANJ", size=size,
+                            color="MINT MELANJ", stock_on_hand=3, reserve=0))
+    session.commit()
+    session.close()
+    engine.dispose()
+
+    out = _run(catalog, "39681", "", "MINT MELANJ")
+
+    assert "Строк 1С: 2" in out, out
+    assert "MINT MELANJ" in out
+    assert "MAVI MELANJ" not in out, "чужой цвет в ответе про этот\n" + out
+
+
+def test_a_color_matches_by_part_and_ignores_case(catalog):
+    """Цвет записан как придётся, а человек называет его как видит.
+
+    Требуй точного совпадения — и самый обычный запрос отвечал бы «такого цвета
+    нет» при том, что строка есть: отказ был бы НЕПРАВДОЙ.
+    """
+    out = _run(catalog, "39681", "", "mavi")
+
+    assert f"Строк 1С: {len(SIZES)}" in out, out
+
+
+def test_size_and_color_together_find_one_row(catalog):
+    out = _run(catalog, "39681", "50", "MAVI MELANJ")
+
+    assert "Строк 1С: 1" in out, out
+    assert "РАЗМЕР 50" in out
+    assert "ЦБ000001910" in out, "это та самая строка, с её движениями\n" + out
+
+
+def test_a_missing_color_is_refused_with_the_list(catalog):
+    """Отказ называет, какие цвета есть: иначе человек решит, что товара нет."""
+    out = _run(catalog, "39681", "", "ЗЕЛЁНЫЙ")
+
+    assert "цвета «ЗЕЛЁНЫЙ» среди них НЕТ" in out, out
+    assert "MAVI MELANJ" in out
+
+
+def test_the_header_lists_sizes_and_colors_without_repeats(catalog):
+    """«L, L, L, L, L, L, L, L, L, M, M…» не говорит ни о размерах, ни о цветах.
+
+    По 45 строкам этот список занимал три строки экрана и не отвечал ни на один
+    вопрос — ни сколько размеров, ни сколько цветов в ряду.
+    """
+    engine = create_engine(catalog, connect_args={"check_same_thread": False})
+    session = sessionmaker(bind=engine, autoflush=False)()
+    for size in SIZES:
+        session.add(Product(uid_1c=f"mint-{size}", article=ARTICLE,
+                            name="Свитшот MINT MELANJ", size=size,
+                            color="MINT MELANJ", stock_on_hand=1, reserve=0))
+    session.commit()
+    session.close()
+    engine.dispose()
+
+    out = _run(catalog, "39681")
+
+    assert f"Строк 1С: {len(SIZES) * 2}" in out, out
+    assert f"размеров {len(SIZES)}: " + ", ".join(SIZES) in out, out
+    assert "цветов 2: MAVI MELANJ, MINT MELANJ" in out, out
