@@ -2,8 +2,17 @@
 
 Запуск:
     C:\\sync_admin\\.venv\\Scripts\\python.exe C:\\sync_admin\\scripts\\probe_movements.py "39681 SELIANIK"
-    ... probe_movements.py 39681 54            # только размер 54
+    ... probe_movements.py 39681 M             # только размер M
+    ... probe_movements.py 39681 M "MAVI MELANJ"   # размер И цвет
+    ... probe_movements.py 39681 "" "MAVI MELANJ"  # весь ряд одного цвета
     ... probe_movements.py 2000932153711       # по баркоду (найдёт весь ряд)
+
+**Артикул один не только на размеры, но и на ЦВЕТА.** 03.10 на бою по
+«39681 SELIANIK» вышло 45 строк: девять цветов на пять размеров. Человек при
+этом называет товар ЦВЕТОМ («Свитшот MAVI MELANJ»), потому что так он выглядит
+на витрине, — и получал простыню, в которой нужные пять строк искал глазами.
+Цвет сузить обязательно, и пустой размер вторым аргументом это позволяет: ряд
+одного цвета — такой же законный вопрос, как один размер всех цветов.
 
 Чем отличается от `probe_offset.py`. Тот отвечает на вопрос «откуда взялся
 порог у ОДНОЙ строки» и при многоразмерном артикуле намеренно ОТКАЗЫВАЕТ: числа
@@ -92,7 +101,7 @@ def _size_key(product: Product):
         return (1, 0.0, raw.upper())
 
 
-def _find_rows(db, needle: str, wanted_size: str):
+def _find_rows(db, needle: str, wanted_size: str, wanted_color: str = ""):
     """Строки ряда: по ID_1С, баркоду, артикулу целиком и по куску артикула.
 
     Баркод обязателен, и не для удобства: артикул человек видит на площадке, а
@@ -130,7 +139,23 @@ def _find_rows(db, needle: str, wanted_size: str):
         if not exact:
             print(f"нашлось строк: {len(rows)}, а размера «{wanted_size}» среди "
                   f"них НЕТ. Есть: "
-                  + ", ".join(sorted((p.size or "-") for p in rows)))
+                  + ", ".join(sorted({(p.size or "-") for p in rows})))
+            return []
+        rows = exact
+
+    if wanted_color:
+        # Цвет сверяем по КУСКУ и без регистра: человек называет его так, как
+        # видит на витрине («MAVI MELANJ»), а у нас он записан как придётся —
+        # «BEJ MEL/TAS MEL», лишние пробелы, другой регистр. Требуй точного
+        # совпадения, и самый обычный запрос отвечал бы «такого цвета нет» при
+        # том, что строка есть, — то есть отказ был бы НЕПРАВДОЙ.
+        needle_color = wanted_color.strip().upper()
+        exact = [p for p in rows
+                 if needle_color in (p.color or "").strip().upper()]
+        if not exact:
+            print(f"нашлось строк: {len(rows)}, а цвета «{wanted_color}» среди "
+                  f"них НЕТ. Есть: "
+                  + ", ".join(sorted({(p.color or "-") for p in rows})))
             return []
         rows = exact
 
@@ -250,16 +275,18 @@ def _print_row(db, product: Product) -> dict:
 
 def main() -> int:
     if len(sys.argv) < 2:
-        print("укажите артикул, ID_1С или баркод; вторым аргументом — размер")
+        print("укажите артикул, ID_1С или баркод; далее размер и цвет")
+        print('пример: probe_movements.py 39681 M "MAVI MELANJ"')
         return 1
     needle = sys.argv[1].strip()
     wanted_size = sys.argv[2].strip() if len(sys.argv) > 2 else ""
+    wanted_color = sys.argv[3].strip() if len(sys.argv) > 3 else ""
 
     db = SessionLocal()
     try:
-        rows = _find_rows(db, needle, wanted_size)
+        rows = _find_rows(db, needle, wanted_size, wanted_color)
         if not rows:
-            if wanted_size == "":
+            if not wanted_size and not wanted_color:
                 print(f"не найдено ни по ID_1С, ни по баркоду, ни по артикулу: "
                       f"{needle}")
             return 1
@@ -268,8 +295,16 @@ def main() -> int:
         print("=" * 78)
         print(f"АРТИКУЛ: {article}")
         print(f"Название: {rows[0].name or '-'}")
-        print(f"Строк 1С: {len(rows)}   размеры: "
-              + ", ".join((p.size or "-") for p in rows))
+        # Размеры и цвета печатаются БЕЗ ПОВТОРОВ. По 45 строкам список
+        # выходил как «L, L, L, L, L, L, L, L, L, M, M, M…» — он не говорил ни
+        # сколько размеров, ни сколько цветов, то есть занимал три строки
+        # экрана и не отвечал ни на один вопрос.
+        sizes = sorted({(p.size or "-") for p in rows},
+                       key=lambda s: _size_key(Product(size=s)))
+        colors = sorted({(p.color or "-") for p in rows})
+        print(f"Строк 1С: {len(rows)}"
+              f"   размеров {len(sizes)}: " + ", ".join(sizes))
+        print(f"           цветов {len(colors)}: " + ", ".join(colors))
         print("-" * 78)
         # Про пояс говорим ПРЯМО, и это не вежливость. Всё время в базе UTC, а
         # документы в 1С стоят по местному: у Москвы UTC+3, и человек, сверяющий
