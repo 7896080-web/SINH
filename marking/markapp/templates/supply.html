@@ -75,9 +75,13 @@
         <label>Итоги<select name="totals_mode"><option value="rows">rows — шапка = сумма строк</option><option value="reference">reference — как в эталонах</option></select></label>
         {% if upd %}<input type="hidden" name="replace_id" value="{{ upd.id_file }}">
         <label>Причина перевыпуска<input name="replace_reason" size="28" required placeholder="обязательно"></label>{% endif %}
-        <button {{ 'disabled' if not (fbo and fbo.ok) }}>{{ 'Перевыпустить' if upd else 'Выпустить УПД' }}</button>
+        <button {{ 'disabled' if not (fbo and fbo.ok) or (intro and intro.blocking) }}>{{ 'Перевыпустить' if upd else 'Выпустить УПД' }}</button>
       </div>
     </form>
+    {% if intro and intro.blocking %}<p class="bad">Выпуск закрыт: {{ intro.blocking }}.
+      <a href="/supplies/{{ supply.id }}/codes">Коды ЧЗ →</a></p>
+    {% elif intro and intro.warning %}<p class="warn">{{ intro.warning }}.</p>
+    {% elif intro and intro.total %}<p class="ok">Все {{ intro.total }} кодов выгрузки — в обороте.</p>{% endif %}
     {% if upd %}
     <p><a class="btn secondary" href="/supplies/{{ supply.id }}/upd.xml">Скачать {{ upd.doc_number }}.xml</a></p>
     <p class="muted">от {{ upd.doc_date|ru }}, схема: {{ scheme_labels[upd.scheme] }}{{ ' (вручную)' if upd.scheme_manual }},

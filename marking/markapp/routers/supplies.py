@@ -123,11 +123,17 @@ def supply_detail(supply_id: int, request: Request, db: Session = Depends(get_db
     editable = (supply.status in [s.value for s in EDITABLE_STATUSES]
                 and not S.movement_sent(supply))
     problems = S.blocking_problems(supply) + (S.catalog_drift(db, supply) if editable else [])
+    intro = None
+    if fbo is not None and fbo.ok:
+        try:
+            intro = U.introduction_check(db, supply, [r.kiz for r in U.read_fbo(fbo.content).rows])
+        except Exception:  # noqa: BLE001 — страница не падает из-за файла; выпуск проверит сам
+            intro = None
     return render(request, "supply.html", user, "supplies", supply=supply, tasks=tasks,
                   totals=S.totals(supply), problems=problems,
                   move_problems=S.movement_problems(supply),
                   editable=editable,
-                  epf_ready=onec.epf_ready(db), fbo=fbo, upd=upd, scheme=scheme,
+                  epf_ready=onec.epf_ready(db), fbo=fbo, upd=upd, scheme=scheme, intro=intro,
                   scheme_warn=scheme_warn, sticker_warn=sticker_warn,
                   scheme_labels=U.SCHEME_LABELS, pending=pending, today=today_local(),
                   gtins=gtins, cards=cards, onec_notes=S.shared_onec_items(supply),
@@ -374,6 +380,12 @@ def supply_upd(supply_id: int, request: Request, doc_date: str = Form(...),
         d = _date_or_none(doc_date)
         if d is None:
             raise S.SupplyError("укажите дату УПД")
+        # Ввод в оборот — ДО сборки и без «force»: «выпустить с ошибками проверки»
+        # снимает замечания к XML, а это не замечание — ЧЗ откажет в передаче кодов
+        # уже после того, как Lamoda подпишет УПД.
+        intro = U.introduction_check(db, supply, [r.kiz for r in U.read_fbo(fbo.content).rows])
+        if intro.blocking:
+            raise S.SupplyError("УПД не выпущен: " + intro.blocking)
         built = U.build_for_supply(db, supply, fbo.content, d, totals_mode)
         errors = U.has_errors(built.findings)
         if errors and not force:
@@ -416,7 +428,9 @@ def supply_upd(supply_id: int, request: Request, doc_date: str = Form(...),
         msg = f"УПД {supply.doc_number} выпущен: {built.positions} поз., с НДС {built.total_with_vat}."
         if built.scheme_warning:
             msg += " Внимание: " + built.scheme_warning
-        flash(request, msg, "warn" if (built.scheme_warning or errors) else "ok")
+        if intro.warning:
+            msg += " Внимание: " + intro.warning + "."
+        flash(request, msg, "warn" if (built.scheme_warning or errors or intro.warning) else "ok")
     except S.SupplyError as e:
         db.rollback()
         flash(request, str(e), "error")

@@ -173,6 +173,51 @@ def _kiz_problems(rows, supply: Supply, db) -> list[str]:
     return out
 
 
+# --- Ввод в оборот перед УПД ------------------------------------------------------
+
+INTRODUCED = "INTRODUCED"
+_STATUS_RU = {"EMITTED": "эмитирован", "APPLIED": "нанесён", "": "статус не запрашивался"}
+
+
+@dataclass
+class IntroCheck:
+    """Можно ли передавать коды выгрузки FBO по УПД.
+
+    УПД с КИЗ уходит в ЧЗ через ЭДО, и ЧЗ отказывает в передаче кода, который
+    не в обороте. Узнать это до отправки можно только по своим кодам: статус
+    `mark_codes` обновляет фоновое задание `codes_status` и кнопка на «Кодах ЧЗ».
+    """
+    blocking: str = ""        # непусто — УПД не выпускается, и `force` это не снимает
+    warning: str = ""         # коды не наши: статус программа не знает
+    not_introduced: int = 0
+    total: int = 0
+
+
+def introduction_check(db: Session, supply: Supply, kizes: list[str]) -> IntroCheck:
+    from markapp.models import MarkCode
+    res = IntroCheck(total=len(kizes))
+    ours = {c.cis: c for c in db.query(MarkCode).filter(MarkCode.supply_id == supply.id).all()}
+    if not ours:
+        if kizes:
+            res.warning = ("коды заказаны не программой — ввод в оборот она не видит; "
+                           "перед отправкой УПД проверьте в ЛК ЧЗ, что все коды «в обороте»")
+        return res
+    by_status: dict[str, int] = defaultdict(int)
+    for k in kizes:
+        c = ours.get((k or "").strip())
+        if c is None:
+            continue          # чужой код — это ошибка сверки FBO (_kiz_problems), не здесь
+        if c.status != INTRODUCED:
+            by_status[c.status] += 1
+    res.not_introduced = sum(by_status.values())
+    if res.not_introduced:
+        parts = ", ".join(f"{_STATUS_RU.get(s, s)}: {n}" for s, n in sorted(by_status.items()))
+        res.blocking = (f"не в обороте {res.not_introduced} из {res.total} кодов ({parts}). "
+                        "ЧЗ не примет передачу таких кодов по УПД: сначала «Ввод в оборот» "
+                        "на странице «Коды ЧЗ», затем «Обновить статусы»")
+    return res
+
+
 # --- Сборка УПД ---------------------------------------------------------------
 
 def seller_of(org: Organization) -> C.SellerIP:
