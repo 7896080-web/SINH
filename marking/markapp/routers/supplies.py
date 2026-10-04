@@ -276,7 +276,10 @@ def supply_move(supply_id: int, request: Request, db: Session = Depends(get_db),
             raise S.SupplyError("обработка 1С не обновлена под маркировку")
         busy = (db.query(OnecTask).filter(OnecTask.supply_id == supply.id,
                                           OnecTask.command == "SUPPLY_MOVEMENT",
-                                          OnecTask.status.in_(("pending", "sent"))).first())
+                                          OnecTask.status.in_(("pending", "sent", "timeout"))).first())
+        if busy and busy.status == "timeout":
+            raise S.SupplyError("перемещение уже отправлялось и зависло — сначала посмотрите документ в 1С, "
+                                "затем «Повторить» у задания внизу страницы")
         if busy:
             raise S.SupplyError("перемещение уже отправлено, ждём ответа 1С")
         task = onec.enqueue_movement(db, supply)
@@ -300,6 +303,12 @@ def supply_retry(supply_id: int, task_id: int, request: Request, db: Session = D
         if task is None or task.supply_id != supply.id or task.command != "SUPPLY_MOVEMENT" \
                 or task.status != "timeout":
             raise S.SupplyError("повторить можно только зависшее перемещение")
+        if supply.status != SupplyStatus.checked.value:
+            # Перемещена (ответ лёг на другое задание) или вернулась в черновик —
+            # повтор либо лишний, либо обходит проверку остатка.
+            raise S.SupplyError("повтор не нужен: поставка уже не в статусе «проверено в 1С»")
+        if not onec.epf_ready(db):
+            raise S.SupplyError("обработка 1С не обновлена под маркировку")
         new = onec.enqueue_movement(db, supply)
         audit.log(db, user.username, "onec_movement_retry", f"поставка {supply.number}",
                   f"после задания {task.id}: {new.order_id}")
@@ -320,7 +329,7 @@ async def supply_fbo(supply_id: int, request: Request, file: UploadFile = File(.
             raise S.SupplyError("выгрузку «Поставки FBO» загружают после перемещения в 1С")
         data = await _read(file)
         try:
-            res = U.check_fbo_against_supply(data, supply)
+            res = U.check_fbo_against_supply(data, supply, db)
         except Exception as e:
             raise S.SupplyError(f"выгрузка не разобрана: {e}")
         report = "\n".join(res.problems + getattr(res, "_diffs", []) + res.notes)

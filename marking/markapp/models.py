@@ -25,7 +25,7 @@ class User(Base):
 
 
 class Organization(Base):
-    """ИП. Реквизиты для УПД и (с этапа 4) доступ к Честному знаку."""
+    """ИП. Реквизиты для УПД и доступ к Честному знаку (вход — chz_auth)."""
     __tablename__ = "organizations"
     id = Column(Integer, primary_key=True)
     name = Column(String(200), nullable=False)          # «ИП Яворская Т.Н.» — для экрана
@@ -43,12 +43,17 @@ class Organization(Base):
     sticker_sender = Column(String(200), nullable=False, default="")
     # Идентификатор участника ЭДО (часть ИдФайл УПД).
     edo_sender_id = Column(String(100), nullable=False, default="")
-    # --- Честный знак (этап 4) ---
+    # --- Честный знак ---
     chz_contour = Column(String(20), nullable=False, default="production")
     oms_id = Column(String(64), nullable=True)
     connection_id = Column(String(64), nullable=True)
     nk_api_key_enc = Column(Text, nullable=True)
     cert_thumbprint = Column(String(64), nullable=True)
+    # Токены входа сертификатом (chz_auth), зашифрованы; срок — UTC.
+    chz_token_enc = Column(Text, nullable=True)
+    chz_token_until = Column(DateTime, nullable=True)
+    suz_token_enc = Column(Text, nullable=True)
+    suz_token_until = Column(DateTime, nullable=True)
     is_active = Column(Boolean, nullable=False, default=True)
     created_at = Column(DateTime, nullable=False, default=now_utc)
 
@@ -133,6 +138,10 @@ class Supply(Base):
     # Заголовки дополнительных колонок входного файла (например «ТНВЭД»):
     # они копируются в каждую строку при развёртке.
     extra_headers = Column(JSON, nullable=False, default=list)
+    # Данные документа «Ввод в оборот» по умолчанию для поставки (ТН ВЭД,
+    # разрешительный документ, дата производства). Колонки файла поставки и
+    # карточка НК по строке — важнее (codes.intro_attrs).
+    intro_attrs = Column(JSON, nullable=True)
     onec_document = Column(String(50), nullable=False, default="")
     moved_at = Column(DateTime, nullable=True)
     is_test = Column(Boolean, nullable=False, default=False)
@@ -292,6 +301,86 @@ class NkRequest(Base):
     organization_id = Column(Integer, ForeignKey("organizations.id"), nullable=False, index=True)
     at = Column(DateTime, nullable=False, default=now_utc, index=True)
     http_status = Column(Integer, nullable=True)
+
+
+class CodeOrder(Base):
+    """Заказ кодов в СУЗ под строку поставки (ТЗ, 7.1).
+
+    Пишется в базу ДО отправки: тело хранится ровно тем, что подписано
+    (подпись откреплённая — один байт разницы, и СУЗ её не примет). Номер
+    заказа СУЗ — сразу после ответа; коды — по мере получения. Сбой на
+    середине ничего не теряет: повтор продолжает с места остановки.
+    """
+    __tablename__ = "code_orders"
+    id = Column(Integer, primary_key=True)
+    supply_id = Column(Integer, ForeignKey("supplies.id"), nullable=False, index=True)
+    organization_id = Column(Integer, ForeignKey("organizations.id"), nullable=False)
+    supplier_sku = Column(String(300), nullable=False)
+    gtin = Column(String(14), nullable=False)
+    quantity = Column(Integer, nullable=False)
+    body = Column(Text, nullable=False)
+    # new — записан, не отправлен; sending — уходит прямо сейчас (захвачен
+    # одной вкладкой); unknown — ответа СУЗ нет (таймаут, 5xx): заказ МОГ
+    # создаться, повторять нельзя до решения человека; sent — СУЗ дал номер,
+    # коды не готовы; ready — коды можно забирать; done — все получены;
+    # rejected / error — заказа нет или он отклонён.
+    status = Column(String(20), nullable=False, default="new", index=True)
+    suz_order_id = Column(String(64), nullable=False, default="")
+    # OMS ID на момент заказа: путь статуса и кодов строится по нему, а не по
+    # текущему значению у организации (его могли поменять между шагами).
+    oms_id = Column(String(64), nullable=True)
+    # Сколько кодов СУЗ сообщил готовыми (availableCodes) — больше не просим.
+    available = Column(Integer, nullable=True)
+    received = Column(Integer, nullable=False, default=0)
+    error = Column(Text, nullable=False, default="")
+    created_by = Column(String(64), nullable=False, default="")
+    created_at = Column(DateTime, nullable=False, default=now_utc)
+    updated_at = Column(DateTime, nullable=False, default=now_utc)
+
+
+class MarkCode(Base):
+    """Код маркировки, закреплённый за поставкой навсегда (ТЗ, 4 и 3.2).
+
+    Короткий КИ (`01…21…`, 31 символ) — открыто, по нему спрашивают статус и
+    вводят в оборот. Полный код (с криптохвостом) — только зашифрованным:
+    по нему печатается этикетка, это секрет.
+    """
+    __tablename__ = "mark_codes"
+    id = Column(Integer, primary_key=True)
+    cis = Column(String(40), nullable=False, unique=True)
+    full_enc = Column(Text, nullable=False)
+    gtin = Column(String(14), nullable=False, index=True)
+    supplier_sku = Column(String(300), nullable=False, default="")
+    supply_id = Column(Integer, ForeignKey("supplies.id"), nullable=False, index=True)
+    order_id = Column(Integer, ForeignKey("code_orders.id"), nullable=True, index=True)
+    # Статус ГИС МТ по /cises/info: EMITTED, APPLIED, INTRODUCED, …; пусто — не спрашивали.
+    status = Column(String(30), nullable=False, default="", index=True)
+    status_at = Column(DateTime, nullable=True)
+    applied_at = Column(DateTime, nullable=True)
+    introduce_doc_id = Column(Integer, ForeignKey("introduce_docs.id"), nullable=True)
+    received_at = Column(DateTime, nullable=False, default=now_utc)
+
+
+class IntroduceDoc(Base):
+    """Документ «Ввод в оборот» (LP_INTRODUCE_GOODS), отправленный в ГИС МТ."""
+    __tablename__ = "introduce_docs"
+    id = Column(Integer, primary_key=True)
+    supply_id = Column(Integer, ForeignKey("supplies.id"), nullable=False, index=True)
+    organization_id = Column(Integer, ForeignKey("organizations.id"), nullable=False)
+    # base64 JSON документа — ровно то, что подписано (прикреплённая подпись).
+    document = Column(Text, nullable=False)
+    codes_count = Column(Integer, nullable=False)
+    # new — подготовлен, ждёт подписи; sending — уходит; unknown — ответа ЧЗ
+    # нет или он без номера: документ МОГ уйти, коды заняты до решения;
+    # sent — принят ЧЗ, идёт проверка; CHECKED_OK / CHECKED_NOT_OK — итог ЧЗ;
+    # error — не отправлен.
+    status = Column(String(20), nullable=False, default="new", index=True)
+    doc_id = Column(String(64), nullable=False, default="")
+    error = Column(Text, nullable=False, default="")
+    created_by = Column(String(64), nullable=False, default="")
+    created_at = Column(DateTime, nullable=False, default=now_utc)
+    sent_at = Column(DateTime, nullable=True)
+    checked_at = Column(DateTime, nullable=True)
 
 
 class OnecBarcode(Base):

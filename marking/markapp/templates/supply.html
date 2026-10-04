@@ -52,6 +52,11 @@
     </form>
   </div>
   <div class="card">
+    <h2>Коды ЧЗ</h2>
+    <p class="muted">Заказ в СУЗ по артикулам поставки, получение кодов, статусы и ввод в оборот.</p>
+    <p><a class="btn{{ '' if supply.status in ('moved', 'upd_issued', 'accepted') else ' secondary' }}" href="/supplies/{{ supply.id }}/codes">Открыть «Коды ЧЗ»</a></p>
+  </div>
+  <div class="card">
     <h2>3. Выгрузка «Поставки FBO»</h2>
     <p class="muted">После загрузки файла с кодами в Lamoda Seller скачайте оттуда «Поставки FBO» и загрузите сюда — программа сверит её с поставкой.</p>
     <form method="post" action="/supplies/{{ supply.id }}/fbo" enctype="multipart/form-data">
