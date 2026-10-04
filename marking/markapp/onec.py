@@ -160,10 +160,12 @@ def has_work(db: Session) -> bool:
     """Есть ли зачем обращаться к 1С: задание ждёт отправки или ответа.
 
     Обмен по факту работы с поставкой, а не постоянный опрос: пока заданий нет,
-    сервер не трогаем вовсе. Зависшие ждём ещё сутки — опоздавший ответ честнее
+    сервер не трогаем вовсе. Зависшие ждём ещё неделю — опоздавший ответ честнее
     вечного «timeout» (AWAITING), но опрашивать их вечно незачем.
     """
-    recent = now_utc() - timedelta(days=1)
+    # Неделя, а не сутки: компьютер выключают на выходные, и ответ на пятничное
+    # задание должен забраться в понедельник.
+    recent = now_utc() - timedelta(days=7)
     return db.query(OnecTask).filter(
         OnecTask.is_test.is_(False),
         (OnecTask.status.in_((OnecTaskStatus.pending.value, OnecTaskStatus.sent.value)))
@@ -266,10 +268,26 @@ def _apply_check(db: Session, task: OnecTask, res: ResultLine, check: dict[str, 
     supply = db.get(Supply, task.supply_id) if task.supply_id else None
     if supply is None:
         return
+    # Ответ применяется, только если это ПОСЛЕДНЯЯ проверка И состав с её
+    # отправки не менялся (строка задания та же). Иначе старый ответ расставил
+    # бы строкам данные чужого состава, а «OK» объявил бы проверенным состав,
+    # который 1С не видела (правка после отправки без новой проверки).
+    latest = (db.query(OnecTask).filter(OnecTask.supply_id == supply.id,
+                                        OnecTask.command == "SUPPLY_CHECK")
+              .order_by(OnecTask.id.desc()).first())
+    if latest is not None and latest.id != task.id:
+        return
+    if task.line != supply_line("SUPPLY_CHECK", task.order_id, supply):
+        if supply.status == SupplyStatus.checked.value:
+            supply.status = SupplyStatus.draft.value
+        return
     for row in supply.rows:
         rec = check.get(row.ean)
         if rec is None:
             row.onec_status = "not_found" if check else ""
+            row.onec_item_id = row.onec_article = row.onec_name = ""
+            row.onec_size = row.onec_color = ""
+            row.onec_stock = None
             continue
         row.onec_item_id = rec["item_id"]
         row.onec_article = rec["article"]
@@ -278,14 +296,6 @@ def _apply_check(db: Session, task: OnecTask, res: ResultLine, check: dict[str, 
         row.onec_color = rec["color"]
         row.onec_stock = _to_int(rec["stock"])
         row.onec_status = rec["status"].lower() or "ok"
-    # Статус поставки двигает только ответ на ПОСЛЕДНЮЮ проверку: правка строк
-    # между проверками возвращает поставку в черновик, и старый ответ не должен
-    # объявить проверенным изменённый состав.
-    latest = (db.query(OnecTask).filter(OnecTask.supply_id == supply.id,
-                                        OnecTask.command == "SUPPLY_CHECK")
-              .order_by(OnecTask.id.desc()).first())
-    if latest is not None and latest.id != task.id:
-        return
     if supply.status in (SupplyStatus.draft.value, SupplyStatus.checked.value):
         # 1С ответила OK, но два артикула легли на один SKU 1С — сопоставление не
         # один к одному, перемещать нельзя (`supplies.movement_problems`).
@@ -298,6 +308,10 @@ def _apply_movement(db: Session, task: OnecTask, res: ResultLine) -> None:
     if supply is None:
         return
     if res.status == "OK":
+        if supply.status not in (SupplyStatus.draft.value, SupplyStatus.checked.value):
+            # Опоздавший ответ на повтор: поставка уже перемещена (и, может быть,
+            # с УПД). Назад в «перемещено» её не возвращаем.
+            return
         supply.status = SupplyStatus.moved.value
         supply.onec_document = res.detail[:50]
         supply.moved_at = now_utc()
@@ -309,7 +323,8 @@ def _apply_movement(db: Session, task: OnecTask, res: ResultLine) -> None:
         supply.status = SupplyStatus.draft.value
 
 
-def apply_result_text(db: Session, text: str, check_text: str = "", dict_text: str = "") -> dict:
+def apply_result_text(db: Session, text: str, check_text: str = "", dict_text: str = "",
+                      label: str = "") -> dict:
     """Применяет файл ответа. Возвращает счётчики. Не коммитит."""
     stats = {"ok": 0, "error": 0, "unmatched": 0}
     check = parse_check_file(check_text) if check_text else {}
@@ -317,10 +332,13 @@ def apply_result_text(db: Session, text: str, check_text: str = "", dict_text: s
         res = parse_result_line(raw)
         if res is None:
             continue
-        task = (db.query(OnecTask)
-                .filter(OnecTask.order_id == res.order_id, OnecTask.command == res.command,
-                        OnecTask.status.in_(AWAITING))
-                .order_by(OnecTask.id).first())
+        found = (db.query(OnecTask)
+                 .filter(OnecTask.order_id == res.order_id, OnecTask.command == res.command,
+                         OnecTask.status.in_(AWAITING))
+                 .order_by(OnecTask.id).all())
+        # У повторов перемещения order_id один: ответ — заданию из того же файла.
+        task = next((t for t in found if label and t.filename == f"task_{label}.txt"),
+                    found[0] if found else None)
         if task is None:
             stats["unmatched"] += 1
             continue
@@ -381,7 +399,14 @@ def _collect(db: Session, ex) -> dict:
                 continue
             check_text = ex.read_result(check_name) or ""
             dict_text = ex.read_result(dict_name) or ""
-            stats = apply_result_text(db, text, check_text, dict_text)
+            if not check_text and any((r := parse_result_line(x)) and r.command == "SUPPLY_CHECK"
+                                      and r.status == "OK" for x in text.splitlines()):
+                # На OK проверки 1С всегда пишет supplycheck_ ДО result_. Его нет —
+                # сбой чтения; применить «OK» без построчных данных значило бы
+                # объявить поставку проверенной вслепую. Ждём следующего прохода.
+                total["failed_files"].append(f"{name}: нет {check_name} — ответ отложен")
+                continue
+            stats = apply_result_text(db, text, check_text, dict_text, label=label)
             db.commit()
         except Exception as e:
             db.rollback()

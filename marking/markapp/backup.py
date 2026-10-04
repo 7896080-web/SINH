@@ -26,6 +26,7 @@ import logging
 import os
 import re
 import sqlite3
+import threading
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -37,7 +38,7 @@ from markapp.timeutils import local_date_of, now_utc
 logger = logging.getLogger(__name__)
 
 NAME_PREFIX = "marking-"
-NAME_RE = re.compile(r"^marking-(\d{8})-(\d{6})\.db$")
+NAME_RE = re.compile(r"^marking-(\d{8})-(\d{6})(?:-\d+)?\.db$")   # «-N» — вторая копия в ту же секунду
 KEEP_DAILY = 14
 KEEP_WEEKLY = 8
 KEEP_ALL_WITHIN_HOURS = 24
@@ -220,7 +221,17 @@ def upload_to_remote(source: Path) -> str:
     return ""
 
 
+_LOCK = threading.Lock()
+
+
 def make_backup(url: str | None = None, directory: Path | None = None) -> BackupResult:
+    """Одна копия за раз: суточная и внеочередная (после кодов) не пишут в один
+    файл и не запускают два rclone на одном конфиге (ТЗ, 11)."""
+    with _LOCK:
+        return _make_backup(url, directory)
+
+
+def _make_backup(url: str | None = None, directory: Path | None = None) -> BackupResult:
     source = database_path(url)
     if source is None:
         return BackupResult("", 0, False, "база не SQLite — копию снимать нечем")
@@ -229,6 +240,10 @@ def make_backup(url: str | None = None, directory: Path | None = None) -> Backup
     directory = Path(directory or config.BACKUP_DIR)
     directory.mkdir(parents=True, exist_ok=True)
     target = directory / f"{NAME_PREFIX}{now_utc():%Y%m%d-%H%M%S}.db"
+    n = 1
+    while target.exists():            # две копии в одну секунду — не перезаписывать
+        target = directory / f"{NAME_PREFIX}{now_utc():%Y%m%d-%H%M%S}-{n}.db"
+        n += 1
     try:
         src = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
         try:

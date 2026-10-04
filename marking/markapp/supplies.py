@@ -14,6 +14,7 @@ from datetime import date
 
 import openpyxl
 from openpyxl.utils.datetime import from_excel
+from sqlalchemy import func
 from sqlalchemy.orm import Session, object_session
 
 from markapp import settings
@@ -163,9 +164,11 @@ def validate_numbers(db: Session, number: str, doc_number: str, supply_id: int |
     q = db.query(Supply)
     if supply_id:
         q = q.filter(Supply.id != supply_id)
-    if q.filter(Supply.number == number).first():
+    # Без учёта регистра: ПОДОБНО в 1С регистр, скорее всего, не различает, и
+    # «a1» нашла бы документ поставки «A1» (та же причина, что запрет «_»).
+    if q.filter(func.upper(Supply.number) == (number or "").upper()).first():
         errs.append(f"поставка с номером {number} уже есть")
-    if q.filter(Supply.doc_number == doc_number).first():
+    if q.filter(func.upper(Supply.doc_number) == (doc_number or "").upper()).first():
         errs.append(f"номер документа {doc_number} уже занят другой поставкой")
     return errs
 

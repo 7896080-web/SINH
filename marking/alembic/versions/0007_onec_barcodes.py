@@ -1,7 +1,11 @@
 """Справочник баркодов 1С для страницы сопоставления
 
-Revision ID: 0004
-Revises: 0003
+Была 0004 в ветке до объединения с веткой рабочего компьютера (там 0004–0006 —
+токены ЧЗ и реестр кодов, и они уже применены к боевой базе), поэтому стала
+последней. Миграция идемпотентна: проверяет, есть ли таблица.
+
+Revision ID: 0007
+Revises: 0006
 Create Date: 2026-10-01 18:00:00
 
 """
@@ -9,8 +13,8 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = '0004'
-down_revision = '0003'
+revision = '0007'
+down_revision = '0006'
 branch_labels = None
 depends_on = None
 

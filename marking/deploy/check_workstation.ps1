@@ -107,4 +107,8 @@ if ($scan) {
     & ssh-keygen -l -f $tmp
     Remove-Item $tmp
     Note "этот отпечаток сверяют с сервером (SFTP_1C.md, шаг 5) — сам по себе он ничего не доказывает"
+} elseif ($t.TcpTestSucceeded) {
+    # Порт открыт, а ssh-keyscan молчит: клиент Windows 9.5 не договаривается
+    # с OpenSSH 10 («unsupported KEX method»). Установщик берёт ключ иначе.
+    Note "ssh-keyscan не получил ключ, хотя $Server`:$SshPort открыт (старый клиент OpenSSH в Windows) — отпечаток покажет install_workstation.ps1"
 } else { Note "SSH на $Server`:$SshPort не ответил" }
