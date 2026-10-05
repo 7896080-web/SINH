@@ -140,3 +140,14 @@ def test_rows_export_to_excel_like_the_screen(client, db):
     row_b = [c.value for c in ws[6]]
     assert -2 in row_b and "не хватает" in row_b                  # остаток и ответ 1С как на экране
     assert ws.cell(row=ws.max_row, column=2).value == "Итого" and ws.cell(row=ws.max_row, column=3).value == 10
+
+
+def test_refresh_all_requeues_every_card(client, db):
+    from markapp.models import NkCard
+    db.add_all([NkCard(gtin="04620180403734", status="ok", tn_ved="6103490001"),
+                NkCard(gtin="04630688318072", status="not_found")])
+    db.commit()
+    r = client.post("/gtin/refresh-all", follow_redirects=False)
+    assert r.status_code == 303
+    db.expire_all()
+    assert {c.status for c in db.query(NkCard)} == {"pending"}
