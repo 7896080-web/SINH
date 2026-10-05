@@ -24,9 +24,19 @@ if (-not (Test-Path $venvPy)) { Fail "Нет $venvPy — сначала install_
 # Остановить запущенную программу: миграция на живой базе и старый код в
 # памяти — плохое сочетание. Ищем именно наш uvicorn по порту в командной строке.
 Info "Останавливаю программу, если запущена"
-Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
+# Без фильтра по имени: python.exe в .venv при Python из Microsoft Store — только
+# оболочка, сам сервер живёт в дочернем процессе с другим именем (python3.14.exe).
+# Убивали одну оболочку, сервер оставался, run_marking видел «уже запущена» —
+# и обновление молча работало на старом коде (05.10.2026).
+Get-CimInstance Win32_Process |
     Where-Object { $_.CommandLine -like "*markapp.main:app*" -and $_.CommandLine -like "*--port $WebPort*" } |
-    ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+$up = $true
+for ($i = 0; $i -lt 20 -and $up; $i++) {
+    try { Invoke-WebRequest "http://127.0.0.1:$WebPort/login" -UseBasicParsing -TimeoutSec 2 | Out-Null; Start-Sleep -Milliseconds 500 }
+    catch { $up = $false }
+}
+if ($up) { Fail "Программа на порту $WebPort не остановилась — закройте её (Диспетчер задач: python) и запустите обновление снова" }
 
 Info "Копия базы до обновления"
 & $venvPy -c "import markapp; from markapp import backup; r=backup.make_backup(); print(r.path, r.error or 'ok'); raise SystemExit(1 if r.error else 0)"

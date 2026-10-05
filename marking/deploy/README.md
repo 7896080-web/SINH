@@ -92,7 +92,7 @@
 
 Сначала остановить программу (как в `update_workstation.ps1`):
 ```powershell
-Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object { $_.CommandLine -like "*markapp.main:app*" } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like "*markapp.main:app*" } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
 # Прежнюю базу ВМЕСТЕ со спутниками -wal/-shm отложить, а не удалять:
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 foreach ($s in @("", "-wal", "-shm")) {
