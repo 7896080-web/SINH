@@ -1,0 +1,17 @@
+# «Ввод в оборот» — отдельная программа: коды из ЛК ЧЗ (PDF) → ввод в оборот →
+# проверка → txt. Версии — как у «Маркировки» на этой же машине.
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+sqlalchemy==2.0.35
+jinja2==3.1.4
+python-multipart==0.0.9
+cryptography==43.0.1
+requests==2.32.3
+pillow==12.3.0
+zxing-cpp==3.1.1
+pypdfium2==5.14.0
+pytest==8.3.3
+httpx==0.27.2
+# Этикетки 58×40 — как в «Маркировке»: libzint (GS1 DataMatrix) и reportlab.
+zint-bindings==1.2.2
+reportlab==5.0.1

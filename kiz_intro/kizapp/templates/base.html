@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}Ввод в оборот{% endblock %}</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="icon" href="/static/favicon.ico">
+</head>
+<body>
+<header>
+  <span class="brand">Ввод в оборот</span>
+  <nav><a href="/">ИП и партии</a></nav>
+  <span class="muted" style="margin-left:auto;color:#cfd6e4">{{ org.name if org is defined and org else '' }}</span>
+</header>
+<main>
+  {% if msg %}<div class="flash {{ 'error' if level == 'error' else level }}">{{ msg }}</div>{% endif %}
+  {% block content %}{% endblock %}
+</main>
+</body>
+</html>
