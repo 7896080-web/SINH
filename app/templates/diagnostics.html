@@ -284,6 +284,23 @@
         </div>
     </div>
 
+    {# Причина сбоя — ТЕКСТОМ, а не в подсказке у бейджа. Она лежала только в
+       `title`, и это не читатель: глазами не видно, по RDP наводить мышкой
+       мучительно, скопировать в переписку нельзя, а длинный ответ площадки
+       подсказка обрезает. 05.10 разом погасли три кабинета WB, и человек видел
+       «отключён» и число сбоёв — но не то, чем ответила площадка, тогда как
+       ответ был записан в базе с самого начала. Писатель без читателя.
+       Показываем у ЛЮБОГО кабинета с непустой ошибкой, а не только у
+       погашенного: четыре сбоя подряд — это тот же отказ, просто пятого ещё
+       не случилось, и разобраться дешевле до того, как кабинет снимут. #}
+    {% if account.last_error %}
+    <div class="flash flash--warn" style="margin:10px 0">
+        <strong>{% if account.is_active %}Последняя ошибка{% else %}Причина отключения{% endif %}:</strong>
+        <div style="margin-top:4px;font-family:ui-monospace,Menlo,Consolas,monospace;
+                    font-size:12px;white-space:pre-wrap;word-break:break-word">{{ account.last_error }}</div>
+    </div>
+    {% endif %}
+
     {% if account.last_connection_check_at %}
     <p class="help-text">
         Последняя проверка подключения: {{ account.last_connection_check_at.strftime('%d.%m.%Y %H:%M:%S') }} —

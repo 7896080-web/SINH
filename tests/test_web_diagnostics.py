@@ -132,3 +132,51 @@ def test_shared_workers_heartbeat_shown(logged_in_client, web_db):
 
     r = logged_in_client.get("/diagnostics")
     assert "dispatch" in r.text
+
+
+def test_the_breaker_reason_is_readable_not_only_a_tooltip(logged_in_client, web_db):
+    """Причина отключения — ТЕКСТОМ на странице, а не в подсказке у бейджа.
+
+    Предохранитель пишет ответ площадки в `PlatformAccount.last_error` с самого
+    начала, но показывался он только в `title` жёлтого бейджа — а это не
+    читатель: глазами не видно, по RDP наводить мышкой мучительно, скопировать
+    в переписку нельзя, длинный ответ подсказка обрежет. 05.10 разом погасли
+    три кабинета WB, и человек видел «отключён» и число сбоёв, но не то, чем
+    ответила площадка. Писатель без читателя — тот же класс, что чинится в этом
+    проекте весь сентябрь.
+
+    Проверяем по РАЗМЕТКЕ ВНЕ `title`: совпадение с подсказкой прошло бы и на
+    прежнем шаблоне, то есть тест молчал бы о дефекте, ради которого написан.
+    """
+    account = _seed_account(web_db)
+    account.is_active = False
+    account.consecutive_failures = 5
+    account.last_error = ("401 Client Error: Unauthorized for url: "
+                          "https://marketplace-api.wildberries.ru/api/v3/orders/new")
+    web_db.commit()
+
+    body = logged_in_client.get("/diagnostics").text
+
+    assert "Причина отключения" in body, body[:2000]
+    outside_tooltips = "\n".join(
+        line for line in body.splitlines() if "title=" not in line)
+    assert account.last_error in outside_tooltips, (
+        "текст ошибки виден только в подсказке — значит человек его не увидит")
+
+
+def test_a_live_account_with_failures_shows_the_error_too(logged_in_client, web_db):
+    """Четыре сбоя подряд — тот же отказ, просто пятого ещё не случилось.
+
+    Разобраться дешевле до того, как кабинет снимут: после снятия его
+    per-account задания сняты, опрос прекращён, и остатки по нему стоят.
+    """
+    account = _seed_account(web_db)
+    account.consecutive_failures = 4
+    account.last_error = "429 Too Many Requests"
+    web_db.commit()
+
+    body = logged_in_client.get("/diagnostics").text
+
+    assert "Последняя ошибка" in body
+    assert "429 Too Many Requests" in "\n".join(
+        line for line in body.splitlines() if "title=" not in line), body[:2000]
