@@ -34,6 +34,9 @@
       {% if org %}<a href="/organizations/{{ org.id }}/chz-login">Войти в ЧЗ</a>{% endif %}</p>{% endif %}
     <p>Карточки: получено <b>{{ counts.ok }}</b>, ждут <b>{{ counts.pending }}</b>, нет в НК <b>{{ counts.not_found }}</b>, ошибок <b>{{ counts.error }}</b>.</p>
     <p class="muted">Лимит НК — 10 запросов за 5 минут по 25 GTIN; работаем на {{ nk_limit }}. Воркер забирает очередь сам.</p>
+    <form method="post" action="/gtin/refresh-all"
+          onsubmit="return confirm('Перечитать из Нацкаталога все карточки? Пока карточка в очереди, её ТН ВЭД и документ не подставляются.')">
+      <button class="secondary">Обновить все карточки из Нацкаталога</button></form>
   </div>
 </div>
 

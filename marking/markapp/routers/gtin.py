@@ -165,6 +165,22 @@ def gtin_card_refresh(gtin: str, request: Request, db: Session = Depends(get_db)
     return RedirectResponse(f"/gtin/card/{gtin}", status_code=303)
 
 
+@router.post("/gtin/refresh-all")
+def gtin_refresh_all(request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Все карточки — в очередь заново: в НК поменяли ТН ВЭД или разрешительный
+    документ (05.10.2026, 60 карточек). Пока карточка в очереди, её данные не
+    подставляются — документ ввода не соберётся, а не уйдёт со старыми."""
+    cards = db.query(NkCard).filter(NkCard.status.in_(("ok", "not_found", "error"))).all()
+    for c in cards:
+        nk.request_refresh(db, c.gtin)
+    audit.log(db, user.username, "nk_refresh_all", details=f"карточек: {len(cards)}")
+    db.commit()
+    minutes = max(1, -(-len(cards) // (25 * int(settings.get(db, settings.NK_LIMIT) or 7))) * 5)
+    flash(request, f"В очередь поставлено карточек: {len(cards)}. Программа перечитает их сама, "
+                   f"примерно за {minutes} мин (нужен вход в ЧЗ).", "ok")
+    return RedirectResponse("/gtin", status_code=303)
+
+
 @router.post("/gtin/nk-settings")
 def gtin_nk_settings(request: Request, attr_color: str = Form(""), attr_size: str = Form(""),
                      attr_tnved: str = Form(""), nk_limit: str = Form("7"),
