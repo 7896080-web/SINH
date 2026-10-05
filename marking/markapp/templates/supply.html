@@ -115,9 +115,15 @@
 </table>
 {% endif %}
 
-<h2>Строки</h2>
+<h2 id="rows">Строки</h2>
 <div class="row" style="margin-bottom:8px">
   {% if editable %}
+  <form id="rowsForm" method="post" action="/supplies/{{ supply.id }}/rows"><button>Сохранить количества</button></form>
+  {% if supply.rows|selectattr('onec_status', 'equalto', 'short')|list %}
+  <form method="post" action="/supplies/{{ supply.id }}/fit-stock"
+        onsubmit="return confirm('Уменьшить количество в строках «не хватает» до остатка ЦС из ответа 1С? Строки с нулевым остатком будут убраны.')">
+    <button class="secondary">Уменьшить до остатка 1С</button></form>
+  {% endif %}
   <form method="post" action="/supplies/{{ supply.id }}/refresh"><button class="secondary">Перечитать из «Одежды полной»</button></form>
   <form method="post" action="/supplies/{{ supply.id }}/delete" onsubmit="return confirm('Удалить черновик поставки {{ supply.number }}? Номер больше не выдаётся.')"><button class="danger">Удалить черновик</button></form>
   {% endif %}
@@ -131,8 +137,8 @@
   <tr>
     <td>{{ r.position }}</td>
     <td>{{ r.supplier_sku }}</td>
-    <td class="num">{% if editable %}<form method="post" action="/supplies/{{ supply.id }}/rows/{{ r.id }}" style="display:flex;gap:4px;justify-content:flex-end">
-      <input type="number" name="qty" value="{{ r.qty }}" min="0" style="width:64px"><button class="secondary" title="0 — убрать строку">✓</button></form>{% else %}{{ r.qty }}{% endif %}</td>
+    <td class="num">{% if editable %}<input type="number" form="rowsForm" name="qty_{{ r.id }}" value="{{ r.qty }}" min="0"
+      style="width:64px" title="0 — убрать строку" onwheel="this.blur()">{% else %}{{ r.qty }}{% endif %}</td>
     <td class="num">{{ r.price|money }}</td>
     <td>{{ r.ean }}</td>
     {% for v in r.extras %}<td>{{ v }}</td>{% endfor %}

@@ -196,6 +196,53 @@ def supply_header(supply_id: int, request: Request, number: str = Form(...),
     return _back(supply_id)
 
 
+def _back_rows(supply_id: int) -> RedirectResponse:
+    # К таблице строк, а не в начало страницы: правят строки — туда и вернуться.
+    return RedirectResponse(f"/supplies/{supply_id}#rows", status_code=303)
+
+
+@router.post("/supplies/{supply_id}/rows")
+async def supply_rows_qty(supply_id: int, request: Request, db: Session = Depends(get_db),
+                          user: User = Depends(get_current_user)):
+    """Количества всех строк одной формой: поля `qty_<id строки>`."""
+    form = await request.form()
+    try:
+        changes = {int(k[4:]): int(str(v).strip() or "0") for k, v in form.items() if k.startswith("qty_")}
+    except ValueError:
+        flash(request, "Количество — целое число.", "error")
+        return _back_rows(supply_id)
+    try:
+        supply = _get(db, supply_id)
+        n = S.update_quantities(supply, changes)
+        if n:
+            audit.log(db, user.username, "supply_rows_edited", f"поставка {supply.number}", f"строк изменено: {n}")
+        db.commit()
+        flash(request, f"Изменено строк: {n}. Поставка — черновик: проверьте остаток в 1С заново." if n
+              else "Количества не изменились.", "ok")
+    except S.SupplyError as e:
+        db.rollback()
+        flash(request, str(e), "error")
+    return _back_rows(supply_id)
+
+
+@router.post("/supplies/{supply_id}/fit-stock")
+def supply_fit_stock(supply_id: int, request: Request, db: Session = Depends(get_db),
+                     user: User = Depends(get_current_user)):
+    try:
+        supply = _get(db, supply_id)
+        changes = onec.fit_to_stock(db, supply)
+        audit.log(db, user.username, "supply_fit_stock", f"поставка {supply.number}", "; ".join(changes)[:2000])
+        db.commit()
+        done = supply.status == SupplyStatus.checked.value
+        flash(request, f"Уменьшено до остатка 1С: {len(changes)} строк. "
+              + ("Поставка — «проверено в 1С», можно перемещать." if done
+                 else "Поставка — черновик: есть другие препятствия, см. замечания."), "ok")
+    except S.SupplyError as e:
+        db.rollback()
+        flash(request, str(e), "error")
+    return _back_rows(supply_id)
+
+
 @router.post("/supplies/{supply_id}/rows/{row_id}")
 def supply_row_qty(supply_id: int, row_id: int, request: Request, qty: int = Form(...),
                    db: Session = Depends(get_db), user: User = Depends(get_current_user)):
@@ -207,7 +254,7 @@ def supply_row_qty(supply_id: int, row_id: int, request: Request, qty: int = For
     except S.SupplyError as e:
         db.rollback()
         flash(request, str(e), "error")
-    return _back(supply_id)
+    return _back_rows(supply_id)
 
 
 @router.post("/supplies/{supply_id}/refresh")
