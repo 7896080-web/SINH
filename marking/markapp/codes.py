@@ -754,6 +754,9 @@ def prepare_introduce(db: Session, supply: Supply, username: str) -> IntroduceDo
     applied = today_local().isoformat()
     doc = {
         "participant_inn": inn, "production_date": prod, "producer_inn": inn, "owner_inn": inn,
+        # Подтверждено заказчиком 05.10.2026: производство собственное,
+        # производитель — сам ИП. Контрактного производства нет; появится —
+        # нужен CONTRACT_PRODUCTION и ИНН фабрики, это не догадка программы.
         "production_type": "OWN_PRODUCTION",
         "products": [{
             "uit_code": c.cis, "production_date": prod, "application_date": applied,

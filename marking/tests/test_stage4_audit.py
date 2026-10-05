@@ -271,3 +271,14 @@ def test_login_refused_when_token_belongs_to_another_inn(client, db, monkeypatch
     assert r.status_code == 400 and "токен не сохранён" in r.json()["error"]
     db.refresh(org)
     assert chz_auth.token(org) is None
+
+
+def test_introduction_is_own_production_by_the_ip_itself(db, supply, fake):
+    """Решение заказчика 05.10: производство собственное, производитель и
+    владелец — сам ИП. Меняется только осознанно, вместе с этим тестом."""
+    _, state = fake
+    _applied(db, supply, state)
+    body = json.loads(base64.b64decode(C.prepare_introduce(db, supply, "op").document))
+    inn = supply.organization.inn
+    assert body["production_type"] == "OWN_PRODUCTION"
+    assert body["producer_inn"] == body["owner_inn"] == body["participant_inn"] == inn
