@@ -25,3 +25,11 @@ def test_scripts_never_touch_sync_admin_services():
         text = p.read_text(encoding="utf-8-sig")
         for svc in ("sync_admin_web", "sync_admin_worker"):
             assert f"nssm restart {svc}" not in text and f"nssm stop {svc}" not in text, p.name
+
+
+def test_update_stops_the_server_whatever_its_process_name():
+    """05.10.2026: при Python из Microsoft Store сервер живёт не в python.exe —
+    фильтр по имени оставлял его работать, обновление шло на старом коде."""
+    text = (Path(__file__).resolve().parents[1] / "deploy" / "update_workstation.ps1").read_text(encoding="utf-8-sig")
+    assert "Name='python.exe'" not in text
+    assert "не остановилась" in text          # порт проверяется, а не верится на слово
