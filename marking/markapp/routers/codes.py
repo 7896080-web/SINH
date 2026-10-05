@@ -35,7 +35,12 @@ def codes_page(supply_id: int, request: Request, db: Session = Depends(get_db),
     supply = db.get(Supply, supply_id)
     if supply is None:
         return RedirectResponse("/supplies", status_code=303)
-    if C.expire_sending(db):
+    changed = C.expire_sending(db)
+    recovered = C.recover_journal(db)
+    if changed or recovered:
+        if recovered:
+            audit.log(db, user.username, "codes_recovered", f"поставка {supply_id}",
+                      f"восстановлено из журнала кодов: {recovered}")
         db.commit()
     lines = C.plan(db, supply)
     org = supply.organization
@@ -48,7 +53,8 @@ def codes_page(supply_id: int, request: Request, db: Session = Depends(get_db),
                   can_order=supply.status in C.ORDER_STATUSES and not supply.is_test,
                   chz_ok=chz_auth.token(org) is not None, suz_ok=chz_auth.token(org, "suz") is not None,
                   intro=C.defaults(supply), cert_types=C.CERT_TYPES, backup=C.backup_state(db, supply),
-                  status_ru=C.STATUS_RU, order_ru=C.ORDER_RU, doc_ru=C.DOC_RU)
+                  status_ru=C.STATUS_RU, order_ru=C.ORDER_RU, doc_ru=C.DOC_RU,
+                  today=today_local().isoformat())
 
 
 @router.post("/supplies/{supply_id}/codes/order-prepare")
@@ -149,7 +155,8 @@ def intro_prepare(supply_id: int, db: Session = Depends(get_db), user: User = De
         db.commit()
         return _err(str(e))
     db.commit()
-    return {"doc_id": doc.id, "document": doc.document, "count": doc.codes_count}
+    return {"doc_id": doc.id, "document": doc.document, "count": doc.codes_count,
+            "summary": getattr(doc, "summary", "")}
 
 
 @router.post("/supplies/{supply_id}/codes/intro-send")

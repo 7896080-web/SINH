@@ -43,19 +43,28 @@ logger = logging.getLogger("marking.codes")
 # состав не меняется, и заказанный код не окажется лишним (ТЗ, 4).
 ORDER_STATUSES = (SupplyStatus.moved.value, SupplyStatus.upd_issued.value, SupplyStatus.accepted.value)
 # Заказ, который занимает количество: повторно на это количество не заказываем.
-OPEN_ORDER = ("new", "sending", "unknown", "sent", "ready")
+# `incomplete` — буфер СУЗ закрыт, а получено меньше заказанного (блок мог
+# потеряться по дороге). Занимает своё количество, как `unknown`: дозаказ — только
+# решением человека, иначе каждый потерянный ответ превращался бы в платный дубль.
+OPEN_ORDER = ("new", "sending", "unknown", "sent", "ready", "incomplete")
 # Документ, чьи коды заняты: в новый документ они не идут.
 BUSY_DOC = ("new", "sending", "unknown", "sent", "CHECKED_OK")
 # Конечные статусы кода: опрашивать дальше незачем.
 FINAL_CIS = ("INTRODUCED", "WRITTEN_OFF", "RETIRED", "WITHDRAWN")
 SENDING_STALE = timedelta(minutes=3)
+# Статусы документа в ЧЗ. Отказом считаем только названные: незнакомый статус
+# коды не освобождает (их могли уже ввести), а держит документ в проверке.
+DOC_REFUSED = ("CHECKED_NOT_OK", "ERROR", "PROCESSING_ERROR", "PARSE_ERROR", "CANCELLED")
+DOC_IN_PROGRESS = ("", "IN_PROGRESS", "WAIT_ACCEPTANCE", "UNDEFINED")
+DOC_SENT_STALE = timedelta(days=1)
 
 STATUS_RU = {"EMITTED": "эмитирован", "APPLIED": "нанесён", "INTRODUCED": "в обороте",
              "WRITTEN_OFF": "списан", "RETIRED": "выбыл", "WITHDRAWN": "выведен",
              "UNKNOWN": "нет данных", "": "не проверен"}
 ORDER_RU = {"new": "ждёт отправки", "sending": "отправляется", "unknown": "НЕИЗВЕСТНО, создан ли заказ",
             "sent": "СУЗ готовит коды", "ready": "коды готовы к получению", "done": "коды получены",
-            "rejected": "отклонён СУЗ", "error": "ошибка"}
+            "rejected": "отклонён СУЗ", "error": "ошибка",
+            "incomplete": "СУЗ закрыл буфер, получены не все коды"}
 DOC_RU = {"new": "ждёт подписи", "sending": "отправляется", "unknown": "НЕИЗВЕСТНО, принят ли",
           "sent": "проверяется ЧЗ", "CHECKED_OK": "принят", "CHECKED_NOT_OK": "отклонён",
           "error": "не отправлен"}
@@ -86,9 +95,15 @@ def short_cis(full: str) -> str:
 
 def _claim(db: Session, model, obj_id: int, frm: str, to: str) -> bool:
     """Атомарно перевести запись из `frm` в `to` и закоммитить. False — её уже
-    взяли (вторая вкладка, двойной клик): SQLite пускает одного писателя."""
+    взяли (вторая вкладка, двойной клик): SQLite пускает одного писателя.
+
+    Вместе со статусом ставится отметка начала отправки. Без неё
+    `expire_sending` мерил бы «сколько висит» от создания записи, и заказ,
+    подготовленный раньше, чем за SENDING_STALE до нажатия, объявлялся бы
+    `unknown` прямо посреди запроса — из соседней вкладки."""
+    stamp = model.updated_at if model is CodeOrder else model.sent_at
     n = (db.query(model).filter(model.id == obj_id, model.status == frm)
-         .update({model.status: to}, synchronize_session=False))
+         .update({model.status: to, stamp: now_utc()}, synchronize_session=False))
     db.commit()
     return n == 1
 
@@ -170,7 +185,7 @@ def expire_sending(db: Session) -> int:
     old = now_utc() - SENDING_STALE
     n = 0
     for model in (CodeOrder, IntroduceDoc):
-        stamp = model.updated_at if model is CodeOrder else model.created_at
+        stamp = model.updated_at if model is CodeOrder else model.sent_at
         for row in db.query(model).filter(model.status == "sending", stamp < old).all():
             row.status = "unknown"
             row.error = "отправка оборвалась — неизвестно, дошла ли"
@@ -207,6 +222,13 @@ def prepare_orders(db: Session, supply: Supply, username: str) -> list[CodeOrder
     решит, был ли он, нового на это количество нет.
     """
     _check_can_order(supply)
+    # Блокировка записи ДО расчёта недостающего. pysqlite читает вне транзакции,
+    # и две вкладки, нажавшие «Заказать» одновременно, обе видели бы дефицит и
+    # обе вставили бы заказы — платный дубль. Пустой UPDATE берёт блокировку
+    # писателя: вторая вкладка ждёт коммита первой и считает план уже с её
+    # заказами.
+    db.query(Supply).filter(Supply.id == supply.id).update(
+        {Supply.id: Supply.id}, synchronize_session=False)
     for line in plan(db, supply):
         if line.gtin and line.deficit > 0:
             db.add(CodeOrder(supply_id=supply.id, organization_id=supply.organization_id,
@@ -229,10 +251,16 @@ def send_order(db: Session, order: CodeOrder, signature: str) -> None:
     try:
         order.suz_order_id = chz_api.create_order(order.oms_id or supply.organization.oms_id,
                                                   order.body, token, signature)
+        # Номер — в журнал СРАЗУ, до коммита: упади запись в базу, заказ стал бы
+        # `unknown`, и номер пришлось бы искать в ЛК СУЗ по времени и GTIN.
+        logger.info("заказ %s (%s, %s шт.): СУЗ создал заказ %s", order.id, order.gtin,
+                    order.quantity, order.suz_order_id)
         order.status, order.error = "sent", ""
     except chz_api.ChzApiError as e:
         order.error = str(e)
-        if e.outcome_unknown or "не вернул номер" in str(e):
+        # 408 и 409 — не «заказа нет»: таймаут на стороне сервера или повтор уже
+        # принятого запроса. Объяви мы их ошибкой, недостающее заказалось бы снова.
+        if e.outcome_unknown or e.status in (408, 409) or "не вернул номер" in str(e):
             order.status = "unknown"
         elif e.status in (401, 429):
             # Не принят: можно повторить после входа / паузы.
@@ -246,13 +274,33 @@ def send_order(db: Session, order: CodeOrder, signature: str) -> None:
         order.updated_at = now_utc()
 
 
+UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
 def resolve_unknown_order(db: Session, order: CodeOrder, suz_order_id: str) -> None:
     """Решение человека по заказу с неизвестным исходом (по ЛК СУЗ): номер
     заказа есть — продолжаем получать коды; нет — заказа не было."""
-    if order.status != "unknown":
-        raise CodesError("решать нужно только заказ с неизвестным исходом")
+    if order.status not in ("unknown", "incomplete"):
+        raise CodesError("решать нужно только заказ с неизвестным исходом или неполным получением")
     suz_order_id = (suz_order_id or "").strip()
+    if order.status == "incomplete":
+        if suz_order_id:
+            raise CodesError("у этого заказа номер уже есть — решение только «дозаказать недостающее»")
+        order.status = "error"
+        order.error = (f"человек подтвердил: получено {order.received} из {order.quantity}, "
+                       "остальные коды не придут — недостающее можно заказать заново")
+        order.updated_at = now_utc()
+        return
     if suz_order_id:
+        if not UUID_RE.match(suz_order_id):
+            raise CodesError("номер заказа СУЗ — это UUID вида 1b2c3d4e-…, проверьте, что скопирован целиком")
+        db.flush()            # autoflush=False: иначе запрос не увидит несохранённые решения
+        taken = (db.query(CodeOrder.id).filter(CodeOrder.suz_order_id == suz_order_id,
+                                               CodeOrder.id != order.id).first())
+        if taken:
+            # Два заказа программы на один буфер СУЗ: план посчитал бы его дважды,
+            # один из них упёрся бы в исчерпание и попросил дозаказ.
+            raise CodesError(f"этот номер уже записан за заказом №{taken[0]} — у каждого заказа свой номер")
         order.suz_order_id, order.status = suz_order_id, "sent"
         order.error = "номер заказа указан человеком по ЛК СУЗ"
     else:
@@ -294,10 +342,21 @@ def run_step(db: Session, order: CodeOrder, action: str, path: str, signature: s
         data = chz_api.suz_get(path, token, signature)
     except chz_api.ChzApiError as e:
         order.error, order.updated_at = str(e), now_utc()
+        if action == "codes" and e.outcome_unknown:
+            # СУЗ мог выдать блок, а ответ не дошёл. Повторный запрос вернёт
+            # СЛЕДУЮЩИЙ блок, этот на нашей стороне потерян. Если коды так и не
+            # доберутся до количества, заказ станет `incomplete` и дозаказ решит
+            # человек — по ЛК СУЗ, где выданные блоки видны.
+            order.error = (f"{e} — ответ на получение кодов не пришёл: блок мог быть выдан. "
+                           "Если коды не доберутся до заказанного, сверьте с ЛК СУЗ")
+            logger.error("заказ %s (%s): получение кодов без ответа: %s", order.id, order.suz_order_id, e)
         if e.status == 401:
             chz_auth.forget(supply.organization, "suz", token)
         raise CodesError(str(e))
     if action == "status":
+        # Коды из журнала — до того, как исчерпанный буфер объявит недополучение:
+        # они могли прийти и не записаться в базу.
+        recover_journal(db, order_id=order.id)
         _apply_status(order, data)
     else:
         _apply_codes(db, supply, order, data)
@@ -313,8 +372,11 @@ def _apply_status(order: CodeOrder, data) -> None:
     elif buffer == "ACTIVE" and available > 0:
         order.status, order.error, order.available = "ready", "", available
     elif buffer in ("EXHAUSTED", "DELETED", "CLOSED") and order.received < order.quantity:
-        order.status = "error"
-        order.error = f"СУЗ закрыл буфер ({buffer}), получено {order.received} из {order.quantity}"
+        # Не `error`: `error` освобождает количество под новый заказ, а коды могли
+        # быть выданы и потеряться по дороге. Дозаказ — решение человека.
+        order.status = "incomplete"
+        order.error = (f"СУЗ закрыл буфер ({buffer}), получено {order.received} из {order.quantity}. "
+                       "Сверьте с ЛК СУЗ, прежде чем дозаказывать")
     # PENDING — СУЗ ещё готовит, ждём.
 
 
@@ -341,12 +403,24 @@ def _journal(order: CodeOrder, data) -> Path | None:
         return None
 
 
-def _apply_codes(db: Session, supply: Supply, order: CodeOrder, data) -> None:
-    raw = (data or {}).get("codes") if isinstance(data, dict) else None
+def _apply_codes(db: Session, supply: Supply, order: CodeOrder, data, recovering: bool = False) -> None:
+    if data is not None and not isinstance(data, dict):
+        # 200 с телом не того вида: могли прийти коды, которые мы не поняли.
+        # Сохраняем как есть и не делаем вид, что буфер пуст.
+        journal = _journal(order, data)
+        raise CodesError(f"ответ СУЗ на получение кодов не разобран — сохранён в журнале "
+                         f"{journal.name if journal else '(НЕ записан!)'}")
+    raw = (data or {}).get("codes")
     if not raw:
-        order.status = "sent"          # буфер опустел раньше ответа — спросить статус снова
+        if not recovering:
+            order.status = "sent"      # буфер опустел раньше ответа — спросить статус снова
         return
-    journal = _journal(order, data)
+    journal = None if recovering else _journal(order, data)
+    if journal is None and not recovering:
+        # Журнал — единственная копия кодов до коммита. Не записался — коды всё
+        # равно применяем (база их сохранит), но говорим об этом громко.
+        logger.error("заказ %s: журнал кодов НЕ записан — при сбое записи в базу коды не восстановить",
+                     order.id)
     bad = []
     for n, full in enumerate(raw, 1):
         full = normalize(str(full))
@@ -365,29 +439,48 @@ def _apply_codes(db: Session, supply: Supply, order: CodeOrder, data) -> None:
         db.flush()
     # По факту, а не «+= добавлено»: две вкладки не потеряют приращение.
     order.received = db.query(MarkCode).filter(MarkCode.order_id == order.id).count()
+    if recovering:
+        # Восстановление только добавляет коды и пересчитывает. Статус не трогаем:
+        # заказ в `error` или `rejected` не должен снова открываться.
+        if order.received >= order.quantity and order.status in OPEN_ORDER:
+            order.status, order.error = "done", ""
+        return
     order.available = None
     order.status = "done" if order.received >= order.quantity else "sent"
-    order.error = ""
+    order.error = "" if journal is not None else "журнал кодов не записан (см. лог) — коды в базе"
     if bad:
         order.error = (f"не принято кодов: {len(bad)} ({'; '.join(bad[:3])}) — ответ СУЗ сохранён в "
                        f"журнале {journal.name if journal else '(НЕ записан!)'}")
         logger.error("заказ %s: %s", order.id, order.error)
 
 
-def recover_journal(db: Session) -> int:
-    """Коды из журнала, которых нет в базе (сбой записи после ответа СУЗ)."""
+def recover_journal(db: Session, order_id: int | None = None) -> int:
+    """Коды из журнала, которых нет в базе (сбой записи после ответа СУЗ).
+
+    Зовётся при каждом открытии «Кодов ЧЗ» и перед разбором статуса заказа:
+    без вызова журнал был бы мёртвым грузом, а исчерпанный буфер объявил бы
+    недополучение по кодам, которые лежат на диске. Идемпотентно — по `cis`.
+    Не коммитит."""
     added = 0
-    for path in sorted(journal_dir().glob("order*.enc")) if journal_dir().exists() else []:
+    pattern = f"order{order_id}-*.enc" if order_id is not None else "order*.enc"
+    for path in sorted(journal_dir().glob(pattern)) if journal_dir().exists() else []:
         try:
             rec = json.loads(decrypt_value(path.read_text(encoding="ascii")))
         except Exception:
             logger.exception("журнал кодов не читается: %s", path.name)
             continue
         order = db.get(CodeOrder, rec["order_id"])
-        if order is None:
+        # Номер заказа — не опознание: после восстановления базы из копии номера
+        # выдаются заново, и журнал старого заказа №5 лёг бы на новый №5 —
+        # чужие коды в чужую поставку. Сверяем всё, что записано рядом.
+        if (order is None or rec.get("supply_id") != order.supply_id or rec.get("gtin") != order.gtin
+                or rec.get("sku") != order.supplier_sku):
             continue
         before = order.received
-        _apply_codes(db, db.get(Supply, order.supply_id), order, rec["data"])
+        try:
+            _apply_codes(db, db.get(Supply, order.supply_id), order, rec["data"], recovering=True)
+        except CodesError:
+            continue          # неразобранный ответ — его разбирает человек, не мы
         added += order.received - before
     return added
 
@@ -484,14 +577,25 @@ def refresh_statuses(db: Session, supply: Supply | None = None, limit: int = 1) 
             try:
                 got = chz_api.cises_info([c.cis for c in chunk], token)
             except chz_api.ChzApiError as e:
+                stats["note"] = str(e)
                 if e.status == 401:
                     chz_auth.forget(s.organization, "true_api", token)
                 elif e.status == 429:
                     settings.put(db, CHZ_PAUSE_UNTIL, (now_utc() + timedelta(seconds=e.retry_after or 60))
                                  .isoformat(timespec="seconds"))
-                stats["note"] = str(e)
+                if e.status in (401, 429):
+                    db.commit()
+                    return stats
+                # Любая другая ошибка — про эту пачку, а не про ЧЗ целиком. Отметка
+                # времени отодвигает пачку в конец очереди: иначе каждый проход
+                # начинался бы с неё же, и статусы ВСЕХ остальных поставок (а за
+                # ними и закрытие документов) не обновлялись бы никогда.
+                stats["requests"] += 1
+                stats["failed"] = stats.get("failed", 0) + 1
+                for c in chunk:
+                    c.status_at = now_utc()
                 db.commit()
-                return stats
+                break
             stats["requests"] += 1
             now = now_utc()
             for c in chunk:
@@ -530,17 +634,19 @@ def _iso(text: str) -> str:
 
 
 def guess_cert_type(number: str) -> str:
-    if re.search(r"RU\s+Д-", number or ""):
+    # «С» в номере сертификата пишут и кириллицей, и латиницей — на глаз не различить.
+    if re.search(r"RU\s*Д-", number or ""):
         return "CONFORMITY_DECLARATION"
-    if re.search(r"RU\s+С-", number or ""):
+    if re.search(r"RU\s*[СC]-", number or ""):
         return "CONFORMITY_CERTIFICATE"
     return ""
 
 
 def defaults(supply: Supply) -> dict:
+    # Дата производства — без умолчания «сегодня»: это утверждение в документе
+    # для ЧЗ, и подставленное программой число человек не вводил и не видел.
     d = dict(supply.intro_attrs or {})
-    d.setdefault("production_date", today_local().isoformat())
-    for k in ("tnved", "cert_type", "cert_number", "cert_date"):
+    for k in ("tnved", "cert_type", "cert_number", "cert_date", "production_date"):
         d.setdefault(k, "")
     return d
 
@@ -576,16 +682,23 @@ def attrs_by_sku(db: Session, supply: Supply) -> tuple[dict[str, dict], list[str
         if nk_tnved and f_tnved and nk_tnved != f_tnved:
             problems.append(f"{sku}: ТН ВЭД в файле {f_tnved}, в Нацкаталоге {nk_tnved}")
         tnved = nk_tnved or f_tnved or base["tnved"]
+        tnved_src = "Нацкаталог" if nk_tnved else ("файл поставки" if f_tnved else "общее для поставки")
         if f_number:
-            number, cdate = f_number, f_date
-            ctype = guess_cert_type(f_number) or base["cert_type"]
+            number, cdate, cert_src = f_number, f_date, "файл поставки"
+            ctype = guess_cert_type(f_number)
+            if not ctype:
+                # Номер из файла с типом из умолчаний поставки — документ из двух
+                # источников: сертификат ушёл бы в ЧЗ декларацией.
+                problems.append(f"{sku}: по номеру «{f_number}» не понять, декларация это или сертификат")
             if not f_date:
                 problems.append(f"{sku}: в файле номер документа без даты начала действия")
         else:
             number, cdate, ctype = base["cert_number"], base["cert_date"], base["cert_type"]
+            cert_src = "общее для поставки"
         if tnved and not re.fullmatch(r"\d{10}", tnved):
             problems.append(f"{sku}: ТН ВЭД «{tnved}» — нужно ровно 10 цифр")
-        out[sku] = {"tnved": tnved, "cert_number": number, "cert_date": cdate, "cert_type": ctype}
+        out[sku] = {"tnved": tnved, "cert_number": number, "cert_date": cdate, "cert_type": ctype,
+                    "tnved_src": tnved_src, "cert_src": cert_src}
     return out, problems
 
 
@@ -606,11 +719,18 @@ def prepare_introduce(db: Session, supply: Supply, username: str) -> IntroduceDo
     if chz_auth.token(supply.organization) is None:
         raise CodesError(f"нужен вход в ЧЗ ({supply.organization.name})")
     # Неподписанный документ прошлого раза — выбросить: состав мог измениться.
-    for d in db.query(IntroduceDoc).filter(IntroduceDoc.supply_id == supply.id,
-                                           IntroduceDoc.status == "new").all():
-        d.status, d.error = "error", "не подписан — заменён новым"
-        for c in db.query(MarkCode).filter(MarkCode.introduce_doc_id == d.id).all():
-            c.introduce_doc_id = None
+    # Условно (`status == "new"` в самом UPDATE): документ, который соседняя
+    # вкладка как раз захватила в отправку, не превратится в «ошибку» с
+    # освобождёнными кодами посреди запроса.
+    stale = [d.id for d in db.query(IntroduceDoc.id).filter(IntroduceDoc.supply_id == supply.id,
+                                                             IntroduceDoc.status == "new").all()]
+    for doc_id in stale:
+        n = (db.query(IntroduceDoc).filter(IntroduceDoc.id == doc_id, IntroduceDoc.status == "new")
+             .update({IntroduceDoc.status: "error", IntroduceDoc.error: "не подписан — заменён новым"},
+                     synchronize_session=False))
+        if n:
+            for c in db.query(MarkCode).filter(MarkCode.introduce_doc_id == doc_id).all():
+                c.introduce_doc_id = None
     db.flush()
     codes = ready_codes(db, supply)
     if not codes:
@@ -630,6 +750,7 @@ def prepare_introduce(db: Session, supply: Supply, username: str) -> IntroduceDo
                          + (f" и ещё {len(problems) - 5}" if len(problems) > 5 else ""))
     inn = supply.organization.inn
     prod = defaults(supply)["production_date"]
+    _check_production_date(prod)
     applied = today_local().isoformat()
     doc = {
         "participant_inn": inn, "production_date": prod, "producer_inn": inn, "owner_inn": inn,
@@ -651,6 +772,18 @@ def prepare_introduce(db: Session, supply: Supply, username: str) -> IntroduceDo
     db.flush()
     for c in codes:
         c.introduce_doc_id = row.id
+    # Сводка для человека ПЕРЕД подписью: что именно утверждает документ. Без
+    # неё подтверждение называло только число кодов, а ТН ВЭД и разрешительный
+    # документ, взятые из общих умолчаний поставки, уходили в ЧЗ невиденными.
+    per_sku = Counter(c.supplier_sku for c in codes)
+    lines = [f"Дата производства: {date.fromisoformat(prod):%d.%m.%Y}, производство собственное, "
+             f"производитель и владелец — ИНН {inn}."]
+    for sku in skus:
+        a = attrs[sku]
+        lines.append(f"{sku} — {per_sku[sku]} шт.: ТН ВЭД {a['tnved']} ({a['tnved_src']}); "
+                     f"{CERT_TYPES.get(a['cert_type'], a['cert_type'])} {a['cert_number']} от "
+                     f"{a['cert_date']} ({a['cert_src']})")
+    row.summary = "\n".join(lines)
     return row
 
 
@@ -662,6 +795,8 @@ def _release(db: Session, doc: IntroduceDoc) -> None:
 
 def send_introduce(db: Session, doc: IntroduceDoc, signature: str) -> None:
     supply = db.get(Supply, doc.supply_id)
+    if supply.is_test:
+        raise CodesError("тестовая поставка — в оборот не вводится")
     token = chz_auth.token(supply.organization)
     if token is None:
         raise CodesError(f"нужен вход в ЧЗ ({supply.organization.name})")
@@ -693,6 +828,16 @@ def release_unknown_doc(db: Session, doc: IntroduceDoc) -> None:
     """Решение человека: документ с неизвестным исходом в ЛК ЧЗ не найден."""
     if doc.status != "unknown":
         raise CodesError("освободить можно только документ с неизвестным исходом")
+    codes = db.query(MarkCode).filter(MarkCode.introduce_doc_id == doc.id).all()
+    if any(c.status == "INTRODUCED" for c in codes):
+        raise CodesError("часть кодов документа уже в обороте — документ дошёл, освобождать нельзя")
+    since = doc.sent_at or doc.created_at
+    stale = [c for c in codes if c.status_at is None or c.status_at <= since]
+    if stale:
+        # Статус, снятый ДО отправки, ничего не говорит о её исходе: документ мог
+        # дойти, а коды показывали бы «нанесён» — и ушли бы во второй документ.
+        raise CodesError(f"сначала «Обновить статусы»: по {len(stale)} кодам статус не проверялся "
+                         "после отправки документа")
     doc.status, doc.error = "error", "человек подтвердил: в ЧЗ документа нет"
     _release(db, doc)
 
@@ -701,8 +846,9 @@ def refresh_documents(db: Session) -> dict:
     """Итог отправленных документов. Истина — статусы кодов, это для причины отказа."""
     db.commit()
     stats = {"checked": 0, "note": ""}
-    # Документ с неизвестным исходом закрывается сам, когда все его коды в обороте.
-    for doc in db.query(IntroduceDoc).filter(IntroduceDoc.status == "unknown").all():
+    # Документ с неизвестным исходом или в проверке закрывается сам, когда все его
+    # коды в обороте: статус кода — истина, ответ /doc/list — только причина отказа.
+    for doc in db.query(IntroduceDoc).filter(IntroduceDoc.status.in_(("unknown", "sent"))).all():
         codes = db.query(MarkCode).filter(MarkCode.introduce_doc_id == doc.id).all()
         if codes and all(c.status == "INTRODUCED" for c in codes):
             doc.status, doc.checked_at = "CHECKED_OK", now_utc()
@@ -719,13 +865,31 @@ def refresh_documents(db: Session) -> dict:
             stats["note"] = str(e)
             continue
         stats["checked"] += 1
-        if status in ("CHECKED_OK", "CHECKED_NOT_OK", "ERROR"):
-            doc.status = "CHECKED_OK" if status == "CHECKED_OK" else "CHECKED_NOT_OK"
-            doc.error, doc.checked_at = errors, now_utc()
-            if doc.status != "CHECKED_OK":
-                _release(db, doc)       # отказ по документу — коды свободны для следующего
+        if status == "CHECKED_OK":
+            doc.status, doc.error, doc.checked_at = "CHECKED_OK", errors, now_utc()
+        elif status in DOC_REFUSED:
+            doc.status, doc.error, doc.checked_at = "CHECKED_NOT_OK", f"{status}: {errors}".strip(": "), now_utc()
+            _release(db, doc)           # отказ по документу — коды свободны для следующего
+        elif status and status not in DOC_IN_PROGRESS:
+            doc.error = f"ЧЗ вернул незнакомый статус документа «{status}» — ждём статусов кодов"
+        elif doc.sent_at and now_utc() - doc.sent_at > DOC_SENT_STALE:
+            # Сутки без итога (документ не находится по номеру, статус не меняется):
+            # не держим коды вечно — решение человеку, как при неизвестном исходе.
+            doc.status = "unknown"
+            doc.error = (f"итога нет больше {DOC_SENT_STALE.days} сут. — проверьте документ в ЛК ЧЗ")
         db.commit()
     return stats
+
+
+def _check_production_date(value: str) -> None:
+    if not value:
+        raise CodesError("укажите дату производства в «Данных документа» — программа её не подставляет")
+    try:
+        d = date.fromisoformat(value)
+    except ValueError:
+        raise CodesError("дата производства — ГГГГ-ММ-ДД")
+    if d > today_local():
+        raise CodesError(f"дата производства {d:%d.%m.%Y} — в будущем")
 
 
 def save_defaults(supply: Supply, tnved: str, cert_type: str, cert_number: str, cert_date: str,
@@ -740,6 +904,8 @@ def save_defaults(supply: Supply, tnved: str, cert_type: str, cert_number: str, 
         raise CodesError("тип документа — сертификат или декларация")
     if tnved.strip() and not re.fullmatch(r"\d{10}", tnved.strip()):
         raise CodesError("ТН ВЭД — ровно 10 цифр")
+    if production_date:
+        _check_production_date(production_date)
     supply.intro_attrs = {"tnved": tnved.strip(), "cert_type": cert_type, "cert_number": cert_number.strip(),
                           "cert_date": cert_date, "production_date": production_date}
 

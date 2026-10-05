@@ -203,13 +203,20 @@ def introduction_check(db: Session, supply: Supply, kizes: list[str]) -> IntroCh
                            "перед отправкой УПД проверьте в ЛК ЧЗ, что все коды «в обороте»")
         return res
     by_status: dict[str, int] = defaultdict(int)
+    foreign = 0
     for k in kizes:
         c = ours.get((k or "").strip())
         if c is None:
-            continue          # чужой код — это ошибка сверки FBO (_kiz_problems), не здесь
-        if c.status != INTRODUCED:
+            # Сверка FBO такой код ловит, но только если коды поставки уже были
+            # в программе при загрузке выгрузки. Загрузили раньше — молчали бы оба.
+            foreign += 1
+        elif c.status != INTRODUCED:
             by_status[c.status] += 1
     res.not_introduced = sum(by_status.values())
+    if foreign:
+        res.blocking = (f"{foreign} из {res.total} кодов выгрузки FBO не заказаны программой для этой "
+                        "поставки — загрузите выгрузку «Поставки FBO» заново: сверка покажет, какие")
+        return res
     if res.not_introduced:
         parts = ", ".join(f"{_STATUS_RU.get(s, s)}: {n}" for s, n in sorted(by_status.items()))
         res.blocking = (f"не в обороте {res.not_introduced} из {res.total} кодов ({parts}). "

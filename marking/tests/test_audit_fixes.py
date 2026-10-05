@@ -29,8 +29,8 @@ def test_timeout_makes_order_unknown_and_blocks_reorder(db, supply, fake, monkey
     assert all(o.supplier_sku != order.supplier_sku for o in C.prepare_orders(db, supply, "op"))
     assert C.plan(db, supply)[0].state.startswith("ошибка заказа: исход неизвестен")
     # Человек нашёл заказ в ЛК СУЗ — продолжаем получать по нему коды.
-    C.resolve_unknown_order(db, order, "SUZ-REAL")
-    assert (order.status, order.suz_order_id) == ("sent", "SUZ-REAL")
+    C.resolve_unknown_order(db, order, "1b2c3d4e-0000-4000-8000-00000000000a")
+    assert (order.status, order.suz_order_id) == ("sent", "1b2c3d4e-0000-4000-8000-00000000000a")
 
 
 def test_unknown_order_confirmed_absent_frees_quantity(db, supply, fake, monkeypatch):
@@ -171,8 +171,25 @@ def test_unknown_doc_released_by_human(db, supply, fake, monkeypatch):
     monkeypatch.setattr(chz_api, "create_document", lambda *a: "")       # принят без номера
     C.send_introduce(db, doc, "S")
     assert doc.status == "unknown"
+    # Статусы сняты ДО отправки — по ним не видно, дошёл ли документ.
+    with pytest.raises(C.CodesError, match="Обновить статусы"):
+        C.release_unknown_doc(db, doc)
+    C.refresh_statuses(db, supply, limit=5)
     C.release_unknown_doc(db, doc)
     assert len(C.ready_codes(db, supply)) == 3
+
+
+def test_release_refused_when_a_code_is_already_introduced(db, supply, fake, monkeypatch):
+    _, state = fake
+    _applied(db, supply, state)
+    doc = C.prepare_introduce(db, supply, "op")
+    db.commit()
+    monkeypatch.setattr(chz_api, "create_document", lambda *a: "")
+    C.send_introduce(db, doc, "S")
+    first = db.query(MarkCode).filter(MarkCode.introduce_doc_id == doc.id).first()
+    first.status = "INTRODUCED"
+    with pytest.raises(C.CodesError, match="уже в обороте"):
+        C.release_unknown_doc(db, doc)
 
 
 def test_document_has_application_date_and_tnved_from_nk(db, supply, fake):
