@@ -10,7 +10,7 @@ from fastapi import APIRouter, Body, Depends, Form, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from sqlalchemy.orm import Session
 
-from markapp import audit, chz_auth, codes as C, codes_txt, labels as L
+from markapp import audit, chz_auth, codes as C, codes_txt, labels as L, supply_file
 from markapp.database import get_db
 from markapp.deps import get_current_user
 from markapp.flash import flash
@@ -276,3 +276,23 @@ def codes_file(supply_id: int, request: Request, db: Session = Depends(get_db),
     audit.log(db, user.username, "codes_txt", f"поставка {supply.number}", f"{total['codes']} кодов")
     db.commit()
     return _file(data, codes_txt.filename(supply.doc_number), "text/plain; charset=ascii")
+
+
+@router.post("/supplies/{supply_id}/codes/supply-xlsx")
+def codes_supply_xlsx(supply_id: int, request: Request, db: Session = Depends(get_db),
+                      user: User = Depends(get_current_user)):
+    """Файл поставки для Lamoda с кодами (ТЗ 6.3): шаблон Lamoda, строка на код.
+    Только когда все коды поставки в обороте и сходятся с составом."""
+    supply = db.get(Supply, supply_id)
+    if supply is None:
+        return RedirectResponse("/supplies", status_code=303)
+    try:
+        data = supply_file.build(db, supply)
+    except supply_file.SupplyFileError as e:
+        flash(request, f"Файл поставки не выдан: {e}", "error")
+        return _back(supply_id)
+    units = sum(r.qty for r in supply.rows)
+    audit.log(db, user.username, "supply_file", f"поставка {supply.number}", f"{units} строк с кодами")
+    db.commit()
+    return _file(data, supply_file.filename(supply),
+                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
