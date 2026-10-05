@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Ввод в оборот — коды вне Lamoda</h1>
+<p class="muted">Коды, заказанные в личном кабинете ЧЗ: загрузили PDF → ввели в оборот → проверили → напечатали этикетки и выгрузили файл кодов (.txt). 1С не участвует.</p>
+
+<div class="card">
+  <h2>ИП</h2>
+  <p class="muted">У каждого ИП свой вход в ЧЗ (сертификатом этого ИП), свой справочник карточек Нацкаталога и свои партии.</p>
+  {% if orgs %}
+  <table>
+    <tr><th>ИП</th><th>ИНН</th><th>Вход в ЧЗ</th><th>Справочник НК</th><th>Изменить</th></tr>
+    {% for o, ok, ncards in orgs %}
+    <tr><td>{{ o.name }}</td><td>{{ o.inn }}</td>
+      <td>{% if ok %}<span class="ok">до {{ o.token_until|local_time }}</span>{% else %}<span class="warn">нужен</span>{% endif %}
+        — <a href="/org/{{ o.id }}/login">войти</a></td>
+      <td><a href="/org/{{ o.id }}/cards">карточек: {{ ncards }}</a></td>
+      <td><form method="post" action="/org" class="row"><input type="hidden" name="org_id" value="{{ o.id }}">
+        <input name="name" value="{{ o.name }}" size="22"><input name="inn" value="{{ o.inn }}" size="13" required>
+        <button class="secondary">Сохранить</button></form></td></tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+  <form method="post" action="/org" class="row" style="margin-top:10px">
+    <label>Новый ИП: название<input name="name" size="26" placeholder="ИП Фамилия И.О."></label>
+    <label>ИНН<input name="inn" size="14" required></label>
+    <button class="secondary">Добавить ИП</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>Загрузить коды из ЛК ЧЗ</h2>
+  <p class="muted">PDF с этикетками из личного кабинета («order_…_gtin_…_quantity_N.pdf»). Коды читаются из DataMatrix; число сверяется с quantity_N в имени файла.</p>
+  <form method="post" action="/upload" enctype="multipart/form-data" class="row">
+    <label>ИП<select name="org_id" required>{% for o, ok, n in orgs %}<option value="{{ o.id }}">{{ o.name }}</option>{% endfor %}</select></label>
+    <input type="file" name="file" accept=".pdf" required>
+    <button>Загрузить</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>Партии</h2>
+  {% if batches %}
+  <table>
+    <tr><th>#</th><th>ИП</th><th>Файл</th><th class="num">Кодов</th><th>Статусы</th><th>Итог</th><th>Загружено</th></tr>
+    {% for b, oname, s in batches %}
+    <tr><td><a href="/batch/{{ b.id }}">{{ b.id }}</a></td><td>{{ oname }}</td><td><a href="/batch/{{ b.id }}">{{ b.title }}</a></td>
+      <td class="num">{{ s.total }}</td>
+      <td>{% for st, n in s.statuses.most_common() %}{{ status_ru.get(st, st) }} {{ n }}{{ ', ' if not loop.last }}{% endfor %}</td>
+      <td class="{{ 'ok' if s.done else 'warn' }}">{{ 'в обороте ✔' if s.done else 'в обороте ' ~ s.introduced ~ ' из ' ~ s.total }}</td>
+      <td>{{ b.created_at|local_time }}</td></tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="muted">Партий пока нет.</p>{% endif %}
+</div>
+
+<details class="card">
+  <summary><b>Шаблон этикетки 58×40</b></summary>
+  <p class="muted">Подстановки: {% for p in placeholders %}{{ '{' ~ p ~ '}' }}{{ ', ' if not loop.last }}{% endfor %}. Строка, где все подстановки пусты, не печатается.</p>
+  <form method="post" action="/labels/settings">
+    <p><label>Заголовок (жирный, справа от кода)<br><input name="title" value="{{ label.label_title }}" size="40"></label></p>
+    <p><label>Строки справа от кода<br><textarea name="right" rows="2" cols="40">{{ label.label_right }}</textarea></label></p>
+    <p><label>Строки под кодом<br><textarea name="bottom" rows="3" cols="40">{{ label.label_bottom }}</textarea></label></p>
+    <p><label>Модуль DataMatrix, мм (203 dpi — 0,5; 300 dpi — 0,508)<br><input name="module" value="{{ label.label_module }}" size="6"></label></p>
+    <button class="secondary">Сохранить шаблон</button>
+  </form>
+</details>
+
+{% if journal %}
+<details class="card">
+  <summary><b>Журнал</b></summary>
+  <table>{% for j in journal %}<tr><td>{{ j.at|local_time }}</td><td>{{ j.action }}</td><td>{{ j.details }}</td></tr>{% endfor %}</table>
+</details>
+{% endif %}
+{% endblock %}

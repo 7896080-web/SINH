@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Справочник НК — {{ org.name }}{% endblock %}
+{% block content %}
+<h1>Справочник Нацкаталога — {{ org.name }}</h1>
+<p><a href="/">← ИП и партии</a> · ИНН {{ org.inn }} · вход в ЧЗ:
+  {% if token_ok %}<span class="ok">есть</span>{% else %}<span class="warn">нужен</span> — <a href="/org/{{ org.id }}/login">войти</a>{% endif %}</p>
+<div class="card">
+  <p class="muted">Карточки запрошены из Нацкаталога токеном этого ИП. Из них берутся название (для этикетки), ТН ВЭД и
+    разрешительный документ (для ввода в оборот). Поменяли карточку в НК — нажмите «Обновить из Нацкаталога».
+    Карточки GTIN из загруженных партий попадают сюда сами.</p>
+  <form method="post" action="/org/{{ org.id }}/cards/refresh" class="row">
+    <label>Добавить GTIN (через пробел или запятую)<input name="gtins" size="50" placeholder="04630688315972"></label>
+    <button>Обновить из Нацкаталога</button>
+  </form>
+</div>
+<div class="card">
+  {% if cards %}
+  <table>
+    <tr><th>GTIN</th><th>Товар</th><th>ТН ВЭД</th><th>Разрешительный документ</th><th>Получено</th></tr>
+    {% for c in cards %}
+    <tr><td>{{ c.gtin }}</td>
+      <td>{% if c.error %}<span class="bad">{{ c.error }}</span>{% else %}{{ c.name }}{% endif %}</td>
+      <td>{{ c.tnved or '—' }}</td>
+      <td>{% if c.permit_number %}{{ cert_ru.get(c.permit_type, c.permit_type) }} {{ c.permit_number }} от {{ c.permit_date }}{% else %}<span class="bad">нет</span>{% endif %}</td>
+      <td>{{ c.fetched_at|local_time }}</td></tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="muted">Карточек пока нет.</p>{% endif %}
+</div>
+{% endblock %}

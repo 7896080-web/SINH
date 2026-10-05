@@ -1,0 +1,128 @@
+{% extends "base.html" %}
+{% block title %}Партия {{ batch.id }}{% endblock %}
+{% block content %}
+<h1>Партия {{ batch.id }}: {{ batch.title }}</h1>
+<p><a href="/">← все партии</a> · <b>{{ org.name }}</b>, ИНН {{ org.inn }}
+  · <a href="/org/{{ org.id }}/cards">справочник НК этого ИП</a> · загружено {{ batch.created_at|local_time }}
+  {% if batch.expected %}· в имени файла {{ batch.expected }} шт.{% endif %}</p>
+
+<div class="card">
+  <h2>Итог ввода в оборот:
+    {% if s.done %}<span class="ok">все {{ s.total }} шт. в обороте ✔</span>
+    {% else %}<span class="warn">в обороте {{ s.introduced }} из {{ s.total }}</span>{% endif %}</h2>
+  <p>Коды: {% for st, n in s.statuses.most_common() %}{{ status_ru.get(st, st) }} — {{ n }}{{ ', ' if not loop.last }}{% endfor %}.
+    Готово к вводу (нанесены): <b>{{ s.ready }}</b>.
+    Вход в ЧЗ: {% if token_ok %}<span class="ok">есть</span>{% else %}<span class="warn">нужен</span> — <a href="/org/{{ org.id }}/login">войти</a>{% endif %}.</p>
+  <table>
+    <tr><th>GTIN</th><th class="num">Кодов</th><th>Товар (Нацкаталог)</th><th>ТН ВЭД</th><th>Разрешительный документ</th><th>Статусы</th></tr>
+    {% for r in s.rows %}{% set c = r.card %}
+    <tr><td>{{ r.gtin }}</td><td class="num">{{ r.count }}</td>
+      <td>{% if c and c.fetched_at and not c.error %}{{ c.name }}{% elif c and c.error %}<span class="bad">{{ c.error }}</span>{% else %}<span class="warn">карточка не запрошена</span>{% endif %}</td>
+      <td>{{ c.tnved if c and c.tnved else '—' }}</td>
+      <td>{% if c and c.permit_number %}{{ cert_ru.get(c.permit_type, c.permit_type) }} {{ c.permit_number }} от {{ c.permit_date }}{% else %}<span class="bad">нет</span>{% endif %}</td>
+      <td>{% for st, n in r.statuses.most_common() %}{{ status_ru.get(st, st) }} {{ n }}{{ ', ' if not loop.last }}{% endfor %}</td></tr>
+    {% endfor %}
+  </table>
+</div>
+
+<div class="card">
+  <h2>Действия</h2>
+  <form method="post" action="/batch/{{ batch.id }}/refresh" style="display:inline"><button class="secondary">Проверить статусы и карточки НК</button></form>
+  <form method="post" action="/batch/{{ batch.id }}/labels" style="display:inline"><button class="secondary">Этикетки 58×40 (PDF)</button></form>
+  <form method="post" action="/batch/{{ batch.id }}/txt" style="display:inline"><button class="secondary" {{ '' if s.done else 'disabled title="только когда все коды в обороте"' }}>Коды (.txt)</button></form>
+  <form method="post" action="/batch/{{ batch.id }}/date" class="row" style="margin-top:12px">
+    <label>Дата производства<input type="date" name="production_date" value="{{ batch.production_date }}" required></label>
+    <button class="secondary">Сохранить дату</button>
+  </form>
+  <p>Сертификат: <select id="cert" disabled><option>загрузка плагина…</option></select> <span id="plugin" class="muted"></span></p>
+  <p><button id="btnIntro" disabled>Ввести в оборот нанесённые ({{ s.ready }})</button></p>
+  <p class="muted">«Нанесён» ЧЗ ставит сам после заказа — время нестабильно; жмите «Проверить статусы», пока коды не станут «нанесён».
+    ТН ВЭД и разрешительный документ — из карточки Нацкаталога. Страница обновляет себя раз в минуту, пока коды не в обороте.</p>
+  <div id="log"></div>
+</div>
+
+{% if docs %}
+<div class="card">
+  <h2>Документы ввода в оборот</h2>
+  <table>
+    <tr><th>#</th><th>Кодов</th><th>Статус</th><th>Номер в ЧЗ</th><th>Отправлен</th><th>Ошибка</th></tr>
+    {% for d in docs %}
+    <tr><td>{{ d.id }}</td><td>{{ d.codes_count }}</td>
+      <td class="{{ 'ok' if d.status == 'CHECKED_OK' else ('bad' if d.status in ('CHECKED_NOT_OK','error','unknown') else 'warn') }}">{{ doc_ru.get(d.status, d.status) }}</td>
+      <td>{{ d.chz_doc_id }}</td><td>{{ d.sent_at|local_time }}</td><td><small>{{ d.error[:300] }}</small>
+      {% if d.status == 'unknown' %}<form method="post" action="/batch/{{ batch.id }}/release"
+        onsubmit="return confirm('Подтверждаете, что в личном кабинете ЧЗ этого документа НЕТ?')">
+        <input type="hidden" name="doc_id" value="{{ d.id }}"><button class="secondary">Документа в ЧЗ нет — освободить коды</button></form>{% endif %}</td></tr>
+    {% endfor %}
+  </table>
+</div>
+{% endif %}
+
+<script src="https://www.cryptopro.ru/sites/default/files/products/cades/cadesplugin_api.js"></script>
+<script>
+  var BASE = '/batch/{{ batch.id }}', ORG_INN = {{ (org.inn or '')|tojson }}, READY = {{ s.ready }}, DONE = {{ 'true' if s.done else 'false' }};
+  var certs = [];
+  function $(id) { return document.getElementById(id); }
+  function log(t, cls) { var d = document.createElement('div'); d.textContent = new Date().toLocaleTimeString('ru-RU') + '  ' + t; if (cls) d.className = cls; $('log').appendChild(d); }
+  function errText(e) { return (window.cadesplugin && cadesplugin.getLastError) ? cadesplugin.getLastError(e) : String(e); }
+  function innOf(s) { var m = s.match(/(?:^|,\s*)(?:ИНН|INN|OID\.1\.2\.643\.3\.131\.1\.1)=\s*"?(\d{10,12})/); return m ? m[1] : ''; }
+  function sameInn(a, b) { return !!a && !!b && ('00' + a).slice(-12) === ('00' + b).slice(-12); }
+  function cnOf(s) { var m = s.match(/(?:^|,\s*)CN=\s*"?([^",]+)/); return m ? m[1] : s.split(',')[0]; }
+  if (!DONE) setTimeout(function () { if (!document.querySelector('#log div')) location.reload(); }, 60000);
+  if (!window.cadesplugin) { $('plugin').textContent = 'плагин не найден'; }
+  else cadesplugin.then(function () {
+    cadesplugin.async_spawn(function* () {
+      try {
+        var store = yield cadesplugin.CreateObjectAsync('CAdESCOM.Store');
+        yield store.Open(cadesplugin.CAPICOM_CURRENT_USER_STORE, cadesplugin.CAPICOM_MY_STORE, cadesplugin.CAPICOM_STORE_OPEN_MAXIMUM_ALLOWED);
+        var coll = yield store.Certificates, n = yield coll.Count, sel = $('cert');
+        sel.innerHTML = '';
+        for (var i = 1; i <= n; i++) {
+          var c = yield coll.Item(i), subj = yield c.SubjectName, to = new Date(yield c.ValidToDate);
+          if (!sameInn(innOf(subj), ORG_INN) || to < new Date()) continue;
+          certs.push(c);
+          var o = document.createElement('option'); o.value = certs.length - 1;
+          o.textContent = cnOf(subj) + ' — до ' + to.toLocaleDateString('ru-RU'); sel.appendChild(o);
+        }
+        yield store.Close();
+        if (certs.length) { sel.disabled = false; $('btnIntro').disabled = READY === 0; }
+        else sel.innerHTML = '<option>нет действующего сертификата с ИНН ' + ORG_INN + '</option>';
+      } catch (e) { $('plugin').textContent = 'сертификаты не прочитаны: ' + errText(e); }
+    });
+  }, function (e) { $('plugin').textContent = 'плагин не инициализировался: ' + errText(e); });
+
+  function signAttached(b64) {
+    var cert = certs[+$('cert').value];
+    return new Promise(function (resolve, reject) {
+      cadesplugin.async_spawn(function* () {
+        try {
+          var signer = yield cadesplugin.CreateObjectAsync('CAdESCOM.CPSigner');
+          yield signer.propset_Certificate(cert);
+          yield signer.propset_CheckCertificate(true);
+          var sd = yield cadesplugin.CreateObjectAsync('CAdESCOM.CadesSignedData');
+          yield sd.propset_ContentEncoding(cadesplugin.CADESCOM_BASE64_TO_BINARY);
+          yield sd.propset_Content(b64);
+          resolve(String(yield sd.SignCades(signer, cadesplugin.CADESCOM_CADES_BES, false)).replace(/\s+/g, ''));
+        } catch (e) { reject(new Error(errText(e))); }
+      });
+    });
+  }
+  async function post(url, body) {
+    var r = await fetch(BASE + url, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body || {})});
+    var j = {}; try { j = await r.json(); } catch (e) {}
+    if (!r.ok) throw new Error(j.error || j.detail || ('HTTP ' + r.status));
+    return j;
+  }
+  $('btnIntro').onclick = async function () {
+    $('btnIntro').disabled = true;
+    try {
+      var d = await post('/prepare');
+      if (!confirm('Отправить «Ввод в оборот» по ' + d.count + ' кодам?\n\n' + d.summary.join('\n'))) { log('Отменено.'); return; }
+      log('Документ на ' + d.count + ' кодов собран, подписываю…');
+      var r = await post('/send', {doc_id: d.doc_id, signature: await signAttached(d.document)});
+      log('Документ принят ЧЗ' + (r.doc_id ? ' (' + r.doc_id + ')' : '') + '. Итог и статусы — через минуты, жмите «Проверить статусы».', 'ok');
+    } catch (e) { log(e.message, 'bad'); }
+    setTimeout(function () { location.reload(); }, 2500);
+  };
+</script>
+{% endblock %}
