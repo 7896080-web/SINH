@@ -33,6 +33,7 @@
   <form method="post" action="/supplies/{{ supply.id }}/codes/refresh" style="display:inline"><button class="secondary">Обновить статусы кодов сейчас</button></form>
   {% if total.codes %}
   <form method="post" action="/supplies/{{ supply.id }}/codes/labels" style="display:inline"><button class="secondary">Этикетки по кодам поставки (PDF)</button></form>
+  <form method="post" action="/supplies/{{ supply.id }}/codes/supply-xlsx" style="display:inline"><button {{ '' if total.done else 'disabled title="только когда все коды в обороте"' }}>Файл поставки для Lamoda (.xlsx)</button></form>
   <form method="post" action="/supplies/{{ supply.id }}/codes/txt" style="display:inline"><button class="secondary" {{ '' if total.done else 'disabled title="только когда все коды в обороте"' }}>Коды поставки (.txt)</button></form>
   {% endif %}
   <p class="muted">Каждый запрос в СУЗ подписывается (может спросить PIN) — держите страницу открытой, пока идёт получение.
