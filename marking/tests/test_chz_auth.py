@@ -55,7 +55,8 @@ def test_login_requeues_cards_that_failed_without_token(db):
 def test_sign_in_strips_line_breaks_and_uses_connection_path(monkeypatch):
     seen = {}
 
-    def fake_post(url, json=None, headers=None, proxies=None, timeout=None):
+    def fake_post(url, json=None, headers=None, proxies=None, timeout=None, allow_redirects=True):
+        assert allow_redirects is False          # заголовки входа не уходят на чужой хост
         seen.update(url=url, body=json)
         return _Resp(200, {"token": "T"})
     monkeypatch.setattr(chz_auth.requests, "post", fake_post)

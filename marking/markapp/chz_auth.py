@@ -56,7 +56,8 @@ def challenge(base_url: str = TRUE_API_URL) -> dict:
     """Строка для подписи: {uuid, data}."""
     try:
         resp = requests.get(f"{base_url.rstrip('/')}/auth/key", headers={"accept": "application/json"},
-                            proxies=_proxies(), timeout=30)
+                            proxies=_proxies(),
+                            allow_redirects=False, timeout=30)
     except requests.RequestException as e:
         raise ChzAuthError(f"ЧЗ недоступен: {type(e).__name__}")
     if resp.status_code != 200:
@@ -78,7 +79,8 @@ def sign_in(uuid: str, signature: str, connection_id: str | None = None,
     signature = re.sub(r"\s+", "", signature or "")
     try:
         resp = requests.post(f"{base_url.rstrip('/')}{path}", json={"uuid": uuid, "data": signature},
-                             headers={"accept": "application/json"}, proxies=_proxies(), timeout=30)
+                             headers={"accept": "application/json"}, proxies=_proxies(),
+                            allow_redirects=False, timeout=30)
     except requests.RequestException as e:
         raise ChzAuthError(f"ЧЗ недоступен: {type(e).__name__}")
     if resp.status_code != 200:
@@ -105,6 +107,23 @@ def expires_at(token: str) -> datetime:
         return datetime.fromtimestamp(int(exp), tz=timezone.utc).replace(tzinfo=None)
     except Exception:
         return now_utc() + TOKEN_LIFETIME
+
+
+def token_inn(token: str) -> str | None:
+    """ИНН из самого токена, если ЧЗ его туда положил (поле `inn` JWT).
+
+    Это вторая, независимая от страницы сверка: разбор подписи (`signer_inn`)
+    проверен только на образцах, и если на настоящей подписи КриптоПро он
+    вернёт None, сверка свелась бы к «поверить странице». Поля нет — None, и
+    решение остаётся за первой сверкой."""
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        inn = json.loads(base64.urlsafe_b64decode(payload)).get("inn")
+    except Exception:  # noqa: BLE001 — не JWT или без полей: сверять нечем
+        return None
+    digits = "".join(ch for ch in str(inn or "") if ch.isdigit())
+    return digits or None
 
 
 def signer_inn(signature: str) -> str | None:

@@ -40,6 +40,25 @@
   <div id="log"></div>
 </div>
 
+{% set incomplete = orders|selectattr('status', 'equalto', 'incomplete')|list %}
+{% if incomplete %}
+<div class="card">
+  <h2 class="bad">Заказы, по которым получены не все коды</h2>
+  <p>СУЗ закрыл буфер, а программа получила меньше заказанного: блок кодов мог быть выдан и потеряться по
+    дороге. Недостающее <b>не дозаказывается само</b> — иначе каждый потерянный ответ оплачивался бы дважды.
+    Откройте заказ в личном кабинете СУЗ: если коды там есть, выгрузите их оттуда; если их нет — разрешите дозаказ.</p>
+  <table>
+    <tr><th>Артикул</th><th>GTIN</th><th>Заказ СУЗ</th><th>Получено</th><th>Ошибка</th><th>Решение</th></tr>
+    {% for o in incomplete %}
+    <tr><td>{{ o.supplier_sku }}</td><td>{{ o.gtin }}</td><td><small>{{ o.suz_order_id }}</small></td>
+      <td>{{ o.received }} из {{ o.quantity }}</td><td><small>{{ o.error[:200] }}</small></td>
+      <td><form method="post" action="/supplies/{{ supply.id }}/codes/order-resolve"
+              onsubmit="return confirm('Подтверждаете, что недостающих {{ o.quantity - o.received }} кодов в СУЗ НЕТ? Они будут заказаны заново — за отдельную плату.')">
+          <input type="hidden" name="order_id" value="{{ o.id }}"><button class="secondary">Разрешить дозаказ</button></form></td></tr>
+    {% endfor %}
+  </table>
+</div>
+{% endif %}
 {% set unknown = orders|selectattr('status', 'equalto', 'unknown')|list %}
 {% if unknown %}
 <div class="card">
@@ -90,7 +109,7 @@
       {% for k, v in cert_types.items() %}<option value="{{ k }}" {{ 'selected' if intro.cert_type == k }}>{{ v }}</option>{% endfor %}</select></label>
     <label>Номер документа<input name="cert_number" value="{{ intro.cert_number }}" size="30"></label>
     <label>Дата документа<input type="date" name="cert_date" value="{{ intro.cert_date }}"></label>
-    <label>Дата производства<input type="date" name="production_date" value="{{ intro.production_date }}"></label>
+    <label>Дата производства<input type="date" name="production_date" value="{{ intro.production_date }}" max="{{ today }}" required></label>
     <button>Сохранить</button>
   </form>
 </details>
@@ -253,6 +272,10 @@
     if (!confirm('Отправить документ «Ввод в оборот» по ' + READY + ' нанесённым кодам?')) return;
     run(async function () {
       var d = await post('/intro-prepare');
+      // Документ — юридическое утверждение: перед подписью человек видит, ЧТО
+      // подписывает. Отказ оставляет документ неподписанным, следующий сбор его заменит.
+      if (!confirm('Документ «Ввод в оборот», ' + d.count + ' кодов:\n\n' + d.summary
+                   + '\n\nВсё верно? Подписать и отправить в ЧЗ?')) { log('Отправка отменена.'); return; }
       log('Документ на ' + d.count + ' кодов собран, подписываю…');
       var r = await post('/intro-send', {doc_id: d.doc_id, signature: await sign(d.document, false, true)});
       log('Документ принят ЧЗ' + (r.doc_id ? ' (' + r.doc_id + ')' : '') + '. Итог и статусы кодов придут в течение минут.', 'ok');

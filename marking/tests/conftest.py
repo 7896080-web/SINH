@@ -72,3 +72,14 @@ def client(db):
 
 def fixture_bytes(name: str) -> bytes:
     return (FIXTURES / name).read_bytes()
+
+
+@pytest.fixture(autouse=True)
+def _fresh_codes_journal():
+    """Журнал кодов СУЗ лежит в общем каталоге копий, а база у каждого теста
+    своя — номера заказов совпадают. Без очистки журнал прошлого теста лёг бы
+    восстановлением (`recover_journal`) на заказ текущего."""
+    import shutil
+    from markapp.codes import journal_dir
+    shutil.rmtree(journal_dir(), ignore_errors=True)
+    yield

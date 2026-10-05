@@ -39,6 +39,9 @@ class ChzApiError(Exception):
         return self.status is None or self.status >= 500
 
 
+# Редиректы запрещены во ВСЕХ запросах к ЧЗ и СУЗ: requests при переходе на
+# другой хост снимает только Authorization, а `clientToken` и `X-Signature`
+# унёс бы на новый адрес как есть. У ЧЗ законных редиректов в API нет.
 def _proxies():
     return {"http": CHZ_PROXY, "https": CHZ_PROXY} if CHZ_PROXY else None
 
@@ -94,7 +97,8 @@ def create_order(oms_id: str, body: str, client_token: str, signature: str) -> s
     headers = _suz_headers(client_token, signature) | {"Content-Type": "application/json"}
     try:
         resp = requests.post(f"{SUZ_URL}/order?omsId={quote(oms_id)}", data=body.encode("utf-8"),
-                             headers=headers, proxies=_proxies(), timeout=60)
+                             headers=headers, proxies=_proxies(),
+                            allow_redirects=False, timeout=60)
     except requests.RequestException as e:
         raise ChzApiError(f"СУЗ недоступен: {type(e).__name__}")
     data = _check(resp, "заказ в СУЗ")
@@ -107,7 +111,8 @@ def create_order(oms_id: str, body: str, client_token: str, signature: str) -> s
 def suz_get(path: str, client_token: str, signature: str):
     try:
         resp = requests.get(f"{SUZ_URL}{path}", headers=_suz_headers(client_token, signature),
-                            proxies=_proxies(), timeout=120)
+                            proxies=_proxies(),
+                            allow_redirects=False, timeout=120)
     except requests.RequestException as e:
         raise ChzApiError(f"СУЗ недоступен: {type(e).__name__}")
     return _check(resp, "СУЗ " + path.split("?")[0])
@@ -125,7 +130,8 @@ def cises_info(short_codes: list[str], token: str) -> dict[str, str]:
         raise ValueError("не больше 1000 кодов за запрос")
     try:
         resp = requests.post(f"{TRUE_API_URL}/cises/info", json=short_codes, headers=_bearer(token),
-                             proxies=_proxies(), timeout=60)
+                             proxies=_proxies(),
+                            allow_redirects=False, timeout=60)
     except requests.RequestException as e:
         raise ChzApiError(f"True API недоступен: {type(e).__name__}")
     data = _check(resp, "статусы кодов")
@@ -149,7 +155,8 @@ def create_document(document_b64: str, signature: str, token: str) -> str:
     try:
         resp = requests.post(f"{TRUE_API_URL}/lk/documents/create?pg={PRODUCT_GROUP}", json=body,
                              headers=_bearer(token) | {"Content-Type": "application/json"},
-                             proxies=_proxies(), timeout=60)
+                             proxies=_proxies(),
+                            allow_redirects=False, timeout=60)
     except requests.RequestException as e:
         raise ChzApiError(f"True API недоступен: {type(e).__name__}")
     data = _check(resp, "документ ввода в оборот")
@@ -165,7 +172,8 @@ def document_status(doc_id: str, token: str) -> tuple[str, str]:
     try:
         resp = requests.get(f"{TRUE_API_URL}/doc/list",
                             params={"number": doc_id, "pg": PRODUCT_GROUP},
-                            headers=_bearer(token), proxies=_proxies(), timeout=60)
+                            headers=_bearer(token), proxies=_proxies(),
+                            allow_redirects=False, timeout=60)
     except requests.RequestException as e:
         raise ChzApiError(f"True API недоступен: {type(e).__name__}")
     data = _check(resp, "статус документа")

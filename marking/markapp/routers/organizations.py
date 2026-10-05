@@ -151,6 +151,14 @@ def chz_login_token(org_id: int, db: Session = Depends(get_db), user: User = Dep
         token = chz_auth.sign_in(uuid, signature, org.connection_id if kind == "suz" else None)
     except chz_auth.ChzAuthError as e:
         return JSONResponse({"error": str(e)}, status_code=502)
+    t_inn = chz_auth.token_inn(token)
+    if t_inn is not None and not chz_auth.inn_matches(org.inn, t_inn):
+        # ЧЗ выдал токен участнику с другим ИНН: сертификат не того ИП, что бы ни
+        # показала страница. Токен не сохраняем — им действовали бы от чужого имени.
+        audit.log(db, user.username, "chz_login_refused", org.name, f"ИНН в токене {t_inn} ≠ {org.inn}")
+        db.commit()
+        return JSONResponse({"error": f"ЧЗ выдал вход для ИНН {t_inn}, а у организации {org.inn} — "
+                                      "токен не сохранён"}, status_code=400)
     until = chz_auth.store(db, org, kind, token)
     audit.log(db, user.username, "chz_login", org.name,
               f"{chz_auth.KINDS[kind]}, ИНН сертификата {inn} ({source})")
