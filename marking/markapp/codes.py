@@ -651,14 +651,46 @@ def defaults(supply: Supply) -> dict:
     return d
 
 
+NK_PERMIT_ATTRS = {"Декларация о соответствии": "CONFORMITY_DECLARATION",
+                   "Сертификат соответствия": "CONFORMITY_CERTIFICATE"}
+
+
+def nk_permit(card) -> tuple[str, str, str] | None:
+    """Разрешительный документ из карточки НК: (тип, номер, дата ГГГГ-ММ-ДД).
+
+    В карточке он лежит атрибутом «Декларация о соответствии» / «Сертификат
+    соответствия» в виде «ЕАЭС N RU Д-RU.РА08.В.73958/26:::2026-09-24»
+    (проверено на живых карточках 05.10.2026). Несколько документов — берётся
+    самый новый по дате.
+    """
+    if card is None or card.status != "ok":
+        return None
+    found = []
+    for a in card.attrs or []:
+        kind = NK_PERMIT_ATTRS.get(str(a.get("attr_name") or "").strip())
+        if not kind:
+            continue
+        for part in re.split(r"[;|\n]", str(a.get("attr_value") or "")):
+            number, _, rest = part.partition(":::")
+            number, day = number.strip(), _iso(rest.strip()[:10])
+            if number:
+                found.append((day, kind, number))
+    if not found:
+        return None
+    day, kind, number = max(found)
+    return kind, number, day
+
+
 def attrs_by_sku(db: Session, supply: Supply) -> tuple[dict[str, dict], list[str]]:
     """Данные документа по артикулу и список проблем.
 
     - ТН ВЭД: карточка НК (первоисточник, ТЗ 5.3) → колонка файла → умолчание
       поставки; расхождение НК и файла — проблема, а не тихий выбор.
-    - Разрешительный документ берётся ЦЕЛИКОМ из одного источника: номер из
-      файла — значит и дата из файла (номер одного документа с датой другого
-      ЧЗ примет или отвергнет, но верным это не станет).
+    - Разрешительный документ — тоже из карточки НК (решение заказчика
+      05.10.2026: документы привязывают в Нацкаталоге) → колонки файла →
+      умолчание поставки. Берётся ЦЕЛИКОМ из одного источника: номер одного
+      документа с датой другого ЧЗ примет или отвергнет, но верным это не
+      станет. Номер в файле не тот, что в карточке, — проблема.
     - Строки одного артикула с разными данными — проблема.
     """
     base = defaults(supply)
@@ -683,7 +715,15 @@ def attrs_by_sku(db: Session, supply: Supply) -> tuple[dict[str, dict], list[str
             problems.append(f"{sku}: ТН ВЭД в файле {f_tnved}, в Нацкаталоге {nk_tnved}")
         tnved = nk_tnved or f_tnved or base["tnved"]
         tnved_src = "Нацкаталог" if nk_tnved else ("файл поставки" if f_tnved else "общее для поставки")
-        if f_number:
+        nk_doc = nk_permit(card)
+        if nk_doc:
+            ctype, number, cdate = nk_doc
+            cert_src = "Нацкаталог"
+            if f_number and " ".join(f_number.split()) != " ".join(number.split()):
+                problems.append(f"{sku}: документ в файле «{f_number}», в Нацкаталоге «{number}»")
+            if not cdate:
+                problems.append(f"{sku}: в карточке НК у документа «{number}» нет даты")
+        elif f_number:
             number, cdate, cert_src = f_number, f_date, "файл поставки"
             ctype = guess_cert_type(f_number)
             if not ctype:

@@ -78,3 +78,50 @@ def test_rows_form_and_fit_button_return_to_rows(client, db):
     assert r.status_code == 303 and r.headers["location"].endswith("#rows")
     db.expire_all()
     assert db.get(Supply, s.id).rows[2].qty == 1
+
+
+# --- Разрешительный документ из карточки НК (решение заказчика 05.10.2026) ----------
+
+def _card(gtin, tn, doc_attr, doc_value):
+    from markapp.models import NkCard
+    return NkCard(gtin=gtin, status="ok", tn_ved=tn,
+                  attrs=[{"attr_name": "Код ТНВЭД", "attr_value": tn},
+                         {"attr_name": "Товарный знак", "attr_value": "AWER"},
+                         {"attr_name": doc_attr, "attr_value": doc_value}])
+
+
+def test_permit_is_taken_from_the_nk_card():
+    from markapp import codes as C
+    kind, number, day = C.nk_permit(_card("04620180403734", "6201400000", "Декларация о соответствии",
+                                          "ЕАЭС N RU Д-RU.РА08.В.85411/26:::2026-09-25"))
+    assert (kind, number, day) == ("CONFORMITY_DECLARATION", "ЕАЭС N RU Д-RU.РА08.В.85411/26", "2026-09-25")
+    kind, number, _ = C.nk_permit(_card("04620180403734", "6109100000", "Сертификат соответствия",
+                                        "ЕАЭС KG 417/043.RU.02.06303:::2024-12-26"))
+    assert kind == "CONFORMITY_CERTIFICATE" and number.endswith("06303")
+    # Два документа — самый новый.
+    _, number, _ = C.nk_permit(_card("04620180403734", "6203429000", "Декларация о соответствии",
+                                     "ЕАЭС N RU Д-TR.РА03.В.54968/21:::2021-12-15;"
+                                     "ЕАЭС N RU Д-RU.РА08.В.73958/26:::2026-09-24"))
+    assert number.endswith("73958/26")
+
+
+def test_document_uses_nk_permit_and_flags_file_mismatch(db):
+    from markapp import codes as C
+    from markapp.models import GtinPair
+    org = settings.lamoda_org(db)
+    s = Supply(number="12597", doc_number="12597", organization_id=org.id, status="moved",
+               extra_headers=["Номер разрешительного документа", "Дата начала действия"])
+    s.rows = [SupplyRow(position=1, supplier_sku="A", qty=1, extras=["", ""]),
+              SupplyRow(position=2, supplier_sku="B", qty=1, extras=["ЕАЭС N RU Д-RU.X.1", "01.01.2026"])]
+    db.add(s)
+    db.add_all([GtinPair(supplier_sku="A", gtin="04620180403734", source="manual"),
+                GtinPair(supplier_sku="B", gtin="04630688318072", source="manual"),
+                _card("04620180403734", "6201400000", "Декларация о соответствии",
+                      "ЕАЭС N RU Д-RU.РА08.В.85411/26:::2026-09-25"),
+                _card("04630688318072", "6110209100", "Декларация о соответствии",
+                      "ЕАЭС N RU Д-RU.РА08.В.73918/26:::2026-09-24")])
+    db.commit()
+    attrs, problems = C.attrs_by_sku(db, s)
+    assert attrs["A"]["cert_number"].endswith("85411/26") and attrs["A"]["cert_src"] == "Нацкаталог"
+    assert attrs["A"]["cert_date"] == "2026-09-25" and attrs["A"]["tnved"] == "6201400000"
+    assert any(p.startswith("B: документ в файле") for p in problems)
