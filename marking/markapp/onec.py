@@ -25,7 +25,7 @@ from sqlalchemy.orm import Session
 
 from markapp import audit, config, exchange, settings
 from markapp.models import OnecTask, OnecTaskStatus, Supply, SupplyStatus
-from markapp.supplies import movement_problems
+from markapp.supplies import SupplyError, blocking_problems, ensure_editable, movement_problems
 from markapp.timeutils import now_utc, ru
 
 COMMANDS = ("PING", "SUPPLY_CHECK", "SUPPLY_MOVEMENT", "BARCODE_DICT")
@@ -439,3 +439,46 @@ def mark_timeouts(db: Session) -> int:
     if stuck:
         db.commit()
     return len(stuck)
+
+
+def fit_to_stock(db: Session, supply: Supply) -> list[str]:
+    """«Уменьшить до остатка 1С»: строки «не хватает» — до остатка ЦС из ответа
+    ПОСЛЕДНЕЙ проверки, остаток 0 и меньше — строка убирается. Если после этого
+    всё сходится, поставка — «проверено в 1С» без нового запроса: данные те же,
+    что прислала 1С, а составом стало меньше. Перемещение в 1С всё равно сверяет
+    остаток заново и при нехватке документа не создаёт (атомарно).
+
+    Только если состав с той проверки не менялся: иначе остатки относятся к
+    другому составу, и нужна новая проверка. Возвращает список изменений.
+    """
+    ensure_editable(supply)
+    last = (db.query(OnecTask).filter(OnecTask.supply_id == supply.id, OnecTask.command == "SUPPLY_CHECK")
+            .order_by(OnecTask.id.desc()).first())
+    if last is None or last.status not in (OnecTaskStatus.done.value, OnecTaskStatus.failed.value):
+        raise SupplyError("нет ответа 1С на проверку — сначала «Проверить в 1С»")
+    if last.line != supply_line("SUPPLY_CHECK", last.order_id, supply):
+        raise SupplyError("состав менялся после последней проверки — остатки 1С к нему не относятся, "
+                          "проверьте в 1С заново")
+    if any(r.onec_status in ("not_found", "ambiguous", "") for r in supply.rows):
+        raise SupplyError("есть строки без ответа 1С или с ненайденным штрихкодом — их остаток не известен")
+    short = [r for r in supply.rows if r.onec_status == "short"]
+    eans = [r.ean for r in short]
+    if len(eans) != len(set(eans)):
+        raise SupplyError("один штрихкод в нескольких строках «не хватает» — поправьте количества вручную")
+    changes = []
+    for r in short:
+        stock = max(0, r.onec_stock or 0)
+        changes.append(f"{r.supplier_sku}: {r.qty} → {stock}" + (" (строка убрана)" if stock == 0 else ""))
+        if stock == 0:
+            supply.rows.remove(r)
+        else:
+            r.qty = stock
+            r.onec_status = "ok"
+    if not changes:
+        raise SupplyError("строк «не хватает» нет")
+    db.flush()
+    if not supply.rows:
+        raise SupplyError("после уменьшения в поставке не осталось строк")
+    ok = not blocking_problems(supply) and not movement_problems(supply)
+    supply.status = SupplyStatus.checked.value if ok else SupplyStatus.draft.value
+    return changes

@@ -429,3 +429,28 @@ def totals(supply: Supply) -> dict:
     money = sum((r.price or 0) * r.qty for r in supply.rows)
     return {"articles": len({r.supplier_sku for r in supply.rows}), "rows": len(supply.rows),
             "units": units, "money": money}
+
+
+def update_quantities(supply: Supply, changes: dict[int, int]) -> int:
+    """Количества нескольких строк одним действием (0 — убрать строку).
+    Возвращает число изменённых строк; без изменений поставка не трогается."""
+    ensure_editable(supply)
+    if any(q < 0 for q in changes.values()):
+        raise SupplyError("количество не может быть отрицательным")
+    rows = {r.id: r for r in supply.rows}
+    unknown = [rid for rid in changes if rid not in rows]
+    if unknown:
+        raise SupplyError("строка не найдена — обновите страницу")
+    changed = 0
+    for rid, qty in changes.items():
+        row = rows[rid]
+        if qty == row.qty:
+            continue
+        if qty == 0:
+            supply.rows.remove(row)
+        else:
+            row.qty = qty
+        changed += 1
+    if changed:
+        mark_edited(supply)
+    return changed
