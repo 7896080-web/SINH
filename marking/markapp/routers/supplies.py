@@ -141,6 +141,77 @@ def supply_detail(supply_id: int, request: Request, db: Session = Depends(get_db
                   organizations=db.query(Organization).filter(Organization.is_active.is_(True)).all())
 
 
+ONEC_LABELS = {"ok": "хватает", "short": "не хватает", "not_found": "не найден",
+               "ambiguous": "штрихкод у нескольких товаров"}
+
+
+def rows_workbook(db: Session, supply) -> bytes:
+    """Таблица «Строки» поставки как на экране — для склада (05.10.2026)."""
+    import io
+
+    import openpyxl
+    from openpyxl.styles import Alignment, Font
+    from markapp.models import STATUS_LABELS, NkCard
+    gmap = G.gtin_map(db)
+    gtins = {r.id: gmap.get(r.supplier_sku, "") for r in supply.rows}
+    cards = {c.gtin: c for c in db.query(NkCard).filter(NkCard.gtin.in_([g for g in gtins.values() if g])).all()}
+    notes = S.shared_onec_items(supply)
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = f"Поставка {supply.number}"
+    t = S.totals(supply)
+    ws["A1"] = (f"Поставка {supply.number} от {ru(supply.supply_date) if supply.supply_date else '—'} · "
+                f"{STATUS_LABELS.get(SupplyStatus(supply.status), supply.status)}")
+    ws["A1"].font = Font(bold=True, size=13)
+    from markapp.templating import money
+    ws["A2"] = f"Артикулов {t['articles']}, штук {t['units']}, сумма {money(t['money'])}"
+    head = (["#", "Размерный артикул", "Кол-во", "Цена", "EAN"] + list(supply.extra_headers or [])
+            + ["GTIN", "НК: цвет", "НК: размер", "1С: товар", "Остаток ЦС", "1С", "Замечания"])
+    ws.append([])
+    ws.append(head)
+    for c in ws[4]:
+        c.font = Font(bold=True)
+        c.alignment = Alignment(wrap_text=True, vertical="top")
+    for r in supply.rows:
+        g = gtins[r.id]
+        card = cards.get(g)
+        ok = card is not None and card.status == "ok"
+        onec = " · ".join(x for x in (r.onec_name, r.onec_size, r.onec_color) if x)
+        ws.append([r.position, r.supplier_sku, r.qty, float(r.price) if r.price is not None else None, r.ean or ""]
+                  + [str(v or "") for v in (r.extras or [])]
+                  + [g, card.color if ok else "", card.size if ok else "", onec, r.onec_stock,
+                     ONEC_LABELS.get(r.onec_status, r.onec_status or ""),
+                     "; ".join(x for x in (r.warnings, notes.get(r.id, "")) if x)])
+        row = ws.max_row
+        ws.cell(row=row, column=4).number_format = "# ##0.00"
+        for col in (5, 6 + len(supply.extra_headers or [])):        # EAN и GTIN — текстом
+            ws.cell(row=row, column=col).number_format = "@"
+    ws.append([None, "Итого", t["units"], None])
+    ws.cell(row=ws.max_row, column=2).font = Font(bold=True)
+    ws.cell(row=ws.max_row, column=3).font = Font(bold=True)
+    widths = [5, 42, 8, 11, 16] + [14] * len(supply.extra_headers or []) + [16, 14, 10, 40, 11, 14, 40]
+    for i, w in enumerate(widths, 1):
+        ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
+    ws.freeze_panes = "C5"
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+@router.get("/supplies/{supply_id}/rows.xlsx")
+def supply_rows_xlsx(supply_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    from urllib.parse import quote
+
+    from fastapi.responses import Response
+    supply = db.get(Supply, supply_id)
+    if supply is None:
+        return RedirectResponse("/supplies", status_code=303)
+    name = f"Поставка_{supply.number}_строки.xlsx"
+    return Response(rows_workbook(db, supply),
+                    media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(name)}"})
+
+
 @router.get("/supplies/{supply_id}/source")
 def supply_source(supply_id: int, db: Session = Depends(get_db),
                   user: User = Depends(get_current_user)):
