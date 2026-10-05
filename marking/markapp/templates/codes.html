@@ -102,7 +102,7 @@
 
 <details class="card" {{ 'open' if not intro.tnved and not intro.cert_number }}>
   <summary><b>Данные документа «Ввод в оборот»</b> — если их нет в колонках файла поставки</summary>
-  <p class="muted">Порядок: колонки файла поставки («ТНВЭД», «Номер разрешительного документа», «Дата начала действия») → ТН ВЭД из карточки НК → значения ниже.</p>
+  <p class="muted">Откуда берутся данные: ТН ВЭД и разрешительный документ — из карточки Нацкаталога; нет в карточке — из колонок файла поставки («ТНВЭД», «Номер разрешительного документа», «Дата начала действия»); нет и там — значения ниже.</p>
   <form method="post" action="/supplies/{{ supply.id }}/codes/attrs" class="row">
     <label>ТН ВЭД<input name="tnved" value="{{ intro.tnved }}" size="12"></label>
     <label>Тип документа<select name="cert_type"><option value="">—</option>
