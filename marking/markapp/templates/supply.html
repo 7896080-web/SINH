@@ -117,6 +117,7 @@
 
 <h2 id="rows">Строки</h2>
 <div class="row" style="margin-bottom:8px">
+  <a class="btn secondary" href="/supplies/{{ supply.id }}/rows.xlsx">Выгрузить в Excel</a>
   {% if editable %}
   <form id="rowsForm" method="post" action="/supplies/{{ supply.id }}/rows"><button>Сохранить количества</button></form>
   {% if supply.rows|selectattr('onec_status', 'equalto', 'short')|list %}

@@ -125,3 +125,18 @@ def test_document_uses_nk_permit_and_flags_file_mismatch(db):
     assert attrs["A"]["cert_number"].endswith("85411/26") and attrs["A"]["cert_src"] == "Нацкаталог"
     assert attrs["A"]["cert_date"] == "2026-09-25" and attrs["A"]["tnved"] == "6201400000"
     assert any(p.startswith("B: документ в файле") for p in problems)
+
+
+def test_rows_export_to_excel_like_the_screen(client, db):
+    import io
+    import openpyxl
+    s = _checked_short(db)
+    r = client.get(f"/supplies/{s.id}/rows.xlsx")
+    assert r.status_code == 200 and r.content[:2] == b"PK"
+    ws = openpyxl.load_workbook(io.BytesIO(r.content)).active
+    assert "Поставка 12599" in ws["A1"].value
+    assert [c.value for c in ws[4]][:5] == ["#", "Размерный артикул", "Кол-во", "Цена", "EAN"]
+    assert ws["B5"].value == "A" and ws["C5"].value == 5 and ws["E5"].value == "2000000000011"
+    row_b = [c.value for c in ws[6]]
+    assert -2 in row_b and "не хватает" in row_b                  # остаток и ответ 1С как на экране
+    assert ws.cell(row=ws.max_row, column=2).value == "Итого" and ws.cell(row=ws.max_row, column=3).value == 10
