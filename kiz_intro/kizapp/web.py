@@ -107,6 +107,18 @@ def label_template_save(template_id: int = Form(0), name: str = Form(""), title:
     return _go("/#labels", f"Шаблон «{t.name}» сохранён.")
 
 
+@app.post("/labels/preview")
+def label_preview(title: str = Form(""), right: str = Form(""), bottom: str = Form(""),
+                  module: str = Form("0.5"), db: Session = Depends(get_db)):
+    """Макет этикетки картинкой: тот же код, что печатает PDF, на образце кода.
+    Предупреждения (текст не влез) — в заголовке X-Label-Warnings."""
+    try:
+        png, warnings = L.preview_png(db, title, right, bottom, module, db.query(Org).order_by(Org.id).first())
+    except L.LabelError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return Response(png, media_type="image/png", headers={"X-Label-Warnings": quote("; ".join(warnings))})
+
+
 @app.post("/labels/template/{template_id}/default")
 def label_template_default(template_id: int, db: Session = Depends(get_db)):
     L.make_default(db, template_id)

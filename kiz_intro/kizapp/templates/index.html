@@ -63,7 +63,8 @@
     <summary><b>{{ t.name }}</b>{% if t.is_default %} <span class="badge">основной</span>{% endif %}
       <span class="muted">— {{ t.title }}{% if t.right %} / {{ t.right.replace('
 ', ' / ') }}{% endif %}, модуль {{ t.module }}</span></summary>
-    <form method="post" action="/labels/template">
+    <form method="post" action="/labels/template" class="tpl-form" style="display:flex;gap:18px;flex-wrap:wrap">
+      <div>
       <input type="hidden" name="template_id" value="{{ t.id }}">
       <p><label>Имя<br><input name="name" value="{{ t.name }}" size="30" required></label></p>
       <p><label>Заголовок (жирный, справа от кода)<br><input name="title" value="{{ t.title }}" size="40"></label></p>
@@ -71,6 +72,8 @@
       <p><label>Строки под кодом<br><textarea name="bottom" rows="3" cols="40">{{ t.bottom }}</textarea></label></p>
       <p><label>Модуль, мм<br><input name="module" value="{{ t.module }}" size="6"></label></p>
       <button class="secondary">Сохранить</button>
+      </div>
+      <div><img class="tpl-preview" alt="макет этикетки" style="width:348px;border:1px solid #ccd"><div class="tpl-warn warn"></div></div>
     </form>
     <div class="row" style="margin-top:6px">
       {% if not t.is_default %}<form method="post" action="/labels/template/{{ t.id }}/default"><button class="secondary">Сделать основным</button></form>{% endif %}
@@ -81,16 +84,39 @@
   {% endfor %}
   <details style="margin-top:10px">
     <summary><b>+ Новый шаблон</b></summary>
-    <form method="post" action="/labels/template">
+    <form method="post" action="/labels/template" class="tpl-form" style="display:flex;gap:18px;flex-wrap:wrap">
+      <div>
       <p><label>Имя<br><input name="name" size="30" required placeholder="например, Мелкий шрифт"></label></p>
       <p><label>Заголовок<br><input name="title" value="{название}" size="40"></label></p>
       <p><label>Строки справа от кода<br><textarea name="right" rows="2" cols="40">GTIN {GTIN}</textarea></label></p>
       <p><label>Строки под кодом<br><textarea name="bottom" rows="3" cols="40">Изготовитель: {изготовитель}, ИНН {ИНН}</textarea></label></p>
       <p><label>Модуль, мм<br><input name="module" value="0.5" size="6"></label></p>
       <button>Добавить шаблон</button>
+      </div>
+      <div><img class="tpl-preview" alt="макет этикетки" style="width:348px;border:1px solid #ccd"><div class="tpl-warn warn"></div></div>
     </form>
   </details>
 </div>
+
+<script>
+  // Макет этикетки: при правке строк или модуля картинка перерисовывается (с паузой 0,4 с).
+  document.querySelectorAll('.tpl-form').forEach(function (form) {
+    var img = form.querySelector('.tpl-preview'), warn = form.querySelector('.tpl-warn'), timer = null;
+    function draw() {
+      var fd = new FormData();
+      ['title', 'right', 'bottom', 'module'].forEach(function (k) { fd.append(k, form.elements[k].value); });
+      fetch('/labels/preview', {method: 'POST', body: fd}).then(function (r) {
+        if (!r.ok) return r.json().then(function (j) { warn.textContent = j.error || 'макет не построен'; });
+        warn.textContent = decodeURIComponent(r.headers.get('X-Label-Warnings') || '');
+        return r.blob().then(function (b) { if (img.src) URL.revokeObjectURL(img.src); img.src = URL.createObjectURL(b); });
+      });
+    }
+    form.addEventListener('input', function () { clearTimeout(timer); timer = setTimeout(draw, 400); });
+    var det = form.closest('details');
+    if (!det || det.open) draw();
+    if (det) det.addEventListener('toggle', function () { if (det.open && !img.src) draw(); });
+  });
+</script>
 
 {% if journal %}
 <details class="card">
