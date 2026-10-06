@@ -278,7 +278,9 @@
       if (!confirm('Документ «Ввод в оборот», ' + d.count + ' кодов:\n\n' + d.summary
                    + '\n\nВсё верно? Подписать и отправить в ЧЗ?')) { log('Отправка отменена.'); return; }
       log('Документ на ' + d.count + ' кодов собран, подписываю…');
-      var r = await post('/intro-send', {doc_id: d.doc_id, signature: await sign(d.document, false, true)});
+      // Документ — ОТКРЕПЛЁННОЙ подписью (True API). Прикреплённая вкладывает в себя
+      // весь документ: на 500 кодах ЧЗ ответил «Подпись слишком большая» (06.10.2026).
+      var r = await post('/intro-send', {doc_id: d.doc_id, signature: await sign(d.document, true, true)});
       log('Документ принят ЧЗ' + (r.doc_id ? ' (' + r.doc_id + ')' : '') + '. Итог и статусы кодов придут в течение минут.', 'ok');
     });
   };
