@@ -13,7 +13,7 @@ from pathlib import Path
 
 from sqlalchemy.orm import Session
 
-from kizapp.models import Setting
+from kizapp.models import LabelTemplate, Setting
 from kizapp.service import FULL_RE
 
 FONTS = Path(__file__).resolve().parent / "fonts"
@@ -42,6 +42,75 @@ def put(db: Session, key: str, value: str) -> None:
     s = db.get(Setting, key) or Setting(key=key)
     s.value = value
     db.add(s)
+
+
+# --- Шаблоны: несколько, один основной ------------------------------------------------
+
+def templates(db: Session) -> list[LabelTemplate]:
+    """Все шаблоны; пусто — создаётся «Основной» из прежней настройки (или умолчаний)."""
+    rows = db.query(LabelTemplate).order_by(LabelTemplate.is_default.desc(), LabelTemplate.name).all()
+    if not rows:
+        t = LabelTemplate(name="Основной", title=get(db, "label_title"), right=get(db, "label_right"),
+                          bottom=get(db, "label_bottom"), module=get(db, "label_module"), is_default=1)
+        db.add(t)
+        db.flush()
+        rows = [t]
+    return rows
+
+
+def template(db: Session, template_id: int | None) -> LabelTemplate:
+    rows = templates(db)
+    if template_id:
+        t = db.get(LabelTemplate, template_id)
+        if t is None:
+            raise LabelError("шаблон не найден")
+        return t
+    return next((t for t in rows if t.is_default), rows[0])
+
+
+def save_template(db: Session, template_id: int | None, name: str, title: str, right: str, bottom: str,
+                  module: str) -> LabelTemplate:
+    name = name.strip()
+    problems = [] if name else ["нужно имя шаблона"]
+    problems += check_template(title + right + bottom)
+    try:
+        m = float(module.replace(",", "."))
+        if not 0.3 <= m <= 1.0:
+            raise ValueError
+    except ValueError:
+        problems.append("модуль — от 0,3 до 1 мм (203 dpi: 0,5; 300 dpi: 0,508)")
+        m = 0.5
+    clash = db.query(LabelTemplate).filter(LabelTemplate.name == name, LabelTemplate.id != (template_id or 0)).first()
+    if clash:
+        problems.append(f"шаблон «{name}» уже есть")
+    if problems:
+        raise LabelError("; ".join(problems))
+    t = db.get(LabelTemplate, template_id) if template_id else None
+    if t is None:
+        t = LabelTemplate(is_default=0 if templates(db) else 1)
+        db.add(t)
+    t.name, t.title, t.right, t.bottom, t.module = name, title.strip(), right.strip(), bottom.strip(), str(m)
+    db.flush()
+    return t
+
+
+def make_default(db: Session, template_id: int) -> None:
+    for t in templates(db):
+        t.is_default = 1 if t.id == template_id else 0
+
+
+def delete_template(db: Session, template_id: int) -> None:
+    rows = templates(db)
+    t = db.get(LabelTemplate, template_id)
+    if t is None:
+        return
+    if len(rows) == 1:
+        raise LabelError("последний шаблон удалить нельзя")
+    was_default = t.is_default
+    db.delete(t)
+    db.flush()
+    if was_default:
+        templates(db)[0].is_default = 1
 
 
 def check_template(text: str) -> list[str]:
@@ -140,13 +209,15 @@ def _fit(c, lines, font, size, width, height, leading=1.25):
     return [w for ln in lines for w in _wrap(c, ln, font, MIN_FONT, width)], MIN_FONT, False
 
 
-def build_pdf(db: Session, codes: list[str], values: list[dict]) -> tuple[bytes, list[str]]:
+def build_pdf(db: Session, codes: list[str], values: list[dict],
+              tpl: LabelTemplate | None = None) -> tuple[bytes, list[str]]:
     """PDF, страница 58×40 мм на этикетку. Возвращает (pdf, предупреждения)."""
     from reportlab.lib.units import mm
     from reportlab.pdfgen import canvas
     _fonts()
-    module = float(get(db, "label_module"))
-    t_title, t_right, t_bottom = get(db, "label_title"), get(db, "label_right"), get(db, "label_bottom")
+    tpl = tpl or template(db, None)
+    module = float(tpl.module)
+    t_title, t_right, t_bottom = tpl.title, tpl.right, tpl.bottom
     buf = io.BytesIO()
     W, H = LABEL_W_MM * mm, LABEL_H_MM * mm
     c = canvas.Canvas(buf, pagesize=(W, H))

@@ -71,7 +71,7 @@ def index(request: Request, db: Session = Depends(get_db)):
     return _render(request, "index.html", orgs=[(o, S.token(o) is not None,
                                                 db.query(Card).filter(Card.org_id == o.id).count()) for o in orgs],
                    batches=[(b, names.get(b.org_id, "?"), S.summary(db, b)) for b in batches],
-                   status_ru=S.STATUS_RU, label={k: L.get(db, k) for k in L.DEFAULTS},
+                   status_ru=S.STATUS_RU, label_templates=L.templates(db),
                    placeholders=L.PLACEHOLDERS,
                    journal=db.query(Journal).order_by(Journal.id.desc()).limit(15).all())
 
@@ -94,22 +94,34 @@ async def upload(file: UploadFile = File(...), org_id: int = Form(...), db: Sess
                + (f" Карточки НК: {note}" if note else ""), "warn" if note else "ok")
 
 
-@app.post("/labels/settings")
-def labels_settings(title: str = Form(""), right: str = Form(""), bottom: str = Form(""),
-                    module: str = Form("0.5"), db: Session = Depends(get_db)):
-    problems = L.check_template(title + right + bottom)
+@app.post("/labels/template")
+def label_template_save(template_id: int = Form(0), name: str = Form(""), title: str = Form(""),
+                        right: str = Form(""), bottom: str = Form(""), module: str = Form("0.5"),
+                        db: Session = Depends(get_db)):
     try:
-        m = float(module.replace(",", "."))
-        if not 0.3 <= m <= 1.0:
-            raise ValueError
-    except ValueError:
-        problems.append("модуль — от 0,3 до 1 мм (203 dpi: 0,5; 300 dpi: 0,508)")
-    if problems:
-        return _go("/", "Не сохранено: " + "; ".join(problems), "error")
-    for k, v in (("label_title", title), ("label_right", right), ("label_bottom", bottom), ("label_module", str(m))):
-        L.put(db, k, v.strip())
+        t = L.save_template(db, template_id or None, name, title, right, bottom, module)
+    except L.LabelError as e:
+        db.rollback()
+        return _go("/#labels", f"Шаблон не сохранён: {e}", "error")
     db.commit()
-    return _go("/", "Шаблон этикетки сохранён.")
+    return _go("/#labels", f"Шаблон «{t.name}» сохранён.")
+
+
+@app.post("/labels/template/{template_id}/default")
+def label_template_default(template_id: int, db: Session = Depends(get_db)):
+    L.make_default(db, template_id)
+    db.commit()
+    return _go("/#labels", "Основной шаблон выбран.")
+
+
+@app.post("/labels/template/{template_id}/delete")
+def label_template_delete(template_id: int, db: Session = Depends(get_db)):
+    try:
+        L.delete_template(db, template_id)
+    except L.LabelError as e:
+        return _go("/#labels", str(e), "error")
+    db.commit()
+    return _go("/#labels", "Шаблон удалён.")
 
 
 # --- ИП: реквизиты, вход, справочник НК --------------------------------------------------------
@@ -192,7 +204,10 @@ def batch_page(batch_id: int, request: Request, db: Session = Depends(get_db)):
     if b is None:
         return _go("/")
     o = S.org_of(db, b)
+    tpls = L.templates(db)
+    db.commit()
     return _render(request, "batch.html", org=o, batch=b, s=S.summary(db, b), token_ok=S.token(o) is not None,
+                   label_templates=tpls,
                    docs=db.query(Doc).filter(Doc.batch_id == b.id).order_by(Doc.id.desc()).all(),
                    status_ru=S.STATUS_RU, doc_ru=S.DOC_RU, cert_ru=S.CERT_RU)
 
@@ -264,17 +279,18 @@ def batch_release(batch_id: int, doc_id: int = Form(...), db: Session = Depends(
 
 
 @app.post("/batch/{batch_id}/labels")
-def batch_labels(batch_id: int, db: Session = Depends(get_db)):
+def batch_labels(batch_id: int, template_id: int = Form(0), db: Session = Depends(get_db)):
     b = db.get(Batch, batch_id)
     if b is None:
         return _go("/")
     try:
         codes = S.full_codes(db, b)
+        tpl = L.template(db, template_id or None)
         pdf, warnings = L.build_pdf(db, codes, L.values_for(db, codes, S.org_of(db, b),
-                                                             date.today().strftime("%d.%m.%Y"), b.id))
+                                                             date.today().strftime("%d.%m.%Y"), b.id), tpl)
     except (S.KizError, L.LabelError) as e:
         return _go(f"/batch/{batch_id}", f"Этикетки не выданы: {e}", "error")
-    S.log(db, "labels", f"партия #{b.id}: {len(codes)} этикеток; предупреждений {len(warnings)}")
+    S.log(db, "labels", f"партия #{b.id}: {len(codes)} этикеток, шаблон «{tpl.name}»; предупреждений {len(warnings)}")
     db.commit()
     return _file(pdf, f"Этикетки_партия_{b.id}_{len(codes)}шт.pdf", "application/pdf")
 
