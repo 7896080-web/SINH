@@ -6,7 +6,7 @@
 - /cises/info — статусы по коротким КИ (до 1000 за запрос), по токену;
 - /lk/documents/create?pg=lp — LP_INTRODUCE_GOODS, ОТКРЕПЛЁННАЯ подпись документа (True API;
   прикреплённая на 500 кодах — «Подпись слишком большая», 06.10.2026);
-- /doc/list?number= — итог документа;
+- /api/v4/…/doc/{id}/info — итог документа (v3 /doc/list нет — 404);
 - /nk/product?gtins= — карточка НК, только с токеном (одного apikey мало).
 """
 from __future__ import annotations
@@ -152,15 +152,31 @@ def create_document(document_b64: str, signature: str, token: str) -> str:
     return ""
 
 
+DOC_OK = ("CHECKED_OK",)
+DOC_FAILED = ("CHECKED_NOT_OK", "PARSE_ERROR", "PROCESSING_ERROR")
+
+
 def document_status(doc_id: str, token: str) -> tuple[str, str]:
-    data = _call("GET", "/doc/list", "статус документа", token, params={"number": doc_id, "pg": "lp"})
-    items = data if isinstance(data, list) else (data or {}).get("results") or (data or {}).get("items") or []
-    doc = next((d for d in items if doc_id in (d.get("documentId"), d.get("id"), d.get("number"))), None)
-    if doc is None:
-        return "", ""
-    errs = doc.get("errors") or doc.get("errorMessage") or doc.get("description") or ""
-    return doc.get("documentStatus") or doc.get("status") or "", (
-        errs if isinstance(errs, str) else json.dumps(errs, ensure_ascii=False))
+    """(статус, ошибки) по GET /api/v4/true-api/doc/{id}/info.
+
+    /api/v3/…/doc/list в True API нет (404), /api/v3/…/doc/{id}/info —
+    «Устаревшее API» (410): проверено вживую 06.10.2026, итог документа не
+    обновлялся. Статусы: IN_PROGRESS / WAIT_FOR_CONTINUATION — проверяется,
+    CHECKED_OK — обработан, CHECKED_NOT_OK / PARSE_ERROR — с ошибками,
+    PROCESSING_ERROR — техническая ошибка."""
+    url = config.TRUE_API_URL.replace("/api/v3/", "/api/v4/") + f"/doc/{doc_id}/info"
+    try:
+        r = requests.get(url, params={"pg": "lp"}, headers={"accept": "application/json",
+                                                            "Authorization": f"Bearer {token}"},
+                         proxies=_proxies(), timeout=60, allow_redirects=False)
+    except requests.RequestException as e:
+        raise ChzError(f"статус документа: ЧЗ недоступен ({type(e).__name__})")
+    if r.status_code != 200:
+        raise ChzError(f"статус документа: HTTP {r.status_code}: {r.text[:300]}", r.status_code)
+    data = r.json()
+    doc = data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else {})
+    errs = doc.get("errors") or doc.get("errorMessage") or ""
+    return doc.get("status") or "", errs if isinstance(errs, str) else json.dumps(errs, ensure_ascii=False)
 
 
 # --- Нацкаталог ----------------------------------------------------------------------------

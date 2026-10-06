@@ -202,7 +202,8 @@ def batch_refresh(batch_id: int, db: Session = Depends(get_db)):
     b = db.get(Batch, batch_id)
     if b is None:
         return _go("/")
-    note = S.refresh_cards(db, b, force=True) or S.refresh_statuses(db, b)
+    # Оба шага всегда: заметка про карточки не должна прятать статусы и итог документа.
+    note = "; ".join(x for x in (S.refresh_cards(db, b, force=True), S.refresh_statuses(db, b)) if x)
     db.commit()
     return _go(f"/batch/{batch_id}", note or "Карточки НК и статусы кодов обновлены.", "warn" if note else "ok")
 
