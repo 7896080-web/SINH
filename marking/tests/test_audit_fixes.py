@@ -364,3 +364,32 @@ def test_codes_not_attached_to_this_supply_are_caught(db, supply, fake):
     db.commit()
     rows = [_Row("A 1", _short(GTIN_A, 1)), _Row("A 1", _short(GTIN_A, 7))]
     assert any("не закреплён" in p for p in _kiz_problems(rows, supply, db))
+
+
+# --- 06.10.2026: итог документа и подпись документа ----------------------------------------
+
+def test_document_status_uses_v4_info(monkeypatch):
+    """/api/v3/…/doc/list в True API нет (404) — отклонённый документ висел «проверяется»."""
+    seen = {}
+
+    class R:
+        status_code = 200
+        text = "[]"
+
+        def json(self):
+            return [{"number": "D", "status": "PARSE_ERROR", "errors": ["33: Подпись слишком большая."]}]
+
+    def get(url, **kw):
+        seen["url"] = url
+        return R()
+    monkeypatch.setattr(chz_api.requests, "get", get)
+    st, errs = chz_api.document_status("D", "T")
+    assert seen["url"].endswith("/api/v4/true-api/doc/D/info")
+    assert st == "PARSE_ERROR" and "слишком большая" in errs
+
+
+def test_introduce_document_is_signed_detached():
+    """Прикреплённая подпись вкладывает документ — на 500 кодах «Подпись слишком большая»."""
+    from pathlib import Path
+    page = (Path(__file__).resolve().parents[1] / "markapp" / "templates" / "codes.html").read_text(encoding="utf-8")
+    assert "signature: await sign(d.document, true, true)" in page

@@ -168,19 +168,21 @@ def create_document(document_b64: str, signature: str, token: str) -> str:
 
 
 def document_status(doc_id: str, token: str) -> tuple[str, str]:
-    """(статус, текст ошибок) документа по /doc/list — так проверял kiz-tool."""
+    """(статус, текст ошибок) документа по GET /api/v4/true-api/doc/{id}/info.
+
+    kiz-tool проверял через /api/v3/…/doc/list — такого метода в True API нет
+    (404), а /api/v3/…/doc/{id}/info — «Устаревшее API» (410): проверено вживую
+    06.10.2026, отклонённый документ висел «проверяется» и держал коды."""
+    url = TRUE_API_URL.replace("/api/v3/", "/api/v4/") + f"/doc/{doc_id}/info"
     try:
-        resp = requests.get(f"{TRUE_API_URL}/doc/list",
-                            params={"number": doc_id, "pg": PRODUCT_GROUP},
-                            headers=_bearer(token), proxies=_proxies(),
+        resp = requests.get(url, params={"pg": PRODUCT_GROUP}, headers=_bearer(token), proxies=_proxies(),
                             allow_redirects=False, timeout=60)
     except requests.RequestException as e:
         raise ChzApiError(f"True API недоступен: {type(e).__name__}")
     data = _check(resp, "статус документа")
-    items = data if isinstance(data, list) else (data or {}).get("results") or (data or {}).get("items") or []
-    doc = next((d for d in items if doc_id in (d.get("documentId"), d.get("id"), d.get("number"))), None)
+    doc = data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else None)
     if doc is None:
         return "", ""
-    status = doc.get("documentStatus") or doc.get("status") or ""
+    status = doc.get("status") or doc.get("documentStatus") or ""
     errors = doc.get("errors") or doc.get("errorMessage") or doc.get("description") or ""
     return status, (json.dumps(errors, ensure_ascii=False) if not isinstance(errors, str) else errors)

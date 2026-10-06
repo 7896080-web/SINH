@@ -890,7 +890,7 @@ def refresh_documents(db: Session) -> dict:
     db.commit()
     stats = {"checked": 0, "note": ""}
     # Документ с неизвестным исходом или в проверке закрывается сам, когда все его
-    # коды в обороте: статус кода — истина, ответ /doc/list — только причина отказа.
+    # коды в обороте: статус кода — истина, ответ /api/v4/…/doc/{id}/info — только причина отказа.
     for doc in db.query(IntroduceDoc).filter(IntroduceDoc.status.in_(("unknown", "sent"))).all():
         codes = db.query(MarkCode).filter(MarkCode.introduce_doc_id == doc.id).all()
         if codes and all(c.status == "INTRODUCED" for c in codes):
