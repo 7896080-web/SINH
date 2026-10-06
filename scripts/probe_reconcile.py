@@ -44,7 +44,7 @@ from app.database import SessionLocal                            # noqa: E402
 from app.models import (Barcode, FtpTask, Product,                # noqa: E402
                         ReconciliationLog)
 from app.timeutils import now_utc                                 # noqa: E402
-from scripts.probe_movements import _classify_filters, _size_key  # noqa: E402
+from scripts.probe_movements import _find_rows, _size_key          # noqa: E402
 
 # Консоль боевого сервера пишет в cp1251, и один символ, которого в ней нет,
 # роняет ВЕСЬ вывод посреди строки. Сюда печатаются ЧУЖИЕ данные — названия
@@ -237,47 +237,19 @@ def main() -> int:
 
     db = SessionLocal()
     try:
-        product = db.query(Product).filter(Product.uid_1c == needle).first()
-        if product is None:
-            link = db.query(Barcode).filter(Barcode.barcode == needle).first()
-            if link is not None:
-                product = db.query(Product).filter(
-                    Product.uid_1c == link.uid_1c).first()
-
-        if product is not None and product.article:
-            rows = db.query(Product).filter(
-                Product.article == product.article).all()
-        elif product is not None:
-            rows = [product]
-        else:
-            rows = db.query(Product).filter(Product.article == needle).all()
-            if not rows:
-                rows = db.query(Product).filter(
-                    Product.article.ilike(f"%{needle}%")).all()
-
+        # Поиск строки ряда — ОДИН на оба скрипта (`probe_movements._find_rows`),
+        # и не ради краткости. Он решает три вопроса сразу: ID_1С или баркод или
+        # артикул; кусок артикула, попавший в ЧУЖОЙ товар (06.10 «2617» нашло
+        # свитшот вместо куртки); размер и цвет СПИСКОМ, в любом порядке, потому
+        # что про каждое уточнение спрашивает сам ряд. Повтори мы его здесь, один
+        # и тот же вызов на двух скриптах однажды ответил бы по-разному — а
+        # человек бежит между ними с одной и той же строкой в буфере.
+        rows = _find_rows(db, needle, filters)
         if not rows:
-            print(f"не найдено ни по ID_1С, ни по баркоду, ни по артикулу: "
-                  f"{needle}")
+            if not filters:
+                print(f"не найдено ни по ID_1С, ни по баркоду, ни по артикулу: "
+                      f"{needle}")
             return 1
-
-        if filters:
-            # Уточнения СПИСКОМ, и порядок в них не значит ничего: размер это
-            # или цвет, решает сам ряд. Правило общее с `probe_movements`, и
-            # функция та же НАМЕРЕННО: повтори её здесь, она однажды разошлась
-            # бы с соседкой, и один и тот же вызов на двух скриптах отвечал бы
-            # по-разному.
-            size, color, error = _classify_filters(rows, filters)
-            if error:
-                print(f"нашлось строк: {len(rows)}, но " + error)
-                return 1
-            if size:
-                rows = [p for p in rows
-                        if (p.size or "").strip().upper() == size]
-            if color:
-                rows = [p for p in rows
-                        if color in (p.color or "").strip().upper()]
-
-        rows = sorted(rows, key=_size_key)
 
         print("=" * 78)
         print(f"АРТИКУЛ: {rows[0].article or '-'}")
