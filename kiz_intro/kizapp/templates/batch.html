@@ -91,7 +91,10 @@
     });
   }, function (e) { $('plugin').textContent = 'плагин не инициализировался: ' + errText(e); });
 
-  function signAttached(b64) {
+  // Документ — ОТКРЕПЛЁННОЙ подписью (True API: «тело документа подписать откреплённой
+  // УКЭП»). Прикреплённая вкладывает документ в подпись: на 500 кодах ЧЗ ответил
+  // «Подпись слишком большая» (06.10.2026). Прикреплённая — только для входа.
+  function signDetached(b64) {
     var cert = certs[+$('cert').value];
     return new Promise(function (resolve, reject) {
       cadesplugin.async_spawn(function* () {
@@ -102,7 +105,7 @@
           var sd = yield cadesplugin.CreateObjectAsync('CAdESCOM.CadesSignedData');
           yield sd.propset_ContentEncoding(cadesplugin.CADESCOM_BASE64_TO_BINARY);
           yield sd.propset_Content(b64);
-          resolve(String(yield sd.SignCades(signer, cadesplugin.CADESCOM_CADES_BES, false)).replace(/\s+/g, ''));
+          resolve(String(yield sd.SignCades(signer, cadesplugin.CADESCOM_CADES_BES, true)).replace(/\s+/g, ''));
         } catch (e) { reject(new Error(errText(e))); }
       });
     });
@@ -119,7 +122,7 @@
       var d = await post('/prepare');
       if (!confirm('Отправить «Ввод в оборот» по ' + d.count + ' кодам?\n\n' + d.summary.join('\n'))) { log('Отменено.'); return; }
       log('Документ на ' + d.count + ' кодов собран, подписываю…');
-      var r = await post('/send', {doc_id: d.doc_id, signature: await signAttached(d.document)});
+      var r = await post('/send', {doc_id: d.doc_id, signature: await signDetached(d.document)});
       log('Документ принят ЧЗ' + (r.doc_id ? ' (' + r.doc_id + ')' : '') + '. Итог и статусы — через минуты, жмите «Проверить статусы».', 'ok');
     } catch (e) { log(e.message, 'bad'); }
     setTimeout(function () { location.reload(); }, 2500);
