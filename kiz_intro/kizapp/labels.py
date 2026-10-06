@@ -270,3 +270,52 @@ def build_pdf(db: Session, codes: list[str], values: list[dict],
         c.showPage()
     c.save()
     return buf.getvalue(), warnings
+
+
+# --- Макет: предпросмотр этикетки картинкой ------------------------------------------------
+
+SAMPLE_CODE = "01" + "04630688315972" + "21" + "Sample/Code-1" + "\x1d91EE10\x1d92" + "Q" * 44   # образец, не настоящий код
+PREVIEW_SCALE = 7          # 58 мм = 164 pt → ~1150 px: видны модули DataMatrix
+
+
+def sample_values(org=None) -> dict:
+    from datetime import date
+    return {"название": "27643 TABA L базовый свитшот", "GTIN": SAMPLE_CODE[2:16],
+            "изготовитель": org.name if org is not None else "ИП Фамилия И.О.",
+            "ИНН": org.inn if org is not None else "000000000000",
+            "дата": date.today().strftime("%d.%m.%Y"), "номер": "1", "всего": "500", "партия": "1"}
+
+
+def preview_png(db: Session, title: str, right: str, bottom: str, module: str, org=None) -> tuple[bytes, list[str]]:
+    """Этикетка образца — тем же кодом, что и печать, — картинкой с рамкой 58×40.
+    Ошибка шаблона — LabelError (тот же разбор, что при сохранении)."""
+    from types import SimpleNamespace
+
+    import pypdfium2 as pdfium
+    from PIL import ImageDraw
+    problems = check_template(title + right + bottom)
+    try:
+        m = float((module or "").replace(",", "."))
+        if not 0.3 <= m <= 1.0:
+            raise ValueError
+    except ValueError:
+        problems.append("модуль — от 0,3 до 1 мм")
+    if problems:
+        raise LabelError("; ".join(problems))
+    tpl = SimpleNamespace(title=title, right=right, bottom=bottom, module=str(m))
+    pdf, warnings = build_pdf(db, [SAMPLE_CODE], [sample_values(org)], tpl)
+    img = pdfium.PdfDocument(pdf)[0].render(scale=PREVIEW_SCALE).to_pil().convert("RGB")
+    d = ImageDraw.Draw(img)
+    w, h = img.size
+    d.rectangle([0, 0, w - 1, h - 1], outline=(40, 90, 200), width=4)               # край этикетки
+    pad = round(2.5 / LABEL_W_MM * w)                                                # поле 2,5 мм
+    for x in range(pad, w - pad, 18):
+        d.line([(x, pad), (min(x + 9, w - pad), pad)], fill=(160, 180, 220), width=1)
+        d.line([(x, h - pad), (min(x + 9, w - pad), h - pad)], fill=(160, 180, 220), width=1)
+    for y in range(pad, h - pad, 18):
+        d.line([(pad, y), (pad, min(y + 9, h - pad))], fill=(160, 180, 220), width=1)
+        d.line([(w - pad, y), (w - pad, min(y + 9, h - pad))], fill=(160, 180, 220), width=1)
+    import io as _io
+    buf = _io.BytesIO()
+    img.save(buf, "PNG")
+    return buf.getvalue(), [w_.split(": ", 1)[-1] for w_ in warnings]
