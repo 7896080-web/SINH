@@ -17,7 +17,8 @@ from app.models import Platform, PlatformAccount, WorkerHeartbeat
 from app.routers.health import SCHEDULER_START_MARKER
 from app.workers.credentials import CredentialsMissing
 from app.workers.client_factory import build_client
-from app.workers.circuit_breaker import record_success, record_failure
+from app.workers.circuit_breaker import (record_success, record_failure,
+                                          survives_a_retry)
 from app.workers.order_poller import poll_new_orders, poll_cancellations, poll_confirmations
 from app.workers.dispatch import run_dispatch_cycle
 from app.workers.catalog_sync import load_platform_catalog
@@ -220,7 +221,13 @@ def job_poll_orders(account_id: int):
         # то есть сбой оставался невидимым и для «Диагностики», и для /health.
         db.rollback()
         if account is not None:
-            disabled = record_failure(db, account, str(e))
+            # Отказ, который переживёт повтор (площадка молчит, 429, 5xx),
+            # кабинет НЕ гасит: он пройдёт сам, а выключенный кабинет сам не
+            # включится. 06.10 на этом погасли три кабинета WB одной секундой —
+            # WB не отвечал на `/api/v3/orders/new`, и защита от сломанных
+            # ключей выключила три кабинета с исправными ключами.
+            disabled = record_failure(db, account, str(e),
+                                      transient=survives_a_retry(e))
             db.commit()
             if disabled:
                 logger.error("%s: кабинет «%s» автоматически отключён после %d сбоев подряд",
