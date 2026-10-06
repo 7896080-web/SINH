@@ -1105,15 +1105,61 @@ def _check_suspicious_snapshot(db: Session) -> Finding | None:
     ).first()
     if row is None or not row.last_error:
         return None
-    if "обнуление" not in row.last_error:
+    # В поле может лежать ДВЕ оговорки через «; » (вторая — про разошедшиеся
+    # баркоды, см. `_check_barcode_conflicts`). Берём в заголовок только свою:
+    # чужой текст в чужой находке читается как одна беда вместо двух.
+    note = next((part.strip() for part in row.last_error.split(";")
+                 if "обнуление" in part), "")
+    if not note:
         return None
     return Finding(
         key="suspicious_snapshot", level=CRITICAL,
-        title=f"Выгрузка 1С пришла неполной — {row.last_error}",
+        title=f"Выгрузка 1С пришла неполной — {note}",
         consequence="Распроданные товары не обнуляются: на площадки продолжает "
                     "уходить остаток по тому, чего на складе нет. Само не пройдёт — "
                     "пока выгрузка приходит обрезанной, так будет каждый час.",
         count=1, link="/diagnostics#workers",
+    )
+
+
+def _check_barcode_conflicts(db: Session) -> Finding | None:
+    """1С отдала РАЗНЫЕ остатки по баркодам одного товара — значит чужой баркод.
+
+    Несколько штрихкодов одного SKU держат ОДИН физический остаток, и 1С отдаёт
+    по ним одно число. Разные означают, что баркод привязан к чужой строке, а
+    `run_reconciliation` берёт по товару МАКСИМУМ — то есть на площадку уезжает
+    остаток СОСЕДНЕГО размера.
+
+    Сверка это замечала всегда (`stats["barcode_conflicts"]`), но говорила одной
+    строкой WARNING в лог — то есть писатель без читателя, и ровно тот класс,
+    который в этом проекте чинят с весны. 06.10 на бою это и вышло боком: по
+    `2617 C24-2317CQ BRICK RED` в 1С по размеру 52 лежало 11, по соседнему 15, и
+    наружу каждый час уезжало 15. На странице расхождений при этом виден только
+    итог «было 11, стало 15» — по нему причина неотличима от зависшего задания
+    1С, и человек идёт чинить не то.
+
+    КРИТИЧНО: следствие — оверселл, прямо сейчас и на живой карточке. Чинится
+    привязкой на «Мэппинге», само не пройдёт никогда: снимок будет приносить то
+    же число час за часом.
+    """
+    row = db.query(WorkerHeartbeat).filter(
+        WorkerHeartbeat.worker_name == "reconciliation_applied",
+    ).first()
+    if row is None or not row.last_error:
+        return None
+    note = next((part.strip() for part in row.last_error.split(";")
+                 if "РАЗНЫЕ остатки" in part), "")
+    if not note:
+        return None
+    return Finding(
+        key="barcode_conflicts", level=CRITICAL,
+        title=f"Разные остатки 1С по баркодам одного товара — {note}",
+        consequence="У такой строки лишний баркод от соседнего размера, и сверка "
+                    "берёт наибольшее из двух чисел: на площадку уходит чужой "
+                    "остаток, то есть больше, чем лежит на складе. Разберите "
+                    "привязку на «Мэппинге» — само не пройдёт, снимок принесёт "
+                    "то же число через час.",
+        count=1, link="/mapping",
     )
 
 
@@ -1588,6 +1634,7 @@ CHECKS = (
     _check_stale_catalog,
     _check_stale_reconciliation,
     _check_suspicious_snapshot,
+    _check_barcode_conflicts,
     _check_dispatch_stuck,
     _check_open_anomalies,
     _check_open_stock_date,
