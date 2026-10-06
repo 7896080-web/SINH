@@ -299,7 +299,8 @@ def run_reconciliation(db: Session, stock_from_1c: dict[str, int],
     склад единицы, которые площадка уже продала."""
 
     stats = {"normal": 0, "auto_plus": 0, "auto_minus": 0, "needs_review": 0,
-             "unmatched_barcodes": 0, "zeroed_missing": 0, "barcode_conflicts": 0}
+             "unmatched_barcodes": 0, "zeroed_missing": 0, "barcode_conflicts": 0,
+             "stale_rows": 0}
 
     # Группируем полученные из 1С количества по uid_1c (может быть несколько
     # баркодов на один товар — считаем максимум, т.к. это один физический остаток)
@@ -363,11 +364,42 @@ def run_reconciliation(db: Session, stock_from_1c: dict[str, int],
         if product is None:
             continue
 
+        # СТАРЫЕ ДАННЫЕ НЕ ЗАТИРАЮТ НОВЫЕ. Остаток приходит двумя каналами с
+        # разной скоростью: минутная дельта и часовой полный снимок. Снимок 1С
+        # формирует ЗАРАНЕЕ, а применяем мы его позже, и между этими моментами
+        # склад успевает измениться.
+        #
+        # 06.10 на бою по `2617 C24-2317CQ BRICK RED` размер 52: 12:29:39
+        # перемещение увезло 4 штуки (15 -> 11), 12:29:58 дельта принесла 11, а
+        # 12:33 часовая выгрузка принесла 15 — её файл 1С сформировала ДО
+        # перемещения. Старое число затёрло новое, и час на площадку уходило 15
+        # при реальных 11: прямой оверселл. Следующий снимок вернул 11, и со
+        # стороны это выглядит качанием остатка туда-обратно — по десятку
+        # позиций сразу, потому что одно перемещение трогает много строк.
+        #
+        # Проверка по времени ЗАПРОСА выгрузки (`fetch_stock_export_snapshot`)
+        # этот случай не ловит и не может: файл НОВЕЕ запроса, он просто старше
+        # дельты. Сравнивать надо с нашими собственными данными по строке.
+        #
+        # Отбрасываем строку, а не файл целиком: снимок несёт весь каталог, и
+        # остальные его позиции верны. Самолечение сохраняется — следующий
+        # снимок уже свежее, и строка применится обычным путём.
+        if (snapshot_at is not None and product.stock_as_of is not None
+                and snapshot_at < product.stock_as_of):
+            stats["stale_rows"] = stats.get("stale_rows", 0) + 1
+            continue
+
         in_flight = _in_flight_adjustment(db, uid_1c, snapshot_at)
         expected_1c = product.stock_on_hand + in_flight
         delta = actual_1c - expected_1c
 
         classification = classify_delta(delta, product.stock_on_hand)
+
+        # Запоминаем, НА КАКОЙ МОМЕНТ стоит теперь остаток, — и при нулевой
+        # разнице тоже: снимок подтвердил число на своё время, и следующий,
+        # более старый, уже не имеет права его тронуть.
+        if snapshot_at is not None:
+            product.stock_as_of = snapshot_at
 
         log = ReconciliationLog(
             uid_1c=uid_1c, python_stock=product.stock_on_hand, in_flight=in_flight,
