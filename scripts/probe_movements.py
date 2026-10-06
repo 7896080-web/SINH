@@ -179,10 +179,32 @@ def _find_rows(db, needle: str, filters: list[str]):
             rows = db.query(Product).filter(
                 Product.article.ilike(f"%{needle}%")).all()
 
+    # Кусок артикула попадает и в ЧУЖИЕ артикулы, и это не теория: 06.10 на бою
+    # «2617» нашло не ту куртку, а свитшот «2101-22» (размеры L/M/XL/XXL,
+    # цвет СИНИЙ). Отказ при этом звучал «52 — ни размер, ни цвет», то есть
+    # ВРАЛ О ПРИЧИНЕ: человек шёл проверять размеры, тогда как найден посторонний
+    # товар. Молчаливый исход хуже: не уточни человек размер, скрипт напечатал бы
+    # числа ЧУЖОГО артикула под шапкой с его именем — ответ, выглядящий ответом.
+    found = sorted({(p.article or "").strip() for p in rows})
+    if len(found) > 1:
+        print(f"«{needle}» — это кусок сразу {len(found)} артикулов. "
+              f"Назовите один целиком:")
+        for article in found[:20]:
+            count = sum(1 for p in rows if (p.article or "").strip() == article)
+            print(f"  {article}   строк: {count}")
+        if len(found) > 20:
+            print(f"  ... и ещё {len(found) - 20}")
+        return []
+
     if filters:
         wanted_size, wanted_color, error = _classify_filters(rows, filters)
         if error:
-            print(f"нашлось строк: {len(rows)}, но " + error)
+            # Артикул НАЗЫВАЕМ: по куску мог найтись не тот товар, и тогда
+            # вопрос не в размере, а в имени. Без него список «размеры: L, M»
+            # читается как утверждение о ТВОЁМ товаре.
+            article = (rows[0].article or "-") if rows else "-"
+            print(f"нашлось строк: {len(rows)} по артикулу «{article}», но "
+                  + error)
             return []
         if wanted_size:
             rows = [p for p in rows
