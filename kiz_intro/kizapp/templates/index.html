@@ -53,17 +53,44 @@
   {% else %}<p class="muted">Партий пока нет.</p>{% endif %}
 </div>
 
-<details class="card">
-  <summary><b>Шаблон этикетки 58×40</b></summary>
-  <p class="muted">Подстановки: {% for p in placeholders %}{{ '{' ~ p ~ '}' }}{{ ', ' if not loop.last }}{% endfor %}. Строка, где все подстановки пусты, не печатается.</p>
-  <form method="post" action="/labels/settings">
-    <p><label>Заголовок (жирный, справа от кода)<br><input name="title" value="{{ label.label_title }}" size="40"></label></p>
-    <p><label>Строки справа от кода<br><textarea name="right" rows="2" cols="40">{{ label.label_right }}</textarea></label></p>
-    <p><label>Строки под кодом<br><textarea name="bottom" rows="3" cols="40">{{ label.label_bottom }}</textarea></label></p>
-    <p><label>Модуль DataMatrix, мм (203 dpi — 0,5; 300 dpi — 0,508)<br><input name="module" value="{{ label.label_module }}" size="6"></label></p>
-    <button class="secondary">Сохранить шаблон</button>
-  </form>
-</details>
+<div class="card" id="labels">
+  <h2>Шаблоны этикеток 58×40</h2>
+  <p class="muted">Подстановки: {% for p in placeholders %}{{ '{' ~ p ~ '}' }}{{ ', ' if not loop.last }}{% endfor %}.
+    Строка, где все подстановки пусты, не печатается. Модуль DataMatrix: 203 dpi — 0,5 мм; 300 dpi — 0,508 мм.
+    Шаблон выбирается при печати на странице партии; основной стоит там по умолчанию.</p>
+  {% for t in label_templates %}
+  <details {{ 'open' if loop.length == 1 }} style="margin:6px 0">
+    <summary><b>{{ t.name }}</b>{% if t.is_default %} <span class="badge">основной</span>{% endif %}
+      <span class="muted">— {{ t.title }}{% if t.right %} / {{ t.right.replace('
+', ' / ') }}{% endif %}, модуль {{ t.module }}</span></summary>
+    <form method="post" action="/labels/template">
+      <input type="hidden" name="template_id" value="{{ t.id }}">
+      <p><label>Имя<br><input name="name" value="{{ t.name }}" size="30" required></label></p>
+      <p><label>Заголовок (жирный, справа от кода)<br><input name="title" value="{{ t.title }}" size="40"></label></p>
+      <p><label>Строки справа от кода<br><textarea name="right" rows="2" cols="40">{{ t.right }}</textarea></label></p>
+      <p><label>Строки под кодом<br><textarea name="bottom" rows="3" cols="40">{{ t.bottom }}</textarea></label></p>
+      <p><label>Модуль, мм<br><input name="module" value="{{ t.module }}" size="6"></label></p>
+      <button class="secondary">Сохранить</button>
+    </form>
+    <div class="row" style="margin-top:6px">
+      {% if not t.is_default %}<form method="post" action="/labels/template/{{ t.id }}/default"><button class="secondary">Сделать основным</button></form>{% endif %}
+      {% if label_templates|length > 1 %}<form method="post" action="/labels/template/{{ t.id }}/delete"
+        onsubmit="return confirm('Удалить шаблон «{{ t.name }}»?')"><button class="danger">Удалить</button></form>{% endif %}
+    </div>
+  </details>
+  {% endfor %}
+  <details style="margin-top:10px">
+    <summary><b>+ Новый шаблон</b></summary>
+    <form method="post" action="/labels/template">
+      <p><label>Имя<br><input name="name" size="30" required placeholder="например, Мелкий шрифт"></label></p>
+      <p><label>Заголовок<br><input name="title" value="{название}" size="40"></label></p>
+      <p><label>Строки справа от кода<br><textarea name="right" rows="2" cols="40">GTIN {GTIN}</textarea></label></p>
+      <p><label>Строки под кодом<br><textarea name="bottom" rows="3" cols="40">Изготовитель: {изготовитель}, ИНН {ИНН}</textarea></label></p>
+      <p><label>Модуль, мм<br><input name="module" value="0.5" size="6"></label></p>
+      <button>Добавить шаблон</button>
+    </form>
+  </details>
+</div>
 
 {% if journal %}
 <details class="card">

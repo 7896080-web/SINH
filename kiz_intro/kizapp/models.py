@@ -91,3 +91,16 @@ class Setting(Base):
     __tablename__ = "settings"
     key = Column(String(64), primary_key=True)
     value = Column(Text, nullable=False, default="")
+
+
+class LabelTemplate(Base):
+    """Шаблон этикетки 58×40: строки с подстановками и модуль DataMatrix.
+    Шаблонов несколько, один — основной (выбран по умолчанию при печати)."""
+    __tablename__ = "label_templates"
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100), nullable=False, unique=True)
+    title = Column(Text, nullable=False, default="")
+    right = Column(Text, nullable=False, default="")
+    bottom = Column(Text, nullable=False, default="")
+    module = Column(String(10), nullable=False, default="0.5")
+    is_default = Column(Integer, nullable=False, default=0)

@@ -228,3 +228,39 @@ def test_rejected_document_releases_codes(db, chz_fake, monkeypatch):
     S.refresh_statuses(db, b)
     assert d.status == "CHECKED_NOT_OK" and "слишком большая" in d.error
     assert len(S.ready_codes(db, b)) == 1                      # коды свободны для нового документа
+
+
+# --- Несколько шаблонов этикеток (06.10.2026) ----------------------------------------------
+
+def test_label_templates_create_choose_default_delete(client, db):
+    from kizapp import labels as L
+    from kizapp.models import LabelTemplate, Setting
+    db.add(Setting(key="label_title", value="{GTIN}"))                 # прежняя одиночная настройка
+    db.commit()
+    first = L.templates(db)
+    assert len(first) == 1 and first[0].name == "Основной" and first[0].title == "{GTIN}" and first[0].is_default
+    small = L.save_template(db, None, "Мелкий", "{название}", "", "{дата}", "0,508")
+    db.commit()
+    assert small.module == "0.508" and not small.is_default
+    with pytest.raises(L.LabelError, match="уже есть"):
+        L.save_template(db, None, "Мелкий", "x", "", "", "0.5")
+    with pytest.raises(L.LabelError, match="неизвестная подстановка"):
+        L.save_template(db, None, "Плохой", "{артикул}", "", "", "0.5")
+    L.make_default(db, small.id)
+    assert L.template(db, None).id == small.id
+    L.delete_template(db, small.id)
+    db.commit()
+    assert L.template(db, None).name == "Основной" and L.template(db, None).is_default   # основной вернулся
+    with pytest.raises(L.LabelError, match="последний"):
+        L.delete_template(db, db.query(LabelTemplate).one().id)
+
+
+def test_labels_printed_with_chosen_template(client, db, chz_fake):
+    from kizapp import labels as L
+    o = org(db)
+    b = S.load_pdf(db, o, pdf_of([full(9)]), "x.pdf")
+    t = L.save_template(db, None, "Только GTIN", "GTIN {GTIN}", "", "", "0.5")
+    db.commit()
+    r = client.post(f"/batch/{b.id}/labels", data={"template_id": str(t.id)})
+    assert r.status_code == 200 and r.content.startswith(b"%PDF")
+    assert "Только GTIN" in client.get(f"/batch/{b.id}").text and "Шаблоны этикеток" in client.get("/").text
