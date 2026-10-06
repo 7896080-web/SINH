@@ -188,3 +188,43 @@ def test_pages_open(client, db):
     assert "Добавить ИП" in client.get("/").text
     assert "Справочник Нацкаталога" in client.get(f"/org/{o.id}/cards").text
     assert "Вход в Честный знак" in client.get(f"/org/{o.id}/login").text
+
+
+def test_document_result_is_read_from_v4_info(monkeypatch):
+    seen = {}
+
+    class R:
+        status_code = 200
+        text = "[]"
+
+        def json(self):
+            return [{"number": "D", "type": "LP_INTRODUCE_GOODS", "status": "CHECKED_NOT_OK",
+                     "errors": ["Подпись слишком большая"]}]
+
+    def get(url, **kw):
+        seen["url"] = url
+        return R()
+    monkeypatch.setattr(chz.requests, "get", get)
+    st, errs = chz.document_status("D", "T")
+    assert seen["url"].endswith("/api/v4/true-api/doc/D/info")
+    assert st == "CHECKED_NOT_OK" and "слишком большая" in errs
+
+
+def test_rejected_document_releases_codes(db, chz_fake, monkeypatch):
+    o = org(db)
+    logged(db, o)
+    db.add(Card(org_id=o.id, gtin=GTIN, name="x", tnved="6110909000", permit_type="CONFORMITY_DECLARATION",
+                permit_number="Д-1", permit_date="2026-01-01", fetched_at=now_utc()))
+    b = S.load_pdf(db, o, pdf_of([full(4)]), "x.pdf")
+    S.set_production_date(b, "2026-10-01")
+    db.commit()
+    chz_fake["cises"] = {c.cis: "APPLIED" for c in db.query(Code)}
+    S.refresh_statuses(db, b)
+    d = S.prepare(db, b)
+    db.commit()
+    S.send(db, d, "S")
+    db.commit()
+    monkeypatch.setattr(chz, "document_status", lambda doc_id, t: ("PARSE_ERROR", "Подпись слишком большая"))
+    S.refresh_statuses(db, b)
+    assert d.status == "CHECKED_NOT_OK" and "слишком большая" in d.error
+    assert len(S.ready_codes(db, b)) == 1                      # коды свободны для нового документа

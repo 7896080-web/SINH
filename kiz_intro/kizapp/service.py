@@ -229,8 +229,7 @@ def refresh_statuses(db: Session, batch: Batch) -> str:
             if got.get(c.cis):
                 c.status, c.status_at = got[c.cis], now
         db.commit()
-    refresh_documents(db, batch)
-    return ""
+    return refresh_documents(db, batch)       # ошибка проверки итога — на экран, а не молча
 
 
 def refresh_documents(db: Session, batch: Batch) -> str:
@@ -250,8 +249,8 @@ def refresh_documents(db: Session, batch: Batch) -> str:
             st, errs = chz.document_status(d.chz_doc_id, t)
         except chz.ChzError as e:
             return str(e)
-        if st in ("CHECKED_OK", "CHECKED_NOT_OK", "ERROR"):
-            d.status = "CHECKED_OK" if st == "CHECKED_OK" else "CHECKED_NOT_OK"
+        if st in chz.DOC_OK + chz.DOC_FAILED:
+            d.status = "CHECKED_OK" if st in chz.DOC_OK else "CHECKED_NOT_OK"
             d.error = errs
             if d.status != "CHECKED_OK":
                 _release(db, d)
