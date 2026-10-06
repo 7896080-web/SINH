@@ -323,6 +323,9 @@ class KitClient(PlatformClient):
         не просто ждёт смены статуса (раздел 5 спецификации)."""
         root_id = order_id.split(":")[0]
         try:
+            # Пауза здесь обязательна: подтверждение идёт ПО ОДНОМУ запросу на
+            # заказ, то есть пачка новых заказов — это пачка запросов вплотную.
+            time.sleep(_THROTTLE_SECONDS)
             self.session.post(f"{BASE_URL}/v1/orders/{root_id}/confirm", timeout=30).raise_for_status()
             return True
         except requests.HTTPError:
@@ -407,6 +410,7 @@ class KitClient(PlatformClient):
             ]}
 
             def call(body=body):
+                time.sleep(_THROTTLE_SECONDS)
                 r = self.session.post(f"{BASE_URL}/v1/variants/stocks/bulk_update",
                                       json=body, timeout=30)
                 r.raise_for_status()

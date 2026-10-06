@@ -1,3 +1,5 @@
+import time
+
 import requests
 
 from app.workers.platform_clients.base import PlatformClient, PlatformOrder, StockPushItem, CatalogItem
@@ -24,6 +26,32 @@ CANCELLED_SUPPLIER_STATUSES = {"cancel"}
 # Одним запросом от базовой даты мы теряли всё, что новее её плюс месяц: по одному
 # кабинету недосчитывались 253 заказа, и расчёт при этом рапортовал «проведено 0,
 # проблем нет» и ставил товару «актуализирован». Поэтому ленту берём окнами.
+# Превентивная пауза перед КАЖДЫМ запросом к WB. Спека (`/api/v3/orders/new`,
+# раздел «Лимит запросов»): 300 запросов в минуту на аккаунт продавца,
+# **интервал 200 мс**, всплеск 20 запросов, и — главное — «один запрос с кодами
+# ответов 4XX учитывается как 10 запросов».
+#
+# Дросселя здесь не было вовсе, и 06.10 это стоило трёх кабинетов WB разом.
+# Лента заказов идёт окнами по 29 дней с листанием по курсору, каталог — до
+# двух тысяч страниц, то есть пачка запросов уходила БЕЗ ПАУЗ: всплеск в
+# двадцать запросов съедается мгновенно, дальше 429. А каждый 429 стоит как
+# десять запросов, и три повтора `with_retry` превращают один вызов в тридцать
+# — спираль, из которой площадка выходит, просто перестав отвечать. В логе это
+# выглядело как `Read timed out (read timeout=30)` по `/api/v3/orders/new`:
+# опрос заказов падал пять циклов подряд, и предохранитель гасил кабинет,
+# хотя ключи были в порядке.
+#
+# Реактивного `with_retry` недостаточно, и у Kit об этом сказано тем же
+# словом: он ловит 429 «медленно и с риском не добрать часть данных». Здесь
+# цена выше — не добрать часть ленты заказов значит не провести продажи и
+# оставить остаток завышенным.
+#
+# 0,2 с — ровно интервал из спеки, то есть пять запросов в секунду. Опрос
+# заказов (три запроса) этого не заметит; полная выгрузка каталога станет
+# медленнее, и это осознанная плата: она суточная и идёт в фоне, а 429 посреди
+# неё обрывал её целиком.
+_THROTTLE_SECONDS = 0.2
+
 ORDERS_WINDOW_DAYS = 29
 
 # Сколько истории лента вообще помнит. Спека `/api/v3/orders`: «возвращает
@@ -127,6 +155,7 @@ class WbClient(PlatformClient):
 
     def _get(self, path: str, **kwargs):
         def call():
+            time.sleep(_THROTTLE_SECONDS)
             r = self.session.get(f"{BASE_URL}{path}", timeout=30, **kwargs)
             r.raise_for_status()
             return r.json()
@@ -134,6 +163,7 @@ class WbClient(PlatformClient):
 
     def _post(self, path: str, json_body=None, **kwargs):
         def call():
+            time.sleep(_THROTTLE_SECONDS)
             r = self.session.post(f"{BASE_URL}{path}", json=json_body, timeout=30, **kwargs)
             r.raise_for_status()
             return r.json()
@@ -142,6 +172,7 @@ class WbClient(PlatformClient):
     def _post_content(self, path: str, json_body=None, **kwargs):
         """POST на контентный хост WB (content-api), а не marketplace-api."""
         def call():
+            time.sleep(_THROTTLE_SECONDS)
             r = self.session.post(f"{CONTENT_BASE_URL}{path}", json=json_body, timeout=30, **kwargs)
             r.raise_for_status()
             return r.json()
@@ -493,6 +524,7 @@ class WbClient(PlatformClient):
                                    for i in remaining]}
 
             def call(body=body):
+                time.sleep(_THROTTLE_SECONDS)
                 resp = self.session.put(f"{BASE_URL}/api/v3/stocks/{warehouse_id}",
                                         json=body, timeout=30)
                 resp.raise_for_status()
@@ -632,6 +664,7 @@ class WbClient(PlatformClient):
                 body = {"skus": list(owners)}
 
             def call(body=body):
+                time.sleep(_THROTTLE_SECONDS)
                 resp = self.session.post(f"{BASE_URL}/api/v3/stocks/{warehouse_id}",
                                           json=body, timeout=30)
                 resp.raise_for_status()
