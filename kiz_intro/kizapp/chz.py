@@ -4,7 +4,8 @@
 Схемы — как в «Маркировке» и рабочей программе заказчика (kiz-tool):
 - вход: /auth/key → прикреплённая CAdES-BES от base64(data) → /auth/simpleSignIn;
 - /cises/info — статусы по коротким КИ (до 1000 за запрос), по токену;
-- /lk/documents/create?pg=lp — LP_INTRODUCE_GOODS, прикреплённая подпись;
+- /lk/documents/create?pg=lp — LP_INTRODUCE_GOODS, ОТКРЕПЛЁННАЯ подпись документа (True API;
+  прикреплённая на 500 кодах — «Подпись слишком большая», 06.10.2026);
 - /doc/list?number= — итог документа;
 - /nk/product?gtins= — карточка НК, только с токеном (одного apikey мало).
 """
