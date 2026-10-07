@@ -126,6 +126,23 @@
     </form>
 </div>
 
+{# Живая строка про отправку в 1С. СВОЙ контейнер и своя подмена: кусок пачки
+   перерисовывается на каждый скан и держит внутри поле скана, так что
+   автообновление внутри него крало бы фокус каждые пятнадцать секунд.
+
+   Пятнадцать секунд, а не чаще: круг «файл собрался — 1С забрала — ответ
+   разобран» идёт минутами, и опрос раз в секунду показывал бы то же число,
+   нагружая веб-службу, которая в это же время принимает заказы.
+
+   Подмена ВНУТРЕННЯЯ (`innerHTML`), и это не вкусовщина: при `outerHTML` ответ
+   заменил бы сам контейнер вместе с `hx-get` и `hx-trigger` — строка
+   обновилась бы ровно один раз и замерла бы навсегда, не сказав ни слова. #}
+<div id="transfer-status"
+     hx-get="/returns/box/status" hx-trigger="every 15s"
+     hx-target="#transfer-status" hx-swap="innerHTML">
+    {% include "returns_transfer_status.html" %}
+</div>
+
 {% include "returns_box_live.html" %}
 
 <script>
@@ -143,23 +160,41 @@
 // этой странице важно, и соврать им нельзя: человек пересканировал бы вещь.
 // Поэтому у каждого запроса свой номер, и подмена отставшим отбрасывается —
 // вещь при этом уже заведена, её покажет ближайший следующий ответ.
+//
+// И ОБЕ ЗАВИСЯТ ОТ ЦЕЛИ ПОДМЕНЫ. Раньше тут стояло «других подмен на этой
+// странице нет», и защиты были общими; с появлением живой строки статуса это
+// перестало быть правдой, а общие защиты сломали бы ровно то, ради чего
+// написаны. Номер очереди на двоих означал бы, что ответ статуса с бо́льшим
+// номером запрещает подмену пачки, — счёт отсканированного соврал бы. А
+// возврат фокуса на любую подмену утаскивал бы курсор в поле скана каждые
+// пятнадцать секунд: человек, открывший список складов, видел бы, как тот
+// закрывается сам. Поэтому очередь считается ПО ЦЕЛИ, а фокус возвращается
+// только после подмены пачки.
 (function () {
-    var sent = 0, shown = 0;
+    var BATCH = "box-live";
+    var sent = {}, shown = {};
+
+    function target(e) {
+        var el = (e.detail && (e.detail.target || e.detail.elt)) || null;
+        return (el && el.id) || "";
+    }
 
     document.body.addEventListener("htmx:beforeRequest", function (e) {
-        e.detail.xhr.__seq = ++sent;
+        var id = target(e);
+        sent[id] = (sent[id] || 0) + 1;
+        e.detail.xhr.__seq = sent[id];
+        e.detail.xhr.__target = id;
     });
 
     document.body.addEventListener("htmx:beforeSwap", function (e) {
+        var id = e.detail.xhr.__target || target(e);
         var seq = e.detail.xhr.__seq || 0;
-        if (seq < shown) { e.detail.shouldSwap = false; return; }
-        shown = seq;
+        if (seq < (shown[id] || 0)) { e.detail.shouldSwap = false; return; }
+        shown[id] = seq;
     });
 
-    // Проверять, что подменили именно пачку, незачем: других подмен на этой
-    // странице нет, а проверка «по имени куска» молча перестала бы работать
-    // при переименовании.
-    document.body.addEventListener("htmx:afterSwap", function () {
+    document.body.addEventListener("htmx:afterSwap", function (e) {
+        if (target(e) !== BATCH) return;
         var code = document.getElementById("code");
         if (code && !code.disabled) code.focus();
     });

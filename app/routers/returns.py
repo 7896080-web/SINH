@@ -732,6 +732,11 @@ def box_page(request: Request, db: Session = Depends(get_db),
     ctx = _base(request, user, db)
     ctx.update(_box_live(request, db))
     ctx.update({
+        # Строка статуса отдаётся сразу, а не только по первому автообновлению:
+        # иначе первые пятнадцать секунд её нет вовсе, и человек, открывший
+        # страницу после передачи пачки, видит пустое место там, где ждал
+        # ответа про свою коробку.
+        "transfer": R.transfer_status(db),
         # Свой пункт меню, а не подсветка «Возвратов»: меню, утверждающее, что
         # ты в другом разделе, читается как «ссылка не сработала».
         "active_page": "box",
@@ -740,6 +745,26 @@ def box_page(request: Request, db: Session = Depends(get_db),
         "warehouses": R.warehouse_choices(),
     })
     return templates.TemplateResponse(request, "returns_box.html", ctx)
+
+
+@router.get("/returns/box/status", response_class=HTMLResponse)
+def box_status(request: Request, db: Session = Depends(get_db),
+               user=Depends(get_current_user)):
+    """Живая строка: что сейчас с вещами, переданными в 1С.
+
+    СВОЙ адрес, а не часть куска пачки. Кусок пачки подменяется на каждый скан,
+    и поле скана лежит внутри него: подмешай мы сюда автообновление, оно каждые
+    пятнадцать секунд перерисовывало бы поле — то есть крало бы фокус посреди
+    коробки, а отставший ответ ещё и сбивал бы счёт отсканированного. Счёт на
+    этой странице единственное, что важно, и соврать им нельзя.
+
+    Под `/returns/`, чтобы страница осталась доступна складу: роль `warehouse`
+    видит только этот раздел, и фрагмент по чужому адресу молча отдавал бы
+    отказ — строка просто не появлялась бы, без единого слова почему.
+    """
+    ctx = _base(request, user, db, flash=False)
+    ctx["transfer"] = R.transfer_status(db)
+    return templates.TemplateResponse(request, "returns_transfer_status.html", ctx)
 
 
 @router.post("/returns/box/mode")

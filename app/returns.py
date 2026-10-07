@@ -674,6 +674,83 @@ def batch_totals(db: Session, items: list[ReturnItem],
     }
 
 
+# Сколько ждать ответа 1С, прежде чем сказать человеку «застряло». Файл
+# собирается раз в минуту (`job_ftp_send`), 1С забирает его своим расписанием,
+# ответ разбирается раз в минуту (`job_ftp_receive`) — то есть штатный круг это
+# единицы минут. Пятнадцать — с запасом на редкий долгий круг: сказать
+# «застряло» о том, что сейчас приедет, значит научить не верить строке.
+TRANSFER_SLOW = timedelta(minutes=15)
+
+
+def transfer_status(db: Session) -> dict:
+    """Что СЕЙЧАС происходит с вещами, переданными в 1С.
+
+    Нужно затем, что после «Передать в 1С» страница про судьбу пачки не
+    говорила НИЧЕГО: вещь уходит в «ждём 1С», файл едет минутным циклом, ответ
+    приходит позже — а кладовщик видит пустую пачку и уходит. Вернётся вещь в
+    остаток или застрянет, он узнавал, только открыв список и посмотрев статусы
+    по одной.
+
+    Считаем по СТАДИИ ЗАДАНИЯ, а не по статусу вещи, и это главное. У вещи
+    статус один на всё ожидание («ждём 1С»), а стоят за ним три совершенно
+    разных положения: файл ещё у нас, файл у 1С, 1С молчит дольше срока. Первые
+    два пройдут сами, третье — нет: автоповтора у возвратов нет вовсе
+    (`repost_stuck_movements` берёт только `CREATE_MOVEMENT`), и такое задание
+    доживёт до ручного разбора. Сказать про них одним словом «в пути» значит
+    спрятать единственное, что требует человека.
+
+    Тренировочные вещи считаются ОТДЕЛЬНО, а не вместе и не молча: их задания
+    помечены `is_test` и в файл для 1С не попадают вовсе, то есть ответа по ним
+    не будет никогда. Смешай мы их с боевыми, полоса показывала бы «ждут 1С:
+    5» в установке, из которой наружу не ушло ничего.
+    """
+    rows = (db.query(ReturnItem, FtpTask)
+            .outerjoin(FtpTask, ReturnItem.ftp_task_id == FtpTask.id)
+            .filter(ReturnItem.status.in_(AWAITING)).all())
+
+    now = now_utc()
+    out = {"queued": 0, "at_1c": 0, "stuck": 0, "test_waiting": 0,
+           "oldest_minutes": 0}
+    for item, task in rows:
+        if item.is_test:
+            out["test_waiting"] += 1
+            continue
+        waiting = int((now - item.status_changed_at).total_seconds() // 60)
+        out["oldest_minutes"] = max(out["oldest_minutes"], waiting)
+        # Задания нет вовсе — то же «застряло»: вещь ждёт ответа, которого
+        # некому прислать. Случай ненормальный, и молчать о нём нельзя.
+        status = task.status if task is not None else FtpTaskStatus.failed
+        if status in (FtpTaskStatus.timeout, FtpTaskStatus.failed):
+            out["stuck"] += 1
+        elif status == FtpTaskStatus.pending:
+            # Ждёт ближайшего файла — но если ждёт слишком долго, значит файлы
+            # не собираются, и для человека это тот же тупик.
+            out["stuck" if waiting >= TRANSFER_SLOW.total_seconds() // 60
+                else "queued"] += 1
+        else:
+            out["at_1c" if waiting < TRANSFER_SLOW.total_seconds() // 60
+                else "stuck"] += 1
+
+    # Что 1С ответила за последние сутки. Сутки, а не «сегодня»: коробку
+    # разбирают и вечером, и в ночную смену, а полоса на пустом экране после
+    # полуночи читалась бы как «канал встал».
+    since = now - timedelta(hours=24)
+    done = (db.query(ReturnItem.status, func.count(ReturnItem.id))
+            .filter(ReturnItem.is_test.is_(False),
+                    ReturnItem.status_changed_at >= since,
+                    ReturnItem.status.in_((ReturnStatus.back_to_sale,
+                                           ReturnStatus.scrapped,
+                                           ReturnStatus.rejected_1c)))
+            .group_by(ReturnItem.status).all())
+    counts = {status: n for status, n in done}
+    out["back_to_sale"] = counts.get(ReturnStatus.back_to_sale, 0)
+    out["scrapped"] = counts.get(ReturnStatus.scrapped, 0)
+    # Отказ 1С — не «проведено»: вещь вернулась в разбор и ждёт человека.
+    out["rejected"] = counts.get(ReturnStatus.rejected_1c, 0)
+    out["waiting"] = out["queued"] + out["at_1c"] + out["stuck"]
+    return out
+
+
 def send_batch(db: Session, items: list[ReturnItem], to_scrap: bool,
                scrap_reason: ScrapReason | None = None,
                warehouse: str = "") -> dict:

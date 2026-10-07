@@ -470,3 +470,84 @@ tr:hover td { background: var(--bg); }
    мешая читать его содержимое. */
 .dsc-negative { background: rgba(200, 40, 40, .08); }
 .dsc-negative .pr-input { color: #b02020; font-weight: 600; }
+
+/* ---------------------------------------------------------------
+   Живая строка статуса отправки в 1С («Коробка возвратов»).
+
+   Полоса стоит над пачкой и обновляет себя сама. Три состояния, и цвет у них
+   не украшение, а разная цена: спокойное (ждать нечего), «идёт» (вещи в пути,
+   пройдёт само) и тревожное (застряло или отказ 1С — само НЕ пройдёт, нужен
+   человек). Смешай мы второе с третьим, строка весь день выглядела бы
+   одинаково, и единственное, что требует действия, потерялось бы в ней.
+   --------------------------------------------------------------- */
+.transfer-status {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    padding: 10px 14px;
+    margin-bottom: 14px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--surface);
+    line-height: 1.5;
+}
+
+.transfer-status--live {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+}
+
+.transfer-status--bad {
+    border-color: var(--bad);
+    background: var(--bad-soft);
+}
+
+/* Точка «дышит», только пока что-то в пути: на странице, открытой весь день,
+   неподвижная строка неотличима от зависшей, а мигание на спокойном экране
+   отвлекает кладовщика от коробки. */
+.transfer-dot {
+    flex: 0 0 auto;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: var(--line);
+    transform: translateY(-1px);
+}
+
+.transfer-status--live .transfer-dot { background: var(--accent); }
+.transfer-status--bad  .transfer-dot { background: var(--bad); }
+
+.transfer-status--live .transfer-dot,
+.transfer-status--bad  .transfer-dot {
+    animation: transfer-pulse 1.6s ease-in-out infinite;
+}
+
+/* Человеку, которому анимация мешает (системная настройка), её не показываем:
+   строка остаётся читаемой, а это всё, что от неё требуется. */
+@media (prefers-reduced-motion: reduce) {
+    .transfer-dot { animation: none !important; }
+}
+
+@keyframes transfer-pulse {
+    0%, 100% { opacity: 1; }
+    50%      { opacity: 0.25; }
+}
+
+.transfer-alarm {
+    display: block;
+    margin-top: 4px;
+    color: var(--bad);
+    font-weight: 600;
+}
+
+.transfer-done {
+    display: block;
+    margin-top: 4px;
+    color: var(--good);
+}
+
+.transfer-note {
+    display: block;
+    margin-top: 4px;
+    color: var(--ink-soft);
+}
