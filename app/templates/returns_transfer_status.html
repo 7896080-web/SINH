@@ -1,0 +1,50 @@
+{# Живая строка: что сейчас с вещами, переданными в 1С.
+
+   Отдельный фрагмент, а НЕ часть куска пачки, и это не про опрятность. Кусок
+   пачки подменяется на каждый скан, и поле скана лежит внутри него: добавь мы
+   сюда автообновление, оно каждые пятнадцать секунд перерисовывало бы поле —
+   то есть крало бы фокус посреди коробки и сбивало счёт отставшими ответами.
+   Поэтому у строки свой адрес, своя цель подмены и свой номер очереди.
+
+   Текст называет СЛЕДСТВИЕ, а не статус: «ждут 1С» человеку ничего не говорит,
+   а «в остаток ещё не вошли» говорит. #}
+<div class="transfer-status{% if transfer.stuck or transfer.rejected %} transfer-status--bad{% elif transfer.waiting %} transfer-status--live{% endif %}">
+    {# Точка «дышит», пока что-то в пути: на странице, открытой весь день,
+       неподвижная строка неотличима от зависшей. Анимации нет, когда ждать
+       нечего, — мигающий индикатор на спокойном экране только отвлекает. #}
+    <span class="transfer-dot" aria-hidden="true"></span>
+
+    <span class="transfer-text">
+        {% if transfer.waiting %}
+            <strong>Ждут ответа 1С: {{ transfer.waiting }}</strong> —
+            в остаток ещё не вошли{% if transfer.queued %}, из них {{ transfer.queued }} в очереди на отправку{% endif %}{% if transfer.at_1c %}, {{ transfer.at_1c }} у 1С{% endif %}.
+        {% else %}
+            <strong>В 1С сейчас ничего не ждёт.</strong>
+        {% endif %}
+
+        {% if transfer.stuck %}
+            <span class="transfer-alarm">Застряло: {{ transfer.stuck }} —
+            само не пройдёт{% if transfer.oldest_minutes %} (ждёт {{ transfer.oldest_minutes }} мин){% endif %}.
+            Эти вещи в остаток не вернутся, пока задание не разберут:
+            позовите администратора.</span>
+        {% endif %}
+
+        {% if transfer.rejected %}
+            <span class="transfer-alarm">1С отказала: {{ transfer.rejected }} —
+            вещи вернулись в разбор, решение по ним нужно принять заново.</span>
+        {% endif %}
+
+        {% if transfer.back_to_sale or transfer.scrapped %}
+            <span class="transfer-done">За сутки проведено:
+            {% if transfer.back_to_sale %}возвращено в продажу {{ transfer.back_to_sale }}{% endif %}{% if transfer.back_to_sale and transfer.scrapped %}, {% endif %}{% if transfer.scrapped %}утилизировано {{ transfer.scrapped }}{% endif %}.</span>
+        {% endif %}
+
+        {% if transfer.test_waiting %}
+            {# Тренировочные считаются отдельно: их задания в файл для 1С не
+               попадают вовсе, значит ответа не будет никогда. Молчи строка о
+               них, человек ждал бы его до конца смены. #}
+            <span class="transfer-note">Тренировочных в ожидании:
+            {{ transfer.test_waiting }} — в 1С они не поедут.</span>
+        {% endif %}
+    </span>
+</div>
