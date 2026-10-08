@@ -35,7 +35,7 @@ def _setup(client, db):
 
 
 def _table(page: str) -> str:
-    return page.split("<table", 1)[1]
+    return page.split("<table class=\"art-table\"", 1)[1]
 
 
 def test_rows_are_articles_base_is_cost_times_rate_and_not_editable(client, db):

@@ -140,7 +140,7 @@ def test_commission_is_tariff_plus_extra_on_pages(client, db):
     a1, _ = _wb(client, db, commission_extra="3")
     page = client.get("/prices?view=rules").text
     assert "Надбавка к комиссии" in page and "известен у 4 из 6 позиций" in page
-    t = client.get("/sku-prices?scope=wb&by=category").text.split("<table", 1)[1]
+    t = client.get("/sku-prices?scope=wb&by=category").text.split("<table class=\"art-table\"", 1)[1]
     assert "Свитшоты" in t and "18,50" in t and "по тарифу" in t        # 15,5 + 3
     assert "28,00" in t and "из правила" in t                             # Джемперы: 25 + 3
 
@@ -153,7 +153,7 @@ def test_category_margin_set_and_sent(client, db):
     row = db.query(CategoryTarget).one()
     assert (row.category, row.account_id, row.kind, row.value) == ("Свитшоты", 0, "margin", Decimal("1.8"))
     # 1323,56 × 1,8 / 0,845 = 2819,4 → вверх до 10, минус 1 → 2829; 1304 × 1,8 / 0,845 = 2777,8 → 2779
-    t = client.get("/sku-prices?scope=wb").text.split("<table", 1)[1]
+    t = client.get("/sku-prices?scope=wb").text.split("<table class=\"art-table\"", 1)[1]
     assert "2779–2829" in t and "категория, площадка" in t
     # в кабинете своя маржинальность — только для него
     client.post("/sku-prices/coef", data={"scope": f"a{a2.id}", "by": "category", "row": "Свитшоты",
@@ -167,7 +167,7 @@ def test_category_margin_set_and_sent(client, db):
 
 def test_category_filter_and_export_keep_page_filters(client, db):
     _wb(client, db)
-    t = client.get("/sku-prices?scope=wb&cat=Джемперы").text.split("<table", 1)[1]
+    t = client.get("/sku-prices?scope=wb&cat=Джемперы").text.split("<table class=\"art-table\"", 1)[1]
     assert "4033" in t and "39681" not in t
     ws = load_workbook(io.BytesIO(client.get("/sku-prices/export?scope=wb&cat=Джемперы").content)).active
     arts = [ws.cell(row=i, column=3).value for i in range(2, ws.max_row + 1)]
@@ -238,7 +238,7 @@ def test_guard_restores_when_platform_lowered_price_and_flags_eaten(client, db):
     assert guard.run(db)["restored"] == 0                         # уже в очереди — второй раз не ставим
     page = client.get("/attention").text
     assert "съедает скидка продавца или акция" in page and f"account_id={a1.id}&amp;flt=guard_eaten" in page
-    t = client.get(f"/prices?view=products&account_id={a1.id}&flt=guard_above").text.split("<table", 1)[1]
+    t = client.get(f"/prices?view=products&account_id={a1.id}&flt=guard_above").text.split("<table class=\"econ\"", 1)[1]
     assert "39681" in t and "4033" not in t
     assert not any(c.account_id == a2.id for c in db.query(PriceChange))   # у кабинета без диапазона — ничего
 
@@ -466,7 +466,7 @@ def test_row_shows_last_send_and_manual_price_can_be_cleared(client, db):
     db.add(PriceChange(item_id="u1", account_id=a1.id, barcode="b1", new_price=3309, status="error",
                        last_error="WB: карточка в карантине"))
     db.commit()
-    t = client.get("/sku-prices?scope=wb").text.split("<table", 1)[1]
+    t = client.get("/sku-prices?scope=wb").text.split("<table class=\"art-table\"", 1)[1]
     assert "не принято" in t and "WB: карточка в карантине" in t and "ручная 1200 ₽" in t
     r = client.post("/sku-prices/manual-clear", data={"scope": "wb", "row": "4033"})
     assert "ручных цен снято — 1" in r.text
@@ -498,9 +498,9 @@ def test_same_price_skip_follows_platform_not_our_last_send(client, db):
 
 def test_tariff_unknown_is_flagged(client, db):
     _wb(client, db)
-    t = client.get("/sku-prices?scope=wb&art=4033").text.split("<table", 1)[1]
+    t = client.get("/sku-prices?scope=wb&art=4033").text.split("<table class=\"art-table\"", 1)[1]
     assert "тариф неизвестен" in t
-    t = client.get("/sku-prices?scope=wb&art=39681").text.split("<table", 1)[1]
+    t = client.get("/sku-prices?scope=wb&art=39681").text.split("<table class=\"art-table\"", 1)[1]
     assert "тариф неизвестен" not in t
 
 
@@ -593,7 +593,7 @@ def test_category_view_says_whose_markup(client, db):
     _wb(client, db)
     client.post("/sku-prices/coef", data={"scope": "wb", "action": "set", "kind": "coef", "value": "2,6",
                                           "arts": ["39681"]})
-    t = client.get("/sku-prices?scope=wb&by=category").text.split("<table", 1)[1]
+    t = client.get("/sku-prices?scope=wb&by=category").text.split("<table class=\"art-table\"", 1)[1]
     assert "у 1 из 1 арт. своя наценка" in t and "у категории своей нет" in t
 
 

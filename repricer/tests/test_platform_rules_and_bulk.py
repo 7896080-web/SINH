@@ -281,7 +281,7 @@ def test_load_current_button_and_markup_by_current(client, db, monkeypatch):
     # 1600 × 0,75 = 1200; 1200 − 1323,56 = −123,56; коэфф. 0,91 — ниже пола 1,3
     page = client.get(f"/prices?view=products&account_id={a1.id}&flt=below_floor_now").text
     assert "−123,56" in page or "-123,56" in page
-    assert "39681" in page and "4033" not in page.split("<table")[1]
+    assert "39681" in page and "4033" not in page.split("<table class=\"econ\"")[1]
 
 
 def test_bulk_manual_from_current_whole_filter_all_cabinets(client, db):

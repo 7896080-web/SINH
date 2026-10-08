@@ -57,3 +57,12 @@ table.attention td { vertical-align:middle; }
   border-radius:6px; font-size:13px; box-shadow:0 2px 10px rgba(0,0,0,.3); max-width:60vw; border-left:4px solid #ffb020; }
 @keyframes busy-run { from { background-position:-35% 0; } to { background-position:135% 0; } }
 button[data-busy-off] { opacity:.6; cursor:progress; }
+
+/* Инструкция страницы (templates/_guides.html) */
+details.guide { margin: 0 0 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--card); }
+details.guide > summary { cursor: pointer; padding: 8px 12px; }
+details.guide[open] > summary { border-bottom: 1px solid var(--line); }
+details.guide .guide-body { padding: 4px 14px 10px; max-width: 120ch; }
+details.guide .guide-body li { margin: 3px 0; }
+table.guide-table td, table.guide-table th { white-space: normal; vertical-align: top; }
+table.guide-table td:first-child { min-width: 180px; }
