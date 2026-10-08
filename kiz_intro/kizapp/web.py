@@ -308,6 +308,19 @@ def batch_txt(batch_id: int, db: Session = Depends(get_db)):
     return _file(data, f"коды_партия_{b.id}.txt", "text/plain; charset=ascii")
 
 
+@app.post("/batch/{batch_id}/upd-csv")
+def batch_upd_csv(batch_id: int, db: Session = Depends(get_db)):
+    b = db.get(Batch, batch_id)
+    if b is None:
+        return _go("/")
+    try:
+        data = S.upd_csv(db, b)
+    except S.KizError as e:
+        return _go(f"/batch/{batch_id}", f"Файл для УПД не выдан: {e}", "error")
+    db.commit()
+    return _file(data, f"коды_для_УПД_партия_{b.id}.csv", "text/csv; charset=utf-8")
+
+
 @app.get("/health")
 def health():
     # `app` — опознание: на соседних портах живут другие программы, и ярлык
