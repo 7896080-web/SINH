@@ -12,8 +12,14 @@ param([int]$Port = 8001)
 $Root = Split-Path $PSScriptRoot -Parent
 $url = "http://127.0.0.1:$Port"
 
+# Опознание, а не «кто-то ответил»: рядом «Репрайсер» (8002) и «Ввод в оборот»
+# (8003) со своими /login. Чужая программа на 8001 открылась бы в браузере как
+# «Маркировка» (08.10.2026 так столкнулись «Ввод в оборот» и «Репрайсер» на 8002).
 function Test-Up {
-    try { Invoke-WebRequest "$url/login" -UseBasicParsing -TimeoutSec 2 | Out-Null; return $true } catch { return $false }
+    try {
+        $r = Invoke-WebRequest "$url/login" -UseBasicParsing -TimeoutSec 2
+        return ($r.Content -match "Маркировка и поставки")
+    } catch { return $false }
 }
 
 if (-not (Test-Up)) {

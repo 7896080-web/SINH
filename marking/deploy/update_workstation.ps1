@@ -33,8 +33,11 @@ Get-CimInstance Win32_Process |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 $up = $true
 for ($i = 0; $i -lt 20 -and $up; $i++) {
-    try { Invoke-WebRequest "http://127.0.0.1:$WebPort/login" -UseBasicParsing -TimeoutSec 2 | Out-Null; Start-Sleep -Milliseconds 500 }
-    catch { $up = $false }
+    try {
+        $r = Invoke-WebRequest "http://127.0.0.1:$WebPort/login" -UseBasicParsing -TimeoutSec 2
+        $up = $r.Content -match "Маркировка и поставки"
+        if ($up) { Start-Sleep -Milliseconds 500 }
+    } catch { $up = $false }
 }
 if ($up) { Fail "Программа на порту $WebPort не остановилась — закройте её (Диспетчер задач: python) и запустите обновление снова" }
 
