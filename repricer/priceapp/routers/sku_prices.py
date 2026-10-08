@@ -43,7 +43,7 @@ from priceapp.pricing import (BLOCK_FLOOR, BLOCK_MAX_CHANGE, KIND_COEF, KIND_LAB
                               _dec, _ru, article_of, base_price, change_percent, decide_for, item_facts,
                               load_inputs, markup, target_for)
 from priceapp.routers.prices import (BULK_LIMIT, CLEAR_CELL, ROWS_LIMIT, _accounts, _cell, _f, _import_flash,
-                                     _num, _read_upload)
+                                     _num, _read_upload, saved_filters)
 from priceapp.timeutils import now_utc
 
 router = APIRouter()
@@ -291,6 +291,16 @@ def summarize(rows: list[dict]) -> dict:
         "pct_span": _pct_span([change_percent(c["current"], c["price"]) for c in cells
                                if c["price"] and c["current"]]),
         "card_price": new_max,
+        # Числа для выгрузки: в файле — числами, а не строкой «1299–1499», иначе
+        # Excel их не сортирует и не фильтрует (аудит 08.10).
+        "n": {"price_min": min((p for p in prices if p), default=None), "price_max": new_max,
+              "margin_min": min((c["margin"] for c in cells if c["margin"] is not None), default=None),
+              "cur_max": cur_max,
+              "cur_margin_min": min((c["cur_margin"] for c in cells if c["cur_margin"] is not None), default=None),
+              "commission_max": max((c["commission"] for c in cells if c["commission"] is not None), default=None),
+              "discount_max": max((c["discount"] for c in cells if c["discount"] is not None), default=None),
+              "base_max": max((r["base"] for r in rows if r["base"] is not None), default=None),
+              "cost_max": max((r["cost_usd"] for r in rows if r["cost_usd"] is not None), default=None)},
         "floor": any(c["floor"] for c in cells), "big_step": any(c["big_step"] for c in cells),
         "changes": any(c["price"] and c["price"] != c["current"] for c in cells),
         "no_cost": any(r["cost_usd"] is None for r in rows),
@@ -426,7 +436,9 @@ def page(request: Request, scope: str = Query(""), art: str = Query(""), barcode
                   filters=FILTERS, actions=ACTIONS, views=VIEWS, kinds=KIND_LABELS, sources=SOURCE_LABELS,
                   categories=cats, ru=_ru, target_text=target_text, rate=rates.current(db),
                   names=PLATFORMS, export_qs=urlencode(keep),
-                  own_level=SRC_CABINET if sc and sc["account_id"] else SRC_ARTICLE, KIND_MARGIN=KIND_MARGIN, **keep)
+                  own_level=SRC_CABINET if sc and sc["account_id"] else SRC_ARTICLE,
+                  saved_filters=saved_filters(db, "/sku-prices"),
+                  current_url="/sku-prices?" + urlencode({k: v for k, v in keep.items() if v}), KIND_MARGIN=KIND_MARGIN, **keep)
 
 
 # --- наценки -------------------------------------------------------------------------
@@ -686,12 +698,18 @@ def send(request: Request, form=Depends(posted_form), db: Session = Depends(get_
 # («Артикул» или «Категория»), «Вид наценки» и «Наценка»; остальное справочное.
 # Пустая «Наценка» ничего не меняет, «-» снимает.
 
-TAIL = ["Новая цена, ₽", "Новая маржинальность", "Текущая цена, ₽", "Текущая маржинальность",
-        "Комиссия, %", "Скидка на площадке, %", "Изменение к текущей, %", "Ниже пола", "Больше лимита"]
+# Числами, а не текстом. У артикула размеры бывают с разными числами: цена —
+# наибольшая (она и уходит на карточку) и наименьшая рядом, маржинальность —
+# наименьшая (худший размер), комиссия и скидка — наибольшие.
+TAIL = ["Новая цена, ₽", "Новая цена от, ₽", "Новая маржинальность (мин.)", "Текущая цена, ₽",
+        "Текущая маржинальность (мин.)", "Комиссия, % (макс.)", "Скидка на площадке, % (макс.)",
+        "Изменение к текущей, %", "Ниже пола", "Больше лимита"]
 
 
 def _tail(g: dict) -> list:
-    return [g["price"], g["margin"], g["current"], g["cur_margin"], g["commission"], g["discount"],
+    n = g["n"]
+    return [n["price_max"], n["price_min"], _f(n["margin_min"]), n["cur_max"], _f(n["cur_margin_min"]),
+            _f(n["commission_max"]), n["discount_max"],
             round(g["pct"], 1) if g["pct"] is not None else None, "да" if g["floor"] else "",
             "да" if g["big_step"] else ""]
 
@@ -717,7 +735,7 @@ def export(scope: str = Query(""), art: str = Query(""), barcode: str = Query(""
                          *_tail(g)])
         return xlsx_response(headers, data, "наценки_категорий.xlsx")
     headers = [SCOPE_COL, "Где", "Артикул", "Размер", "Наименование", "Категория", "Цвета", "Размеры",
-               "Себестоимость, $", "Базовая цена, ₽", KIND_COL, VALUE_COL, "Откуда наценка", *TAIL]
+               "Себестоимость, $ (макс.)", "Базовая цена, ₽ (макс.)", KIND_COL, VALUE_COL, "Откуда наценка", *TAIL]
     # «Наценка» — только значение ТОГО уровня, на котором открыта страница:
     # кабинет — наценка артикула в кабинете, площадка — на площадке.
     # Унаследованное идёт в «Откуда наценка». Иначе круг «выгрузил — загрузил»
@@ -727,29 +745,32 @@ def export(scope: str = Query(""), art: str = Query(""), barcode: str = Query(""
     for g in groups:
         own = g["source"] == own_level
         data.append([sc["key"], sc["label"], g["key"], "", g["name"], g["category"], ", ".join(g["colors"]),
-                     ", ".join(g["sizes"]), g["cost"], g["base"],
+                     ", ".join(g["sizes"]), _f(g["n"]["cost_max"]), _f(g["n"]["base_max"]),
                      KIND_LABELS.get(g["kind"], "") if own else "", _f(g["coef"]) if own else None,
                      f"{target_text(g['kind'], g['coef'])} ({SOURCE_LABELS.get(g['source'], 'разные')})",
                      *_tail(g)])
         for d in g["sizes_detail"]:
             s = d["row"]["sku"]
             data.append([sc["key"], sc["label"], g["key"], f"{s.color} {s.size}".strip() if s else d["row"]["item_id"],
-                         "", "", "", "", d["cost"], d["base"], "", None, "", *_tail(d)])
+                         "", "", "", "", _f(d["n"]["cost_max"]), _f(d["n"]["base_max"]), "", None, "", *_tail(d)])
     return xlsx_response(headers, data, "наценки_артикулов.xlsx")
 
 
 @router.post("/sku-prices/import")
-def import_file(request: Request, file: UploadFile = File(...), db: Session = Depends(get_db),
-                user: User = Depends(get_current_user)):
+def import_file(request: Request, file: UploadFile = File(...), form=Depends(posted_form),
+                db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    # Назад — на ту же страницу с теми же «где» и отборами: без них человек
+    # попадал на первую площадку списка и не находил своих изменений (аудит 08.10).
+    keep = _keep(form)
     rows = _read_upload(request, file, SCOPE_COL)
     if rows is None:
-        return _back()
+        return _back(**keep)
     head = rows[0]
     level_category = "Категория" in head and "Артикул" not in head
     key_col = "Категория" if level_category else "Артикул"
     if key_col not in head or VALUE_COL not in head:
         flash(request, f"В файле нет колонок «{key_col}» и «{VALUE_COL}» — выгрузите файл с этой страницы.", "warn")
-        return _back()
+        return _back(**keep)
     by_key = {s["key"]: s for s in scopes(db)}
     known: dict[str, set[str]] = {}
     changed, errors = 0, []
@@ -787,4 +808,9 @@ def import_file(request: Request, file: UploadFile = File(...), db: Session = De
               f"{changed} наценок", f"ошибок {len(errors)}")
     db.commit()
     _import_flash(request, f"Наценок изменено: {changed}. На площадки ничего не отправлено.", errors)
-    return _back(by="category" if level_category else "")
+    # Файл другого вида, чем открыт, — показать его вид, иначе изменений не видно.
+    if level_category:
+        keep["by"] = "category"
+    elif keep["by"] == "category":
+        keep["by"] = ""
+    return _back(**keep)

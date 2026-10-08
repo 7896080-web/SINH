@@ -94,16 +94,17 @@
     {% for a in accounts %}<option value="{{ a.id }}" {% if account and account.id == a.id %}selected{% endif %}>{{ label(a) }}</option>{% endfor %}</select></label>
   <label>Поиск<input name="q" value="{{ q }}" placeholder="артикул, наименование, баркод"></label>
   <label>Отбор<select name="flt">{% for k, v in product_filters.items() %}<option value="{{ k }}" {% if flt == k %}selected{% endif %}>{{ v }}</option>{% endfor %}</select></label>
-  <label>Маржинальность по текущей от<input name="coef_min" value="{{ coef_min }}" inputmode="decimal" style="width:70px"></label>
+  <label title="По цене, которая стоит на площадке сейчас (со скидкой продавца)">Текущая маржин. от<input name="coef_min" value="{{ coef_min }}" inputmode="decimal" style="width:70px"></label>
   <label>до<input name="coef_max" value="{{ coef_max }}" inputmode="decimal" style="width:70px"></label>
   <button class="secondary">Показать</button>
 </form>
 {% if account %}
 <div class="row" style="margin-bottom:10px">
-  <form method="post" action="/prices/load-current"><input type="hidden" name="account_id" value="{{ account.id }}">
+  <form method="post" action="/prices/load-current"><input type="hidden" name="account_id" value="{{ account.id }}">{% for k, v in (('q', q), ('flt', flt), ('coef_min', coef_min), ('coef_max', coef_max)) %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
     <button class="secondary" title="Читает цены со всех активных кабинетов, на площадках ничего не меняет">Загрузить текущие цены со всех площадок</button></form>
   <a class="btn secondary" href="/prices/export/{{ account.id }}?{{ export_qs }}">Экспорт отбора в Excel</a>
   <form method="post" action="/prices/import/{{ account.id }}" enctype="multipart/form-data" class="row">
+    {% for k, v in (('q', q), ('flt', flt), ('coef_min', coef_min), ('coef_max', coef_max)) %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
     <label>Импорт ручных цен (колонка «Ручная цена, ₽»; пусто — без изменений, «-» — снять)<input type="file" name="file" accept=".xlsx" required></label>
     <button class="secondary">Импорт из Excel</button>
   </form>
