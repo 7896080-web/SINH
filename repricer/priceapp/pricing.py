@@ -352,12 +352,7 @@ def recalculate_account(db: Session, account: Account, is_test: bool = False) ->
     inp = load_inputs(db, account.platform)
     rule = inp.rule
     rate = rates.current(db)
-    for old in db.query(PriceChange).filter(PriceChange.account_id == account.id,
-                                            PriceChange.is_test.is_(is_test),
-                                            PriceChange.status.in_(OPEN)):
-        old.status = PriceChangeStatus.rejected.value
-        old.note = "вытеснено новым расчётом"
-
+    new_rows: list[PriceChange] = []
     items = mapping.account_items(db, account.id)
     costs = {c.item_id: c for c in db.query(OnecCost).filter(OnecCost.item_id.in_(list(items)))}
     prices = {p.item_id: p for p in db.query(ProductPrice).filter(ProductPrice.account_id == account.id)}
@@ -377,7 +372,7 @@ def recalculate_account(db: Session, account: Account, is_test: bool = False) ->
         if d.new_price == (current if current else last):
             stats.unchanged += 1
             continue
-        db.add(PriceChange(
+        new_rows.append(PriceChange(
             item_id=item_id, account_id=account.id, barcode=rows[0].barcode,
             cost_usd=cost.cost_usd if cost else None, usd_rub=rate.usd_rub if rate else None,
             cost_rub=d.cost_rub, commission_percent=d.commission,
@@ -390,8 +385,23 @@ def recalculate_account(db: Session, account: Account, is_test: bool = False) ->
             stats.blocked += 1
         else:
             stats.proposed += 1
+    # Сначала посчитать, потом писать — и писать порциями. Прежде вытеснение шло
+    # ДО расчёта, и транзакция держала запись базы всё время расчёта каталога:
+    # фоновый поток ждал её дольше busy_timeout (аудит 08.10).
+    (db.query(PriceChange)
+     .filter(PriceChange.account_id == account.id, PriceChange.is_test.is_(is_test),
+             PriceChange.status.in_(OPEN))
+     .update({PriceChange.status: PriceChangeStatus.rejected.value,
+              PriceChange.note: "вытеснено новым расчётом"}, synchronize_session=False))
+    for i, ch in enumerate(new_rows, start=1):
+        db.add(ch)
+        if i % COMMIT_EVERY == 0:
+            db.commit()
     db.commit()
     return stats
+
+
+COMMIT_EVERY = 500
 
 
 def approve(change: PriceChange, actor: str, confirm_large: bool = False) -> str | None:

@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from priceapp import accounts as acc_mod, audit, platforms
 from priceapp.crypto import mask_value
 from priceapp.database import get_db
-from priceapp.deps import get_current_user
+from priceapp.deps import get_current_user, posted_form
 from priceapp.flash import flash
 from priceapp.models import Account, PlatformItem, User
 from priceapp.pages import render
@@ -39,8 +39,7 @@ def page(request: Request, db: Session = Depends(get_db), user: User = Depends(g
 
 
 @router.post("/api-keys/new")
-async def create(request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    form = await request.form()
+def create(request: Request, form=Depends(posted_form), db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     platform = str(form.get("platform") or "")
     name = str(form.get("name") or "").strip()[:128]
     if platform not in platforms.PLATFORMS or not name:
@@ -56,13 +55,12 @@ async def create(request: Request, db: Session = Depends(get_db), user: User = D
 
 
 @router.post("/api-keys/{account_id}")
-async def save(account_id: int, request: Request, db: Session = Depends(get_db),
+def save(account_id: int, request: Request, form=Depends(posted_form), db: Session = Depends(get_db),
                user: User = Depends(get_current_user)):
     a = db.get(Account, account_id)
     if a is None:
         flash(request, "Кабинет не найден.", "warn")
         return _back()
-    form = await request.form()
     name = str(form.get("name") or "").strip()[:128]
     if name and name != a.name:
         a.name = name

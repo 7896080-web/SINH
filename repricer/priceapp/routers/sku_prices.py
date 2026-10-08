@@ -29,7 +29,7 @@ from sqlalchemy.orm import Session
 
 from priceapp import audit, mapping, rates
 from priceapp.database import get_db
-from priceapp.deps import get_current_user
+from priceapp.deps import get_current_user, posted_form
 from priceapp.excel import xlsx_response
 from priceapp.flash import flash
 from priceapp.models import (ArticleCoef, CategoryTarget, OnecBarcode, OnecCost, PriceChange, PriceChangeStatus,
@@ -37,7 +37,7 @@ from priceapp.models import (ArticleCoef, CategoryTarget, OnecBarcode, OnecCost,
 from priceapp.pages import render
 from priceapp.platforms import PLATFORMS
 from priceapp.pricing import (BLOCK_FLOOR, BLOCK_MAX_CHANGE, KIND_COEF, KIND_LABELS, KIND_MARGIN, OPEN,
-                              SOURCE_LABELS, SRC_CABINET, SRC_CAT_CABINET, SRC_CATEGORY, SRC_DEFAULT, SRC_MANUAL,
+                              SOURCE_LABELS, SRC_ARTICLE, SRC_CABINET, SRC_CAT_CABINET, SRC_CATEGORY, SRC_DEFAULT, SRC_MANUAL,
                               _dec, _ru, article_of, base_price, change_percent, decide_for, item_facts,
                               load_inputs, markup, target_for)
 from priceapp.routers.prices import (BULK_LIMIT, CLEAR_CELL, ROWS_LIMIT, _accounts, _cell, _f, _import_flash,
@@ -63,6 +63,7 @@ ACTIONS = {
     "clear": "Снять (взять уровнем выше)",
 }
 VIEWS = {"": "по артикулам", "sku": "с размерами", "category": "по категориям"}
+COMMIT_EVERY = 500
 KEEP = ("scope", "art", "barcode", "color", "size", "cat", "flt", "mmin", "mmax", "by")
 NO_CATEGORY = "(без категории)"
 SCOPE_COL = "Где (код)"
@@ -390,7 +391,8 @@ def page(request: Request, scope: str = Query(""), art: str = Query(""), barcode
                   skus=sum(len(g["rows"]) for g in groups), scopes=scopes(db), sc=sc, rule=rule,
                   filters=FILTERS, actions=ACTIONS, views=VIEWS, kinds=KIND_LABELS, sources=SOURCE_LABELS,
                   categories=cats, ru=_ru, target_text=target_text, rate=rates.current(db),
-                  names=PLATFORMS, export_qs=urlencode(keep), KIND_MARGIN=KIND_MARGIN, **keep)
+                  names=PLATFORMS, export_qs=urlencode(keep),
+                  own_level=SRC_CABINET if sc and sc["account_id"] else SRC_ARTICLE, KIND_MARGIN=KIND_MARGIN, **keep)
 
 
 # --- наценки -------------------------------------------------------------------------
@@ -448,11 +450,10 @@ def _value(raw, kind: str) -> Decimal:
 
 
 @router.post("/sku-prices/coef")
-async def save_coef(request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+def save_coef(request: Request, form=Depends(posted_form), db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Наценка отмеченным артикулам или категориям (или всему отбору) в выбранном
     «где». Строка страницы — тот же путь с одной группой; пустое поле в строке —
     осознанное «снять»: человек стёр число."""
-    form = await request.form()
     keep = _keep(form)
     sc = pick_scope(db, keep["scope"])
     if sc is None:
@@ -515,11 +516,10 @@ async def save_coef(request: Request, db: Session = Depends(get_db), user: User 
 
 
 @router.post("/sku-prices/manual-clear")
-async def manual_clear(request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+def manual_clear(request: Request, form=Depends(posted_form), db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Снять ручные цены кабинетов у строки — тогда действует наценка. Ручная цена
     задаётся на «Правила и журнал» → «Текущие и ручные цены», а побеждает наценку:
     без этой кнопки оператор задавал наценку и не понимал, почему уходит другое."""
-    form = await request.form()
     keep = _keep(form)
     sc = pick_scope(db, keep["scope"])
     key = str(form.get("row") or "")
@@ -543,13 +543,12 @@ async def manual_clear(request: Request, db: Session = Depends(get_db), user: Us
 # --- передача на площадки ------------------------------------------------------------
 
 @router.post("/sku-prices/send")
-async def send(request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+def send(request: Request, form=Depends(posted_form), db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Передать новые цены отмеченных строк (или всего отбора) во все кабинеты
     «где». Это и есть подтверждение: цена встаёт в очередь отправки, как
     подтверждённая на «Ценах». Ниже пола — никогда; больше лимита шага — только с
     галочкой. Цена, которую площадка уже приняла от нас или которая там уже
     стоит, повторно не уходит."""
-    form = await request.form()
     keep = _keep(form)
     sc = pick_scope(db, keep["scope"])
     if sc is None:
@@ -568,6 +567,15 @@ async def send(request: Request, db: Session = Depends(get_db), user: User = Dep
         return _back(**keep)
     now = now_utc()
     queued, same, floor, big, none, superseded = 0, 0, 0, 0, {}, 0
+    # Прежние решения по парам — ОДНИМ запросом на всю передачу, а не запросом на
+    # каждую ячейку: 60 тыс. запросов внутри открытой транзакции держали запись
+    # базы больше минуты.
+    acc_ids = [a.id for a in sc["accounts"]]
+    earlier: dict[tuple, list] = {}
+    for old in db.query(PriceChange).filter(
+            PriceChange.account_id.in_(acc_ids), PriceChange.is_test.is_(False),
+            PriceChange.status.in_(OPEN + (PriceChangeStatus.approved.value,))):
+        earlier.setdefault((old.item_id, old.account_id), []).append(old)
     for g in chosen:
         for r in g["rows"]:
             for c in r["cells"]:
@@ -587,10 +595,7 @@ async def send(request: Request, db: Session = Depends(get_db), user: User = Dep
                 if d.new_price == (c["current"] if c["current"] else c["last_sent"]):
                     same += 1
                     continue
-                for old in db.query(PriceChange).filter(
-                        PriceChange.account_id == acc.id, PriceChange.item_id == r["item_id"],
-                        PriceChange.is_test.is_(False),
-                        PriceChange.status.in_(OPEN + (PriceChangeStatus.approved.value,))):
+                for old in earlier.pop((r["item_id"], acc.id), []):
                     old.status = PriceChangeStatus.rejected.value
                     old.note = "вытеснено передачей со страницы «Цены товаров»"
                     superseded += 1
@@ -603,8 +608,15 @@ async def send(request: Request, db: Session = Depends(get_db), user: User = Dep
                     new_price=d.new_price, markup_rub=d.markup_rub, markup_coef=d.markup_coef, source=d.source,
                     status=PriceChangeStatus.approved.value, block_reason=d.block_reason,
                     note=(how or "")[:255] or None, decided_by=user.username, decided_at=now))
-                db.flush()
                 queued += 1
+                # Коммит порциями: одна транзакция на весь каталог держала запись
+                # базы дольше busy_timeout, и фоновый поток (отправка, обмен с 1С)
+                # получал «database is locked» (аудит 08.10: 51–71 с). Каждая цена —
+                # самостоятельное решение, атомарность всей пачки не нужна: оборвись
+                # передача посередине, ушедшее в очередь уйдёт, остальное передадут
+                # повторно — «уже стоит» отсеет сделанное.
+                if queued % COMMIT_EVERY == 0:
+                    db.commit()
     audit.log(db, user.username, "prices_sent_from_articles", sc["label"][:100],
               f"строк {len(chosen)}; в очередь {queued}; уже стоит {same}; ниже пола {floor}; "
               f"большой шаг без подтверждения {big}; не посчитано {none}")
@@ -665,8 +677,14 @@ def export(scope: str = Query(""), art: str = Query(""), barcode: str = Query(""
         return xlsx_response(headers, data, "наценки_категорий.xlsx")
     headers = [SCOPE_COL, "Где", "Артикул", "Размер", "Наименование", "Категория", "Цвета", "Размеры",
                "Себестоимость, $", "Базовая цена, ₽", KIND_COL, VALUE_COL, "Откуда наценка", *TAIL]
+    # «Наценка» — только значение ТОГО уровня, на котором открыта страница:
+    # кабинет — наценка артикула в кабинете, площадка — на площадке.
+    # Унаследованное идёт в «Откуда наценка». Иначе круг «выгрузил — загрузил»
+    # без единой правки превращал наценку площадки в наценку кабинета, и правка на
+    # площадке переставала действовать в этом кабинете (аудит 08.10).
+    own_level = SRC_CABINET if sc and sc["account_id"] else SRC_ARTICLE
     for g in groups:
-        own = g["source"] in ("article", SRC_CABINET)
+        own = g["source"] == own_level
         data.append([sc["key"], sc["label"], g["key"], "", g["name"], g["category"], ", ".join(g["colors"]),
                      ", ".join(g["sizes"]), g["cost"], g["base"],
                      KIND_LABELS.get(g["kind"], "") if own else "", _f(g["coef"]) if own else None,
