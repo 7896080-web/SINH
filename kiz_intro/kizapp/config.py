@@ -27,4 +27,6 @@ SECRETS_KEY = os.environ.get("KIZ_SECRETS_KEY", "")
 BACKUP_DIR = Path(os.environ.get("KIZ_BACKUP_DIR", str(ROOT / "backups")))
 TRUE_API_URL = os.environ.get("KIZ_TRUE_API_URL", "https://markirovka.crpt.ru/api/v3/true-api").rstrip("/")
 CHZ_PROXY = os.environ.get("KIZ_CHZ_PROXY", "")
-PORT = int(os.environ.get("KIZ_PORT", "8002"))
+# 8003: 8001 — «Маркировка», 8002 — «Репрайсер». До 08.10.2026 здесь стояло
+# 8002, и ярлык «Ввода в оборот» упирался в занятый «Репрайсером» порт.
+PORT = int(os.environ.get("KIZ_PORT", "8003"))

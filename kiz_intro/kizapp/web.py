@@ -310,4 +310,6 @@ def batch_txt(batch_id: int, db: Session = Depends(get_db)):
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    # `app` — опознание: на соседних портах живут другие программы, и ярлык
+    # обязан отличить «Ввод в оборот» от них, а не любой ответ 200.
+    return {"ok": True, "app": "kiz_intro"}

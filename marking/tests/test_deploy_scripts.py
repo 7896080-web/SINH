@@ -33,3 +33,11 @@ def test_update_stops_the_server_whatever_its_process_name():
     text = (Path(__file__).resolve().parents[1] / "deploy" / "update_workstation.ps1").read_text(encoding="utf-8-sig")
     assert "Name='python.exe'" not in text
     assert "не остановилась" in text          # порт проверяется, а не верится на слово
+
+
+def test_launch_and_update_recognise_marking_not_any_answer():
+    """Рядом «Репрайсер» и «Ввод в оборот» со своими /login: ответ 200 — ещё не
+    «Маркировка» (08.10.2026 столкнулись две соседние программы на одном порту)."""
+    for name in ("run_marking.ps1", "update_workstation.ps1"):
+        text = (DEPLOY / name).read_text(encoding="utf-8-sig")
+        assert '-match "Маркировка и поставки"' in text, name

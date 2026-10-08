@@ -4,7 +4,7 @@
 
 .DESCRIPTION
     Отдельная программа: своя папка (C:\kiz_intro), своя база, свой ключ
-    шифрования, порт 8002, свой ярлык. «Маркировку» не трогает.
+    шифрования, порт 8003 (8001 — «Маркировка», 8002 — «Репрайсер»), свой ярлык. «Маркировку» не трогает.
       1. Находит Python 3.11+.
       2. Создаёт .venv и ставит зависимости.
       3. Создаёт .env со своим ключом шифрования (если .env нет).
@@ -15,7 +15,7 @@
     powershell -ExecutionPolicy Bypass -File C:\kiz_intro\deploy\install.ps1
 #>
 [CmdletBinding()]
-param([int]$Port = 8002)
+param([int]$Port = 8003)
 $ErrorActionPreference = "Stop"
 function Info($m) { Write-Host "[*] $m" -ForegroundColor Cyan }
 function Ok($m)   { Write-Host "[OK] $m" -ForegroundColor Green }
