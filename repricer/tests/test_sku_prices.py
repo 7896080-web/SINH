@@ -155,7 +155,7 @@ def test_excel_roundtrip_empty_changes_nothing(client, db):
     book = load_workbook(io.BytesIO(r.content))
     ws = book.active
     h = [c.value for c in ws[1]]
-    assert {"Где (код)", "Артикул", "Вид наценки", "Наценка", "Новая маржинальность", "Текущая цена, ₽"} <= set(h)
+    assert {"Где (код)", "Артикул", "Вид наценки", "Наценка", "Новая маржинальность (мин.)", "Текущая цена, ₽"} <= set(h)
     rows = {ws.cell(row=i, column=h.index("Артикул") + 1).value: i for i in range(2, ws.max_row + 1)}
     col = h.index("Наценка") + 1
     ws.cell(row=rows["39681"], column=col, value=None)                 # не трогать

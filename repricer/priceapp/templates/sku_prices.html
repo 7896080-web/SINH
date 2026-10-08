@@ -23,6 +23,14 @@
 в кабинете, категория на площадке, умолчание площадки. Маржинальность = цена × (1 − скидка продавца) × (1 − комиссия) /
 себестоимость. Ручная цена кабинета главнее наценки. Подробно — <a href="/help/prices">«Справка»</a>.</p></details>
 
+<div class="row saved-filters" style="margin-bottom:10px">
+  {% for sf in saved_filters %}<span class="chip"><a href="{{ sf.url }}">{{ sf.name }}</a>
+    <form method="post" action="/filters/{{ sf.id }}/delete" style="display:inline"><button class="chip-x" title="Удалить отбор" onclick="return confirm('Удалить отбор «{{ sf.name }}»?')">×</button></form></span>{% endfor %}
+  {% if sc %}<form method="post" action="/filters/save" class="row" style="gap:6px">
+    <input type="hidden" name="url" value="{{ current_url }}">
+    <input name="name" placeholder="имя отбора" style="width:160px" required>
+    <button class="secondary" title="Запомнить «где», вид и отбор этой страницы">Сохранить отбор</button></form>{% endif %}
+</div>
 {% if not sc %}<p class="warn">Нет ни одного активного кабинета — заведите их на «API-ключах».</p>{% else %}
 <form method="get" action="/sku-prices" class="card">
   <div class="row">
@@ -35,7 +43,7 @@
     <label>Цвет<input name="color" value="{{ color }}" style="width:80px"></label>
     <label>Размер<input name="size" value="{{ size }}" style="width:56px"></label>
     <label>Отбор<select name="flt">{% for k, v in filters.items() %}<option value="{{ k }}" {% if flt == k %}selected{% endif %}>{{ v }}</option>{% endfor %}</select></label>
-    <label>Маржин. от<input name="mmin" value="{{ mmin }}" inputmode="decimal" style="width:56px"></label>
+    <label title="Новая маржинальность — по цене, которая уйдёт; у артикула — наименьшая по размерам">Новая маржин. от<input name="mmin" value="{{ mmin }}" inputmode="decimal" style="width:56px"></label>
     <label>до<input name="mmax" value="{{ mmax }}" inputmode="decimal" style="width:56px"></label>
     <button class="secondary">Показать</button>
     <a class="btn secondary" href="/sku-prices?scope={{ sc.key }}{% if by %}&amp;by={{ by }}{% endif %}">Сбросить</a>
@@ -50,6 +58,7 @@
 <div class="row" style="margin-top:8px">
   <a class="btn secondary" href="/sku-prices/export?{{ export_qs }}" title="Ровно то, что отобрано на странице">Экспорт отбора в Excel</a>
   <form method="post" action="/sku-prices/import" enctype="multipart/form-data" class="row">
+    {% for k, v in (('scope', sc.key), ('art', art), ('barcode', barcode), ('color', color), ('size', size), ('cat', cat), ('flt', flt), ('mmin', mmin), ('mmax', mmax), ('by', by)) %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
     <label>Импорт наценок (колонки «Вид наценки» и «Наценка»; пусто — без изменений, «-» — снять)<input type="file" name="file" accept=".xlsx" required></label>
     <button class="secondary">Импорт из Excel</button>
   </form>

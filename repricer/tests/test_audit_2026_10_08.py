@@ -215,3 +215,56 @@ def test_pages_carry_selection_hooks(client, db):
     assert f'data-sel-key="prod:{a1.id}"' in html and "selConfirm(" in html
     js = client.get("/static/selection.js").text
     assert "offscreen" in js and "sessionStorage" in js
+
+
+# --- п. 7: после импорта и загрузки цен — та же страница ------------------------------
+
+def test_markup_import_returns_to_the_same_scope_and_filters(client, db):
+    a1, a2 = _wb_two(db)
+    content = client.get(f"/sku-prices/export?scope=a{a2.id}").content
+    r = client.post("/sku-prices/import", data={"scope": f"a{a2.id}", "cat": "x", "by": "sku"},
+                    files={"file": ("f.xlsx", io.BytesIO(content), "x")}, follow_redirects=False)
+    loc = r.headers["location"]
+    assert f"scope=a{a2.id}" in loc and "cat=x" in loc and "by=sku" in loc
+
+
+def test_manual_import_and_price_load_keep_filters(client, db):
+    a1, _ = _wb_two(db)
+    content = client.get(f"/prices/export/{a1.id}").content
+    r = client.post(f"/prices/import/{a1.id}", data={"q": "100", "flt": "manual"},
+                    files={"file": ("f.xlsx", io.BytesIO(content), "x")}, follow_redirects=False)
+    assert "q=100" in r.headers["location"] and "flt=manual" in r.headers["location"]
+    r = client.post("/prices/load-current", data={"account_id": str(a1.id), "q": "100"}, follow_redirects=False)
+    assert "q=100" in r.headers["location"] and f"account_id={a1.id}" in r.headers["location"]
+
+
+# --- п. 8: числа в выгрузке — числами -------------------------------------------------
+
+def test_markup_export_writes_numbers_not_text(client, db):
+    _wb_two(db)
+    rows = _rows(client.get("/sku-prices/export?scope=wb").content)
+    h = rows[0]
+    row = rows[1]
+    for col in ("Новая цена, ₽", "Новая цена от, ₽", "Новая маржинальность (мин.)", "Себестоимость, $ (макс.)",
+                "Базовая цена, ₽ (макс.)", "Комиссия, % (макс.)"):
+        assert isinstance(row[h.index(col)], (int, float)), (col, row[h.index(col)])
+
+
+# --- п. 9–10: подписи отборов и сохранённые отборы «Цен товаров» -----------------------
+
+def test_margin_filters_say_which_margin(client, db):
+    a1, _ = _wb_two(db)
+    assert "Новая маржин. от" in client.get("/sku-prices?scope=wb").text
+    assert "Текущая маржин. от" in client.get(f"/prices?view=products&account_id={a1.id}").text
+
+
+def test_sku_prices_filter_can_be_saved_and_is_shown_only_there(client, db):
+    _wb_two(db)
+    url = "/sku-prices?scope=wb&flt=floor"
+    r = client.post("/filters/save", data={"name": "Ниже пола WB", "url": url})
+    assert "Ниже пола WB" in r.text and 'href="/sku-prices?scope=wb&amp;flt=floor"' in r.text
+    assert "Ниже пола WB" not in client.get("/prices?view=log").text
+    from priceapp.models import SavedFilter
+    f = db.query(SavedFilter).one()
+    r = client.post(f"/filters/{f.id}/delete", follow_redirects=False)
+    assert r.headers["location"] == "/sku-prices"

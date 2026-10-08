@@ -651,7 +651,7 @@ def bulk_edit(account_id: int, request: Request, form=Depends(posted_form), db: 
 
 @router.post("/prices/load-current")
 def load_current(request: Request, account_id: str = Form(""), back: str = Form("products"),
-                 db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+                 form=Depends(posted_form), db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Текущие цены со всех активных кабинетов — для наценки по текущим. Только
     читает площадки, ничего не меняет на них."""
     from priceapp.routers import accounts as acc_router
@@ -682,7 +682,7 @@ def load_current(request: Request, account_id: str = Form(""), back: str = Form(
     if problems:
         msg += " Не загружены: " + "; ".join(problems) + "."
     flash(request, msg, "warn" if problems else "ok")
-    return _back(back if back in VIEWS else "products", account_id=account_id)
+    return _back(back if back in VIEWS else "products", account_id=account_id, **_keep(form))
 
 
 ACCOUNT_COL = "Кабинет (код)"
@@ -720,7 +720,7 @@ def export(account_id: int, q: str = Query(""), flt: str = Query(""), coef_min: 
 
 
 @router.post("/prices/import/{account_id}")
-def import_manual(account_id: int, request: Request, file: UploadFile = File(...),
+def import_manual(account_id: int, request: Request, file: UploadFile = File(...), form=Depends(posted_form),
                   db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Импорт ручных цен из файла вкладки «Товары». Читается ТОЛЬКО колонка
     «Ручная цена, ₽»: остальное справочное. Пустая ячейка ничего не меняет, «-»
@@ -730,21 +730,21 @@ def import_manual(account_id: int, request: Request, file: UploadFile = File(...
         return _back("products")
     rows = _read_upload(request, file, MANUAL_COL)
     if rows is None:
-        return _back("products", account_id=account_id)
+        return _back("products", account_id=account_id, **_keep(form))
     # Файл несёт кабинет, из которого выгружен: ручные цены одного кабинета,
     # молча легшие в другой (SKU у кабинетов WB общие), уходили бы там чужими
     # ценами — ручная цена главнее любой наценки (аудит 08.10).
     if ACCOUNT_COL not in rows[0]:
         flash(request, f"В файле нет колонки «{ACCOUNT_COL}» — выгрузите файл заново с этой вкладки: "
                        "без неё не проверить, из какого он кабинета.", "warn")
-        return _back("products", account_id=account_id)
+        return _back("products", account_id=account_id, **_keep(form))
     foreign = {_cell(r.get(ACCOUNT_COL)) for r in rows} - {"", str(a.id)}
     if foreign:
         names = {str(x.id): label(x) for x in db.query(Account)}
         flash(request, f"Файл выгружен из другого кабинета ({', '.join(names.get(f, f) for f in sorted(foreign))}), "
                        f"а загружается в «{label(a)}» — ничего не изменено. Откройте нужный кабинет и загрузите "
                        "файл там.", "error")
-        return _back("products", account_id=account_id)
+        return _back("products", account_id=account_id, **_keep(form))
     known = set(mapping.account_items(db, a.id))
     changed, errors = 0, []
     for i, row in enumerate(rows, start=2):
@@ -767,7 +767,7 @@ def import_manual(account_id: int, request: Request, file: UploadFile = File(...
     audit.log(db, user.username, "price_import", label(a), f"изменено {changed}, ошибок {len(errors)}")
     db.commit()
     _import_flash(request, f"Ручных цен изменено: {changed}. На площадки ничего не отправлено.", errors)
-    return _back("products", account_id=account_id)
+    return _back("products", account_id=account_id, **_keep(form))
 
 
 # --- предложения и журнал -------------------------------------------------------------
@@ -881,7 +881,7 @@ def page(request: Request, view: str = Query("rules"), account_id: str = Query("
                source_labels=SOURCE_LABELS, change_percent=change_percent, rate=rates.current(db),
                rows_limit=ROWS_LIMIT, ru=_ru, price_status_labels=PRICE_STATUS_LABELS,
                coef_title=COEF_TITLE,
-               saved_filters=db.query(SavedFilter).order_by(SavedFilter.name).all(),
+               saved_filters=saved_filters(db, "/prices", "/mapping"),
                current_url=str(request.url.path) + (f"?{request.url.query}" if request.url.query else ""),
                rate_shift=overview.rate_shift(db),
                open_count=db.query(PriceChange).filter(PriceChange.status.in_(OPEN),
@@ -1140,17 +1140,29 @@ def preview(platform: str, request: Request, form=Depends(posted_form), db: Sess
 
 # --- сохранённые отборы -------------------------------------------------------------
 
+# Страницы, чей отбор можно запомнить. «Цены товаров» — основной рабочий экран, а
+# отбор на нём сохранить было нельзя: сервер принимал только /prices и /mapping, а
+# переход по меню сбрасывает фильтры (аудит 08.10).
+SAVED_FILTER_PAGES = ("/prices", "/mapping", "/sku-prices")
+
+
+def saved_filters(db: Session, *pages: str) -> list:
+    """Сохранённые отборы этих страниц: «Цены товаров» показывают свои, а не всех."""
+    return [f for f in db.query(SavedFilter).order_by(SavedFilter.name)
+            if f.url.split("?")[0] in pages]
+
+
 @router.post("/filters/save")
 def save_filter(request: Request, name: str = Form(""), url: str = Form(""), db: Session = Depends(get_db),
                 user: User = Depends(get_current_user)):
     name = name.strip()[:100]
     # Только свои страницы: адрес из формы не должен уводить куда угодно.
-    if not name or not (url.startswith("/prices") or url.startswith("/mapping")) or "//" in url:
+    if not name or not url.startswith(SAVED_FILTER_PAGES) or "//" in url:
         flash(request, "Дайте отбору имя.", "warn")
         return RedirectResponse(url if url.startswith("/") and "//" not in url else "/prices", status_code=303)
     db.add(SavedFilter(name=name, url=url[:1000], created_by=user.username))
     db.commit()
-    flash(request, f"Отбор «{name}» сохранён — он над вкладками.", "ok")
+    flash(request, f"Отбор «{name}» сохранён — он вверху страницы.", "ok")
     return RedirectResponse(url, status_code=303)
 
 
@@ -1162,4 +1174,7 @@ def delete_filter(filter_id: int, request: Request, db: Session = Depends(get_db
         db.delete(f)
         db.commit()
         flash(request, f"Отбор «{f.name}» удалён.", "ok")
-    return _back("proposals")
+        page = f.url.split("?")[0]
+        if page in SAVED_FILTER_PAGES:
+            return RedirectResponse(page, status_code=303)    # туда, где он был, а не на «Пересчёт»
+    return _back("rules")
