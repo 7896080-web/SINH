@@ -55,7 +55,7 @@
   </form>
 </div></details>
 
-<form method="post" action="/sku-prices/coef" id="bulk">
+<form method="post" action="/sku-prices/coef" id="bulk" data-sel-key="sku:{{ sc.key }}:{{ by }}" data-sel-name="arts" data-sel-total="{{ total }}" data-sel-unit="{{ 'категорий' if by == 'category' else 'артикулов' }}">
   {% for k, v in (('scope', sc.key), ('art', art), ('barcode', barcode), ('color', color), ('size', size), ('cat', cat), ('flt', flt), ('mmin', mmin), ('mmax', mmax), ('by', by)) %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
   <div class="card">
     <div class="row">
@@ -63,11 +63,13 @@
       <label>1. Наценка {{ 'категории' if by == 'category' else 'артикула' }}<select name="action">{% for k, v in actions.items() %}<option value="{{ k }}">{{ v }}</option>{% endfor %}</select></label>
       <label>вид<select name="kind">{% for k, v in kinds.items() %}<option value="{{ k }}" {% if (by == 'category') == (k == KIND_MARGIN) %}selected{% endif %}>{{ v }}</option>{% endfor %}</select></label>
       <label>значение<input name="value" inputmode="decimal" style="width:70px" placeholder="{{ '1,8' if by == 'category' else '2,5' }}"></label>
-      <button type="submit" onclick="return check('Установить наценку')">Установить</button>
+      <button type="submit" onclick="return selConfirm('bulk', 'Установить наценку', '{{ 'категорий' if by == 'category' else 'артикулов' }} (все их размеры)', true)">Установить</button>
       <span style="width:16px"></span>
       <label style="flex-direction:row;gap:6px;align-items:center"><input type="checkbox" name="confirm_large" value="1"> включая изменения больше лимита</label>
-      <button type="submit" formaction="/sku-prices/send" onclick="return check('ПЕРЕДАТЬ НОВЫЕ ЦЕНЫ на площадку «{{ sc.label }}»')">2. Передать на площадки</button>
+      <button type="submit" formaction="/sku-prices/send" data-sel-clear onclick="return selConfirm('bulk', 'ПЕРЕДАТЬ НОВЫЕ ЦЕНЫ на площадку «{{ sc.label }}»', '{{ 'категорий' if by == 'category' else 'артикулов' }} (все их размеры)', true)">2. Передать на площадки</button>
     </div>
+    <div class="row" style="margin-top:6px"><span class="sel-count muted" data-for="bulk"></span>
+      <button type="button" class="secondary sel-clear" data-for="bulk" style="padding:2px 8px;font-size:12px">Снять отметки</button></div>
     <p class="muted" style="margin-bottom:0">Сначала наценка — новая цена и маржинальность сразу видны в таблице, на площадки ничего не уходит.
     Затем «Передать»: цены встают в очередь отправки во все кабинеты «{{ sc.label }}». Ниже пола не уходит никогда; цена,
     которая уже стоит на площадке, повторно не отправляется.
@@ -75,7 +77,7 @@
   </div>
 
 <div class="scroll"><table class="art-table">
-<tr><th><input type="checkbox" onclick="document.querySelectorAll('input[name=arts]').forEach(c => c.checked = this.checked)"></th>
+<tr><th><input type="checkbox" class="sel-all" data-for="bulk" title="Отметить строки на экране"></th>
 <th>{{ 'Категория' if by == 'category' else 'Артикул' }}</th>{% if by != 'category' %}<th class="num">Базовая, ₽<div class="muted">себест., $</div></th>{% else %}<th class="num">Комиссия, %</th>{% endif %}<th>Наценка</th>
 <th class="num">Новая цена<div class="muted">маржинальность</div></th><th class="num">Текущая цена<div class="muted">маржинальность</div></th>
 <th class="num">Изменение</th><th>Последняя отправка</th></tr>
@@ -128,12 +130,6 @@ document.addEventListener('submit', function (e) {
   var v = document.querySelector('input[form=' + f.id + '][name=value]');
   if (v && !v.value.trim() && !confirm('Поле пустое — снять наценку у «' + f.querySelector('input[name=row]').value + '»? Тогда будет действовать наценка уровнем выше.')) e.preventDefault();
 }, true);
-function check(what) {
-  var all = document.getElementById('all-filtered').checked;
-  var n = all ? {{ total }} : document.querySelectorAll('input[name=arts]:checked').length;
-  if (!n) { alert('Ничего не отмечено.'); return false; }
-  return confirm(what + ': ' + n + ' {{ "категорий" if by == "category" else "артикулов" }} (все их размеры)?' + (all ? ' Это ВЕСЬ отбор, включая строки вне экрана.' : ''));
-}
 </script>
 {% endif %}
 {% endblock %}
