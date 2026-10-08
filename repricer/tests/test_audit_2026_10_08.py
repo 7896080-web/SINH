@@ -2,6 +2,7 @@
 воспроизводил дефект до правки."""
 import ast
 import io
+from decimal import Decimal
 from pathlib import Path
 
 from openpyxl import load_workbook
@@ -268,3 +269,31 @@ def test_sku_prices_filter_can_be_saved_and_is_shown_only_there(client, db):
     f = db.query(SavedFilter).one()
     r = client.post(f"/filters/{f.id}/delete", follow_redirects=False)
     assert r.headers["location"] == "/sku-prices"
+
+
+# --- п. 11, 12, 16 --------------------------------------------------------------------
+
+def test_category_view_names_cabinets_with_their_own_category_markup(client, db):
+    from decimal import Decimal
+    from priceapp.models import CategoryTarget, PlatformItem
+    a1, a2 = _wb_two(db)
+    for it in db.query(PlatformItem):
+        it.category = "Куртки"
+    db.add(CategoryTarget(category="Куртки", platform="wb", account_id=a2.id, kind="margin", value=Decimal("2")))
+    db.commit()
+    html = client.get("/sku-prices?scope=wb&by=category").text
+    assert "своя у: ИП 2" in html
+
+
+def test_multiply_says_that_inherited_markup_became_own(client, db):
+    _wb_two(db)
+    r = client.post("/sku-prices/coef", data={"scope": "wb", "action": "mult", "kind": "coef", "value": "1.1",
+                                              "arts": ["100"]})
+    assert "своей наценки не было" in r.text
+    assert db.query(ArticleCoef).filter_by(article="100", account_id=0).one().coef == Decimal("2.750")
+
+
+def test_page_tells_that_last_send_column_needs_a_reload(client, db):
+    _wb_two(db)
+    client.post("/sku-prices/send", data={"scope": "wb", "arts": ["100"], "confirm_large": "1"})
+    assert "В очереди на отправку: 1" in client.get("/sku-prices?scope=wb").text

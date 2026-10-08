@@ -85,6 +85,8 @@
     Найдено: {{ total }} {{ 'категорий' if by == 'category' else 'артикулов' }} ({{ skus }} размеров){% if total > groups|length %}, показаны первые {{ groups|length }} — галочка «весь отбор» берёт все, полный список — в Excel{% endif %}.</p>
   </div>
 
+{% if queued %}<p class="muted">В очереди на отправку: {{ queued }} {{ 'кат.' if by == 'category' else 'арт.' }} — колонка «Последняя отправка» сама не обновляется,
+<a href="">обновите страницу</a> через минуту-две, чтобы увидеть «ушло» или «не принято».</p>{% endif %}
 <div class="scroll"><table class="art-table">
 <tr><th><input type="checkbox" class="sel-all" data-for="bulk" title="Отметить строки на экране"></th>
 <th>{{ 'Категория' if by == 'category' else 'Артикул' }}</th>{% if by != 'category' %}<th class="num">Базовая, ₽<div class="muted">себест., $</div></th>{% else %}<th class="num">Комиссия, %</th>{% endif %}<th>Наценка</th>
@@ -96,7 +98,8 @@
   <td class="art"><b>{{ g.key }}</b><div class="muted">{{ g.articles|length }} арт. · {{ g.rows|length }} разм.</div></td>
   <td class="num">{{ g.commission }}<div class="muted">{{ 'по тарифу' if g.tariff_known else 'из правила' }}</div></td>
   <td class="mk">{% if g.key != '(без категории)' %}<select form="row{{ n }}" name="kind" class="kind">{% for k, v in kinds.items() %}<option value="{{ k }}" {% if (g.own_kind or KIND_MARGIN) == k %}selected{% endif %}>{{ 'маржинальность' if k == KIND_MARGIN else '× от базовой' }}</option>{% endfor %}</select><input form="row{{ n }}" name="value" value="{{ ru(g.own_value) if g.own_value is not none else '' }}" placeholder="—" inputmode="decimal" style="width:56px"><button form="row{{ n }}" class="secondary" style="padding:4px 8px">ok</button>{% endif %}
-    <div class="muted">{% if g.own_value is not none %}задано на категорию{% else %}у категории своей нет — действует {{ target_text(g.kind, g.coef) if not g.articles_own else 'умолчание площадки' }}{% endif %}{% if g.articles_own %}; у {{ g.articles_own }} из {{ g.articles|length }} арт. своя наценка — она главнее{% endif %}</div></td>
+    <div class="muted">{% if g.own_value is not none %}задано на категорию{% else %}у категории своей нет — действует {{ target_text(g.kind, g.coef) if not g.articles_own else 'умолчание площадки' }}{% endif %}{% if g.articles_own %}; у {{ g.articles_own }} из {{ g.articles|length }} арт. своя наценка — она главнее{% endif %}</div>
+    {% if g.cat_cabinets %}<div class="muted" title="У этих кабинетов своя наценка этой категории — заданная здесь в них не действует">своя у: {{ g.cat_cabinets|join(', ') }}</div>{% endif %}</td>
   {% else %}
   <td class="art"><b>{{ g.key }}</b><div class="muted">{{ g.name }}</div>
     <div class="muted">{% if g.category %}{{ g.category }} · {% endif %}{% if g.colors %}{{ g.colors|join(', ') }} · {% endif %}{{ g.rows|length }} разм.{% if g.sizes and g.sizes|length <= 8 %}: {{ g.sizes|join(', ') }}{% endif %}</div></td>

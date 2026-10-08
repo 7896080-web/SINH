@@ -382,6 +382,7 @@ def build(db: Session, sc: dict, art: str = "", barcode: str = "", color: str = 
     a_l, b_l, c_l, s_l = art.strip().lower(), barcode.strip(), color.strip().lower(), size.strip().lower()
     lo, hi = _dec_or_none(mmin), _dec_or_none(mmax)
     by_category = by == "category"
+    cat_own = set(load_inputs(db, sc["platform"]).categories) if by_category else set()
     groups: dict[str, list[dict]] = {}
     for r in sku_rows(db, sc):
         if _passes(r, a_l, b_l, c_l, s_l, cat):
@@ -405,6 +406,11 @@ def build(db: Session, sc: dict, art: str = "", barcode: str = "", color: str = 
         if by_category:
             own = category_target(db, sc["platform"], sc["account_id"], key) if key != NO_CATEGORY else None
             g["own_kind"], g["own_value"] = own if own else (None, None)
+            # Кабинеты со СВОЕЙ наценкой этой категории: наценка, заданная на
+            # площадку, в них не действует — страница обязана это сказать, иначе
+            # «задал на категорию» и «в ИП Ребрик уходит другое» не связать.
+            g["cat_cabinets"] = sorted(a.name for a in sc["accounts"]
+                                       if not sc["account_id"] and (key, a.id) in cat_own)
             g["articles_own"] = len({r["article"] for r in rows if r["source"] in ("article", SRC_CABINET)})
         out.append(g)
     return out
@@ -431,7 +437,9 @@ def page(request: Request, scope: str = Query(""), art: str = Query(""), barcode
     rule = load_inputs(db, sc["platform"]).rule if sc else None
     cats = categories_in(db, sc) if sc else []
     db.commit()
+    queued = sum(1 for g in groups[:ROWS_LIMIT] if g["last"] and g["last"]["status"] == "approved")
     return render(request, "sku_prices.html", user, "sku_prices", groups=groups[:ROWS_LIMIT], total=len(groups),
+                  queued=queued,
                   skus=sum(len(g["rows"]) for g in groups), scopes=scopes(db), sc=sc, rule=rule,
                   filters=FILTERS, actions=ACTIONS, views=VIEWS, kinds=KIND_LABELS, sources=SOURCE_LABELS,
                   categories=cats, ru=_ru, target_text=target_text, rate=rates.current(db),
@@ -538,7 +546,8 @@ def save_coef(request: Request, form=Depends(posted_form), db: Session = Depends
         return _back(**keep)
     account_id = sc["account_id"] or 0
     level_category = keep["by"] == "category"
-    changed, skipped = 0, 0
+    own_level = SRC_CABINET if sc["account_id"] else SRC_ARTICLE
+    changed, skipped, detached = 0, 0, 0
     for g in chosen:
         if level_category and g["key"] == NO_CATEGORY:
             skipped += 1
@@ -550,6 +559,8 @@ def save_coef(request: Request, form=Depends(posted_form), db: Session = Depends
                 skipped += 1
                 continue
             new_kind, new = cur_kind, (_dec(cur) * value).quantize(Decimal("0.001"))
+            if not level_category and g["source"] != own_level:
+                detached += 1      # своей не было — станет своя, от категории больше не зависит
         if level_category:
             changed += set_category(db, user, g["key"], sc["platform"], account_id, new, new_kind)
         else:
@@ -563,6 +574,8 @@ def save_coef(request: Request, form=Depends(posted_form), db: Session = Depends
     msg = (f"{sc['label']}: «{ACTIONS[action]}»{shown} — {what} {len(chosen)}, изменено {changed}"
            + (f", пропущено {skipped} (наценка не задана — умножать нечего, или строка без категории)"
               if skipped else "")
+           + (f". У {detached} арт. своей наценки не было — им записана своя (унаследованная × "
+              f"{_ru(value)}): наценка категории и умолчание на них больше не действуют" if detached else "")
            + ". Новые цены и маржинальность — в таблице; на площадки ничего не отправлено.")
     flash(request, msg, "warn" if skipped else "ok")
     return _back(**keep)
