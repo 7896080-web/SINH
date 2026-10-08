@@ -17,12 +17,13 @@ import json
 import re
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta, timezone
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 from sqlalchemy.orm import Session
 
 from kizapp import chz
 from kizapp.crypto import decrypt, encrypt
-from kizapp.models import Batch, Card, Code, Doc, Journal, Org, now_utc
+from kizapp.models import Batch, Card, Code, Doc, Journal, Org, Setting, now_utc
 
 GS = "\x1d"
 FULL_RE = re.compile(r"^01(\d{14})21(.{13})\x1d91(.{4})\x1d92(.{44})$", re.S)
@@ -435,43 +436,104 @@ def txt(db: Session, batch: Batch) -> bytes:
 
 
 UPD_OKEI = "796"          # штука
+UPD_VAT = Decimal("5")    # ставка НДС ИП, процентов (решение заказчика 08.10.2026)
+_CENT = Decimal("0.01")
 
 
-def upd_csv(db: Session, batch: Batch) -> bytes:
-    """Коды партии для УПД в Диадоке — CSV по шаблону загрузки кодов маркировки.
+def _cents(x: Decimal) -> Decimal:
+    return x.quantize(_CENT, rounding=ROUND_HALF_UP)
 
-    Строка CSV — товарная строка УПД: номер, наименование, цена, количество,
-    ОКЕИ, ставка НДС, тип идентификатора («КИЗ»), затем коды — каждый в своей
-    колонке. Строка — на GTIN, в порядке загрузки кодов. Цена и НДС ПУСТЫЕ
-    (решение заказчика 08.10.2026): в программе их нет, они уже стоят в УПД, файл
-    только добавляет коды к строкам. Наименование — из карточки Нацкаталога ИП.
 
-    Коды — короткие КИ (01 + GTIN + 21 + серийный): в УПД идёт код без
-    криптохвоста, полный код из базы не расшифровывается вовсе. Выдаётся, как и
-    .txt, только когда в обороте ВСЕ коды партии: УПД с кодом не в обороте ЧЗ не
-    примет, а узнали бы об этом уже после подписи покупателем.
+def upd_amounts(price_with_vat: Decimal, qty: int) -> dict:
+    """Суммы строки УПД от цены С НДС за штуку — как их считает УПД.
 
-    Формат — как у шаблона: UTF-8 без BOM, запятая, переводы строк LF; поле с
-    запятой или кавычкой — в кавычках (серийный номер КИ может содержать и то и
-    другое).
-    """
-    import csv
-    import io
+    Цена в файле — БЕЗ НДС (в УПД «Цена» без налога): введённая / 1,05 до
+    копеек. Стоимость с НДС = введённая × количество; НДС выделяется из неё
+    (× 5/105), стоимость без НДС — разность: так сходится итог «с НДС», который
+    человек и сверяет с договором, а копейка округления уходит в цену."""
+    rate = UPD_VAT / Decimal(100)
+    total_with = _cents(price_with_vat * qty)
+    vat = _cents(total_with * UPD_VAT / (Decimal(100) + UPD_VAT))
+    return {"price": _cents(price_with_vat / (1 + rate)), "price_with_vat": _cents(price_with_vat),
+            "total": total_with - vat, "vat": vat, "total_with_vat": total_with}
+
+
+def parse_price(text: str) -> Decimal:
+    t = (text or "").strip().replace(" ", "").replace("\u00a0", "").replace(",", ".")
+    try:
+        v = Decimal(t)
+    except InvalidOperation:
+        raise KizError(f"цена «{text}» — не число")
+    if v <= 0:
+        raise KizError("цена должна быть больше нуля")
+    return v
+
+
+def _price_key(org_id: int, gtin: str) -> str:
+    return f"upd_price:{org_id}:{gtin}"
+
+
+def upd_lines(db: Session, batch: Batch) -> list[dict]:
+    """Строки УПД партии: GTIN в порядке загрузки кодов, наименование из карточки
+    НК ЭТОГО ИП, количество, коды и последняя введённая цена с НДС."""
     codes = db.query(Code).filter(Code.batch_id == batch.id).order_by(Code.id).all()
-    if not codes:
-        raise KizError("в партии нет кодов")
-    if any(c.status != "INTRODUCED" for c in codes):
-        raise KizError("не все коды партии в обороте")
     by_gtin: dict[str, list[str]] = {}
     for c in codes:
         by_gtin.setdefault(c.gtin, []).append(c.cis)
     names = {c.gtin: c.name for c in db.query(Card).filter(Card.org_id == batch.org_id,
                                                            Card.gtin.in_(list(by_gtin))).all()}
+    out = []
+    for gtin, cises in by_gtin.items():
+        s = db.get(Setting, _price_key(batch.org_id, gtin))
+        out.append({"gtin": gtin, "name": names.get(gtin, ""), "qty": len(cises), "cises": cises,
+                    "price": s.value if s else ""})
+    return out
+
+
+def upd_csv(db: Session, batch: Batch, prices: dict[str, str]) -> bytes:
+    """Коды партии для УПД в Диадоке — CSV по шаблону загрузки кодов маркировки.
+
+    Строка CSV — товарная строка УПД: номер, наименование, цена БЕЗ НДС,
+    количество, ОКЕИ, ставка «5%», тип «КИЗ», затем коды — каждый в своей
+    колонке. Строка — на GTIN, в порядке загрузки кодов. Цену человек вводит С
+    НДС за штуку (`prices`: GTIN → текст), программа делит на 1,05; стоимость и
+    НДС — только на экране, в шаблоне Диадока их колонок нет (решение заказчика
+    08.10.2026). Введённая цена запоминается по ИП и GTIN.
+
+    Коды — короткие КИ: полный код не расшифровывается. Выдаётся, как и .txt,
+    только когда в обороте ВСЕ коды партии: УПД с кодом не в обороте ЧЗ не
+    примет. Формат — как у шаблона: UTF-8 без BOM, запятая, LF; поле с запятой
+    или кавычкой — в кавычках.
+    """
+    import csv
+    import io
+    codes = db.query(Code).filter(Code.batch_id == batch.id).all()
+    if not codes:
+        raise KizError("в партии нет кодов")
+    if any(c.status != "INTRODUCED" for c in codes):
+        raise KizError("не все коды партии в обороте")
+    lines = upd_lines(db, batch)
+    parsed = {}
+    for ln in lines:
+        raw = prices.get(ln["gtin"], "")
+        if not raw.strip():
+            raise KizError(f"не указана цена для {ln['name'] or ln['gtin']}")
+        try:
+            parsed[ln["gtin"]] = parse_price(raw)
+        except KizError as e:
+            raise KizError(f"{ln['name'] or ln['gtin']}: {e}")
     out = io.StringIO()
     w = csv.writer(out, lineterminator="\n")
-    for n, (gtin, cises) in enumerate(by_gtin.items(), 1):
-        w.writerow([n, names.get(gtin, ""), "", len(cises), UPD_OKEI, "", "КИЗ", *cises])
-    log(db, "upd_csv", f"партия #{batch.id}: строк {len(by_gtin)}, кодов {len(codes)}")
+    total = Decimal(0)
+    for n, ln in enumerate(lines, 1):
+        a = upd_amounts(parsed[ln["gtin"]], ln["qty"])
+        total += a["total_with_vat"]
+        w.writerow([n, ln["name"], f"{a['price']:.2f}", ln["qty"], UPD_OKEI, f"{UPD_VAT:.0f}%", "КИЗ",
+                    *ln["cises"]])
+        s = db.get(Setting, _price_key(batch.org_id, ln["gtin"])) or Setting(key=_price_key(batch.org_id, ln["gtin"]))
+        s.value = f"{parsed[ln['gtin']]}"
+        db.add(s)
+    log(db, "upd_csv", f"партия #{batch.id}: строк {len(lines)}, кодов {len(codes)}, с НДС {total:.2f}")
     return out.getvalue().rstrip("\n").encode("utf-8")
 
 
