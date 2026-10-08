@@ -264,3 +264,14 @@ def test_labels_printed_with_chosen_template(client, db, chz_fake):
     r = client.post(f"/batch/{b.id}/labels", data={"template_id": str(t.id)})
     assert r.status_code == 200 and r.content.startswith(b"%PDF")
     assert "Только GTIN" in client.get(f"/batch/{b.id}").text and "Шаблоны этикеток" in client.get("/").text
+
+
+def test_label_layout_preview(client, db):
+    org(db)
+    r = client.post("/labels/preview", data={"title": "{название}", "right": "GTIN {GTIN}",
+                                             "bottom": "Изготовитель: {изготовитель}", "module": "0.5"})
+    assert r.status_code == 200 and r.content[:8] == b"\x89PNG\r\n\x1a\n"
+    r = client.post("/labels/preview", data={"title": "{артикул}", "module": "0.5"})
+    assert r.status_code == 400 and "неизвестная подстановка" in r.json()["error"]
+    page = client.get("/").text
+    assert "tpl-preview" in page and "/labels/preview" in page
