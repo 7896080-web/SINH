@@ -405,6 +405,47 @@ def txt(db: Session, batch: Batch) -> bytes:
     return "".join(decrypt(c.full_enc) + "\r\n" for c in codes).encode("ascii")
 
 
+UPD_OKEI = "796"          # штука
+
+
+def upd_csv(db: Session, batch: Batch) -> bytes:
+    """Коды партии для УПД в Диадоке — CSV по шаблону загрузки кодов маркировки.
+
+    Строка CSV — товарная строка УПД: номер, наименование, цена, количество,
+    ОКЕИ, ставка НДС, тип идентификатора («КИЗ»), затем коды — каждый в своей
+    колонке. Строка — на GTIN, в порядке загрузки кодов. Цена и НДС ПУСТЫЕ
+    (решение заказчика 08.10.2026): в программе их нет, они уже стоят в УПД, файл
+    только добавляет коды к строкам. Наименование — из карточки Нацкаталога ИП.
+
+    Коды — короткие КИ (01 + GTIN + 21 + серийный): в УПД идёт код без
+    криптохвоста, полный код из базы не расшифровывается вовсе. Выдаётся, как и
+    .txt, только когда в обороте ВСЕ коды партии: УПД с кодом не в обороте ЧЗ не
+    примет, а узнали бы об этом уже после подписи покупателем.
+
+    Формат — как у шаблона: UTF-8 без BOM, запятая, переводы строк LF; поле с
+    запятой или кавычкой — в кавычках (серийный номер КИ может содержать и то и
+    другое).
+    """
+    import csv
+    import io
+    codes = db.query(Code).filter(Code.batch_id == batch.id).order_by(Code.id).all()
+    if not codes:
+        raise KizError("в партии нет кодов")
+    if any(c.status != "INTRODUCED" for c in codes):
+        raise KizError("не все коды партии в обороте")
+    by_gtin: dict[str, list[str]] = {}
+    for c in codes:
+        by_gtin.setdefault(c.gtin, []).append(c.cis)
+    names = {c.gtin: c.name for c in db.query(Card).filter(Card.org_id == batch.org_id,
+                                                           Card.gtin.in_(list(by_gtin))).all()}
+    out = io.StringIO()
+    w = csv.writer(out, lineterminator="\n")
+    for n, (gtin, cises) in enumerate(by_gtin.items(), 1):
+        w.writerow([n, names.get(gtin, ""), "", len(cises), UPD_OKEI, "", "КИЗ", *cises])
+    log(db, "upd_csv", f"партия #{batch.id}: строк {len(by_gtin)}, кодов {len(codes)}")
+    return out.getvalue().rstrip("\n").encode("utf-8")
+
+
 def full_codes(db: Session, batch: Batch) -> list[str]:
     """Полные коды партии в порядке загрузки — для этикеток (печать по желанию,
     до ввода в оборот тоже: этикетку клеят раньше, чем ЧЗ ставит «в обороте»)."""

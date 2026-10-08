@@ -32,6 +32,7 @@
     <select name="template_id">{% for t in label_templates %}<option value="{{ t.id }}" {{ 'selected' if t.is_default }}>{{ t.name }}</option>{% endfor %}</select>
     <button class="secondary">Этикетки 58×40 (PDF)</button></form>
   <form method="post" action="/batch/{{ batch.id }}/txt" style="display:inline"><button class="secondary" {{ '' if s.done else 'disabled title="только когда все коды в обороте"' }}>Коды (.txt)</button></form>
+  <form method="post" action="/batch/{{ batch.id }}/upd-csv" style="display:inline"><button class="secondary" {{ '' if s.done else 'disabled title="только когда все коды в обороте"' }} title="CSV для загрузки кодов в УПД (Диадок): строка на GTIN, цена и НДС пустые — они уже в УПД">Коды для УПД (.csv)</button></form>
   <form method="post" action="/batch/{{ batch.id }}/date" class="row" style="margin-top:12px">
     <label>Дата производства<input type="date" name="production_date" value="{{ batch.production_date }}" required></label>
     <button class="secondary">Сохранить дату</button>
