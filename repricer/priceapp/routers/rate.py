@@ -7,7 +7,7 @@ from decimal import Decimal, InvalidOperation
 
 from priceapp import audit, overview, rates, settings
 from priceapp.database import get_db
-from priceapp.deps import get_current_user
+from priceapp.deps import get_current_user, posted_form
 from priceapp.flash import flash
 from priceapp.models import ExchangeRate, User
 from priceapp.pages import render
@@ -37,8 +37,7 @@ def refresh(request: Request, db: Session = Depends(get_db), user: User = Depend
 
 
 @router.post("/rate/mode")
-async def set_mode(request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    form = await request.form()
+def set_mode(request: Request, form=Depends(posted_form), db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     mode = "manual" if form.get("mode") == "manual" else "cbr"
     manual = str(form.get("manual") or "").strip()
     if mode == "manual":
@@ -60,10 +59,9 @@ async def set_mode(request: Request, db: Session = Depends(get_db), user: User =
 
 
 @router.post("/rate/alert")
-async def set_alert(request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+def set_alert(request: Request, form=Depends(posted_form), db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Порог предупреждения «курс ушёл от курса последнего расчёта». Только
     предупреждает: цены программа сама не пересчитывает и не отправляет."""
-    form = await request.form()
     raw = str(form.get("alert") or "").strip().replace(",", ".")
     try:
         value = Decimal(raw)

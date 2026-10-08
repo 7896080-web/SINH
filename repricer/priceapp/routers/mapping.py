@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from priceapp import article_matching as am, audit, mapping, settings
 from priceapp.database import get_db
-from priceapp.deps import get_current_user
+from priceapp.deps import get_current_user, posted_form
 from priceapp.excel import xlsx_response
 from priceapp.flash import flash
 from priceapp.models import Account, User
@@ -50,12 +50,11 @@ def page(request: Request, view: str = Query("status"), account_id: str = Query(
 
 
 @router.post("/mapping/rules/{account_id}")
-async def save_rule(account_id: int, request: Request, db: Session = Depends(get_db),
+def save_rule(account_id: int, request: Request, form=Depends(posted_form), db: Session = Depends(get_db),
                     user: User = Depends(get_current_user)):
     a = db.get(Account, account_id)
     if a is None:
         return RedirectResponse("/mapping", status_code=303)
-    form = await request.form()
     kinds = [k for k in am.KINDS if k in form.getlist("kinds")]
     rule = am.get_rule(db, a.id)
     before = (rule.kinds, rule.strip_prefix, rule.strip_suffix)
@@ -71,13 +70,12 @@ async def save_rule(account_id: int, request: Request, db: Session = Depends(get
 
 
 @router.post("/mapping/confirm/{account_id}")
-async def confirm(account_id: int, request: Request, db: Session = Depends(get_db),
+def confirm(account_id: int, request: Request, form=Depends(posted_form), db: Session = Depends(get_db),
                   user: User = Depends(get_current_user)):
     a = db.get(Account, account_id)
     back = RedirectResponse(f"/mapping?view=candidates&account_id={account_id}", status_code=303)
     if a is None:
         return back
-    form = await request.form()
     pairs = [tuple(str(v).split("|", 1)) for v in form.getlist("pick") if "|" in str(v)]
     if not pairs:
         flash(request, "Ничего не выбрано.", "warn")

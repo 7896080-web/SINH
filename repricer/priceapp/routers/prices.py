@@ -26,7 +26,7 @@ from sqlalchemy.orm import Session
 
 from priceapp import accounts as acc_mod, audit, mapping, overview, platforms, rates, settings
 from priceapp.database import get_db
-from priceapp.deps import get_current_user
+from priceapp.deps import get_current_user, posted_form
 from priceapp.excel import ExcelReadError, read_xlsx_rows, xlsx_response
 from priceapp.flash import flash
 from priceapp.models import (Account, ApiCredential, OnecBarcode, OnecCost, PlatformItem, PlatformRule,
@@ -43,6 +43,7 @@ router = APIRouter()
 
 ROWS_LIMIT = 500
 BULK_LIMIT = 20000
+COMMIT_EVERY = 500
 VIEWS = ("rules", "proposals", "products", "compare", "log")
 CLEAR_CELL = "-"
 STATUS_LABELS = {
@@ -242,12 +243,11 @@ def _rule_raw(rule: PlatformRule) -> dict:
 
 
 @router.post("/prices/rules/{platform}")
-async def save_rule(platform: str, request: Request, db: Session = Depends(get_db),
+def save_rule(platform: str, request: Request, form=Depends(posted_form), db: Session = Depends(get_db),
                     user: User = Depends(get_current_user)):
     if platform not in PLATFORMS:
         flash(request, "Площадка не найдена.", "warn")
         return _back("rules")
-    form = await request.form()
     values, errors = validate_rule(db, platform, {k: form.get(k) for k in RULE_KEYS})
     if errors:
         flash(request, f"{PLATFORMS[platform]}: не сохранено — " + "; ".join(errors), "warn")
@@ -357,10 +357,9 @@ def _apply_guard(db: Session, user: User, a: Account, values: dict) -> bool:
 
 
 @router.post("/prices/guard/{account_id}")
-async def save_guard(account_id: int, request: Request, db: Session = Depends(get_db),
+def save_guard(account_id: int, request: Request, form=Depends(posted_form), db: Session = Depends(get_db),
                      user: User = Depends(get_current_user)):
     a = db.get(Account, account_id)
-    form = await request.form()
     if a is None:
         return _back("rules")
     values, errors = validate_guard(form.get("guard_min_margin"), form.get("guard_max_margin"))
@@ -560,9 +559,8 @@ def _keep(form) -> dict:
 
 
 @router.post("/prices/manual/{account_id}")
-async def set_manual(account_id: int, request: Request, db: Session = Depends(get_db),
+def set_manual(account_id: int, request: Request, form=Depends(posted_form), db: Session = Depends(get_db),
                      user: User = Depends(get_current_user)):
-    form = await request.form()
     item_id, value, keep = str(form.get("item_id") or ""), form.get("value"), _keep(form)
     a = db.get(Account, account_id)
     if a is None or not item_id:
@@ -581,13 +579,12 @@ async def set_manual(account_id: int, request: Request, db: Session = Depends(ge
 
 
 @router.post("/prices/bulk/{account_id}")
-async def bulk_edit(account_id: int, request: Request, db: Session = Depends(get_db),
+def bulk_edit(account_id: int, request: Request, form=Depends(posted_form), db: Session = Depends(get_db),
                     user: User = Depends(get_current_user)):
     """Массовая правка ручных цен: по отмеченным строкам или по ВСЕМУ отбору.
     «Во всех кабинетах площадки» — то же в каждом её кабинете, где товар
     сопоставлен (у WB три ИП); «от текущей» берёт текущую цену КАЖДОГО
     кабинета. Ничего не отправляет: дальше расчёт и подтверждение."""
-    form = await request.form()
     keep = _keep(form)
     a = db.get(Account, account_id)
     action = str(form.get("action") or "")
@@ -618,9 +615,12 @@ async def bulk_edit(account_id: int, request: Request, db: Session = Depends(get
         targets = [x for x in _accounts(db) if x.platform == a.platform]
     wanted = set(item_ids)
     changed = skipped = 0
-    for acc in targets:
-        rows = {r["item_id"]: r for r in product_rows(db, acc) if r["item_id"] in wanted}
-        rule = get_rule(db, acc.platform)
+    # Сначала посчитать строки ВСЕХ кабинетов, потом писать: расчёт второго
+    # кабинета шёл внутри уже открытой транзакции и держал запись базы
+    # (аудит 08.10). Запись — порциями.
+    plan = [(acc, {r["item_id"]: r for r in product_rows(db, acc) if r["item_id"] in wanted},
+             get_rule(db, acc.platform)) for acc in targets]
+    for acc, rows, rule in plan:
         skipped += len(wanted - set(rows))
         for item_id, r in rows.items():
             if action == "set_manual":
@@ -635,6 +635,8 @@ async def bulk_edit(account_id: int, request: Request, db: Session = Depends(get
                 new = round_price(Decimal(base) * value, rule.round_step, rule.round_minus)
             if _set_manual(db, item_id, acc.id, new):
                 changed += 1
+                if changed % COMMIT_EVERY == 0:
+                    db.commit()
     audit.log(db, user.username, "price_bulk_edit", ", ".join(x.name for x in targets)[:100],
               f"{BULK_ACTIONS[action]} {value if value is not None else ''}; строк {len(item_ids)}; "
               f"изменено {changed}, пропущено {skipped}")
@@ -683,13 +685,14 @@ def load_current(request: Request, account_id: str = Form(""), back: str = Form(
     return _back(back if back in VIEWS else "products", account_id=account_id)
 
 
+ACCOUNT_COL = "Кабинет (код)"
 PRODUCT_HEADERS = ["ID_1С", "Артикул 1С", "Наименование", "Размер", "Цвет", "Баркод площадки",
                    "Артикул площадки", "Себестоимость, $", "Себестоимость, ₽", "Комиссия, %",
                    "Текущая цена, ₽", "Текущая цена продажи, ₽", "К получению по текущей, ₽",
                    "Прибыль по текущей, ₽", "Маржинальность по текущей",
                    "Расчётная цена, ₽", "Как посчитана", "К получению по расчётной, ₽",
                    "Прибыль по расчётной, ₽", "Маржинальность по расчётной",
-                   "Отправлено нами, ₽", "Ручная цена, ₽"]
+                   "Отправлено нами, ₽", "Ручная цена, ₽", "Кабинет", ACCOUNT_COL]
 MANUAL_COL = "Ручная цена, ₽"
 
 
@@ -707,7 +710,7 @@ def export(account_id: int, q: str = Query(""), flt: str = Query(""), coef_min: 
              _f(r["commission"]), r["current"], r["current_sale"], _f(r["current_payout"]),
              _f(r["current_markup_rub"]), _f(r["current_coef"]),
              r["price"], SOURCE_LABELS.get(r["source"], "") if r["price"] else r["note"],
-             _f(r["payout"]), _f(r["markup_rub"]), _f(r["markup_coef"]), r["last_sent"], r["manual"]]
+             _f(r["payout"]), _f(r["markup_rub"]), _f(r["markup_coef"]), r["last_sent"], r["manual"], label(a), a.id]
             for r in rows]
     return xlsx_response(PRODUCT_HEADERS, data, f"цены_{a.name}.xlsx")
 
@@ -723,6 +726,20 @@ def import_manual(account_id: int, request: Request, file: UploadFile = File(...
         return _back("products")
     rows = _read_upload(request, file, MANUAL_COL)
     if rows is None:
+        return _back("products", account_id=account_id)
+    # Файл несёт кабинет, из которого выгружен: ручные цены одного кабинета,
+    # молча легшие в другой (SKU у кабинетов WB общие), уходили бы там чужими
+    # ценами — ручная цена главнее любой наценки (аудит 08.10).
+    if ACCOUNT_COL not in rows[0]:
+        flash(request, f"В файле нет колонки «{ACCOUNT_COL}» — выгрузите файл заново с этой вкладки: "
+                       "без неё не проверить, из какого он кабинета.", "warn")
+        return _back("products", account_id=account_id)
+    foreign = {_cell(r.get(ACCOUNT_COL)) for r in rows} - {"", str(a.id)}
+    if foreign:
+        names = {str(x.id): label(x) for x in db.query(Account)}
+        flash(request, f"Файл выгружен из другого кабинета ({', '.join(names.get(f, f) for f in sorted(foreign))}), "
+                       f"а загружается в «{label(a)}» — ничего не изменено. Откройте нужный кабинет и загрузите "
+                       "файл там.", "error")
         return _back("products", account_id=account_id)
     known = set(mapping.account_items(db, a.id))
     changed, errors = 0, []
@@ -945,9 +962,8 @@ def _ids(form) -> list[int]:
 
 
 @router.post("/prices/approve")
-async def approve_changes(request: Request, db: Session = Depends(get_db),
+def approve_changes(request: Request, form=Depends(posted_form), db: Session = Depends(get_db),
                           user: User = Depends(get_current_user)):
-    form = await request.form()
     ids, account_id = _ids(form), str(form.get("account_id") or "")
     confirm_large = form.get("confirm_large") == "true"
     if form.get("all_filtered") == "1":
@@ -975,9 +991,8 @@ async def approve_changes(request: Request, db: Session = Depends(get_db),
 
 
 @router.post("/prices/reject")
-async def reject_changes(request: Request, db: Session = Depends(get_db),
+def reject_changes(request: Request, form=Depends(posted_form), db: Session = Depends(get_db),
                          user: User = Depends(get_current_user)):
-    form = await request.form()
     ids, account_id = _ids(form), str(form.get("account_id") or "")
     if form.get("all_filtered") == "1":
         ids = [c.id for c in _changes_query(db, "proposals", account_id, str(form.get("status") or ""),
@@ -1090,11 +1105,10 @@ def rollback(change_id: int, request: Request, db: Session = Depends(get_db),
 # --- «что будет, если» для правила --------------------------------------------------
 
 @router.post("/prices/rules/{platform}/preview")
-async def preview(platform: str, request: Request, db: Session = Depends(get_db),
+def preview(platform: str, request: Request, form=Depends(posted_form), db: Session = Depends(get_db),
                   user: User = Depends(get_current_user)):
     if platform not in PLATFORMS:
         return _back("rules")
-    form = await request.form()
     values, errors = validate_rule(db, platform, {k: form.get(k) for k in RULE_KEYS})
     if errors:
         flash(request, f"{PLATFORMS[platform]}: проверить нельзя — " + "; ".join(errors), "warn")

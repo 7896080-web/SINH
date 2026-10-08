@@ -90,7 +90,7 @@
   <td class="art"><b>{{ g.key }}</b><div class="muted">{{ g.name }}</div>
     <div class="muted">{% if g.category %}{{ g.category }} · {% endif %}{% if g.colors %}{{ g.colors|join(', ') }} · {% endif %}{{ g.rows|length }} разм.{% if g.sizes and g.sizes|length <= 8 %}: {{ g.sizes|join(', ') }}{% endif %}</div></td>
   <td class="num">{{ g.base }}<div class="muted" style="font-size:12px">{{ g.cost }} $</div></td>
-  <td class="mk"><select form="row{{ n }}" name="kind" class="kind">{% for k, v in kinds.items() %}<option value="{{ k }}" {% if (g.kind or 'coef') == k %}selected{% endif %}>{{ 'маржинальность' if k == KIND_MARGIN else '× от базовой' }}</option>{% endfor %}</select><input form="row{{ n }}" name="value" value="{{ ru(g.coef) if g.coef is not none and g.source in ('article', 'cabinet') else '' }}"
+  <td class="mk"><select form="row{{ n }}" name="kind" class="kind">{% for k, v in kinds.items() %}<option value="{{ k }}" {% if (g.kind or 'coef') == k %}selected{% endif %}>{{ 'маржинальность' if k == KIND_MARGIN else '× от базовой' }}</option>{% endfor %}</select><input form="row{{ n }}" name="value" value="{{ ru(g.coef) if g.coef is not none and g.source == own_level else '' }}"
       placeholder="{{ ru(g.coef) if g.coef is not none else '—' }}" inputmode="decimal" style="width:56px"
       title="Пусто — наценка категории или умолчание площадки"><button form="row{{ n }}" class="secondary" style="padding:4px 8px">ok</button>
     <div class="muted">{{ target_text(g.kind, g.coef) }} · {{ sources.get(g.source, 'разные') }}</div>
