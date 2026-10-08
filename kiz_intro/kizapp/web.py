@@ -219,7 +219,7 @@ def batch_page(batch_id: int, request: Request, db: Session = Depends(get_db)):
     tpls = L.templates(db)
     db.commit()
     return _render(request, "batch.html", org=o, batch=b, s=S.summary(db, b), token_ok=S.token(o) is not None,
-                   label_templates=tpls,
+                   label_templates=tpls, upd_lines=S.upd_lines(db, b), upd_vat=S.UPD_VAT,
                    docs=db.query(Doc).filter(Doc.batch_id == b.id).order_by(Doc.id.desc()).all(),
                    status_ru=S.STATUS_RU, doc_ru=S.DOC_RU, cert_ru=S.CERT_RU)
 
@@ -321,12 +321,14 @@ def batch_txt(batch_id: int, db: Session = Depends(get_db)):
 
 
 @app.post("/batch/{batch_id}/upd-csv")
-def batch_upd_csv(batch_id: int, db: Session = Depends(get_db)):
+async def batch_upd_csv(batch_id: int, request: Request, db: Session = Depends(get_db)):
     b = db.get(Batch, batch_id)
     if b is None:
         return _go("/")
+    form = await request.form()
+    prices = {k[len("price_"):]: str(v) for k, v in form.items() if k.startswith("price_")}
     try:
-        data = S.upd_csv(db, b)
+        data = S.upd_csv(db, b, prices)
     except S.KizError as e:
         return _go(f"/batch/{batch_id}", f"Файл для УПД не выдан: {e}", "error")
     db.commit()

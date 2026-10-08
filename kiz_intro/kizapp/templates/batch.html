@@ -26,13 +26,58 @@
 </div>
 
 <div class="card">
+  <h2>Коды для УПД (.csv)</h2>
+  <p class="muted">Файл для загрузки кодов в УПД в Диадоке. Цену вводите <b>с НДС</b> за штуку — в файл
+    уйдёт цена без НДС (÷ 1,{{ '%02d' % upd_vat }}) и ставка {{ upd_vat }}%. Стоимость и НДС — здесь, для сверки с УПД;
+    в файле их колонок нет. Цена запоминается по товару.</p>
+  <form method="post" action="/batch/{{ batch.id }}/upd-csv" id="updForm">
+    <table>
+      <tr><th>№</th><th>GTIN</th><th>Товар</th><th class="num">Кол-во</th><th class="num">Цена с НДС, ₽/шт</th>
+        <th class="num">Цена без НДС</th><th class="num">Стоимость без НДС</th><th class="num">НДС {{ upd_vat }}%</th><th class="num">Стоимость с НДС</th></tr>
+      {% for l in upd_lines %}
+      <tr data-qty="{{ l.qty }}"><td>{{ loop.index }}</td><td>{{ l.gtin }}</td><td>{{ l.name or '—' }}</td><td class="num">{{ l.qty }}</td>
+        <td class="num"><input name="price_{{ l.gtin }}" value="{{ l.price }}" size="9" inputmode="decimal" required></td>
+        <td class="num" data-f="price"></td><td class="num" data-f="total"></td><td class="num" data-f="vat"></td><td class="num" data-f="with"></td></tr>
+      {% endfor %}
+      <tr><td colspan="6"><b>Итого</b></td><td class="num" id="sumTotal"></td><td class="num" id="sumVat"></td><td class="num" id="sumWith"></td></tr>
+    </table>
+    <p><button class="secondary" {{ '' if s.done else 'disabled title="только когда все коды в обороте"' }}>Скачать коды для УПД (.csv)</button></p>
+  </form>
+  <script>
+  (function () {
+    // Тот же счёт, что в файле (service.upd_amounts): с НДС = цена × кол-во, НДС = с НДС × {{ upd_vat }}/{{ 100 + upd_vat }},
+    // без НДС = разность; цена без НДС = цена / 1,{{ '%02d' % upd_vat }}. Считаем в копейках, чтобы не было «0,1+0,2».
+    var R = {{ upd_vat }};
+    function cents(x) { return Math.round(x * 100 + (x >= 0 ? 1e-7 : -1e-7)); }
+    function money(c) { return (c / 100).toLocaleString('ru-RU', {minimumFractionDigits: 2, maximumFractionDigits: 2}); }
+    function calc() {
+      var st = 0, sv = 0, sw = 0;
+      document.querySelectorAll('#updForm tr[data-qty]').forEach(function (tr) {
+        var p = parseFloat(tr.querySelector('input').value.replace(/\s/g, '').replace(',', '.'));
+        var q = +tr.dataset.qty, f = function (k) { return tr.querySelector('[data-f="' + k + '"]'); };
+        if (!(p > 0)) { ['price', 'total', 'vat', 'with'].forEach(function (k) { f(k).textContent = ''; }); return; }
+        var w = cents(p * q), v = Math.round(w * R / (100 + R)), t = w - v;
+        f('price').textContent = money(cents(p / (1 + R / 100))); f('total').textContent = money(t);
+        f('vat').textContent = money(v); f('with').textContent = money(w);
+        st += t; sv += v; sw += w;
+      });
+      document.getElementById('sumTotal').textContent = money(st);
+      document.getElementById('sumVat').textContent = money(sv);
+      document.getElementById('sumWith').textContent = money(sw);
+    }
+    document.getElementById('updForm').addEventListener('input', calc);
+    calc();
+  })();
+  </script>
+</div>
+
+<div class="card">
   <h2>Действия</h2>
   <form method="post" action="/batch/{{ batch.id }}/refresh" style="display:inline"><button class="secondary">Проверить статусы и карточки НК</button></form>
   <form method="post" action="/batch/{{ batch.id }}/labels" style="display:inline">
     <select name="template_id">{% for t in label_templates %}<option value="{{ t.id }}" {{ 'selected' if t.is_default }}>{{ t.name }}</option>{% endfor %}</select>
     <button class="secondary">Этикетки 58×40 (PDF)</button></form>
   <form method="post" action="/batch/{{ batch.id }}/txt" style="display:inline"><button class="secondary" {{ '' if s.done else 'disabled title="только когда все коды в обороте"' }}>Коды (.txt)</button></form>
-  <form method="post" action="/batch/{{ batch.id }}/upd-csv" style="display:inline"><button class="secondary" {{ '' if s.done else 'disabled title="только когда все коды в обороте"' }} title="CSV для загрузки кодов в УПД (Диадок): строка на GTIN, цена и НДС пустые — они уже в УПД">Коды для УПД (.csv)</button></form>
   <form method="post" action="/batch/{{ batch.id }}/date" class="row" style="margin-top:12px">
     <label>Дата производства<input type="date" name="production_date" value="{{ batch.production_date }}" required></label>
     <button class="secondary">Сохранить дату</button>
