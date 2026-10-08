@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Цены товаров{% endblock %}
 {% block content %}
+{% import "_guides.html" as guides %}
 <style>
 .art-table td { white-space:nowrap; }
 .art-table td.art { white-space:normal; min-width:180px; max-width:260px; }
@@ -13,6 +14,7 @@
 .art-table td.last { white-space:normal; min-width:90px; font-size:13px; }
 </style>
 <h1>Цены товаров</h1>
+{{ guides.sku_prices() }}
 <p><b>1.</b> Выберите, где (площадка или кабинет) → <b>2.</b> задайте наценку артикулам или категориям → <b>3.</b> проверьте
 новую цену и маржинальность → <b>4.</b> «Передать на площадки».
 {% if rate %}<span class="muted">Курс: <b>{{ rate.usd_rub|money(4) }} ₽</b>.</span>{% else %}<span class="bad">Курса нет — базовая цена не считается.</span>{% endif %}</p>

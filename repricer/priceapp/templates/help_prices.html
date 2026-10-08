@@ -1,13 +1,23 @@
 {% extends "base.html" %}
 {% block title %}Справка: типы цен{% endblock %}
 {% block content %}
+{% import "_guides.html" as guides %}
 <style>
 .help h2 { margin-top:22px; } .help dt { font-weight:600; margin-top:10px; } .help dd { margin:2px 0 0 0; max-width:110ch; }
 .help table td, .help table th { white-space:normal; vertical-align:top; }
 .formula { background:var(--code, #f3f4f7); border-radius:6px; padding:8px 12px; font-family:ui-monospace, Consolas, monospace; font-size:13px; display:inline-block; }
 </style>
 <div class="help">
-<h1>Типы цен, с которыми работает программа</h1>
+<h1>Справка: цены</h1>
+<p><a href="#pages">Что куда уходит и инструкции по страницам</a> · <a href="#types">Типы цен</a></p>
+
+<h2 id="pages">Что куда уходит</h2>
+{{ guides.flow() }}
+<h2>Инструкции по страницам</h2>
+<p class="muted">Те же, что вверху каждой страницы.</p>
+{{ guides.sku_prices() }}{{ guides.rules() }}{{ guides.products() }}{{ guides.proposals() }}{{ guides.log() }}{{ guides.compare() }}{{ guides.rate() }}{{ guides.attention() }}
+
+<h2 id="types">Типы цен, с которыми работает программа</h2>
 <p class="muted">Одно и то же слово «цена» на площадках значит разное. Ниже — что именно программа читает, считает и отправляет.</p>
 
 <h2>Как сделать</h2>

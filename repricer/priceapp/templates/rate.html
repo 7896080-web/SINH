@@ -1,7 +1,9 @@
 {% extends "base.html" %}
 {% block title %}Курс доллара{% endblock %}
 {% block content %}
+{% import "_guides.html" as guides %}
 <h1>Курс доллара</h1>
+{{ guides.rate() }}
 <div class="card">
   {% if current %}
   <p style="font-size:18px;margin-top:0">Считаем по курсу <b>{{ current.usd_rub|money(4) }} ₽ за $1</b> — {{ current.label }}.</p>
@@ -29,7 +31,7 @@
 <div class="card">
   <h2 style="margin-top:0">Предупреждение о скачке курса</h2>
   {% if shift %}<p class="warn" style="margin-top:0">Курс ушёл на {{ shift.pct }}% от курса последнего расчёта
-  ({{ shift.was|money(4) }} → {{ shift.now|money(4) }} ₽) — пересчитайте цены на странице «Цены».</p>{% endif %}
+  ({{ shift.was|money(4) }} → {{ shift.now|money(4) }} ₽) — новые цены на <a href="/sku-prices?flt=changes">«Ценах товаров»</a> (отбор «новая цена ≠ текущей»), там их и передают.</p>{% endif %}
   <form method="post" action="/rate/alert" class="row">
     <label>Предупреждать, если курс ушёл от курса расчёта больше чем на, %<input name="alert" value="{{ alert }}" inputmode="decimal" style="width:90px"></label>
     <button type="submit">Сохранить</button>

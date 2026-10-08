@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Правила и журнал{% endblock %}
 {% block content %}
+{% import "_guides.html" as guides %}
 <h1>Правила и журнал</h1>
 <p class="muted">Цены выставляют и передают на площадки на странице <a href="/sku-prices">«Цены товаров»</a> — это основной путь.
 Здесь — правила площадок, журнал отправок, текущие цены по кабинету и ручные цены, сравнение площадок и пересчёт всех цен разом.
@@ -24,6 +25,8 @@
     <input name="name" placeholder="имя отбора" style="width:160px" required>
     <button class="secondary" title="Запомнить текущую вкладку с её отбором">Сохранить отбор</button></form>{% endif %}
 </div>
+
+{% if view == 'rules' %}{{ guides.rules() }}{% elif view == 'products' %}{{ guides.products() }}{% elif view == 'proposals' %}{{ guides.proposals() }}{% elif view == 'log' %}{{ guides.log() }}{% elif view == 'compare' %}{{ guides.compare() }}{% endif %}
 
 {% if not accounts %}
 <div class="card">Нет активных кабинетов — заведите их на странице «API-ключи».</div>
