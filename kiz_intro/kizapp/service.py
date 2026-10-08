@@ -232,10 +232,22 @@ def refresh_statuses(db: Session, batch: Batch) -> str:
     return refresh_documents(db, batch)       # ошибка проверки итога — на экран, а не молча
 
 
+DOC_SENT_STALE = timedelta(days=1)
+
+
 def refresh_documents(db: Session, batch: Batch) -> str:
+    """Итог документов партии. Истина — статусы КОДОВ: документ «проверяется» или
+    с неизвестным исходом закрывается сам, когда все его коды в обороте.
+
+    08.10.2026 документ на 200 кодов висел «проверяется ЧЗ»: закрывался он
+    только ответом /doc/{id}/info, и любой статус вне трёх известных, как и
+    отсутствие ответа, оставлял его так навсегда — коды заняты, повторить
+    нечем. Теперь незнакомый статус называется на экране, а сутки без итога
+    переводят документ в «неизвестно», где решение — за человеком."""
     o = org_of(db, batch)
     t = token(o)
-    for d in db.query(Doc).filter(Doc.batch_id == batch.id, Doc.status == "unknown").all():
+    notes = []
+    for d in db.query(Doc).filter(Doc.batch_id == batch.id, Doc.status.in_(("unknown", "sent"))).all():
         codes = db.query(Code).filter(Code.doc_id == d.id).all()
         if codes and all(c.status == "INTRODUCED" for c in codes):
             d.status, d.error = "CHECKED_OK", "принят — все его коды в обороте"
@@ -248,14 +260,23 @@ def refresh_documents(db: Session, batch: Batch) -> str:
         try:
             st, errs = chz.document_status(d.chz_doc_id, t)
         except chz.ChzError as e:
-            return str(e)
+            notes.append(str(e))
+            st, errs = None, ""
         if st in chz.DOC_OK + chz.DOC_FAILED:
             d.status = "CHECKED_OK" if st in chz.DOC_OK else "CHECKED_NOT_OK"
             d.error = errs
             if d.status != "CHECKED_OK":
                 _release(db, d)
+        else:
+            if st is not None:
+                d.error = f"ЧЗ: статус документа «{st or 'пусто'}»" + (f" — {errs}" if errs else "")
+                notes.append(f"документ {d.chz_doc_id[:8]}…: {d.error}")
+            if d.sent_at and now_utc() - d.sent_at > DOC_SENT_STALE:
+                d.status = "unknown"
+                d.error = (f"итога нет больше {DOC_SENT_STALE.days} сут. ({d.error or 'ЧЗ не ответил'}) — "
+                           "проверьте документ в ЛК ЧЗ")
         db.commit()
-    return ""
+    return "; ".join(notes)
 
 
 # --- Сводка ---------------------------------------------------------------------------------
@@ -388,6 +409,14 @@ def send(db: Session, doc: Doc, signature: str) -> None:
 def release_unknown(db: Session, doc: Doc) -> None:
     if doc.status != "unknown":
         raise KizError("освободить можно только документ с неизвестным исходом")
+    codes = db.query(Code).filter(Code.doc_id == doc.id).all()
+    if any(c.status == "INTRODUCED" for c in codes):
+        raise KizError("часть кодов документа уже в обороте — документ дошёл, освобождать нельзя")
+    since = doc.sent_at or doc.created_at
+    if any(c.status_at is None or c.status_at <= since for c in codes):
+        # Статус, снятый до отправки, не говорит, дошёл ли документ: коды ушли
+        # бы во второй документ.
+        raise KizError("сначала «Проверить статусы»: статус кодов не проверялся после отправки документа")
     doc.status, doc.error = "error", "человек подтвердил: в ЧЗ документа нет"
     _release(db, doc)
 
