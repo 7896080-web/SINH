@@ -703,7 +703,6 @@ def export(account_id: int, q: str = Query(""), flt: str = Query(""), coef_min: 
     if a is None:
         return _back("products")
     rows = product_rows(db, a, q, flt, coef_min, coef_max)
-    db.commit()
     data = [[r["item_id"], r["sku"].article if r["sku"] else "", r["sku"].name if r["sku"] else "",
              r["sku"].size if r["sku"] else "", r["sku"].color if r["sku"] else "",
              r["platform"].barcode, r["platform"].article, _f(r["cost_usd"]), _f(r["cost_rub"]),
@@ -712,7 +711,12 @@ def export(account_id: int, q: str = Query(""), flt: str = Query(""), coef_min: 
              r["price"], SOURCE_LABELS.get(r["source"], "") if r["price"] else r["note"],
              _f(r["payout"]), _f(r["markup_rub"]), _f(r["markup_coef"]), r["last_sent"], r["manual"], label(a), a.id]
             for r in rows]
-    return xlsx_response(PRODUCT_HEADERS, data, f"цены_{a.name}.xlsx")
+    # Коммит — ПОСЛЕ чтения строк: он помечает загруженные объекты устаревшими, и
+    # каждое обращение к ним ушло бы в базу заново — 40 тыс. запросов на кабинет
+    # (аудит 08.10: экспорт 15 с, из них большая часть — эти запросы).
+    name = a.name
+    db.commit()
+    return xlsx_response(PRODUCT_HEADERS, data, f"цены_{name}.xlsx")
 
 
 @router.post("/prices/import/{account_id}")
@@ -758,6 +762,8 @@ def import_manual(account_id: int, request: Request, file: UploadFile = File(...
             continue
         if _set_manual(db, item_id, a.id, value):
             changed += 1
+            if changed % COMMIT_EVERY == 0:
+                db.commit()     # порциями: файл на десятки тысяч строк не держит запись базы
     audit.log(db, user.username, "price_import", label(a), f"изменено {changed}, ошибок {len(errors)}")
     db.commit()
     _import_flash(request, f"Ручных цен изменено: {changed}. На площадки ничего не отправлено.", errors)
@@ -891,7 +897,6 @@ def page(request: Request, view: str = Query("rules"), account_id: str = Query("
         account = _pick(accs, account_id)
         rows = product_rows(db, account, q, flt, coef_min, coef_max) if account else []
         rule = get_rule(db, account.platform) if account else None
-        db.commit()
         ctx.update(account=account, account_id=str(account.id) if account else "", rows=rows[:ROWS_LIMIT],
                    total=len(rows), rule=rule, flt=flt, coef_min=coef_min, coef_max=coef_max,
                    product_filters=PRODUCT_FILTERS, bulk_actions=BULK_ACTIONS,
@@ -914,7 +919,9 @@ def page(request: Request, view: str = Query("rules"), account_id: str = Query("
         ctx.update(total=query.count(), changes=changes, status_choices=_statuses(view),
                    skus=_sku_info(db, {c.item_id for c in changes}),
                    export_qs=urlencode({"view": view, "account_id": account_id, "status": status, "q": q}))
-    return render(request, "prices.html", user, "prices", **ctx)
+    response = render(request, "prices.html", user, "prices", **ctx)
+    db.commit()       # после отрисовки: коммит до неё заставлял перечитывать каждую строку
+    return response
 
 
 def _tariff_counts(db: Session, accs) -> dict:
@@ -1043,7 +1050,6 @@ def compare_rows(db: Session, accs: list[Account], q: str = "", flt: str = "") -
 def export_compare(q: str = Query(""), flt: str = Query(""), db: Session = Depends(get_db),
                    user: User = Depends(get_current_user)):
     rows, cols = compare_rows(db, _accounts(db), q, flt)
-    db.commit()
     headers = ["ID_1С", "Артикул 1С", "Наименование", "Размер", "Цвет", "Разброс текущих, %"]
     for a in cols:
         headers += [f"{a.name}: текущая, ₽", f"{a.name}: маржинальность по текущей", f"{a.name}: расчётная, ₽"]
@@ -1056,6 +1062,7 @@ def export_compare(q: str = Query(""), flt: str = Query(""), db: Session = Depen
             c = r["cells"][a.id]
             line += [c["current"], _f(c["current_coef"]), c["price"]] if c else [None, None, None]
         data.append(line)
+    db.commit()       # после чтения строк — см. `export`
     return xlsx_response(headers, data, "сравнение_площадок.xlsx")
 
 

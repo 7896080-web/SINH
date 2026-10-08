@@ -141,3 +141,52 @@ def test_manual_prices_file_without_cabinet_column_is_refused(client, db):
     r = client.post(f"/prices/import/{a1.id}", files={"file": ("f.xlsx", io.BytesIO(buf.getvalue()), "x")})
     assert "Кабинет (код)" in r.text
     assert db.query(ProductPrice).filter(ProductPrice.manual_price.isnot(None)).count() == 0
+
+
+# --- п. 6: расчёт «Цен товаров» не повторяется, пока данные не менялись ---------------
+
+def _count_computes(monkeypatch):
+    from priceapp.routers import sku_prices
+    calls = []
+    real = sku_prices._compute_rows
+    monkeypatch.setattr(sku_prices, "_compute_rows", lambda db, sc: calls.append(1) or real(db, sc))
+    return calls
+
+
+def test_rows_are_reused_between_requests_without_changes(client, db, monkeypatch):
+    _wb_two(db)
+    calls = _count_computes(monkeypatch)
+    client.get("/sku-prices?scope=wb")
+    client.get("/sku-prices?scope=wb&art=100")          # другой отбор — тот же расчёт
+    client.get("/sku-prices/export?scope=wb")
+    assert len(calls) == 1
+
+
+def test_any_price_affecting_commit_invalidates_rows(client, db, monkeypatch):
+    from priceapp import settings
+    a1, _ = _wb_two(db)
+    calls = _count_computes(monkeypatch)
+    client.get("/sku-prices?scope=wb")
+    settings.put(db, "attention_dirty", "1")             # «Внимание» на цену не влияет
+    db.commit()
+    client.get("/sku-prices?scope=wb")
+    assert len(calls) == 1
+    settings.put(db, settings.RATE_MANUAL, "90")          # курс — влияет
+    db.commit()
+    client.get("/sku-prices?scope=wb")
+    assert len(calls) == 2
+    pp = ProductPrice(item_id="i0", account_id=a1.id, manual_price=1234)   # как фоновый поток
+    db.add(pp)
+    db.commit()
+    assert "1234" in client.get("/sku-prices?scope=wb").text
+    assert len(calls) == 3
+
+
+def test_row_ok_computes_once(client, db, monkeypatch):
+    _wb_two(db)
+    client.get("/sku-prices?scope=wb")
+    calls = _count_computes(monkeypatch)
+    r = client.post("/sku-prices/coef", data={"scope": "wb", "row": "100", "value": "3", "kind": "coef"})
+    assert r.status_code == 200 and len(calls) == 1      # POST из кэша, страница после — заново
+    db.expire_all()
+    assert db.query(ArticleCoef).filter_by(article="100").one().coef == 3

@@ -46,3 +46,60 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+# --- версия данных для кэша расчёта цен -------------------------------------------
+#
+# «Цены товаров» пересчитывали весь каталог «где» на КАЖДЫЙ запрос: 6–8 с на
+# страницу, поиск одного артикула столько же, строка «ok» — 12 с (расчёт в POST и
+# ещё раз после редиректа). Кэш результата живёт до первой записи в таблицы, от
+# которых зависит цена: любой коммит, тронувший их, — веб или фоновый поток, один
+# процесс, — сдвигает версию, и следующий запрос считает заново. Таблицы, на цену
+# не влияющие (журнал, отметки заданий, «Внимание»), версию не двигают: иначе
+# фоновый поток сбрасывал бы кэш каждую минуту и ускорения не было бы вовсе.
+
+_DATA_VERSION = [0]
+_IGNORED_TABLES = {"audit_log", "worker_heartbeats", "users", "saved_filters", "onec_tasks", "api_credentials"}
+
+
+def data_version() -> int:
+    return _DATA_VERSION[0]
+
+
+def _touches_prices(obj) -> bool:
+    table = getattr(obj, "__tablename__", "")
+    if table in _IGNORED_TABLES:
+        return False
+    if table == "settings":
+        return str(getattr(obj, "key", "")).startswith("rate_")
+    return True
+
+
+@event.listens_for(SessionLocal, "after_flush")
+def _note_price_writes(session, _ctx):
+    if any(_touches_prices(o) for o in (*session.new, *session.dirty, *session.deleted)):
+        session.info["prices_written"] = True
+
+
+@event.listens_for(SessionLocal, "do_orm_execute")
+def _note_bulk_writes(state):
+    # query.update()/delete() мимо единицы работы — after_flush их не видит.
+    if state.is_update or state.is_delete:
+        state.session.info["prices_written"] = True
+
+
+@event.listens_for(SessionLocal, "after_commit")
+def _bump_version(session):
+    if session.info.pop("prices_written", None):
+        _DATA_VERSION[0] += 1
+
+
+@event.listens_for(SessionLocal, "after_rollback")
+def _forget_writes(session):
+    session.info.pop("prices_written", None)
+
+
+def wrote_prices(db) -> bool:
+    """В текущей транзакции уже записано что-то, влияющее на цену (ещё без
+    коммита) — кэшем пользоваться нельзя."""
+    return bool(db.info.get("prices_written")) or bool(db.new or db.dirty or db.deleted)

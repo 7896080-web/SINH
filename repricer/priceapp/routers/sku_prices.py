@@ -20,7 +20,9 @@
 """
 from __future__ import annotations
 
+import time
 from decimal import Decimal, InvalidOperation
+from types import SimpleNamespace
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, File, Query, Request, UploadFile
@@ -28,7 +30,7 @@ from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 
 from priceapp import audit, mapping, rates
-from priceapp.database import get_db
+from priceapp.database import data_version, get_db, wrote_prices
 from priceapp.deps import get_current_user, posted_form
 from priceapp.excel import xlsx_response
 from priceapp.flash import flash
@@ -142,7 +144,36 @@ def target_text(kind: str | None, value) -> str:
 
 # --- строки --------------------------------------------------------------------------
 
+# Кэш расчёта строк по «где»: живёт, пока не сдвинулась версия данных
+# (`database.data_version` — любой коммит в таблицы, от которых зависит цена). Время
+# жизни — подстраховка на случай записи мимо приложения.
+ROWS_CACHE_TTL = 600
+ROWS_CACHE_SIZE = 6
+_rows_cache: dict[tuple, tuple[float, list[dict]]] = {}
+
+
+def _snap(obj, *fields):
+    """Снимок нужных полей объекта базы: строки кэша переживают свою сессию, а
+    объект ORM после её закрытия читать нельзя."""
+    return None if obj is None else SimpleNamespace(**{f: getattr(obj, f) for f in fields})
+
+
 def sku_rows(db: Session, scope: dict) -> list[dict]:
+    """Строки страницы для «где» — из кэша, если данные с прошлого расчёта не
+    менялись; иначе расчёт заново (`_compute_rows`)."""
+    key = (scope["key"], tuple(a.id for a in scope["accounts"]), data_version())
+    hit = _rows_cache.get(key)
+    if hit is not None and time.monotonic() - hit[0] < ROWS_CACHE_TTL and not wrote_prices(db):
+        return hit[1]
+    rows = _compute_rows(db, scope)
+    if not wrote_prices(db):
+        for k in [k for k in _rows_cache if k[2] != key[2]] + list(_rows_cache)[:-ROWS_CACHE_SIZE]:
+            _rows_cache.pop(k, None)
+        _rows_cache[key] = (time.monotonic(), rows)
+    return rows
+
+
+def _compute_rows(db: Session, scope: dict) -> list[dict]:
     """По каждому SKU 1С, который есть хотя бы в одном кабинете «где»: базовая,
     наценка, и по каждому кабинету — новая цена и маржинальность против
     текущих. Считается ТЕМ ЖЕ `decide_for`, что и расчёт и отправка."""
@@ -179,7 +210,7 @@ def sku_rows(db: Session, scope: dict) -> list[dict]:
         cost_usd = cost.cost_usd if cost else None
         base = base_price(cost_usd, usd)
         all_rows = [p for items in per_acc.values() for p in items.get(item_id, [])]
-        category = item_facts(rule, all_rows).category
+        category = next((p.category for p in all_rows if p.category), "")   # как item_facts
         target = target_for(inp, item_id, scope["account_id"], category)
         art = article_of(inp.articles, item_id)
         cells = []
@@ -189,13 +220,13 @@ def sku_rows(db: Session, scope: dict) -> list[dict]:
                 continue
             pp = pps.get((item_id, acc.id))
             facts = item_facts(rule, plat)
-            d = decide_for(inp, item_id, acc.id, cost_usd, usd, pp, plat)
+            d = decide_for(inp, item_id, acc.id, cost_usd, usd, pp, plat, facts)
             cur_margin = None
             if base is not None and facts.commission is not None and facts.sale:
                 cur_margin = markup(facts.sale, base, facts.commission)[1]
             # Баркод строки каталога ЭТОГО кабинета: отправка ищет позицию в его
             # каталоге, чужой баркод там не найдётся.
-            cells.append({"account": acc, "barcode": plat[0].barcode, "decision": d, "price": d.new_price,
+            cells.append({"account": _snap(acc, "id", "name", "platform"), "barcode": plat[0].barcode, "decision": d, "price": d.new_price,
                           "current": facts.current, "sale": facts.sale,
                           "discount": int((facts.discount * 100).quantize(Decimal("1"))) if facts.discount else None,
                           "commission": facts.commission, "tariff": facts.tariff,
@@ -205,9 +236,12 @@ def sku_rows(db: Session, scope: dict) -> list[dict]:
                           "big_step": d.block_reason == BLOCK_MAX_CHANGE,
                           "last_sent": pp.last_sent_price if pp else None,
                           "manual_price": pp.manual_price if pp else None,
-                          "last_change": last_change.get((item_id, acc.id)),
+                          "last_change": _snap(last_change.get((item_id, acc.id)), "status", "new_price",
+                                               "sent_at", "decided_at", "created_at", "last_error", "note"),
                           "own_cabinet": (art, acc.id) in inp.coefs or (category, acc.id) in inp.categories})
-        out.append({"item_id": item_id, "article": art, "sku": info.get(item_id), "category": category,
+        out.append({"item_id": item_id, "article": art,
+                    "sku": _snap(info.get(item_id), "item_id", "article", "name", "size", "color"),
+                    "category": category,
                     "barcodes": barcodes.get(item_id, []), "plat_barcodes": [p.barcode for p in all_rows],
                     "cost_usd": cost_usd, "base": base,
                     "kind": target.kind if target else None, "coef": target.value if target else None,
