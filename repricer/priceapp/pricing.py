@@ -314,11 +314,12 @@ def coef_for(inp: Inputs, item_id: str, account_id: int | None, category: str = 
 
 
 def decide_for(inp: Inputs, item_id: str, account_id: int | None, cost_usd, usd_rub,
-               pp: "ProductPrice | None", rows=None) -> Decision:
+               pp: "ProductPrice | None", rows=None, facts: "Facts | None" = None) -> Decision:
     """Решение по товару в кабинете. `rows` — его строки каталога кабинета:
     из них тариф комиссии, скидка продавца и категория. Ручная цена кабинета
-    главнее наценки; пол и лимит шага не обходит ни одна."""
-    facts = item_facts(inp.rule, rows)
+    главнее наценки; пол и лимит шага не обходит ни одна. `facts` — уже
+    посчитанные `item_facts(inp.rule, rows)`, если они есть у вызывающего."""
+    facts = facts or item_facts(inp.rule, rows)
     manual = pp.manual_price if pp and pp.manual_price is not None else None
     target = target_for(inp, item_id, account_id, facts.category)
     # Лимит шага — от последней принятой нами цены, а пока мы ничего не

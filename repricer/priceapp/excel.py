@@ -7,7 +7,10 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.cell import WriteOnlyCell
 from openpyxl.styles import Font
 
-MAX_IMPORT_ROWS = 20000
+# Выгрузка кабинета целиком бывает больше 20 тыс. строк, и её же должно быть можно
+# залить обратно (аудит 08.10). Обработчики форм идут в пуле потоков, так что
+# долгое чтение файла больше не замораживает интерфейс.
+MAX_IMPORT_ROWS = 60000
 
 
 class ExcelReadError(Exception):

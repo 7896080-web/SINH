@@ -58,3 +58,13 @@ def client(db):
         r = c.post("/login", data={"username": "op", "password": "password1"})
         assert r.status_code in (200, 303)
         yield c
+
+
+@pytest.fixture(autouse=True)
+def _fresh_module_caches():
+    """Модульный кэш расчёта «Цен товаров» переживает тест, а база — нет: без
+    сброса тест видел бы строки предыдущего."""
+    from priceapp.routers import sku_prices
+    sku_prices._rows_cache.clear()
+    yield
+    sku_prices._rows_cache.clear()
