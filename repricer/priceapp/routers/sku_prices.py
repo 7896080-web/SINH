@@ -469,11 +469,18 @@ def set_category(db: Session, user: User, category: str, platform: str, account_
                    kind, value, user, "value")
 
 
-def _chosen(form, groups: list[dict]) -> list[dict]:
+def _chosen(form, db: Session, sc: dict, keep: dict) -> list[dict]:
+    """Строки, по которым действовать. «Весь отбор» — текущий отбор целиком.
+    Отметки — ищутся по ВСЕМУ «где» (только вид тот же): отметка переживает
+    смену фильтра (static/selection.js), и строка, отмеченная при другом
+    отборе, иначе молча выпала бы из правки — «отмечено 50, изменено 30».
+    Браузер спрашивает подтверждение, называя, сколько отмеченных не на экране."""
     if form.get("all_filtered") == "1":
-        return groups
+        return build(db, sc, **keep)
     wanted = set(str(v) for v in form.getlist("arts"))
-    return [g for g in groups if g["key"] in wanted]
+    if not wanted:
+        return []
+    return [g for g in build(db, sc, by=keep.get("by", "")) if g["key"] in wanted]
 
 
 def _value(raw, kind: str) -> Decimal:
@@ -509,8 +516,8 @@ def save_coef(request: Request, form=Depends(posted_form), db: Session = Depends
         except ValueError as e:
             flash(request, f"«{ACTIONS[action]}»: значение — {e}.", "warn")
             return _back(**keep)
-    groups = build(db, sc, **keep)
-    chosen = [g for g in groups if g["key"] == row_key] if row_key else _chosen(form, groups)
+    chosen = ([g for g in build(db, sc, by=keep["by"]) if g["key"] == row_key] if row_key
+              else _chosen(form, db, sc, keep))
     if not chosen:
         flash(request, "Ничего не отмечено.", "warn")
         return _back(**keep)
@@ -557,7 +564,7 @@ def manual_clear(request: Request, form=Depends(posted_form), db: Session = Depe
     keep = _keep(form)
     sc = pick_scope(db, keep["scope"])
     key = str(form.get("row") or "")
-    groups = [g for g in build(db, sc, **keep) if g["key"] == key] if sc else []
+    groups = [g for g in build(db, sc, by=keep["by"]) if g["key"] == key] if sc else []
     n = 0
     for g in groups:
         for r in g["rows"]:
@@ -592,7 +599,7 @@ def send(request: Request, form=Depends(posted_form), db: Session = Depends(get_
         flash(request, "Курса доллара нет — базовую цену не посчитать. Страница «Курс $».", "error")
         return _back(**keep)
     confirm_large = form.get("confirm_large") == "1"
-    chosen = _chosen(form, build(db, sc, **keep))
+    chosen = _chosen(form, db, sc, keep)
     if not chosen:
         flash(request, "Ничего не отмечено.", "warn")
         return _back(**keep)

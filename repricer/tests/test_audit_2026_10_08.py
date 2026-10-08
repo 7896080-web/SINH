@@ -190,3 +190,28 @@ def test_row_ok_computes_once(client, db, monkeypatch):
     assert r.status_code == 200 and len(calls) == 1      # POST из кэша, страница после — заново
     db.expire_all()
     assert db.query(ArticleCoef).filter_by(article="100").one().coef == 3
+
+
+# --- п. 5: отметки переживают смену отбора --------------------------------------------
+
+def test_marked_rows_outside_current_filter_are_still_acted_on(client, db):
+    """Отметка, сделанная при другом отборе, уезжает скрытым полем
+    (static/selection.js) — и сервер обязан её найти, а не молча выкинуть, потому
+    что её нет в текущем отборе."""
+    _wb_two(db, n=3)
+    r = client.post("/sku-prices/coef", data={"scope": "wb", "art": "102", "action": "set", "kind": "coef",
+                                              "value": "3", "arts": ["100", "101"]})
+    assert "артикулов 2, изменено 2" in r.text
+    db.expire_all()
+    assert sorted(c.article for c in db.query(ArticleCoef)) == ["100", "101"]
+
+
+def test_pages_carry_selection_hooks(client, db):
+    a1, _ = _wb_two(db)
+    html = client.get("/sku-prices?scope=wb").text
+    assert 'data-sel-key="sku:wb:"' in html and 'class="sel-count' in html and "selConfirm(" in html
+    assert "/static/selection.js" in html
+    html = client.get(f"/prices?view=products&account_id={a1.id}").text
+    assert f'data-sel-key="prod:{a1.id}"' in html and "selConfirm(" in html
+    js = client.get("/static/selection.js").text
+    assert "offscreen" in js and "sessionStorage" in js
