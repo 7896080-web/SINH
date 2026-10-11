@@ -3,7 +3,7 @@
 Корректировка ставки для возраста 45–54 (оба пола) в кампаниях ЕПК Сети КО и ТО.
 Остальные корректировки, бюджеты и площадки не трогает.
 
-Сейчас стоит −50% (BidModifier 50) — доля расхода на 45–54 упала с 31% до 3%.
+С 10.10.2026 стоит −20% (до этого −50%: доля расхода на 45–54 упала с 31% до 3%).
 Цель — около 15%. Директ не задаёт долю расхода напрямую, только ставку:
 по двум точкам (без корректировки → 31%, −50% → 3%) выходит примерно −20%.
 
@@ -11,6 +11,8 @@
   python direct_age_45_54.py              — пробный прогон: покажет, что изменится
   python direct_age_45_54.py --apply      — применить −20%
   python direct_age_45_54.py -30 --apply  — применить другое значение (например −30%)
+                                            Знак обязателен: -30 или +10. Число без знака скрипт не примет,
+                                            чтобы «20» случайно не стало +20% вместо −20%.
   python direct_age_45_54.py --rollback   — вернуть прежнее значение
 
 Резервные копии: direct_backups\\age4554_*.json (откат этапа 1 они не затрагивают).
@@ -29,7 +31,9 @@ AGE = "AGE_45_54"
 NEW_PERCENT = -20            # −20% → BidModifier 80
 
 for a in sys.argv[1:]:
-    if re.fullmatch(r"[-+]?\d+", a):
+    if re.fullmatch(r"\d+", a):
+        raise SystemExit(f"Укажите знак: -{a} (снизить ставку на {a}%) или +{a} (повысить). Число без знака не принимаю.")
+    if re.fullmatch(r"[-+]\d+", a):
         NEW_PERCENT = int(a)
 NEW_MODIFIER = 100 + NEW_PERCENT
 if not 0 <= NEW_MODIFIER <= 1300:
@@ -43,13 +47,16 @@ HEADERS = {"Authorization": f"Bearer {TOKEN}", "Accept-Language": "ru"}
 if LOGIN:
     HEADERS["Client-Login"] = LOGIN
 API = "https://api.direct.yandex.com/json/v5/"
-BACKUP_DIR = Path("direct_backups")
+BACKUP_DIR = Path(__file__).resolve().with_name("direct_backups")   # рядом со скриптом, откуда бы ни запускали
 BACKUP_DIR.mkdir(exist_ok=True)
 
 
 def call(service, method, params):
-    r = requests.post(API + service, headers=HEADERS, json={"method": method, "params": params}, timeout=60)
-    data = json.loads(r.content.decode("utf-8"))
+    try:
+        r = requests.post(API + service, headers=HEADERS, json={"method": method, "params": params}, timeout=60)
+        data = json.loads(r.content.decode("utf-8"))
+    except (requests.RequestException, ValueError) as e:
+        raise RuntimeError(f"{service}.{method}: нет ответа от Директа ({e.__class__.__name__})")
     if "error" in data:
         e = data["error"]
         raise RuntimeError(f"{service}.{method}: {e.get('error_code')} {e.get('error_string')} — {e.get('error_detail')}")
@@ -163,7 +170,9 @@ if __name__ == "__main__":
         sys.exit()
     found, other = current()
     show(found, other)
-    if "--apply" in sys.argv:
+    if all(m and m["DemographicsAdjustment"]["BidModifier"] == NEW_MODIFIER for m in found.values()):
+        print(f"\nУже стоит {pct(NEW_MODIFIER)} — менять нечего. Резервная копия не создаётся.")
+    elif "--apply" in sys.argv:
         apply(found)
     else:
         print(f"\nЭто пробный прогон — ничего не изменено. Применить: python direct_age_45_54.py --apply")

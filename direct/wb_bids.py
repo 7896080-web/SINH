@@ -288,6 +288,10 @@ def find(camps, key):
             if str(cid) == key or key.lower() in str((a.get("settings") or {}).get("name", "")).lower()]
 
 
+# Сбои загрузки данных, без которых ставки считать нельзя. Если список не пуст, --apply ничего не меняет.
+DATA_PROBLEMS = []
+
+
 def nm_stats(token, ids):
     d2 = dt.date.today() - dt.timedelta(days=1)
     d1 = d2 - dt.timedelta(days=STATS_DAYS - 1)
@@ -300,6 +304,7 @@ def nm_stats(token, ids):
                         what="Статистика кампаний")
         except ApiError as e:
             log(f"  ! {e} — считаю по конверсии по умолчанию.")
+            DATA_PROBLEMS.append(f"статистика кампаний не загрузилась ({e})")
             continue
         for item in data or []:
             aid = item.get("advertId")
@@ -337,6 +342,7 @@ def cluster_stats(token, pairs):
         except ApiError as e:
             if days == 7:
                 log(f"  ! {e}")
+                DATA_PROBLEMS.append(f"статистика запросов не загрузилась ({e})")
             res.clear()
     return res
 
@@ -356,6 +362,7 @@ def get_stock(token, nm_ids):
                 res[pr.get("nmId")] = {"wb": (pr.get("stocks") or {}).get("wb"), "vendor": pr.get("vendorCode")}
     except ApiError as e:
         log(f"  ! {e} — остатки неизвестны, минимальные ставки «по остаткам» не ставлю.")
+        DATA_PROBLEMS.append(f"остатки не загрузились ({e})")
         return None
     return res
 
@@ -405,9 +412,11 @@ def get_minus(token, pairs):
         data = call("POST", ADV + "/adv/v0/normquery/get-minus", token,
                     body={"items": [{"advert_id": a, "nm_id": n} for a, n in part]}, what="Минус-фразы") or {}
         for it in data.get("items") or []:
-            res[(it.get("advert_id"), it.get("nm_id"))] = list(it.get("norm_queries") or [])
-    for p in pairs:
-        res.setdefault(tuple(p), [])
+            nq = it.get("norm_queries")
+            if isinstance(nq, list):
+                res[(it.get("advert_id"), it.get("nm_id"))] = list(nq)
+    # Пары, которых нет в ответе, в res не попадают: текущий список неизвестен. Записывать такой паре нельзя —
+    # WB заменяет список целиком, и пустой «текущий» стёр бы все её минус-фразы.
     return res
 
 
@@ -687,7 +696,10 @@ def plan_cabinet(cab, token, rules, state):
             cr_ref = smooth(tot_o, tot_c, PRIOR_CR, K_CLICKS)
             for nm in (nms if cur_minus is not None else []):
                 key = pk(cid, nm)
-                current = list(cur_minus.get((cid, nm), []))
+                if (cid, nm) not in cur_minus:
+                    log(f"    ! Товар {nm}: WB не вернул текущие минус-фразы — не трогаю, чтобы не стереть их.")
+                    continue
+                current = list(cur_minus[(cid, nm)])
                 cur_set = set(current)
                 add_auto, add_route, rem_route = [], [], []
                 # маршрутизация
@@ -798,10 +810,13 @@ def apply_cluster_bids(token, items, key):
                 log(f"  ✗ запрос «{f.get('normQuery')}» ({f.get('nmId')}): {f.get('reason')}")
         except ApiError as e:
             if e.status in (401, 403):   # метод только для Персонального токена — пробуем старый
-                call("POST", ADV + "/adv/v0/normquery/bids", token, what="Ставки запросов (руб.)", body={"bids": [
-                    {"advert_id": i["advert_id"], "nm_id": i["nm_id"], "norm_query": i["query"],
-                     "bid": int(round(i[key] / 100))} for i in part]})
-                ok += len(part)
+                try:
+                    call("POST", ADV + "/adv/v0/normquery/bids", token, what="Ставки запросов (руб.)", body={"bids": [
+                        {"advert_id": i["advert_id"], "nm_id": i["nm_id"], "norm_query": i["query"],
+                         "bid": int(round(i[key] / 100))} for i in part]})
+                    ok += len(part)
+                except ApiError as e2:
+                    log(f"  ✗ {e2}")
             else:
                 log(f"  ✗ {e}")
     for part in chunks(to_del, 100):
@@ -816,16 +831,17 @@ def apply_cluster_bids(token, items, key):
 
 
 def apply_minus(token, items, key):
-    ok = 0
+    """Возвращает список товаров, которым WB принял минус-фразы."""
+    done = []
     for i in items:
         pace(token, "nq", 0.25)
         try:
             call("POST", ADV + "/adv/v0/normquery/set-minus", token, what="Минус-фразы",
                  body={"advert_id": i["advert_id"], "nm_id": i["nm_id"], "norm_queries": i[key]})
-            ok += 1
+            done.append(i)
         except ApiError as e:
             log(f"  ✗ {e}")
-    return ok
+    return done
 
 
 def apply_limits(token, items, key, cfg_min=0):
@@ -887,9 +903,9 @@ def run_apply(cabs, plan, key, state, reverse=False):
                         d[i["query"]] = dt.date.today().isoformat()
             STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
         if sel["minus"]:
-            n = apply_minus(tok, sel["minus"], key)
-            res.append(f"минус-фразы {n}/{len(sel['minus'])} товаров")
-            update_state(state, sel["minus"], reverse=reverse)
+            done = apply_minus(tok, sel["minus"], key)
+            res.append(f"минус-фразы {len(done)}/{len(sel['minus'])} товаров")
+            update_state(state, done, reverse=reverse)
         if sel["limits"]:
             res.append(f"дневные лимиты {apply_limits(tok, sel['limits'], key)}/{len(sel['limits'])}")
         log(f"  {cab}: " + ("; ".join(res) if res else "нечего применять"))
@@ -906,8 +922,10 @@ def main():
         plan.setdefault("cluster_bids", [])
         plan.setdefault("minus", [])
         plan.setdefault("limits", [])
-        log(f"Откат по {files[-1].name}")
+        log(f"{dt.datetime.now():%d.%m.%Y %H:%M} — ОТКАТ по {files[-1].name}")
         run_apply(cabs, plan, "old", state, reverse=True)
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write("\n".join(out) + "\n\n")
         return
 
     apply = "--apply" in sys.argv
@@ -933,7 +951,12 @@ def main():
     n_minus = sum(len(m["add_auto"]) + len(m["add_route"]) for m in plan["minus"])
     log(f"\nИтого: ставки товаров {len(plan['bids'])} (↑{up} ↓{len(plan['bids']) - up}), "
         f"ставки запросов {len(plan['cluster_bids'])}, новых минус-фраз {n_minus}, дневных лимитов {len(plan['limits'])}.")
-    if apply and any(plan.values()):
+    if apply and DATA_PROBLEMS:
+        log("\n✗ НЕ ПРИМЕНЯЮ: часть данных не загрузилась, ставки были бы посчитаны вслепую:")
+        for msg in dict.fromkeys(DATA_PROBLEMS):
+            log(f"  — {msg}")
+        log("В кабинетах ничего не изменено. Запустите позже ещё раз.")
+    elif apply and any(plan.values()):
         BACKUP_DIR.mkdir(exist_ok=True)
         path = BACKUP_DIR / f"bids_{dt.datetime.now():%Y%m%d_%H%M%S}.json"
         path.write_text(json.dumps(plan, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -941,6 +964,8 @@ def main():
         run_apply(cabs, plan, "new", state)
         log("Откат: python wb_bids.py --rollback")
     elif any(plan.values()):
+        if DATA_PROBLEMS:
+            log("! Часть данных не загрузилась (см. «!» выше) — --apply сейчас откажется применять.")
         log("Это пробный прогон. Применить: python wb_bids.py --apply")
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write("\n".join(out) + "\n\n")

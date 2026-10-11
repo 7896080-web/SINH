@@ -2,8 +2,8 @@
 """
 Перенаправление рекламы на куртки AWER:
   A) КО: объявления групп курток ведут не на общий каталог, а на коллекции AWER
-     (/catalog/kurtki → /collections/kurtki-awer, /catalog/puhoviki → /collections/awer-kurtki-puhoviki);
-     UTM-метки в ссылках сохраняются.
+     (куртки → /collections/kurtki-awer-demisezonnye, пуховики → /collections/awer-kurtki-puhoviki;
+     точные правила — HREF_MAP ниже); UTM-метки в ссылках сохраняются.
   B) ТО, «Мужские куртки - Новая ЦА»: показывать из фида только AWER и Black Vinyl (без Dauntless).
      Делается, если фильтр товаров группы доступен через API: добавляется новый фильтр с условием
      по бренду, старый — приостанавливается (не удаляется).
@@ -12,6 +12,8 @@
   python direct_awer_jackets.py            — пробный прогон (ничего не меняет)
   python direct_awer_jackets.py --apply    — применить (с резервной копией)
   python direct_awer_jackets.py --rollback — вернуть ссылки и фильтры как было
+Резервная копия пишется ДО изменений и дополняется после каждого шага. Если менять нечего,
+--apply ничего не делает и копию не создаёт (иначе откат стал бы холостым).
 """
 import json
 import sys
@@ -35,13 +37,16 @@ H = {"Authorization": f"Bearer {cfg['yandex_oauth_token']}", "Accept-Language": 
 if cfg.get("direct_client_login"):
     H["Client-Login"] = cfg["direct_client_login"]
 API = "https://api.direct.yandex.com/json/v5/"
-BACKUP = Path("direct_backups")
+BACKUP = Path(__file__).resolve().with_name("direct_backups")   # рядом со скриптом, откуда бы ни запускали
 BACKUP.mkdir(exist_ok=True)
 
 
 def call(service, method, params):
-    r = requests.post(API + service, headers=H, json={"method": method, "params": params}, timeout=60)
-    data = json.loads(r.content.decode("utf-8"))
+    try:
+        r = requests.post(API + service, headers=H, json={"method": method, "params": params}, timeout=60)
+        data = json.loads(r.content.decode("utf-8"))
+    except (requests.RequestException, ValueError) as e:
+        raise RuntimeError(f"{service}.{method}: нет ответа от Директа ({e.__class__.__name__})")
     if "error" in data:
         e = data["error"]
         raise RuntimeError(f"{service}.{method}: {e.get('error_code')} {e.get('error_string')} — {e.get('error_detail')}")
@@ -124,24 +129,38 @@ def apply(href_changes, target_changes):
     stamp = time.strftime("%Y%m%d_%H%M%S")
     backup = {"href_changes": href_changes, "suspended_targets": [], "added_targets": []}
     path = BACKUP / f"awer_jackets_{stamp}.json"
+
+    def save():
+        path.write_text(json.dumps(backup, ensure_ascii=False, indent=1), encoding="utf-8")
+
+    save()   # до любых изменений: старые ссылки уже в копии
+    print(f"\nРезервная копия: {path}")
     if href_changes:
         print("\nМеняю ссылки объявлений КО")
-        results("ads.update", call("ads", "update", {"Ads": [{"Id": c["Id"], "TextAd": {"Href": c["new"]}}
-                                                            for c in href_changes]}).get("UpdateResults", []))
+        try:
+            results("ads.update", call("ads", "update", {"Ads": [{"Id": c["Id"], "TextAd": {"Href": c["new"]}}
+                                                                for c in href_changes]}).get("UpdateResults", []))
+        except RuntimeError as e:
+            print(f"  ✗ {e}")
     for t in target_changes:
         conds = (t.get("Conditions") or []) + [{"Operand": "vendor", "Operator": "EQUALS_ANY", "Arguments": KEEP_BRANDS}]
         item = {"AdGroupId": t["AdGroupId"], "Name": (t.get("Name") or "Фильтр") + " — AWER и Black Vinyl",
                 "Conditions": conds, "AvailableItemsOnly": t.get("AvailableItemsOnly", "YES")}
         print(f"\nДобавляю фильтр по бренду для группы {t['AdGroupId']}")
-        res = call("dynamicfeedadtargets", "add", {"DynamicFeedAdTargets": [item]}).get("AddResults", [])
-        results("dynamicfeedadtargets.add", res)
-        new_ids = [r["Id"] for r in res if r.get("Id")]
-        if new_ids:
-            backup["added_targets"] += new_ids
-            results("dynamicfeedadtargets.suspend (старый)",
-                    call("dynamicfeedadtargets", "suspend", {"SelectionCriteria": {"Ids": [t["Id"]]}}).get("SuspendResults", []))
-            backup["suspended_targets"].append(t["Id"])
-    path.write_text(json.dumps(backup, ensure_ascii=False, indent=1), encoding="utf-8")
+        try:
+            res = call("dynamicfeedadtargets", "add", {"DynamicFeedAdTargets": [item]}).get("AddResults", [])
+            results("dynamicfeedadtargets.add", res)
+            new_ids = [r["Id"] for r in res if r.get("Id")]
+            if new_ids:
+                backup["added_targets"] += new_ids
+                save()
+                results("dynamicfeedadtargets.suspend (старый)",
+                        call("dynamicfeedadtargets", "suspend", {"SelectionCriteria": {"Ids": [t["Id"]]}}).get("SuspendResults", []))
+                backup["suspended_targets"].append(t["Id"])
+                save()
+        except RuntimeError as e:
+            print(f"  ✗ {e}")
+    save()
     print(f"\nГотово. Резервная копия: {path}. Откат: python direct_awer_jackets.py --rollback")
 
 
@@ -167,7 +186,9 @@ if __name__ == "__main__":
         rollback()
         sys.exit()
     hc, tc = plan()
-    if "--apply" in sys.argv:
+    if not hc and not tc:
+        print("\nМенять нечего. Резервная копия не создаётся.")
+    elif "--apply" in sys.argv:
         apply(hc, tc)
     else:
         print("\nЭто пробный прогон — ничего не изменено. Чтобы применить: python direct_awer_jackets.py --apply")
