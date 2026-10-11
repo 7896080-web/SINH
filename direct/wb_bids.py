@@ -451,12 +451,58 @@ def get_min_bids(token, aid, nm_ids, pay, placement):
 _rec_cache = {}
 
 
+REC_SAMPLE = HERE / "wb_bids_rec_sample.json"   # образец ответа WB с рекомендациями — для сверки формата
+
+
 def get_rec(token, aid, nm):
     if (aid, nm) not in _rec_cache:
         pace(token, "rec", 12.5)
-        _rec_cache[(aid, nm)] = call("GET", ADV + "/api/advert/v0/bids/recommendations", token,
-                                     params={"nmId": nm, "advertId": aid}, what=f"Рекомендованные ставки {nm}") or {}
+        data = call("GET", ADV + "/api/advert/v0/bids/recommendations", token,
+                    params={"nmId": nm, "advertId": aid}, what=f"Рекомендованные ставки {nm}") or {}
+        if not _rec_cache:   # первый ответ за запуск сохраняем как образец (токенов в нём нет)
+            try:
+                REC_SAMPLE.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+            except OSError:
+                pass
+        _rec_cache[(aid, nm)] = data if isinstance(data, dict) else {}
     return _rec_cache[(aid, nm)]
+
+
+def _kop(v):
+    """Ставка в копейках из {"bidKopecks": N} или просто числа."""
+    if isinstance(v, dict):
+        v = v.get("bidKopecks")
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def rec_cpc(data, key):
+    """Рекомендованная ставка за клик для уровня key (range3To10 …). WB встречался в двух видах:
+    levels = [{range…: …}] или levels = {range…: …} / {"search": {range…: …}}. Непонятно — None."""
+    lv = data.get("levels")
+    if isinstance(lv, list):
+        lv = lv[0] if lv and isinstance(lv[0], dict) else {}
+    if not isinstance(lv, dict):
+        return None
+    if key in lv:
+        return _kop(lv[key])
+    if isinstance(lv.get("search"), dict):
+        return _kop(lv["search"].get(key))
+    return None
+
+
+def rec_cpm(data, key):
+    base = data.get("base")
+    return _kop(base.get(key)) if isinstance(base, dict) else None
+
+
+def rec_queries(data):
+    """{запрос: рекомендации по нему}; normQueries — список или словарь."""
+    nq = data.get("normQueries")
+    if isinstance(nq, dict):
+        return {k: v for k, v in nq.items() if isinstance(v, dict)}
+    if isinstance(nq, list):
+        return {q.get("normQuery"): q for q in nq if isinstance(q, dict)}
+    return {}
 
 
 def get_config(token):
@@ -673,10 +719,10 @@ def plan_cabinet(cab, token, rules, state):
                 else:
                     try:
                         data = get_rec(token, cid, nm)
-                        if pay == "cpc":
-                            rec = ((data.get("levels") or [{}])[0] or {}).get(CPC_LEVEL[target], {}).get("bidKopecks")
-                        else:
-                            rec = ((data.get("base") or {}).get(CPM_LEVEL[target]) or {}).get("bidKopecks")
+                        rec = rec_cpc(data, CPC_LEVEL[target]) if pay == "cpc" else rec_cpm(data, CPM_LEVEL[target])
+                        if rec is None and data:
+                            log(f"      ! {nm}: не понял ответ WB с рекомендацией (образец — {REC_SAMPLE.name}), ставку не трогаю.")
+                            DATA_PROBLEMS.append(f"непонятный формат рекомендаций WB — см. {REC_SAMPLE.name}")
                     except ApiError as e:
                         log(f"      ! {e}")
                     nb, reason = new_bid(current, rec, cap, mn, step, r["max_raise_pct"],
@@ -701,7 +747,7 @@ def plan_cabinet(cab, token, rules, state):
                     if no_stock(nm):
                         continue
                     try:
-                        recs = {q.get("normQuery"): q for q in (get_rec(token, cid, nm).get("normQueries") or [])}
+                        recs = rec_queries(get_rec(token, cid, nm))
                     except ApiError as e:
                         log(f"    ! {e}")
                         recs = {}
@@ -741,12 +787,13 @@ def plan_cabinet(cab, token, rules, state):
                         ctr = smooth(s_own.get("clicks", 0), s_own.get("views", 0), PRIOR_CTR, K_VIEWS)
                         cap = int(min(mcpo(cab, r, nm) * cr * ctr * 1000 * 100, cap_abs))
                         rq = recs.get(q) or {}
-                        lvl = rq.get(REACH[target]) or {}
-                        rec = lvl.get("bidKopecks")
-                        mn = lvl.get("bidKopecksMin") or mins.get(nm) or 0
+                        lvl = rq.get(REACH[target])
+                        lvl = lvl if isinstance(lvl, dict) else {}
+                        rec = _kop(lvl)
+                        mn = _kop(lvl.get("bidKopecksMin")) or mins.get(nm) or 0
                         cur = cur_cb.get((cid, nm), {}).get(q)
                         if rec is None:
-                            rec = ((get_rec(token, cid, nm).get("base") or {}).get(CPM_LEVEL[target]) or {}).get("bidKopecks")
+                            rec = rec_cpm(get_rec(token, cid, nm), CPM_LEVEL[target])
                         nb, reason = new_bid(cur, rec, cap, mn, step, r["max_raise_pct"],
                                              day_base(state, "clusters", cid, nm, q))
                         planned_cluster[(cid, nm)].add(q)
