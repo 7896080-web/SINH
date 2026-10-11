@@ -76,6 +76,8 @@ DEFAULTS = {
     "max_bid_cpc": 60,          # потолок ставки за клик, ₽
     "max_bid_cpm": 800,         # потолок ставки за 1000 показов, ₽
     "max_raise_pct": 30,        # максимум роста ставки в сутки, % (от ставки при первом запуске за день)
+    "max_drop_pct": 30,         # максимум снижения ставки в сутки, % (None — без ограничения). Нет в наличии или
+                                # нет ходовых размеров — минимальная ставка сразу, это ограничение не действует
     "no_stock": "min",          # нет в наличии (WB + FBS, см. COUNT_FBS_STOCK): "min" — минимальная ставка, "skip" — не трогать
     "base_bid": "auto",         # "min" — ставка товара минимальная (для кампаний «только лучшие запросы»)
     "cluster_bids": None,       # None / "all" / "top"
@@ -644,9 +646,9 @@ def smooth(hit, total, prior, k):
     return (hit + prior * k) / (total + k)
 
 
-def new_bid(current, rec, cap, mn, step, max_raise, base=None):
+def new_bid(current, rec, cap, mn, step, max_raise, base=None, max_drop=None):
     """Возвращает (новая ставка, причина). base — ставка на начало суток (первая, увиденная сегодня):
-    рост за сутки не больше max_raise % от неё, сколько бы запусков ни было. Снижение — без ограничений."""
+    рост за сутки не больше max_raise %, снижение — не больше max_drop % от неё, сколько бы запусков ни было."""
     if not rec:
         return current, "WB не дал рекомендацию"
     new = min(rec, cap)
@@ -657,6 +659,11 @@ def new_bid(current, rec, cap, mn, step, max_raise, base=None):
         if new > top:
             new = top
             reason += f", рост ограничен +{max_raise}% в сутки"
+        if max_drop is not None and current:
+            floor_ = min(current, int(math.ceil(base * (1 - max_drop / 100) / step) * step))
+            if new < floor_:
+                new = floor_
+                reason += f", снижение ограничено −{max_drop}% в сутки"
     new = int(math.floor(new / step) * step)
     if mn and new < mn:
         new = mn
@@ -832,7 +839,7 @@ def plan_cabinet(cab, token, rules, state):
                     except ApiError as e:
                         log(f"      ! {e}")
                     nb, reason = new_bid(current, rec, cap, mn, step, r["max_raise_pct"],
-                                         day_base(state, "bids", cid, nm, placement))
+                                         day_base(state, "bids", cid, nm, placement), r.get("max_drop_pct"))
                     if size_short(nm) == "hold" and current and nb and nb > current:
                         nb, reason = current, f"мало ходовых размеров (закрыто {cover[nm][0]:.0%} спроса) — не повышаю"
                 ch = changed(nb, current, step)
@@ -903,7 +910,7 @@ def plan_cabinet(cab, token, rules, state):
                         if rec is None:
                             rec = rec_cpm(get_rec(token, cid, nm), CPM_LEVEL[target])
                         nb, reason = new_bid(cur, rec, cap, mn, step, r["max_raise_pct"],
-                                             day_base(state, "clusters", cid, nm, q))
+                                             day_base(state, "clusters", cid, nm, q), r.get("max_drop_pct"))
                         if size_short(nm) and cur and nb and nb > cur:
                             nb, reason = cur, "мало ходовых размеров — не повышаю"
                         planned_cluster[(cid, nm)].add(q)
@@ -946,12 +953,17 @@ def plan_cabinet(cab, token, rules, state):
             tot_o = sum(s["orders"] for p, d in cl.items() if p[0] == cid for s in d.values())
             cr_ref = smooth(tot_o, tot_c, PRIOR_CR, K_CLICKS)
             held_notes = []
-            for nm in (nms if cur_minus is not None else []):
+            # Формат ответа WB «подтверждён» для кампании, если WB вернул список хотя бы по одному её товару:
+            # тогда товар без списка — это просто товар без минус-фраз. Если по кампании не вернулось ничего —
+            # либо фраз нет совсем, либо тип кампании их не поддерживает; писать вслепую нельзя (запись заменяет список).
+            camp_known = cur_minus is not None and any((cid, nm) in cur_minus for nm in nms)
+            if cur_minus is not None and not camp_known:
+                log("    Минус-фразы: WB не вернул по этой кампании ни одного списка — у неё нет минус-фраз или её тип их "
+                    "не поддерживает. Автоминус здесь не работает; чтобы включить его, добавьте в кабинете WB одну "
+                    "минус-фразу любому товару этой кампании (так скрипт убедится, что WB отдаёт списки).")
+            for nm in (nms if camp_known else []):
                 key = pk(cid, nm)
-                if (cid, nm) not in cur_minus:
-                    log(f"    ! Товар {nm}: WB не вернул текущие минус-фразы — не трогаю, чтобы не стереть их.")
-                    continue
-                current = list(cur_minus[(cid, nm)])
+                current = list(cur_minus.get((cid, nm), []))
                 cur_set = set(current)
                 add_auto, add_route, rem_route = [], [], []
                 # маршрутизация
