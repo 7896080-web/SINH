@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(./direct/wb_tokens.txt)",
+      "Read(./direct/yandex_delivery_token.txt)",
+      "Read(./direct/*token*.txt)",
+      "Read(./direct/config.json)",
+      "Read(./.env)"
+    ]
+  }
+}
