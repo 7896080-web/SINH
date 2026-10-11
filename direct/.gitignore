@@ -1,0 +1,8 @@
+# Токены и настройки с ключами — никогда не коммитить.
+# Скрипты читают их сами с компьютера пользователя.
+wb_tokens.txt
+yandex_delivery_token.txt
+*token*.txt
+*tokens*.txt
+config.json
+.env
