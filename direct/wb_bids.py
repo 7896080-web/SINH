@@ -97,6 +97,13 @@ RETURN_PAUSE_DAYS = 30              # …и после возврата стол
 STATS_DAYS = 14                     # статистика товаров для конверсии
 UNIT_MAX_AGE = 14                   # "auto": предупредить, если юнит-экономика старше стольких дней
 COUNT_FBS_STOCK = True             # остаток = склады WB + свой склад (FBS). False — только склады WB (FBO)
+# Размеры: если в наличии нет размеров, на которые приходится основной спрос, реклама приводит покупателей впустую.
+SIZE_RULE = True                    # учитывать размеры (остатки и заказы по размерам, API «Аналитика»)
+SIZE_DAYS = 30                      # за сколько дней смотреть заказы по размерам
+SIZE_MIN_ORDERS = 5                 # меньше заказов за период — по размерам не судим
+SIZE_COVER_NO_RAISE = 0.6           # в наличии размеры с долей спроса < 60% — ставку не повышать, автоминус не ставить
+SIZE_COVER_MIN_BID = 0.3            # < 30% — как «нет в наличии»: минимальная ставка
+SIZE_CACHE_HOURS = 6                # данные по размерам обновляются у WB раз в 2 часа; чаще 6 ч не запрашиваем
 MINUS_AFTER_RESTOCK_DAYS = 14       # автоминус по товару — только после стольких дней подряд в наличии (WB + FBS)
 CLUSTER_DAYS = 30                   # статистика запросов
 PRIOR_CR, K_CLICKS = 0.03, 100      # конверсия по умолчанию и её вес
@@ -451,6 +458,62 @@ def stock_label(s):
     return f"{wb}/{int(s['mp'])}" if COUNT_FBS_STOCK and s.get("mp") is not None else wb
 
 
+SIZE_CACHE = HERE / "wb_sizes_cache.json"
+
+
+def get_sizes(token, nm_ids):
+    """{nm: [{"name", "orders", "stock"}]} — заказы за SIZE_DAYS и текущий остаток по каждому размеру
+    (склады WB + свой склад, если COUNT_FBS_STOCK). Кэш на SIZE_CACHE_HOURS. Сбой — пустой результат и пометка."""
+    try:
+        cache = json.loads(SIZE_CACHE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        cache = {}
+    now = dt.datetime.now()
+    fresh = lambda e: e and now - dt.datetime.fromisoformat(e["at"]) < dt.timedelta(hours=SIZE_CACHE_HOURS)
+    res, failed = {}, 0
+    y = dt.date.today() - dt.timedelta(days=1)
+    for nm in nm_ids:
+        e = cache.get(str(nm))
+        if not fresh(e):
+            pace(token, "sizes", 20.5)
+            body = {"nmID": nm, "currentPeriod": {"start": (y - dt.timedelta(days=SIZE_DAYS - 1)).isoformat(),
+                                                  "end": y.isoformat()},
+                    "stockType": "" if COUNT_FBS_STOCK else "wb", "orderBy": {"field": "ordersCount", "mode": "desc"},
+                    "includeOffice": False}
+            try:
+                data = call("POST", ANA + "/api/v2/stocks-report/products/sizes", token, body=body,
+                            what=f"Размеры {nm}") or {}
+            except ApiError as ex:
+                failed += 1
+                if failed == 1:
+                    log(f"  ! {ex} — размеры не учтены.")
+                continue
+            sizes = []
+            for z in ((data.get("data") or {}).get("sizes") or []):
+                m = z.get("metrics") or {}
+                sizes.append({"name": str(z.get("name") or z.get("chrtID")), "orders": num(m.get("ordersCount")),
+                              "stock": num(m.get("stockCount"))})
+            e = cache[str(nm)] = {"at": now.isoformat(timespec="seconds"), "sizes": sizes}
+        res[nm] = e["sizes"]
+    if failed:
+        log(f"  ! Размеры не получены для {failed} тов. — для них правило размеров не применяется.")
+    try:
+        SIZE_CACHE.write_text(json.dumps(cache, ensure_ascii=False, indent=1), encoding="utf-8")
+    except OSError:
+        pass
+    return res
+
+
+def size_cover(sizes):
+    """(доля спроса, приходящаяся на размеры в наличии, [нет в наличии: ходовые размеры]) или (None, []) — мало данных."""
+    total = sum(z["orders"] for z in sizes or [])
+    if total < SIZE_MIN_ORDERS:
+        return None, []
+    have = sum(z["orders"] for z in sizes if z["stock"] > 0)
+    missing = [z["name"] for z in sorted(sizes, key=lambda z: -z["orders"]) if z["stock"] <= 0 and z["orders"] > 0]
+    return have / total, missing
+
+
 def get_min_bids(token, aid, nm_ids, pay, placement):
     ptype = {"search": "search", "recommendations": "recommendation", "combined": "combined"}[placement]
     res = {}
@@ -660,6 +723,25 @@ def plan_cabinet(cab, token, rules, state):
             elif q <= 0:
                 since.pop(str(nm), None)
 
+    # размеры: доля спроса, которую закрывают размеры в наличии
+    cover = {}
+    if SIZE_RULE and stock is not None:
+        in_stock = [nm for nm in sorted({nm for cid in involved for nm in nms_of[cid]}) if not no_stock(nm)]
+        for nm, sizes in get_sizes(token, in_stock).items():
+            c, miss = size_cover(sizes)
+            if c is not None:
+                cover[nm] = (c, miss)
+        short = {nm: v for nm, v in cover.items() if v[0] < SIZE_COVER_NO_RAISE}
+        if short:
+            log(f"  Размеры: у {len(short)} тов. в наличии меньше {SIZE_COVER_NO_RAISE:.0%} спроса по размерам "
+                f"(ставку не повышаю, автоминус не ставлю; меньше {SIZE_COVER_MIN_BID:.0%} — минимальная ставка):")
+            for nm, (c, miss) in sorted(short.items(), key=lambda x: x[1][0]):
+                log(f"      {nm:>11} закрыто {c:.0%} спроса, нет: {', '.join(miss[:6])}")
+
+    def size_short(nm):
+        c = cover.get(nm)
+        return None if c is None else ("min" if c[0] < SIZE_COVER_MIN_BID else "hold" if c[0] < SIZE_COVER_NO_RAISE else None)
+
     def stock_days(nm):
         d = since.get(str(nm))
         return (today - dt.date.fromisoformat(d)).days if d else None
@@ -736,6 +818,8 @@ def plan_cabinet(cab, token, rules, state):
                 if no_stock(nm):
                     nb, reason = (current, "нет на WB — не трогаю") if r["no_stock"] == "skip" else \
                         (mn or current, "нет в наличии → минимальная" if COUNT_FBS_STOCK else "нет на складах WB → минимальная")
+                elif size_short(nm) == "min" and r["no_stock"] != "skip":
+                    nb, reason = (mn or current), f"нет ходовых размеров ({', '.join(cover[nm][1][:3])}) → минимальная"
                 elif r["base_bid"] == "min":
                     nb, reason = (mn or current), "минимальная (кампания только для лучших запросов)"
                 else:
@@ -749,6 +833,8 @@ def plan_cabinet(cab, token, rules, state):
                         log(f"      ! {e}")
                     nb, reason = new_bid(current, rec, cap, mn, step, r["max_raise_pct"],
                                          day_base(state, "bids", cid, nm, placement))
+                    if size_short(nm) == "hold" and current and nb and nb > current:
+                        nb, reason = current, f"мало ходовых размеров (закрыто {cover[nm][0]:.0%} спроса) — не повышаю"
                 ch = changed(nb, current, step)
                 log(f"      {nm:>11} {cut(s_info.get('vendor'), 16):16}{stock_label(s_info):>9}"
                     f"{int(v['clicks']):>6}{int(v['orders']):>5}{cr * 100:>5.1f}%{rub(current):>9}{rub(rec):>9}"
@@ -818,6 +904,8 @@ def plan_cabinet(cab, token, rules, state):
                             rec = rec_cpm(get_rec(token, cid, nm), CPM_LEVEL[target])
                         nb, reason = new_bid(cur, rec, cap, mn, step, r["max_raise_pct"],
                                              day_base(state, "clusters", cid, nm, q))
+                        if size_short(nm) and cur and nb and nb > cur:
+                            nb, reason = cur, "мало ходовых размеров — не повышаю"
                         planned_cluster[(cid, nm)].add(q)
                         if nb is None:
                             continue
@@ -876,7 +964,7 @@ def plan_cabinet(cab, token, rules, state):
                 # плохие запросы; пока товар меньше MINUS_AFTER_RESTOCK_DAYS дней в наличии — только MINUS_WORDS
                 if r["auto_minus"]:
                     sd = stock_days(nm)
-                    gated = sd is None or sd < MINUS_AFTER_RESTOCK_DAYS
+                    gated = sd is None or sd < MINUS_AFTER_RESTOCK_DAYS or size_short(nm) is not None
                     cs = cl.get((cid, nm), {})
                     bad = sorted(((q, s) for q, s in cs.items()
                                   if s["orders"] == 0 and (s["clicks"] >= MINUS_MIN_CLICKS or negative(q))
@@ -888,7 +976,9 @@ def plan_cabinet(cab, token, rules, state):
                     if held:
                         held_notes.append(
                             f"      … {nm:>11} {len(held)} запр. без заказов пока не в минус: " +
-                            (f"товар в наличии {sd} дн. из {MINUS_AFTER_RESTOCK_DAYS}, автоминус включится через "
+                            ("мало ходовых размеров в наличии — запросы не судим, пока размеры не вернутся"
+                             if size_short(nm) and sd is not None and sd >= MINUS_AFTER_RESTOCK_DAYS else
+                             f"товар в наличии {sd} дн. из {MINUS_AFTER_RESTOCK_DAYS}, автоминус включится через "
                              f"{MINUS_AFTER_RESTOCK_DAYS - sd} дн." if sd is not None else
                              f"товара нет в наличии (или остаток неизвестен) — автоминус включится через "
                              f"{MINUS_AFTER_RESTOCK_DAYS} дн. после появления"))
