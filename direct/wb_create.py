@@ -18,10 +18,11 @@
   --cabinet "Яворская"            — кабинет из wb_tokens.txt (если их несколько).
   --with-no-stock                 — включить товары, которых нет на складах WB (по умолчанию пропускаются).
 
-Запуск, пауза и пополнение бюджета готовой кампании:
-    python wb_create.py --start 123456789
-    python wb_create.py --pause 123456789
-    python wb_create.py --deposit 123456789 --budget 2000 --source balance
+Запуск, пауза и пополнение бюджета готовой кампании — тоже сначала пробный прогон, с --apply выполняется:
+    python wb_create.py --start 123456789 --apply
+    python wb_create.py --pause 123456789 --apply
+    python wb_create.py --deposit 123456789 --budget 2000 --source balance --apply
+  Пополнение бюджета вернуть нельзя: деньги уходят из выбранного источника в бюджет кампании.
 """
 import argparse
 import datetime as dt
@@ -160,6 +161,10 @@ def main():
     if a.deposit:
         if not a.budget:
             ap.error("для --deposit укажите --budget")
+        if not a.apply:
+            print(f"Пробный прогон: {cab}: бюджет кампании {a.deposit} будет пополнен на {a.budget} ₽ "
+                  f"из «{ {'balance': 'Баланс (взаиморасчёт)', 'account': 'Счёт', 'bonus': 'Бонусы'}[a.source]}». Вернуть эти деньги нельзя.\nВыполнить: добавьте --apply")
+            return
         try:
             res = call("POST", ADV + "/adv/v1/budget/deposit", token, params={"id": a.deposit},
                        body={"sum": int(a.budget), "type": SOURCES[a.source], "return": True}, what="Пополнение бюджета")
@@ -172,6 +177,10 @@ def main():
     if a.start or a.pause:
         cid = a.start or a.pause
         path = "/adv/v0/start" if a.start else "/adv/v0/pause"
+        if not a.apply:
+            print(f"Пробный прогон: {cab}: кампания {cid} будет {'запущена — начнёт тратить бюджет' if a.start else 'поставлена на паузу'}."
+                  "\nВыполнить: добавьте --apply")
+            return
         try:
             call("GET", ADV + path, token, params={"id": cid}, what="Запуск" if a.start else "Пауза")
             print(f"{cab}: кампания {cid} {'запущена' if a.start else 'поставлена на паузу'}.")

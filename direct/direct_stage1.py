@@ -9,6 +9,9 @@
   python direct_stage1.py            — пробный прогон: только показывает, что будет изменено
   python direct_stage1.py --apply    — применить (перед этим сохраняется резервная копия)
   python direct_stage1.py --rollback — вернуть как было по последней резервной копии
+Если менять нечего, --apply ничего не делает и новую резервную копию не создаёт —
+иначе она стала бы «последней» и откат к состоянию до этапа 1 был бы потерян.
+Откат не трогает стратегию, если её тип с тех пор сменился (иначе сбросится обучение).
 
 Токен берётся из настроек AWER CRM (Маркетинг → Подключение к Яндексу).
 """
@@ -40,7 +43,7 @@ TABLET_MODIFIER = 0          # 0 = −100%
 DEMOGRAPHICS = {
     (None, "AGE_0_17"): 0,              # −100%, как было
     (None, "AGE_18_24"): 0,             # −100%, как было
-    (None, "AGE_45_54"): 50,            # −50%: покупают втрое реже 55+
+    (None, "AGE_45_54"): 80,            # −20% (06.10 было −50%, 10.10 смягчено direct_age_45_54.py)
 }
 # Эти корректировки не трогаем: где есть — остаются как есть, где нет — не добавляются.
 KEEP_AS_IS = {("GENDER_FEMALE", "AGE_55")}
@@ -65,14 +68,17 @@ HEADERS = {"Authorization": f"Bearer {TOKEN}", "Accept-Language": "ru"}
 if LOGIN:
     HEADERS["Client-Login"] = LOGIN
 API = "https://api.direct.yandex.com/json/v5/"
-BACKUP_DIR = Path("direct_backups")
+BACKUP_DIR = Path(__file__).resolve().with_name("direct_backups")   # рядом со скриптом, откуда бы ни запускали
 BACKUP_DIR.mkdir(exist_ok=True)
 IDS = list(CAMPAIGNS)
 
 
 def call(service, method, params):
-    r = requests.post(API + service, headers=HEADERS, json={"method": method, "params": params}, timeout=60)
-    data = json.loads(r.content.decode("utf-8"))
+    try:
+        r = requests.post(API + service, headers=HEADERS, json={"method": method, "params": params}, timeout=60)
+        data = json.loads(r.content.decode("utf-8"))
+    except (requests.RequestException, ValueError) as e:
+        raise RuntimeError(f"{service}.{method}: нет ответа от Директа ({e.__class__.__name__})")
     if "error" in data:
         e = data["error"]
         raise RuntimeError(f"{service}.{method}: {e.get('error_code')} {e.get('error_string')} — {e.get('error_detail')}")
@@ -178,6 +184,26 @@ def show_plan(camps, mods):
             print("   + добавить регионы: " + ", ".join(f"{r}={v - 100:+d}%" for r, v in REGION_MODIFIERS.items()))
 
 
+def has_changes(camps, mods):
+    for cid in CAMPAIGNS:
+        c = camps.get(cid)
+        if not c:
+            continue
+        net = network_strategy(c).get("Network") or {}
+        params = next((v for k, v in net.items() if isinstance(v, dict)), None)
+        if params is not None and params.get("WeeklySpendLimit") != int(WEEKLY_BUDGET[cid] * 1_000_000):
+            return True
+        excluded = ((c.get("ExcludedSites") or {}).get("Items")) or []
+        if any(s not in excluded for s in EXCLUDE):
+            return True
+        if any(demo_plan(cid, mods)):
+            return True
+        have = {m.get("Type") for m in mods if m.get("CampaignId") == cid}
+        if "TABLET_ADJUSTMENT" not in have or "REGIONAL_ADJUSTMENT" not in have:
+            return True
+    return False
+
+
 def apply(camps, mods):
     stamp = time.strftime("%Y%m%d_%H%M%S")
     backup = {"campaigns": camps, "bidmodifiers": mods, "added_bidmodifier_ids": []}
@@ -188,7 +214,10 @@ def apply(camps, mods):
     # 1. Бюджет + запрещённые площадки
     items = []
     for cid in CAMPAIGNS:
-        c = camps[cid]
+        c = camps.get(cid)
+        if not c:
+            print(f"  ! {CAMPAIGNS[cid]}: кампания не найдена — пропускаю")
+            continue
         strat = json.loads(json.dumps(network_strategy(c)))   # копия
         net = strat.get("Network") or {}
         key = next((k for k, v in net.items() if isinstance(v, dict)), None)
@@ -202,11 +231,16 @@ def apply(camps, mods):
             print(f"  ! {CAMPAIGNS[cid]}: не нашёл параметры стратегии, бюджет не меняю")
         items.append(item)
     print("\nКампании: бюджет и запрещённые площадки")
-    report_results("campaigns.update", call("campaigns", "update", {"Campaigns": items}).get("UpdateResults", []))
+    try:
+        report_results("campaigns.update", call("campaigns", "update", {"Campaigns": items}).get("UpdateResults", []))
+    except RuntimeError as e:
+        print(f"  ✗ {e}")
 
     # 2. Корректировки
     added, changed, deleted = [], [], []
     for cid in CAMPAIGNS:
+        if cid not in camps:
+            continue
         name = CAMPAIGNS[cid]
         d, st, ad = demo_plan(cid, mods)
         if d:
@@ -270,14 +304,20 @@ def rollback():
                        call("bidmodifiers", "add", {"BidModifiers": [{"CampaignId": m["CampaignId"],
                                                                        "DemographicsAdjustments": [item]}]})
                        .get("AddResults", []))
+    now_camps, _ = get_state()
     items = []
     for cid, c in b["campaigns"].items():
         old_sites = ((c.get("ExcludedSites") or {}).get("Items")) or []
         # пустой список в API задаётся как null
         item = {"Id": int(cid), "ExcludedSites": {"Items": old_sites} if old_sites else None}
         strat = network_strategy(c)
-        if strat:
+        now = network_strategy(now_camps.get(int(cid)) or {})
+        kinds = lambda s: ((s.get("Search") or {}).get("BiddingStrategyType"), (s.get("Network") or {}).get("BiddingStrategyType"))
+        if strat and kinds(strat) == kinds(now):
             item["TextCampaign"] = {"BiddingStrategy": strat}
+        elif strat:
+            print(f"  ! {cid}: стратегия с тех пор сменилась ({kinds(strat)} → {kinds(now)}) — её не трогаю, "
+                  "иначе сбросится обучение. Бюджет верните вручную, если нужно.")
         items.append(item)
     report_results("campaigns.update", call("campaigns", "update", {"Campaigns": items}).get("UpdateResults", []))
 
@@ -288,7 +328,9 @@ if __name__ == "__main__":
         sys.exit()
     camps, mods = get_state()
     show_plan(camps, mods)
-    if "--apply" in sys.argv:
+    if not has_changes(camps, mods):
+        print("\nВсё уже как в настройках этапа 1 — менять нечего. Резервная копия не создаётся.")
+    elif "--apply" in sys.argv:
         apply(camps, mods)
     else:
         print("\nЭто пробный прогон — ничего не изменено. Чтобы применить: python direct_stage1.py --apply")

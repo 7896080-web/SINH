@@ -14,22 +14,25 @@
   5. Можно ли уже доверять разнице в покупках.
 
 Суммы без НДС (так же, как бюджеты в Директе). Покупки и выручка — из Метрики
-(оформленные заказы с рекламы, последний значимый переход).
-Токен, счётчик и коэффициент соинвеста берутся из настроек AWER CRM.
+(оформленные заказы с рекламы, последний значимый переход) — только переходы из кампаний КО и ТО,
+тех же, по которым считается расход. Покупки с другой рекламы показываются отдельной строкой.
+Токен, счётчик и коэффициент соинвеста берутся из настроек AWER CRM (yandex_token.py).
 
 Запуск: python direct_before_after.py   -> вывод + direct_before_after.txt
 """
 import csv
 import datetime as dt
 import io
-import json
 import math
+import os
 import sys
 import time
 from collections import defaultdict
 from pathlib import Path
 
 import requests
+
+from yandex_token import crm_config
 
 BEFORE = ("2026-09-29", "2026-10-05")
 AFTER_FROM = "2026-10-06"
@@ -51,19 +54,12 @@ AGE_NAMES = {"AGE_0_17": "до 18", "AGE_18_24": "18–24", "AGE_25_34": "25–3
              "AGE_45_54": "45–54", "AGE_55": "55+", "UNKNOWN": "не определён"}
 DEVICE_NAMES = {"DESKTOP": "компьютеры", "MOBILE": "смартфоны", "TABLET": "планшеты", "SMART_TV": "Smart TV"}
 
-# Если AWER CRM на этом компьютере не настроена — впишите токен сюда.
-TOKEN = ""
-COUNTER = "110246968"
-MULT = 2.0
-CLIENT_LOGIN = ""
-
-cfg_path = Path.home() / "AWER CRM" / "config.json"
-if cfg_path.exists():
-    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-    TOKEN = cfg.get("yandex_oauth_token") or TOKEN
-    COUNTER = str(cfg.get("metrika_counter_id") or COUNTER)
-    MULT = float(cfg.get("coinvest_multiplier") or MULT)
-    CLIENT_LOGIN = cfg.get("direct_client_login") or CLIENT_LOGIN
+# Токен в код не вписывать: он берётся из настроек AWER CRM или переменной окружения YANDEX_OAUTH_TOKEN.
+cfg = crm_config()
+TOKEN = os.environ.get("YANDEX_OAUTH_TOKEN") or cfg.get("yandex_oauth_token") or ""
+COUNTER = str(cfg.get("metrika_counter_id") or "110246968")
+MULT = float(cfg.get("coinvest_multiplier") or 2.0)
+CLIENT_LOGIN = cfg.get("direct_client_login") or ""
 
 DH = {"Authorization": f"Bearer {TOKEN}", "Accept-Language": "ru", "processingMode": "auto",
       "returnMoneyInMicros": "false", "skipReportHeader": "true", "skipReportSummary": "true"}
@@ -145,9 +141,29 @@ def direct(fields, name):
     return []
 
 
+def campaign_names():
+    """Точные названия КО и ТО из Директа: {название: "КО"/"ТО"}. Пусто — если Директ не ответил."""
+    h = {k: v for k, v in DH.items() if k in ("Authorization", "Accept-Language", "Client-Login")}
+    try:
+        r = requests.post("https://api.direct.yandex.com/json/v5/campaigns", headers=h, timeout=60,
+                          json={"method": "get", "params": {"SelectionCriteria": {"Ids": [int(c) for c in CAMPAIGNS]},
+                                                            "FieldNames": ["Id", "Name"]}})
+        camps = r.json().get("result", {}).get("Campaigns", [])
+    except (requests.RequestException, ValueError) as e:
+        log(f"[Директ, названия кампаний] ошибка: {e}")
+        return {}
+    return {c["Name"]: CAMPAIGNS[str(c["Id"])] for c in camps if str(c.get("Id")) in CAMPAIGNS and c.get("Name")}
+
+
+NAMES = {}   # заполняется в main() из Директа
+
+
 def short_campaign(name):
     if not name:
         return "без кампании"
+    if NAMES:
+        return NAMES.get(name.strip(), "другое")
+    # Директ не отдал названия — угадываем по слову в названии (менее надёжно).
     for tag in ("КО", "ТО"):
         if f"- {tag} -" in name or f" {tag} " in f" {name} ":
             return tag
@@ -166,6 +182,9 @@ def metrika():
             log(f"[Метрика, {dims}] ошибка {r.status_code}: {r.text[:300]}")
             continue
         rows = []
+        if len(dims.split(",")) == 1:
+            log("ВНИМАНИЕ: Метрика не дала разбивку по кампаниям — покупки и выручка ниже по ВСЕЙ рекламе, "
+                "а расход только по КО и ТО. Доля рекламы и цена покупки получатся лучше настоящих.")
         for row in r.json().get("data", []):
             d = row["dimensions"]
             date = d[0].get("name")
@@ -195,14 +214,17 @@ def build(daily, mrows):
             if p:
                 tot[p][k] += v
                 camp[p][cid][k] += v
+    ours = set(CAMPAIGNS.values()) | {"все"}   # «все» — только если Метрика не дала разбивку
     for r in mrows:
         p = period_of(r["date"])
-        for k in ("visits", "purch", "rev"):
-            day[r["date"]][k] += r[k]
-            if p:
-                tot[p][k] += r[k]
-                if r["camp"] != "все":
-                    camp[p][r["camp"]][k] += r[k]
+        if r["camp"] in ours:
+            for k in ("visits", "purch", "rev"):
+                day[r["date"]][k] += r[k]
+                if p:
+                    tot[p][k] += r[k]
+        if p and r["camp"] != "все":
+            for k in ("visits", "purch", "rev"):
+                camp[p][r["camp"]][k] += r[k]
     return tot, camp, day
 
 
@@ -251,7 +273,8 @@ def dist_table(title, pct, top=None, order=None):
 
 def main():
     if not TOKEN:
-        sys.exit("Нет токена: AWER CRM не найдена на этом компьютере. Впишите токен в TOKEN в начале файла.")
+        sys.exit("Нет токена Яндекса: сохраните его в AWER CRM (Маркетинг → Подключение к Яндексу) "
+                 "или задайте переменную окружения YANDEX_OAUTH_TOKEN. В код токен не вписывать.")
     if AFTER_TO < AFTER_FROM:
         sys.exit("После изменений ещё не прошло ни одного полного дня.")
 
@@ -264,6 +287,9 @@ def main():
     dev = direct(["Device", "Cost"], "device")
     geo = direct(["TargetingLocationName", "Cost"], "geo")
     pl = direct(["Placement", "Cost"], "placement")
+    NAMES.update(campaign_names())
+    if not NAMES:
+        log("ВНИМАНИЕ: Директ не отдал названия кампаний — КО и ТО в Метрике определяю по слову в названии.")
     mrows = metrika()
 
     tot, camp, day = build(daily, mrows)
@@ -302,10 +328,11 @@ def main():
             f"{fm(ca['cost'] / ND['a']):>14}{fm(WEEKLY_NEW[cid] / 7):>10}"
             f"{fm(cb['purch'] / ND['b'], 2):>12}{fm(ca['purch'] / ND['a'], 2):>8}"
             f"{(fm(drr_b, 1) + '%') if drr_b else '—':>15}{(fm(drr_a, 1) + '%') if drr_a else '—':>8}")
-    other = {k: v for k, v in camp["a"].items() if k not in CAMPAIGNS.values()}
-    for nm, v in other.items():
-        if v.get("purch"):
-            log(f"  Покупки с рекламы вне КО/ТО после изменений ({nm}): {v['purch']:.0f}")
+    for p, title in (("b", "до"), ("a", "после")):
+        for nm, v in camp[p].items():
+            if nm not in CAMPAIGNS.values() and v.get("purch"):
+                log(f"  Не входят в итоги — покупки с другой рекламы {title} изменений ({nm}): "
+                    f"{v['purch']:.0f} на {fm(v['rev'])} ₽")
 
     # 3. По дням
     log("\n=== 3. По дням ===")
