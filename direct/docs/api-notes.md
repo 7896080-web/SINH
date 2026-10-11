@@ -1,0 +1,85 @@
+# Заметки по API — особенности и ловушки
+
+## Яндекс OAuth
+- Приложение «Помощник по рекламе», ClientID `ee73474726014494bf00435638a0421d` (не секрет), права:
+  `direct:api`, `metrika:read`, `webmaster:hostinfo`. Токен — в AWER CRM (`yandex_oauth_token`), читается
+  через `yandex_token.py`. Полный доступ к API Директа одобрен в октябре 2026.
+
+## Яндекс Директ API v5 (JSON)
+- `https://api.direct.yandex.com/json/v5/<service>`, заголовок `Authorization: Bearer <token>`,
+  `Client-Login` — только если задан в настройках CRM. Баллы — в заголовке `Units`.
+- Отчёты (`/reports`): ответы 201/202 + `retryIn` → ждать и повторять; 200 — готово.
+  `processingMode: auto`, `returnMoneyInMicros: false`, `skipReportHeader/Summary: true`, `IncludeVAT: NO`.
+  Имя отчёта должно быть уникальным (добавлять время в мс). Декодировать `r.content.decode("utf-8")`.
+- Деньги в объектах (бюджеты, ставки) — в микро-единицах: ×1 000 000. Бюджеты и ставки — без НДС.
+- ЕПК (единые перфоманс-кампании): поля `Goals`/конверсии в CUSTOM_REPORT приходят нулями → конверсии брать
+  из Метрики. `REACH_AND_FREQUENCY_PERFORMANCE_REPORT` для ЕПК пустой. `dynamicfeedadtargets` для групп ЕПК
+  недоступен (фильтры фида — в интерфейсе). `feeds.get` требует `Ids` (брать из групп).
+- Корректировки ставок: `BidModifier` 0 = −100%, 50 = −50%, 100 = без изменений. Более точный регион перекрывает
+  общий. ID регионов: 3 ЦФО, 1 Москва и МО, 213 Москва, 17 СЗФО, 10174 СПб и ЛО, 40 ПФО, 52 УФО.
+- Смена текста/ссылки объявления → повторная модерация. Смена стратегии/цели → сброс обучения.
+
+## Яндекс Метрика API
+- Счётчик `110246968`. `https://api-metrika.yandex.net/stat/v1/data`, заголовок `Authorization: OAuth <token>`.
+- Реклама: фильтр `ym:s:lastsignTrafficSource=='ad'`. Полезные измерения: `lastsignDirectPlatform`,
+  `lastsignDirectBannerGroup`, `lastsignDirectClickOrderName`, `ageInterval`, `gender`, `deviceCategory`,
+  `productBrand`, `productName`. Метрики e-commerce: `ecommercePurchases`, `ecommerceRevenue`.
+- Цель покупки в Директе: `579065793` (Ecommerce: покупка). «Конверсии по всем целям» в Мастере отчётов
+  сильно завышены — смотреть только ключевые цели/покупки.
+
+## Яндекс Вебмастер API v4
+- Хост `awer-russia.ru`; `user`, `hosts`, `summary`, `diagnostics`, `sitemaps`, `search-queries/popular`.
+
+## Яндекс Доставка (other-day)
+- `https://b2b-authproxy.taxi.yandex.net/api/b2b/platform/...` (`requests/info`, `request/history`).
+  Токен — отдельный (ЛК Доставки → Профиль компании), файл `yandex_delivery_token.txt`.
+- Известная неточность скрипта: путаница ПВЗ/курьер; флаг примерки API не отдаёт (примерка включена).
+
+## Wildberries API
+- Хосты: `advert-api` (Продвижение), `seller-analytics-api` (Аналитика), `statistics-api` (Статистика),
+  `finance-api` (Финансы), `common-api` (данные продавца). Заголовок `Authorization: <token>` (без Bearer).
+- Токен — «Персональный»: у «Базового» лимиты 1–5 запросов в час. Категории токена — по нужным хостам.
+- Лимиты (персональный токен): статистика кампаний `/adv/v3/fullstats` — 3/мин, до 50 ID, до 31 дня;
+  воронка `/api/analytics/v3/sales-funnel/products` — 3/мин; рекомендованные ставки — 5/мин (12 с на товар);
+  заказы/продажи `statistics-api` — 1/мин; детализация реализации `finance-api` — 1/мин.
+  При 429 — ждать `X-Ratelimit-Retry`.
+- Кампании: тип 9 — «единая» или «ручная» ставка (`bid_type`), оплата `cpm` (за 1000 показов) или `cpc` (за клик).
+  Тип 8 (старые автокампании) — только чтение. Оплаты за заказ в API нет. WB Медиа — только чтение.
+- Ставки товаров: `PATCH /api/advert/v1/bids`, в копейках (`bid_kopecks`), `placement`: `search` /
+  `recommendations` (ручная) или `combined` (единая).
+- Ставки на поисковые кластеры — только ручная ставка + оплата за показы: `POST /api/advert/v1/normquery/bids`
+  (`bidMinorUnits`, только персональный токен) или `/adv/v0/normquery/bids` (рубли).
+- Минус-фразы: `POST /adv/v0/normquery/set-minus` **заменяет весь список** пары (кампания, товар), до 1000 фраз.
+  Сначала `get-minus`, потом дописывать. Состояние «что добавил скрипт» — `wb_bids_state.json`.
+- Дневной лимит — только для оплаты за клики: `PUT /api/advert/v0/daily-limits`, суммы в копейках.
+- Создание кампании: `POST /adv/v2/seacat/save-ad` (до 50 товаров), ставки при создании — минимальные.
+  Пополнение бюджета: `POST /adv/v1/budget/deposit?id=` (`type`: 0 счёт, 1 баланс, 3 бонусы).
+- Статистика рекламы считает **заказы**, не выкупы. Выкуп брать из воронки за «созревший» период
+  (заказы 21–120 дней назад): выкупы и отмены в воронке относятся к дню заказа.
+- **Отчёт «Поисковые запросы» (подписка «Джем»)**, хост `seller-analytics-api`, все методы — 3 запроса в минуту
+  (в скриптах общий ключ паузы `JAM_KEY`), данные обновляются раз в 2 часа, период — не раньше 365 дней назад:
+  - `POST /api/v2/search-report/product/search-texts` — топ запросов по товарам (до 50 артикулов): `weekFrequency`,
+    `frequency`, `medianPosition`, `avgPosition`, `visibility`, `openCard`/`addToCart`/`orders` с `percentile`
+    (насколько лучше/хуже конкурентов по запросу), `openToCart`/`cartToOrder`, цена. `limit` до 30 («Стандарт»)
+    или до 100 («Продвинутый»/«Премиальный»; при отказе 400 скрипты сами берут 30). Период может быть одним днём →
+    позиции по запросу по дням.
+  - `POST /api/v2/search-report/report` — основная страница: `positionInfo` (медиана и средняя + `chartItems` по дням),
+    `visibilityInfo.byDay` (видимость, переходы). С `nmIds: [один артикул]` — медианная позиция этого товара по дням;
+    без фильтра — весь кабинет. 1 запрос на товар.
+  - `POST /api/v2/search-report/table/details` — по товарам (до 50): средняя позиция, видимость, переходы, корзины,
+    заказы, `isAdvertised`; медианы по товару здесь нет.
+  - `POST /api/v2/search-report/product/orders` — по одному товару и **своему списку запросов** (до 30/100):
+    средняя позиция и заказы по дням, период до 7 дней.
+  - CSV-выгрузки (`/api/v2/nm-report/downloads`, типы `SEARCH_QUERIES_PREMIUM_REPORT_*`, `DETAIL_HISTORY_REPORT`) —
+    для истории до года; колонки CSV в спецификации не описаны, в скриптах пока не используются.
+- Воронка по дням: `POST /api/analytics/v3/sales-funnel/products/history` — до 20 товаров, **только последняя неделя**;
+  без показов/CTR (их в API нет). Для старых дней — `/sales-funnel/products` с периодом в один день (все товары,
+  1000 на страницу): там же `avgPrice`, `timeToReady` (срок доставки), `addToWishlist`, рейтинг и остатки
+  (рейтинг и остатки — только текущие).
+- Реклама: `/adv/v3/fullstats` → `boosterStats` (`avg_position` по дням и товарам — позиция в рекламе);
+  `/adv/v0/normquery/stats` → по кластерам `avg_pos`, расход, клики, корзины, заказы (у CPC `views` = null).
+  Органическую позицию отдельно от рекламной API не отдаёт.
+- Детализация реализации (`finance-api`): строки отчётов (обычно еженедельных), постранично по `rrdId` до 204.
+  Удержания за продвижение — в `deduction` с причиной про «Продвижение» (не путать с остальными удержаниями).
+- Официальная спецификация: https://dev.wildberries.ru (из рабочей среды недоступна напрямую;
+  актуальные поля сверялись по пакету `wildberries-sdk` на PyPI, собранному из спецификации).
