@@ -16,7 +16,7 @@
   Без --apply — только показывает, что будет создано. С --apply — создаёт.
   --budget 3000 --source balance  — сразу пополнить бюджет кампании (balance — взаиморасчёт, account — счёт, bonus — бонусы).
   --cabinet "Яворская"            — кабинет из wb_tokens.txt (если их несколько).
-  --with-no-stock                 — включить товары, которых нет на складах WB (по умолчанию пропускаются).
+  --with-no-stock                 — включить товары без остатка ни на складах WB, ни на своём (FBS); по умолчанию пропускаются.
 
 Запуск, пауза и пополнение бюджета готовой кампании — тоже сначала пробный прогон, с --apply выполняется:
     python wb_create.py --start 123456789 --apply
@@ -223,7 +223,9 @@ def main():
     take, skip = [], []
     for nm in nms:
         s = info.get(nm) or {}
-        if not a.with_no_stock and s.get("wb") is not None and s["wb"] <= 0:
+        # в наличии = склады WB + свой склад (FBS); пропускаем, только если пусто и там, и там
+        if not a.with_no_stock and (s.get("wb") is not None or s.get("mp") is not None) \
+                and (s.get("wb") or 0) + (s.get("mp") or 0) <= 0:
             skip.append(nm)
         else:
             take.append(nm)
