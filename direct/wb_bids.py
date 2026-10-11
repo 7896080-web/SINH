@@ -330,16 +330,19 @@ def record_day_base(state, plan):
 def get_campaigns(token):
     pace(token, "count", 0.3)
     data = call("GET", ADV + "/adv/v1/promotion/count", token, what="Список кампаний") or {}
-    ids = []
+    ids, status = [], {}
     for grp in data.get("adverts") or []:
         if grp.get("status") in (4, 9, 11):
-            ids += [a["advertId"] for a in grp.get("advert_list") or []]
+            for a in grp.get("advert_list") or []:
+                ids.append(a["advertId"])
+                status[a["advertId"]] = grp.get("status")
     camps = {}
     for part in chunks(ids, 50):
         pace(token, "adverts", 0.3)
         d = call("GET", ADV + "/api/advert/v2/adverts", token, params={"ids": ",".join(map(str, part))},
                  what="Настройки кампаний") or {}
         for a in d.get("adverts") or []:
+            a.setdefault("_status", status.get(a["id"]))
             camps[a["id"]] = a
     return camps
 
@@ -614,7 +617,8 @@ def plan_cabinet(cab, token, rules, state):
 
     involved = set(todo) | {r.get("clusters_from_id") for r in todo.values()} | {r.get("route_from_id") for r in todo.values()}
     involved.discard(None)
-    stats = nm_stats(token, list(involved))
+    # статистику WB отдаёт только для статусов 7, 9, 11; «готовая к запуску» (4) в пакете могла бы сорвать весь запрос
+    stats = nm_stats(token, [c for c in involved if camps[c].get("_status") != 4])
     nms_of = {cid: [s.get("nm_id") for s in camps[cid].get("nm_settings") or []] for cid in involved}
     stock = get_stock(token, sorted({nm for cid in involved for nm in nms_of[cid]}))
     def no_stock(nm):
