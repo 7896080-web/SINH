@@ -5,14 +5,16 @@
 
 Подготовка (один раз для каждого кабинета):
   Кабинет продавца WB → Настройки → Доступ к API → Создать токен.
-  Тип — Персональный. Категории — «Продвижение» и «Аналитика». Отметьте «Только на чтение».
+  Тип — Персональный. Категории — «Продвижение», «Аналитика», «Статистика», «Финансы».
+  «Только на чтение» НЕ отмечайте: этот отчёт работает и с токеном на чтение, но автопилоту wb_bids.py
+  и wb_create.py нужно право изменений — проще один токен на все скрипты.
   При первом запуске скрипт создаст рядом с собой файл wb_tokens.txt —
   впишите туда токены (одна строка — один кабинет:  Название = токен).
   Токены никому не пересылайте.
 
 Запуск:  python wb_ads_report.py        — за 30 дней по вчерашний день
          python wb_ads_report.py 14     — за 14 дней
-Результат: вывод на экран + wb_ads_report.txt + таблицы для Excel:
+Результат (рядом со скриптом): вывод на экран + wb_ads_report.txt + таблицы для Excel:
            wb_ads_campaigns.csv, wb_ads_products.csv, wb_ads_clusters.csv
 
 Как считается выкуп: WB в рекламной статистике показывает заказы, не выкупы.
@@ -33,12 +35,14 @@ ADV = "https://advert-api.wildberries.ru"
 ANA = "https://seller-analytics-api.wildberries.ru"
 COMMON = "https://common-api.wildberries.ru"
 
-TOKENS_FILE = Path(__file__).resolve().with_name("wb_tokens.txt")
-TEMPLATE = """# Кабинеты Wildberries для wb_ads_report.py
+HERE = Path(__file__).resolve().parent
+TOKENS_FILE = HERE / "wb_tokens.txt"
+TEMPLATE = """# Кабинеты Wildberries для всех скриптов wb_*.py
 # Одна строка — один кабинет:   Название = токен
 # Названия можно менять. Строки без токена пропускаются.
 # Токен: кабинет WB → Настройки → Доступ к API → Создать токен,
-#        тип «Персональный», категории «Продвижение» и «Аналитика», «Только на чтение».
+#        тип «Персональный», категории «Продвижение», «Аналитика», «Статистика», «Финансы»,
+#        без «Только на чтение» (автопилоту wb_bids.py нужно право изменений).
 # Этот файл никому не пересылайте.
 Караман 1 =
 Караман 2 =
@@ -577,10 +581,17 @@ def analyze(cab_name, token):
 
 
 def write_csv(name, rows):
-    if not rows:
+    p = HERE / name
+    if not rows:            # нет данных — убрать старый файл, чтобы не путать с прошлым отчётом
+        if p.exists():
+            p.unlink()
         return
     cols = list(rows[0].keys())
-    with open(name, "w", encoding="utf-8-sig", newline="") as f:
+    for r in rows[1:]:
+        for k in r:
+            if k not in cols:
+                cols.append(k)
+    with open(p, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols, delimiter=";")
         w.writeheader()
         for r in rows:
@@ -628,7 +639,7 @@ def main():
     write_csv("wb_ads_campaigns.csv", all_c)
     write_csv("wb_ads_products.csv", all_p)
     write_csv("wb_ads_clusters.csv", all_cl)
-    Path("wb_ads_report.txt").write_text("\n".join(out), encoding="utf-8")
+    (HERE / "wb_ads_report.txt").write_text("\n".join(out), encoding="utf-8")
     print("\nСохранено: wb_ads_report.txt, wb_ads_campaigns.csv, wb_ads_products.csv, wb_ads_clusters.csv")
 
 

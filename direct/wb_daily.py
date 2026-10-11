@@ -37,6 +37,7 @@ STOCK_DAYS_ALERT = 7        # предупредить, если остатка 
 STOCK_DAYS_TARGET = 21      # сколько дней продаж довозить
 DROP = 0.5                  # «падение» — вчера меньше половины среднего
 JUMP = 2.0                  # «рост» — вчера больше двух средних
+QUERIES_MAX_AGE = 8         # пункты из wb_queries_actions.csv старше стольких дней не показывать
 # ===========================================================
 
 Y = YESTERDAY
@@ -204,7 +205,9 @@ def analyze(cab, token):
         if pu is not None and pu < 0 and int(to_float(u.get("продано шт")) or 0) >= 3:
             act(3, "убыточный товар", {"артикул WB": nm, "артикул продавца": u.get("артикул продавца")},
                 f"по юнит-экономике {fm(pu)} ₽ на проданной штуке — поднять цену или вывести")
-    for q in [x for x in read_csv("wb_queries_actions.csv") if x.get("кабинет") == cab][:8]:
+    qa = age_days("wb_queries_actions.csv")
+    q_rows = read_csv("wb_queries_actions.csv") if qa is not None and qa <= QUERIES_MAX_AGE else []
+    for q in [x for x in q_rows if x.get("кабинет") == cab][:8]:
         act(4, "запрос: " + q.get("действие", ""), {"артикул WB": q.get("артикул WB"), "артикул продавца": q.get("артикул продавца")},
             f"«{q.get('запрос')}» ({q.get('класс')}, {q.get('запросов в неделю')}/нед) — {q.get('почему')}")
     pa = age_days("wb_positions_actions.csv")
@@ -232,11 +235,10 @@ def analyze(cab, token):
         log("  (Позиции в поиске и воронку по дням отслеживает wb_positions.py — запускайте его каждое утро перед этим отчётом.)")
     elif pa > 1.5:
         log(f"  (Позициям {pa:.0f} дн. — обновите: python wb_positions.py)")
-    qa = age_days("wb_queries_actions.csv")
     if qa is None:
         log("  (Анализа поисковых запросов нет — запустите wb_queries.py раз в неделю.)")
-    elif qa > 8:
-        log(f"  (Анализу запросов {qa:.0f} дн. — обновите: python wb_queries.py)")
+    elif qa > QUERIES_MAX_AGE:
+        log(f"  (Анализу запросов {qa:.0f} дн. — его пункты не показываю, они устарели. Обновите: python wb_queries.py)")
     return prow, acts
 
 
