@@ -242,7 +242,7 @@ def main():
         s = info.get(nm) or {}
         print(f"  {nm:>11}  {str(s.get('vendor') or ''):22} на WB {s.get('wb', '?')}, свой склад {s.get('mp', '?')}")
     if skip:
-        print(f"Пропущены — нет на складах WB ({len(skip)}): {', '.join(map(str, skip))}  (включить: --with-no-stock)")
+        print(f"Пропущены — нет в наличии ни на WB, ни на своём складе ({len(skip)}): {', '.join(map(str, skip))}  (включить: --with-no-stock)")
     if a.budget:
         print(f"Бюджет: пополнить на {a.budget} ₽ из «{a.source}»")
     if not a.apply:
