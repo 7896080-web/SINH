@@ -9,17 +9,13 @@
 """
 import csv
 import io
-import json
 import time
-from pathlib import Path
 
 import requests
 
-cfg = json.loads((Path.home() / "AWER CRM" / "config.json").read_text(encoding="utf-8"))
-TOKEN = cfg.get("yandex_oauth_token", "")
-LOGIN = cfg.get("direct_client_login", "")
-if not TOKEN:
-    raise SystemExit("В CRM не сохранён токен Яндекса (Маркетинг → Подключение к Яндексу).")
+from yandex_token import yandex_token, crm_config
+TOKEN = yandex_token()   # из настроек AWER CRM
+LOGIN = crm_config().get("direct_client_login", "")
 
 URL = "https://api.direct.yandex.com/json/v5/reports"
 HEADERS = {"Authorization": f"Bearer {TOKEN}", "Accept-Language": "ru", "processingMode": "auto",
@@ -38,9 +34,9 @@ def report(name, fields, rtype="REACH_AND_FREQUENCY_PERFORMANCE_REPORT"):
     # для них есть отдельный тип отчёта REACH_AND_FREQUENCY_PERFORMANCE_REPORT.
     body = {"params": {"SelectionCriteria": {}, "FieldNames": fields,
                        "ReportName": f"freq_{name}_{int(time.time() * 1000)}", "ReportType": rtype,
-                       "DateRangeType": "LAST_30_DAYS", "Format": "TSV", "IncludeVAT": "YES"}}
+                       "DateRangeType": "LAST_30_DAYS", "Format": "TSV", "IncludeVAT": "NO"}}
     for _ in range(90):
-        r = requests.post(URL, json=body, headers=HEADERS)
+        r = requests.post(URL, json=body, headers=HEADERS, timeout=90)
         if r.status_code == 200:
             return list(csv.DictReader(io.StringIO(r.content.decode("utf-8")), delimiter="\t"))
         if r.status_code in (201, 202):

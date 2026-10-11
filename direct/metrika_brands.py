@@ -4,16 +4,16 @@
 Токен и счётчик берутся из настроек AWER CRM.
 Запуск: python metrika_brands.py [дней]  -> вывод + metrika_brands.txt  (по умолчанию 60 дней)
 """
-import json
 import sys
 from pathlib import Path
 
 import requests
 
+from yandex_token import yandex_token, crm_config
+
 DAYS = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 60
-cfg = json.loads((Path.home() / "AWER CRM" / "config.json").read_text(encoding="utf-8"))
-TOKEN = cfg["yandex_oauth_token"]
-COUNTER = cfg.get("metrika_counter_id") or "110246968"
+TOKEN = yandex_token()   # из настроек AWER CRM
+COUNTER = crm_config().get("metrika_counter_id") or "110246968"
 H = {"Authorization": f"OAuth {TOKEN}"}
 out = []
 

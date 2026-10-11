@@ -28,7 +28,7 @@ def report(title, dim, limit=60):
               "metrics": ",".join(METRICS), "filters": "ym:s:lastsignTrafficSource=='ad'",
               "sort": "-ym:s:visits", "limit": limit, "accuracy": "full", "lang": "ru"}
     r = requests.get("https://api-metrika.yandex.net/stat/v1/data",
-                     headers={"Authorization": f"OAuth {TOKEN}"}, params=params)
+                     headers={"Authorization": f"OAuth {TOKEN}"}, params=params, timeout=60)
     log(f"\n=== {title} ===")
     if r.status_code != 200:
         log(f"ошибка {r.status_code}: {r.text[:300]}")

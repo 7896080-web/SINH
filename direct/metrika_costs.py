@@ -2,6 +2,7 @@
 """
 Расходы Яндекс Директа через API Метрики (без доступа к API Директа).
 Запуск: python metrika_costs.py  -> вывод + metrika_costs.txt
+Расход (ym:ad:RUBAdCost) — как его отдаёт Метрика; включён ли в нём НДС, API не сообщает.
 """
 import requests
 
@@ -18,7 +19,7 @@ params = {
     "accuracy": "full", "lang": "ru",
 }
 r = requests.get("https://api-metrika.yandex.net/stat/v1/data",
-                 headers={"Authorization": f"OAuth {TOKEN}"}, params=params)
+                 headers={"Authorization": f"OAuth {TOKEN}"}, params=params, timeout=60)
 lines = []
 if r.status_code != 200:
     lines.append(f"Ошибка {r.status_code}: {r.text[:500]}")

@@ -14,14 +14,16 @@ from pathlib import Path
 
 import requests
 
+from yandex_token import yandex_token, crm_config
+
 CAMPAIGNS = {712220172: "ЕПК Сети КО", 712219913: "ЕПК Сети ТО"}
 MUST_EXCLUDE = ["com.vkontakte.android", "com.vk.vkclient", "vk.com", "ok.ru", "ru.ok.android",
                 "m.pogoda.yandex.ru", "pogoda.yandex.ru", "gismeteo.ru",
                 "ru.yandex.mobile.weather", "ru.yandex.weatherplugin"]
 REGIONS = {3: "ЦФО", 1: "Москва и МО", 213: "Москва", 17: "СЗФО", 10174: "СПб и ЛО", 40: "ПФО", 52: "УФО"}
 
-cfg = json.loads((Path.home() / "AWER CRM" / "config.json").read_text(encoding="utf-8"))
-HEADERS = {"Authorization": f"Bearer {cfg['yandex_oauth_token']}", "Accept-Language": "ru"}
+cfg = crm_config()
+HEADERS = {"Authorization": f"Bearer {yandex_token()}", "Accept-Language": "ru"}
 if cfg.get("direct_client_login"):
     HEADERS["Client-Login"] = cfg["direct_client_login"]
 API = "https://api.direct.yandex.com/json/v5/"
@@ -117,7 +119,9 @@ except RuntimeError as e:
 
 # Расход по дням
 def report(range_type):
-    body = {"params": {"SelectionCriteria": {}, "FieldNames": ["Date", "CampaignName", "Impressions", "Clicks", "Cost"],
+    # только две кампании из заголовка отчёта (CAMPAIGNS), а не весь кабинет
+    flt = [{"Field": "CampaignId", "Operator": "IN", "Values": [str(c) for c in CAMPAIGNS]}]
+    body = {"params": {"SelectionCriteria": {"Filter": flt}, "FieldNames": ["Date", "CampaignName", "Impressions", "Clicks", "Cost"],
                        "ReportName": f"check_{range_type}_{int(time.time() * 1000)}", "ReportType": "CUSTOM_REPORT",
                        "DateRangeType": range_type, "Format": "TSV", "IncludeVAT": "NO"}}
     h = HEADERS | {"processingMode": "auto", "returnMoneyInMicros": "false",

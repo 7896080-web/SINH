@@ -21,7 +21,7 @@ def log(s=""):
 
 
 def get(path, params=None):
-    r = requests.get(API + path, headers=HEADERS, params=params)
+    r = requests.get(API + path, headers=HEADERS, params=params, timeout=60)
     if r.status_code != 200:
         raise RuntimeError(f"HTTP {r.status_code}: {r.text[:400]}")
     return r.json()

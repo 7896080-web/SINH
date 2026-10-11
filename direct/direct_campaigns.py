@@ -6,14 +6,15 @@
 Запуск:  pip install requests
          python direct_campaigns.py
 Результат: вывод в консоль + файл direct_report.txt
+Суммы — без НДС (как бюджеты в Директе).
 """
 import json
 import time
 import requests
 
-from yandex_token import yandex_token
+from yandex_token import yandex_token, crm_config
 TOKEN = yandex_token()   # из настроек AWER CRM
-CLIENT_LOGIN = ""        # заполнять только для агентского аккаунта
+CLIENT_LOGIN = crm_config().get("direct_client_login", "")   # из настроек CRM, если задан
 SANDBOX = False          # True — песочница (если доступ к API ещё тестовый)
 
 BASE = "https://api-sandbox.direct.yandex.com" if SANDBOX else "https://api.direct.yandex.com"
@@ -29,7 +30,7 @@ def log(s=""):
 
 def call(service, method, params):
     r = requests.post(f"{BASE}/json/v5/{service}",
-                      json={"method": method, "params": params}, headers=HEADERS)
+                      json={"method": method, "params": params}, headers=HEADERS, timeout=60)
     data = r.json()
     if "error" in data:
         e = data["error"]
@@ -73,22 +74,24 @@ body = {"params": {
     "ReportType": "CAMPAIGN_PERFORMANCE_REPORT",
     "DateRangeType": "LAST_30_DAYS",
     "Format": "TSV",
-    "IncludeVAT": "YES",
+    "IncludeVAT": "NO",
 }}
 rep_headers = dict(HEADERS, processingMode="auto", returnMoneyInMicros="false",
                    skipReportHeader="true", skipReportSummary="false")
 
-log("\n=== Статистика за последние 30 дней ===")
-while True:
-    r = requests.post(f"{BASE}/json/v5/reports", json=body, headers=rep_headers)
+log("\n=== Статистика за последние 30 дней (без НДС) ===")
+for _ in range(120):   # не ждать бесконечно
+    r = requests.post(f"{BASE}/json/v5/reports", json=body, headers=rep_headers, timeout=90)
     if r.status_code == 200:
-        log(r.text)
+        log(r.content.decode("utf-8"))
         break
     if r.status_code in (201, 202):
         time.sleep(int(r.headers.get("retryIn", 5)))
         continue
     log(f"Ошибка отчёта {r.status_code}: {r.text}")
     break
+else:
+    log("Отчёт не успел сформироваться за 120 попыток — запустите скрипт ещё раз позже.")
 
 with open("direct_report.txt", "w", encoding="utf-8") as f:
     f.write("\n".join(out))

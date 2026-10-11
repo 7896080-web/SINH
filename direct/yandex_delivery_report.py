@@ -37,6 +37,18 @@ PAY = {"already_paid": "Предоплата", "card_on_receipt": "При пол
 DONE_OK = {"DELIVERY_DELIVERED", "PARTICULARLY_DELIVERED"}
 DONE_BAD = {"CANCELLED", "SORTING_CENTER_RETURN_RETURNED", "RETURN_TRANSPORTATION_STARTED",
             "RETURN_ARRIVED_DELIVERY", "RETURN_READY_FOR_PICKUP", "RETURN_RETURNED"}
+# Известные промежуточные статусы (заявка ещё в работе). Список собран по документации other-day
+# по памяти — всё, чего здесь нет, попадёт в «прочие/неизвестные статусы» и будет показано в отчёте.
+IN_TRANSIT = {"DRAFT", "VALIDATING", "CREATED", "DELIVERY_PROCESSING_STARTED", "DELIVERY_TRACK_RECIEVED",
+              "SORTING_CENTER_PROCESSING_STARTED", "SORTING_CENTER_TRACK_RECEIVED", "SORTING_CENTER_TRACK_LOADED",
+              "DELIVERY_LOADED", "SORTING_CENTER_LOADED", "SORTING_CENTER_AT_START", "SORTING_CENTER_PREPARED",
+              "SORTING_CENTER_TRANSMITTED", "DELIVERY_AT_START", "DELIVERY_AT_START_SORT", "DELIVERY_TRANSPORTATION",
+              "DELIVERY_ARRIVED_PICKUP_POINT", "DELIVERY_TRANSMITTED_TO_RECIPIENT", "DELIVERY_STORAGE_PERIOD_EXTENDED",
+              "DELIVERY_STORAGE_PERIOD_EXPIRED", "DELIVERY_UPDATED_BY_SHOP", "DELIVERY_UPDATED_BY_RECIPIENT",
+              "DELIVERY_UPDATED_BY_DELIVERY", "DELIVERY_ATTEMPT_FAILED", "CONFIRMATION_CODE_RECEIVED",
+              "SORTING_CENTER_RETURN_PREPARING", "SORTING_CENTER_RETURN_PREPARING_SENDER",
+              "SORTING_CENTER_RETURN_ARRIVED", "SORTING_CENTER_RETURN_TRANSMITTED", "RETURN_PREPARING"}
+UNKNOWN = "Прочие/неизвестные статусы"
 
 out = []
 def log(s=""):
@@ -45,7 +57,9 @@ def log(s=""):
 
 
 def iso(d):
-    return d.strftime("%Y-%m-%dT%H:%M:%S.000000Z")
+    # Даты в скрипте — московское время (полночь по Москве), а не UTC. Суффикс «Z» означал бы UTC
+    # и сдвигал бы границы окон на 3 часа, поэтому указываем смещение Москвы +03:00.
+    return d.strftime("%Y-%m-%dT%H:%M:%S.000000+03:00")
 
 
 def post(path, body):
@@ -73,8 +87,9 @@ def ts(state):
 
 # ---------- 1. Выгрузка заявок ----------
 start = dt.datetime.fromisoformat(DATE_FROM)
-end = dt.datetime.fromisoformat(DATE_TO) if DATE_TO else dt.datetime.utcnow()
+end = dt.datetime.fromisoformat(DATE_TO) if DATE_TO else dt.datetime.utcnow() + dt.timedelta(hours=3)   # «сейчас» по Москве
 all_req = {}
+failed = []   # окна, которые не удалось выгрузить
 cur = start
 while cur < end:
     nxt = min(cur + dt.timedelta(days=CHUNK_DAYS), end)
@@ -85,9 +100,15 @@ while cur < end:
         print(f"{cur:%d.%m} — {nxt:%d.%m}: {len(data.get('requests', []))} заявок")
     except RuntimeError as e:
         print(f"{cur:%d.%m} — {nxt:%d.%m}: ошибка — {e}")
+        failed.append(f"{cur:%d.%m.%Y} — {nxt:%d.%m.%Y}: {e}")
     cur = nxt
 
 log(f"Всего заявок за период: {len(all_req)}")
+if failed:
+    log(f"\n!!! ВНИМАНИЕ: не выгружено окон — {len(failed)}. Данные неполные, % выкупа и суммы ниже")
+    log("!!! посчитаны без заявок за эти периоды. Перезапустите скрипт позже. Не выгружены:")
+    for w in failed:
+        log(f"!!!   {w}")
 if not all_req:
     raise SystemExit("Заявок нет — проверьте токен и период.")
 
@@ -100,6 +121,10 @@ for i, (rid, r) in enumerate(all_req.items(), 1):
     items = req.get("items", []) or []
     amount = sum((it.get("billing_details", {}).get("unit_price", 0) or 0) * (it.get("count", 0) or 0)
                  for it in items) / 100
+    # выкупленная часть: count − refused_count (поле отказанных единиц — то же, что ниже в «отказано_единиц»)
+    amount_bought = sum((it.get("billing_details", {}).get("unit_price", 0) or 0)
+                        * max((it.get("count", 0) or 0) - (it.get("refused_count", 0) or 0), 0)
+                        for it in items) / 100
     units = sum(it.get("count", 0) or 0 for it in items)
     refused = sum(it.get("refused_count", 0) or 0 for it in items)
     fitting = any(it.get("fitting") for it in items)
@@ -128,8 +153,10 @@ for i, (rid, r) in enumerate(all_req.items(), 1):
             outcome = "Отмена до выдачи (причина не указана)"
     elif status == "VALIDATING_ERROR":
         outcome = "Ошибка создания"
-    else:
+    elif status in IN_TRANSIT:
         outcome = "В пути / в ПВЗ"
+    else:
+        outcome = UNKNOWN
 
     days_transit = None
     if created and (arrived or delivered):
@@ -152,6 +179,7 @@ for i, (rid, r) in enumerate(all_req.items(), 1):
         "куда": "ПВЗ" if req.get("last_mile_policy") == "self_pickup" else "Курьер",
         "город": ((req.get("destination", {}).get("custom_location") or {}).get("details") or {}).get("locality", ""),
         "сумма_руб": round(amount),
+        "сумма_выкуплено_руб": round(amount_bought),
         "единиц": units,
         "отказано_единиц": refused,
         "частичный_выкуп_разрешён": "да" if req.get("particular_items_refuse") else "нет",
@@ -169,7 +197,7 @@ with open("delivery_orders.csv", "w", encoding="utf-8-sig", newline="") as f:
     w.writerows(rows)
 
 # ---------- 3. Сводка ----------
-finished = [r for r in rows if r["итог"] not in ("В пути / в ПВЗ", "Ошибка создания")]
+finished = [r for r in rows if r["итог"] not in ("В пути / в ПВЗ", "Ошибка создания", UNKNOWN)]
 ok = lambda r: r["итог"] in ("Выкуплен", "Частично выкуплен")
 
 def rate(lst):
@@ -178,10 +206,18 @@ def rate(lst):
 log(f"\n=== Итоги по всем заявкам ===")
 for k, v in Counter(r["итог"] for r in rows).most_common():
     log(f"  {k}: {v}")
+unknown = Counter(r["текущий_статус"] or "(пусто)" for r in rows if r["итог"] == UNKNOWN)
+if unknown:
+    log(f"\n=== {UNKNOWN} — не входят в % выкупа, проверьте вручную ===")
+    for k, v in unknown.most_common():
+        log(f"  {k}: {v}")
 
 log(f"\n=== Выкуп по завершённым заявкам: {rate(finished)} ===")
-log(f"  Сумма выкупленных: {sum(r['сумма_руб'] for r in finished if ok(r)):,.0f} ₽".replace(",", " "))
-log(f"  Сумма невыкупленных: {sum(r['сумма_руб'] for r in finished if not ok(r)):,.0f} ₽".replace(",", " "))
+if failed:
+    log(f"  (!) неполные данные: не выгружено окон — {len(failed)}, см. предупреждение в начале")
+log(f"  Сумма выкупленных (без отказанных позиций): {sum(r['сумма_выкуплено_руб'] for r in finished if ok(r)):,.0f} ₽".replace(",", " "))
+log(f"  Сумма невыкупленных (включая отказы в частичных выкупах): "
+    f"{sum(r['сумма_руб'] - (r['сумма_выкуплено_руб'] if ok(r) else 0) for r in finished):,.0f} ₽".replace(",", " "))
 
 def by(field, title):
     log(f"\n=== Выкуп по полю «{title}» ===")
