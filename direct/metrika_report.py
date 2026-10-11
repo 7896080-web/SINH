@@ -23,7 +23,7 @@ def log(s=""):
 
 
 def get(path, params=None):
-    r = requests.get(API + path, headers=HEADERS, params=params)
+    r = requests.get(API + path, headers=HEADERS, params=params, timeout=60)
     if r.status_code != 200:
         try:
             msg = r.json().get("message")

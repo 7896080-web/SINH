@@ -16,13 +16,15 @@ from pathlib import Path
 
 import requests
 
+from yandex_token import yandex_token, crm_config
+
 CAMPAIGNS = {712220172: "ЕПК Сети КО", 712219913: "ЕПК Сети ТО", 714517819: "ЕПК Сети ТО (новый фид)"}
 PARTNER_BRANDS = ["dauntless", "black vinyl", "black vinyil", "mcl", "konko", "nero", "tony montana"]
 
 URL_ARGS = [a for a in sys.argv[1:] if a.startswith("http")]
 
-cfg = json.loads((Path.home() / "AWER CRM" / "config.json").read_text(encoding="utf-8"))
-HEADERS = {"Authorization": f"Bearer {cfg['yandex_oauth_token']}", "Accept-Language": "ru"}
+cfg = crm_config()
+HEADERS = {"Authorization": f"Bearer {yandex_token()}", "Accept-Language": "ru"}
 if cfg.get("direct_client_login"):
     HEADERS["Client-Login"] = cfg["direct_client_login"]
 API = "https://api.direct.yandex.com/json/v5/"

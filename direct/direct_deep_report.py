@@ -6,6 +6,7 @@
   3) группы объявлений       -> direct_adgroups.csv
   4) устройства, пол, возраст -> direct_audience.csv
 Итоговая сводка            -> direct_deep_report.txt
+Расход — без НДС (как бюджеты в Директе); «реальная цена покупки» — расход ÷ соинвест (coinvest_multiplier).
 
 Запуск: python direct_deep_report.py
 """
@@ -15,9 +16,11 @@ import time
 
 import requests
 
-from yandex_token import yandex_token
+from yandex_token import yandex_token, crm_config
 TOKEN = yandex_token()   # из настроек AWER CRM
-CLIENT_LOGIN = ""                 # только для агентского аккаунта
+CFG = crm_config()
+CLIENT_LOGIN = CFG.get("direct_client_login", "")   # из настроек CRM, если задан
+COINVEST = float(CFG.get("coinvest_multiplier") or 2.0)   # соинвест Яндекса: реальные деньги = расход ÷ COINVEST
 PERIOD = "LAST_30_DAYS"
 
 # Цели Метрики (счётчик 110246968)
@@ -46,15 +49,15 @@ def log(s=""):
 def report(name, rtype, fields, with_goals=True):
     params = {
         "SelectionCriteria": {}, "FieldNames": fields, "ReportName": f"{name}_{int(time.time())}",
-        "ReportType": rtype, "DateRangeType": PERIOD, "Format": "TSV", "IncludeVAT": "YES",
+        "ReportType": rtype, "DateRangeType": PERIOD, "Format": "TSV", "IncludeVAT": "NO",
     }
     if with_goals:
         params["Goals"] = list(GOALS)
         params["AttributionModels"] = [ATTRIBUTION]
     for _ in range(60):
-        r = requests.post(URL, json={"params": params}, headers=HEADERS)
+        r = requests.post(URL, json={"params": params}, headers=HEADERS, timeout=90)
         if r.status_code == 200:
-            rows = list(csv.DictReader(io.StringIO(r.text), delimiter="\t"))
+            rows = list(csv.DictReader(io.StringIO(r.content.decode("utf-8")), delimiter="\t"))
             return rows
         if r.status_code in (201, 202):
             time.sleep(int(r.headers.get("retryIn", 5)))
@@ -113,10 +116,10 @@ def summary(rows, key, title, top=25):
         a["расход"] += num(r.get("Cost"))
         for g in GOALS.values():
             a[g] += r[g]
-    log(f"\n=== {title} (топ-{top} по расходу) ===")
-    log("название\tпоказы\tклики\tрасход\tпокупки\tоформления\tдоставлено\tцена покупки")
+    log(f"\n=== {title} (топ-{top} по расходу; расход кабинета без НДС) ===")
+    log(f"название\tпоказы\tклики\tрасход\tпокупки\tоформления\tдоставлено\tреальная цена покупки (расход ÷ {COINVEST:g})")
     for k, a in sorted(agg.items(), key=lambda x: -x[1]["расход"])[:top]:
-        cpa = f"{a['расход'] / a['покупка']:.0f}" if a["покупка"] else "—"
+        cpa = f"{a['расход'] / COINVEST / a['покупка']:.0f}" if a["покупка"] else "—"
         log(f"{k}\t{a['показы']:.0f}\t{a['клики']:.0f}\t{a['расход']:.0f}\t{a['покупка']:.0f}\t"
             f"{a['оформление']:.0f}\t{a['доставлен']:.0f}\t{cpa}")
     return agg
@@ -131,7 +134,12 @@ save(pl, "direct_placements.csv")
 net = [r for r in pl if r.get("AdNetworkType") == "AD_NETWORK"]
 agg = summary(net, "Placement", "Площадки РСЯ")
 waste = {k: a for k, a in agg.items() if a["покупка"] == 0 and a["оформление"] == 0 and a["расход"] >= 500}
-if waste:
+if pl and not any(r["покупка"] or r["оформление"] for r in pl):
+    # у ЕПК API Директа отдаёт конверсии нулями — список «плохих» площадок был бы ложным
+    log("\nКонверсии (покупки/оформления) в API Директа везде нулевые — для единых перфоманс-кампаний (ЕПК)")
+    log("API их не отдаёт. Площадки без покупок по этим данным не определить — смотрите покупки в Метрике")
+    log("(metrika_direct_breakdown.py) или в Мастере отчётов Директа.")
+elif waste:
     total_waste = sum(a["расход"] for a in waste.values())
     log(f"\nПлощадок с расходом от 500 ₽ и без единого оформления/покупки: {len(waste)}, расход {total_waste:.0f} ₽")
     for k, a in sorted(waste.items(), key=lambda x: -x[1]["расход"])[:40]:
