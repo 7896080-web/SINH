@@ -9,7 +9,7 @@
       за показы: допустимая цена заказа × конверсия × CTR × 1000.
     Растёт не больше чем на 30% в сутки (от ставки при первом запуске за день, сколько бы запусков
     ни было — ставка «на начало дня» хранится в wb_bids_state.json), снижается сразу.
-    Нет на складах WB → минимальная.
+    Нет в наличии (склады WB + свой склад FBS, см. COUNT_FBS_STOCK) → минимальная.
   • cluster_bids — ставки на поисковые кластеры (только ручная ставка + оплата за показы):
       "all" — на все кластеры, по которым WB даёт рекомендацию;
       "top" — только на лучшие запросы из кампании clusters_from (сколько заказов принесли).
@@ -19,7 +19,7 @@
   • auto_minus — минус-фразы для запросов, которые много кликали и ни разу не заказали
       (ожидалось ≥ 3 заказов при средней конверсии кампании, а их 0). Не больше 20 за запуск,
       слова из PROTECT не трогаются, ваши собственные минус-фразы сохраняются.
-      Только для товара, который лежит на складах WB не меньше MINUS_AFTER_RESTOCK_DAYS (14) дней подряд:
+      Только для товара, который в наличии (WB + FBS) не меньше MINUS_AFTER_RESTOCK_DAYS (14) дней подряд:
       без остатка запросы не продают, и судить их рано. Слова «не наша аудитория» (MINUS_WORDS) — сразу.
   • route_from — запросы, на которые стоят ставки в кампании route_from (за показы),
       добавляются в минус-фразы этой кампании (за клики), чтобы кампании не перебивали друг друга.
@@ -76,7 +76,7 @@ DEFAULTS = {
     "max_bid_cpc": 60,          # потолок ставки за клик, ₽
     "max_bid_cpm": 800,         # потолок ставки за 1000 показов, ₽
     "max_raise_pct": 30,        # максимум роста ставки в сутки, % (от ставки при первом запуске за день)
-    "no_stock": "min",          # нет на складах WB: "min" — минимальная ставка, "skip" — не трогать
+    "no_stock": "min",          # нет в наличии (WB + FBS, см. COUNT_FBS_STOCK): "min" — минимальная ставка, "skip" — не трогать
     "base_bid": "auto",         # "min" — ставка товара минимальная (для кампаний «только лучшие запросы»)
     "cluster_bids": None,       # None / "all" / "top"
     "clusters_from": None,      # для "top": кампания, откуда брать лучшие запросы
@@ -96,7 +96,8 @@ RETURN_FACTOR = 1.5                 # "top": запрос возвращаетс
 RETURN_PAUSE_DAYS = 30              # …и после возврата столько дней не передаётся за показы снова
 STATS_DAYS = 14                     # статистика товаров для конверсии
 UNIT_MAX_AGE = 14                   # "auto": предупредить, если юнит-экономика старше стольких дней
-MINUS_AFTER_RESTOCK_DAYS = 14       # автоминус по товару — только после стольких дней подряд на складах WB
+COUNT_FBS_STOCK = True             # остаток = склады WB + свой склад (FBS). False — только склады WB (FBO)
+MINUS_AFTER_RESTOCK_DAYS = 14       # автоминус по товару — только после стольких дней подряд в наличии (WB + FBS)
 CLUSTER_DAYS = 30                   # статистика запросов
 PRIOR_CR, K_CLICKS = 0.03, 100      # конверсия по умолчанию и её вес
 PRIOR_CTR, K_VIEWS = 0.03, 1000     # CTR в поиске по умолчанию и его вес
@@ -424,12 +425,30 @@ def get_stock(token, nm_ids):
                         what="Остатки (воронка продаж)") or {}
             for p in (data.get("data") or {}).get("products") or []:
                 pr = p.get("product") or {}
-                res[pr.get("nmId")] = {"wb": (pr.get("stocks") or {}).get("wb"), "vendor": pr.get("vendorCode")}
+                st = pr.get("stocks") or {}
+                res[pr.get("nmId")] = {"wb": st.get("wb"), "mp": st.get("mp"), "vendor": pr.get("vendorCode")}
     except ApiError as e:
         log(f"  ! {e} — остатки неизвестны, минимальные ставки «по остаткам» не ставлю.")
         DATA_PROBLEMS.append(f"остатки не загрузились ({e})")
         return None
     return res
+
+
+def available(s):
+    """Сколько штук можно продать: склады WB + свой склад (FBS), если COUNT_FBS_STOCK. None — неизвестно."""
+    if not s:
+        return None
+    wb, mp = s.get("wb"), s.get("mp") if COUNT_FBS_STOCK else None
+    if wb is None and mp is None:
+        return None
+    return (wb or 0) + (mp or 0)
+
+
+def stock_label(s):
+    if not s or (s.get("wb") is None and s.get("mp") is None):
+        return ""
+    wb = "" if s.get("wb") is None else str(int(s["wb"]))
+    return f"{wb}/{int(s['mp'])}" if COUNT_FBS_STOCK and s.get("mp") is not None else wb
 
 
 def get_min_bids(token, aid, nm_ids, pay, placement):
@@ -622,23 +641,23 @@ def plan_cabinet(cab, token, rules, state):
     nms_of = {cid: [s.get("nm_id") for s in camps[cid].get("nm_settings") or []] for cid in involved}
     stock = get_stock(token, sorted({nm for cid in involved for nm in nms_of[cid]}))
     def no_stock(nm):
-        s = (stock or {}).get(nm)
-        return s is not None and s.get("wb") is not None and s["wb"] <= 0
+        q = available((stock or {}).get(nm))
+        return q is not None and q <= 0
 
-    # с какого дня товар непрерывно на складах WB (для автоминуса). Меняется только в памяти —
+    # с какого дня товар непрерывно в наличии (WB + FBS) (для автоминуса). Меняется только в памяти —
     # в wb_bids_state.json попадает лишь при --apply; пробный прогон ничего не записывает.
     today = dt.date.today()
     since = state.setdefault("in_stock_since", {})
     started = []
     if stock is not None:
         for nm in sorted({nm for cid in involved for nm in nms_of[cid]}):
-            wb = (stock.get(nm) or {}).get("wb")
-            if wb is None:
+            q = available(stock.get(nm))
+            if q is None:
                 continue                      # остаток по товару неизвестен — отсчёт не меняем
-            if wb > 0 and str(nm) not in since:
+            if q > 0 and str(nm) not in since:
                 since[str(nm)] = today.isoformat()
                 started.append(nm)
-            elif wb <= 0:
+            elif q <= 0:
                 since.pop(str(nm), None)
 
     def stock_days(nm):
@@ -647,7 +666,7 @@ def plan_cabinet(cab, token, rules, state):
 
     started = [nm for nm in started if any(todo[c]["auto_minus"] and nm in nms_of[c] for c in todo)]
     if started:
-        log(f"  Остатки на WB: отсчёт наличия начат сегодня для {len(started)} тов. "
+        log(f"  Остатки{' (WB + свой склад FBS)' if COUNT_FBS_STOCK else ' на WB'}: отсчёт наличия начат сегодня для {len(started)} тов. "
             f"({', '.join(map(str, started[:10]))}{' …' if len(started) > 10 else ''}) — автоминус по ним включится "
             f"через {MINUS_AFTER_RESTOCK_DAYS} дн. (слова «не наша аудитория» — сразу).")
 
@@ -703,7 +722,7 @@ def plan_cabinet(cab, token, rules, state):
             mins = get_min_bids(token, cid, nms, pay, placement)
             key_cur = "search" if placement == "combined" else placement
             log(f"    Ставки товаров — {({'search': 'поиск', 'recommendations': 'рекомендации', 'combined': 'поиск+рекомендации'})[placement]}:")
-            log(f"      {'артикул':>11} {'арт. продавца':16}{'WB шт':>6}{'клики':>6}{'зак.':>5}{'конв.':>6}"
+            log(f"      {'артикул':>11} {'арт. продавца':16}{'WB/FBS' if COUNT_FBS_STOCK else 'WB шт':>9}{'клики':>6}{'зак.':>5}{'конв.':>6}"
                 f"{'сейчас':>9}{'реком.':>9}{'потолок':>9}{'будет':>9}  {unit}")
             for nm in nms:
                 v = stats.get((cid, nm)) or defaultdict(float)
@@ -712,12 +731,11 @@ def plan_cabinet(cab, token, rules, state):
                 econ = mcpo(cab, r, nm) * cr * 100 * (1 if pay == "cpc" else ctr * 1000)
                 cap = int(min(econ, cap_abs))
                 s_info = (stock or {}).get(nm) or {}
-                wb = s_info.get("wb")
                 current, mn = cur_all.get(nm, {}).get(key_cur), mins.get(nm) or 0
                 rec = None
                 if no_stock(nm):
                     nb, reason = (current, "нет на WB — не трогаю") if r["no_stock"] == "skip" else \
-                        (mn or current, "нет на складах WB → минимальная")
+                        (mn or current, "нет в наличии → минимальная" if COUNT_FBS_STOCK else "нет на складах WB → минимальная")
                 elif r["base_bid"] == "min":
                     nb, reason = (mn or current), "минимальная (кампания только для лучших запросов)"
                 else:
@@ -732,7 +750,7 @@ def plan_cabinet(cab, token, rules, state):
                     nb, reason = new_bid(current, rec, cap, mn, step, r["max_raise_pct"],
                                          day_base(state, "bids", cid, nm, placement))
                 ch = changed(nb, current, step)
-                log(f"      {nm:>11} {cut(s_info.get('vendor'), 16):16}{'' if wb is None else int(wb):>6}"
+                log(f"      {nm:>11} {cut(s_info.get('vendor'), 16):16}{stock_label(s_info):>9}"
                     f"{int(v['clicks']):>6}{int(v['orders']):>5}{cr * 100:>5.1f}%{rub(current):>9}{rub(rec):>9}"
                     f"{rub(cap):>9}{rub(nb):>9}  {('↑' if nb > current else '↓') if ch else '='} {reason}")
                 if ch:
@@ -855,7 +873,7 @@ def plan_cabinet(cab, token, rules, state):
                 for q in sorted(prev_route - route_want.get(nm, set())):
                     if q in cur_set:
                         rem_route.append(q)
-                # плохие запросы; пока товар меньше MINUS_AFTER_RESTOCK_DAYS дней на складах WB — только MINUS_WORDS
+                # плохие запросы; пока товар меньше MINUS_AFTER_RESTOCK_DAYS дней в наличии — только MINUS_WORDS
                 if r["auto_minus"]:
                     sd = stock_days(nm)
                     gated = sd is None or sd < MINUS_AFTER_RESTOCK_DAYS
@@ -870,9 +888,9 @@ def plan_cabinet(cab, token, rules, state):
                     if held:
                         held_notes.append(
                             f"      … {nm:>11} {len(held)} запр. без заказов пока не в минус: " +
-                            (f"товар на складах WB {sd} дн. из {MINUS_AFTER_RESTOCK_DAYS}, автоминус включится через "
+                            (f"товар в наличии {sd} дн. из {MINUS_AFTER_RESTOCK_DAYS}, автоминус включится через "
                              f"{MINUS_AFTER_RESTOCK_DAYS - sd} дн." if sd is not None else
-                             f"товара нет на складах WB (или остаток неизвестен) — автоминус включится через "
+                             f"товара нет в наличии (или остаток неизвестен) — автоминус включится через "
                              f"{MINUS_AFTER_RESTOCK_DAYS} дн. после появления"))
                     for q, s in bad:
                         if q in held:
