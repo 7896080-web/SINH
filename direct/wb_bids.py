@@ -7,7 +7,9 @@
   • Ставки товаров — подтягивает к рекомендованной WB для нужных позиций, но не выше окупаемой:
       за клики:  допустимая цена заказа × конверсия товара (клик → заказ);
       за показы: допустимая цена заказа × конверсия × CTR × 1000.
-    Растёт не больше чем на 30% за запуск, снижается сразу. Нет на складах WB → минимальная.
+    Растёт не больше чем на 30% в сутки (от ставки при первом запуске за день, сколько бы запусков
+    ни было — ставка «на начало дня» хранится в wb_bids_state.json), снижается сразу.
+    Нет на складах WB → минимальная.
   • cluster_bids — ставки на поисковые кластеры (только ручная ставка + оплата за показы):
       "all" — на все кластеры, по которым WB даёт рекомендацию;
       "top" — только на лучшие запросы из кампании clusters_from (сколько заказов принесли).
@@ -17,6 +19,8 @@
   • auto_minus — минус-фразы для запросов, которые много кликали и ни разу не заказали
       (ожидалось ≥ 3 заказов при средней конверсии кампании, а их 0). Не больше 20 за запуск,
       слова из PROTECT не трогаются, ваши собственные минус-фразы сохраняются.
+      Только для товара, который лежит на складах WB не меньше MINUS_AFTER_RESTOCK_DAYS (14) дней подряд:
+      без остатка запросы не продают, и судить их рано. Слова «не наша аудитория» (MINUS_WORDS) — сразу.
   • route_from — запросы, на которые стоят ставки в кампании route_from (за показы),
       добавляются в минус-фразы этой кампании (за клики), чтобы кампании не перебивали друг друга.
       Если запрос уберут из route_from — минус-фраза снимется сама.
@@ -71,7 +75,7 @@ DEFAULTS = {
     "max_cost_per_order_default": 600,
     "max_bid_cpc": 60,          # потолок ставки за клик, ₽
     "max_bid_cpm": 800,         # потолок ставки за 1000 показов, ₽
-    "max_raise_pct": 30,        # максимум роста ставки за запуск, %
+    "max_raise_pct": 30,        # максимум роста ставки в сутки, % (от ставки при первом запуске за день)
     "no_stock": "min",          # нет на складах WB: "min" — минимальная ставка, "skip" — не трогать
     "base_bid": "auto",         # "min" — ставка товара минимальная (для кампаний «только лучшие запросы»)
     "cluster_bids": None,       # None / "all" / "top"
@@ -91,6 +95,8 @@ MINUS_MAX_PER_RUN = 20              # не больше стольких нов�
 RETURN_FACTOR = 1.5                 # "top": запрос возвращается в клики, если заказ за показы дороже лимита в 1,5 раза
 RETURN_PAUSE_DAYS = 30              # …и после возврата столько дней не передаётся за показы снова
 STATS_DAYS = 14                     # статистика товаров для конверсии
+UNIT_MAX_AGE = 14                   # "auto": предупредить, если юнит-экономика старше стольких дней
+MINUS_AFTER_RESTOCK_DAYS = 14       # автоминус по товару — только после стольких дней подряд на складах WB
 CLUSTER_DAYS = 30                   # статистика запросов
 PRIOR_CR, K_CLICKS = 0.03, 100      # конверсия по умолчанию и её вес
 PRIOR_CTR, K_VIEWS = 0.03, 1000     # CTR в поиске по умолчанию и его вес
@@ -191,23 +197,50 @@ def cut(s, n):
 
 
 def load_unit_limits():
-    """{(кабинет, артикул): лимит цены заказа, ₽} из wb_unit_economics.csv."""
+    """{(кабинет, артикул): лимит цены заказа, ₽} из wb_unit_economics.csv.
+    Если в RULES есть "auto", предупреждает: файла нет, он старый или себестоимость в нём — оценка."""
     import csv
     p = HERE / "wb_unit_economics.csv"
     res = {}
+    auto_cabs = {cab for cab, rules in RULES.items() for rule in rules.values()
+                 if dict(DEFAULTS, **rule)["max_cost_per_order"] == "auto"}
     if not p.exists():
+        if auto_cabs:
+            log(f"! Нет файла wb_unit_economics.csv, а в RULES стоит \"auto\" ({', '.join(sorted(auto_cabs))}) — "
+                "для всех товаров беру max_cost_per_order_default. Запустите: python wb_unit.py")
         return res
     raw = p.read_bytes()
     try:
         text = raw.decode("utf-8-sig")
     except UnicodeDecodeError:
         text = raw.decode("cp1251")
+    est, dates = set(), []
     for r in csv.DictReader(text.splitlines(), delimiter=";"):
         try:
             v = float(str(r.get("лимит цены заказа") or "").replace(",", ".").replace(" ", ""))
             res[(r.get("кабинет"), int(r.get("артикул WB")))] = v
         except (TypeError, ValueError):
-            pass
+            continue
+        if r.get("кабинет") in auto_cabs:
+            if (r.get("себестоимость") or "").strip() == "оценка":
+                est.add((r.get("кабинет"), r.get("артикул WB")))
+            if r.get("дата расчёта"):
+                dates.append(r["дата расчёта"])
+    if auto_cabs:
+        try:
+            made = dt.date.fromisoformat(min(dates)) if dates else dt.date.fromtimestamp(p.stat().st_mtime)
+            age = (dt.date.today() - made).days
+        except ValueError:
+            age = (dt.date.today() - dt.date.fromtimestamp(p.stat().st_mtime)).days
+        if not any(k[0] in auto_cabs for k in res):
+            log("! В wb_unit_economics.csv нет лимитов для кабинетов с \"auto\" — беру max_cost_per_order_default. "
+                "Запустите: python wb_unit.py")
+        elif age > UNIT_MAX_AGE:
+            log(f"! Юнит-экономике {age} дн. (лимиты цены заказа для \"auto\" могли устареть) — обновите: python wb_unit.py")
+        if est:
+            log(f"! У {len(est)} товаров в wb_unit_economics.csv себестоимость — оценка (доля от цены, "
+                "в wb_unit.py по умолчанию 37%), "
+                "лимит цены заказа для \"auto\" приблизительный. Впишите себестоимость в wb_cost.csv и запустите wb_unit.py.")
     return res
 
 
@@ -261,6 +294,35 @@ def load_state():
 
 def pk(cid, nm):
     return f"{cid}:{nm}"
+
+
+def save_state(state):
+    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def day_base(state, kind, cid, nm, sub):
+    """Ставка на начало суток (kind "bids": sub = зона, "clusters": sub = запрос) или None, если сегодня
+    --apply по ней ещё не было — тогда база = текущая ставка."""
+    db = state.get("day_base") or {}
+    if db.get("date") != dt.date.today().isoformat():
+        return None
+    return ((db.get(kind) or {}).get(pk(cid, nm)) or {}).get(sub)
+
+
+def record_day_base(state, plan):
+    """Только при --apply: запоминает ставку до первого за сутки изменения (повторные запуски её не трогают)."""
+    today = dt.date.today().isoformat()
+    db = state.get("day_base")
+    if not db or db.get("date") != today:
+        db = state["day_base"] = {"date": today, "bids": {}, "clusters": {}}
+    for i in plan["bids"]:
+        v = i["old"] or i["new"]
+        if v:
+            db["bids"].setdefault(pk(i["advert_id"], i["nm_id"]), {}).setdefault(i["placement"], v)
+    for i in plan["cluster_bids"]:
+        v = i["old"] if i["old"] is not None else i["new"]
+        if v and not i.get("returned"):
+            db["clusters"].setdefault(pk(i["advert_id"], i["nm_id"]), {}).setdefault(i["query"], v)
 
 
 # ============================ чтение из WB ============================
@@ -451,15 +513,19 @@ def smooth(hit, total, prior, k):
     return (hit + prior * k) / (total + k)
 
 
-def new_bid(current, rec, cap, mn, step, max_raise):
-    """Возвращает (новая ставка, причина)."""
+def new_bid(current, rec, cap, mn, step, max_raise, base=None):
+    """Возвращает (новая ставка, причина). base — ставка на начало суток (первая, увиденная сегодня):
+    рост за сутки не больше max_raise % от неё, сколько бы запусков ни было. Снижение — без ограничений."""
     if not rec:
         return current, "WB не дал рекомендацию"
     new = min(rec, cap)
     reason = "до рекомендованной" if rec <= cap else "потолок по цене заказа"
-    if current and new > current * (1 + max_raise / 100):
-        new = int(current * (1 + max_raise / 100))
-        reason += f", рост ограничен +{max_raise}%"
+    base = base or current
+    if base:
+        top = max(current or 0, int(base * (1 + max_raise / 100)))
+        if new > top:
+            new = top
+            reason += f", рост ограничен +{max_raise}% в сутки"
     new = int(math.floor(new / step) * step)
     if mn and new < mn:
         new = mn
@@ -508,6 +574,32 @@ def plan_cabinet(cab, token, rules, state):
     def no_stock(nm):
         s = (stock or {}).get(nm)
         return s is not None and s.get("wb") is not None and s["wb"] <= 0
+
+    # с какого дня товар непрерывно на складах WB (для автоминуса). Меняется только в памяти —
+    # в wb_bids_state.json попадает лишь при --apply; пробный прогон ничего не записывает.
+    today = dt.date.today()
+    since = state.setdefault("in_stock_since", {})
+    started = []
+    if stock is not None:
+        for nm in sorted({nm for cid in involved for nm in nms_of[cid]}):
+            wb = (stock.get(nm) or {}).get("wb")
+            if wb is None:
+                continue                      # остаток по товару неизвестен — отсчёт не меняем
+            if wb > 0 and str(nm) not in since:
+                since[str(nm)] = today.isoformat()
+                started.append(nm)
+            elif wb <= 0:
+                since.pop(str(nm), None)
+
+    def stock_days(nm):
+        d = since.get(str(nm))
+        return (today - dt.date.fromisoformat(d)).days if d else None
+
+    started = [nm for nm in started if any(todo[c]["auto_minus"] and nm in nms_of[c] for c in todo)]
+    if started:
+        log(f"  Остатки на WB: отсчёт наличия начат сегодня для {len(started)} тов. "
+            f"({', '.join(map(str, started[:10]))}{' …' if len(started) > 10 else ''}) — автоминус по ним включится "
+            f"через {MINUS_AFTER_RESTOCK_DAYS} дн. (слова «не наша аудитория» — сразу).")
 
     cfg = get_config(token)
     steps = {"cpc": int(cfg.get("cpcStep") or 100), "cpm": int(cfg.get("cpmStep") or 100)}
@@ -587,7 +679,8 @@ def plan_cabinet(cab, token, rules, state):
                             rec = ((data.get("base") or {}).get(CPM_LEVEL[target]) or {}).get("bidKopecks")
                     except ApiError as e:
                         log(f"      ! {e}")
-                    nb, reason = new_bid(current, rec, cap, mn, step, r["max_raise_pct"])
+                    nb, reason = new_bid(current, rec, cap, mn, step, r["max_raise_pct"],
+                                         day_base(state, "bids", cid, nm, placement))
                 ch = changed(nb, current, step)
                 log(f"      {nm:>11} {cut(s_info.get('vendor'), 16):16}{'' if wb is None else int(wb):>6}"
                     f"{int(v['clicks']):>6}{int(v['orders']):>5}{cr * 100:>5.1f}%{rub(current):>9}{rub(rec):>9}"
@@ -654,7 +747,8 @@ def plan_cabinet(cab, token, rules, state):
                         cur = cur_cb.get((cid, nm), {}).get(q)
                         if rec is None:
                             rec = ((get_rec(token, cid, nm).get("base") or {}).get(CPM_LEVEL[target]) or {}).get("bidKopecks")
-                        nb, reason = new_bid(cur, rec, cap, mn, step, r["max_raise_pct"])
+                        nb, reason = new_bid(cur, rec, cap, mn, step, r["max_raise_pct"],
+                                             day_base(state, "clusters", cid, nm, q))
                         planned_cluster[(cid, nm)].add(q)
                         if nb is None:
                             continue
@@ -694,6 +788,7 @@ def plan_cabinet(cab, token, rules, state):
             tot_c = sum(s["clicks"] for p, d in cl.items() if p[0] == cid for s in d.values())
             tot_o = sum(s["orders"] for p, d in cl.items() if p[0] == cid for s in d.values())
             cr_ref = smooth(tot_o, tot_c, PRIOR_CR, K_CLICKS)
+            held_notes = []
             for nm in (nms if cur_minus is not None else []):
                 key = pk(cid, nm)
                 if (cid, nm) not in cur_minus:
@@ -709,8 +804,10 @@ def plan_cabinet(cab, token, rules, state):
                 for q in sorted(prev_route - route_want.get(nm, set())):
                     if q in cur_set:
                         rem_route.append(q)
-                # плохие запросы
-                if r["auto_minus"] and not no_stock(nm):
+                # плохие запросы; пока товар меньше MINUS_AFTER_RESTOCK_DAYS дней на складах WB — только MINUS_WORDS
+                if r["auto_minus"]:
+                    sd = stock_days(nm)
+                    gated = sd is None or sd < MINUS_AFTER_RESTOCK_DAYS
                     cs = cl.get((cid, nm), {})
                     bad = sorted(((q, s) for q, s in cs.items()
                                   if s["orders"] == 0 and (s["clicks"] >= MINUS_MIN_CLICKS or negative(q))
@@ -718,7 +815,17 @@ def plan_cabinet(cab, token, rules, state):
                                   and not protected(q) and q not in planned_cluster.get((cid, nm), set())
                                   and q not in route_want.get(nm, set())),
                                  key=lambda x: (not negative(x[0]), -x[1]["spend"]))
+                    held = {q for q, s in bad if gated and not negative(q)}
+                    if held:
+                        held_notes.append(
+                            f"      … {nm:>11} {len(held)} запр. без заказов пока не в минус: " +
+                            (f"товар на складах WB {sd} дн. из {MINUS_AFTER_RESTOCK_DAYS}, автоминус включится через "
+                             f"{MINUS_AFTER_RESTOCK_DAYS - sd} дн." if sd is not None else
+                             f"товара нет на складах WB (или остаток неизвестен) — автоминус включится через "
+                             f"{MINUS_AFTER_RESTOCK_DAYS} дн. после появления"))
                     for q, s in bad:
+                        if q in held:
+                            continue
                         if added_total >= MINUS_MAX_PER_RUN:
                             break
                         add_auto.append(q)
@@ -745,6 +852,8 @@ def plan_cabinet(cab, token, rules, state):
                         log(f"      − {m['nm_id']:>11} {cut(q, 40):40} возвращён (в «{r['route_from']}» ставки больше нет)")
             elif cur_minus is not None:
                 log("    Минус-фразы: добавлять нечего.")
+            for note in held_notes:
+                log(note)
 
         # ---- дневной лимит ----
         if r["daily_limit"]:
@@ -929,8 +1038,8 @@ def main():
         return
 
     apply = "--apply" in sys.argv
-    UNIT_LIMITS.update(load_unit_limits())
     log(f"{dt.datetime.now():%d.%m.%Y %H:%M} — {'ПРИМЕНЕНИЕ' if apply else 'пробный прогон, ничего не меняется'}")
+    UNIT_LIMITS.update(load_unit_limits())
     if UNIT_LIMITS:
         log(f"Юнит-экономика: лимиты цены заказа для {len(UNIT_LIMITS)} товаров (wb_unit_economics.csv).")
     print("Рекомендации WB отдаёт по одному товару раз в 12 секунд — на кампанию уходит несколько минут.")
@@ -961,12 +1070,15 @@ def main():
         path = BACKUP_DIR / f"bids_{dt.datetime.now():%Y%m%d_%H%M%S}.json"
         path.write_text(json.dumps(plan, ensure_ascii=False, indent=1), encoding="utf-8")
         log(f"Резервная копия: {path.name}")
+        record_day_base(state, plan)
         run_apply(cabs, plan, "new", state)
         log("Откат: python wb_bids.py --rollback")
     elif any(plan.values()):
         if DATA_PROBLEMS:
             log("! Часть данных не загрузилась (см. «!» выше) — --apply сейчас откажется применять.")
         log("Это пробный прогон. Применить: python wb_bids.py --apply")
+    if apply and not DATA_PROBLEMS:
+        save_state(state)     # ставки на начало дня и отсчёт наличия на WB — только при настоящем применении
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write("\n".join(out) + "\n\n")
 

@@ -17,7 +17,7 @@
          python wb_unit.py 60         — за 60 дней
          python wb_unit.py --cabinet "Яворская"
 Нужны категории токена: «Финансы», «Продвижение», «Аналитика».
-Результат: wb_unit_report.txt, wb_unit_economics.csv
+Результат: wb_unit_report.txt, wb_unit_economics.csv (строки других кабинетов при --cabinet сохраняются)
 """
 import datetime as dt
 from collections import defaultdict
@@ -49,9 +49,16 @@ def load_costs():
     return by_nm, by_vendor
 
 
+def merge_unit_rows(old_rows, new_rows, done_cabs):
+    """Строки кабинетов из done_cabs заменяются новыми, строки остальных кабинетов остаются как были
+    (запуск с --cabinet или сбой одного кабинета не стирает чужую юнит-экономику)."""
+    keep = [{k: v for k, v in r.items() if k} for r in old_rows if r.get("кабинет") not in done_cabs]
+    return keep + list(new_rows)
+
+
 def ensure_cost_template(products):
-    existing = {r.get("артикул WB") for r in read_csv("wb_cost.csv")}
     rows = read_csv("wb_cost.csv")
+    existing = {r.get("артикул WB") for r in rows}
     added = 0
     for nm, p in sorted(products.items(), key=lambda x: str(x[1].get("vendor"))):
         if str(nm) not in existing:
@@ -59,8 +66,10 @@ def ensure_cost_template(products):
                          "название": p.get("title") or "", "себестоимость": ""})
             added += 1
     if added:
-        write_csv("wb_cost.csv", [{k: r.get(k, "") for k in ("кабинет", "артикул WB", "артикул продавца", "название",
-                                                               "себестоимость")} for r in rows])
+        # свои колонки пользователя (если дописал) сохраняются; себестоимость не трогаем
+        base = ("кабинет", "артикул WB", "артикул продавца", "название", "себестоимость")
+        write_csv("wb_cost.csv", [{**{k: r.get(k) or "" for k in base},
+                                   **{k: v for k, v in r.items() if k and k not in base}} for r in rows])
     return added
 
 
@@ -164,6 +173,7 @@ def analyze(cab, token, costs_nm, costs_vendor):
             "реклама ₽": round(s["sum"], 2), "заказов с рекламы": int(s["orders"]),
             "цена заказа с рекламы факт": round(cpo_fact, 2) if cpo_fact else "",
             "прибыль после рекламы ₽": round(profit - s["sum"], 2),
+            "дата расчёта": TODAY.isoformat(),
         })
     res.sort(key=lambda r: -r["выручка ₽"])
 
@@ -217,17 +227,21 @@ def main():
     costs_nm, costs_vendor = load_costs()
     log(f"Юнит-экономика WB: {len(cabs)} каб., {DAYS} дн. Налоги {TAX_SHARE:.1%} от выручки, "
         f"себестоимость по умолчанию {DEFAULT_COGS_SHARE:.0%} от цены.")
-    allrows, products = [], {}
+    allrows, products, done = [], {}, set()
     for cab, token in cabs.items():
         try:
             rows = analyze(cab, token, costs_nm, costs_vendor)
         except ApiError as e:
-            log(f"  ✗ {cab}: {e}")
+            log(f"  ✗ {cab}: {e} — прежняя юнит-экономика кабинета в wb_unit_economics.csv сохранена.")
             continue
+        if not rows:
+            log(f"  Прежняя юнит-экономика кабинета «{cab}» в wb_unit_economics.csv сохранена.")
+            continue
+        done.add(cab)
         allrows += rows
         for r in rows:
             products[r["артикул WB"]] = {"cab": cab, "vendor": r["артикул продавца"], "title": r["название"]}
-    write_csv("wb_unit_economics.csv", allrows)
+    write_csv("wb_unit_economics.csv", merge_unit_rows(read_csv("wb_unit_economics.csv"), allrows, done))
     added = ensure_cost_template(products)
     if added:
         log(f"\nВ wb_cost.csv добавлено артикулов без себестоимости: {added}. Откройте файл в Excel, впишите "

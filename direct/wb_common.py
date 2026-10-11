@@ -160,8 +160,25 @@ def arg_int(default):
     return default
 
 
-def write_csv(path, rows):
+def write_csv(path, rows, header=None):
+    """Пишет таблицу. Пустой результат тоже записывается (только заголовок), чтобы не остался старый файл
+    с прошлыми данными: заголовок — header или из старого файла; если его взять неоткуда — старый файл удаляется."""
     if not rows:
+        p = HERE / path
+        cols = list(header or [])
+        if not cols and p.exists():
+            raw = p.read_bytes()
+            try:
+                text = raw.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                text = raw.decode("cp1251")
+            cols = next(csv.reader(text.splitlines()[:1], delimiter=";"), [])
+        cols = [c for c in cols if c]
+        if cols:
+            with open(p, "w", encoding="utf-8-sig", newline="") as f:
+                csv.writer(f, delimiter=";").writerow(cols)
+        elif p.exists():
+            p.unlink()
         return
     cols = list(rows[0].keys())
     for r in rows[1:]:
