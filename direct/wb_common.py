@@ -54,7 +54,9 @@ def pace(token, key, interval):
     _last[k] = time.time()
 
 
-CATEGORY_HINT = {ADV: "Продвижение", ANA: "Аналитика", STAT: "Статистика", FIN: "Финансы", COMMON: "любая"}
+CATEGORY_HINT = {ADV: "Продвижение", ANA: "Аналитика", STAT: "Статистика", FIN: "Финансы", COMMON: "любая",
+                 "https://marketplace-api.wildberries.ru": "Маркетплейс",
+                 "https://feedbacks-api.wildberries.ru": "Вопросы и отзывы"}
 
 
 def call(method, url, token, params=None, body=None, what=""):
