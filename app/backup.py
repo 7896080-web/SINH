@@ -90,10 +90,28 @@ DEFAULT_RCLONE_EXE = r"C:\sync_admin\tools\rclone.exe"
 # руками, всё сошлось — а суточная выгрузка молчит. Тот же класс отказа, что и
 # «клиенту нужна живая сессия», поэтому путь общий и лежит рядом с приложением.
 DEFAULT_RCLONE_CONFIG = r"C:\sync_admin\rclone.conf"
-# Выгрузка идёт в фоновом задании, и повиснуть на ней нельзя: воркер в это время
-# не принимает заказы. Пятнадцати минут хватает на сотни мегабайт по любому
-# разумному каналу, а всё, что дольше, — это уже не медленная сеть, а зависание.
-RCLONE_TIMEOUT = 900
+# Сколько ждём rclone. Пределов ДВА, и это не аккуратность: «медленно» и
+# «повисло» — разные беды, и один предел на обе лечит только одну.
+#
+# 12.10 замер на боевом сервере по WebDAV Яндекс.Диска: 111 КиБ/с, то есть
+# копия в 305 МБ уезжает СОРОК ШЕСТЬ МИНУТ, ровно и без срывов. Прежние 900 с
+# на все команды разом обрывали её на одиннадцати процентах — и выглядело это
+# как «rclone не ответил», то есть как зависание, которого не было.
+#
+# Листинг и удаление — секунды работы: им долгий предел не нужен и вреден,
+# повисший `lsjson` держал бы задание часами.
+RCLONE_TIMEOUT = 300
+# Выгрузка копии. Запас от замера четырёхкратный, и он нужен: база растёт
+# примерно на 7 МБ в сутки, то есть минута выгрузки в день. Числом «46 минут
+# плюс чуть-чуть» мы купили бы себе ровно то же падение через полгода, и
+# искать причину пришлось бы заново.
+RCLONE_UPLOAD_TIMEOUT = 4 * 3600
+# А «повисло» ловит САМ rclone, и это главное: он знает, идут ли байты, а мы
+# снаружи видим только, что процесс жив. Выгрузка, по которой две минуты не
+# прошло ни байта, обрывается им самим — то есть долгий предел выше не
+# превращается в четыре часа ожидания мёртвого соединения.
+RCLONE_STALL_SECONDS = 120
+RCLONE_CONNECT_SECONDS = 30
 
 # Сколько храним. Ежедневных две недели — этого хватает, чтобы заметить порчу
 # данных, которую видно не сразу (перепутанный мэппинг, неверный импорт).
@@ -572,13 +590,23 @@ def rclone_settings(db=None) -> tuple[str, str, str] | None:
     return exe, remote.rstrip("/"), config
 
 
-def _run_rclone(exe: str, config: str, args: list[str]) -> tuple[bool, str]:
+def _run_rclone(exe: str, config: str, args: list[str],
+                timeout: int = RCLONE_TIMEOUT) -> tuple[bool, str]:
     """Позвать rclone. (получилось, что сказал).
 
     Вывод обрезаем: он уезжает в `last_error` успешной отметки, а её читает и
     «Диагностика», и находка отчёта — простыня там вытеснила бы всё остальное.
+
+    `timeout` задаётся вызывающим: у листинга и у выгрузки копии он разный на
+    порядок — см. `RCLONE_UPLOAD_TIMEOUT`.
     """
-    command = [exe, "--config", config, "--log-level", "ERROR"] + args
+    # `--log-level` стоит ПОСЛЕДНИМ среди наших флагов намеренно: подкоманда
+    # всегда идёт следом за ним, и проверки находят её по этому месту. Вставишь
+    # новый флаг после — и они начнут смотреть не туда.
+    command = [exe, "--config", config,
+               "--contimeout", f"{RCLONE_CONNECT_SECONDS}s",
+               "--timeout", f"{RCLONE_STALL_SECONDS}s",
+               "--log-level", "ERROR"] + args
     try:
         # Кодировка задаётся ЯВНО. `text=True` декодирует по
         # `locale.getpreferredencoding()`, а на боевой Windows с русской
@@ -601,11 +629,11 @@ def _run_rclone(exe: str, config: str, args: list[str]) -> tuple[bool, str]:
         # потерять сообщение целиком — ровно то же правило, по которому
         # скрипты глушат ошибку кодирования на выводе.
         done = subprocess.run(command, capture_output=True, encoding="utf-8",
-                              errors="replace", timeout=RCLONE_TIMEOUT)
+                              errors="replace", timeout=timeout)
     except FileNotFoundError:
         return False, f"rclone не найден: {exe}"
     except subprocess.TimeoutExpired:
-        return False, f"rclone не ответил за {RCLONE_TIMEOUT} с"
+        return False, f"rclone не ответил за {timeout} с"
     except Exception as e:                           # noqa: BLE001
         return False, f"{type(e).__name__}: {e}"
     if done.returncode != 0:
@@ -668,15 +696,15 @@ def cloud_gist(said: str, remote: str) -> str:
     """
     code = cloud_code(said)
     if code in CLOUD_NO_FOLDER_CODES:
-        return (f"папки {remote} в облаке нет — создайте её "
+        return (f"папки {remote} там нет — создайте её "
                 "(rclone mkdir) или поправьте «Путь в облаке»")
     if code in CLOUD_ACCESS_CODES:
-        return ("облако не пускает — токен отозван или доступ снят, "
+        return ("не пускает — токен отозван или доступ снят, "
                 "нужен rclone config")
     if code in CLOUD_FULL_CODES:
-        return "в облаке кончилось место"
+        return "кончилось место"
     if code in CLOUD_TRANSIENT_CODES:
-        return (f"облако отвечает отказом ({code}) — такое обычно проходит "
+        return (f"отвечает отказом ({code}) — такое обычно проходит "
                 f"само; если держится дольше суток, проверьте, на месте ли "
                 f"папка {remote}")
     return ""
@@ -691,6 +719,12 @@ def _cloud_problem(said: str, remote: str) -> str:
     """
     gist = cloud_gist(said, remote)
     return f"{gist}. {said}" if gist else said
+
+
+# Площадку называет ОДИН раз тот, кто её знает, — `upload_to_remote` подписывает
+# свою строку словом «облако», а причина начинается сразу с существа дела.
+# Повтори его обе стороны, и на «Диагностике» встало бы «облако: облако
+# отвечает отказом»: читается как сбой самого сообщения.
 
 
 def _remote_listing(exe: str, config: str, remote: str) -> tuple[list[dict], str]:
@@ -726,7 +760,8 @@ def upload_to_remote(source: Path, db=None) -> str:
     exe, remote, config = settings
 
     ok, said = _run_rclone(exe, config,
-                           ["copyto", str(source), f"{remote}/{source.name}"])
+                           ["copyto", str(source), f"{remote}/{source.name}"],
+                           timeout=RCLONE_UPLOAD_TIMEOUT)
     if not ok:
         return f"облако: {_cloud_problem(said, remote)}"
 

@@ -54,11 +54,13 @@ class Rclone:
         self.stdout = stdout.encode("utf-8")
         self.code = code
         self.calls = []
+        self.waited = []                 # сколько секунд ждали каждую команду
         self.kwargs = {}
 
     def __call__(self, command, capture_output=True, timeout=None,
                  encoding=None, errors=None, text=False):
         self.calls.append(command)
+        self.waited.append(timeout)
         self.kwargs = {"encoding": encoding, "errors": errors, "text": text}
         enc = encoding or (WINDOWS_LOCALE if text else None)
         if enc is None:                      # байтовый режим — нам не нужен
@@ -137,7 +139,7 @@ def test_the_fake_would_actually_catch_the_mojibake():
 
 @pytest.mark.parametrize("said, expected", [
     ("[410 - GoneError] Gone (Ресурс больше недоступен.)", "отвечает отказом (410)"),
-    ("HTTP error 404 (404 Not Found)", "в облаке нет"),
+    ("HTTP error 404 (404 Not Found)", "там нет"),
     ("googleapi: Error 403: Forbidden", "не пускает"),
     ("status code 503", "отвечает отказом (503)"),
     ("[507 - InsufficientStorage]", "кончилось место"),
@@ -344,3 +346,85 @@ def test_without_a_second_site_nothing_is_stamped(db, monkeypatch):
     marks = _run_job_backup(db, monkeypatch, mirror_error="", configured=False)
 
     assert MIRROR_OK_MARKER not in marks
+
+
+# --------------------------------------------------------------- сколько ждём
+
+def test_the_upload_gets_its_own_patience(copy, configured, monkeypatch):
+    """Выгрузке дают часы, листингу — минуты. Один предел на обе беды не годится.
+
+    12.10 замер по WebDAV Яндекс.Диска: 111 КиБ/с, то есть копия в 305 МБ
+    уезжает 46 минут ровно и без срывов. Прежние 900 с на все команды разом
+    обрывали её на одиннадцати процентах, и выглядело это как «rclone не
+    ответил» — то есть как зависание, которого не было.
+
+    Обратную сторону тоже нельзя потерять: дай мы четыре часа листингу,
+    повисший `lsjson` держал бы суточное задание полдня.
+    """
+    fake = Rclone(stdout="[]", code=0)
+    monkeypatch.setattr(subprocess, "run", fake)
+
+    backup.upload_to_remote(copy)
+
+    waited = dict(zip(fake.subcommands(), fake.waited))
+    assert waited["copyto"] == backup.RCLONE_UPLOAD_TIMEOUT
+    assert waited["lsjson"] == backup.RCLONE_TIMEOUT
+    assert backup.RCLONE_UPLOAD_TIMEOUT > backup.RCLONE_TIMEOUT * 4
+
+
+def test_the_upload_limit_has_room_for_a_growing_database():
+    """Запас считается ОТ ЗАМЕРА, а не «46 минут плюс чуть-чуть».
+
+    База растёт примерно на 7 МБ в сутки — это минута выгрузки в день. Предел
+    впритык купил бы ровно то же падение через полгода, и причину пришлось бы
+    искать заново.
+    """
+    measured_seconds = 305 * 1024 / 111        # 305 МБ на 111 КиБ/с
+    assert backup.RCLONE_UPLOAD_TIMEOUT > measured_seconds * 3
+
+
+def test_a_hung_connection_is_cut_by_rclone_itself(copy, configured, monkeypatch):
+    """Долгий предел НЕ должен означать четыре часа ожидания мертвеца.
+
+    Снаружи мы видим только, что процесс жив; идут ли байты, знает сам rclone.
+    Поэтому у него свои пределы на простой и на соединение — без них четыре
+    часа терпения превратились бы в четыре часа висящего суточного задания.
+    """
+    fake = Rclone(stdout="[]", code=0)
+    monkeypatch.setattr(subprocess, "run", fake)
+
+    backup.upload_to_remote(copy)
+
+    command = fake.calls[0]
+    assert "--timeout" in command, command
+    assert "--contimeout" in command, command
+    assert command[command.index("--timeout") + 1].endswith("s")
+
+
+def test_the_refusal_names_the_limit_that_was_hit(copy, configured, monkeypatch):
+    """«Не ответил за 900 с» при пределе в четыре часа — неправда в сообщении.
+
+    Человек читает его на «Диагностике» и по нему решает, поднимать предел или
+    искать зависание.
+    """
+    def hang(*a, **kw):
+        raise subprocess.TimeoutExpired("rclone", kw.get("timeout"))
+
+    monkeypatch.setattr(subprocess, "run", hang)
+
+    problem = backup.upload_to_remote(copy)
+
+    assert str(backup.RCLONE_UPLOAD_TIMEOUT) in problem, problem
+
+
+def test_the_cloud_is_named_once(copy, configured, monkeypatch):
+    """«облако: облако отвечает отказом» читается как сбой самого сообщения.
+
+    Площадку подписывает тот, кто её знает, а причина начинается с существа
+    дела. 12.10 на бою это и вышло: слово задвоилось в первой же оговорке.
+    """
+    monkeypatch.setattr(subprocess, "run", Rclone(stderr=GONE))
+
+    problem = backup.upload_to_remote(copy)
+
+    assert problem.count("облако") == 1, problem
