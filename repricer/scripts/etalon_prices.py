@@ -26,13 +26,13 @@ import argparse
 import os
 import statistics
 import sys
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.stdout.reconfigure(errors="replace")      # консоль Windows — cp1251
 
 import priceapp  # noqa: E402,F401  (.env читается на импорте)
-from priceapp import mapping, rates  # noqa: E402
+from priceapp import mapping, platforms, rates  # noqa: E402
 from priceapp.database import SessionLocal  # noqa: E402
 from priceapp.models import Account, OnecBarcode, OnecCost  # noqa: E402
 from priceapp.platforms import PLATFORMS  # noqa: E402
@@ -141,8 +141,35 @@ def wb_rows(db, et: dict, wb_discount: Decimal, articles, costs, info, usd,
                         "avg": avg, "etalon": e,
                         "vs_avg": (float(facts.sale) / float(avg) - 1) * 100 if facts.sale and avg else None,
                         "margin": margin, "commission": facts.commission,
+                        "card": _wb_card(rows),
                         **wb_plan(facts.current, facts.sale, lo, hi)})
+    mark_mixed_cards(out)
     return out
+
+
+MIXED = "цены со скидкой по размерам разные — отправлять ТОЛЬКО по размерам"
+
+
+def _wb_card(rows) -> str:
+    for r in rows or []:
+        if r is not None and getattr(r, "external_id", ""):
+            return platforms.card_key("wb", r)
+    return ""
+
+
+def mark_mixed_cards(out: list[dict]) -> int:
+    """Цена на WB уходит карточкой (nmID) — одна на все размеры, наибольшая. Если у размеров
+    одной карточки цена со скидкой РАЗНАЯ, такая отправка подняла бы цену дешёвым размерам,
+    а цена со скидкой не должна вырасти ни у одного. Помечаем такие карточки: им годится
+    только цена по размерам. Возвращает число помеченных карточек."""
+    sales: dict[tuple, set] = {}
+    for r in out:
+        if r["card"] and r["current_sale"]:
+            sales.setdefault((r["account"], r["card"]), set()).add(r["current_sale"])
+    mixed = {k for k, v in sales.items() if len(v) > 1}
+    for r in out:
+        r["mixed"] = (r["account"], r["card"]) in mixed
+    return len(mixed)
 
 
 IN_CORRIDOR = "скидка уже в коридоре"
@@ -157,7 +184,9 @@ def wb_plan(current_list: int | None, current_sale: int | None, lo: Decimal, hi:
     if lo / 100 <= need <= hi / 100:
         return {"action": IN_CORRIDOR, "disc": need, "list": current_list}
     bound = lo / 100 if need < lo / 100 else hi / 100
-    new_list = int((Decimal(current_sale) / (1 - bound)).quantize(Decimal(1), ROUND_HALF_UP))
+    # вниз, а не к ближайшему: цена со скидкой = цена до скидки × (1 − скидка) не должна
+    # стать больше нынешней даже на рубль
+    new_list = int((Decimal(current_sale) / (1 - bound)).quantize(Decimal(1), ROUND_FLOOR))
     return {"action": LIST_UP if new_list > current_list else LIST_DOWN, "disc": bound, "list": new_list}
 
 
@@ -208,6 +237,10 @@ def main() -> int:
             for act in (IN_CORRIDOR, LIST_UP, LIST_DOWN, NO_CURRENT):
                 if cnt.get(act):
                     print(f"  {cnt[act]:6d}  {act}")
+            mixed = {(r["account"], r["card"]) for r in wb if r["mixed"]}
+            if mixed:
+                print(f"  {len(mixed):6d}  карточек: {MIXED} (карточкой ушла бы наибольшая цена, "
+                      f"и дешёвые размеры подорожали бы)")
             cats: dict[str, list[dict]] = {}
             for r in wb:
                 cats.setdefault(r["category"], []).append(r)
@@ -282,12 +315,13 @@ def main() -> int:
                        "Сейчас: цена со скидкой, ₽", "Сейчас: скидка, %", "Средняя со скидкой по WB, ₽",
                        "Кабинет к средней, %", f"Эталон (−{args.wb_discount}%), ₽", "Что сделать",
                        "Новая цена до скидки, ₽", "Новая скидка, %", "Цена со скидкой (не меняется), ₽",
-                       "Маржинальность по текущей", "Комиссия, %"])
+                       "Маржинальность по текущей", "Комиссия, %", "Карточка"])
             for r in sorted(wb, key=lambda r: (r["category"], r["article"], r["size"], r["account"])):
                 ws.append([r["account"], r["category"], r["article"], r["size"], r["color"], r["item_id"],
                            r["current_list"], r["current_sale"], _pct(r["current_disc"]), _f(r["avg"], 0),
                            _f(r["vs_avg"], 1), _f(r["etalon"], 0), r["action"], r["list"], _pct(r["disc"]),
-                           r["current_sale"], _f(r["margin"]), _f(r["commission"])])
+                           r["current_sale"], _f(r["margin"]), _f(r["commission"]),
+                           MIXED if r["mixed"] else ""])
             book.save(args.xlsx)
             print(f"\nФайл: {args.xlsx}")
     finally:
