@@ -1,14 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-Часовая «сторожевая» проверка ставок WB (дополнение к автопилоту wb_bids.py).
+Часовая проверка ставок WB (дополнение к автопилоту wb_bids.py, который идёт 3 раза в день).
 
-Если WB поднял минимальную ставку и наша ставка оказалась ниже минимума, товар выпадает из показов до следующего
-прогона автопилота. Эта проверка раз в час смотрит только минимальные ставки (несколько запросов, ≈1 минута) и:
-  • поднимает ставку до нового минимума, если минимум НЕ выше окупаемого потолка товара
-    (потолок — из последнего применения wb_bids.py --apply: цена заказа × конверсия × поправка на выкуп);
-  • если минимум выше окупаемого потолка — ставку НЕ поднимает, а пишет в отчёт: реклама этого товара
-    по минимальной ставке убыточна, решать вам (оставить, убрать из кампании, поднять допустимую цену заказа).
-Больше ничего не меняет: рекомендации, бюджеты, лимиты, минус-фразы — дело wb_bids.py.
+За час рекомендованная ставка WB может заметно измениться. При оплате за клики WB списывает ровно нашу ставку:
+если для нужных мест теперь хватает 10 ₽, а у нас стоит 20 — каждый клик вдвое дороже, чем нужно. И наоборот:
+если WB поднял минимальную ставку выше нашей — товар выпадает из показов.
+
+Раз в час проверка:
+  1. Смотрит минимальные ставки WB. Ставка ниже минимума → поднимает до минимума, только если минимум НЕ выше
+     окупаемого потолка товара; если выше — не трогает и пишет в отчёт (решать вам).
+  2. Для самых кликабельных товаров (до REC_MAX штук, по кликам за 14 дней) смотрит рекомендованную ставку WB
+     и двигает нашу за ней — по тем же правилам, что автопилот:
+       • не выше окупаемого потолка (цена заказа × конверсия × поправка на выкуп — из последнего wb_bids.py --apply);
+       • не больше +30% / −30% за сутки от ставки на начало дня (сколько бы проверок ни было);
+       • не ниже минимальной ставки WB;
+       • товарам «без ходовых размеров» и «много кликов без заказов» — не повышает;
+       • товары, которым автопилот сознательно держит минимальную ставку (нет в наличии и т. п.), не трогает.
+Бюджеты, лимиты, минус-фразы, ставки по запросам — только wb_bids.py.
 
 Безопасность:
   • без --apply — пробный прогон: только показывает;
@@ -17,9 +25,10 @@
   • потолки старше 2 суток (автопилот давно не применялся) — ничего не меняет, только сообщает.
 
 Запуск:  python wb_guard.py              (пробный прогон)
-         python wb_guard.py --apply      (поднять до минимума, где это окупается)
+         python wb_guard.py --apply      (применить)
          python wb_guard.py --rollback   (вернуть ставки последнего запуска)
 По расписанию — каждый час с --apply (см. wb_schedule.ps1). Токен с категорией «Продвижение».
+Время: WB отдаёт рекомендации раз в 12 с — при REC_MAX = 40 проверка идёт ≈9 минут.
 Результат: вывод на экран + wb_guard_log.txt (дописывается).
 """
 import datetime as dt
@@ -30,6 +39,7 @@ from collections import defaultdict
 import wb_bids as B
 
 # ---------------- НАСТРОЙКИ ----------------
+REC_MAX = 40                # сколько товаров за проверку сверять с рекомендацией WB (самые кликабельные)
 CAPS_MAX_AGE_HOURS = 48     # потолки из wb_bids.py старше — не доверяю, ничего не меняю
 LOCK_MAX_AGE_HOURS = 2      # файл wb_bids.running старше — считаю, что автопилот упал, и работаю
 # -------------------------------------------
@@ -37,10 +47,6 @@ LOCK_MAX_AGE_HOURS = 2      # файл wb_bids.running старше — счит
 BACKUP_DIR = B.HERE / "wb_guard_backups"
 LOG_FILE = B.HERE / "wb_guard_log.txt"
 log = B.log
-
-
-def rub(k):
-    return B.rub(k)
 
 
 def busy():
@@ -58,36 +64,73 @@ def write_log():
         f.write("\n".join(B.out) + "\n\n")
 
 
-def plan_cabinet(cab, token, caps):
-    """Ставки ниже минимума WB: поднять (если окупается) или сообщить."""
+def rec_for(token, cid, nm, pay, target):
+    data = B.get_rec(token, cid, nm)
+    rec = B.rec_cpc(data, B.CPC_LEVEL[target]) if pay == "cpc" else B.rec_cpm(data, B.CPM_LEVEL[target])
+    if rec is None and data and target != "3-10":    # нет уровня для мест 1–2 — как автопилот, берём 3–10
+        rec = B.rec_cpc(data, B.CPC_LEVEL["3-10"]) if pay == "cpc" else B.rec_cpm(data, B.CPM_LEVEL["3-10"])
+    return rec
+
+
+def plan_cabinet(cab, token, caps, state, budget):
+    """Возвращает (изменения, «минимум выше окупаемого»). budget — сколько ещё товаров можно сверить с рекомендацией."""
     by_c = defaultdict(dict)
     for key, zones in caps.items():
         cid, nm = key.split(":")
         by_c[int(cid)][int(nm)] = zones
     camps = B.get_campaigns(token)
-    raise_, losing = [], []
-    for cid, items in sorted(by_c.items()):
+    cand = []                          # (кампания, товар, зона, данные кампании) — только активные кампании
+    for cid, items in by_c.items():
         a = camps.get(cid)
-        if not a or a.get("_status") != 9:
-            continue                                   # кампания не активна — показов и так нет
+        if a and a.get("_status") == 9:
+            for nm, zones in items.items():
+                for zone, c in zones.items():
+                    cand.append((cid, nm, zone, c if isinstance(c, dict) else {"cap": c, "fixed": True}, a))
+    # минимальные ставки — по всем товарам (дёшево: один запрос на кампанию и зону)
+    mins = {}
+    for cid, zone in sorted({(x[0], x[2]) for x in cand}):
+        a = camps[cid]
+        nms = [x[1] for x in cand if x[0] == cid and x[2] == zone]
+        for nm, v in B.get_min_bids(token, cid, nms, (a.get("settings") or {}).get("payment_type"), zone).items():
+            mins[(cid, nm, zone)] = v
+    # рекомендации — самым кликабельным, не «зафиксированным» правилом
+    rec_ok = {(x[0], x[1], x[2]) for x in sorted((x for x in cand if not x[3].get("fixed")),
+                                                  key=lambda x: -(x[3].get("clicks") or 0))[:budget]}
+    changes, losing, checked = [], [], 0
+    for cid, nm, zone, c, a in sorted(cand, key=lambda x: (x[0], -(x[3].get("clicks") or 0))):
         st = a.get("settings") or {}
-        name, pay = st.get("name"), st.get("payment_type")
         cur_all = {s.get("nm_id"): s.get("bids_kopecks") or {} for s in a.get("nm_settings") or []}
-        zones = sorted({z for zs in items.values() for z in zs})
-        for zone in zones:
-            nms = [nm for nm, zs in items.items() if zone in zs and nm in cur_all]
-            if not nms:
+        if nm not in cur_all:
+            continue                                   # товар убрали из кампании
+        cur = cur_all[nm].get("search" if zone == "combined" else zone)
+        mn, cap = mins.get((cid, nm, zone)), c["cap"]
+        if not cur:
+            continue
+        base = {"cabinet": cab, "advert_id": cid, "campaign": st.get("name"), "nm_id": nm, "placement": zone,
+                "old": cur, "cap": cap}
+        if mn and mn > cap:                            # окупаемо только ниже минимума WB
+            if cur < mn:
+                losing.append({**base, "new": mn})
+            continue
+        if (cid, nm, zone) in rec_ok:
+            checked += 1
+            try:
+                rec = rec_for(token, cid, nm, c.get("pay") or st.get("payment_type"), c.get("target") or "3-10")
+            except B.ApiError as e:
+                log(f"  ! {e}")
+                rec = None
+            if rec:
+                step = c.get("step") or 1
+                nb, why = B.new_bid(cur, rec, cap, mn or 0, step, c.get("max_raise", 30),
+                                    B.day_base(state, "bids", cid, nm, zone), c.get("max_drop"))
+                if c.get("no_raise") and nb > cur:
+                    nb, why = cur, "не повышаю (мало размеров или много кликов без заказов)"
+                if B.changed(nb, cur, step):
+                    changes.append({**base, "new": nb, "rec": rec, "why": why})
                 continue
-            mins = B.get_min_bids(token, cid, nms, pay, zone)
-            key_cur = "search" if zone == "combined" else zone
-            for nm in nms:
-                cur, mn, cap = cur_all[nm].get(key_cur), mins.get(nm), items[nm][zone]
-                if not mn or not cur or cur >= mn:
-                    continue
-                it = {"cabinet": cab, "advert_id": cid, "campaign": name, "nm_id": nm, "placement": zone,
-                      "old": cur, "new": mn, "cap": cap}
-                (raise_ if mn <= cap else losing).append(it)
-    return raise_, losing
+        if mn and cur < mn:                            # рекомендацию не смотрели — только минимум
+            changes.append({**base, "new": mn, "rec": None, "why": "ниже минимума WB → минимальная"})
+    return changes, losing, checked
 
 
 def main():
@@ -107,13 +150,14 @@ def main():
         return
 
     apply = "--apply" in sys.argv
-    log(f"{dt.datetime.now():%d.%m.%Y %H:%M} — проверка минимальных ставок WB "
+    log(f"{dt.datetime.now():%d.%m.%Y %H:%M} — часовая проверка ставок WB "
         f"({'ПРИМЕНЕНИЕ' if apply else 'пробный прогон, ничего не меняется'})")
     if busy():
         log("  Сейчас работает wb_bids.py — проверку пропускаю.")
         write_log()
         return
-    caps = (B.load_state().get("caps") or {})
+    state = B.load_state()
+    caps = state.get("caps") or {}
     try:
         age = dt.datetime.now() - dt.datetime.fromisoformat(caps.get("at") or "")
     except ValueError:
@@ -127,38 +171,42 @@ def main():
         write_log()
         return
 
-    all_raise, all_losing = [], []
+    changes, losing, budget = [], [], REC_MAX
     for cab, token in cabs.items():
         try:   # ID кампаний у WB уникальны: в каждом кабинете проверяются только его кампании
-            r, l = plan_cabinet(cab, token, caps["items"])
+            ch, lo, n = plan_cabinet(cab, token, caps["items"], state, budget)
         except B.ApiError as e:
             log(f"  ✗ {cab}: {e}")
             continue
-        all_raise += r
-        all_losing += l
-
-    if not all_raise and not all_losing:
-        log("  Все ставки не ниже минимальных — менять нечего.")
-    for it in all_raise:
-        log(f"  ↑ «{it['campaign']}» {it['nm_id']}: ставка {rub(it['old'])} ниже минимума WB → {rub(it['new'])} "
-            f"(окупаемый потолок {rub(it['cap'])})")
-    if all_losing:
+        changes += ch
+        losing += lo
+        budget = max(budget - n, 0)
+    print(" " * 60, end="\r")
+    log(f"  Сверено с рекомендацией WB: {REC_MAX - budget} тов.; изменений ставок: {len(changes)}.")
+    for it in changes:
+        arrow = "↑" if it["new"] > it["old"] else "↓"
+        log(f"  {arrow} «{it['campaign']}» {it['nm_id']}: {B.rub(it['old'])} → {B.rub(it['new'])}"
+            + (f" (рекоменд. WB {B.rub(it['rec'])}, потолок {B.rub(it['cap'])})" if it.get("rec") else
+               f" (потолок {B.rub(it['cap'])})") + f" — {it['why']}")
+    if losing:
         log("  Минимальная ставка WB выше окупаемого потолка — НЕ поднимаю (товар может выпасть из показов):")
-        for it in all_losing:
-            log(f"    ! «{it['campaign']}» {it['nm_id']}: ставка {rub(it['old'])}, минимум WB {rub(it['new'])}, "
-                f"окупается до {rub(it['cap'])}")
+        for it in losing:
+            log(f"    ! «{it['campaign']}» {it['nm_id']}: ставка {B.rub(it['old'])}, минимум WB {B.rub(it['new'])}, "
+                f"окупается до {B.rub(it['cap'])}")
         log("    Решить: оставить как есть, убрать товар из кампании или поднять допустимую цену заказа в wb_bids.py.")
 
-    if apply and all_raise:
+    if apply and changes:
         BACKUP_DIR.mkdir(exist_ok=True)
         path = BACKUP_DIR / f"guard_{dt.datetime.now():%Y%m%d_%H%M%S}.json"
-        path.write_text(json.dumps(all_raise, ensure_ascii=False, indent=1), encoding="utf-8")
+        path.write_text(json.dumps(changes, ensure_ascii=False, indent=1), encoding="utf-8")
         log(f"  Резервная копия: {path.name}")
-        for cab in sorted({i["cabinet"] for i in all_raise}):
-            n = B.apply_bids(cabs[cab], [i for i in all_raise if i["cabinet"] == cab], "new")
-            log(f"  {cab}: поднято ставок {n} из {sum(1 for i in all_raise if i['cabinet'] == cab)}")
+        B.record_day_base(state, {"bids": changes, "cluster_bids": []})   # ±30% в сутки — от ставки на начало дня
+        for cab in sorted({i["cabinet"] for i in changes}):
+            n = B.apply_bids(cabs[cab], [i for i in changes if i["cabinet"] == cab], "new")
+            log(f"  {cab}: изменено ставок {n} из {sum(1 for i in changes if i['cabinet'] == cab)}")
+        B.save_state(state)
         log("  Откат: python wb_guard.py --rollback")
-    elif all_raise:
+    elif changes:
         log("  Это пробный прогон. Применить: python wb_guard.py --apply")
     write_log()
 
