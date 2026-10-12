@@ -87,6 +87,8 @@ DEFAULTS = {
     "max_bid_cpc": 60,          # потолок ставки за клик, ₽
     "max_bid_cpm": 800,         # потолок ставки за 1000 показов, ₽
     "max_raise_pct": 30,        # максимум роста ставки в сутки, % (от ставки при первом запуске за день)
+    "min_stock": 15,            # товар, которого в наличии меньше (WB + свой склад), убрать из кампании (None — не убирать).
+                                # Правило пользователя от 12.10.2026. Кампанию целиком не опустошает. Откат возвращает товар
     "max_drop_pct": 30,         # максимум снижения ставки в сутки, % (None — без ограничения). Нет в наличии или
                                 # нет ходовых размеров — минимальная ставка сразу, это ограничение не действует
     "no_stock": "min",          # нет в наличии (WB + FBS, см. COUNT_FBS_STOCK): "min" — минимальная ставка, "skip" — не трогать
@@ -688,7 +690,7 @@ def changed(new, cur, step):
 
 def plan_cabinet(cab, token, rules, state):
     log(f"\n══════════ {cab} ══════════")
-    plan = {"bids": [], "cluster_bids": [], "minus": [], "limits": []}
+    plan = {"bids": [], "cluster_bids": [], "minus": [], "limits": [], "trim": []}
     camps = get_campaigns(token)
     todo = {}
     explicit = {}
@@ -824,6 +826,21 @@ def plan_cabinet(cab, token, rules, state):
             f"{'за клики' if pay == 'cpc' else 'за показы'}, цель {target}, "
             f"{'заказ до ' + str(r['max_cost_per_order']) + ' ₽' if r['max_cost_per_order'] != 'auto' else 'цена заказа — из юнит-экономики'}, "
             f"конверсия {camp_cr * 100:.1f}%" + (f"; режим запуска новинки до {r['_until']}" if r.get("_until") else ""))
+
+        # ---- товары с малым остатком: убрать из кампании ----
+        if r.get("min_stock") and stock is not None:
+            low = [nm for nm in nms if (available(stock.get(nm)) is not None and available(stock.get(nm)) < r["min_stock"])]
+            if low and len(low) == len(nms):
+                log(f"    ! У всех товаров кампании меньше {r['min_stock']} шт — кампанию не опустошаю; "
+                    "если реклама ей не нужна, поставьте её на паузу в кабинете WB.")
+            elif low:
+                bk = {s_.get("nm_id"): s_.get("bids_kopecks") or {} for s_ in a.get("nm_settings") or []}
+                log(f"    Убрать из кампании (в наличии меньше {r['min_stock']} шт): "
+                    + ", ".join(f"{nm} ({stock_label(stock.get(nm))})" for nm in low))
+                for nm in low:
+                    plan["trim"].append({"cabinet": cab, "advert_id": cid, "nm_id": nm, "bid_type": a.get("bid_type"),
+                                         "bids_kopecks": bk.get(nm, {}), "stock": available(stock.get(nm))})
+                nms = [nm for nm in nms if nm not in low]
 
         # ---- ставки товаров ----
         if unified:
@@ -1203,6 +1220,51 @@ def update_state(state, minus_items, reverse=False):
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
+def patch_nms(token, advert_id, add=(), delete=()):
+    pace(token, "auction_nms", 1.1)
+    data = call("PATCH", ADV + "/adv/v0/auction/nms", token, what="Товары кампании",
+                body={"nms": [{"advert_id": advert_id, "nms": {"add": list(add), "delete": list(delete)}}]}) or {}
+    res = {"added": [], "deleted": []}
+    for it in data.get("nms") or []:
+        if it.get("advert_id") == advert_id:
+            res["added"] += (it.get("nms") or {}).get("added") or []
+            res["deleted"] += (it.get("nms") or {}).get("deleted") or []
+    return res
+
+
+def apply_trim(token, items, reverse=False):
+    """Убрать товары из кампаний; при откате — вернуть и поставить прежние ставки (WB ставит минимальную)."""
+    by = defaultdict(list)
+    for i in items:
+        by[i["advert_id"]].append(i)
+    ok = 0
+    for aid, its in by.items():
+        try:
+            r = patch_nms(token, aid, **({"add": [i["nm_id"] for i in its]} if reverse else {"delete": [i["nm_id"] for i in its]}))
+            ok += len(r["added"] if reverse else r["deleted"])
+        except ApiError as e:
+            log(f"  ✗ {e}")
+            continue
+        if reverse:
+            bids = []
+            for i in its:
+                b = i.get("bids_kopecks") or {}
+                if i.get("bid_type") == "unified":
+                    if b.get("search"):
+                        bids.append({"nm_id": i["nm_id"], "bid_kopecks": int(b["search"]), "placement": "combined"})
+                else:
+                    bids += [{"nm_id": i["nm_id"], "bid_kopecks": int(b[p]), "placement": p}
+                             for p in ("search", "recommendations") if b.get(p)]
+            for part in chunks(bids, 50):
+                pace(token, "patch", 0.3)
+                try:
+                    call("PATCH", ADV + "/api/advert/v1/bids", token, body={"bids": [{"advert_id": aid, "nm_bids": part}]},
+                         what="Ставки товаров")
+                except ApiError as e:
+                    log(f"  ✗ {e}")
+    return ok
+
+
 def run_apply(cabs, plan, key, state, reverse=False):
     for cab in sorted({i["cabinet"] for part in plan.values() for i in part}):
         if cab not in cabs:
@@ -1211,6 +1273,8 @@ def run_apply(cabs, plan, key, state, reverse=False):
         tok = cabs[cab]
         sel = {k: [i for i in v if i["cabinet"] == cab] for k, v in plan.items()}
         res = []
+        if sel.get("trim"):
+            res.append(f"{'возвращено' if reverse else 'убрано'} товаров {apply_trim(tok, sel['trim'], reverse)}/{len(sel['trim'])}")
         if sel["bids"]:
             res.append(f"ставки товаров {apply_bids(tok, sel['bids'], key)}/{len(sel['bids'])}")
         if sel["cluster_bids"]:
@@ -1244,6 +1308,7 @@ def main():
         plan.setdefault("cluster_bids", [])
         plan.setdefault("minus", [])
         plan.setdefault("limits", [])
+        plan.setdefault("trim", [])
         log(f"{dt.datetime.now():%d.%m.%Y %H:%M} — ОТКАТ по {files[-1].name}")
         run_apply(cabs, plan, "old", state, reverse=True)
         with open(LOG_FILE, "a", encoding="utf-8") as f:
@@ -1256,7 +1321,7 @@ def main():
     if UNIT_LIMITS:
         log(f"Юнит-экономика: лимиты цены заказа для {len(UNIT_LIMITS)} товаров (wb_unit_economics.csv).")
     print("Рекомендации WB отдаёт по одному товару раз в 12 секунд — на кампанию уходит несколько минут.")
-    plan = {"bids": [], "cluster_bids": [], "minus": [], "limits": []}
+    plan = {"bids": [], "cluster_bids": [], "minus": [], "limits": [], "trim": []}
     for cab, rules in RULES.items():
         if cab not in cabs:
             log(f"\n✗ Кабинет «{cab}» есть в RULES, но нет в wb_tokens.txt")
@@ -1272,7 +1337,8 @@ def main():
     up = sum(1 for c in plan["bids"] if c["new"] > (c["old"] or 0))
     n_minus = sum(len(m["add_auto"]) + len(m["add_route"]) for m in plan["minus"])
     log(f"\nИтого: ставки товаров {len(plan['bids'])} (↑{up} ↓{len(plan['bids']) - up}), "
-        f"ставки запросов {len(plan['cluster_bids'])}, новых минус-фраз {n_minus}, дневных лимитов {len(plan['limits'])}.")
+        f"ставки запросов {len(plan['cluster_bids'])}, новых минус-фраз {n_minus}, дневных лимитов {len(plan['limits'])}, "
+        f"убрать товаров с малым остатком {len(plan['trim'])}.")
     if apply and DATA_PROBLEMS:
         log("\n✗ НЕ ПРИМЕНЯЮ: часть данных не загрузилась, ставки были бы посчитаны вслепую:")
         for msg in dict.fromkeys(DATA_PROBLEMS):
