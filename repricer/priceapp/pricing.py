@@ -44,10 +44,11 @@ SRC_CAT_CABINET, SRC_CATEGORY = "cat_cabinet", "category"
 SOURCE_LABELS = {SRC_CABINET: "артикул, кабинет", SRC_ARTICLE: "артикул, площадка",
                  SRC_CAT_CABINET: "категория, кабинет", SRC_CATEGORY: "категория, площадка",
                  SRC_DEFAULT: "по умолчанию площадки", SRC_MANUAL: "ручная цена кабинета"}
-KIND_COEF, KIND_MARGIN = "coef", "margin"
+KIND_COEF, KIND_MARGIN, KIND_ETALON = "coef", "margin", "etalon"
 # Площадки, чьи тарифы комиссий программа читает (WB — по предметам, Ozon — по товару).
 TARIFF_PLATFORMS = {"wb", "ozon"}
-KIND_LABELS = {KIND_COEF: "коэффициент от базовой", KIND_MARGIN: "маржинальность"}
+KIND_LABELS = {KIND_COEF: "коэффициент от базовой", KIND_MARGIN: "маржинальность",
+               KIND_ETALON: "от эталона WB, %"}
 
 BLOCK_FLOOR = "floor"
 BLOCK_MAX_CHANGE = "max_change"
@@ -180,7 +181,8 @@ class Decision:
 
 def decide(cost_usd, usd_rub, rule: PlatformRule, target: "Target | None",
            manual_price: int | None, last_sent_price: int | None,
-           facts: "Facts | None" = None) -> Decision:
+           facts: "Facts | None" = None, etalon: Decimal | None = None,
+           discount_range: tuple = (Decimal(35), Decimal(50))) -> Decision:
     """Какую цену предложить и пропускают ли её ограничители. `facts` — комиссия
     и скидка товара; без них — комиссия из правила и скидки нет."""
     facts = facts or item_facts(rule)
@@ -202,7 +204,18 @@ def decide(cost_usd, usd_rub, rule: PlatformRule, target: "Target | None",
         return Decision(None, cost_rub=cost_rub,
                         note="наценка не задана ни у артикула, ни у категории, ни по умолчанию у площадки")
     else:
-        if target.kind == KIND_MARGIN:
+        if target.kind == KIND_ETALON:
+            if etalon is None:
+                return Decision(None, cost_rub=cost_rub, source=target.source, kind=target.kind, coef=target.value,
+                                note="эталона нет: артикула нет на WB или там нет цены продавца со скидкой")
+            lo, hi = discount_range
+            if not (lo <= disc * 100 <= hi):
+                return Decision(None, cost_rub=cost_rub, source=target.source, kind=target.kind, coef=target.value,
+                                note=f"скидка продавца {_ru((disc * 100).quantize(Decimal('1')))}% вне "
+                                     f"{_ru(lo)}–{_ru(hi)}% — цену до скидки не посчитать; поставьте скидку "
+                                     "в кабинете площадки")
+            raw = _dec(etalon) * (1 + target.value / 100) / (1 - disc)
+        elif target.kind == KIND_MARGIN:
             raw = cost_rub * target.value / ((1 - c / 100) * (1 - disc))
         else:
             raw = cost_rub * target.value
@@ -273,16 +286,86 @@ class Inputs:
     coefs: dict          # (артикул, account_id | 0) -> (kind, value)
     articles: dict       # item_id -> артикул
     categories: dict = field(default_factory=dict)   # (категория, account_id | 0) -> (kind, value)
+    # Эталон WB (см. `etalon_prices`): артикул -> цена для покупателя; None — не нужен этой площадке.
+    etalon: dict | None = None
+    etalon_default: Decimal | None = None   # «от эталона, %» по умолчанию площадки; None — выключено
+    discount_range: tuple = (Decimal(35), Decimal(50))
 
 
 def load_inputs(db: Session, platform: str, rule: PlatformRule | None = None,
                 articles: dict | None = None) -> Inputs:
-    return Inputs(rule if rule is not None else get_rule(db, platform),
-                  {(c.article, c.account_id): (c.kind or KIND_COEF, _dec(c.coef))
-                   for c in db.query(ArticleCoef).filter(ArticleCoef.platform == platform)},
-                  articles if articles is not None else article_map(db),
-                  {(c.category, c.account_id): (c.kind or KIND_MARGIN, _dec(c.value))
-                   for c in db.query(CategoryTarget).filter(CategoryTarget.platform == platform)})
+    inp = Inputs(rule if rule is not None else get_rule(db, platform),
+                 {(c.article, c.account_id): (c.kind or KIND_COEF, _dec(c.coef))
+                  for c in db.query(ArticleCoef).filter(ArticleCoef.platform == platform)},
+                 articles if articles is not None else article_map(db),
+                 {(c.category, c.account_id): (c.kind or KIND_MARGIN, _dec(c.value))
+                  for c in db.query(CategoryTarget).filter(CategoryTarget.platform == platform)})
+    if platform != "wb":
+        from priceapp import settings
+        inp.etalon_default = etalon_default(db, platform)
+        inp.discount_range = discount_range(db)
+        # Эталон дорогой (сборка каталогов WB), поэтому — только если площадке он нужен.
+        if inp.etalon_default is not None or any(k == KIND_ETALON for k, _ in
+                                                 (*inp.coefs.values(), *inp.categories.values())):
+            inp.etalon = etalon_prices(db, inp.articles)
+    return inp
+
+
+# --- эталон WB -------------------------------------------------------------------------
+#
+# Цена ЗА ВЫЧЕТОМ скидки продавца (то, что платит покупатель до скидок площадки за её
+# счёт) на Kit, Ламоде и других площадках ставится от эталона WB:
+#   эталон артикула = средняя по всем кабинетам WB цена продавца со скидкой − ETALON_WB_DISCOUNT %;
+#   цель на площадке = эталон × (1 + p / 100), p — наценка вида «от эталона WB, %» (Kit −10, Ламода 0);
+#   цена до скидки   = цель / (1 − скидка продавца ЭТОГО товара на ЭТОЙ площадке).
+# Скидку программа не меняет — её ставят в кабинете. Скидка вне диапазона
+# (ETALON_DISC_MIN–MAX) — цена не считается: «цена до скидки» от случайной скидки
+# (нулевой — тем более) поставила бы покупателю не ту цену.
+
+def _pct_setting(db: Session, key: str, default: str | None) -> Decimal | None:
+    from priceapp import settings
+    raw = (settings.get(db, key) if settings.get(db, key) is not None else default) or ""
+    raw = raw.strip().replace(",", ".")
+    if not raw:
+        return None
+    try:
+        return Decimal(raw)
+    except Exception:
+        return None
+
+
+def etalon_default(db: Session, platform: str) -> Decimal | None:
+    from priceapp import settings
+    return _pct_setting(db, settings.etalon_pct_key(platform), None)
+
+
+def discount_range(db: Session) -> tuple:
+    from priceapp import settings
+    return (_pct_setting(db, settings.ETALON_DISC_MIN, "35") or Decimal(0),
+            _pct_setting(db, settings.ETALON_DISC_MAX, "50") or Decimal(0))
+
+
+def etalon_prices(db: Session, articles: dict | None = None) -> dict[str, Decimal]:
+    """Артикул 1С -> эталонная цена для покупателя: средняя цена продавца со скидкой по
+    всем карточкам всех активных кабинетов WB минус ETALON_WB_DISCOUNT %."""
+    from priceapp import mapping, settings
+    from priceapp.database import session_cache
+    cache = session_cache(db)
+    if "etalon" in cache:
+        return cache["etalon"]
+    articles = articles if articles is not None else article_map(db)
+    cut = _pct_setting(db, settings.ETALON_WB_DISCOUNT, "31") or Decimal(0)
+    rule = get_rule(db, "wb")
+    vals: dict[str, list[int]] = {}
+    for a in db.query(Account).filter(Account.is_active.is_(True), Account.platform == "wb"):
+        for item_id, rows in mapping.account_items(db, a.id).items():
+            sale = item_facts(rule, rows).sale
+            if sale:
+                vals.setdefault(article_of(articles, item_id), []).append(sale)
+    out = {art: (Decimal(sum(v)) / len(v) * (1 - cut / 100)).quantize(Decimal("0.01"))
+           for art, v in vals.items()}
+    cache["etalon"] = out
+    return out
 
 
 def target_for(inp: Inputs, item_id: str, account_id: int | None, category: str = "") -> Target | None:
@@ -302,6 +385,8 @@ def target_for(inp: Inputs, item_id: str, account_id: int | None, category: str 
         if key in table:
             kind, value = table[key]
             return Target(kind, value, src)
+    if inp.etalon_default is not None:
+        return Target(KIND_ETALON, inp.etalon_default, SRC_DEFAULT)
     if inp.rule.base_coef is not None:
         return Target(KIND_COEF, _dec(inp.rule.base_coef), SRC_DEFAULT)
     return None
@@ -326,7 +411,8 @@ def decide_for(inp: Inputs, item_id: str, account_id: int | None, cost_usd, usd_
     # отправляли — от ТЕКУЩЕЙ на площадке: иначе первая же отправка (опечатка в
     # наценке, ×10 в себестоимости 1С) ушла бы без всякой проверки шага.
     last = (pp.last_sent_price if pp and pp.last_sent_price else None) or facts.current
-    return decide(cost_usd, usd_rub, inp.rule, target, manual, last, facts)
+    etalon = inp.etalon.get(article_of(inp.articles, item_id)) if inp.etalon is not None else None
+    return decide(cost_usd, usd_rub, inp.rule, target, manual, last, facts, etalon, inp.discount_range)
 
 
 @dataclass

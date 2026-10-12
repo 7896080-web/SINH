@@ -36,6 +36,20 @@ FOLLOW_TOLERANCE = "follow_tolerance"
 FOLLOW_MAX_STEP = "follow_max_step"
 FOLLOW_DUE_AT = "follow_due_at"
 
+# Эталон WB (`pricing.etalon_prices`): цена продавца со скидкой на WB минус этот %;
+# допустимая скидка продавца на площадке (вне — цена до скидки не считается); «от
+# эталона, %» по умолчанию площадки (пусто — выключено).
+ETALON_WB_DISCOUNT = "etalon_wb_discount"
+ETALON_DISC_MIN = "etalon_disc_min"
+ETALON_DISC_MAX = "etalon_disc_max"
+ETALON_PLATFORMS = ("kit", "lamoda", "ozon")   # площадки, которым можно задать «от эталона»
+ETALON_SUGGEST = {"kit": "-10", "lamoda": "0"}  # подсказка на странице; включает человек
+
+
+def etalon_pct_key(platform: str) -> str:
+    return f"etalon_pct_{platform}"
+
+
 # Себестоимость из 1С выравнивается по «артикул + цвет» (самое частое значение): 0 — выключить.
 COST_NORMALIZE = "cost_normalize"
 
@@ -47,6 +61,9 @@ DEFAULTS = {
     REF_DROP_PERCENT: "10",
     REF_RATE_PERCENT: "2",
     REF_POLL_NOW: "0",
+    ETALON_WB_DISCOUNT: "31",
+    ETALON_DISC_MIN: "35",
+    ETALON_DISC_MAX: "50",
     FOLLOW_ENABLED: "1",
     FOLLOW_PERCENT: "10",
     FOLLOW_TOLERANCE: "1",
