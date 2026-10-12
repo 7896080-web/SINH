@@ -1247,6 +1247,7 @@ def plan_cabinet(cab, token, rules, state):
                 log(note)
 
         # ---- дневной лимит ----
+        limit_need = 0     # ₽: WB не ставит дневной лимит больше бюджета кампании («insufficient campaign budget»)
         if r["daily_limit"]:
             if pay != "cpc":
                 log("    ! Дневной лимит WB даёт только кампаниям с оплатой за клики — пропускаю.")
@@ -1269,6 +1270,7 @@ def plan_cabinet(cab, token, rules, state):
                         f"{', потрачено сегодня ' + rub(lim.get('spentToday')) if lim.get('spentToday') is not None else ''}"
                         f" → {'без изменений' if same else rub(want) + ' ₽'}.{note}")
                     if not same:
+                        limit_need = want / 100
                         plan["limits"].append({"cabinet": cab, "advert_id": cid,
                                                "old": {"enabled": bool(lim.get("enabled")), "dailyLimit": lim.get("dailyLimit"),
                                                        "carryOverEnabled": bool(lim.get("carryOverEnabled"))},
@@ -1281,8 +1283,27 @@ def plan_cabinet(cab, token, rules, state):
                                      "day_cap": r["topup_day_cap"], "week_cap": r["topup_week_cap"],
                                      "source": r["topup_source"], "start": can_start}
             bud = get_budgets(token, [cid]).get(cid)
+            short = max(limit_need - (bud or 0), 0)       # сколько не хватает бюджета, чтобы WB принял новый лимит
             if bud is None:
                 log("    ! Бюджет кампании не получен — пополнение пропускаю.")
+            elif short > 0:
+                week = topped_week(state, cid)
+                today_ = topped_week(state, cid, days=1)
+                need = int(math.ceil(short / 100) * 100)
+                amount = min(max(need, r["topup_amount"] if bud < r["topup_below"] else 0),
+                             r["topup_day_cap"] - today_, r["topup_week_cap"] - week)
+                if amount < need:
+                    newlim = int(max(bud + max(amount, 0), 0) // 100 * 100)
+                    plan["limits"][-1]["new"]["dailyLimit"] = newlim * 100
+                    log(f"    ! Бюджет {fm_rub(bud)} ₽ меньше нового лимита {limit_need:.0f} ₽, а пополнить можно только на "
+                        f"{max(amount, 0)} ₽ (потолки) — ставлю лимит {newlim} ₽, полный поставлю при следующем запуске.")
+                if amount >= 100:
+                    start = can_start and a.get("_status") == 11
+                    log(f"    Бюджет: {fm_rub(bud)} ₽ — WB не ставит дневной лимит больше бюджета → пополнить на {amount} ₽ "
+                        f"из «{SOURCE_RU[r['topup_source']]}» (сегодня уже {fm_rub(today_)} из {r['topup_day_cap']} ₽, "
+                        f"за 7 дней {fm_rub(week)} из {r['topup_week_cap']} ₽)" + (" и запустить кампанию" if start else "") + ".")
+                    plan["topup"].append({"cabinet": cab, "advert_id": cid, "name": name, "amount": amount,
+                                          "source": r["topup_source"], "budget_before": bud, "start": start})
             elif bud >= r["topup_below"]:
                 log(f"    Бюджет: {fm_rub(bud)} ₽ — пополнять не нужно (порог {r['topup_below']} ₽).")
             else:
@@ -1391,7 +1412,9 @@ def apply_limits(token, items, key, cfg_min=0):
                     log(f"  ! Лимит кампании {a.get('advertId')} ниже рекомендуемого WB ({rub(a.get('requiredLimit'))} ₽) — "
                         "кампания может останавливаться раньше вечера.")
         except ApiError as e:
-            log(f"  ✗ {e}")
+            hint = (" — в бюджете кампании меньше нового лимита; следующий запуск пополнит бюджет и поставит лимит"
+                    if "insufficient campaign budget" in str(e) else "")
+            log(f"  ✗ Кампания {i['advert_id']}: {e}{hint}")
             continue
         if v["enabled"]:
             # Спецификация WB не говорит прямо, в каких единицах PUT принимает лимит (пишем в копейках, как его отдаёт GET).
