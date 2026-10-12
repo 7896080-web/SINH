@@ -207,7 +207,7 @@ def test_the_manual_script_names_both_second_sites(live_db, monkeypatch, capsys)
     monkeypatch.setenv("BACKUP_RCLONE_EXE", str(live_db / "rclone.exe"))
     monkeypatch.setenv("BACKUP_RCLONE_CONFIG", str(live_db / "rclone.conf"))
 
-    def fake_run(command, capture_output=True, text=True, timeout=None):
+    def fake_run(command, capture_output=True, timeout=None, **kw):
         sub = command[command.index("--log-level") + 2]
         if sub == "lsjson":
             name = os.path.basename(command[-1])
@@ -251,7 +251,7 @@ def test_one_broken_site_does_not_read_as_no_site_at_all(live_db, monkeypatch, c
     monkeypatch.setenv("BACKUP_RCLONE_EXE", str(live_db / "rclone.exe"))
     monkeypatch.setenv("BACKUP_RCLONE_CONFIG", str(live_db / "rclone.conf"))
 
-    def fake_run(command, capture_output=True, text=True, timeout=None):
+    def fake_run(command, capture_output=True, timeout=None, **kw):
         sub = command[command.index("--log-level") + 2]
         if sub == "lsjson":
             files = sorted((live_db / "backups").glob("sync_admin-*.db"))

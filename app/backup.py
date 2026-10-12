@@ -580,8 +580,28 @@ def _run_rclone(exe: str, config: str, args: list[str]) -> tuple[bool, str]:
     """
     command = [exe, "--config", config, "--log-level", "ERROR"] + args
     try:
-        done = subprocess.run(command, capture_output=True, text=True,
-                              timeout=RCLONE_TIMEOUT)
+        # Кодировка задаётся ЯВНО. `text=True` декодирует по
+        # `locale.getpreferredencoding()`, а на боевой Windows с русской
+        # локалью это cp1251 — тогда как rclone пишет UTF-8. 12.10 оговорка на
+        # «Диагностике» выглядела так: «Р РµСЃСѓСЂСЃ Р±РѕР»СЊС€Рµ
+        # РЅРµРґРѕСЃС‚СѓРїРµРЅ.» То есть «Ресурс больше недоступен», прочитанное
+        # не той кодировкой, — и причина отказа была нечитаема ровно тогда,
+        # когда её читают. Беда не в опрятности: мозаика занимает ВДВОЕ больше
+        # места (каждая кириллическая буква становится двумя символами), а
+        # строка режется по 300 символов, то есть мусор вытесняет собой то
+        # самое, ради чего её и смотрят. Разбор занял час вместо минуты.
+        #
+        # Здесь, на Linux с UTF-8, `text=True` работает правильно — то есть
+        # ровно тот класс «зелёно здесь, красно там», которым открывается
+        # `CLAUDE.md`. Поэтому проверка подставляет БОЕВУЮ машину (см.
+        # `tests/test_backup_mirror_diagnosis.py`), а не здешнюю.
+        #
+        # `errors="replace"` обязателен: в выводе чужая строка (имя файла,
+        # тело ответа облака), и упасть на неожиданном байте значило бы
+        # потерять сообщение целиком — ровно то же правило, по которому
+        # скрипты глушат ошибку кодирования на выводе.
+        done = subprocess.run(command, capture_output=True, encoding="utf-8",
+                              errors="replace", timeout=RCLONE_TIMEOUT)
     except FileNotFoundError:
         return False, f"rclone не найден: {exe}"
     except subprocess.TimeoutExpired:
@@ -592,6 +612,85 @@ def _run_rclone(exe: str, config: str, args: list[str]) -> tuple[bool, str]:
         said = (done.stderr or done.stdout or "").strip().replace("\n", "; ")
         return False, f"rclone вернул {done.returncode}: {said[:300]}"
     return True, (done.stdout or "")
+
+
+# Код ответа облака, вынутый из того, что сказал rclone. Структурно его у нас
+# нет — rclone отдаёт только строку, — поэтому разбираем формы, в которых коды
+# печатают сами бэкенды: `[410 - GoneError]` у Яндекс.Диска, `HTTP error 404`,
+# `Error 403`, `status code 503` у остальных.
+_HTTP_CODE_RE = re.compile(
+    r"\[\s*(\d{3})\s*-"
+    r"|HTTP\s+(?:error\s+)?(\d{3})\b"
+    r"|[Ee]rror\s+(\d{3})\b"
+    r"|status(?:\s+code)?\s+(\d{3})\b")
+
+# Папки нет — это чинится руками и само не пройдёт.
+CLOUD_NO_FOLDER_CODES = {404}
+# Нас не пускают: токен отозван, доступ снят, приложение отключено.
+CLOUD_ACCESS_CODES = {401, 403}
+CLOUD_FULL_CODES = {507}
+# Отказ, который ПЕРЕЖИВЁТ повтор: сбой на стороне облака, лимит, блокировка.
+#
+# 410 здесь не по букве HTTP (там это «удалено навсегда»), а по тому, что
+# наблюдали 12.10 на бою: Яндекс.Диск отвечал 410 и на запись, и на ЧТЕНИЕ
+# папки, которая была на месте, — у них шёл сбой, о котором они сами писали на
+# своей странице. Отказ на чтении это и доказывает: будь дело в нашем пути,
+# правах или имени, чтение бы прошло.
+CLOUD_TRANSIENT_CODES = {408, 410, 423, 425, 429, 500, 502, 503, 504}
+
+
+def cloud_code(said: str) -> int | None:
+    """Код ответа облака из текста rclone, иначе None."""
+    found = _HTTP_CODE_RE.search(said or "")
+    if found is None:
+        return None
+    for group in found.groups():
+        if group:
+            return int(group)
+    return None
+
+
+def cloud_gist(said: str, remote: str) -> str:
+    """Что этот отказ ЗНАЧИТ, своими словами. Пустая строка — не разобрали.
+
+    Вопрос ровно тот же, что у предохранителя кабинетов
+    (`circuit_breaker.survives_a_retry`): переживёт ли отказ повтор. И цена
+    ошибки та же несимметричная. 06.10 предохранитель погасил три кабинета WB
+    за `ReadTimeout` — структурное действие в ответ на отказ, который прошёл бы
+    сам. 12.10 то же самое едва не повторилось здесь: 410 прочитали как
+    «папку удалили» и собрались создавать её заново, а папка была на месте.
+
+    Поэтому код НИЧЕГО НЕ ЧИНИТ — ни папок не заводит, ни повторов не
+    городит, — а только называет причину. Незнакомый код отдаётся как есть:
+    разбирать за облако то, чего мы не понимаем, мы не беремся. Ровно то же
+    правило, по которому незнакомый код отказа площадки не метится
+    терминальным.
+    """
+    code = cloud_code(said)
+    if code in CLOUD_NO_FOLDER_CODES:
+        return (f"папки {remote} в облаке нет — создайте её "
+                "(rclone mkdir) или поправьте «Путь в облаке»")
+    if code in CLOUD_ACCESS_CODES:
+        return ("облако не пускает — токен отозван или доступ снят, "
+                "нужен rclone config")
+    if code in CLOUD_FULL_CODES:
+        return "в облаке кончилось место"
+    if code in CLOUD_TRANSIENT_CODES:
+        return (f"облако отвечает отказом ({code}) — такое обычно проходит "
+                f"само; если держится дольше суток, проверьте, на месте ли "
+                f"папка {remote}")
+    return ""
+
+
+def _cloud_problem(said: str, remote: str) -> str:
+    """Причина словами, а за ней — что сказал rclone.
+
+    Обе части обязательны. Без причины человек читает сырой код как поломку
+    настройки и идёт чинить то, что не ломалось; без сырого текста нечем
+    проверить, что причину разобрали верно.
+    """
+    gist = cloud_gist(said, remote)
+    return f"{gist}. {said}" if gist else said
 
 
 def _remote_listing(exe: str, config: str, remote: str) -> tuple[list[dict], str]:
@@ -629,14 +728,15 @@ def upload_to_remote(source: Path, db=None) -> str:
     ok, said = _run_rclone(exe, config,
                            ["copyto", str(source), f"{remote}/{source.name}"])
     if not ok:
-        return f"облако: {said}"
+        return f"облако: {_cloud_problem(said, remote)}"
 
     entries, problem = _remote_listing(exe, config, remote)
     if problem:
         # Выгрузка прошла, а проверить не вышло. Это НЕ успех: сказать «копия в
         # облаке», не увидев её там, значит вернуться ровно к тому, от чего
         # уходили.
-        return f"облако: копия отправлена, но проверить не удалось — {problem}"
+        return ("облако: копия отправлена, но проверить не удалось — "
+                + _cloud_problem(problem, remote))
 
     sizes = {e.get("Name"): e.get("Size") for e in entries if isinstance(e, dict)}
     if source.name not in sizes:
@@ -659,6 +759,16 @@ def upload_to_remote(source: Path, db=None) -> str:
         if not gone:
             logger.warning("облако: не удалось удалить %s: %s", name, why)
     return ""
+
+
+def second_site_configured(db=None) -> bool:
+    """Задана ли вообще вторая площадка — папка или облако.
+
+    Нужно ровно одному: отметке «зеркало сработало». Писать её при пустых
+    настройках значило бы утверждать, что вторая площадка есть, — а её нет, и
+    отчёт потом молчал бы по самому честному из возможных поводов.
+    """
+    return mirror_dir(db) is not None or rclone_settings(db) is not None
 
 
 def make_backup(database_url: str | None = None,
