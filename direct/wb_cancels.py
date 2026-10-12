@@ -17,6 +17,7 @@
      Если доступа к «Маркетплейсу» нет — этот раздел пропускается, остальное работает.
   3. Через сколько после заказа отменяют: до 1 ч, 1–24 ч, 1–3 дня, 3–7 дней, позже.
   4. Отмены по складу (ваш склад FBS / склады WB), по моделям, размерам и регионам.
+  5. «Примерка»: сколько отказов приходится на корзины, где одну модель взяли в нескольких размерах или цветах.
 
 Запуск:  python wb_cancels.py                       (все товары, 30 дней)
          python wb_cancels.py 60                    (за 60 дней, не больше 90)
@@ -211,6 +212,35 @@ def run_cabinet(cab, token, mods):
             log(f"    {lbl:14}{ages[lbl]:>6}  {ages[lbl] / tot:>5.0%}  " + "█" * round(ages[lbl] / tot * 50))
         log("    До 1 часа — покупатель передумал сразу; 1–3 дня — обычно отмена сборки; позже — отказ при получении.")
 
+    # «примерка»: одна модель в одной корзине (gNumber) в нескольких размерах или цветах
+    model = lambda r: next((m for m in mods if m in str(r.get("supplierArticle") or "").lower()), None) or str(r.get("nmId"))
+    baskets = defaultdict(list)
+    for r in orders:
+        if r.get("gNumber"):
+            baskets[(r["gNumber"], model(r))].append(r)
+    if baskets:
+        kinds = {"один размер, один цвет": [], "несколько размеров": [], "несколько цветов, размер один": []}
+        for items in baskets.values():
+            sizes = {str(r.get("techSize")) for r in items}
+            colors = {r.get("nmId") for r in items}
+            k = ("несколько размеров" if len(sizes) > 1 else
+                 "несколько цветов, размер один" if len(colors) > 1 else "один размер, один цвет")
+            kinds[k] += items
+        log("\n  3. Заказывают ли «на примерку» (одна модель в одной корзине покупателя):")
+        log(f"    {'как заказали':32}{'вещей':>7}{'отказ':>7}{'доля':>7}{'доля всех отмен':>17}")
+        for k, items in kinds.items():
+            c = sum(1 for r in items if r.get("isCancel"))
+            if items:
+                log(f"    {k:32}{len(items):>7}{c:>7}{c / len(items):>7.0%}{c / len(canc) if canc else 0:>17.0%}")
+        multi = kinds["несколько размеров"]
+        if multi:
+            log("    Если в корзинах «несколько размеров» отказов много — люди не уверены в размере и берут два-три на примерку:")
+            log("    это лечится понятной размерной сеткой и подсказкой в карточке («маломерит / в размер»), а не ставками.")
+        if not mods:
+            log("    (без --models модель = артикул WB, поэтому «несколько цветов» не видно; запустите с --models 27643,36446)")
+    else:
+        log("\n  3. «Примерка»: WB не отдал номер корзины (gNumber) — раздел пропущен.")
+
     def group(fn):
         g = defaultdict(lambda: {"n": 0, "c": 0, "sum": 0.0})
         for r in orders:
@@ -221,7 +251,7 @@ def run_cabinet(cab, token, mods):
                 x["sum"] += price(r)
         return g
 
-    log("\n  3. Где отменяют чаще:")
+    log("\n  4. Где отменяют чаще:")
     table("Склад", group(lambda r: "ваш склад (FBS)" if fbs(r) else f"WB: {r.get('warehouseName') or '?'}"), "склад")
     table("Артикулы продавца", group(lambda r: str(r.get("supplierArticle") or "?")), "артикул")
     table("Размеры", group(lambda r: str(r.get("techSize") or "?")), "размер")
