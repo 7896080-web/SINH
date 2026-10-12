@@ -296,7 +296,7 @@ def load_unit_limits():
 
 
 UNIT_LIMITS = {}
-CAPS = {}         # {"кампания:артикул": {зона: окупаемый потолок, коп.}} — для часовой проверки wb_guard.py
+CAPS = {}         # {"кампания:артикул": {зона: {потолок, правила товара}}} — для часовой проверки wb_guard.py
 LOCK_FILE = HERE / "wb_bids.running"   # пока автопилот работает, wb_guard.py ставки не трогает
 BUYOUT = {}       # {(кабинет, артикул): (множитель потолка, выкуп товара, заказов в расчёте)}
 
@@ -957,7 +957,7 @@ def plan_cabinet(cab, token, rules, state):
                 ctr = smooth(v["clicks"], v["views"], camp_ctr, K_VIEWS)
                 econ = mcpo(cab, r, nm) * cr * 100 * (1 if pay == "cpc" else ctr * 1000)
                 cap = int(min(econ, cap_abs))
-                CAPS.setdefault(pk(cid, nm), {})[placement] = cap
+                fixed = True    # ставку задаёт правило (нет в наличии / нет размеров / «минимальная»), не рекомендация
                 s_info = (stock or {}).get(nm) or {}
                 current, mn = cur_all.get(nm, {}).get(key_cur), mins.get(nm) or 0
                 rec = None
@@ -969,6 +969,7 @@ def plan_cabinet(cab, token, rules, state):
                 elif r["base_bid"] == "min":
                     nb, reason = (mn or current), "минимальная (кампания только для лучших запросов)"
                 else:
+                    fixed = False
                     try:
                         data = get_rec(token, cid, nm)
                         rec = rec_cpc(data, CPC_LEVEL[target]) if pay == "cpc" else rec_cpm(data, CPM_LEVEL[target])
@@ -990,6 +991,12 @@ def plan_cabinet(cab, token, rules, state):
                                           f"за {STATS_DAYS} дн без заказов")
                         if current and nb and nb > current:
                             nb, reason = current, f"{int(v['clicks'])} кликов без заказов — не повышаю, проверить карточку"
+                # для часовой проверки wb_guard.py: потолок и правила товара на момент этого прогона
+                CAPS.setdefault(pk(cid, nm), {})[placement] = {
+                    "cap": cap, "pay": pay, "target": target, "step": step, "clicks": int(v["clicks"]),
+                    "max_raise": r["max_raise_pct"], "max_drop": r.get("max_drop_pct"), "fixed": fixed,
+                    "no_raise": bool(size_short(nm) == "hold" or (r.get("stop_clicks") and v["clicks"] >= r["stop_clicks"]
+                                                                and not v["orders"]))}
                 ch = changed(nb, current, step)
                 log(f"      {nm:>11} {cut(s_info.get('vendor'), 16):16}{stock_label(s_info):>9}"
                     f"{int(v['clicks']):>6}{int(v['orders']):>5}{cr * 100:>5.1f}%{rub(current):>9}{rub(rec):>9}"

@@ -1,7 +1,8 @@
 ﻿# Расписание автопилота WB в Планировщике заданий Windows (запускать ПОСЛЕ первого удачного ручного
 # python wb_bids.py --apply). Решение пользователя 12.10.2026:
 #   • wb_bids.py --apply — 3 раза в день: 08:00, 13:00, 18:00;
-#   • wb_guard.py --apply — каждый час в :40 с 07:40 до 23:40 (поднимает ставку до минимума WB, только если окупается).
+#   • wb_guard.py --apply — каждый час в :40 с 07:40 до 23:40: ставка за рекомендацией WB и минимумом, не выше
+#     окупаемого потолка, ±30% в сутки (≈10 минут).
 # Установить:  powershell -ExecutionPolicy Bypass -File C:\direct\wb_schedule.ps1
 # Проверить:   Get-ScheduledTask -TaskName "AWER_WB_*"
 # Снять:       powershell -ExecutionPolicy Bypass -File C:\direct\wb_schedule.ps1 -Remove
@@ -35,9 +36,9 @@ Register-ScheduledTask -TaskName "AWER_WB_bids" -Action (Make-Action "wb_bids.py
 $guardTrigger = New-ScheduledTaskTrigger -Daily -At "07:40"
 $rep = New-ScheduledTaskTrigger -Once -At "07:40" -RepetitionInterval (New-TimeSpan -Hours 1) -RepetitionDuration (New-TimeSpan -Hours 16)
 $guardTrigger.Repetition = $rep.Repetition
-$guardSet = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 15)
+$guardSet = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 25)
 Register-ScheduledTask -TaskName "AWER_WB_guard" -Action (Make-Action "wb_guard.py") -Trigger $guardTrigger `
-    -Settings $guardSet -Description "Проверка минимальных ставок WB (wb_guard.py --apply), каждый час" -Force | Out-Null
+    -Settings $guardSet -Description "Часовая проверка ставок WB (wb_guard.py --apply)" -Force | Out-Null
 
 Write-Host "Готово. Python: $py"
 Get-ScheduledTask -TaskName "AWER_WB_*" | ForEach-Object {
