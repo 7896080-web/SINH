@@ -190,10 +190,15 @@ def run_cabinet(cab, token, with_finished):
                     nm_places[(nm, {"search": "поиск", "recommendations": "рекомендации"}.get(p, p))].append(st.get("name"))
                 if (nf.get("stock_wb") or 0) + (nf.get("stock_mp") or 0) <= 0 and nf:
                     warn.append(f"«{st.get('name')}»: товар {nm} ({nf.get('vendor')}) без остатка ни на WB, ни на своём складе.")
+    dup = defaultdict(lambda: defaultdict(set))     # набор кампаний → места → товары
     for (nm, p), names in nm_places.items():
         if len(names) > 1:
-            warn.append(f"Товар {nm} в {len(names)} активных кампаниях на одном месте ({p}): {', '.join(names)} — "
-                        "по правилу «один товар, одно место — одна кампания» оставить одну.")
+            dup[tuple(sorted(names))][p].add(nm)
+    for names, places_nm in dup.items():
+        nms_d = set().union(*places_nm.values())
+        warn.append(f"Дубли: {len(nms_d)} тов. одновременно в кампаниях {' + '.join('«' + n + '»' for n in names)} "
+                    f"на местах {', '.join(sorted(places_nm))} ({', '.join(map(str, sorted(nms_d))[:6])}"
+                    f"{' …' if len(nms_d) > 6 else ''}) — по правилу «один товар, одно место — одна кампания» оставить одну.")
     if mc is not None and not mc:
         log("\n  Минус-фраз WB не вернул ни по одной кампании — у кампаний нет минус-фраз или их тип их не поддерживает.")
     log("\n=== 2. На что обратить внимание ===")
