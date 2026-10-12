@@ -12,7 +12,7 @@
   2. Для самых кликабельных товаров (до REC_MAX штук, по кликам за 14 дней) смотрит рекомендованную ставку WB
      и двигает нашу за ней — по тем же правилам, что автопилот:
        • не выше окупаемого потолка (цена заказа × конверсия × поправка на выкуп — из последнего wb_bids.py --apply);
-       • не больше +30% / −30% за сутки от ставки на начало дня (сколько бы проверок ни было);
+       • снижение — сразу; повышение — сразу, но только до потолка (решение 12.10.2026);
        • не ниже минимальной ставки WB;
        • товарам «без ходовых размеров» и «много кликов без заказов» — не повышает;
        • товары, которым автопилот сознательно держит минимальную ставку (нет в наличии и т. п.), не трогает.
@@ -121,7 +121,7 @@ def plan_cabinet(cab, token, caps, state, budget):
                 rec = None
             if rec:
                 step = c.get("step") or 1
-                nb, why = B.new_bid(cur, rec, cap, mn or 0, step, c.get("max_raise", 30),
+                nb, why = B.new_bid(cur, rec, cap, mn or 0, step, c.get("max_raise"),
                                     B.day_base(state, "bids", cid, nm, zone), c.get("max_drop"))
                 if c.get("no_raise") and nb > cur:
                     nb, why = cur, "не повышаю (мало размеров или много кликов без заказов)"
@@ -200,7 +200,7 @@ def main():
         path = BACKUP_DIR / f"guard_{dt.datetime.now():%Y%m%d_%H%M%S}.json"
         path.write_text(json.dumps(changes, ensure_ascii=False, indent=1), encoding="utf-8")
         log(f"  Резервная копия: {path.name}")
-        B.record_day_base(state, {"bids": changes, "cluster_bids": []})   # ±30% в сутки — от ставки на начало дня
+        B.record_day_base(state, {"bids": changes, "cluster_bids": []})   # ставка на начало дня (если в правилах вернут ограничения в сутки)
         for cab in sorted({i["cabinet"] for i in changes}):
             n = B.apply_bids(cabs[cab], [i for i in changes if i["cabinet"] == cab], "new")
             log(f"  {cab}: изменено ставок {n} из {sum(1 for i in changes if i['cabinet'] == cab)}")
