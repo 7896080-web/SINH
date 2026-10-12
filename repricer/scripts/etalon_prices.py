@@ -11,6 +11,11 @@
     C:\\repricer\\.venv\\Scripts\\python.exe C:\\repricer\\scripts\\etalon_prices.py --xlsx C:\\repricer\\эталон_цены.xlsx
     ... --wb-discount 31 --kit -10 --lamoda 0 --disc-min 35 --disc-max 50
 
+WB — источник эталона: цена СО СКИДКОЙ продавца на нём не меняется; меняются цена до
+скидки и скидка — так, чтобы скидка встала в коридор (по умолчанию тот же 35–50%,
+`--wb-disc-min/--wb-disc-max`). Лист «WB» и сводка по категориям: цена со скидкой и
+скидка в каждом кабинете, эталон, кабинет к средней по WB, что сделать.
+
 Цель округляется тем же правилом, что и цены программы (шаг и окончание — «Правила
 площадок»). Маржинальность — по цели: цель × (1 − комиссия) / себестоимость, ₽; ниже
 пола площадки — пометка.
@@ -111,6 +116,51 @@ def compute(db, platform: str, shift: Decimal, et: dict, articles, costs, info, 
     return out
 
 
+def wb_rows(db, et: dict, wb_discount: Decimal, articles, costs, info, usd,
+            lo: Decimal = Decimal(35), hi: Decimal = Decimal(50)) -> list[dict]:
+    """WB — источник эталона, цель на нём не ставится. По каждому товару каждого кабинета:
+    цена до скидки, со скидкой, скидка продавца, средняя по кабинетам (от неё эталон) и
+    насколько этот кабинет от неё отстоит, эталон, маржинальность по текущей."""
+    rule = get_rule(db, "wb")
+    keep = 1 - wb_discount / 100
+    out = []
+    for a in _accounts(db, "wb"):
+        for item_id, rows in mapping.account_items(db, a.id).items():
+            art = article_of(articles, item_id)
+            facts = item_facts(rule, rows)
+            sku = info.get(item_id)
+            e = et.get(art)
+            avg = e / keep if e is not None and keep else None
+            base = base_price(costs.get(item_id), usd)
+            margin = (Decimal(facts.sale) * (1 - facts.commission / 100) / base
+                      if facts.sale and base and facts.commission is not None else None)
+            out.append({"platform": "wb", "account": a.name, "item_id": item_id, "article": art,
+                        "size": sku.size if sku else "", "color": sku.color if sku else "",
+                        "category": facts.category or NO_CATEGORY, "current_list": facts.current,
+                        "current_sale": facts.sale, "current_disc": facts.discount if facts.current else None,
+                        "avg": avg, "etalon": e,
+                        "vs_avg": (float(facts.sale) / float(avg) - 1) * 100 if facts.sale and avg else None,
+                        "margin": margin, "commission": facts.commission,
+                        **wb_plan(facts.current, facts.sale, lo, hi)})
+    return out
+
+
+IN_CORRIDOR = "скидка уже в коридоре"
+
+
+def wb_plan(current_list: int | None, current_sale: int | None, lo: Decimal, hi: Decimal) -> dict:
+    """WB: цену со скидкой продавца НЕ трогаем; цену до скидки и скидку — так, чтобы скидка
+    была в коридоре, а цена со скидкой осталась прежней."""
+    if not current_list or not current_sale:
+        return {"action": NO_CURRENT, "disc": None, "list": None}
+    need = Decimal(1) - Decimal(current_sale) / Decimal(current_list)
+    if lo / 100 <= need <= hi / 100:
+        return {"action": IN_CORRIDOR, "disc": need, "list": current_list}
+    bound = lo / 100 if need < lo / 100 else hi / 100
+    new_list = int((Decimal(current_sale) / (1 - bound)).quantize(Decimal(1), ROUND_HALF_UP))
+    return {"action": LIST_UP if new_list > current_list else LIST_DOWN, "disc": bound, "list": new_list}
+
+
 def _pct(d):
     return None if d is None else round(float(d) * 100, 1)
 
@@ -126,6 +176,8 @@ def main() -> int:
     ap.add_argument("--lamoda", type=Decimal, default=Decimal(0))
     ap.add_argument("--disc-min", type=Decimal, default=Decimal(35))
     ap.add_argument("--disc-max", type=Decimal, default=Decimal(50))
+    ap.add_argument("--wb-disc-min", type=Decimal, default=None, help="коридор скидки на WB (по умолчанию как у остальных)")
+    ap.add_argument("--wb-disc-max", type=Decimal, default=None)
     ap.add_argument("--show", type=int, default=15, help="примеров на площадку в консоли")
     ap.add_argument("--xlsx", default="", help="сохранить расчёт в .xlsx")
     args = ap.parse_args()
@@ -144,6 +196,41 @@ def main() -> int:
         et = etalon(db, articles, args.wb_discount)
         print(f"Эталон: средняя цена продавца со скидкой на WB минус {args.wb_discount}% — {len(et)} артикулов. "
               f"Коридор скидки продавца {lo}–{hi}%. НИЧЕГО НЕ ОТПРАВЛЯЕТСЯ.")
+        wlo = args.wb_disc_min if args.wb_disc_min is not None else lo
+        whi = args.wb_disc_max if args.wb_disc_max is not None else hi
+        wb = wb_rows(db, et, args.wb_discount, articles, costs, info, rate.usd_rub, wlo, whi)
+        if wb:
+            print(f"\n=== Wildberries — цена со скидкой продавца НЕ меняется; цена до скидки и скидка — "
+                  f"под коридор {wlo}–{whi}%. Товаров {len(wb)}")
+            cnt: dict[str, int] = {}
+            for r in wb:
+                cnt[r["action"]] = cnt.get(r["action"], 0) + 1
+            for act in (IN_CORRIDOR, LIST_UP, LIST_DOWN, NO_CURRENT):
+                if cnt.get(act):
+                    print(f"  {cnt[act]:6d}  {act}")
+            cats: dict[str, list[dict]] = {}
+            for r in wb:
+                cats.setdefault(r["category"], []).append(r)
+            print(f"  {'категория':34} {'арт.':>4} {'со скидкой':>10} {'скидка':>7} {'эталон':>7}  "
+                  + "  ".join(f"{a.name[:12]:>12}" for a in _accounts(db, "wb")))
+            for cat, rs in sorted(cats.items(), key=lambda kv: -len(kv[1])):
+                sale = [r["current_sale"] for r in rs if r["current_sale"]]
+                disc = [float(r["current_disc"]) * 100 for r in rs if r["current_disc"] is not None]
+                ets = [float(r["etalon"]) for r in rs if r["etalon"] is not None]
+                per = []
+                for a in _accounts(db, "wb"):
+                    v = [r["vs_avg"] for r in rs if r["account"] == a.name and r["vs_avg"] is not None]
+                    per.append(f"{statistics.median(v):+11.1f}%" if v else f"{'-':>12}")
+                print(f"  {cat[:34]:34} {len({r['article'] for r in rs}):>4} "
+                      f"{statistics.median(sale) if sale else '-':>10} "
+                      f"{(format(statistics.median(disc), '.0f') + '%') if disc else '-':>7} "
+                      f"{format(statistics.median(ets), '.0f') if ets else '-':>7}  " + "  ".join(per))
+            print("  (по кабинетам — насколько цена со скидкой в кабинете выше/ниже средней по WB, от которой эталон)")
+            print("  примеры:")
+            for r in [r for r in wb if r["action"] in (LIST_UP, LIST_DOWN)][:args.show]:
+                print(f"    {r['account']}: {r['article']} {r['size']} {r['color']}: сейчас {r['current_list']} / "
+                      f"{r['current_sale']} ({_pct(r['current_disc'])}%) -> {r['action']}: цена до скидки "
+                      f"{r['list']}, скидка {_pct(r['disc'])}%, со скидкой {r['current_sale']} (без изменений)")
         rows = []
         for platform, shift in (("kit", args.kit), ("lamoda", args.lamoda)):
             if not _accounts(db, platform):
@@ -186,8 +273,22 @@ def main() -> int:
                      _f(r["change"], 1), _f(r["margin"]), "да" if r["below_floor"] else "",
                      _f(r["commission"])]
                     for r in sorted(rows, key=lambda r: (r["platform"], r["category"], r["article"], r["size"]))]
-            with open(args.xlsx, "wb") as f:
-                f.write(xlsx_bytes(head, data))
+            from openpyxl import load_workbook
+            import io
+            book = load_workbook(io.BytesIO(xlsx_bytes(head, data)))
+            book.active.title = "Kit и Ламода"
+            ws = book.create_sheet("WB")
+            ws.append(["Кабинет", "Категория", "Артикул", "Размер", "Цвет", "ID_1С", "Сейчас: цена до скидки, ₽",
+                       "Сейчас: цена со скидкой, ₽", "Сейчас: скидка, %", "Средняя со скидкой по WB, ₽",
+                       "Кабинет к средней, %", f"Эталон (−{args.wb_discount}%), ₽", "Что сделать",
+                       "Новая цена до скидки, ₽", "Новая скидка, %", "Цена со скидкой (не меняется), ₽",
+                       "Маржинальность по текущей", "Комиссия, %"])
+            for r in sorted(wb, key=lambda r: (r["category"], r["article"], r["size"], r["account"])):
+                ws.append([r["account"], r["category"], r["article"], r["size"], r["color"], r["item_id"],
+                           r["current_list"], r["current_sale"], _pct(r["current_disc"]), _f(r["avg"], 0),
+                           _f(r["vs_avg"], 1), _f(r["etalon"], 0), r["action"], r["list"], _pct(r["disc"]),
+                           r["current_sale"], _f(r["margin"]), _f(r["commission"])])
+            book.save(args.xlsx)
             print(f"\nФайл: {args.xlsx}")
     finally:
         db.rollback()
