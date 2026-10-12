@@ -23,7 +23,11 @@ class FakeRun:
         self.fail_on = fail_on          # подкоманда, на которой падаем
         self.code = code
 
-    def __call__(self, command, capture_output=True, text=True, timeout=None):
+    def __call__(self, command, capture_output=True, timeout=None, **kw):
+        # Аргументы декодирования заглушку не интересуют: она и так отдаёт
+        # готовые строки. Что вывод читается ИМЕННО UTF-8, проверяет
+        # `tests/test_backup_mirror_diagnosis.py` — там заглушка держит байты и
+        # декодирует их тем, о чём попросили.
         self.calls.append(command)
         sub = command[command.index("--log-level") + 2]
         if self.fail_on and sub == self.fail_on:

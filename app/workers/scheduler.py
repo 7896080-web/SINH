@@ -9,12 +9,12 @@ from app.timeutils import now_utc
 from apscheduler.schedulers.blocking import BlockingScheduler
 
 from app.database import SessionLocal
-from app.backup import last_backup, make_backup
+from app.backup import last_backup, make_backup, second_site_configured
 from app.retention import apply_retention
 from app.report import CRITICAL, collect_findings, summary_line
 from app.workers.verify_stock import verify_all
 from app.models import Platform, PlatformAccount, WorkerHeartbeat
-from app.routers.health import SCHEDULER_START_MARKER
+from app.routers.health import MIRROR_OK_MARKER, SCHEDULER_START_MARKER
 from app.workers.credentials import CredentialsMissing
 from app.workers.client_factory import build_client
 from app.workers.circuit_breaker import (record_success, record_failure,
@@ -872,6 +872,19 @@ def job_backup():
             if result.mirror_error:
                 logger.warning("бэкап: копия НЕ доехала до зеркала — %s",
                                result.mirror_error)
+            elif second_site_configured(db):
+                # Зеркало сработало — ставим отметку ВРЕМЕНИ. Пишется только на
+                # удаче, и в этом весь смысл: её возраст и есть единственный
+                # ответ на вопрос «сколько суток второй площадки нет». Пиши мы
+                # её на каждом прогоне, ответ стирался бы ровно тем прогоном,
+                # который его и должен был дать, — а отличить «зеркала нет один
+                # день» от «зеркала нет месяц» больше неоткуда: отметка
+                # хранит одно состояние, истории у неё нет.
+                #
+                # Условие про настроенную вторую площадку обязательно: при
+                # пустых настройках `mirror_error` тоже пуст, и отметка
+                # утверждала бы наличие того, чего нет.
+                _heartbeat(db, MIRROR_OK_MARKER, True)
             _heartbeat(db, "backup", True,
                        f"копия не доехала до зеркала: {result.mirror_error}"
                        if result.mirror_error else "")
