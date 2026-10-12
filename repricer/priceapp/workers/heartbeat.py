@@ -17,6 +17,7 @@ EXPECTED = {
     "price_dispatch": (600, True),         # каждые 2 минуты
     "rate": (2 * 6 * 3600 + 600, True),    # раз в 6 часов
     "daily_refresh": (2 * 26 * 3600, False),
+    "wb_poll": (2 * 6 * 3600 + 1800, False),   # опрос WB: при запуске и раз в 6 часов
     "backup": (2 * 26 * 3600, False),
     "attention": (3 * 600, False),          # раз в 10 минут, при правках — сразу
 }

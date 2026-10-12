@@ -47,6 +47,10 @@
     <label>Отбор<select name="flt">{% for k, v in filters.items() %}<option value="{{ k }}" {% if flt == k %}selected{% endif %}>{{ v }}</option>{% endfor %}</select></label>
     <label title="Новая маржинальность — по цене, которая уйдёт; у артикула — наименьшая по размерам">Новая маржин. от<input name="mmin" value="{{ mmin }}" inputmode="decimal" style="width:56px"></label>
     <label>до<input name="mmax" value="{{ mmax }}" inputmode="decimal" style="width:56px"></label>
+    <label title="Цена на площадке сейчас (у артикула — наибольшая по размерам)">Цена сейчас, ₽ от<input name="pmin" value="{{ pmin }}" inputmode="decimal" style="width:70px"></label>
+    <label>до<input name="pmax" value="{{ pmax }}" inputmode="decimal" style="width:70px"></label>
+    <label title="Заданная наценка артикула или категории: коэффициент от базовой или маржинальность, с которыми работаем">Наценка (заданная) от<input name="cmin" value="{{ cmin }}" inputmode="decimal" style="width:56px"></label>
+    <label>до<input name="cmax" value="{{ cmax }}" inputmode="decimal" style="width:56px"></label>
     <button class="secondary">Показать</button>
     <a class="btn secondary" href="/sku-prices?scope={{ sc.key }}{% if by %}&amp;by={{ by }}{% endif %}">Сбросить</a>
   </div>
@@ -60,14 +64,14 @@
 <div class="row" style="margin-top:8px">
   <a class="btn secondary" href="/sku-prices/export?{{ export_qs }}" title="Ровно то, что отобрано на странице">Экспорт отбора в Excel</a>
   <form method="post" action="/sku-prices/import" enctype="multipart/form-data" class="row">
-    {% for k, v in (('scope', sc.key), ('art', art), ('barcode', barcode), ('color', color), ('size', size), ('cat', cat), ('flt', flt), ('mmin', mmin), ('mmax', mmax), ('by', by)) %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
+    {% for k, v in (('scope', sc.key), ('art', art), ('barcode', barcode), ('color', color), ('size', size), ('cat', cat), ('flt', flt), ('mmin', mmin), ('mmax', mmax), ('pmin', pmin), ('pmax', pmax), ('cmin', cmin), ('cmax', cmax), ('by', by)) %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
     <label>Импорт наценок (колонки «Вид наценки» и «Наценка»; пусто — без изменений, «-» — снять)<input type="file" name="file" accept=".xlsx" required></label>
     <button class="secondary">Импорт из Excel</button>
   </form>
 </div></details>
 
 <form method="post" action="/sku-prices/coef" id="bulk" data-sel-key="sku:{{ sc.key }}:{{ by }}" data-sel-name="arts" data-sel-total="{{ total }}" data-sel-unit="{{ 'категорий' if by == 'category' else 'артикулов' }}">
-  {% for k, v in (('scope', sc.key), ('art', art), ('barcode', barcode), ('color', color), ('size', size), ('cat', cat), ('flt', flt), ('mmin', mmin), ('mmax', mmax), ('by', by)) %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
+  {% for k, v in (('scope', sc.key), ('art', art), ('barcode', barcode), ('color', color), ('size', size), ('cat', cat), ('flt', flt), ('mmin', mmin), ('mmax', mmax), ('pmin', pmin), ('pmax', pmax), ('cmin', cmin), ('cmax', cmax), ('by', by)) %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
   <div class="card">
     <div class="row">
       <label style="flex-direction:row;gap:6px;align-items:center"><input type="checkbox" name="all_filtered" value="1" id="all-filtered"> весь отбор — {{ total }} {{ 'кат.' if by == 'category' else 'арт.' }}</label>
@@ -135,7 +139,7 @@
 {% else %}<tr><td colspan="8" class="muted">Нет товаров: загрузите каталоги кабинетов («API-ключи») и справочник 1С («Диагностика») или ослабьте отбор.</td></tr>{% endfor %}
 </table></div>
 </form>
-{% for g in groups %}{% set hidden %}<input type="hidden" name="row" value="{{ g.key }}">{% for k, v in (('scope', sc.key), ('art', art), ('barcode', barcode), ('color', color), ('size', size), ('cat', cat), ('flt', flt), ('mmin', mmin), ('mmax', mmax), ('by', by)) %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}{% endset %}
+{% for g in groups %}{% set hidden %}<input type="hidden" name="row" value="{{ g.key }}">{% for k, v in (('scope', sc.key), ('art', art), ('barcode', barcode), ('color', color), ('size', size), ('cat', cat), ('flt', flt), ('mmin', mmin), ('mmax', mmax), ('pmin', pmin), ('pmax', pmax), ('cmin', cmin), ('cmax', cmax), ('by', by)) %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}{% endset %}
 <form id="row{{ loop.index }}" method="post" action="/sku-prices/coef">{{ hidden }}</form>{% if g.manual %}<form id="manual{{ loop.index }}" method="post" action="/sku-prices/manual-clear">{{ hidden }}</form>{% endif %}{% endfor %}
 <script>
 document.addEventListener('submit', function (e) {

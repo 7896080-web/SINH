@@ -66,7 +66,7 @@ ACTIONS = {
 }
 VIEWS = {"": "по артикулам", "sku": "с размерами", "category": "по категориям"}
 COMMIT_EVERY = 500
-KEEP = ("scope", "art", "barcode", "color", "size", "cat", "flt", "mmin", "mmax", "by")
+KEEP = ("scope", "art", "barcode", "color", "size", "cat", "flt", "mmin", "mmax", "pmin", "pmax", "cmin", "cmax", "by")
 NO_CATEGORY = "(без категории)"
 SCOPE_COL = "Где (код)"
 KIND_COL = "Вид наценки"
@@ -375,12 +375,14 @@ def category_target(db: Session, platform: str, account_id: int | None, category
 
 def build(db: Session, sc: dict, art: str = "", barcode: str = "", color: str = "", size: str = "",
           cat: str = "", flt: str = "", mmin: str = "", mmax: str = "", by: str = "",
-          scope: str = "") -> list[dict]:
+          scope: str = "", pmin: str = "", pmax: str = "", cmin: str = "", cmax: str = "") -> list[dict]:
     """Группы в порядке ключа: артикулы (с размерами внутри) или категории. Отборы
     по тексту — по SKU, по состоянию — по группе целиком: наценка одна на группу,
     и отбор, разрезающий её, ставил бы её строкам разные решения в одной правке."""
     a_l, b_l, c_l, s_l = art.strip().lower(), barcode.strip(), color.strip().lower(), size.strip().lower()
     lo, hi = _dec_or_none(mmin), _dec_or_none(mmax)
+    plo, phi = _dec_or_none(pmin), _dec_or_none(pmax)          # цена на площадке сейчас (наибольшая по размерам)
+    clo, chi = _dec_or_none(cmin), _dec_or_none(cmax)          # наценка, с которой работаем (заданное значение)
     by_category = by == "category"
     cat_own = set(load_inputs(db, sc["platform"]).categories) if by_category else set()
     groups: dict[str, list[dict]] = {}
@@ -394,6 +396,13 @@ def build(db: Session, sc: dict, art: str = "", barcode: str = "", color: str = 
                                                   (r["sku"].size if r["sku"] else "")))
         g = summarize(rows)
         if not _group_passes(g, flt, lo, hi):
+            continue
+        cur = g["n"]["cur_max"]
+        if (plo is not None or phi is not None) and (cur is None or (plo is not None and _dec(cur) < plo)
+                                                      or (phi is not None and _dec(cur) > phi)):
+            continue
+        if (clo is not None or chi is not None) and (g["coef"] is None or (clo is not None and _dec(g["coef"]) < clo)
+                                                      or (chi is not None and _dec(g["coef"]) > chi)):
             continue
         s = rows[0]["sku"]
         g.update(key=key, article=key, rows=rows, level="category" if by_category else "article",
@@ -427,12 +436,14 @@ def categories_in(db: Session, sc: dict) -> list[str]:
 @router.get("/sku-prices")
 def page(request: Request, scope: str = Query(""), art: str = Query(""), barcode: str = Query(""),
          color: str = Query(""), size: str = Query(""), cat: str = Query(""), flt: str = Query(""),
-         mmin: str = Query(""), mmax: str = Query(""), by: str = Query(""), db: Session = Depends(get_db),
+         mmin: str = Query(""), mmax: str = Query(""), by: str = Query(""), pmin: str = Query(""), pmax: str = Query(""),
+         cmin: str = Query(""), cmax: str = Query(""), db: Session = Depends(get_db),
          user: User = Depends(get_current_user)):
     sc = pick_scope(db, scope)
     by = by if by in VIEWS else ""
     keep = {"scope": sc["key"] if sc else "", "art": art, "barcode": barcode, "color": color, "size": size,
-            "cat": cat, "flt": flt, "mmin": mmin, "mmax": mmax, "by": by}
+            "cat": cat, "flt": flt, "mmin": mmin, "mmax": mmax, "pmin": pmin, "pmax": pmax, "cmin": cmin, "cmax": cmax,
+            "by": by}
     groups = build(db, sc, **keep) if sc else []
     rule = load_inputs(db, sc["platform"]).rule if sc else None
     cats = categories_in(db, sc) if sc else []
@@ -730,11 +741,13 @@ def _tail(g: dict) -> list:
 @router.get("/sku-prices/export")
 def export(scope: str = Query(""), art: str = Query(""), barcode: str = Query(""), color: str = Query(""),
            size: str = Query(""), cat: str = Query(""), flt: str = Query(""), mmin: str = Query(""),
-           mmax: str = Query(""), by: str = Query(""), db: Session = Depends(get_db),
+           mmax: str = Query(""), by: str = Query(""), pmin: str = Query(""), pmax: str = Query(""),
+           cmin: str = Query(""), cmax: str = Query(""), db: Session = Depends(get_db),
            user: User = Depends(get_current_user)):
     """Выгружается РОВНО то, что отобрано на странице: те же «где», отборы и вид."""
     sc = pick_scope(db, scope)
-    keep = dict(art=art, barcode=barcode, color=color, size=size, cat=cat, flt=flt, mmin=mmin, mmax=mmax, by=by)
+    keep = dict(art=art, barcode=barcode, color=color, size=size, cat=cat, flt=flt, mmin=mmin, mmax=mmax, pmin=pmin,
+                pmax=pmax, cmin=cmin, cmax=cmax, by=by)
     groups = build(db, sc, **keep) if sc else []
     db.commit()
     data = []

@@ -180,3 +180,15 @@ def test_retry_waits_for_pause(db):
     dispatch.run_account(db, acc, client)
     dispatch.run_account(db, acc, client)
     assert len(client.calls) == 1
+
+
+def test_kit_push_sends_manual_discount_price_with_price():
+    s = _KitSession({})
+    res = platforms.KitClient("t", s).push_prices([
+        PriceItem("b1", 6000, "v1", sale=4000), PriceItem("b2", 3000, "v2", sale=3500),    # скидка не выше цены
+        PriceItem("b3", 2000, "v3")])                                                        # без скидки — ключа нет
+    assert s.calls[0][1] == {"items": [
+        {"variant_id": "v1", "price": "6000", "manual_discount_price": "4000"},
+        {"variant_id": "v2", "price": "3000", "manual_discount_price": "3000"},
+        {"variant_id": "v3", "price": "2000"}]}
+    assert sorted(res["ok"]) == ["b1", "b2", "b3"]

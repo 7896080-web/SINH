@@ -1,0 +1,199 @@
+"""Эталонная цена кабинетов WB: запись при отправке, возврат при падении «к получению» больше
+чем на 10%, пересчёт при сдвиге курса больше чем на 2%, опрос WB по расписанию."""
+from decimal import Decimal
+
+from priceapp import accounts as acc_mod, dispatch, reference, settings
+from priceapp.models import PlatformItem, PriceChange, ProductPrice, ReferencePrice
+from tests import factories as f
+
+COST = "10"             # $; курс 80 → себестоимость 800 ₽, цена по правилу ×2,5 = 2000 (с округлением)
+
+
+def _setup(db, platform="wb", rate="80", current=(2500, 2500)):
+    f.manual_rate(db, rate)
+    acc = f.account(db, platform=platform, commission=25)
+    f.rule(db, acc, base_coef="2.5", min_markup_coef="1.3", max_change_percent=1000)
+    f.sku(db, "u1", "A1", "S", barcodes=["b1"], cost_usd=COST)
+    f.item(db, acc, "b1", "A1", external_id="5:1", size="S")
+    row = db.query(PlatformItem).filter_by(barcode="b1").one()
+    row.current_price, row.current_sale_price = current
+    db.commit()
+    return acc
+
+
+def _cur(db, price, sale=None):
+    row = db.query(PlatformItem).filter_by(barcode="b1").one()
+    row.current_price, row.current_sale_price = price, sale if sale is not None else price
+    db.commit()
+
+
+def _ref(db, acc, price=2009):
+    rows = db.query(PlatformItem).filter_by(account_id=acc.id).all()
+    assert reference.record(db, acc, "u1", price, rows)
+    db.commit()
+    return db.query(ReferencePrice).filter_by(account_id=acc.id, item_id="u1").one()
+
+
+def test_record_stores_payout_and_rate(db):
+    acc = _setup(db, current=(2500, 2000))                       # скидка продавца 20%
+    ref = _ref(db, acc, 2009)
+    assert ref.ref_price == 2009 and ref.usd_rub == Decimal("80.0000") and ref.discount == Decimal("0.2000")
+    assert ref.ref_payout == Decimal(str(2009 * 0.8 * 0.75)).quantize(Decimal("0.01"))      # 1205,40
+    # повторная запись обновляет ту же строку
+    ref2 = _ref(db, acc, 2100)
+    assert db.query(ReferencePrice).count() == 1 and ref2.ref_price == 2100
+
+
+def test_non_wb_has_no_reference(db):
+    acc = _setup(db, platform="ozon")
+    rows = db.query(PlatformItem).all()
+    assert reference.record(db, acc, "u1", 2009, rows) is False and db.query(ReferencePrice).count() == 0
+
+
+class _Push:
+    def push_prices(self, items):
+        return {"ok": [i.barcode for i in items], "errors": [], "sent_prices": {}}
+
+
+def test_dispatch_records_reference_after_successful_send(db):
+    acc = _setup(db)
+    db.add(PriceChange(item_id="u1", account_id=acc.id, barcode="b1", new_price=2009, status="approved", decided_by="op"))
+    db.commit()
+    dispatch.run_account(db, acc, _Push())
+    ref = db.query(ReferencePrice).one()
+    assert ref.ref_price == 2009 and ref.source == "sent" and ref.ref_payout == Decimal("1506.75")
+    assert db.query(ProductPrice).one().last_sent_price == 2009
+
+
+def test_adopt_sent_records_prices_sent_before_the_rule(db):
+    acc = _setup(db)
+    db.add(ProductPrice(item_id="u1", account_id=acc.id, last_sent_price=2009))
+    db.commit()
+    st = reference.adopt_sent(db)
+    assert st["recorded"] == 1 and db.query(ReferencePrice).one().source == "adopt"
+
+
+def test_restore_when_platform_lowers_price_more_than_10_percent(db):
+    acc = _setup(db)
+    _ref(db, acc, 2009)                                           # к получению 1506,75; порог 1356,07
+    _cur(db, 1950)                                                # 1462,5 — падение 3% — в порядке
+    assert reference.run(db)["restored"] == 0 and db.query(PriceChange).count() == 0
+    _cur(db, 1700)                                                # 1275 — падение 15,4%
+    st = reference.run(db)
+    assert st["restored"] == 1 and st["eaten"] == 0
+    ch = db.query(PriceChange).one()
+    assert (ch.status, ch.source, ch.new_price, ch.old_price, ch.item_id) == ("approved", "reference", 2009, 1700, "u1")
+    assert "возврат эталонной цены 2009" in ch.note
+    assert reference.run(db)["restored"] == 0 and db.query(PriceChange).count() == 1    # уже в очереди
+
+
+def test_discount_drop_is_attention_not_a_send(db):
+    acc = _setup(db)
+    _ref(db, acc, 2009)
+    _cur(db, 2009, sale=1500)                                     # цена в списке та же, скидка продавца съела выручку
+    st = reference.run(db)
+    assert st["restored"] == 0 and st["eaten"] == 1 and db.query(PriceChange).count() == 0
+
+
+def test_never_lowers_price_and_keeps_human_decision(db):
+    acc = _setup(db)
+    _ref(db, acc, 2009)
+    _cur(db, 3000)                                                # площадка подняла — не трогаем
+    assert reference.run(db)["restored"] == 0
+    _cur(db, 1700)
+    db.add(PriceChange(item_id="u1", account_id=acc.id, barcode="b1", new_price=5000, status="approved", decided_by="op"))
+    db.commit()
+    reference.run(db)
+    assert [(c.new_price, c.status) for c in db.query(PriceChange)] == [(5000, "approved")]
+
+
+def test_rate_move_over_2_percent_recomputes_reference(db):
+    acc = _setup(db)
+    ref = _ref(db, acc, 2009)
+    f.manual_rate(db, "81.2")                                     # +1,5% — порога нет
+    assert reference.rate_moved(db) is False and reference.run(db)["revalued"] == 0
+    assert db.query(ReferencePrice).one().ref_price == 2009
+    f.manual_rate(db, "82.4")                                     # +3%
+    assert reference.rate_moved(db) is True
+    st = reference.run(db)
+    db.expire_all()
+    ref = db.query(ReferencePrice).one()
+    assert st["revalued"] == 1 and ref.usd_rub == Decimal("82.4000")
+    assert ref.ref_price == 2069 and ref.source == "rate"        # 10 $ × 82,4 × 2,5 = 2060 → вверх до шага 10, минус 1 = 2069
+    assert st["restored"] == 0                                    # цена площадки (2500) не ниже новой эталонной
+
+
+def test_rate_move_then_first_rule_applies(db):
+    acc = _setup(db)
+    _ref(db, acc, 2009)
+    _cur(db, 1700)                                                # площадка уже занижена
+    f.manual_rate(db, "82.4")
+    st = reference.run(db)
+    assert st["revalued"] == 1 and st["restored"] == 1
+    assert db.query(PriceChange).one().new_price == 2069          # возвращается уже ПЕРЕСЧИТАННАЯ эталонная
+
+
+def test_rate_fall_lowers_reference_but_sends_nothing(db):
+    acc = _setup(db)
+    _ref(db, acc, 2009)
+    f.manual_rate(db, "77.6")                                     # −3%
+    st = reference.run(db)
+    db.expire_all()
+    assert st["revalued"] == 1 and db.query(ReferencePrice).one().ref_price < 2009 and st["restored"] == 0
+    assert db.query(PriceChange).count() == 0
+
+
+def test_rule_can_be_disabled_and_thresholds_changed(db):
+    acc = _setup(db)
+    _ref(db, acc, 2009)
+    _cur(db, 1700)
+    settings.put(db, settings.REF_ENABLED, "0")
+    db.commit()
+    assert reference.run(db)["disabled"] is True and db.query(PriceChange).count() == 0
+    settings.put(db, settings.REF_ENABLED, "1")
+    settings.put(db, settings.REF_DROP_PERCENT, "20")             # падение 15,4% < 20% — не возвращаем
+    db.commit()
+    assert reference.run(db)["restored"] == 0
+
+
+class _FakeWb:
+    last_truncated = False
+
+    def get_prices(self):
+        return {}
+
+    def price_key(self, item):
+        return (item.external_id or "").split(":")[0]
+
+
+def test_wb_poll_loads_prices_then_runs_rule_and_skips_fresh_prices(db, monkeypatch):
+    from priceapp.timeutils import now_utc
+    from priceapp.workers import jobs
+    acc = _setup(db)
+    acc_mod.set_credential(db, acc, "token", "t")
+    db.commit()
+    calls = []
+    monkeypatch.setattr(jobs.accounts, "load_prices", lambda db_, a, c: calls.append("prices") or {"truncated": False})
+    monkeypatch.setattr(jobs.reference, "run", lambda db_: calls.append("rule") or
+                        {"accounts": 1, "revalued": 0, "restored": 0, "eaten": 0, "disabled": False})
+    jobs.job_wb_poll(lambda p, c: _FakeWb())
+    assert calls == ["prices", "rule"]
+    calls.clear()
+    acc.prices_loaded_at = now_utc()                              # цены только что загружены суточным обновлением
+    db.commit()
+    jobs.job_wb_poll(lambda p, c: _FakeWb())
+    assert calls == ["rule"]
+    assert db.get(__import__("priceapp.models", fromlist=["WorkerHeartbeat"]).WorkerHeartbeat, "wb_poll").last_success
+
+
+def test_poll_now_flag_is_read_once(db):
+    from priceapp.workers import jobs
+    assert jobs.wb_poll_requested() is False
+    settings.put(db, settings.REF_POLL_NOW, "1")
+    db.commit()
+    assert jobs.wb_poll_requested() is True and jobs.wb_poll_requested() is False
+
+
+def test_heavy_loop_polls_wb_at_start_and_every_6_hours():
+    from priceapp.workers import background
+    assert background.WB_POLL_EVERY == 6 * 3600 and background.WB_POLL_EVERY * 4 == 24 * 3600
