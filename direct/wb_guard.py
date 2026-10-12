@@ -16,7 +16,9 @@
        • не ниже минимальной ставки WB;
        • товарам «без ходовых размеров» и «много кликов без заказов» — не повышает;
        • товары, которым автопилот сознательно держит минимальную ставку (нет в наличии и т. п.), не трогает.
-Бюджеты, лимиты, минус-фразы, ставки по запросам — только wb_bids.py.
+  3. Бюджеты: меньше порога → пополнить по тем же правилам и потолкам (в сутки/неделю), что у автопилота; кампания,
+     вставшая на паузу из-за пустого бюджета, после пополнения запускается. Пополнения не откатываются.
+Лимиты, минус-фразы, ставки по запросам, уборка товаров — только wb_bids.py.
 
 Безопасность:
   • без --apply — пробный прогон: только показывает;
@@ -72,13 +74,40 @@ def rec_for(token, cid, nm, pay, target):
     return rec
 
 
+def plan_topups(cab, token, camps, state):
+    """Пополнения бюджетов по правилам последнего wb_bids.py --apply (те же порог, сумма и потолки в сутки/неделю).
+    Кампания на паузе с бюджетом ниже порога (кончились деньги) — пополнить и запустить, если автопилот ею управлял."""
+    rules = {int(k): v for k, v in (state.get("topup_rules") or {}).items() if v.get("cabinet") == cab}
+    ids = [cid for cid, t in rules.items() if cid in camps and (camps[cid].get("_status") == 9 or
+                                                                (camps[cid].get("_status") == 11 and t.get("start")))]
+    if not ids:
+        return []
+    buds = B.get_budgets(token, ids)
+    res = []
+    for cid in ids:
+        t, bud = rules[cid], buds.get(cid)
+        if bud is None or bud >= t["below"]:
+            continue
+        amount = min(t["amount"], t["day_cap"] - B.topped_week(state, cid, days=1), t["week_cap"] - B.topped_week(state, cid))
+        paused = camps[cid].get("_status") == 11
+        if amount < 100:
+            log(f"  ! «{t['name']}»: бюджет {B.fm_rub(bud)} ₽, но потолок пополнений исчерпан — не пополняю"
+                + (" (кампания стоит на паузе)" if paused else ""))
+            continue
+        res.append({"cabinet": cab, "advert_id": cid, "name": t["name"], "amount": amount, "source": t["source"],
+                    "budget_before": bud, "start": paused})
+    return res
+
+
 def plan_cabinet(cab, token, caps, state, budget):
-    """Возвращает (изменения, «минимум выше окупаемого»). budget — сколько ещё товаров можно сверить с рекомендацией."""
+    """Возвращает (изменения, «минимум выше окупаемого», сверено, пополнения). budget — сколько ещё товаров
+    можно сверить с рекомендацией."""
     by_c = defaultdict(dict)
     for key, zones in caps.items():
         cid, nm = key.split(":")
         by_c[int(cid)][int(nm)] = zones
     camps = B.get_campaigns(token)
+    topups = plan_topups(cab, token, camps, state)
     cand = []                          # (кампания, товар, зона, данные кампании) — только активные кампании
     for cid, items in by_c.items():
         a = camps.get(cid)
@@ -130,7 +159,7 @@ def plan_cabinet(cab, token, caps, state, budget):
                 continue
         if mn and cur < mn:                            # рекомендацию не смотрели — только минимум
             changes.append({**base, "new": mn, "rec": None, "why": "ниже минимума WB → минимальная"})
-    return changes, losing, checked
+    return changes, losing, checked, topups
 
 
 def main():
@@ -171,15 +200,16 @@ def main():
         write_log()
         return
 
-    changes, losing, budget = [], [], REC_MAX
+    changes, losing, topups, budget = [], [], [], REC_MAX
     for cab, token in cabs.items():
         try:   # ID кампаний у WB уникальны: в каждом кабинете проверяются только его кампании
-            ch, lo, n = plan_cabinet(cab, token, caps["items"], state, budget)
+            ch, lo, n, tp = plan_cabinet(cab, token, caps["items"], state, budget)
         except B.ApiError as e:
             log(f"  ✗ {cab}: {e}")
             continue
         changes += ch
         losing += lo
+        topups += tp
         budget = max(budget - n, 0)
     print(" " * 60, end="\r")
     log(f"  Сверено с рекомендацией WB: {REC_MAX - budget} тов.; изменений ставок: {len(changes)}.")
@@ -195,6 +225,13 @@ def main():
                 f"окупается до {B.rub(it['cap'])}")
         log("    Решить: оставить как есть, убрать товар из кампании или поднять допустимую цену заказа в wb_bids.py.")
 
+    for t in topups:
+        log(f"  ₽ «{t['name']}»: бюджет {B.fm_rub(t['budget_before'])} ₽ → пополнить на {t['amount']} ₽"
+            + (" и запустить (стоит на паузе — кончились деньги)" if t["start"] else ""))
+    if apply and topups:
+        for cab in sorted({t["cabinet"] for t in topups}):
+            n = B.apply_topups(cabs[cab], [t for t in topups if t["cabinet"] == cab], state)
+            log(f"  {cab}: пополнено бюджетов {n} (пополнения не откатываются)")
     if apply and changes:
         BACKUP_DIR.mkdir(exist_ok=True)
         path = BACKUP_DIR / f"guard_{dt.datetime.now():%Y%m%d_%H%M%S}.json"
@@ -206,7 +243,7 @@ def main():
             log(f"  {cab}: изменено ставок {n} из {sum(1 for i in changes if i['cabinet'] == cab)}")
         B.save_state(state)
         log("  Откат: python wb_guard.py --rollback")
-    elif changes:
+    elif changes or topups:
         log("  Это пробный прогон. Применить: python wb_guard.py --apply")
     write_log()
 

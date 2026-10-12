@@ -67,7 +67,7 @@ RULES = {
         # (заказы 27643 идут ровно с 7 до 24 ч; лимит впритык выключал бы рекламу в сильные дни к 18–20 ч).
         # ── Главные кампании (решение 12.10.2026): потолок пополнений 2 000 ₽ в сутки и 14 000 ₽ в неделю; если встали на паузу
         #    из-за пустого бюджета — после пополнения запустить. Остальное — как в "*".
-        "31049161": {"daily_limit": 3000, "topup_week_cap": 14000, "topup_day_cap": 3000, "start_after_topup": True},   # «27643 клик»
+        "31049161": {"daily_limit": 3000, "topup_week_cap": 21000, "topup_day_cap": 3000, "start_after_topup": True},   # «27643 клик»
         "31048671": {"daily_limit": 2000, "topup_week_cap": 14000, "topup_day_cap": 2000, "start_after_topup": True},   # «36446 клик»
         # «Куртка общ» включена пользователем 12.10.2026 с пустым бюджетом: общие правила "*", после пополнения — запустить.
         "36114933": {"start_after_topup": True},   # «Куртка общ от 25.04.2026», за клики
@@ -104,6 +104,8 @@ DEFAULTS = {
                                 # «проверить карточку» (фото, цена, размеры, отзывы); None — выключено
     "min_stock": 15,            # товар, которого в наличии меньше (WB + свой склад), убрать из кампании (None — не убирать).
                                 # Правило пользователя от 12.10.2026. Кампанию целиком не опустошает. Откат возвращает товар
+    "return_stock": 20,         # убранный из-за малого остатка товар вернуть в кампанию, когда в наличии снова столько
+                                # (WB + свой склад); выше min_stock, чтобы товар не дёргался туда-сюда (решение 12.10.2026)
     "max_drop_pct": None,       # максимум снижения ставки в сутки, %; None — без ограничения (решение 12.10.2026:
                                 # переплачивать нет смысла, снижать сразу). Нет в наличии или
                                 # нет ходовых размеров — минимальная ставка сразу, это ограничение не действует
@@ -299,6 +301,8 @@ def load_unit_limits():
 
 
 UNIT_LIMITS = {}
+MANAGED = {}      # {кампания: кабинет} — какими кампаниями управлял этот прогон (для «пауза из-за денег»)
+TOPUP_RULES = {}  # {кампания: правила пополнения} — для часовой проверки wb_guard.py
 CAPS = {}         # {"кампания:артикул": {зона: {потолок, правила товара}}} — для часовой проверки wb_guard.py
 LOCK_FILE = HERE / "wb_bids.running"   # пока автопилот работает, wb_guard.py ставки не трогает
 BUYOUT = {}       # {(кабинет, артикул): (множитель потолка, выкуп товара, заказов в расчёте)}
@@ -311,6 +315,29 @@ def mcpo(cab, rule, nm):
     if v == "auto":
         return UNIT_LIMITS.get((cab, nm), rule["max_cost_per_order_default"])
     return v * BUYOUT.get((cab, nm), (1.0,))[0]
+
+
+TRIM_BACKUPS = HERE / "wb_trim_backups"
+
+
+def trimmed_items(state, cab):
+    """Товары, убранные из кампаний из-за малого остатка: автопилотом (state["trimmed"]) и вручную через wb_trim.py.
+    {(кампания, артикул): запись с прежними ставками}."""
+    res = {}
+    files = [(f, None) for f in sorted(TRIM_BACKUPS.glob("trim_*.json"))] if TRIM_BACKUPS.exists() else []
+    files += [(f, "trim") for f in sorted(BACKUP_DIR.glob("bids_*.json"))] if BACKUP_DIR.exists() else []
+    for f, key in files:      # резервные копии wb_trim.py и прошлых --apply автопилота (в т. ч. до появления «trimmed»)
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            for i in (data.get(key) or []) if key else data:
+                if i.get("cabinet") == cab:
+                    res[(i["advert_id"], i["nm_id"])] = i
+        except (OSError, ValueError, KeyError, AttributeError):
+            continue
+    for i in (state.get("trimmed") or {}).values():
+        if i.get("cabinet") == cab:
+            res[(i["advert_id"], i["nm_id"])] = i
+    return res
 
 
 def load_buyout(cab, token, nm_ids, vendor):
@@ -783,7 +810,7 @@ def changed(new, cur, step):
 
 def plan_cabinet(cab, token, rules, state):
     log(f"\n══════════ {cab} ══════════")
-    plan = {"bids": [], "cluster_bids": [], "minus": [], "limits": [], "trim": [], "topup": []}
+    plan = {"bids": [], "cluster_bids": [], "minus": [], "limits": [], "trim": [], "untrim": [], "topup": []}
     camps = get_campaigns(token)
     todo = {}
     explicit = {}
@@ -812,6 +839,23 @@ def plan_cabinet(cab, token, rules, state):
             todo[cid] = dict(DEFAULTS, **rules["*"])
         log(f"  Все активные кампании: {len(auto)}" + (f" (кроме {len(skip)} из «_except»)" if skip else "") + ": "
             + ", ".join(f"«{(camps[c].get('settings') or {}).get('name')}» {c}" for c in auto))
+        # кампания, которой автопилот управлял, встала на паузу: бюджет меньше порога — пауза из-за денег (пополнить
+        # и запустить); деньги в бюджете есть — паузу поставили вы, не трогаю
+        managed = state.get("managed") or {}
+        paused = [cid for cid, a in camps.items() if a.get("_status") == 11 and str(cid) in managed
+                  and cid not in todo and cid not in skip]
+        thr = {**DEFAULTS, **rules["*"]}.get("topup_below")
+        if paused:
+            buds = get_budgets(token, paused)
+            for cid in paused:
+                nm_ = (camps[cid].get("settings") or {}).get("name")
+                b = buds.get(cid)
+                if thr and b is not None and b < thr:
+                    todo[cid] = dict(DEFAULTS, **rules["*"], _resume=True)
+                    log(f"  «{nm_}» {cid} на паузе, бюджет {fm_rub(b)} ₽ < {thr} ₽ — похоже, кончились деньги: пополню и запущу.")
+                else:
+                    log(f"  «{nm_}» {cid} на паузе, в бюджете {fm_rub(b) if b is not None else '?'} ₽ — паузу, видимо, "
+                        "поставили вы: не трогаю.")
     if not todo:
         log("  Нет кампаний для управления.")
         return plan
@@ -832,7 +876,11 @@ def plan_cabinet(cab, token, rules, state):
     # статистику WB отдаёт только для статусов 7, 9, 11; «готовая к запуску» (4) в пакете могла бы сорвать весь запрос
     stats = nm_stats(token, [c for c in involved if camps[c].get("_status") != 4])
     nms_of = {cid: [s.get("nm_id") for s in camps[cid].get("nm_settings") or []] for cid in involved}
-    stock = get_stock(token, sorted({nm for cid in involved for nm in nms_of[cid]}))
+    was_trimmed = {k: v for k, v in trimmed_items(state, cab).items() if k[0] in todo and k[1] not in nms_of.get(k[0], [])}
+    stock = get_stock(token, sorted({nm for cid in involved for nm in nms_of[cid]} | {k[1] for k in was_trimmed}))
+    for cid in todo:
+        if camps[cid].get("_status") in (9, 11):
+            MANAGED[cid] = cab
     load_buyout(cab, token, sorted({nm for cid in involved for nm in nms_of[cid]}),
                 {nm: v.get("vendor") for nm, v in (stock or {}).items()})
     def no_stock(nm):
@@ -940,6 +988,17 @@ def plan_cabinet(cab, token, rules, state):
                     plan["trim"].append({"cabinet": cab, "advert_id": cid, "nm_id": nm, "bid_type": a.get("bid_type"),
                                          "bids_kopecks": bk.get(nm, {}), "stock": available(stock.get(nm))})
                 nms = [nm for nm in nms if nm not in low]
+        # ---- убранные раньше из-за малого остатка: вернуть, когда в наличии снова return_stock ----
+        if r.get("return_stock") and stock is not None:
+            back = [i for (c_, nm), i in was_trimmed.items() if c_ == cid
+                    and (available(stock.get(nm)) or 0) >= r["return_stock"]]
+            if back:
+                log(f"    Вернуть в кампанию (в наличии снова {r['return_stock']}+ шт): "
+                    + ", ".join(f"{i['nm_id']} ({stock_label(stock.get(i['nm_id']))})" for i in back))
+                for i in back:
+                    plan["untrim"].append({"cabinet": cab, "advert_id": cid, "nm_id": i["nm_id"],
+                                           "bid_type": i.get("bid_type") or a.get("bid_type"),
+                                           "bids_kopecks": i.get("bids_kopecks") or {}})
 
         # ---- ставки товаров ----
         if unified:
@@ -1216,6 +1275,11 @@ def plan_cabinet(cab, token, rules, state):
                                                "new": {"enabled": True, "dailyLimit": want, "carryOverEnabled": bool(r["carry_over"])}})
         # ---- автопополнение бюджета ----
         if r.get("topup_below"):
+            can_start = bool(r.get("start_after_topup") or r.get("_resume") or str(cid) in (state.get("managed") or {})
+                             or camps[cid].get("_status") == 9)
+            TOPUP_RULES[str(cid)] = {"cabinet": cab, "name": name, "below": r["topup_below"], "amount": r["topup_amount"],
+                                     "day_cap": r["topup_day_cap"], "week_cap": r["topup_week_cap"],
+                                     "source": r["topup_source"], "start": can_start}
             bud = get_budgets(token, [cid]).get(cid)
             if bud is None:
                 log("    ! Бюджет кампании не получен — пополнение пропускаю.")
@@ -1229,7 +1293,7 @@ def plan_cabinet(cab, token, rules, state):
                     log(f"    ! Бюджет {fm_rub(bud)} ₽ ниже порога, но потолок исчерпан: сегодня пополнено на {fm_rub(today_)} "
                         f"из {r['topup_day_cap']} ₽, за 7 дней на {fm_rub(week)} из {r['topup_week_cap']} ₽ — не пополняю.")
                 else:
-                    start = bool(r.get("start_after_topup")) and a.get("_status") == 11
+                    start = can_start and a.get("_status") == 11
                     log(f"    Бюджет: {fm_rub(bud)} ₽ < {r['topup_below']} ₽ → пополнить на {amount} ₽ из «{SOURCE_RU[r['topup_source']]}» "
                         f"(сегодня уже {fm_rub(today_)} из {r['topup_day_cap']} ₽, за 7 дней {fm_rub(week)} из {r['topup_week_cap']} ₽)" + (" и запустить кампанию" if start else "") + ".")
                     plan["topup"].append({"cabinet": cab, "advert_id": cid, "name": name, "amount": amount,
@@ -1476,6 +1540,21 @@ def run_apply(cabs, plan, key, state, reverse=False):
                 res.append(f"пополнено бюджетов {apply_topups(tok, sel['topup'], state)}/{len(sel['topup'])}")
         if sel.get("trim"):
             res.append(f"{'возвращено' if reverse else 'убрано'} товаров {apply_trim(tok, sel['trim'], reverse)}/{len(sel['trim'])}")
+            tr = state.setdefault("trimmed", {})
+            for i in sel["trim"]:
+                if reverse:
+                    tr.pop(pk(i["advert_id"], i["nm_id"]), None)
+                else:
+                    tr[pk(i["advert_id"], i["nm_id"])] = {**i, "date": dt.date.today().isoformat()}
+        if sel.get("untrim"):
+            res.append(f"{'снова убрано' if reverse else 'возвращено в кампании'} товаров "
+                       f"{apply_trim(tok, sel['untrim'], not reverse)}/{len(sel['untrim'])}")
+            tr = state.setdefault("trimmed", {})
+            for i in sel["untrim"]:
+                if reverse:
+                    tr[pk(i["advert_id"], i["nm_id"])] = {**i, "date": dt.date.today().isoformat()}
+                else:
+                    tr.pop(pk(i["advert_id"], i["nm_id"]), None)
         if sel["bids"]:
             res.append(f"ставки товаров {apply_bids(tok, sel['bids'], key)}/{len(sel['bids'])}")
         if sel["cluster_bids"]:
@@ -1510,9 +1589,11 @@ def main():
         plan.setdefault("minus", [])
         plan.setdefault("limits", [])
         plan.setdefault("trim", [])
+        plan.setdefault("untrim", [])
         plan["topup"] = []          # пополнения не откатываются
         log(f"{dt.datetime.now():%d.%m.%Y %H:%M} — ОТКАТ по {files[-1].name}")
         run_apply(cabs, plan, "old", state, reverse=True)
+        save_state(state)     # список убранных товаров («trimmed») после отката
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write("\n".join(out) + "\n\n")
         return
@@ -1523,7 +1604,7 @@ def main():
     if UNIT_LIMITS:
         log(f"Юнит-экономика: лимиты цены заказа для {len(UNIT_LIMITS)} товаров (wb_unit_economics.csv).")
     print("Рекомендации WB отдаёт по одному товару раз в 12 секунд — на кампанию уходит несколько минут.")
-    plan = {"bids": [], "cluster_bids": [], "minus": [], "limits": [], "trim": [], "topup": []}
+    plan = {"bids": [], "cluster_bids": [], "minus": [], "limits": [], "trim": [], "untrim": [], "topup": []}
     for cab, rules in RULES.items():
         if cab not in cabs:
             log(f"\n✗ Кабинет «{cab}» есть в RULES, но нет в wb_tokens.txt")
@@ -1540,7 +1621,7 @@ def main():
     n_minus = sum(len(m["add_auto"]) + len(m["add_route"]) for m in plan["minus"])
     log(f"\nИтого: ставки товаров {len(plan['bids'])} (↑{up} ↓{len(plan['bids']) - up}), "
         f"ставки запросов {len(plan['cluster_bids'])}, новых минус-фраз {n_minus}, дневных лимитов {len(plan['limits'])}, "
-        f"убрать товаров с малым остатком {len(plan['trim'])}, "
+        f"убрать товаров с малым остатком {len(plan['trim'])}, вернуть {len(plan['untrim'])}, "
         f"пополнить бюджетов {len(plan['topup'])} на {sum(t['amount'] for t in plan['topup'])} ₽.")
     if apply and DATA_PROBLEMS:
         log("\n✗ НЕ ПРИМЕНЯЮ: часть данных не загрузилась, ставки были бы посчитаны вслепую:")
@@ -1561,6 +1642,10 @@ def main():
         log("Это пробный прогон. Применить: python wb_bids.py --apply")
     if apply and not DATA_PROBLEMS:
         state["caps"] = {"at": dt.datetime.now().isoformat(timespec="seconds"), "items": CAPS}   # для wb_guard.py
+        state["topup_rules"] = TOPUP_RULES
+        man = state.setdefault("managed", {})
+        for cid, cab_ in MANAGED.items():
+            man[str(cid)] = {"cabinet": cab_, "seen": dt.date.today().isoformat()}
         save_state(state)     # ставки на начало дня и отсчёт наличия на WB — только при настоящем применении
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write("\n".join(out) + "\n\n")
