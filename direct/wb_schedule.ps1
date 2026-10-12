@@ -2,7 +2,7 @@
 # python wb_bids.py --apply). Решение пользователя 12.10.2026:
 #   • wb_bids.py --apply — 3 раза в день: 08:00, 13:00, 18:00;
 #   • wb_guard.py --apply — каждый час в :40 с 07:40 до 23:40: ставка за рекомендацией WB и минимумом, не выше
-#     окупаемого потолка, ±30% в сутки (≈10 минут).
+#     окупаемого потолка, вниз и вверх сразу (≈10 минут).
 # Установить:  powershell -ExecutionPolicy Bypass -File C:\direct\wb_schedule.ps1
 # Проверить:   Get-ScheduledTask -TaskName "AWER_WB_*"
 # Снять:       powershell -ExecutionPolicy Bypass -File C:\direct\wb_schedule.ps1 -Remove
