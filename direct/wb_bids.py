@@ -142,6 +142,12 @@ SIZE_COVER_NO_RAISE = 0.6           # в наличии размеры с дол
 SIZE_COVER_MIN_BID = 0.3            # < 30% — как «нет в наличии»: минимальная ставка
 SIZE_CACHE_HOURS = 6                # данные по размерам обновляются у WB раз в 2 часа; чаще 6 ч не запрашиваем
 MINUS_AFTER_RESTOCK_DAYS = 14       # автоминус по товару — только после стольких дней подряд в наличии (WB + FBS)
+# Выкуп (решение 12.10.2026): заказ цвета, который чаще не выкупают, стоит дороже — потолок цены заказа по каждому
+# артикулу умножается на (его выкуп ÷ средний выкуп кабинета). Деньги перетекают к тому, что реально продаётся.
+BUYOUT_RULE = True                  # False — один потолок для всех товаров, как раньше
+BUYOUT_FROM_DAYS, BUYOUT_TO_DAYS = 120, 21   # «созревшие» заказы: 21–120 дней назад (почти все уже выкуплены или нет)
+BUYOUT_PRIOR = 20                   # у товара мало истории — выкуп тянется к среднему (вес среднего, в заказах)
+BUYOUT_MIN, BUYOUT_MAX = 0.6, 1.4   # множитель потолка не меньше ×0.6 и не больше ×1.4
 CLUSTER_DAYS = 30                   # статистика запросов
 PRIOR_CR, K_CLICKS = 0.03, 100      # конверсия по умолчанию и её вес
 PRIOR_CTR, K_VIEWS = 0.03, 1000     # CTR в поиске по умолчанию и его вес
@@ -290,14 +296,57 @@ def load_unit_limits():
 
 
 UNIT_LIMITS = {}
+BUYOUT = {}       # {(кабинет, артикул): (множитель потолка, выкуп товара, заказов в расчёте)}
 
 
 def mcpo(cab, rule, nm):
-    """Допустимая цена заказа для товара: число из правила или лимит из юнит-экономики."""
+    """Допустимая цена заказа для товара: число из правила × поправка на выкуп товара,
+    или лимит из юнит-экономики ("auto" — там выкуп уже учтён)."""
     v = rule["max_cost_per_order"]
     if v == "auto":
         return UNIT_LIMITS.get((cab, nm), rule["max_cost_per_order_default"])
-    return v
+    return v * BUYOUT.get((cab, nm), (1.0,))[0]
+
+
+def load_buyout(cab, token, nm_ids, vendor):
+    """Выкуп по артикулам за «созревший» период → множитель потолка цены заказа. Ошибка — без поправки."""
+    if not BUYOUT_RULE or not nm_ids:
+        return
+    d1 = dt.date.today() - dt.timedelta(days=BUYOUT_FROM_DAYS)
+    d2 = dt.date.today() - dt.timedelta(days=BUYOUT_TO_DAYS)
+    got = {}
+    try:
+        for part in chunks(nm_ids, 100):
+            pace(token, "funnel", 21)
+            body = {"selectedPeriod": {"start": d1.isoformat(), "end": d2.isoformat()}, "nmIds": part,
+                    "brandNames": [], "subjectIds": [], "tagIds": [], "skipDeletedNm": False, "limit": 1000, "offset": 0}
+            data = call("POST", ANA + "/api/analytics/v3/sales-funnel/products", token, body=body,
+                        what="Выкуп по товарам (воронка продаж)") or {}
+            for p in (data.get("data") or {}).get("products") or []:
+                sel = (p.get("statistic") or {}).get("selected") or {}
+                b, c = num(sel.get("buyoutCount")), num(sel.get("cancelCount"))
+                got[(p.get("product") or {}).get("nmId")] = (b, c)
+    except ApiError as e:
+        log(f"  ! {e} — потолок цены заказа без поправки на выкуп.")
+        return
+    tb, tn = sum(b for b, c in got.values()), sum(b + c for b, c in got.values())
+    if tn < 50:
+        log(f"  Выкуп: мало истории ({tn:.0f} заказов за {BUYOUT_TO_DAYS}–{BUYOUT_FROM_DAYS} дн. назад) — потолок без поправки.")
+        return
+    avg = tb / tn
+    rows = []
+    for nm, (b, c) in got.items():
+        share = (b + BUYOUT_PRIOR * avg) / (b + c + BUYOUT_PRIOR)
+        k = min(max(share / avg, BUYOUT_MIN), BUYOUT_MAX)
+        BUYOUT[(cab, nm)] = (k, share, b + c)
+        if abs(k - 1) >= 0.1:
+            rows.append((k, nm, share, b + c))
+    log(f"  Выкуп: средний {avg:.0%} (заказы {BUYOUT_TO_DAYS}–{BUYOUT_FROM_DAYS} дн. назад). Потолок цены заказа по товару "
+        f"× (его выкуп ÷ средний), от ×{BUYOUT_MIN} до ×{BUYOUT_MAX}; при малой истории — ближе к среднему.")
+    if rows:
+        log("    Заметная поправка (±10% и больше):")
+        for k, nm, share, n in sorted(rows):
+            log(f"      {nm:>11} {str(vendor.get(nm) or '')[:22]:22} выкуп {share:.0%} (по {n:.0f} заказам) → потолок ×{k:.2f}")
 
 
 def negative(q):
@@ -776,6 +825,8 @@ def plan_cabinet(cab, token, rules, state):
     stats = nm_stats(token, [c for c in involved if camps[c].get("_status") != 4])
     nms_of = {cid: [s.get("nm_id") for s in camps[cid].get("nm_settings") or []] for cid in involved}
     stock = get_stock(token, sorted({nm for cid in involved for nm in nms_of[cid]}))
+    load_buyout(cab, token, sorted({nm for cid in involved for nm in nms_of[cid]}),
+                {nm: v.get("vendor") for nm, v in (stock or {}).items()})
     def no_stock(nm):
         q = available((stock or {}).get(nm))
         return q is not None and q <= 0
@@ -864,7 +915,7 @@ def plan_cabinet(cab, token, rules, state):
         camp_ctr = smooth(c_clicks, c_views, PRIOR_CTR, K_VIEWS)
         log(f"\n  ▶ {name} (ID {cid}) — {'единая' if unified else 'ручная'} ставка, "
             f"{'за клики' if pay == 'cpc' else 'за показы'}, цель {target}, "
-            f"{'заказ до ' + str(r['max_cost_per_order']) + ' ₽' if r['max_cost_per_order'] != 'auto' else 'цена заказа — из юнит-экономики'}, "
+            f"{'заказ до ' + str(r['max_cost_per_order']) + ' ₽' + (' × выкуп товара' if any(k[0] == cab for k in BUYOUT) else '') if r['max_cost_per_order'] != 'auto' else 'цена заказа — из юнит-экономики'}, "
             f"конверсия {camp_cr * 100:.1f}%" + (f"; режим запуска новинки до {r['_until']}" if r.get("_until") else ""))
 
         # ---- товары с малым остатком: убрать из кампании ----
