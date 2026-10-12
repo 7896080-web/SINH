@@ -482,6 +482,7 @@ def product_rows(db: Session, account: Account, q: str = "", flt: str = "",
             "commission": commission, "tariff": facts.tariff, "category": facts.category,
             "markup_rub": d.markup_rub, "markup_coef": d.markup_coef,
             "block_reason": d.block_reason, "note": d.note, "source": d.source,
+            "target_kind": d.kind, "target_value": d.coef,
             "manual": pp.manual_price if pp else None, "last_sent": pp.last_sent_price if pp else None,
             "current": cur.current_price if cur else None, "current_sale": cur_sale,
             "current_payout": payout(cur_sale, commission) if cur_sale and commission is not None else None,
@@ -904,8 +905,10 @@ def page(request: Request, view: str = Query("rules"), account_id: str = Query("
                    siblings=[a for a in accs if account and a.platform == account.platform],
                    export_qs=urlencode({"q": q, "flt": flt, "coef_min": coef_min, "coef_max": coef_max}))
     elif view == "compare":
-        rows, cols = compare_rows(db, accs, q, flt)
-        ctx.update(rows=rows[:ROWS_LIMIT], total=len(rows), cols=cols, flt=flt,
+        all_rows, cols, summary = compare_all(db, accs, q)
+        rows = filter_compare(all_rows, flt)
+        ctx.update(rows=rows[:ROWS_LIMIT], total=len(rows), cols=cols, flt=flt, summary=summary,
+                   issue_labels=ISSUES, target_label=target_label,
                    compare_filters=COMPARE_FILTERS, export_qs=urlencode({"q": q, "flt": flt}))
     else:
         query = _changes_query(db, view, account_id, status, q)
@@ -1019,48 +1022,144 @@ def reject_changes(request: Request, form=Depends(posted_form), db: Session = De
 
 # --- сравнение площадок: товар и все кабинеты в одной строке -------------------------
 
-COMPARE_FILTERS = {"": "все", "spread": "цены расходятся больше чем на 15%",
-                   "below_floor_now": "где-то ниже пола по текущей"}
+COMPARE_FILTERS = {
+    "": "все",
+    "issues": "есть любое расхождение",
+    "cabinets_differ": "кабинеты одной площадки расходятся (наценка или новая цена)",
+    "markup_differs": "наценки разные",
+    "new_spread": "новые цены расходятся больше чем на 15%",
+    "spread": "текущие цены расходятся больше чем на 15%",
+    "below_floor_new": "где-то новая цена ниже пола",
+    "below_floor_now": "где-то ниже пола по текущей",
+    "manual": "где-то ручная цена",
+}
+SPREAD_LIMIT = 15.0
+
+# Расхождения одного товара между кабинетами. Слова — следствия, а не факты:
+# «наценки разные» само по себе нормально (у площадок разные комиссии и цели),
+# а вот разная наценка в двух ИП одной площадки почти всегда случайность.
+ISSUES = {
+    "cabinets_differ": "кабинеты одной площадки: разная наценка или новая цена — покупатель видит у ИП разные цены",
+    "new_spread": "новые цены по площадкам расходятся больше чем на 15%",
+    "spread": "текущие цены расходятся больше чем на 15%",
+    "below_floor_new": "новая цена где-то ниже пола — туда не уйдёт",
+    "below_floor_now": "по текущей цене где-то продаётся ниже пола",
+    "manual": "где-то ручная цена — наценка там не действует",
+}
+
+
+def _spread(values) -> float:
+    vals = [v for v in values if v]
+    return (max(vals) - min(vals)) * 100.0 / min(vals) if len(vals) > 1 else 0.0
+
+
+def _target_key(c: dict):
+    return (c["target_kind"], c["target_value"]) if c["target_value"] is not None else None
+
+
+def compare_issues(cells: dict, accs: dict) -> list[str]:
+    """Что расходится у одного товара 1С между кабинетами (ключи ISSUES)."""
+    present = {aid: c for aid, c in cells.items() if c}
+    out = []
+    by_platform: dict[str, list[dict]] = {}
+    for aid, c in present.items():
+        by_platform.setdefault(accs[aid].platform, []).append(c)
+    if any(len({_target_key(c) for c in group}) > 1 or len({c["price"] for c in group}) > 1
+           for group in by_platform.values() if len(group) > 1):
+        out.append("cabinets_differ")
+    if _spread(c["price"] for c in present.values()) > SPREAD_LIMIT:
+        out.append("new_spread")
+    if _spread(c["current"] for c in present.values()) > SPREAD_LIMIT:
+        out.append("spread")
+    if any(c["block_reason"] == BLOCK_FLOOR for c in present.values()):
+        out.append("below_floor_new")
+    if any(c["below_floor_now"] for c in present.values()):
+        out.append("below_floor_now")
+    if any(c["manual"] is not None for c in present.values()):
+        out.append("manual")
+    return out
 
 
 def compare_rows(db: Session, accs: list[Account], q: str = "", flt: str = "") -> tuple[list[dict], list[Account]]:
-    """SKU 1С -> по каждому кабинету: текущая и расчётная цена, коэффициент по
-    текущей. Считается ТЕМ ЖЕ `product_rows`, что и «Товары»: разойдись они,
-    сравнение показывало бы не те числа, что вкладка кабинета."""
+    """SKU 1С -> по каждому кабинету: текущая и новая цена, наценка и
+    маржинальность. Считается ТЕМ ЖЕ `product_rows`, что и «Текущие и ручные
+    цены»: разойдись они, сравнение показывало бы не те числа, что вкладка
+    кабинета. Сравниваются только товары, которые есть хотя бы в двух кабинетах:
+    одинаковый товар — это общий SKU 1С."""
+    rows, cols, _ = compare_all(db, accs, q)
+    return filter_compare(rows, flt), cols
+
+
+def filter_compare(rows: list[dict], flt: str) -> list[dict]:
+    if flt == "issues":
+        return [r for r in rows if r["issues"]]
+    if flt == "markup_differs":
+        return [r for r in rows if r["markup_differs"]]
+    if flt in ISSUES:
+        return [r for r in rows if flt in r["issues"]]
+    return rows
+
+
+def compare_all(db: Session, accs: list[Account], q: str = "") -> tuple[list[dict], list[Account], dict]:
+    """Все строки сравнения и сводка: сколько товаров с каждым расхождением."""
     per = {a.id: {r["item_id"]: r for r in product_rows(db, a, q)} for a in accs}
     cols = [a for a in accs if per[a.id]]
+    by_id = {a.id: a for a in cols}
     items = sorted({i for a in cols for i in per[a.id]})
     out = []
+    summary = {"shared": 0, "issues": 0, "markup_differs": 0, **{k: 0 for k in ISSUES}}
     for item_id in items:
         cells = {a.id: per[a.id].get(item_id) for a in cols}
         present = [c for c in cells.values() if c]
-        sku = present[0]["sku"]
-        current = [c["current"] for c in present if c["current"]]
-        spread = (max(current) - min(current)) * 100.0 / min(current) if len(current) > 1 else 0.0
-        if flt == "spread" and spread <= 15:
+        if len(present) < 2:
             continue
-        if flt == "below_floor_now" and not any(c["below_floor_now"] for c in present):
-            continue
-        out.append({"item_id": item_id, "sku": sku, "cells": cells, "spread": spread})
+        issues = compare_issues(cells, by_id)
+        markup_differs = len({_target_key(c) for c in present}) > 1
+        summary["shared"] += 1
+        summary["issues"] += bool(issues)
+        summary["markup_differs"] += markup_differs
+        for k in issues:
+            summary[k] += 1
+        out.append({"item_id": item_id, "sku": present[0]["sku"], "cells": cells, "issues": issues,
+                    "markup_differs": markup_differs,
+                    "spread": _spread(c["current"] for c in present),
+                    "new_spread": _spread(c["price"] for c in present)})
     out.sort(key=lambda r: ((r["sku"].article if r["sku"] else ""), (r["sku"].size if r["sku"] else "")))
-    return out, cols
+    return out, cols, summary
+
+
+def target_label(c: dict) -> str:
+    """«× 2,5 (умолчание)» / «маржин. 1,8 (категория)» / «ручная» — для ячейки и файла."""
+    if c is None:
+        return ""
+    if c["source"] == "manual":
+        return f"ручная {c['manual']}"
+    if c["target_value"] is None:
+        return "—"
+    v = pricing._ru(c["target_value"])
+    what = f"маржин. {v}" if c["target_kind"] == pricing.KIND_MARGIN else f"× {v}"
+    return f"{what} ({SOURCE_LABELS.get(c['source'], c['source'])})"
 
 
 @router.get("/prices/compare-export")
 def export_compare(q: str = Query(""), flt: str = Query(""), db: Session = Depends(get_db),
                    user: User = Depends(get_current_user)):
     rows, cols = compare_rows(db, _accounts(db), q, flt)
-    headers = ["ID_1С", "Артикул 1С", "Наименование", "Размер", "Цвет", "Разброс текущих, %"]
+    headers = ["ID_1С", "Артикул 1С", "Наименование", "Размер", "Цвет", "Расхождения",
+               "Разброс текущих, %", "Разброс новых, %"]
     for a in cols:
-        headers += [f"{a.name}: текущая, ₽", f"{a.name}: маржинальность по текущей", f"{a.name}: расчётная, ₽"]
+        headers += [f"{a.name}: текущая, ₽", f"{a.name}: маржин. по текущей", f"{a.name}: новая, ₽",
+                    f"{a.name}: маржин. новая", f"{a.name}: наценка"]
     data = []
     for r in rows:
         s = r["sku"]
         line = [r["item_id"], s.article if s else "", s.name if s else "", s.size if s else "",
-                s.color if s else "", round(r["spread"], 1)]
+                s.color if s else "", "; ".join(ISSUES[k] for k in r["issues"]),
+                round(r["spread"], 1), round(r["new_spread"], 1)]
         for a in cols:
             c = r["cells"][a.id]
-            line += [c["current"], _f(c["current_coef"]), c["price"]] if c else [None, None, None]
+            line += ([c["current"], _f(c["current_coef"]), c["price"], _f(c["markup_coef"]), target_label(c)]
+                     if c else [None, None, None, None, ""])
         data.append(line)
     db.commit()       # после чтения строк — см. `export`
     return xlsx_response(headers, data, "сравнение_площадок.xlsx")

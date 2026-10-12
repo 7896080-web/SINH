@@ -176,17 +176,29 @@ function bulkConfirm() {
   <button class="secondary">Показать</button>
   <a class="btn secondary" href="/prices/compare-export?{{ export_qs }}">Экспорт в Excel</a>
 </form>
-<p class="muted">Товар 1С и все кабинеты в одной строке: текущая цена площадки, маржинальность по ней и расчётная цена.
-Сравнение только для чтения — цены меняются на «Товарах» и в «Предложениях». Строк: {{ total }}{% if total > rows|length %}, показаны первые {{ rows|length }} — полный список в Excel{% endif %}.</p>
+{% if summary.shared %}<div class="card summary">
+  <b>Проверка одинаковых товаров</b> (общий SKU 1С хотя бы в двух кабинетах{% if q %}, с учётом поиска{% endif %}): {{ summary.shared }}.
+  Есть расхождения — <a href="/prices?view=compare&amp;flt=issues&amp;q={{ q }}">{{ summary.issues }}</a>:
+  <ul style="margin:6px 0 0">
+  {% for k, label in issue_labels.items() %}{% if summary[k] %}<li><a href="/prices?view=compare&amp;flt={{ k }}&amp;q={{ q }}">{{ summary[k] }}</a> — {{ label }}</li>{% endif %}{% endfor %}
+  </ul>
+  <p class="muted" style="margin:6px 0 0">Наценки разные у {{ summary.markup_differs }} — само по себе нормально (у площадок разные комиссии и
+  цели), разбирать стоит, если это кабинеты одной площадки (первая строка списка).</p>
+</div>{% else %}<div class="card muted">Одинаковых товаров (общий SKU 1С хотя бы в двух кабинетах) нет — сравнивать нечего.</div>{% endif %}
+<p class="muted">В ячейке: текущая цена и маржинальность по ней; новая цена, её маржинальность и откуда наценка. Только
+для чтения — править на <a href="/sku-prices">«Ценах товаров»</a> (ручную цену — на «Текущих и ручных ценах»).
+Строк: {{ total }}{% if total > rows|length %}, показаны первые {{ rows|length }} — полный список в Excel{% endif %}.</p>
 <div class="scroll"><table class="econ">
-<tr><th>Товар 1С</th><th class="num">Разброс</th>{% for a in cols %}<th class="num">{{ a.name }}<div class="muted">{{ platform_names[a.platform] }}</div></th>{% endfor %}</tr>
+<tr><th>Товар 1С</th><th>Расхождения</th>{% for a in cols %}<th class="num">{{ a.name }}<div class="muted">{{ platform_names[a.platform] }}</div></th>{% endfor %}</tr>
 {% for r in rows %}<tr>
   <td>{{ r.sku.article if r.sku else r.item_id }}{% if r.sku and r.sku.size %} · {{ r.sku.size }}{% endif %}{% if r.sku and r.sku.color %} · {{ r.sku.color }}{% endif %}<div class="muted">{{ r.sku.name if r.sku else '' }}</div></td>
-  <td class="num {{ 'warn' if r.spread > 15 else 'muted' }}">{{ '%.0f%%'|format(r.spread) if r.spread else '' }}</td>
+  <td style="white-space:normal;min-width:160px;max-width:240px">{% for k in r.issues %}<div class="{{ 'bad' if k in ('cabinets_differ', 'below_floor_new', 'below_floor_now') else 'warn' }}" style="font-size:12px">{{ issue_labels[k].split(' — ')[0] }}</div>{% else %}<span class="muted">—</span>{% endfor %}
+    {% if r.spread or r.new_spread %}<div class="muted" style="font-size:12px">разброс: тек. {{ '%.0f'|format(r.spread) }}%, нов. {{ '%.0f'|format(r.new_spread) }}%</div>{% endif %}</td>
   {% for a in cols %}{% set c = r.cells[a.id] %}<td class="num">{% if c %}
-    <a href="/prices/history/{{ a.id }}/{{ r.item_id }}">{{ c.current or '—' }}</a>{% if c.current_coef is not none %} <span class="{{ 'bad' if c.below_floor_now else 'muted' }}">×{{ c.current_coef|money }}</span>{% endif %}
-    <div class="muted">расч. {{ c.price if c.price is not none else '—' }}</div>{% else %}<span class="muted">—</span>{% endif %}</td>{% endfor %}
-</tr>{% else %}<tr><td colspan="{{ cols|length + 2 }}" class="muted">Нет сопоставленных товаров.</td></tr>{% endfor %}
+    <a href="/prices/history/{{ a.id }}/{{ r.item_id }}" title="История цены">{{ c.current or '—' }}</a>{% if c.current_coef is not none %} <span class="{{ 'bad' if c.below_floor_now else 'muted' }}">×{{ c.current_coef|money }}</span>{% endif %}
+    <div>нов. <b>{{ c.price if c.price is not none else '—' }}</b>{% if c.markup_coef is not none %} <span class="{{ 'bad' if c.block_reason == BLOCK_FLOOR else 'muted' }}">×{{ c.markup_coef|money }}</span>{% endif %}</div>
+    <div class="muted" style="font-size:12px;white-space:normal">{{ target_label(c) }}</div>{% else %}<span class="muted">—</span>{% endif %}</td>{% endfor %}
+</tr>{% else %}<tr><td colspan="{{ cols|length + 2 }}" class="muted">Нет строк под этот отбор.</td></tr>{% endfor %}
 </table></div>
 
 {% else %}
