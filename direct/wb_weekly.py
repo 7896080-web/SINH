@@ -180,13 +180,16 @@ def analyze(cab, token):
     def line(title, key, per=None, unit=" ₽"):
         c = cur["total"][key] / (cur["total"][per] or 1) if per else cur["total"][key]
         o = (old["total"][key] / (old["total"][per] or 1) if per else old["total"][key]) if old else None
-        log(f"    {title:38}{fm(c, 0, unit):>14}" + (f"{fm(o, 0, unit):>14}{change(c, o):>8}" if old else ""))
+        d = (f"{c - o:+.0f} п.п." if unit == "%" else change(c, o)) if old else ""   # для процентов — разница в пунктах
+        log(f"    {title:38}{fm(c, 0, unit):>14}" + (f"{fm(o, 0, unit):>14}{d:>9}" if old else ""))
     line("Выкуплено", "sold", unit=" шт")
     line("Возвратов", "returned", unit=" шт")
     line("Продажи (за вычетом возвратов)", "retail")
     line("Комиссия WB (продажи − к перечислению)", "commission")
     line("СПП — скидка WB покупателю, в среднем", "spp_w", per="w", unit="%")
     line("Комиссия WB (кВВ без НДС), в среднем", "kvw_w", per="w", unit="%")
+    log("    (кВВ бывает меньше нуля: WB сам оплачивает СПП из своей комиссии и при большой СПП доплачивает продавцу;\n"
+        "     чем ниже СПП, тем больше WB оставляет себе при той же цене)")
     line("Логистика всего", "logistics")
     line("Логистика на 1 выкуп", "logistics", per="sold")
     line("Удержано за рекламу (с «Баланса»)", "ads")
