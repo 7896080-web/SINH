@@ -61,11 +61,11 @@ RULES = {
     "Яворская": {
         "*": {"target": "3-10", "max_cost_per_order": 600, "daily_limit": 2500, "auto_minus": True},
         "_except": [],
-        # ── Новинки (запуск, решение 12.10.2026): допустимый заказ вдвое выше обычного, запросы не минусуем,
-        #    пока набираются продажи и отзывы. С 03.11 — общие правила "*".
-        "39661494": {"target": "3-10", "max_cost_per_order": 1200, "daily_limit": 2500, "auto_minus": False,
+        # ── Новинки (запуск, решение 12.10.2026): цель — места 1–2, допустимый заказ вдвое выше обычного,
+        #    запросы не минусуем, пока набираются продажи и отзывы. С 03.11 — общие правила "*".
+        "39661494": {"target": "1-2", "max_cost_per_order": 1200, "daily_limit": 2500, "auto_minus": False,
                      "until": "2026-11-02"},   # ZJYM269002, за клики
-        "39829896": {"target": "3-10", "max_cost_per_order": 1200, "daily_limit": 2500, "auto_minus": False,
+        "39829896": {"target": "1-2", "max_cost_per_order": 1200, "daily_limit": 2500, "auto_minus": False,
                      "until": "2026-11-02"},   # 256250 («Кампания от 29.08.2026»), за клики
 
         # ── Этап 1. Те же товары в рекомендациях, оплата за показы. Создать:
@@ -87,6 +87,8 @@ DEFAULTS = {
     "max_bid_cpc": 60,          # потолок ставки за клик, ₽
     "max_bid_cpm": 800,         # потолок ставки за 1000 показов, ₽
     "max_raise_pct": 30,        # максимум роста ставки в сутки, % (от ставки при первом запуске за день)
+    "stop_clicks": 150,         # столько кликов за 14 дней без единого заказа — ставку не повышать и в отчёт
+                                # «проверить карточку» (фото, цена, размеры, отзывы); None — выключено
     "min_stock": 15,            # товар, которого в наличии меньше (WB + свой склад), убрать из кампании (None — не убирать).
                                 # Правило пользователя от 12.10.2026. Кампанию целиком не опустошает. Откат возвращает товар
     "max_drop_pct": 30,         # максимум снижения ставки в сутки, % (None — без ограничения). Нет в наличии или
@@ -804,6 +806,7 @@ def plan_cabinet(cab, token, rules, state):
     # порядок: сначала кампании со ставками на запросы, потом остальные (для route_from)
     order = sorted(todo, key=lambda c: 0 if todo[c]["cluster_bids"] else 1)
     planned_cluster = defaultdict(set)   # (cid, nm) → запросы, на которые будут стоять ставки
+    check_card = []                      # товары с кликами без заказов — проверить карточку
     returned_now = defaultdict(set)      # (cid, nm) → запросы, которые в этом запуске возвращаются в клики
 
     for cid in order:
@@ -878,6 +881,10 @@ def plan_cabinet(cab, token, rules, state):
                     try:
                         data = get_rec(token, cid, nm)
                         rec = rec_cpc(data, CPC_LEVEL[target]) if pay == "cpc" else rec_cpm(data, CPM_LEVEL[target])
+                        if rec is None and data and target != "3-10":   # нет уровня для мест 1–2 — берём 3–10
+                            rec = rec_cpc(data, CPC_LEVEL["3-10"]) if pay == "cpc" else rec_cpm(data, CPM_LEVEL["3-10"])
+                            if rec is not None:
+                                log(f"      ({nm}: WB не дал ставку для мест {target}, беру для 3–10)")
                         if rec is None and data:
                             log(f"      ! {nm}: не понял ответ WB с рекомендацией (образец — {REC_SAMPLE.name}), ставку не трогаю.")
                             DATA_PROBLEMS.append(f"непонятный формат рекомендаций WB — см. {REC_SAMPLE.name}")
@@ -887,6 +894,11 @@ def plan_cabinet(cab, token, rules, state):
                                          day_base(state, "bids", cid, nm, placement), r.get("max_drop_pct"))
                     if size_short(nm) == "hold" and current and nb and nb > current:
                         nb, reason = current, f"мало ходовых размеров (закрыто {cover[nm][0]:.0%} спроса) — не повышаю"
+                    if r.get("stop_clicks") and v["clicks"] >= r["stop_clicks"] and not v["orders"]:
+                        check_card.append(f"{nm} ({cut(s_info.get('vendor'), 20)}) в «{name}»: {int(v['clicks'])} кликов "
+                                          f"за {STATS_DAYS} дн без заказов")
+                        if current and nb and nb > current:
+                            nb, reason = current, f"{int(v['clicks'])} кликов без заказов — не повышаю, проверить карточку"
                 ch = changed(nb, current, step)
                 log(f"      {nm:>11} {cut(s_info.get('vendor'), 16):16}{stock_label(s_info):>9}"
                     f"{int(v['clicks']):>6}{int(v['orders']):>5}{cr * 100:>5.1f}%{rub(current):>9}{rub(rec):>9}"
@@ -1098,6 +1110,11 @@ def plan_cabinet(cab, token, rules, state):
                                                "old": {"enabled": bool(lim.get("enabled")), "dailyLimit": lim.get("dailyLimit"),
                                                        "carryOverEnabled": bool(lim.get("carryOverEnabled"))},
                                                "new": {"enabled": True, "dailyLimit": want, "carryOverEnabled": bool(r["carry_over"])}})
+    if check_card:
+        log("\n  Проверить карточку (много кликов, ни одного заказа — дело скорее в фото, цене, размерах или отзывах, "
+            "а не в ставке; ставку таким товарам не повышаю):")
+        for c in check_card:
+            log(f"    • {c}")
     return plan
 
 
