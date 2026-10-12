@@ -94,6 +94,12 @@ def detail(rows):
             a["sold" if sign > 0 else "returned"] += q
             a["retail"] += sign * num(r.get("retailAmount"))
             a["for_pay"] += sign * num(r.get("forPay"))
+        if sign > 0:
+            # средняя СПП (скидка WB покупателю) и итоговая комиссия WB, взвешенные по продажам
+            w = num(r.get("retailAmount"))
+            t["w"] += w
+            t["spp_w"] += num(r.get("spp")) * w
+            t["kvw_w"] += num(r.get("kvw")) * w
         logi = num(r.get("deliveryService")) + num(r.get("rebillLogisticCost"))
         a["logistics"] += logi
         t["logistics"] += logi
@@ -179,6 +185,8 @@ def analyze(cab, token):
     line("Возвратов", "returned", unit=" шт")
     line("Продажи (за вычетом возвратов)", "retail")
     line("Комиссия WB (продажи − к перечислению)", "commission")
+    line("СПП — скидка WB покупателю, в среднем", "spp_w", per="w", unit="%")
+    line("Комиссия WB (кВВ без НДС), в среднем", "kvw_w", per="w", unit="%")
     line("Логистика всего", "logistics")
     line("Логистика на 1 выкуп", "logistics", per="sold")
     line("Удержано за рекламу (с «Баланса»)", "ads")
