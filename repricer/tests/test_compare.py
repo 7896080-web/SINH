@@ -51,3 +51,28 @@ def test_compare_export_has_markup_and_issues(client, db):
     assert row[h.index("ИП 2: наценка")] == "× 3 (артикул, кабинет)"
     assert "кабинеты одной площадки" in row[h.index("Расхождения")]
     assert isinstance(row[h.index("ИП 1: новая, ₽")], int)
+
+
+def test_check_script_runs_read_only_on_cp1251_console(db, tmp_path):
+    """Скрипт для офисного ПК: печатает сводку, пишет файл, базу не меняет. Консоль
+    боевой машины — cp1251, вывод не должен обрываться."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+    from priceapp.models import ArticleCoef, PriceChange
+    _setup(db)
+    before = (db.query(ArticleCoef).count(), db.query(PriceChange).count())
+    out = tmp_path / "check.xlsx"
+    root = Path(__file__).resolve().parent.parent
+    env = {**os.environ, "PYTHONIOENCODING": "cp1251"}
+    r = subprocess.run([sys.executable, str(root / "scripts" / "check_same_items.py"), "--xlsx", str(out)],
+                       capture_output=True, env=env, cwd=root)
+    text = r.stdout.decode("cp1251")
+    assert r.returncode == 0, r.stderr.decode("utf-8", "replace")
+    assert "Одинаковых товаров (общий SKU 1С хотя бы в двух кабинетах): 2" in text
+    assert "кабинеты одной площадки" in text and "x 3 (артикул, кабинет)" in text and "?" not in text
+    ws = load_workbook(out).active
+    assert ws.max_row == 2                      # заголовок + товар с расхождением
+    db.expire_all()
+    assert (db.query(ArticleCoef).count(), db.query(PriceChange).count()) == before
