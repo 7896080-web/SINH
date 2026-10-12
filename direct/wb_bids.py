@@ -1142,6 +1142,20 @@ def apply_limits(token, items, key, cfg_min=0):
                         "кампания может останавливаться раньше вечера.")
         except ApiError as e:
             log(f"  ✗ {e}")
+            continue
+        if v["enabled"]:
+            # Спецификация WB не говорит прямо, в каких единицах PUT принимает лимит (пишем в копейках, как его отдаёт GET).
+            # Перечитываем и сравниваем: если WB понял иначе — громкое предупреждение, лимит проверить в кабинете.
+            try:
+                got = (get_limits(token, [i["advert_id"]]).get(i["advert_id"]) or {}).get("dailyLimit")
+            except ApiError as e:
+                log(f"  ! Не удалось перечитать лимит кампании {i['advert_id']}: {e}")
+                continue
+            if got is not None and int(got) != body["dailyLimit"]:
+                log(f"  ✗✗ ВНИМАНИЕ: кампании {i['advert_id']} записан лимит {rub(body['dailyLimit'])} ₽, а WB показывает "
+                    f"{rub(got)} ₽. Проверьте лимит в кабинете WB и сообщите Claude — единицы лимита поняты неверно.")
+            else:
+                log(f"  ✓ Лимит кампании {i['advert_id']}: {rub(got)} ₽ — WB подтвердил.")
     return ok
 
 
