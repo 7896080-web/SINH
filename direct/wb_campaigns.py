@@ -114,7 +114,9 @@ def run_cabinet(cab, token, with_finished):
     nms = sorted({s.get("nm_id") for a in camps.values() for s in a.get("nm_settings") or [] if s.get("nm_id")})
     log(f"  Кампаний: {len(ids)}, товаров в них: {len(nms)}. Загружаю бюджеты, лимиты, минус-фразы, статистику…")
     bud = budgets(token, [i for i in ids if camps[i]["_status"] in (4, 9, 11)])
-    lim = limits(token, [i for i in ids if camps[i]["_status"] in (4, 9, 11)])
+    # дневной лимит у WB есть только у кампаний с оплатой за клики; CPM в запросе даёт ошибку 400 на весь пакет
+    lim = limits(token, [i for i in ids if camps[i]["_status"] in (4, 9, 11)
+                         and (camps[i].get("settings") or {}).get("payment_type") == "cpc"])
     pairs = [(i, s.get("nm_id")) for i, a in camps.items() for s in a.get("nm_settings") or []]
     mc = minus_counts(token, pairs)
     d1 = YESTERDAY - dt.timedelta(days=6)
@@ -148,7 +150,8 @@ def run_cabinet(cab, token, with_finished):
                 for k in ("views", "clicks", "sum", "orders"):
                     s7[k] += v[k]
         l = lim.get(i) or {}
-        lim_txt = (fm(rub(l.get("dailyLimit"))) + " ₽") if l.get("enabled") else ("выключен" if l else "—")
+        lim_txt = ((fm(rub(l.get("dailyLimit"))) + " ₽") if l.get("enabled") else ("выключен" if l else "—")) \
+            if st.get("payment_type") == "cpc" else "нет (у оплаты за показы WB лимит не даёт)"
         nm_list = [s.get("nm_id") for s in a.get("nm_settings") or []]
         row = {"кабинет": cab, "ID": i, "название": st.get("name"), "статус": STATUS.get(a["_status"], a["_status"]),
                "тип ставки": BID.get(a.get("bid_type"), a.get("bid_type")), "оплата": PAY.get(st.get("payment_type"), st.get("payment_type")),
