@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta
 
-from priceapp import accounts, backup, dispatch, guard, onec, platforms, rates, settings
+from priceapp import accounts, backup, dispatch, follow, guard, onec, platforms, rates, reference, settings
 from priceapp.database import SessionLocal
 from priceapp.models import Account, ApiCredential, OnecTask, OnecTaskStatus
 from priceapp.timeutils import now_utc, today_local
@@ -45,6 +45,13 @@ def job_rate(session=None) -> None:
         if last is None or last.rate_date < today_local() or \
                 now_utc() - last.fetched_at > timedelta(hours=6):
             rates.fetch_cbr(db, session)
+        # Курс ушёл от курса эталонных цен дальше порога — опросить WB сразу, не ждать 6 часов.
+        try:
+            if reference.enabled(db) and reference.rate_moved(db):
+                settings.put(db, settings.REF_POLL_NOW, "1")
+                db.commit()
+        except Exception:
+            db.rollback()
         beat(db, "rate", True, "")
     except Exception as e:
         logger.warning("курс ЦБ: %s", e)
@@ -61,6 +68,12 @@ def job_price_dispatch(client_factory=None) -> None:
         if any(v.get("sent") for v in stats.values()):
             from priceapp import overview
             overview.mark_dirty(db)
+        # Цены ушли на WB (автоматически или по ручному подтверждению) — Kit пересчитается после
+        # того, как WB их примет: опрос через FOLLOW_DELAY, а не сразу (площадка применяет не мгновенно).
+        wb_names = {a.name for a in db.query(Account).filter(Account.platform.in_(follow.SOURCE_PLATFORMS))}
+        if follow.enabled(db) and any(v.get("sent") for k, v in stats.items() if k in wb_names):
+            settings.put(db, settings.FOLLOW_DUE_AT, (now_utc() + FOLLOW_DELAY).isoformat())
+            db.commit()
         beat(db, "price_dispatch", True, "; ".join(errors))
         if stats:
             logger.info("цены: %s", stats)
@@ -137,6 +150,76 @@ def job_daily_refresh(client_factory=None, force_prices: bool = False) -> None:
     except Exception as e:
         logger.exception("суточное обновление упало")
         beat(db, "daily_refresh", False, f"{type(e).__name__}: {e}")
+    finally:
+        db.close()
+
+
+WB_PRICES_MAX_AGE = timedelta(minutes=5)
+FOLLOW_DELAY = timedelta(minutes=5)
+
+
+def _older_than_ts(raw: str) -> bool:
+    """Срок (ISO) ещё не наступил? Да — True (ждём)."""
+    try:
+        return datetime.fromisoformat(raw) > now_utc()
+    except ValueError:
+        return False
+
+
+def wb_poll_requested() -> bool:
+    """Просили опросить WB вне расписания (курс ушёл за порог эталонных цен; цены ушли на WB и пора
+    пересчитать Kit). Флаги снимаются."""
+    db = SessionLocal()
+    try:
+        due = settings.get(db, settings.FOLLOW_DUE_AT)
+        due_now = bool(due) and not _older_than_ts(due)
+        if settings.get(db, settings.REF_POLL_NOW) == "1" or due_now:
+            settings.put(db, settings.REF_POLL_NOW, "0")
+            if due_now:
+                settings.put(db, settings.FOLLOW_DUE_AT, "")
+            db.commit()
+            return True
+        return False
+    except Exception:
+        db.rollback()
+        return False
+    finally:
+        db.close()
+
+
+def job_wb_poll(client_factory=None, max_age: timedelta = WB_PRICES_MAX_AGE) -> None:
+    """Опрос WB: текущие цены кабинетов, затем правило эталонной цены (`reference.py`) —
+    при запуске программы, каждые 6 часов и сразу, когда курс ушёл за порог. Цены,
+    загруженные меньше `max_age` назад (суточное обновление после запуска), повторно не
+    запрашиваются."""
+    db = SessionLocal()
+    notes = []
+    try:
+        poll_platforms = ["wb"] + (list(follow.TARGET_PLATFORMS) if follow.enabled(db) else [])
+        for acc in db.query(Account).filter(Account.is_active.is_(True), Account.platform.in_(poll_platforms)):
+            if db.query(ApiCredential.id).filter(ApiCredential.account_id == acc.id).first() is None:
+                continue
+            if acc.prices_loaded_at and now_utc() - acc.prices_loaded_at < max_age:
+                continue
+            try:
+                st = accounts.load_prices(db, acc, accounts.client_for(db, acc, client_factory))
+                if st["truncated"]:
+                    notes.append(f"{acc.name}: цены выгружены не полностью")
+            except Exception as e:
+                db.rollback()
+                notes.append(f"{acc.name}: цены не загружены — {e}"[:200])
+        st = reference.run(db)
+        logger.info("%s", reference.summary(st))
+        fst = follow.run(db)
+        logger.info("%s", follow.summary(fst))
+        if st["restored"] or fst.get("approved"):
+            from priceapp import overview
+            overview.mark_dirty(db)
+        beat(db, "wb_poll", True, "; ".join(notes))
+    except Exception as e:
+        db.rollback()
+        logger.exception("опрос WB упал")
+        beat(db, "wb_poll", False, f"{type(e).__name__}: {e}")
     finally:
         db.close()
 

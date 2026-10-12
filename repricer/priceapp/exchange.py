@@ -102,7 +102,9 @@ class SftpExchange:
             raise ExchangeError(f"SFTP {self.host}:{self.port}: {e}") from e
         except OSError as e:
             raise ExchangeError(f"SFTP {self.host}:{self.port} недоступен: {e}") from e
-        return client.open_sftp(), client.close
+        sftp = client.open_sftp()
+        sftp.get_channel().settimeout(30)      # без этого оборванное соединение вешало быстрый поток вместе с отправкой цен
+        return sftp, client.close
 
     def __enter__(self):
         self._sftp, self._close = self._connect()

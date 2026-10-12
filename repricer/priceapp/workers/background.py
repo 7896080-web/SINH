@@ -10,6 +10,8 @@
 - текущие цены площадок — ПРИ КАЖДОМ запуске (площадка меняет цену сама не чаще
   раза в сутки, но пока программа была выключена, могла поменять) и раз в сутки,
   после них — проверка диапазонов безопасности акций;
+- опрос WB (текущие цены кабинетов + правило эталонной цены) — при запуске и раз в 6 часов,
+  а также сразу, если курс ушёл от курса эталонных цен больше чем на 2% (`reference.py`);
 - копия базы — через 10 минут после запуска, не чаще раза в сутки.
 
 Потоков ДВА. Быстрый — обмен с 1С, курс, отправка, копия: их нельзя задерживать.
@@ -31,6 +33,7 @@ DISPATCH_EVERY = 120
 RATE_EVERY = 6 * 3600
 REFRESH_FIRST_AFTER = 60
 REFRESH_EVERY = 3600          # задание само решит, пора ли (раз в сутки)
+WB_POLL_EVERY = 6 * 3600      # опрос WB: 4 раза в сутки
 BACKUP_FIRST_AFTER = 600
 
 HEAVY_TICK = 30
@@ -64,13 +67,17 @@ def _loop() -> None:
 
 def _heavy_loop() -> None:
     started = time.monotonic()
-    last = {"refresh": None, "attention": None}
+    last = {"refresh": None, "attention": None, "wb": None}
     while not _stop.is_set():
         now = time.monotonic()
         if now - started >= REFRESH_FIRST_AFTER and (
                 last["refresh"] is None or now - last["refresh"] >= REFRESH_EVERY):
             jobs.job_daily_refresh(force_prices=last["refresh"] is None)
             last["refresh"] = now
+        if now - started >= REFRESH_FIRST_AFTER and (
+                last["wb"] is None or now - last["wb"] >= WB_POLL_EVERY or jobs.wb_poll_requested()):
+            jobs.job_wb_poll()
+            last["wb"] = time.monotonic()
         if last["attention"] is None or now - last["attention"] >= ATTENTION_EVERY or jobs.attention_dirty():
             jobs.job_attention()
             last["attention"] = time.monotonic()

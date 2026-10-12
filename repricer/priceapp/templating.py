@@ -50,6 +50,7 @@ templates.env.filters["local"] = local
 NAV = [
     ("attention", "/attention", "Внимание"),
     ("sku_prices", "/sku-prices", "Цены товаров"),
+    ("approval", "/approval", "Утверждение цен"),
     ("prices", "/prices?view=rules", "Правила и журнал"),
     ("mapping", "/mapping", "Сопоставление"),
     ("rate", "/rate", "Курс $"),

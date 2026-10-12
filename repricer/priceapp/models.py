@@ -377,3 +377,44 @@ class CategoryTarget(Base):
     value = Column(Numeric(7, 3), nullable=False)
     updated_at = Column(DateTime, nullable=False, default=now_utc, onupdate=now_utc)
     updated_by = Column(String(64), nullable=False, default="")
+
+
+class ReferencePrice(Base):
+    """ЭТАЛОННАЯ цена SKU в кабинете WB — последняя цена, которую программа отправила
+    на карточку (`reference.py`). От неё считается «площадка снизила цену»: если
+    «к получению» по текущей цене площадки ниже эталонной больше чем на 10%,
+    эталонная возвращается автоматически. При сдвиге курса больше чем на 2% от
+    `usd_rub` эталонная пересчитывается по наценке. `ref_payout` — к получению
+    с эталонной цены (с учётом скидки продавца и комиссии на момент записи)."""
+    __tablename__ = "reference_prices"
+    __table_args__ = (UniqueConstraint("account_id", "item_id", name="uq_reference_price"),)
+    id = Column(Integer, primary_key=True)
+    account_id = Column(Integer, ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False)
+    item_id = Column(String(64), nullable=False, index=True)
+    ref_price = Column(Integer, nullable=False)
+    ref_payout = Column(Numeric(12, 2), nullable=True)
+    commission_percent = Column(Numeric(6, 2), nullable=True)
+    discount = Column(Numeric(6, 4), nullable=False, default=0)
+    usd_rub = Column(Numeric(12, 4), nullable=True)
+    source = Column(String(16), nullable=False, default="sent")   # sent / rate / adopt
+    set_at = Column(DateTime, nullable=False, default=now_utc)
+
+
+class CardEcon(Base):
+    """Экономика строки «карточка площадки + артикул 1С» кабинета, которой нет в отчётах площадки
+    через API: доля выплаты от цены продавца `k`, цена покупателя / цена продавца `w`, логистика с
+    отказами и штрафы на нетто-единицу `f_logistics`, нетто-продажи за период `net_units`.
+    Заполняется импортом Excel на странице «Утверждение цен» (`approval.py`)."""
+    __tablename__ = "card_econ"
+    __table_args__ = (UniqueConstraint("account_id", "card", "article", name="uq_card_econ"),)
+    id = Column(Integer, primary_key=True)
+    account_id = Column(Integer, ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False)
+    card = Column(String(64), nullable=False)
+    article = Column(String(200), nullable=False)
+    net_units = Column(Integer, nullable=False, default=0)
+    k = Column(Numeric(8, 5), nullable=True)
+    w = Column(Numeric(8, 5), nullable=True)
+    f_logistics = Column(Numeric(12, 2), nullable=True)
+    how = Column(String(200), nullable=False, default="")
+    updated_at = Column(DateTime, nullable=False, default=now_utc, onupdate=now_utc)
+

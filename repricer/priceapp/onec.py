@@ -165,14 +165,56 @@ def parse_cost(text: str) -> dict[str, Decimal]:
     return out
 
 
+def normalize_costs(db: Session, merged: dict[str, Decimal]) -> dict[str, Decimal]:
+    """Одна себестоимость на «артикул + цвет + размерная сетка»: внутри группы всем размерам — САМОЕ ЧАСТОЕ значение
+    (при равенстве — медиана). Убирает выбросы вроде одного размера с 28,88 $ при 15,01 $ у
+    остальных: цена карточки WB берёт наибольшую по размерам, и один плохой размер тянул вверх
+    всю карточку. SKU без артикула или без сведений в справочнике штрихкодов не трогаем."""
+    from collections import Counter, defaultdict
+    from statistics import median
+
+    from priceapp.models import OnecBarcode
+    meta: dict[str, tuple[str, str, str]] = {}
+    for item_id, article, color, size in db.query(OnecBarcode.item_id, OnecBarcode.article, OnecBarcode.color,
+                                                  OnecBarcode.size):
+        if item_id in merged and item_id not in meta:
+            size = (size or "").strip()
+            # Числовая (48–58) и буквенная (L–3XL) размерные сетки одного артикула и цвета — разные изделия.
+            meta[item_id] = ((article or "").strip(), (color or "").strip(), "num" if size.replace("/", "").isdigit() else "let")
+    groups: dict[tuple[str, str, str], list[str]] = defaultdict(list)
+    for item_id in merged:
+        art, color, grid = meta.get(item_id, ("", "", ""))
+        if art:
+            groups[(art, color, grid)].append(item_id)
+    out = dict(merged)
+    for ids in groups.values():
+        if len(ids) < 2:
+            continue
+        vals = [merged[i] for i in ids]
+        counts = Counter(vals)
+        top = max(counts.values())
+        tied = [v for v, n in counts.items() if n == top]
+        target = tied[0] if len(tied) == 1 else Decimal(str(median(vals))).quantize(Decimal("0.01"))
+        for i in ids:
+            out[i] = target
+    return out
+
+
 def load_costs(db: Session, costs: dict[str, Decimal]) -> dict:
     """Обновить себестоимость. SKU, которого нет в файле, сохраняет прежнюю:
-    пропуск в выгрузке — не повод обнулять базу расчёта. Не коммитит."""
+    пропуск в выгрузке — не повод обнулять базу расчёта. Не коммитит.
+    Сохраняется себестоимость, выровненная по «артикул + цвет» (`normalize_costs`)."""
     if not costs:
         raise OnecError("в файле себестоимости нет ни одной строки")
     existing = {c.item_id: c for c in db.query(OnecCost)}
+    merged = {i: Decimal(str(c.cost_usd)) for i, c in existing.items()}
+    merged.update(costs)
+    use = settings.get(db, settings.COST_NORMALIZE) != "0"
+    final = normalize_costs(db, merged) if use else merged
     now, changed = now_utc(), 0
+    normalized = sum(1 for i, v in costs.items() if final[i] != v)
     for item_id, value in costs.items():
+        value = final[item_id]
         row = existing.get(item_id)
         if row is None:
             db.add(OnecCost(item_id=item_id[:64], cost_usd=value, loaded_at=now))
@@ -182,9 +224,27 @@ def load_costs(db: Session, costs: dict[str, Decimal]) -> dict:
                 changed += 1
             row.cost_usd = value
             row.loaded_at = now
+    for item_id, row in existing.items():
+        if item_id not in costs and Decimal(str(row.cost_usd)) != final[item_id]:
+            row.cost_usd = final[item_id]
+            changed += 1
     settings.put(db, settings.COST_LOADED_AT, now.isoformat(timespec="seconds"))
     settings.put(db, settings.COST_ROWS, str(len(costs)))
-    return {"rows": len(costs), "changed": changed}
+    return {"rows": len(costs), "changed": changed, "normalized": normalized}
+
+
+def renormalize_stored(db: Session) -> int:
+    """Выровнять уже загруженную себестоимость по «артикул + цвет» (разово или после смены справочника
+    штрихкодов). Возвращает, у скольких SKU значение изменилось. Не коммитит."""
+    existing = {c.item_id: c for c in db.query(OnecCost)}
+    merged = {i: Decimal(str(c.cost_usd)) for i, c in existing.items()}
+    final = normalize_costs(db, merged)
+    n = 0
+    for i, row in existing.items():
+        if final[i] != merged[i]:
+            row.cost_usd = final[i]
+            n += 1
+    return n
 
 
 def apply_result_text(db: Session, text: str, cost_text: str = "", dict_text: str = "") -> dict:

@@ -1,0 +1,122 @@
+{% extends "base.html" %}
+{% block title %}Утверждение цен{% endblock %}
+{% block content %}
+{% macro n0(v) %}{% if v is none %}—{% else %}{{ '{:,.0f}'.format(v).replace(',', ' ') }}{% endif %}{% endmacro %}
+{% macro n2(v) %}{% if v is none %}—{% else %}{{ '{:.2f}'.format(v).replace('.', ',') }}{% endif %}{% endmacro %}
+{% macro pc(v) %}{% if v is none %}—{% else %}{{ '{:+.0f}'.format(v * 100) }}%{% endif %}{% endmacro %}
+{% macro pp(v) %}{% if v is none %}—{% else %}{{ '{:.0f}'.format(v * 100) }}%{% endif %}{% endmacro %}
+<style>
+.ap-table td { white-space:nowrap; font-size:13px; }
+.ap-table td.wrap { white-space:normal; min-width:160px; max-width:260px; }
+.ap-table td.mg input { width:62px; padding:2px 4px; background:#fff8dc; }
+.ap-table tr.cont td { color:var(--muted); }
+.ap-table .neg { color:var(--bad); font-weight:600; }
+.ap-table .big { font-weight:700; }
+</style>
+<h1>Утверждение цен</h1>
+{% if not acc %}
+<p class="warn">Нет ни одного активного кабинета — заведите их на «API-ключах».</p>
+{% else %}
+<p class="muted">Строка — «карточка площадки + артикул 1С». Вводите маржинальность (к получению / себестоимость) артикула в кабинете — цена карточки
+(<b>наибольшая из цен её артикулов</b>, так её ставит программа), прибыль и окупаемость пересчитываются после «Сохранить».
+Сохранение только записывает наценки: на площадки ничего не уходит, цены отправляются на «Ценах товаров».
+{% if rate %}Курс: <b>{{ '{:.4f}'.format(rate.usd_rub|float).replace('.', ',') }} ₽</b>.{% else %}<span class="bad">Курса нет — цены не считаются.</span>{% endif %}</p>
+
+<form method="get" action="/approval" class="card">
+  <div class="row">
+    <label>Кабинет<select name="account_id" onchange="this.form.submit()" style="font-weight:600">
+      {% for a in accounts %}<option value="{{ a.id }}" {% if a.id == acc.id %}selected{% endif %}>{{ names[a.platform] }}: {{ a.name }}</option>{% endfor %}</select></label>
+    <label>Категория<select name="cat"><option value="">все</option>{% for c in cats %}<option value="{{ c }}" {% if f.cat == c %}selected{% endif %}>{{ c }}</option>{% endfor %}</select></label>
+    <label>Артикул 1С / WB, карточка<input name="art" value="{{ f.art }}" placeholder="27643" style="width:130px"></label>
+    <label>Штрихкод<input name="barcode" value="{{ f.barcode }}" placeholder="2000932…" style="width:130px"></label>
+    <label>Размер<input name="size" value="{{ f.size }}" placeholder="XL" style="width:60px"></label>
+    <label>Отбор<select name="flt">{% for k, v in filters.items() %}<option value="{{ k }}" {% if f.flt == k %}selected{% endif %}>{{ v }}</option>{% endfor %}</select></label>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <label title="Цена продавца карточки на площадке сейчас">Цена сейчас, ₽ от<input name="pmin" value="{{ f.pmin }}" inputmode="decimal" style="width:76px"></label>
+    <label>до<input name="pmax" value="{{ f.pmax }}" inputmode="decimal" style="width:76px"></label>
+    <label title="Итоговая цена продавца карточки по введённым маржинальностям">Новая цена, ₽ от<input name="nmin" value="{{ f.nmin }}" inputmode="decimal" style="width:76px"></label>
+    <label>до<input name="nmax" value="{{ f.nmax }}" inputmode="decimal" style="width:76px"></label>
+    <label title="Маржинальность (к получению / сс), с которой работаем: заданная наценка артикула в кабинете">Маржинальность от<input name="mmin" value="{{ f.mmin }}" inputmode="decimal" style="width:62px"></label>
+    <label>до<input name="mmax" value="{{ f.mmax }}" inputmode="decimal" style="width:62px"></label>
+    <label title="Коэффициент от базовой (цена в списке / себестоимость), который вносится в репрайсер">Коэф. к внесению от<input name="cmin" value="{{ f.cmin }}" inputmode="decimal" style="width:62px"></label>
+    <label>до<input name="cmax" value="{{ f.cmax }}" inputmode="decimal" style="width:62px"></label>
+    <button class="secondary">Показать</button>
+    <a class="btn secondary" href="/approval?account_id={{ acc.id }}">Сбросить</a>
+  </div>
+  <p class="muted" style="margin-bottom:0">Строк: {{ total }} из {{ all_total }}{% if total > limit %} (показано {{ limit }}){% endif %}.
+  Пол репрайсера {{ '{:.2f}'.format(rule.min_markup_coef|float).replace('.', ',') }}; наценка по умолчанию
+  {% if rule.base_coef is none %}не задана — без наценки цена не считается{% else %}{{ '{:.2f}'.format(rule.base_coef|float).replace('.', ',') }}{% endif %}.
+  Эталонная цена WB: {% if ref_enabled %}включена — при падении «к получению» больше чем на {{ '{:.0f}'.format(drop) }}% возвращается последняя отправленная цена{% else %}выключена{% endif %}.</p>
+</form>
+
+<div class="card">
+  <b>Прибыль за 7 недель при прошлом объёме (условно):</b>
+  сейчас <b class="{{ 'bad' if tot.profit_now < 0 else '' }}">{{ n0(tot.profit_now) }} ₽</b>
+  → по утверждённым ценам <b class="{{ 'bad' if tot.profit_new < 0 else 'ok' }}">{{ n0(tot.profit_new) }} ₽</b>
+  <span class="muted">(налог {{ '{:.0f}'.format(p.tax * 100) }}%, реклама {{ '{:.1f}'.format((p.ads + p.extra_ads) * 100) }}%, аренда {{ n0(p.rent_unit) }} ₽ на единицу; спрос от цены не меняется)</span>
+</div>
+
+<details style="margin-bottom:10px"><summary><b>Параметры расчёта</b> — налог, реклама, аренда склада, целевая окупаемость</summary>
+<form method="post" action="/approval/params" class="row" style="margin-top:8px">
+  <input type="hidden" name="account_id" value="{{ acc.id }}">
+  <label>Налог, % от цены покупателя<input name="tax" value="{{ '{:g}'.format(p.tax * 100) }}" style="width:70px"></label>
+  <label>Целевая окупаемость, %<input name="roi" value="{{ '{:g}'.format(p.roi * 100) }}" style="width:70px"></label>
+  <label>Реклама кабинета, % цены продавца<input name="ads" value="{{ '{:g}'.format(p.ads_pct) }}" style="width:70px"></label>
+  <label>Доп. реклама, %<input name="extra_ads" value="{{ '{:g}'.format(p.extra_ads * 100) }}" style="width:70px"></label>
+  <label>Аренда склада, ₽/мес<input name="rent_month" value="{{ '{:g}'.format(p.rent_month) }}" style="width:90px"></label>
+  <label>Доля аренды, %<input name="rent_share" value="{{ '{:g}'.format(p.rent_share * 100) }}" style="width:70px"></label>
+  <label>Нетто-продаж в месяц<input name="net_month" value="{{ '{:g}'.format(p.net_month) }}" style="width:80px"></label>
+  <button class="secondary">Сохранить параметры</button>
+</form></details>
+
+<details style="margin-bottom:10px"><summary><b>Excel</b> — выгрузить книгу или загрузить маржинальности и экономику из неё</summary>
+<div class="row" style="margin-top:8px">
+  <a class="btn secondary" href="/approval/export?account_id={{ acc.id }}">Экспорт кабинета в Excel</a>
+  <a class="btn secondary" href="/approval/export?account_id={{ acc.id }}&amp;platform_all=1">Экспорт всех кабинетов площадки</a>
+  <form method="post" action="/approval/import?account_id={{ acc.id }}" enctype="multipart/form-data" class="row">
+    <label>Импорт книги (лист — кабинет; читаются «Артикул 1С», «Маржинальность…», k, W/P, логистика, продажи; пусто — без изменений, «-» — снять)
+      <input type="file" name="file" accept=".xlsx" required></label>
+    <button class="secondary">Импорт из Excel</button>
+  </form>
+  <form method="post" action="/approval/align" onsubmit="return confirm('Выровнять цены общих товаров кабинетов по ИП Яворская?')">
+    <input type="hidden" name="account_id" value="{{ acc.id }}">
+    <button class="secondary" title="Один и тот же артикул в нескольких кабинетах получает одну цену продавца">Выровнять общие товары</button></form>
+</div></details>
+
+<form method="post" action="/approval/save">
+<input type="hidden" name="account_id" value="{{ acc.id }}">
+{% for k, v in f.items() %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
+<p class="row" style="align-items:center"><button>Сохранить маржинальности</button>
+<span class="muted">Пустое поле — без изменений, «-» — снять наценку артикула в этом кабинете.</span></p>
+<div class="scroll" style="max-height:none">
+<table class="ap-table">
+<tr><th>Категория</th><th>Карточка</th><th>Артикул 1С</th><th>Размеры</th><th class="num">Нетто за 7 нед.</th><th class="num">Себест. ср. / макс., ₽</th>
+<th class="num">Цена сейчас, ₽</th><th>Эталон (посл. отправленная)</th><th>Маржинальность</th><th class="num">Цена по артикулу, ₽</th>
+<th class="num">ИТОГО продавца, ₽</th><th class="num">покупателя, ₽</th><th class="num">в списке, ₽</th><th class="num">Коэф. к внесению</th>
+<th class="num">Прибыль на ед., ₽</th><th class="num">Окупаемость</th><th class="num">К текущей</th><th>Предупреждение</th></tr>
+{% for r in rows %}
+<tr class="{{ '' if r.first_of_art else 'cont' }}">
+<td>{{ r.category or '—' }}</td>
+<td class="wrap">{{ r.card }}<br><span class="muted">{{ r.wbart }}</span></td>
+<td class="wrap">{{ r.art }}{% if r.narts > 1 %} <span class="badge warn" title="В карточке несколько артикулов 1С: цена карточки — наибольшая из их цен">{{ r.narts }} арт.</span>{% endif %}</td>
+<td class="wrap" title="{{ r.barcodes|join(', ') }}">{{ r.sizes|join(', ') or '—' }}</td>
+<td class="num">{{ r.net }}</td>
+<td class="num">{{ n0(r.cost) }} / {{ n0(r.costmax) }}</td>
+<td class="num">{{ n0(r.sale) }}</td>
+<td>{% if r.ref_price %}{{ n0(r.ref_price) }}{% if r.ref_status and r.ref_status != 'в порядке' %} <span class="badge bad">{{ r.ref_status }}</span>{% else %} <span class="badge ok">ок</span>{% endif %}{% else %}<span class="muted">—</span>{% endif %}</td>
+<td class="mg">{% if r.first_of_art %}<input name="m:{{ r.art }}" value="{{ '{:g}'.format(r.margin) if r.margin is not none else '' }}" inputmode="decimal" placeholder="{{ r.target_text or 'не задана' }}" title="{{ r.target_text }} {{ r.target_source }}">
+{% else %}<span class="muted">{{ '{:g}'.format(r.margin) if r.margin is not none else '↑' }}</span>{% endif %}</td>
+<td class="num">{{ n0(r.apa) }}</td>
+<td class="num big">{{ n0(r.ap) }}</td><td class="num">{{ n0(r.bap) }}</td><td class="num">{{ n0(r.al) }}</td>
+<td class="num">{{ '{:.4f}'.format(r.ac).replace('.', ',') if r.ac is not none else '—' }}</td>
+<td class="num {{ 'neg' if r.apr is not none and r.apr < 0 else '' }}">{{ n0(r.apr) }}</td>
+<td class="num">{{ pp(r.aroi) }}</td><td class="num">{{ pc(r.achg) }}</td>
+<td class="wrap {{ 'neg' if r.warn.startswith('УБЫТОК') else 'warn' }}">{{ r.warn }}</td>
+</tr>
+{% else %}<tr><td colspan="18" class="muted">Нет строк по этому отбору.</td></tr>{% endfor %}
+</table></div>
+<p><button>Сохранить маржинальности</button></p>
+</form>
+{% endif %}
+{% endblock %}

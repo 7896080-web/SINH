@@ -69,6 +69,7 @@ class PriceItem:
     price: int
     external_id: str = ""
     article: str = ""
+    sale: int | None = None     # цена со скидкой продавца, ₽ — только Kit (`manual_discount_price`)
 
 
 @dataclass
@@ -565,8 +566,9 @@ class KitClient:
         одна невалидная позиция бракует всю пачку с 400 и списком виновных
         (`errors[].variant_id`, `code`) — их вынимаем и досылаем остальное, иначе
         одна позиция держала бы всю пачку вечно. Цену со скидкой
-        (`manual_discount_price`) не трогаем: если она выше новой цены, Kit
-        отклоняет позицию `INVALID_PRICE` — снять скидку решает человек."""
+        (`manual_discount_price`) шлём вместе с ценой, когда она передана (`PriceItem.sale`):
+        покупатель платит именно её. Без неё, если она выше новой цены, Kit отклоняет
+        позицию `INVALID_PRICE`."""
         by_variant: dict[str, list[PriceItem]] = {}
         errors = []
         for it in items:
@@ -577,6 +579,10 @@ class KitClient:
         # Два SKU 1С на одном варианте: повтор варианта Kit бракует (DUPLICATE_ITEM) —
         # уходит один, с большей ценой.
         price_of = {v: max(i.price for i in g) for v, g in by_variant.items()}
+        # Цена со скидкой у Kit — отдельное число в рублях, а не процент: покупатель платит именно её.
+        # Раньше уходила только «цена до скидки», и на витрине ничего не менялось. Не выше цены до скидки.
+        sale_of = {v: min(max(i.sale for i in g if i.sale), price_of[v]) for v, g in by_variant.items()
+                   if any(i.sale for i in g)}
         ok, sent = [], {}
         variants = list(price_of)
         for start in range(0, len(variants), KIT_PUSH_CHUNK):
@@ -584,7 +590,9 @@ class KitClient:
             for _ in range(3):          # отказ по позициям -> вынуть виновных и дослать
                 if not pending:
                     break
-                body = {"items": [{"variant_id": v, "price": str(price_of[v])} for v in pending]}
+                body = {"items": [{"variant_id": v, "price": str(price_of[v]),
+                                   **({"manual_discount_price": str(sale_of[v])} if v in sale_of else {})}
+                                  for v in pending]}
                 try:
                     r = self._post("/v1/variants/prices/bulk_update", body)
                 except requests.RequestException as e:

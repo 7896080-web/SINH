@@ -59,7 +59,7 @@ def get_db():
 # фоновый поток сбрасывал бы кэш каждую минуту и ускорения не было бы вовсе.
 
 _DATA_VERSION = [0]
-_IGNORED_TABLES = {"audit_log", "worker_heartbeats", "users", "saved_filters", "onec_tasks", "api_credentials"}
+_IGNORED_TABLES = {"audit_log", "worker_heartbeats", "users", "saved_filters", "onec_tasks", "api_credentials", "reference_prices"}
 
 
 def data_version() -> int:

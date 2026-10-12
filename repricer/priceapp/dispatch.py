@@ -13,7 +13,7 @@ from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
-from priceapp import accounts, rates
+from priceapp import accounts, rates, reference
 from priceapp.models import (Account, OnecCost, PlatformItem, PriceChange, PriceChangeStatus,
                              ProductPrice)
 from priceapp.platforms import PriceItem, card_key
@@ -162,7 +162,13 @@ def run_account(db: Session, account: Account, client) -> dict:
             continue
         card_price[key] = price
         for ch, row in queued:
-            items_out.append(PriceItem(row.barcode, price, row.external_id, row.article))
+            sale = None
+            if account.platform == "kit":
+                # Kit: покупатель платит «цену со скидкой» — отдельное число; прежний процент скидки сохраняется.
+                disc = item_facts(rule, items.get(ch.item_id) or [row]).discount
+                if disc and disc > 0:
+                    sale = int((Decimal(price) * (1 - disc)).quantize(Decimal(1), rounding="ROUND_HALF_UP"))
+            items_out.append(PriceItem(row.barcode, price, row.external_id, row.article, sale))
             by_barcode[row.barcode] = ch
             card_of_barcode[row.barcode] = key
 
@@ -190,6 +196,7 @@ def run_account(db: Session, account: Account, client) -> dict:
             if price != ch.new_price:
                 ch.note = f"площадка приняла {price} ₽ — одна цена на карточку, наибольшая из её размеров"
             _record_sent(db, ch.item_id, account.id, price)
+            reference.record(db, account, ch.item_id, price, items.get(ch.item_id) or [], rule, rate)
             accepted_cards[card_of_barcode[barcode]] = price
         elif ch.attempts < MAX_ATTEMPTS:
             ch.next_attempt_at = now_utc() + _retry_delay(ch.attempts)
@@ -204,6 +211,7 @@ def run_account(db: Session, account: Account, client) -> dict:
         for sib in members.get(key, set()):
             if sib not in latest:
                 _record_sent(db, sib, account.id, price)
+                reference.record(db, account, sib, price, items.get(sib) or [], rule, rate)
     db.commit()
     return {"sent": len(ok & set(by_barcode)), "tried": len(by_barcode), "floored": floored, "waiting": waiting}
 

@@ -19,10 +19,40 @@ DICT_ROWS = "onec_dict_rows"
 # Курс ушёл от курса последнего расчёта больше чем на столько % — предупреждаем.
 RATE_ALERT_PERCENT = "rate_alert_percent"
 
+# Эталонная цена WB (`reference.py`): включено ли правило, на сколько % падение «к получению»
+# от эталонной возвращает эталонную, на сколько % сдвиг курса пересчитывает эталонную;
+# отметка «опросить WB сейчас» (курс ушёл дальше порога).
+REF_ENABLED = "ref_enabled"
+REF_DROP_PERCENT = "ref_drop_percent"
+REF_RATE_PERCENT = "ref_rate_percent"
+REF_POLL_NOW = "ref_poll_now"
+
+# Kit следует за WB (`follow.py`): включено ли, на сколько % цена Kit ниже средней цены WB для
+# покупателя, при каком смещении средней пересчитываем наценку, до какого шага (% к последней
+# отправленной цене) подтверждаем сами, и когда опросить площадки после отправки цен на WB.
+FOLLOW_ENABLED = "follow_enabled"
+FOLLOW_PERCENT = "follow_percent"
+FOLLOW_TOLERANCE = "follow_tolerance"
+FOLLOW_MAX_STEP = "follow_max_step"
+FOLLOW_DUE_AT = "follow_due_at"
+
+# Себестоимость из 1С выравнивается по «артикул + цвет» (самое частое значение): 0 — выключить.
+COST_NORMALIZE = "cost_normalize"
+
 DEFAULTS = {
     RATE_MODE: "cbr",
     RATE_MANUAL: "",
     RATE_ALERT_PERCENT: "2",
+    REF_ENABLED: "1",
+    REF_DROP_PERCENT: "10",
+    REF_RATE_PERCENT: "2",
+    REF_POLL_NOW: "0",
+    FOLLOW_ENABLED: "1",
+    FOLLOW_PERCENT: "10",
+    FOLLOW_TOLERANCE: "1",
+    FOLLOW_MAX_STEP: "50",
+    FOLLOW_DUE_AT: "",
+    COST_NORMALIZE: "1",
 }
 
 
