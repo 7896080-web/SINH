@@ -1,0 +1,70 @@
+"""Цены от эталона WB через скидку продавца (scripts/etalon_prices.py): только чтение."""
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+from openpyxl import load_workbook
+
+from priceapp.models import ArticleCoef, PlatformItem, PriceChange, ProductPrice
+from tests import factories as F
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def _setup(db):
+    w1 = F.account(db, "wb", "ИП 1", commission=25)
+    w2 = F.account(db, "wb", "ИП 2", commission=25)
+    kit = F.account(db, "kit", "КИТ", commission=10)
+    lam = F.account(db, "lamoda", "Ламода", commission=30)
+    F.manual_rate(db, "100")
+    F.sku(db, "a1", "100", "M", barcodes=["b1"], cost_usd=10)
+    F.sku(db, "a3", "300", "M", barcodes=["b3"], cost_usd=10)      # нет на WB
+    F.item(db, w1, "b1", "100"); F.item(db, w2, "b1", "100")
+    F.item(db, kit, "b1", "100"); F.item(db, lam, "b1", "100"); F.item(db, kit, "b3", "300")
+    prices = {(w1.id, "b1"): (8000, 4000), (w2.id, "b1"): (9000, 6000),   # эталон (4000+6000)/2 × 0,69 = 3450
+              (kit.id, "b1"): (6000, 4000), (lam.id, "b1"): (5000, 4500), (kit.id, "b3"): (3000, 2000)}
+    for it in db.query(PlatformItem):
+        it.current_price, it.current_sale_price = prices[(it.account_id, it.barcode)]
+    db.commit()
+
+
+def _run(tmp_path, *extra):
+    out = tmp_path / "p.xlsx"
+    env = {**os.environ, "PYTHONIOENCODING": "cp1251"}
+    r = subprocess.run([sys.executable, str(ROOT / "scripts" / "etalon_prices.py"), "--xlsx", str(out), *extra],
+                       capture_output=True, env=env, cwd=ROOT)
+    assert r.returncode == 0, r.stderr.decode("utf-8", "replace")
+    ws = load_workbook(out).active
+    rows = list(ws.iter_rows(values_only=True))
+    return r.stdout.decode("cp1251"), [dict(zip(rows[0], x)) for x in rows[1:]]
+
+
+def test_target_is_reached_by_discount_within_corridor(db, tmp_path):
+    _setup(db)
+    text, rows = _run(tmp_path)
+    assert "НИЧЕГО НЕ ОТПРАВЛЯЕТСЯ" in text
+    kit = next(r for r in rows if r["Площадка"] == "Яндекс KIT" and r["Артикул"] == "100")
+    # Kit: цель 3450 × 0,9 = 3105; при цене до скидки 6000 скидка 48,25% — в коридоре 35–50%
+    assert kit["Цель со скидкой, ₽"] == 3105 and kit["Что сделать"] == "сменить скидку"
+    assert kit["Новая цена до скидки, ₽"] == 6000 and kit["Новая скидка, %"] == 48.2
+    assert round(6000 * (1 - kit["Новая скидка, %"] / 100)) in (3105, 3108)
+
+
+def test_out_of_corridor_moves_the_list_price_to_the_nearest_bound(db, tmp_path):
+    _setup(db)
+    _, rows = _run(tmp_path)
+    lam = next(r for r in rows if r["Площадка"] == "Lamoda")
+    # Ламода: цель 3450; при 5000 нужна скидка 31% < 35% — цена до скидки 3450 / 0,65 = 5308, скидка 35%
+    assert lam["Цель со скидкой, ₽"] == 3450 and lam["Что сделать"] == "поднять цену до скидки"
+    assert lam["Новая цена до скидки, ₽"] == 5308 and lam["Новая скидка, %"] == 35.0
+    assert lam["Изменение цены для покупателя, %"] == round((3450 - 4500) * 100 / 4500, 1)
+
+
+def test_article_without_wb_has_no_etalon_and_nothing_changes(db, tmp_path):
+    _setup(db)
+    before = (db.query(PriceChange).count(), db.query(ArticleCoef).count(), db.query(ProductPrice).count())
+    _, rows = _run(tmp_path)
+    assert next(r for r in rows if r["Артикул"] == "300")["Что сделать"] == "нет эталона (нет на WB)"
+    db.expire_all()
+    assert (db.query(PriceChange).count(), db.query(ArticleCoef).count(), db.query(ProductPrice).count()) == before
