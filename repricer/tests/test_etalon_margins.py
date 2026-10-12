@@ -62,25 +62,40 @@ def test_margins_follow_the_etalon_logic(db, tmp_path):
     assert abs(items[("Lamoda", "a2")][10] - 6900 * 0.7 / 2000) < 0.001
 
 
-def test_import_sheet_is_the_category_import_format_and_reproduces_the_price(client, db, tmp_path):
-    from priceapp.routers.sku_prices import build, pick_scope
-    kit, lam = _setup(db)
-    _, wb = _run(tmp_path)
-    assert wb.active.title == "Импорт"
-    head = [c.value for c in wb["Импорт"][1]]
-    assert head == ["Где (код)", "Где", "Категория", "Вид наценки", "Наценка"]
+def _import(client, wb):
     buf = io.BytesIO()
     wb.save(buf)
-    r = client.post("/sku-prices/import", files={"file": ("e.xlsx", io.BytesIO(buf.getvalue()), "x")})
-    assert "Наценок изменено: 2" in r.text
-    assert {(c.platform, c.category, c.kind) for c in db.query(CategoryTarget)} == \
-        {("kit", "Куртки", "margin"), ("lamoda", "Куртки", "margin")}
-    # Ламода, одна категория на два товара — медиана; товар с той же целевой m встаёт ровно в эталон.
+    return client.post("/sku-prices/import", files={"file": ("e.xlsx", io.BytesIO(buf.getvalue()), "x")})
+
+
+def test_article_import_puts_every_article_exactly_on_its_etalon(client, db, tmp_path):
+    from priceapp.models import ArticleCoef
+    from priceapp.routers.sku_prices import build, pick_scope
+    _setup(db)
+    text, wb = _run(tmp_path)
+    assert "наценки артикулов: мин - медиана - макс" in text
+    assert wb.active.title == "Импорт"
+    assert [c.value for c in wb["Импорт"][1]] == ["Где (код)", "Где", "Категория", "Артикул", "Вид наценки", "Наценка"]
+    arts = list(wb["Артикулы"].iter_rows(values_only=True))
+    assert arts[0][2] == "Артикул" and len(arts) == 5                 # 2 артикула × Kit и Ламода
+    r = _import(client, wb)
+    assert "Наценок изменено: 4" in r.text
+    assert {(c.platform, c.article, c.account_id, c.kind) for c in db.query(ArticleCoef)} == {
+        ("kit", "100", 0, "margin"), ("kit", "200", 0, "margin"),
+        ("lamoda", "100", 0, "margin"), ("lamoda", "200", 0, "margin")}
     db.expire_all()
-    g = build(db, pick_scope(db, "lamoda"), art="100")[0]
-    price = g["rows"][0]["cells"][0]["price"]
-    # обе m в категории равны 2,415 — цена товара 100 = эталон 3450, вверх до шага округления
-    assert 3450 <= price < 3450 * 1.05
+    for scope, art, want in (("lamoda", "100", 3450), ("lamoda", "200", 6900), ("kit", "100", 3105),
+                             ("kit", "200", 6210)):
+        price = build(db, pick_scope(db, scope), art=art)[0]["rows"][0]["cells"][0]["price"]
+        assert want <= price < want * 1.002, (scope, art, price)       # вверх до шага округления
+
+
+def test_category_level_is_an_option(client, db, tmp_path):
+    _setup(db)
+    _, wb = _run(tmp_path, "--level", "category")
+    assert [c.value for c in wb["Импорт"][1]] == ["Где (код)", "Где", "Категория", "Вид наценки", "Наценка"]
+    assert "Наценок изменено: 2" in _import(client, wb).text
+    assert {(c.platform, c.category) for c in db.query(CategoryTarget)} == {("kit", "Куртки"), ("lamoda", "Куртки")}
 
 
 def test_script_changes_nothing(db, tmp_path):

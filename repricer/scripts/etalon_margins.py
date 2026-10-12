@@ -1,4 +1,4 @@
-"""Наценки по категориям от эталона WB — ТОЛЬКО ЧТЕНИЕ, ничего не меняет и не отправляет.
+"""Наценки по артикулам (по категориям) от эталона WB — ТОЛЬКО ЧТЕНИЕ, ничего не меняет и не отправляет.
 
 Логика (задана владельцем 12.10):
   * эталон по артикулу 1С = средняя по всем кабинетам WB ЦЕНА ПРОДАВЦА СО СКИДКОЙ
@@ -18,13 +18,15 @@
     C:\\repricer\\.venv\\Scripts\\python.exe C:\\repricer\\scripts\\etalon_margins.py --xlsx C:\\repricer\\эталон.xlsx
     ... --wb-discount 31 --kit -10 --lamoda 0       # проценты логики (по умолчанию — эти)
 
-Лист «Импорт» — ровно в формате импорта «Цены товаров» по категориям (вид «по
-категориям» → Excel → «Импорт из Excel»). Загружать его — решение человека, после
+Лист «Импорт» — ровно в формате импорта «Цены товаров»: по умолчанию наценки на
+АРТИКУЛЫ (медиана по размерам; вид «по артикулам» → Excel → «Импорт из Excel»), с
+`--level category` — на категории. Загружать его — решение человека, после
 просмотра листа «Категории».
 """
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import statistics
 import sys
@@ -113,6 +115,33 @@ def by_category(rows: list[dict]) -> list[dict]:
     return out
 
 
+def by_article(rows: list[dict]) -> list[dict]:
+    """Наценка на АРТИКУЛ (все его размеры) — медиана целевых наценок его товаров. Категория
+    артикула — та, в которой больше его товаров. Порядок — по категории, затем по артикулу."""
+    groups: dict[str, list[dict]] = {}
+    for r in rows:
+        groups.setdefault(r["article"], []).append(r)
+    out = []
+    for art, rs in groups.items():
+        ms = [r["target_m"] for r in rs if r["target_m"] is not None]
+        cur = [r["current_m"] for r in rs if r["current_m"] is not None]
+        cats = [r["category"] for r in rs]
+        out.append({"article": art, "category": max(set(cats), key=cats.count), "items": len(rs),
+                    "with_target": len(ms), "etalon": rs[0]["etalon"],
+                    "target_price": statistics.median([r["target_price"] for r in rs if r["target_price"]])
+                    if ms else None,
+                    "median": statistics.median(ms) if ms else None, "min": min(ms) if ms else None,
+                    "max": max(ms) if ms else None, "current_median": statistics.median(cur) if cur else None,
+                    "why": next((r["why"] for r in rs if r["why"]), "")})
+    return sorted(out, key=lambda a: (a["category"], a["article"]))
+
+
+def _up(m: float) -> float:
+    """Наценка хранится с тремя знаками. Вверх, а не по правилам округления: иначе цена
+    выходила на рубль НИЖЕ эталона (2,7945 -> 2,794 -> 6209 вместо 6210)."""
+    return math.ceil(round(m * 1000, 6)) / 1000
+
+
 def _r(v, nd=3):
     return round(v, nd) if isinstance(v, float) else v
 
@@ -122,6 +151,8 @@ def main() -> int:
     ap.add_argument("--wb-discount", type=float, default=31.0, help="эталон = цена продавца WB со скидкой минус N %%")
     ap.add_argument("--kit", type=float, default=-10.0, help="Kit к эталону, %% (минус — дешевле)")
     ap.add_argument("--lamoda", type=float, default=0.0, help="Ламода к эталону, %%")
+    ap.add_argument("--level", choices=("article", "category"), default="article",
+                    help="лист «Импорт»: наценки на артикулы (по умолчанию) или на категории")
     ap.add_argument("--xlsx", default="", help="сохранить расчёт в .xlsx (листы «Категории», «Товары», «Импорт»)")
     args = ap.parse_args()
     db = SessionLocal()
@@ -136,18 +167,27 @@ def main() -> int:
         print(f"Курс {rate.usd_rub}. Эталон: средняя цена продавца со скидкой на WB минус {args.wb_discount:g}% — "
               f"посчитан по {len(et)} артикулам.")
         plan = [("kit", args.kit), ("lamoda", args.lamoda)]
-        all_items, all_cats = [], []
+        all_items, all_cats, all_arts = [], [], []
         for platform, shift in plan:
             if not _accounts(db, platform):
                 print(f"\n{PLATFORMS[platform]}: активных кабинетов нет — пропускаю.")
                 continue
             items = targets(db, platform, shift, et, articles, costs, rate.usd_rub)
             cats = by_category(items)
+            arts = by_article(items)
+            all_arts += [dict(a, platform=platform) for a in arts]
             all_items += [dict(r, platform=platform) for r in items]
             all_cats += [dict(g, platform=platform, shift=shift) for g in cats]
             done = sum(g["with_target"] for g in cats)
             print(f"\n=== {PLATFORMS[platform]}: цена для покупателя = эталон {shift:+g}% — товаров {len(items)}, "
                   f"с эталоном {done}, категорий {len(cats)}")
+            print(f"{'категория':40} {'артикулов':>9}   наценки артикулов: мин - медиана - макс")
+            for cat in sorted({a["category"] for a in arts}):
+                ms = [a["median"] for a in arts if a["category"] == cat and a["median"] is not None]
+                n = sum(1 for a in arts if a["category"] == cat)
+                print(f"{cat[:40]:40} {n:>9}   " + (f"{min(ms):.2f} - {statistics.median(ms):.2f} - {max(ms):.2f}"
+                                                   if ms else "эталона нет ни у одного"))
+            print(f"\nЕсли ставить одну наценку на категорию:")
             print(f"{'категория':40} {'товаров':>7} {'наценка':>8} {'разброс (25–75%)':>18} {'близко':>7} {'сейчас':>7}")
             for g in cats:
                 if g["median"] is None:
@@ -180,20 +220,35 @@ def main() -> int:
                      float(r["base"]) if r["base"] is not None else None, _r(r["etalon"], 0),
                      _r(r["target_price"], 0), r["current_sale"], _r(r["target_m"]), _r(r["current_m"]), r["why"]]
                     for r in all_items]
-            imp_h = ["Где (код)", "Где", "Категория", "Вид наценки", "Наценка"]
-            imp_d = [[g["platform"], PLATFORMS[g["platform"]], g["category"], "маржинальность", round(g["median"], 3)]
-                     for g in all_cats if g["median"] is not None and g["category"] != NO_CATEGORY]
+            art_h = ["Площадка", "Категория", "Артикул", "Товаров (размеров)", "С эталоном",
+                     "Эталон (покупатель WB), ₽", "Цель для покупателя, ₽", "Наценка (медиана по размерам)",
+                     "мин", "макс", "Сейчас (медиана)", "Почему нет"]
+            art_d = [[PLATFORMS[a["platform"]], a["category"], a["article"], a["items"], a["with_target"],
+                      _r(a["etalon"], 0), _r(a["target_price"], 0), _r(a["median"]), _r(a["min"]), _r(a["max"]),
+                      _r(a["current_median"]), a["why"]] for a in all_arts]
+            if args.level == "article":
+                # Формат импорта «Цен товаров» по артикулам; «Категория» — справочно (импорт её не читает).
+                imp_h = ["Где (код)", "Где", "Категория", "Артикул", "Вид наценки", "Наценка"]
+                imp_d = [[a["platform"], PLATFORMS[a["platform"]], a["category"], a["article"], "маржинальность",
+                          _up(a["median"])] for a in all_arts if a["median"] is not None]
+            else:
+                imp_h = ["Где (код)", "Где", "Категория", "Вид наценки", "Наценка"]
+                imp_d = [[g["platform"], PLATFORMS[g["platform"]], g["category"], "маржинальность",
+                          _up(g["median"])]
+                         for g in all_cats if g["median"] is not None and g["category"] != NO_CATEGORY]
             wb = load_workbook(io.BytesIO(xlsx_bytes(cat_h, cat_d)))
             wb.active.title = "Категории"
-            for title, (h, d) in (("Товары", (it_h, it_d)), ("Импорт", (imp_h, imp_d))):
+            for title, (h, d) in (("Артикулы", (art_h, art_d)), ("Товары", (it_h, it_d)),
+                                  ("Импорт", (imp_h, imp_d))):
                 ws = wb.create_sheet(title)
                 ws.append(h)
                 for row in d:
                     ws.append(row)
-            wb.move_sheet("Импорт", offset=-2)    # импорт читает первый лист
+            wb.move_sheet("Импорт", offset=-3)    # импорт читает первый лист
             wb.active = 0
             wb.save(args.xlsx)
-            print(f"\nФайл: {args.xlsx} (первый лист «Импорт» — для «Цены товаров» → по категориям → Импорт)")
+            print(f"\nФайл: {args.xlsx} (первый лист «Импорт» — для «Цены товаров» → "
+                  f"{'по артикулам' if args.level == 'article' else 'по категориям'} → Импорт из Excel)")
     finally:
         db.rollback()
         db.close()
