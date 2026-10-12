@@ -54,11 +54,19 @@ import requests
 # "*" — все АКТИВНЫЕ кампании кабинета (статус «активна»; пауза и «готова» не трогаются) с этими правилами.
 #   Кампании, перечисленные по названию или ID отдельно, берут свои правила вместо "*".
 #   "_except": [ID или часть названия, …] — активные кампании, которые автопилот не трогает (например, на время теста).
+#   "until": "ГГГГ-ММ-ДД" в правиле кампании — правило действует до этой даты включительно, потом кампания
+#   переходит на общие правила "*" (режим запуска новинок: дороже допустимый заказ на 2–3 недели).
 #   Дневной лимит WB даёт только кампаниям за клики; у кампаний за показы он пропускается.
 RULES = {
     "Яворская": {
         "*": {"target": "3-10", "max_cost_per_order": 600, "daily_limit": 2500, "auto_minus": True},
         "_except": [],
+        # ── Новинки (запуск, решение 12.10.2026): допустимый заказ вдвое выше обычного, запросы не минусуем,
+        #    пока набираются продажи и отзывы. С 03.11 — общие правила "*".
+        "39661494": {"target": "3-10", "max_cost_per_order": 1200, "daily_limit": 2500, "auto_minus": False,
+                     "until": "2026-11-02"},   # ZJYM269002, за клики
+        "39829896": {"target": "3-10", "max_cost_per_order": 1200, "daily_limit": 2500, "auto_minus": False,
+                     "until": "2026-11-02"},   # 256250 («Кампания от 29.08.2026»), за клики
 
         # ── Этап 1. Те же товары в рекомендациях, оплата за показы. Создать:
         #    python wb_create.py --name "27643 рекомендации показы" --pay cpm --where recommendations --from "27643 клик"
@@ -683,7 +691,16 @@ def plan_cabinet(cab, token, rules, state):
     plan = {"bids": [], "cluster_bids": [], "minus": [], "limits": []}
     camps = get_campaigns(token)
     todo = {}
-    explicit = {k: v for k, v in rules.items() if k not in ("*", "_except")}
+    explicit = {}
+    for k, v in rules.items():
+        if k in ("*", "_except"):
+            continue
+        if v.get("until") and dt.date.today().isoformat() > v["until"]:
+            log(f"  Правило «{k}» действовало до {v['until']} — теперь кампания на общих правилах.")
+            continue
+        explicit[k] = {kk: vv for kk, vv in v.items() if kk != "until"}
+        if v.get("until"):
+            explicit[k]["_until"] = v["until"]
     for key, rule in explicit.items():
         ids = find(camps, key)
         if not ids:
@@ -806,7 +823,7 @@ def plan_cabinet(cab, token, rules, state):
         log(f"\n  ▶ {name} (ID {cid}) — {'единая' if unified else 'ручная'} ставка, "
             f"{'за клики' if pay == 'cpc' else 'за показы'}, цель {target}, "
             f"{'заказ до ' + str(r['max_cost_per_order']) + ' ₽' if r['max_cost_per_order'] != 'auto' else 'цена заказа — из юнит-экономики'}, "
-            f"конверсия {camp_cr * 100:.1f}%")
+            f"конверсия {camp_cr * 100:.1f}%" + (f"; режим запуска новинки до {r['_until']}" if r.get("_until") else ""))
 
         # ---- ставки товаров ----
         if unified:
