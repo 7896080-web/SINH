@@ -15,7 +15,8 @@
 У каждого графика есть «Таблица» — те же цифры без графика.
 
 Запуск:  python wb_dashboard.py            (соберёт страницу и откроет её в браузере)
-         python wb_dashboard.py --no-open  (только собрать)
+         python wb_dashboard.py --no-open  (только собрать — так делает расписание после каждого запуска)
+         ярлык «Реклама WB» на рабочем столе — то же, что первая команда (ставится wb_dashboard_shortcut.ps1)
 Данные свежие настолько, насколько свежий последний запуск wb_positions.py (каждое утро).
 Результат: wb_dashboard.html (открывается двойным щелчком, интернет не нужен).
 """
@@ -109,6 +110,8 @@ def load_autopilot():
 
 
 def main():
+    if sys.stdout is None:          # запуск ярлыком через pythonw.exe — консоли нет, print некуда писать
+        sys.stdout = sys.stderr = open(HERE / "wb_dashboard_log.txt", "a", encoding="utf-8")
     data = {"generated": dt.datetime.now().strftime("%d.%m.%Y %H:%M"), **load_db(), "autopilot": load_autopilot(),
             "has_db": DB.exists()}
     payload = json.dumps(data, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")

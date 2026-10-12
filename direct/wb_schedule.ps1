@@ -3,6 +3,7 @@
 #   • wb_bids.py --apply — 3 раза в день: 08:00, 13:00, 18:00;
 #   • wb_guard.py --apply — каждый час в :40 с 07:40 до 23:40: ставка за рекомендацией WB и минимумом, не выше
 #     окупаемого потолка, вниз и вверх сразу (≈10 минут).
+#   • после каждого запуска — пересборка дашборда wb_dashboard.html (python wb_dashboard.py --no-open), 13.10.2026.
 # Установить:  powershell -ExecutionPolicy Bypass -File C:\direct\wb_schedule.ps1
 # Проверить:   Get-ScheduledTask -TaskName "AWER_WB_*"
 # Снять:       powershell -ExecutionPolicy Bypass -File C:\direct\wb_schedule.ps1 -Remove
@@ -23,7 +24,8 @@ $py = (Get-Command python -ErrorAction SilentlyContinue).Source
 if (-not $py) { Write-Host "Не найден python. Установите Python или проверьте, что команда python работает."; exit 1 }
 
 function Make-Action($script) {
-    $cmd = "/c set PYTHONIOENCODING=utf-8&& cd /d $dir && `"$py`" $script --apply >> wb_sched_out.txt 2>&1"
+    # после скрипта (даже если он упал) пересобрать дашборд — страница всегда показывает последнее состояние
+    $cmd = "/c set PYTHONIOENCODING=utf-8&& cd /d $dir && `"$py`" $script --apply >> wb_sched_out.txt 2>&1 & `"$py`" wb_dashboard.py --no-open >> wb_sched_out.txt 2>&1"
     New-ScheduledTaskAction -Execute "cmd.exe" -Argument $cmd -WorkingDirectory $dir
 }
 
