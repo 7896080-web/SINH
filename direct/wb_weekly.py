@@ -41,6 +41,17 @@ def d10(v):
     return str(v or "")[:10]
 
 
+def week_key(r):
+    """Неделя строки — с понедельника по воскресенье. WB режет неделю на границе месяца на два отчёта
+    (например, 28–30.09 и 01–04.10) — здесь они складываются обратно в одну неделю."""
+    try:
+        d = dt.date.fromisoformat(d10(r.get("dateFrom")))
+    except ValueError:
+        return (d10(r.get("dateFrom")), d10(r.get("dateTo")))
+    mon = d - dt.timedelta(days=d.weekday())
+    return (mon.isoformat(), (mon + dt.timedelta(days=6)).isoformat())
+
+
 def change(new, old):
     if not old:
         return ""
@@ -54,20 +65,23 @@ def week_list(token, d1, d2):
                 body={"dateFrom": d1.isoformat(), "dateTo": d2.isoformat(), "limit": 1000, "offset": 0,
                       "period": "weekly"}) or []
     weeks = defaultdict(lambda: defaultdict(float))
+    last_to = ""
     for r in data if isinstance(data, list) else []:
-        w = weeks[(d10(r.get("dateFrom")), d10(r.get("dateTo")))]
+        w = weeks[week_key(r)]
+        last_to = max(last_to, d10(r.get("dateTo")))
         for k, f in LIST_FIELDS:
             w[k] += num(r.get(f))
         w["reports"] += 1
-    return weeks
+    return weeks, last_to
 
 
 def detail(rows):
     """Детализация по неделям: {(начало, конец): {"total": {...}, "nm": {nm: {...}}, "info": {nm: (арт, название)}}}."""
-    res = defaultdict(lambda: {"total": defaultdict(float), "nm": defaultdict(lambda: defaultdict(float))})
+    res = defaultdict(lambda: {"total": defaultdict(float), "nm": defaultdict(lambda: defaultdict(float)),
+                               "ded": defaultdict(float)})
     info = {}
     for r in rows:
-        wk = res[(d10(r.get("dateFrom")), d10(r.get("dateTo")))]
+        wk = res[week_key(r)]
         t = wk["total"]
         nm = r.get("nmId") or 0
         doc = (r.get("docTypeName") or "").lower()
@@ -87,9 +101,12 @@ def detail(rows):
         reason = f"{r.get('bonusTypeName') or ''} {r.get('sellerOperName') or ''}".lower()
         if ded and ("продвиж" in reason or "реклам" in reason):
             t["ads"] += ded
+        if ded:
+            wk["ded"][cut(r.get("bonusTypeName") or r.get("sellerOperName") or "без названия", 60)] += ded
         if sign:
             t["sold" if sign > 0 else "returned"] += q
         t["retail"] += sign * num(r.get("retailAmount"))
+        t["for_pay"] += sign * num(r.get("forPay"))
     return res, info
 
 
@@ -100,29 +117,31 @@ def analyze(cab, token):
     d1 = last_sunday - dt.timedelta(weeks=WEEKS) + dt.timedelta(days=1)
     print("  список отчётов о реализации (WB отдаёт 1 раз в минуту)...")
     try:
-        weeks = week_list(token, d1, TODAY - dt.timedelta(days=1))
+        weeks, last_to = week_list(token, d1, TODAY - dt.timedelta(days=1))
     except ApiError as e:
         log(f"  ! Список отчётов: {e}")
-        weeks = {}
+        weeks, last_to = {}, ""
 
     rows_csv = []
     keys = sorted(weeks)[-WEEKS:]
     if keys:
         log(f"\n  1. Недели по отчётам о реализации (как в кабинете WB, «Финансовые отчёты»), ₽:")
         log(f"  {'неделя':13}{'продажи':>11}{'к переч.':>11}{'логист.':>10}{'хранен.':>9}{'штрафы':>8}"
-            f"{'удерж.':>9}{'к оплате':>11}{'логист. %':>10}{'к опл. Δ':>9}")
+            f"{'удерж.':>9}{'к оплате':>11}{'комис.%':>8}{'логист.%':>9}{'к опл. Δ':>9}")
         prev = None
         for k in keys:
             w = weeks[k]
             log(f"  {k[0][8:10]}.{k[0][5:7]}–{k[1][8:10]}.{k[1][5:7]}  {fm(w['retail']):>11}{fm(w['for_pay']):>11}"
                 f"{fm(w['delivery']):>10}{fm(w['storage']):>9}{fm(w['penalty']):>8}{fm(w['deduction']):>9}"
-                f"{fm(w['bank']):>11}{fm(pct(w['delivery'], w['retail']), 0, '%'):>10}"
+                f"{fm(w['bank']):>11}{fm(pct(w['retail'] - w['for_pay'], w['retail']), 0, '%'):>8}"
+                f"{fm(pct(w['delivery'], w['retail']), 0, '%'):>9}"
                 f"{change(w['bank'], prev['bank']) if prev else '':>9}")
             prev = w
-        if keys[-1][1] < last_sunday.isoformat():
+        if last_to < last_sunday.isoformat():
             log(f"  ! Отчёта за прошлую неделю ({last_sunday - dt.timedelta(days=6):%d.%m}–"
                 f"{last_sunday:%d.%m}) ещё нет — WB обычно формирует его в понедельник–вторник. "
                 "Запустите позже.")
+        log("  «комис.%» — сколько WB оставил себе от продаж (продажи − к перечислению); «логист.%» — логистика от продаж.")
         log("  «удерж.» — прочие удержания WB (в т.ч. оплата рекламы с «Баланса»); «к оплате» — что WB перечислит на счёт.")
     else:
         log("  Список отчётов пуст — беру детализацию за последние 2 недели.")
@@ -145,6 +164,8 @@ def analyze(cab, token):
     if not wk:
         log("  Детализация пуста.")
         return rows_csv
+    for w in wk:
+        det[w]["total"]["commission"] = det[w]["total"]["retail"] - det[w]["total"]["for_pay"]
     cur = det[wk[-1]]
     old = det[wk[0]] if len(wk) == 2 else None
     name = lambda k: f"{k[0][8:10]}.{k[0][5:7]}–{k[1][8:10]}.{k[1][5:7]}"
@@ -157,6 +178,7 @@ def analyze(cab, token):
     line("Выкуплено", "sold", unit=" шт")
     line("Возвратов", "returned", unit=" шт")
     line("Продажи (за вычетом возвратов)", "retail")
+    line("Комиссия WB (продажи − к перечислению)", "commission")
     line("Логистика всего", "logistics")
     line("Логистика на 1 выкуп", "logistics", per="sold")
     line("Удержано за рекламу (с «Баланса»)", "ads")
@@ -164,6 +186,11 @@ def analyze(cab, token):
         log(f"    Реклама от продаж: {fm(pct(cur['total']['ads'], cur['total']['retail']), 1, '%')}"
             + (f" (неделей раньше {fm(pct(old['total']['ads'], old['total']['retail']), 1, '%')})" if old else "")
             + ". Реклама, оплаченная со «Счёта» (картой), сюда не попадает — её смотрите в wb_ads_report.py.")
+
+    if cur["ded"] or (old and old["ded"]):
+        log("    Из чего состоят удержания (₽, эта неделя / прошлая):")
+        for k in sorted(set(cur["ded"]) | (set(old["ded"]) if old else set()), key=lambda k: -abs(cur["ded"].get(k, 0)))[:10]:
+            log(f"      {cut(k, 60):60}{fm(cur['ded'].get(k, 0)):>12}" + (f"{fm(old['ded'].get(k, 0)):>12}" if old else ""))
 
     nms = set(cur["nm"]) | (set(old["nm"]) if old else set())
     nms.discard(0)
