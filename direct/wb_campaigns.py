@@ -11,8 +11,8 @@
   3. На что обратить внимание: один товар в нескольких активных кампаниях на одном месте показа, реклама товаров
      без остатка, активные кампании без дневного лимита, расход без заказов.
 
-Запуск:  python wb_campaigns.py                        (кампании «активна», «пауза», «готова к запуску»)
-         python wb_campaigns.py --all                  (плюс завершённые за последние 30 дней)
+Запуск:  python wb_campaigns.py                        (только активные кампании)
+         python wb_campaigns.py --all                  (плюс «пауза», «готова к запуску» и завершённые за 30 дней)
          python wb_campaigns.py --cabinet "Яворская"
 Нужны категории токена: «Продвижение», «Аналитика».
 Результат: wb_campaigns_report.txt, wb_campaigns.csv, wb_campaigns_products.csv,
@@ -44,7 +44,7 @@ def list_campaigns(token, with_finished):
     for g in data.get("adverts") or []:
         st = g.get("status")
         for a in g.get("advert_list") or []:
-            if st in (4, 9, 11) or (with_finished and st == 7 and str(a.get("changeTime") or "")[:10] >= since):
+            if st == 9 or (with_finished and (st in (4, 11) or (st == 7 and str(a.get("changeTime") or "")[:10] >= since))):
                 ids.append(a["advertId"])
                 status[a["advertId"]] = st
     camps = {}
@@ -53,8 +53,9 @@ def list_campaigns(token, with_finished):
         d = call("GET", ADV + "/api/advert/v2/adverts", token, params={"ids": ",".join(map(str, part))},
                  what="Настройки кампаний") or {}
         for a in d.get("adverts") or []:
-            a["_status"] = status.get(a.get("id"), a.get("status"))
-            camps[a["id"]] = a
+            if a.get("id") in status:
+                a["_status"] = status[a["id"]]
+                camps[a["id"]] = a
     return camps
 
 
