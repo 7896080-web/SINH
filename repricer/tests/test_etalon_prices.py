@@ -35,7 +35,7 @@ def _run(tmp_path, *extra):
     r = subprocess.run([sys.executable, str(ROOT / "scripts" / "etalon_prices.py"), "--xlsx", str(out), *extra],
                        capture_output=True, env=env, cwd=ROOT)
     assert r.returncode == 0, r.stderr.decode("utf-8", "replace")
-    ws = load_workbook(out).active
+    ws = load_workbook(out)["Kit и Ламода"]
     rows = list(ws.iter_rows(values_only=True))
     return r.stdout.decode("cp1251"), [dict(zip(rows[0], x)) for x in rows[1:]]
 
@@ -68,3 +68,36 @@ def test_article_without_wb_has_no_etalon_and_nothing_changes(db, tmp_path):
     assert next(r for r in rows if r["Артикул"] == "300")["Что сделать"] == "нет эталона (нет на WB)"
     db.expire_all()
     assert (db.query(PriceChange).count(), db.query(ArticleCoef).count(), db.query(ProductPrice).count()) == before
+
+
+def test_wb_sheet_shows_each_cabinet_against_the_average(db, tmp_path):
+    _setup(db)
+    text, _ = _run(tmp_path)
+    assert "цена со скидкой продавца НЕ меняется" in text
+    wb = load_workbook(tmp_path / "p.xlsx")["WB"]
+    rows = list(wb.iter_rows(values_only=True))
+    h = rows[0]
+    got = {r[h.index("Кабинет")]: r for r in rows[1:]}
+    # средняя (4000 + 6000) / 2 = 5000, эталон 3450; ИП 1 на 20% ниже средней, ИП 2 на 20% выше
+    assert got["ИП 1"][h.index("Средняя со скидкой по WB, ₽")] == 5000
+    assert got["ИП 1"][h.index("Кабинет к средней, %")] == -20.0
+    assert got["ИП 2"][h.index("Кабинет к средней, %")] == 20.0
+    assert got["ИП 2"][h.index("Эталон (−31%), ₽")] == 3450
+    assert got["ИП 1"][h.index("Сейчас: скидка, %")] == 50.0
+
+
+def test_wb_keeps_the_sale_price_and_moves_list_and_discount_into_corridor(db, tmp_path):
+    _setup(db)
+    _run(tmp_path)
+    wb = load_workbook(tmp_path / "p.xlsx")["WB"]
+    rows = list(wb.iter_rows(values_only=True))
+    h = rows[0]
+    got = {r[h.index("Кабинет")]: r for r in rows[1:]}
+    # ИП 1: 8000 / 4000 — скидка 50%, уже в коридоре: ничего не меняем
+    assert got["ИП 1"][h.index("Что сделать")] == "скидка уже в коридоре"
+    assert got["ИП 1"][h.index("Новая цена до скидки, ₽")] == 8000
+    # ИП 2: 9000 / 6000 — скидка 33% < 35%: цена со скидкой та же 6000, скидка 35%, до скидки 6000 / 0,65 = 9231
+    r = got["ИП 2"]
+    assert r[h.index("Что сделать")] == "поднять цену до скидки"
+    assert r[h.index("Новая цена до скидки, ₽")] == 9231 and r[h.index("Новая скидка, %")] == 35.0
+    assert r[h.index("Цена со скидкой (не меняется), ₽")] == 6000
