@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 Автопилот рекламы Wildberries: ставки, ставки на поисковые кластеры, минус-фразы, дневные лимиты.
-Трогает только кампании, перечисленные в RULES. Без --apply ничего не меняет.
+Трогает только кампании из RULES ("*" — все активные, кроме «_except»). Без --apply ничего не меняет.
 
-Что делает для каждой кампании из RULES:
+Что делает для каждой кампании из RULES ("*" — все активные):
   • Ставки товаров — подтягивает к рекомендованной WB для нужных позиций, но не выше окупаемой:
       за клики:  допустимая цена заказа × конверсия товара (клик → заказ);
       за показы: допустимая цена заказа × конверсия × CTR × 1000.
@@ -51,11 +51,14 @@ import requests
 #   для товаров без юнит-экономики берётся max_cost_per_order_default.
 #   Джемперы: средний заказ ≈ 7 400 ₽, выкуп ≈ 50% → 15% от выкупа ≈ 550–600 ₽.
 #   Куртки на запуске (первые 2–3 недели) ≈ 2 400 ₽, потом ≈ 1 200 ₽.
+# "*" — все АКТИВНЫЕ кампании кабинета (статус «активна»; пауза и «готова» не трогаются) с этими правилами.
+#   Кампании, перечисленные по названию или ID отдельно, берут свои правила вместо "*".
+#   "_except": [ID или часть названия, …] — активные кампании, которые автопилот не трогает (например, на время теста).
+#   Дневной лимит WB даёт только кампаниям за клики; у кампаний за показы он пропускается.
 RULES = {
     "Яворская": {
-        # ── Этап 1 (сейчас). Поиск, оплата за клики — основной двигатель продаж.
-        "27643 клик": {"target": "3-10", "max_cost_per_order": 600, "daily_limit": 2500, "auto_minus": True},
-        "36446 клик": {"target": "3-10", "max_cost_per_order": 600, "daily_limit": 2500, "auto_minus": True},
+        "*": {"target": "3-10", "max_cost_per_order": 600, "daily_limit": 2500, "auto_minus": True},
+        "_except": [],
 
         # ── Этап 1. Те же товары в рекомендациях, оплата за показы. Создать:
         #    python wb_create.py --name "27643 рекомендации показы" --pay cpm --where recommendations --from "27643 клик"
@@ -212,8 +215,8 @@ def load_unit_limits():
     import csv
     p = HERE / "wb_unit_economics.csv"
     res = {}
-    auto_cabs = {cab for cab, rules in RULES.items() for rule in rules.values()
-                 if dict(DEFAULTS, **rule)["max_cost_per_order"] == "auto"}
+    auto_cabs = {cab for cab, rules in RULES.items() for k, rule in rules.items()
+                 if k != "_except" and dict(DEFAULTS, **rule)["max_cost_per_order"] == "auto"}
     if not p.exists():
         if auto_cabs:
             log(f"! Нет файла wb_unit_economics.csv, а в RULES стоит \"auto\" ({', '.join(sorted(auto_cabs))}) — "
@@ -680,7 +683,8 @@ def plan_cabinet(cab, token, rules, state):
     plan = {"bids": [], "cluster_bids": [], "minus": [], "limits": []}
     camps = get_campaigns(token)
     todo = {}
-    for key, rule in rules.items():
+    explicit = {k: v for k, v in rules.items() if k not in ("*", "_except")}
+    for key, rule in explicit.items():
         ids = find(camps, key)
         if not ids:
             log(f"  ! Кампания «{key}» не найдена среди активных, на паузе и готовых к запуску.")
@@ -689,6 +693,13 @@ def plan_cabinet(cab, token, rules, state):
             continue
         for cid in ids:
             todo[cid] = dict(DEFAULTS, **rule)
+    if "*" in rules:
+        skip = {cid for k in rules.get("_except") or [] for cid in find(camps, k)}
+        auto = [cid for cid, a in camps.items() if a.get("_status") == 9 and cid not in todo and cid not in skip]
+        for cid in auto:
+            todo[cid] = dict(DEFAULTS, **rules["*"])
+        log(f"  Все активные кампании: {len(auto)}" + (f" (кроме {len(skip)} из «_except»)" if skip else "") + ": "
+            + ", ".join(f"«{(camps[c].get('settings') or {}).get('name')}» {c}" for c in auto))
     if not todo:
         log("  Нет кампаний для управления.")
         return plan
