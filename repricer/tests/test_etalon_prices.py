@@ -96,8 +96,34 @@ def test_wb_keeps_the_sale_price_and_moves_list_and_discount_into_corridor(db, t
     # ИП 1: 8000 / 4000 — скидка 50%, уже в коридоре: ничего не меняем
     assert got["ИП 1"][h.index("Что сделать")] == "скидка уже в коридоре"
     assert got["ИП 1"][h.index("Новая цена до скидки, ₽")] == 8000
-    # ИП 2: 9000 / 6000 — скидка 33% < 35%: цена со скидкой та же 6000, скидка 35%, до скидки 6000 / 0,65 = 9231
+    # ИП 2: 9000 / 6000 — скидка 33% < 35%: цена со скидкой та же 6000, скидка 35%, до скидки
+    # 6000 / 0,65 = 9230,77 — ВНИЗ, до 9230: с округлением вверх цена со скидкой стала бы 6000,15
     r = got["ИП 2"]
     assert r[h.index("Что сделать")] == "поднять цену до скидки"
-    assert r[h.index("Новая цена до скидки, ₽")] == 9231 and r[h.index("Новая скидка, %")] == 35.0
+    assert r[h.index("Новая цена до скидки, ₽")] == 9230 and r[h.index("Новая скидка, %")] == 35.0
+    assert 9230 * 0.65 <= 6000
     assert r[h.index("Цена со скидкой (не меняется), ₽")] == 6000
+
+
+def test_wb_card_with_different_sale_prices_per_size_is_marked_for_per_size_only(db, tmp_path):
+    """Цена на WB уходит карточкой — наибольшая на все размеры. Размер, у которого цена со
+    скидкой ниже, при такой отправке подорожал бы, поэтому карточка помечается."""
+    w = F.account(db, "wb", "ИП 1", commission=25)
+    F.manual_rate(db, "100")
+    F.sku(db, "s", "500", "S", barcodes=["bs"], cost_usd=10)
+    F.sku(db, "l", "500", "L", barcodes=["bl"], cost_usd=10)
+    F.sku(db, "m", "600", "M", barcodes=["bm"], cost_usd=10)
+    F.sku(db, "x", "600", "XL", barcodes=["bx"], cost_usd=10)
+    F.item(db, w, "bs", "500", external_id="111:1"); F.item(db, w, "bl", "500", external_id="111:2")
+    F.item(db, w, "bm", "600", external_id="222:1"); F.item(db, w, "bx", "600", external_id="222:2")
+    prices = {"bs": (6000, 3000), "bl": (7000, 3500), "bm": (6000, 3000), "bx": (6000, 3000)}
+    for it in db.query(PlatformItem):
+        it.current_price, it.current_sale_price = prices[it.barcode]
+    db.commit()
+    text, _ = _run(tmp_path)
+    assert "1  карточек: цены со скидкой по размерам разные" in text
+    wb = load_workbook(tmp_path / "p.xlsx")["WB"]
+    rows = list(wb.iter_rows(values_only=True))
+    h = rows[0]
+    mark = {r[h.index("ID_1С")]: r[h.index("Карточка")] for r in rows[1:]}
+    assert mark["s"] and mark["l"] and not mark["m"] and not mark["x"]
