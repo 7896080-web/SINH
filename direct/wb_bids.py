@@ -296,6 +296,8 @@ def load_unit_limits():
 
 
 UNIT_LIMITS = {}
+CAPS = {}         # {"кампания:артикул": {зона: окупаемый потолок, коп.}} — для часовой проверки wb_guard.py
+LOCK_FILE = HERE / "wb_bids.running"   # пока автопилот работает, wb_guard.py ставки не трогает
 BUYOUT = {}       # {(кабинет, артикул): (множитель потолка, выкуп товара, заказов в расчёте)}
 
 
@@ -955,6 +957,7 @@ def plan_cabinet(cab, token, rules, state):
                 ctr = smooth(v["clicks"], v["views"], camp_ctr, K_VIEWS)
                 econ = mcpo(cab, r, nm) * cr * 100 * (1 if pay == "cpc" else ctr * 1000)
                 cap = int(min(econ, cap_abs))
+                CAPS.setdefault(pk(cid, nm), {})[placement] = cap
                 s_info = (stock or {}).get(nm) or {}
                 current, mn = cur_all.get(nm, {}).get(key_cur), mins.get(nm) or 0
                 rec = None
@@ -1544,10 +1547,21 @@ def main():
             log("! Часть данных не загрузилась (см. «!» выше) — --apply сейчас откажется применять.")
         log("Это пробный прогон. Применить: python wb_bids.py --apply")
     if apply and not DATA_PROBLEMS:
+        state["caps"] = {"at": dt.datetime.now().isoformat(timespec="seconds"), "items": CAPS}   # для wb_guard.py
         save_state(state)     # ставки на начало дня и отсчёт наличия на WB — только при настоящем применении
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write("\n".join(out) + "\n\n")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        LOCK_FILE.write_text(dt.datetime.now().isoformat(timespec="seconds"), encoding="utf-8")
+    except OSError:
+        pass
+    try:
+        main()
+    finally:
+        try:
+            LOCK_FILE.unlink()
+        except OSError:
+            pass
