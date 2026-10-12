@@ -197,7 +197,7 @@ def run_cabinet(cab, token, with_finished):
     for names, places_nm in dup.items():
         nms_d = set().union(*places_nm.values())
         warn.append(f"Дубли: {len(nms_d)} тов. одновременно в кампаниях {' + '.join('«' + n + '»' for n in names)} "
-                    f"на местах {', '.join(sorted(places_nm))} ({', '.join(map(str, sorted(nms_d))[:6])}"
+                    f"на местах {', '.join(sorted(places_nm))} ({', '.join(map(str, sorted(nms_d)[:6]))}"
                     f"{' …' if len(nms_d) > 6 else ''}) — по правилу «один товар, одно место — одна кампания» оставить одну.")
     if mc is not None and not mc:
         log("\n  Минус-фраз WB не вернул ни по одной кампании — у кампаний нет минус-фраз или их тип их не поддерживает.")
