@@ -1145,6 +1145,14 @@ def target_label(c: dict) -> str:
 def export_compare(q: str = Query(""), flt: str = Query(""), db: Session = Depends(get_db),
                    user: User = Depends(get_current_user)):
     rows, cols = compare_rows(db, _accounts(db), q, flt)
+    headers, data = compare_table(rows, cols)
+    db.commit()       # после чтения строк — см. `export`
+    return xlsx_response(headers, data, "сравнение_площадок.xlsx")
+
+
+def compare_table(rows: list[dict], cols: list[Account]) -> tuple[list[str], list[list]]:
+    """Заголовки и строки выгрузки сравнения — одни на страницу и на
+    scripts/check_same_items.py."""
     headers = ["ID_1С", "Артикул 1С", "Наименование", "Размер", "Цвет", "Расхождения",
                "Разброс текущих, %", "Разброс новых, %"]
     for a in cols:
@@ -1161,8 +1169,7 @@ def export_compare(q: str = Query(""), flt: str = Query(""), db: Session = Depen
             line += ([c["current"], _f(c["current_coef"]), c["price"], _f(c["markup_coef"]), target_label(c)]
                      if c else [None, None, None, None, ""])
         data.append(line)
-    db.commit()       # после чтения строк — см. `export`
-    return xlsx_response(headers, data, "сравнение_площадок.xlsx")
+    return headers, data
 
 
 # --- история цены товара и возврат прежней ------------------------------------------
