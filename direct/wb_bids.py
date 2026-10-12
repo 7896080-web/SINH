@@ -452,19 +452,23 @@ def cluster_stats(token, pairs):
 
 
 def get_stock(token, nm_ids):
-    y = (dt.date.today() - dt.timedelta(days=1)).isoformat()
+    y = dt.date.today() - dt.timedelta(days=1)
     res = {}
     try:
         for part in chunks(nm_ids, 100):
             pace(token, "funnel", 21)
-            body = {"selectedPeriod": {"start": y, "end": y}, "nmIds": part, "brandNames": [], "subjectIds": [],
+            # остатки — на текущий день; заказы — за SIZE_DAYS (нужны, чтобы спрашивать размеры только у продающих)
+            body = {"selectedPeriod": {"start": (y - dt.timedelta(days=SIZE_DAYS - 1)).isoformat(), "end": y.isoformat()},
+                    "nmIds": part, "brandNames": [], "subjectIds": [],
                     "tagIds": [], "skipDeletedNm": False, "limit": 1000, "offset": 0}
             data = call("POST", ANA + "/api/analytics/v3/sales-funnel/products", token, body=body,
                         what="Остатки (воронка продаж)") or {}
             for p in (data.get("data") or {}).get("products") or []:
                 pr = p.get("product") or {}
                 st = pr.get("stocks") or {}
-                res[pr.get("nmId")] = {"wb": st.get("wb"), "mp": st.get("mp"), "vendor": pr.get("vendorCode")}
+                sel = (p.get("statistic") or {}).get("selected") or {}
+                res[pr.get("nmId")] = {"wb": st.get("wb"), "mp": st.get("mp"), "vendor": pr.get("vendorCode"),
+                                       "orders": num(sel.get("orderCount"))}
     except ApiError as e:
         log(f"  ! {e} — остатки неизвестны, минимальные ставки «по остаткам» не ставлю.")
         DATA_PROBLEMS.append(f"остатки не загрузились ({e})")
@@ -503,9 +507,15 @@ def get_sizes(token, nm_ids):
     fresh = lambda e: e and now - dt.datetime.fromisoformat(e["at"]) < dt.timedelta(hours=SIZE_CACHE_HOURS)
     res, failed = {}, 0
     y = dt.date.today() - dt.timedelta(days=1)
+    todo_n = sum(1 for nm in nm_ids if not fresh(cache.get(str(nm))))
+    if todo_n:
+        print(f"  Размеры: запрашиваю {todo_n} тов. (WB — раз в 20 с, ≈{todo_n * 20 // 60 + 1} мин; дальше 6 ч из кэша)…", flush=True)
+    k = 0
     for nm in nm_ids:
         e = cache.get(str(nm))
         if not fresh(e):
+            k += 1
+            print(f"    размеры {k}/{todo_n}", end="\r", flush=True)
             pace(token, "sizes", 20.5)
             body = {"nmID": nm, "currentPeriod": {"start": (y - dt.timedelta(days=SIZE_DAYS - 1)).isoformat(),
                                                   "end": y.isoformat()},
@@ -526,6 +536,8 @@ def get_sizes(token, nm_ids):
                               "stock": num(m.get("stockCount"))})
             e = cache[str(nm)] = {"at": now.isoformat(timespec="seconds"), "sizes": sizes}
         res[nm] = e["sizes"]
+    if todo_n:
+        print(" " * 60, end="\r", flush=True)
     if failed:
         log(f"  ! Размеры не получены для {failed} тов. — для них правило размеров не применяется.")
     try:
@@ -572,9 +584,11 @@ REC_SAMPLE = HERE / "wb_bids_rec_sample.json"   # образец ответа WB
 
 def get_rec(token, aid, nm):
     if (aid, nm) not in _rec_cache:
+        print(f"    рекомендации WB: {len(_rec_cache) + 1}-й товар…", end="\r", flush=True)
         pace(token, "rec", 12.5)
         data = call("GET", ADV + "/api/advert/v0/bids/recommendations", token,
                     params={"nmId": nm, "advertId": aid}, what=f"Рекомендованные ставки {nm}") or {}
+        print(" " * 60, end="\r", flush=True)
         if not _rec_cache:   # первый ответ за запуск сохраняем как образец (токенов в нём нет)
             try:
                 REC_SAMPLE.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -779,7 +793,10 @@ def plan_cabinet(cab, token, rules, state):
     # размеры: доля спроса, которую закрывают размеры в наличии
     cover = {}
     if SIZE_RULE and stock is not None:
-        in_stock = [nm for nm in sorted({nm for cid in involved for nm in nms_of[cid]}) if not no_stock(nm)]
+        # размеры решают что-то только у товаров с заказами (меньше SIZE_MIN_ORDERS за период — по размерам не судим):
+        # WB отдаёт размеры по одному товару раз в 20 секунд, поэтому остальные не спрашиваем
+        in_stock = [nm for nm in sorted({nm for cid in involved for nm in nms_of[cid]})
+                    if not no_stock(nm) and ((stock.get(nm) or {}).get("orders") or 0) >= SIZE_MIN_ORDERS]
         for nm, sizes in get_sizes(token, in_stock).items():
             c, miss = size_cover(sizes)
             if c is not None:
