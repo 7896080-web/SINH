@@ -59,19 +59,20 @@ import requests
 #   Дневной лимит WB даёт только кампаниям за клики; у кампаний за показы он пропускается.
 RULES = {
     "Яворская": {
-        "*": {"target": "3-10", "max_cost_per_order": 600, "daily_limit": 2500, "auto_minus": True,
+        "*": {"target": "3-10", "max_cost_per_order": 600, "daily_limit": 1000, "auto_minus": True,
               "topup_below": 500, "topup_amount": 1000, "topup_week_cap": 7000, "topup_day_cap": 1000,
               "topup_source": "balance"},
         "_except": [],
+        # Дневной лимит (решение 12.10.2026): 1 000 ₽ в сутки на кампанию, у «27643 клик» и «36446 клик» — 2 000 ₽.
         # ── Главные кампании (решение 12.10.2026): потолок пополнений 2 000 ₽ в сутки и 14 000 ₽ в неделю; если встали на паузу
         #    из-за пустого бюджета — после пополнения запустить. Остальное — как в "*".
-        "31049161": {"topup_week_cap": 14000, "topup_day_cap": 2000, "start_after_topup": True},   # «27643 клик»
-        "31048671": {"topup_week_cap": 14000, "topup_day_cap": 2000, "start_after_topup": True},   # «36446 клик»
+        "31049161": {"daily_limit": 2000, "topup_week_cap": 14000, "topup_day_cap": 2000, "start_after_topup": True},   # «27643 клик»
+        "31048671": {"daily_limit": 2000, "topup_week_cap": 14000, "topup_day_cap": 2000, "start_after_topup": True},   # «36446 клик»
         # ── Новинки (запуск, решение 12.10.2026): цель — места 1–2, допустимый заказ вдвое выше обычного,
         #    запросы не минусуем, пока набираются продажи и отзывы. С 03.11 — общие правила "*".
-        "39661494": {"target": "1-2", "max_cost_per_order": 1200, "daily_limit": 2500, "auto_minus": False,
+        "39661494": {"target": "1-2", "max_cost_per_order": 1200, "auto_minus": False,
                      "until": "2026-11-02"},   # ZJYM269002, за клики
-        "39829896": {"target": "1-2", "max_cost_per_order": 1200, "daily_limit": 2500, "auto_minus": False,
+        "39829896": {"target": "1-2", "max_cost_per_order": 1200, "auto_minus": False,
                      "until": "2026-11-02"},   # 256250 («Кампания от 29.08.2026»), за клики
 
         # ── Этап 1. Те же товары в рекомендациях, оплата за показы. Создать:
