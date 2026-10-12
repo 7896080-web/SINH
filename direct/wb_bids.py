@@ -59,8 +59,14 @@ import requests
 #   Дневной лимит WB даёт только кампаниям за клики; у кампаний за показы он пропускается.
 RULES = {
     "Яворская": {
-        "*": {"target": "3-10", "max_cost_per_order": 600, "daily_limit": 2500, "auto_minus": True},
+        "*": {"target": "3-10", "max_cost_per_order": 600, "daily_limit": 2500, "auto_minus": True,
+              "topup_below": 500, "topup_amount": 1000, "topup_week_cap": 7000, "topup_day_cap": 1000,
+              "topup_source": "balance"},
         "_except": [],
+        # ── Главные кампании (решение 12.10.2026): потолок пополнений 2 000 ₽ в сутки и 14 000 ₽ в неделю; если встали на паузу
+        #    из-за пустого бюджета — после пополнения запустить. Остальное — как в "*".
+        "31049161": {"topup_week_cap": 14000, "topup_day_cap": 2000, "start_after_topup": True},   # «27643 клик»
+        "31048671": {"topup_week_cap": 14000, "topup_day_cap": 2000, "start_after_topup": True},   # «36446 клик»
         # ── Новинки (запуск, решение 12.10.2026): цель — места 1–2, допустимый заказ вдвое выше обычного,
         #    запросы не минусуем, пока набираются продажи и отзывы. С 03.11 — общие правила "*".
         "39661494": {"target": "1-2", "max_cost_per_order": 1200, "daily_limit": 2500, "auto_minus": False,
@@ -102,6 +108,14 @@ DEFAULTS = {
     "auto_minus": False,
     "route_from": None,
     "daily_limit": None,        # ₽ в сутки
+    # Автопополнение бюджета кампании (у WB нет настройки автопополнения в API — делаем сами методом «пополнить»).
+    # ДЕНЬГИ НЕ ВОЗВРАЩАЮТСЯ: пополнение не откатывается. Только при --apply, в пробном прогоне — план.
+    "topup_below": None,        # пополнять, когда в бюджете кампании меньше стольких ₽ (None — не пополнять)
+    "topup_amount": 1000,       # сумма одного пополнения, ₽
+    "topup_week_cap": 7000,     # не больше стольких ₽ пополнений на кампанию за 7 дней
+    "topup_day_cap": 1000,      # и не больше стольких ₽ за сутки — чтобы недельные деньги не ушли за 2–3 дня
+    "topup_source": "balance",  # balance — «Баланс» (взаиморасчёт), account — «Счёт», bonus — «Бонусы»
+    "start_after_topup": False, # кампания на паузе из-за пустого бюджета — запустить после пополнения
     "carry_over": False,        # переносить неизрасходованный дневной лимит на следующий день
 }
 PROTECT = ["awer", "авер", "mcl"]   # запросы с этими словами никогда не уходят в минус
@@ -692,7 +706,7 @@ def changed(new, cur, step):
 
 def plan_cabinet(cab, token, rules, state):
     log(f"\n══════════ {cab} ══════════")
-    plan = {"bids": [], "cluster_bids": [], "minus": [], "limits": [], "trim": []}
+    plan = {"bids": [], "cluster_bids": [], "minus": [], "limits": [], "trim": [], "topup": []}
     camps = get_campaigns(token)
     todo = {}
     explicit = {}
@@ -713,7 +727,7 @@ def plan_cabinet(cab, token, rules, state):
             log(f"  ! «{key}» подходит к нескольким кампаниям ({', '.join(map(str, ids))}) — уточните название или укажите ID.")
             continue
         for cid in ids:
-            todo[cid] = dict(DEFAULTS, **rule)
+            todo[cid] = {**DEFAULTS, **rules.get("*", {}), **rule}
     if "*" in rules:
         skip = {cid for k in rules.get("_except") or [] for cid in find(camps, k)}
         auto = [cid for cid, a in camps.items() if a.get("_status") == 9 and cid not in todo and cid not in skip]
@@ -1110,6 +1124,26 @@ def plan_cabinet(cab, token, rules, state):
                                                "old": {"enabled": bool(lim.get("enabled")), "dailyLimit": lim.get("dailyLimit"),
                                                        "carryOverEnabled": bool(lim.get("carryOverEnabled"))},
                                                "new": {"enabled": True, "dailyLimit": want, "carryOverEnabled": bool(r["carry_over"])}})
+        # ---- автопополнение бюджета ----
+        if r.get("topup_below"):
+            bud = get_budgets(token, [cid]).get(cid)
+            if bud is None:
+                log("    ! Бюджет кампании не получен — пополнение пропускаю.")
+            elif bud >= r["topup_below"]:
+                log(f"    Бюджет: {fm_rub(bud)} ₽ — пополнять не нужно (порог {r['topup_below']} ₽).")
+            else:
+                week = topped_week(state, cid)
+                today_ = topped_week(state, cid, days=1)
+                amount = min(r["topup_amount"], r["topup_day_cap"] - today_, r["topup_week_cap"] - week)
+                if amount < 100:     # меньше 100 ₽ не пополняем — дневной или недельный потолок исчерпан
+                    log(f"    ! Бюджет {fm_rub(bud)} ₽ ниже порога, но потолок исчерпан: сегодня пополнено на {fm_rub(today_)} "
+                        f"из {r['topup_day_cap']} ₽, за 7 дней на {fm_rub(week)} из {r['topup_week_cap']} ₽ — не пополняю.")
+                else:
+                    start = bool(r.get("start_after_topup")) and a.get("_status") == 11
+                    log(f"    Бюджет: {fm_rub(bud)} ₽ < {r['topup_below']} ₽ → пополнить на {amount} ₽ из «{SOURCE_RU[r['topup_source']]}» "
+                        f"(сегодня уже {fm_rub(today_)} из {r['topup_day_cap']} ₽, за 7 дней {fm_rub(week)} из {r['topup_week_cap']} ₽)" + (" и запустить кампанию" if start else "") + ".")
+                    plan["topup"].append({"cabinet": cab, "advert_id": cid, "name": name, "amount": amount,
+                                          "source": r["topup_source"], "budget_before": bud, "start": start})
     if check_card:
         log("\n  Проверить карточку (много кликов, ни одного заказа — дело скорее в фото, цене, размерах или отзывах, "
             "а не в ставке; ставку таким товарам не повышаю):")
@@ -1237,6 +1271,61 @@ def update_state(state, minus_items, reverse=False):
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
+SOURCE_TYPE = {"account": 0, "balance": 1, "bonus": 3}
+SOURCE_RU = {"account": "Счёт", "balance": "Баланс (взаиморасчёт)", "bonus": "Бонусы"}
+
+
+def fm_rub(v):
+    return f"{v:,.0f}".replace(",", " ")
+
+
+def get_budgets(token, ids):
+    res = {}
+    for part in chunks(ids, 50):
+        pace(token, "budget", 3.1)
+        try:
+            d = call("POST", ADV + "/api/advert/v2/budget", token, body={"advertIds": part}, what="Бюджеты") or {}
+        except ApiError as e:
+            log(f"    ! {e}")
+            continue
+        for b in d.get("adverts") or []:
+            if b.get("total") is not None:
+                res[b.get("advertId")] = num(b["total"])
+    return res
+
+
+def topped_week(state, cid, days=7):
+    since = (dt.date.today() - dt.timedelta(days=days - 1)).isoformat()
+    return sum(t["sum"] for t in state.get("topups", {}).get(str(cid), []) if t["date"] >= since)
+
+
+def apply_topups(token, items, state):
+    """Пополнить бюджеты. Деньги не возвращаются — отката нет. Записывает пополнения в состояние (для потолка)."""
+    ok = 0
+    for i in items:
+        pace(token, "deposit", 1.1)
+        try:
+            res = call("POST", ADV + "/adv/v1/budget/deposit", token, params={"id": i["advert_id"]}, what="Пополнение бюджета",
+                       body={"sum": int(i["amount"]), "type": SOURCE_TYPE[i["source"]], "return": True})
+        except ApiError as e:
+            log(f"  ✗ «{i['name']}»: пополнение не прошло — {e}")
+            continue
+        ok += 1
+        state.setdefault("topups", {}).setdefault(str(i["advert_id"]), []).append(
+            {"date": dt.date.today().isoformat(), "sum": i["amount"]})
+        total = res.get("total") if isinstance(res, dict) else None
+        log(f"  ✓ «{i['name']}»: +{i['amount']} ₽" + (f", бюджет теперь {fm_rub(num(total))} ₽" if total is not None else ""))
+        if i.get("start"):
+            pace(token, "start", 1.1)
+            try:
+                call("GET", ADV + "/adv/v0/start", token, params={"id": i["advert_id"]}, what="Запуск кампании")
+                log(f"  ✓ «{i['name']}»: запущена после пополнения")
+            except ApiError as e:
+                log(f"  ✗ «{i['name']}»: не запустилась — {e}")
+    save_state(state)
+    return ok
+
+
 def patch_nms(token, advert_id, add=(), delete=()):
     pace(token, "auction_nms", 1.1)
     data = call("PATCH", ADV + "/adv/v0/auction/nms", token, what="Товары кампании",
@@ -1290,6 +1379,11 @@ def run_apply(cabs, plan, key, state, reverse=False):
         tok = cabs[cab]
         sel = {k: [i for i in v if i["cabinet"] == cab] for k, v in plan.items()}
         res = []
+        if sel.get("topup"):
+            if reverse:
+                log("  Пополнения бюджета не откатываются — деньги уже в бюджетах кампаний.")
+            else:
+                res.append(f"пополнено бюджетов {apply_topups(tok, sel['topup'], state)}/{len(sel['topup'])}")
         if sel.get("trim"):
             res.append(f"{'возвращено' if reverse else 'убрано'} товаров {apply_trim(tok, sel['trim'], reverse)}/{len(sel['trim'])}")
         if sel["bids"]:
@@ -1326,6 +1420,7 @@ def main():
         plan.setdefault("minus", [])
         plan.setdefault("limits", [])
         plan.setdefault("trim", [])
+        plan["topup"] = []          # пополнения не откатываются
         log(f"{dt.datetime.now():%d.%m.%Y %H:%M} — ОТКАТ по {files[-1].name}")
         run_apply(cabs, plan, "old", state, reverse=True)
         with open(LOG_FILE, "a", encoding="utf-8") as f:
@@ -1338,7 +1433,7 @@ def main():
     if UNIT_LIMITS:
         log(f"Юнит-экономика: лимиты цены заказа для {len(UNIT_LIMITS)} товаров (wb_unit_economics.csv).")
     print("Рекомендации WB отдаёт по одному товару раз в 12 секунд — на кампанию уходит несколько минут.")
-    plan = {"bids": [], "cluster_bids": [], "minus": [], "limits": [], "trim": []}
+    plan = {"bids": [], "cluster_bids": [], "minus": [], "limits": [], "trim": [], "topup": []}
     for cab, rules in RULES.items():
         if cab not in cabs:
             log(f"\n✗ Кабинет «{cab}» есть в RULES, но нет в wb_tokens.txt")
@@ -1355,7 +1450,8 @@ def main():
     n_minus = sum(len(m["add_auto"]) + len(m["add_route"]) for m in plan["minus"])
     log(f"\nИтого: ставки товаров {len(plan['bids'])} (↑{up} ↓{len(plan['bids']) - up}), "
         f"ставки запросов {len(plan['cluster_bids'])}, новых минус-фраз {n_minus}, дневных лимитов {len(plan['limits'])}, "
-        f"убрать товаров с малым остатком {len(plan['trim'])}.")
+        f"убрать товаров с малым остатком {len(plan['trim'])}, "
+        f"пополнить бюджетов {len(plan['topup'])} на {sum(t['amount'] for t in plan['topup'])} ₽.")
     if apply and DATA_PROBLEMS:
         log("\n✗ НЕ ПРИМЕНЯЮ: часть данных не загрузилась, ставки были бы посчитаны вслепую:")
         for msg in dict.fromkeys(DATA_PROBLEMS):
