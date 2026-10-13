@@ -163,6 +163,20 @@ def plan_cabinet(cab, token, caps, state, budget):
                 continue
         if mn and cur < mn:                            # рекомендацию не смотрели — только минимум
             changes.append({**base, "new": mn, "rec": None, "why": "ниже минимума WB → минимальная"})
+    # потолки посчитаны автопилотом до 14 ч назад; товар мог за это время закончиться — повышать ему ставку не нужно
+    ups = sorted({c["nm_id"] for c in changes if c["new"] > c["old"] and c.get("rec")})
+    if ups:
+        stock = B.get_stock(token, ups)
+        if stock is not None:
+            low_min = B.DEFAULTS.get("min_stock") or 0
+            keep = []
+            for c in changes:
+                q = B.available(stock.get(c["nm_id"])) if c["nm_id"] in ups else None
+                if c["new"] > c["old"] and c.get("rec") and q is not None and q < low_min:
+                    log(f"  «{c['campaign']}» {c['nm_id']}: в наличии {q:.0f} шт (< {low_min}) — ставку не повышаю.")
+                    continue
+                keep.append(c)
+            changes = keep
     return changes, losing, checked, topups
 
 

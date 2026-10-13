@@ -26,6 +26,14 @@ YESTERDAY = TODAY - dt.timedelta(days=1)
 
 S = requests.Session()
 _out = []
+WARNINGS = []     # данные загрузились не полностью — цифры отчёта занижены (пишется в начало и конец отчёта)
+
+# Вывод в консоль Windows (cp1251) или в файл без UTF-8 не должен падать на ₽ ═ ✓: непечатаемое заменяется «?».
+try:
+    if sys.stdout is not None and (sys.stdout.encoding or "").lower().replace("-", "") != "utf8":
+        sys.stdout.reconfigure(errors="replace")
+except (AttributeError, ValueError):
+    pass
 
 
 def log(s=""):
@@ -33,8 +41,20 @@ def log(s=""):
     _out.append(str(s))
 
 
+def warn_incomplete(msg):
+    """Часть данных не загрузилась: отметить в отчёте крупно, чтобы заниженные цифры не приняли за настоящие."""
+    WARNINGS.append(msg)
+    log(f"  ! ДАННЫЕ НЕПОЛНЫЕ: {msg}")
+
+
 def save_log(name):
-    (HERE / name).write_text("\n".join(_out), encoding="utf-8")
+    text = "\n".join(_out)
+    if WARNINGS:
+        head = ("!!! ВНИМАНИЕ: часть данных WB не загрузилась — цифры ниже могут быть занижены, выводы «окупается / "
+                "не окупается» ненадёжны. Запустите отчёт ещё раз позже.\n" + "\n".join(f"  — {w}" for w in dict.fromkeys(WARNINGS)))
+        text = head + "\n\n" + text + "\n\n" + head
+        print("\n" + head)
+    (HERE / name).write_text(text, encoding="utf-8")
 
 
 class ApiError(Exception):
@@ -197,7 +217,16 @@ def write_csv(path, rows, header=None):
         w = csv.DictWriter(f, fieldnames=cols, delimiter=";")
         w.writeheader()
         for r in rows:
-            w.writerow({k: (str(v).replace(".", ",") if isinstance(v, float) else v) for k, v in r.items()})
+            w.writerow({k: _cell(v) for k, v in r.items()})
+
+
+def _cell(v):
+    """Число для Excel: запятая, без «1e-05» и «nan»."""
+    if isinstance(v, float):
+        if v != v or v in (float("inf"), float("-inf")):
+            return ""
+        return f"{v:.6f}".rstrip("0").rstrip(".").replace(".", ",")
+    return v
 
 
 def read_csv(path):
@@ -261,7 +290,7 @@ def ad_stats(token, ids, d1, d2):
                             params={"ids": ",".join(map(str, part)), "beginDate": a.isoformat(), "endDate": b.isoformat()},
                             what="Статистика рекламы")
             except ApiError as e:
-                log(f"  ! {e}")
+                warn_incomplete(f"статистика рекламы {a:%d.%m}–{b:%d.%m} по {len(part)} кампаниям: {e}")
                 continue
             for item in data or []:
                 aid = item.get("advertId")
@@ -317,6 +346,9 @@ def mature_buyout(token):
     return res, avg
 
 
+PAGE_SURE = 10000   # страница короче этого — точно последняя (предел страницы у WB заметно больше)
+
+
 def stat_rows(token, kind, date_from):
     """Заказы (kind="orders") или продажи/возвраты (kind="sales") из «Статистики», изменённые с date_from."""
     rows, cursor = [], date_from.isoformat()
@@ -325,7 +357,9 @@ def stat_rows(token, kind, date_from):
         data = call("GET", STAT + f"/api/v1/supplier/{kind}", token, params={"dateFrom": cursor, "flag": 0},
                     what="Заказы" if kind == "orders" else "Продажи") or []
         rows += data
-        if len(data) < 80000:
+        # WB: «от 0 до примерно 80 000 строк» за раз, продолжать до пустого ответа. Страница заметно меньше
+        # предела (< PAGE_SURE) — данных точно больше нет, лишний запрос (минута ожидания) не нужен.
+        if len(data) < PAGE_SURE:
             break
         cursor = data[-1].get("lastChangeDate") or cursor
     seen, uniq = set(), []
@@ -345,11 +379,11 @@ def finance_rows(token, d1, d2, period="weekly"):
         data = call("POST", FIN + "/api/finance/v1/sales-reports/detailed", token, what="Отчёт реализации",
                     body={"dateFrom": d1.isoformat(), "dateTo": d2.isoformat(), "limit": 100000, "rrdId": rrd,
                           "period": period})
-        if not data:
+        if not data:            # WB: «повторяйте запрос, пока не получите ответ 204»
             break
         rows += data
         rrd = data[-1].get("rrdId") or 0
-        if len(data) < 100000:
+        if len(data) < PAGE_SURE:
             break
     return rows
 

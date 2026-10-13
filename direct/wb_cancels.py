@@ -81,7 +81,8 @@ def ts(v):
 def fbs_status(token, d1):
     """{rid (= srid в «Статистике»): кто отменил} по сборочным заданиям FBS. None — нет доступа к «Маркетплейсу»."""
     ids, rid_of = [], {}
-    start = dt.datetime.combine(d1 - dt.timedelta(days=1), dt.time())
+    # WB отдаёт сборочные задания только за последние 3 месяца — раньше не спрашиваем (иначе ошибка 400)
+    start = max(dt.datetime.combine(d1 - dt.timedelta(days=1), dt.time()), dt.datetime.now() - dt.timedelta(days=89))
     end = dt.datetime.now()
     while start < end:
         stop = min(start + dt.timedelta(days=30), end)

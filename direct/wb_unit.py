@@ -123,8 +123,14 @@ def analyze(cab, token, costs_nm, costs_vendor):
         log(f"  ! {e} — выкуп возьму 40% для всех.")
         buy, buy_avg = {}, 0.4
     try:
-        camps = campaigns(token, changed_since=D1.isoformat())
-        _, by_cn = ad_stats(token, list(camps), D1, D2) if camps else ({}, {})
+        # реклама — за тот же период, что покрывают отчёты реализации (последняя неделя часто ещё не готова)
+        p1 = max(min((str(r.get("dateFrom") or "")[:10] for r in rows if r.get("dateFrom")), default=D1.isoformat()), D1.isoformat())
+        p2 = min(max((str(r.get("dateTo") or "")[:10] for r in rows if r.get("dateTo")), default=D2.isoformat()), D2.isoformat())
+        a1, a2 = dt.date.fromisoformat(p1), dt.date.fromisoformat(p2)
+        if (a1, a2) != (D1, D2):
+            log(f"  Отчёты реализации покрывают {a1:%d.%m}–{a2:%d.%m} — рекламу беру за тот же период.")
+        camps = campaigns(token, changed_since=a1.isoformat())
+        _, by_cn = ad_stats(token, list(camps), a1, a2) if camps else ({}, {})
     except ApiError as e:
         log(f"  ! {e} — без рекламы.")
         by_cn = {}
@@ -149,7 +155,9 @@ def analyze(cab, token, costs_nm, costs_vendor):
         cogs = (cogs_u or 0) * max(net, 0)
         tax = TAX_SHARE * max(v["retail"], 0)
         profit = payout - cogs - tax
-        b = buy.get(nm, buy_avg) or 0.4
+        b = buy.get(nm)                       # 0 — товар реально не выкупают; «нет данных» — None
+        b = buy_avg if b is None else b
+        b = 0.4 if b is None else b
         pu = profit / net if net > 0 else None
         po = pu * b if pu is not None else None
         s = ad[nm]
