@@ -25,6 +25,8 @@
       добавляются в минус-фразы этой кампании (за клики), чтобы кампании не перебивали друг друга.
       Если запрос уберут из route_from — минус-фраза снимется сама.
   • daily_limit — дневной лимит расхода, ₽ (только кампании с оплатой за клики).
+  Минус-фразы (auto_minus, route_from) работают только у кампаний за показы: у кампаний за клики WB не даёт
+  исключать запросы — там этот шаг пропускается.
 
 Запуск:
   python wb_bids.py              — пробный прогон, ничего не меняет
@@ -994,7 +996,7 @@ def plan_cabinet(cab, token, rules, state):
     # статистика запросов нужна для auto_minus, cluster_bids и источников "top"
     need_cl = set()
     for cid, r in todo.items():
-        if r["auto_minus"] or r["cluster_bids"]:
+        if (r["auto_minus"] and (camps[cid].get("settings") or {}).get("payment_type") != "cpc") or r["cluster_bids"]:
             need_cl.add(cid)
         if r.get("clusters_from_id"):
             need_cl.add(r["clusters_from_id"])
@@ -1209,7 +1211,12 @@ def plan_cabinet(cab, token, rules, state):
                         f"{int(s_q['orders'])} зак., " + (f"заказ {cpo:,.0f} ₽".replace(",", " ") if cpo else "без заказов"))
 
         # ---- минус-фразы ----
-        if r["auto_minus"] or r.get("route_from_id"):
+        # У кампаний за клики WB не даёт управлять запросами: в кабинете нет ни кластеров, ни минус-фраз,
+        # а API (/adv/v0/normquery/*) по ним списков не отдаёт. Минус-фразы — только у кампаний за показы.
+        if (r["auto_minus"] or r.get("route_from_id")) and pay == "cpc":
+            log("    Минус-фразы: кампания за клики — WB не даёт исключать в ней запросы (кластеры и минус-фразы есть "
+                "только у кампаний за показы). Пропускаю; лишние запросы здесь срезает только ставка.")
+        elif r["auto_minus"] or r.get("route_from_id"):
             pairs = [(cid, nm) for nm in nms]
             try:
                 cur_minus = get_minus(token, pairs)
@@ -1233,9 +1240,10 @@ def plan_cabinet(cab, token, rules, state):
             # либо фраз нет совсем, либо тип кампании их не поддерживает; писать вслепую нельзя (запись заменяет список).
             camp_known = cur_minus is not None and any((cid, nm) in cur_minus for nm in nms)
             if cur_minus is not None and not camp_known:
-                log("    Минус-фразы: WB не вернул по этой кампании ни одного списка — у неё нет минус-фраз или её тип их "
-                    "не поддерживает. Автоминус здесь не работает; чтобы включить его, добавьте в кабинете WB одну "
-                    "минус-фразу любому товару этой кампании (так скрипт убедится, что WB отдаёт списки).")
+                log("    Минус-фразы: WB не вернул по этой кампании ни одного списка — скорее всего, исключённых запросов "
+                    "в ней пока нет. Писать вслепую нельзя (запись заменяет весь список), поэтому автоминус здесь ждёт: "
+                    "чтобы включить его, исключите в кабинете WB любой один кластер у любого товара этой кампании "
+                    "(«Кластеры» → «Исключить»). Посмотреть кластеры: python wb_clusters.py --campaign " + str(cid))
             for nm in (nms if camp_known else []):
                 key = pk(cid, nm)
                 current = list(cur_minus.get((cid, nm), []))
