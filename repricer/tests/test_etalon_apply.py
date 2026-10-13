@@ -140,3 +140,40 @@ def test_adopt_refuses_on_mismatch_then_records_etalon_and_enables_rule(db, tmp_
     assert reference.enabled(db) is True
     assert {r.ref_price for r in db.query(ReferencePrice)} == {14193, 13940, 10770}
     assert {r.nm_id: r.discount for r in db.query(ReferenceDiscount)} == {"111": 45, "222": 44, "333": 50}
+
+
+def test_big_drop_goes_in_steps_and_adopt_waits_for_the_end(db, tmp_path, capsys):
+    w = F.account(db, "wb", "ИП 1", commission=50)
+    F.manual_rate(db, "100")
+    F.sku(db, "s", "3164M", "M", barcodes=["a1"], cost_usd=100)
+    F.item(db, w, "a1", "3164M", external_id="180413586:1")
+    for it in db.query(PlatformItem):
+        it.current_price, it.current_sale_price = 472479, 236240           # 50%
+    db.commit()
+    m = _mod()
+    after = Path(str(engine.url).replace("sqlite:///", ""))
+    arts = {"3164M": {"category": "К", "cost_rub": 10000.0, "art": 1.6, "over": {}}}   # цель 32000
+    live, _ = m.wrd.load(after)
+    (c,) = m.build_plan(db, arts, {}, live, 35, 50, 33)
+    # шаг: не ниже 236240 x 0,67 = 158281; цель 32000 — потом
+    assert c.step and c.final_target == 32000 and c.target == 158281 and c.disc == 50
+    assert (236240 - c.new_list * 0.5) / 236240 <= 0.33 + 1e-9
+    # WB применил шаг — следующий шаг от новой цены
+    for it in db.query(PlatformItem):
+        it.current_price, it.current_sale_price = c.new_list, c.new_list // 2
+    db.commit()
+    live, _ = m.wrd.load(after)
+    (c2,) = m.build_plan(db, arts, {}, live, 35, 50, 33)
+    assert c2.step and c2.target < c.target
+    # до конца шагов эталон не пишется
+    from openpyxl import Workbook
+    b = Workbook()
+    ws = b.active
+    ws.title = "Артикулы"
+    ws.append(["Артикул", "Категория", "Себестоимость макс, руб", "Маржинальность артикула"])
+    ws.append(["3164M", "К", 10000, 1.6])
+    b.create_sheet("Категории").append(["Категория", "a", "b", "Маржинальность категории"])
+    f = tmp_path / "f.xlsx"
+    b.save(f)
+    assert m.main(["--form", str(f), "--adopt", "--after", str(after)]) == 1
+    assert "по шагам 1" in capsys.readouterr().out
