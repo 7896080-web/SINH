@@ -239,3 +239,41 @@ def test_poll_now_flag_is_read_once(db):
 def test_heavy_loop_polls_wb_at_start_and_every_6_hours():
     from priceapp.workers import background
     assert background.WB_POLL_EVERY == 6 * 3600 and background.WB_POLL_EVERY * 4 == 24 * 3600
+
+
+def test_etalon_copy_is_saved_on_change_and_not_repeated(db):
+    from openpyxl import load_workbook
+    from priceapp import config
+    for p in config.ETALON_DIR.glob("etalon_*.xlsx") if config.ETALON_DIR.exists() else []:
+        p.unlink()
+    settings.put(db, settings.REF_SNAPSHOT_HASH, "")
+    db.commit()
+    acc = _setup(db, current=(2500, 2000))
+    _ref(db, acc, 2009)                                             # запись эталона
+    p1 = reference.snapshot_if_dirty(db, "тест")
+    assert p1 is not None and p1.exists()
+    rows = list(load_workbook(p1).active.iter_rows(values_only=True))
+    got = dict(zip(rows[0], rows[1]))
+    assert got["Артикул WB"] == 5 and got["Цена до скидки, руб"] == 2009 and got["Скидка продавца, %"] == 20
+    assert got["ЭТАЛОН: цена после скидки продавца, руб"] == 1607
+    assert reference.snapshot_if_dirty(db, "тест") is None          # не менялся — копии нет
+    _ref(db, acc, 2009)                                             # записали то же самое
+    assert reference.snapshot_if_dirty(db, "тест") is None          # содержимое то же — копии нет
+    _ref(db, acc, 2100)
+    p2 = reference.snapshot_if_dirty(db, "тест")
+    assert p2 is not None and p2 != p1 and len(list(config.ETALON_DIR.glob("etalon_*.xlsx"))) == 2
+
+
+def test_dispatch_send_saves_etalon_copy(db):
+    from priceapp import config
+    settings.put(db, settings.REF_SNAPSHOT_HASH, "")
+    db.commit()
+    before = set(config.ETALON_DIR.glob("etalon_*.xlsx")) if config.ETALON_DIR.exists() else set()
+    acc = _setup(db)
+    acc_mod.set_credential(db, acc, "token", "t")
+    db.add(PriceChange(item_id="u1", account_id=acc.id, barcode="b1", new_price=2009, status="approved", decided_by="op"))
+    db.commit()
+    dispatch.run(db, lambda p, c: _Push())
+    after = set(config.ETALON_DIR.glob("etalon_*.xlsx"))
+    new = after - before
+    assert len(new) == 1 and "отправка" in next(iter(new)).name

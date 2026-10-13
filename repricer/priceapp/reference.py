@@ -84,6 +84,7 @@ def record(db: Session, account: Account, item_id: str, price: int, rows, rule=N
     row.source = source
     row.set_at = now_utc()
     db.flush()
+    _mark_dirty()
     return True
 
 
@@ -117,6 +118,7 @@ def adopt_sent(db: Session, account: Account | None = None) -> dict:
         if n:
             audit.log(db, "программа", "reference_adopt", a.name, f"эталонных цен записано: {n}")
         db.commit()
+    snapshot_if_dirty(db, "запись эталона")
     return st
 
 
@@ -145,6 +147,7 @@ def adopt_current(db: Session, actor: str = "программа") -> dict:
         audit.log(db, actor, "reference_adopt_current", a.name,
                   f"новый эталон: эталонных цен {n} (цены загружены {a.prices_loaded_at})")
         db.commit()
+    snapshot_if_dirty(db, "запись эталона")
     return st
 
 
@@ -242,6 +245,7 @@ def run(db: Session, product_rows=None, actor: str = "программа", clien
                 ref.source = "rate"
                 ref.set_at = now
                 revalued += 1
+                _mark_dirty()
             if r["item_id"] in busy:
                 continue
             # 2. Площадка занизила цену после скидки продавца — вернуть эталонную (только вверх).
@@ -266,6 +270,7 @@ def run(db: Session, product_rows=None, actor: str = "программа", clien
         if revalued:
             audit.log(db, actor, "reference_run", a.name, f"эталонных пересчитано по курсу: {revalued}")
         db.commit()
+    snapshot_if_dirty(db, "пересчёт по курсу")
     return st
 
 
@@ -320,3 +325,89 @@ def summary(st: dict) -> str:
     if st.get("errors"):
         parts.append("ошибки: " + "; ".join(st["errors"]))
     return "; ".join(parts) + "."
+
+
+# --- Копии эталона ----------------------------------------------------------------
+# Эталон меняют четыре события: ручная отправка цены, команды записи эталона, отправка по
+# диапазону безопасности и пересчёт по курсу. После каждого сохраняется Excel с ПОЛНЫМ
+# эталоном (`config.ETALON_DIR`) — чтобы было видно, что и когда стало эталоном, и чтобы
+# было к чему вернуться. Тот же эталон второй раз не сохраняется (сверка по хэшу).
+SNAPSHOT_KEEP = 500
+_dirty = False
+
+
+def _mark_dirty() -> None:
+    global _dirty
+    _dirty = True
+
+
+def snapshot_rows(db: Session) -> list[list]:
+    from priceapp import mapping
+    from priceapp.pricing import article_map, article_of
+    articles = article_map(db)
+    out = []
+    for a in db.query(Account).filter(Account.platform.in_(PLATFORMS)).order_by(Account.name):
+        refs = db.query(ReferencePrice).filter(ReferencePrice.account_id == a.id).all()
+        if not refs:
+            continue
+        items = mapping.account_items(db, a.id)
+        for r in sorted(refs, key=lambda r: (article_of(articles, r.item_id), r.item_id)):
+            rows = items.get(r.item_id) or []
+            nm = next((_nm(x) for x in rows if _nm(x)), "")
+            out.append([a.name, int(nm) if nm else None, article_of(articles, r.item_id), r.item_id,
+                        int(r.ref_price), ref_discount_int(r), ref_sale(r), r.source,
+                        r.set_at.strftime("%Y-%m-%d %H:%M") if r.set_at else "",
+                        float(r.usd_rub) if r.usd_rub is not None else None])
+    return out
+
+
+SNAPSHOT_HEAD = ["Кабинет", "Артикул WB", "Артикул 1С", "ID_1С", "Цена до скидки, руб", "Скидка продавца, %",
+                 "ЭТАЛОН: цена после скидки продавца, руб", "Источник", "Записан (UTC)", "Курс $"]
+
+
+def snapshot(db: Session, reason: str = ""):
+    """Сохранить копию эталона, если он изменился с прошлой копии. Возвращает путь или None."""
+    import hashlib
+    import json
+    from datetime import datetime
+
+    from priceapp import config
+    from priceapp.excel import xlsx_bytes
+    rows = snapshot_rows(db)
+    if not rows:
+        return None
+    digest = hashlib.sha256(json.dumps([r[:7] for r in rows], ensure_ascii=False).encode()).hexdigest()
+    if settings.get(db, settings.REF_SNAPSHOT_HASH) == digest:
+        return None
+    config.ETALON_DIR.mkdir(parents=True, exist_ok=True)
+    tag = "".join(ch if ch.isalnum() else "_" for ch in reason)[:30].strip("_")
+    stem = f"etalon_{datetime.now():%Y%m%d-%H%M%S}"
+    path = config.ETALON_DIR / f"{stem}{('_' + tag) if tag else ''}.xlsx"
+    n = 1
+    while path.exists():                                  # две копии в одну секунду — не затирать
+        n += 1
+        path = config.ETALON_DIR / f"{stem}-{n}{('_' + tag) if tag else ''}.xlsx"
+    path.write_bytes(xlsx_bytes(SNAPSHOT_HEAD, rows))
+    settings.put(db, settings.REF_SNAPSHOT_HASH, digest)
+    audit.log(db, "программа", "etalon_snapshot", "", f"копия эталона: {path.name} ({len(rows)} строк; {reason})")
+    db.commit()
+    for old in sorted(config.ETALON_DIR.glob("etalon_*.xlsx"))[:-SNAPSHOT_KEEP]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+    return path
+
+
+def snapshot_if_dirty(db: Session, reason: str = ""):
+    """Копия — только если эталон в этом процессе менялся (дёшево звать после каждой отправки)."""
+    global _dirty
+    if not _dirty:
+        return None
+    _dirty = False
+    try:
+        return snapshot(db, reason)
+    except Exception:
+        import logging
+        logging.getLogger("repricer.reference").exception("копия эталона не сохранилась")
+        return None

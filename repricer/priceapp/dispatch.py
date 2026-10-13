@@ -282,4 +282,5 @@ def run(db: Session, client_factory=None) -> dict:
             # Сбой одного кабинета не должен останавливать отправку остальных.
             db.rollback()
             stats[account.name] = {"error": f"{type(e).__name__}: {e}"}
+    reference.snapshot_if_dirty(db, "отправка цен")
     return stats

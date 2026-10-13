@@ -12,6 +12,7 @@ os.environ["REPRICER_ONEC_TASKS_DIR"] = str(_TMP / "sync" / "tasks")
 os.environ["REPRICER_ONEC_RESULTS_DIR"] = str(_TMP / "sync" / "results" / "pricing")
 os.environ["REPRICER_ONEC_ARCHIVE_DIR"] = str(_TMP / "sync" / "archive" / "pricing")
 os.environ["REPRICER_BACKUP_DIR"] = str(_TMP / "backups")
+os.environ["REPRICER_ETALON_DIR"] = str(_TMP / "etalon_history")
 os.environ["REPRICER_BACKGROUND"] = "0"
 os.environ["REPRICER_ONEC_SFTP_HOST"] = ""
 

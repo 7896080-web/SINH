@@ -37,6 +37,8 @@ ONEC_SFTP_ARCHIVE = os.environ.get("REPRICER_ONEC_SFTP_ARCHIVE", "/archive/prici
 ONEC_TIMEOUT_MINUTES = int(os.environ.get("REPRICER_ONEC_TIMEOUT_MINUTES", "20"))
 
 BACKUP_DIR = _path("REPRICER_BACKUP_DIR", str(BASE_DIR / "backups"))
+# Копии эталона WB (Excel) — при каждом его изменении (`reference.snapshot`).
+ETALON_DIR = _path("REPRICER_ETALON_DIR", str(BASE_DIR / "etalon_history"))
 
 # Курс ЦБ РФ — официальный ежедневный XML, без ключа.
 CBR_URL = os.environ.get("REPRICER_CBR_URL", "https://www.cbr.ru/scripts/XML_daily.asp")
