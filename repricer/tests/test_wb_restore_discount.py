@@ -79,3 +79,79 @@ def test_send_puts_only_nm_and_discount(db, tmp_path):
     assert url.endswith("/api/v2/upload/task")
     assert body == {"data": [{"nmID": 111, "discount": 50}, {"nmID": 222, "discount": 40}]}
     assert db.query(AuditLog).filter(AuditLog.action == "wb_restore_discount").count() == 1
+
+
+def test_from_report_file_maps_1c_sku_to_card_and_sends_nothing_without_send(db, tmp_path):
+    """«Как было» — из отчёта эталона: кабинет + ID_1С -> nmID по каталогу кабинета."""
+    from openpyxl import Workbook
+    w = F.account(db, "wb", "ИП 1")
+    F.sku(db, "s1", "100", "M", barcodes=["a1"]); F.sku(db, "s2", "100", "L", barcodes=["a2"])
+    F.sku(db, "s3", "200", "M", barcodes=["b1"])
+    F.item(db, w, "a1", "100", external_id="111:1"); F.item(db, w, "a2", "100", external_id="111:2")
+    F.item(db, w, "b1", "200", external_id="222:1")
+    # сейчас на WB: у 111 скидка 70%, у 222 не менялась
+    _set(db, {"a1": (10000, 3000), "a2": (10000, 3000), "b1": (8000, 4800)})
+    book = Workbook()
+    ws = book.active
+    ws.title = "WB"
+    ws.append(["Кабинет", "ID_1С", "Сейчас: цена до скидки, ₽", "Сейчас: цена со скидкой, ₽", "Сейчас: скидка, %"])
+    ws.append(["ИП 1", "s1", 10000, 5000, 50]); ws.append(["ИП 1", "s2", 10000, 5000, 50])
+    ws.append(["ИП 1", "s3", 8000, 4800, 40]); ws.append(["Чужой", "s3", 1, 1, 0])
+    f = tmp_path / "et.xlsx"
+    book.save(f)
+    out = tmp_path / "d.xlsx"
+    r = subprocess.run([sys.executable, str(ROOT / "scripts" / "wb_restore_discount.py"), "--from-xlsx", str(f),
+                        "--xlsx", str(out)], capture_output=True, cwd=ROOT,
+                       env={**__import__("os").environ, "PYTHONIOENCODING": "cp1251"})
+    assert r.returncode == 0, r.stderr.decode("utf-8", "replace")
+    text = r.stdout.decode("cp1251")
+    assert "вернуть: 1 карточек" in text and "Ничего не отправлено" in text
+    rows = list(load_workbook(out)["ИП 1"].iter_rows(values_only=True))
+    assert [(x[0], x[4], x[5]) for x in rows[1:]] == [(111, 70, 50)]
+
+
+def test_corridor_never_raises_the_sale_price():
+    for lst in range(1000, 20000, 37):
+        for sale in range(int(lst * 0.2), lst, max(1, lst // 53)):
+            nl, d = wbrd.corridor(lst, sale, 35, 50)
+            assert 35 <= d <= 50
+            assert nl * (100 - d) / 100 <= sale + 0.5
+
+
+def test_plan_sends_list_and_discount_per_card_and_skips_unsafe_cards(db, tmp_path):
+    from openpyxl import Workbook
+    w = F.account(db, "wb", "ИП 1")
+    for sku_id, bc, nm in (("s1", "a1", "111:1"), ("s2", "a2", "111:2"), ("s3", "b1", "222:1"),
+                           ("s4", "c1", "333:1"), ("s5", "c2", "333:2"), ("s6", "d1", "444:1")):
+        F.sku(db, sku_id, "A" + nm[:3], barcodes=[bc])
+        F.item(db, w, bc, "A" + nm[:3], external_id=nm)
+    # сейчас на WB (WB сменил скидки); у 444 сменилась цена до скидки
+    _set(db, {"a1": (10000, 3000), "a2": (10000, 3000), "b1": (9000, 6000), "c1": (6000, 3000),
+              "c2": (6000, 3000), "d1": (7000, 3500)})
+    book = Workbook()
+    ws = book.active
+    ws.title = "WB"
+    ws.append(["Кабинет", "ID_1С", "Сейчас: цена до скидки, ₽", "Сейчас: цена со скидкой, ₽"])
+    ws.append(["ИП 1", "s1", 10000, 5000]); ws.append(["ИП 1", "s2", 10000, 5000])   # 50% — в коридоре
+    ws.append(["ИП 1", "s3", 9000, 6000])                                             # 33% — ниже коридора
+    ws.append(["ИП 1", "s4", 6000, 3000]); ws.append(["ИП 1", "s5", 6000, 2500])       # размеры разные
+    ws.append(["ИП 1", "s6", 5000, 2500])                                             # цена сменилась
+    f = tmp_path / "et.xlsx"
+    book.save(f)
+    after = wbrd.load(Path(str(engine.url).replace("sqlite:///", "")))[0]
+    cards = {c.nm: c for c in wbrd.load_plan(f, db, after, 35, 50)}
+    assert (cards["111"].new_list, cards["111"].disc) == (10000, 50)
+    assert (cards["222"].new_list, cards["222"].disc) == (9230, 35)
+    assert cards["333"].skip.startswith("цены со скидкой у размеров разные")
+    assert cards["444"].skip.startswith("цена до скидки на WB сменилась")
+    calls = []
+
+    class Fake:
+        def _post(self, url, body):
+            calls.append(body)
+            return {"error": False}
+
+    res = wbrd.send_plan(db, list(cards.values()), factory=lambda platform, creds: Fake())
+    assert res["ИП 1"] == "отправлено карточек: 2"
+    assert calls == [{"data": [{"nmID": 111, "price": 10000, "discount": 50},
+                               {"nmID": 222, "price": 9230, "discount": 35}]}]
