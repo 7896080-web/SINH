@@ -97,7 +97,7 @@ RULES = {
     #    Ставки по рекомендации WB (follow_rec, места 3–10), без окупаемого потолка; деньги держит недельный бюджет
     #    пополнений 7 000 ₽ на кабинет ("_week_budget") и дневные лимиты (за клики). Сравнить 27.10: цена заказа, заказы, выкуп.
     "Ребрик": {
-        "_week_budget": 12000,      # 7 000 — эксперимент + 5 000 — новинки 40842596 (решение 14.10.2026)
+        "_week_budget": 14200,      # 9 200 — эксперимент (джемперы ×2) + 5 000 — новинки 40842596 (решения 14.10.2026)
         # новинки за клики, «Кампания от 10.10.2026», запущена пользователем 14.10.2026: свой бюджет 5 000 ₽/нед
         "40842596": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True, "daily_limit": 700,
                      "topup_below": 700, "topup_amount": 700, "topup_day_cap": 700, "topup_week_cap": 5000},
@@ -106,8 +106,9 @@ RULES = {
         # 40769287 включена обратно, кампания за показы на эти же куртки 40863039 — на паузе (в правила не входит)
         "40769287": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True, "daily_limit": 500,
                      "topup_below": 500, "topup_amount": 500, "topup_day_cap": 500, "topup_week_cap": 3500},
-        "40863019": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True,   # 256250 + ZJYM
-                     "topup_below": 300, "topup_amount": 300, "topup_day_cap": 300, "topup_week_cap": 2000},
+        # джемперы 256250 + ZJYM: бюджет ×2 (решение 14.10.2026) — 600 ₽/сутки, как 300 + 300 у Карамана за клики
+        "40863019": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True,
+                     "topup_below": 600, "topup_amount": 600, "topup_day_cap": 600, "topup_week_cap": 4200},
         # «Ребрик 2101 показы» — создана 14.10.2026 через wb_create.py
         "40955628": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True,
                                "topup_below": 150, "topup_amount": 150, "topup_day_cap": 150, "topup_week_cap": 1000},
@@ -116,7 +117,7 @@ RULES = {
                                "topup_below": 100, "topup_amount": 100, "topup_day_cap": 100, "topup_week_cap": 500},
     },
     "Караман": {
-        "_week_budget": 14100,      # 9 100 — эксперимент + 5 000 — новинки 40842612 (решения 14.10.2026)
+        "_week_budget": 16200,      # 11 200 — эксперимент (джемперы ×2) + 5 000 — новинки 40842612 (решения 14.10.2026)
         # новинки за клики, «Кампания от 10.10.2026», запущена пользователем 14.10.2026: свой бюджет 5 000 ₽/нед
         "40842612": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True, "daily_limit": 700,
                      "topup_below": 700, "topup_amount": 700, "topup_day_cap": 700, "topup_week_cap": 5000},
@@ -129,10 +130,10 @@ RULES = {
         # «Караман пуховики показы» — создана 14.10.2026 через wb_create.py
         "40955797": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True,
                                     "topup_below": 500, "topup_amount": 500, "topup_day_cap": 500, "topup_week_cap": 3500},
-        "40769357": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True, "daily_limit": 150,
-                     "topup_below": 150, "topup_amount": 150, "topup_day_cap": 150, "topup_week_cap": 1050},   # 256250
-        "40769361": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True, "daily_limit": 150,
-                     "topup_below": 150, "topup_amount": 150, "topup_day_cap": 150, "topup_week_cap": 1050},   # ZJYM
+        "40769357": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True, "daily_limit": 300,
+                     "topup_below": 300, "topup_amount": 300, "topup_day_cap": 300, "topup_week_cap": 2100},   # 256250
+        "40769361": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True, "daily_limit": 300,
+                     "topup_below": 300, "topup_amount": 300, "topup_day_cap": 300, "topup_week_cap": 2100},   # ZJYM
         "40769369": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True, "daily_limit": 200,
                      "topup_below": 200, "topup_amount": 200, "topup_day_cap": 200, "topup_week_cap": 1400},   # 2101
     },
