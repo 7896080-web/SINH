@@ -112,6 +112,12 @@ def list_for(target: int, cur_disc: int | None, lo: int, hi: int) -> tuple[int, 
     return math.ceil(target * 100 / (100 - d) - 1e-9), d
 
 
+def already_set(c, live: dict) -> bool:
+    """WB уже держит цену до скидки и скидку из плана."""
+    cur = live.get((c.account_id, c.nm))
+    return bool(cur) and cur.price == c.new_list and cur.discount == c.disc
+
+
 def build_plan(db, arts: dict, cats: dict, live: dict, lo: int, hi: int, max_drop: float = 33) -> list:
     """PlanCard на каждую карточку WB, где форма задаёт маржинальность.
 
@@ -223,9 +229,7 @@ def main(argv=None) -> int:
             for c in steps[:10]:
                 print(f"    {c.account}: {c.nm} {c.article}: сейчас со скидкой {c.old_sale}, цель {c.final_target}")
         cards = [c for c in cards if not getattr(c, "step", False)]
-        bad = [c for c in cards if not c.skip and not (
-            live.get((c.account_id, c.nm)) and live[(c.account_id, c.nm)].price == c.new_list
-            and live[(c.account_id, c.nm)].discount == c.disc)]
+        bad = [c for c in cards if not c.skip and not already_set(c, live)]
         wrd.verify_plan(cards, live, accs)
         if not args.adopt:
             return 0
@@ -235,6 +239,14 @@ def main(argv=None) -> int:
             return 1
         return adopt(accs)
     go = [c for c in cards if not c.skip]
+    # WB отвечает 400 на загрузку, где ВСЕ цены и скидки уже стоят («already set»), и это
+    # выглядело как ошибка кабинета. Карточку, которая уже держит план, не отправляем вовсе.
+    already = [c for c in go if not getattr(c, "step", False) and already_set(c, live)]
+    if already:
+        for c in already:
+            c.skip = "уже стоит на WB по плану"
+        go = [c for c in go if not c.skip]
+        print(f"Уже стоят на WB по плану, не отправляются: {len(already)}")
     print(f"Форма {args.form}: артикулов {len(arts)}; кабинеты {', '.join(cabs)}. "
           f"Скидка в коридоре {args.disc_min}-{args.disc_max}%.")
     for name, t in accs.values():
