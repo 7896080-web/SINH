@@ -38,6 +38,8 @@
 import datetime as dt
 import json
 import math
+import os
+import shutil
 import sys
 import time
 from collections import defaultdict
@@ -243,11 +245,18 @@ def pace(token, key, interval):
     _last[k] = time.time()
 
 
-def call(method, url, token, params=None, body=None, what=""):
+UNCLEAR = "unclear"   # ApiError.status: запрос мог дойти до WB, а ответ потерялся (тайм-аут, обрыв, ошибка 5xx)
+
+
+def call(method, url, token, params=None, body=None, what="", retry=True):
+    """retry=False — для запросов, повтор которых опасен (пополнение бюджета, запуск): повторяется только то, что
+    WB точно не выполнил (429, не удалось соединиться); тайм-аут или ошибка 5xx → ApiError(status=UNCLEAR)."""
     for attempt in range(6):
         try:
             r = S.request(method, url, headers={"Authorization": token}, params=params, json=body, timeout=120)
         except requests.RequestException as e:
+            if not retry and not isinstance(e, requests.ConnectTimeout):
+                raise ApiError(f"{what}: WB не ответил ({e.__class__.__name__}) — запрос мог пройти", UNCLEAR)
             if attempt < 3:
                 time.sleep(5)
                 continue
@@ -268,6 +277,8 @@ def call(method, url, token, params=None, body=None, what=""):
                 raise ApiError(f"{what}: WB просит подождать {wait / 60:.0f} мин — нужен Персональный токен.")
             time.sleep(wait + 1)
             continue
+        if r.status_code >= 500 and not retry:
+            raise ApiError(f"{what}: ошибка WB {r.status_code} — запрос мог пройти", UNCLEAR)
         if r.status_code >= 500 and attempt < 3:
             time.sleep(10)
             continue
@@ -352,7 +363,13 @@ UNIT_LIMITS = {}
 MANAGED = {}      # {кампания: кабинет} — какими кампаниями управлял этот прогон (для «пауза из-за денег»)
 TOPUP_RULES = {}  # {кампания: правила пополнения} — для часовой проверки wb_guard.py
 CAPS = {}         # {"кампания:артикул": {зона: {потолок, правила товара}}} — для часовой проверки wb_guard.py
-LOCK_FILE = HERE / "wb_bids.running"   # пока автопилот работает, wb_guard.py ставки не трогает
+CAPS_CAB = {}     # {"кампания:артикул": кабинет} — чтобы при сбое одного кабинета сохранить его прежние потолки
+FAILED_CABS = set()   # кабинеты, планирование которых в этом запуске упало с ошибкой
+LOCK_FILE = HERE / "wb_bids.running"   # общая блокировка: пока применяет автопилот или страж, второй не стартует
+LOCK_MAX_AGE_MIN = 65                  # блокировка старше (задача в планировщике снимается через 1 ч) — процесс упал
+PAUSED_MONEY_BELOW = 100               # кампания на паузе с бюджетом меньше этого, ₽ — «кончились деньги»: пополнить
+                                       # и запустить можно; больше — паузу поставили вы, не трогать
+_lock_id = None
 BUYOUT = {}       # {(кабинет, артикул): (множитель потолка, выкуп товара, заказов в расчёте)}
 
 
@@ -368,19 +385,35 @@ def mcpo(cab, rule, nm):
 TRIM_BACKUPS = HERE / "wb_trim_backups"
 
 
+TRIM_HISTORY_DAYS = 30   # старые резервные копии (до появления state["trimmed"]) учитываются не дольше этого
+
+
 def trimmed_items(state, cab):
-    """Товары, убранные из кампаний из-за малого остатка: автопилотом (state["trimmed"]) и вручную через wb_trim.py.
-    {(кампания, артикул): запись с прежними ставками}."""
+    """Товары, убранные из кампаний из-за малого остатка: {(кампания, артикул): запись с прежними ставками}.
+    Главный источник — state["trimmed"] (автопилот добавляет при уборке и удаляет при возврате). Резервные копии
+    wb_trim.py и прошлых --apply учитываются в порядке дат и не старше TRIM_HISTORY_DAYS: более поздний возврат
+    («untrim») отменяет более раннюю уборку — иначе товар, который вы потом убрали сами, вернулся бы обратно."""
+    since = (dt.date.today() - dt.timedelta(days=TRIM_HISTORY_DAYS)).strftime("%Y%m%d")
+    files = [(f, None) for f in TRIM_BACKUPS.glob("trim_*.json")] if TRIM_BACKUPS.exists() else []
+    files += [(f, "bids") for f in BACKUP_DIR.glob("bids_*.json")] if BACKUP_DIR.exists() else []
+    stamp = lambda f: f.stem.split("_", 1)[-1]          # «20261013_001000»
     res = {}
-    files = [(f, None) for f in sorted(TRIM_BACKUPS.glob("trim_*.json"))] if TRIM_BACKUPS.exists() else []
-    files += [(f, "trim") for f in sorted(BACKUP_DIR.glob("bids_*.json"))] if BACKUP_DIR.exists() else []
-    for f, key in files:      # резервные копии wb_trim.py и прошлых --apply автопилота (в т. ч. до появления «trimmed»)
+    for f, kind in sorted(files, key=lambda x: stamp(x[0])):
+        if stamp(f)[:8] < since:
+            continue
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
-            for i in (data.get(key) or []) if key else data:
+            if kind is None:
+                adds, removes = data, []
+            else:
+                adds, removes = data.get("trim") or [], data.get("untrim") or []
+            for i in adds:
                 if i.get("cabinet") == cab:
                     res[(i["advert_id"], i["nm_id"])] = i
-        except (OSError, ValueError, KeyError, AttributeError):
+            for i in removes:
+                if i.get("cabinet") == cab:
+                    res.pop((i["advert_id"], i["nm_id"]), None)
+        except (OSError, ValueError, KeyError, AttributeError, TypeError):
             continue
     for i in (state.get("trimmed") or {}).values():
         if i.get("cabinet") == cab:
@@ -459,11 +492,91 @@ def load_tokens():
     return cabs
 
 
+STATE_PREV = HERE / "wb_bids_state.prev.json"   # предыдущая версия файла состояния — на случай порчи основного
+
+
 def load_state():
+    """Состояние автопилота. Нет файла — начинаем с пустого. Файл испорчен — берём предыдущую версию; если и её нет —
+    останавливаемся: с пустым состоянием автопилот «забыл» бы пополнения и снова потратил недельные потолки."""
+    if not STATE_FILE.exists():
+        return {"minus_auto": {}, "minus_route": {}, "cluster_returned": {}}
     try:
         return json.loads(STATE_FILE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return {"minus_auto": {}, "minus_route": {}, "cluster_returned": {}}
+        bad = STATE_FILE.with_name(f"wb_bids_state.corrupt_{dt.datetime.now():%Y%m%d_%H%M%S}.json")
+        try:
+            shutil.copyfile(STATE_FILE, bad)
+        except OSError:
+            pass
+        try:
+            state = json.loads(STATE_PREV.read_text(encoding="utf-8"))
+            log(f"! Файл состояния испорчен (копия: {bad.name}) — взял предыдущую версию {STATE_PREV.name}.")
+            return state
+        except (OSError, ValueError):
+            sys.exit(f"✗ Файл состояния {STATE_FILE.name} испорчен, а предыдущей версии нет (копия: {bad.name}). "
+                     "Ничего не меняю: без учёта пополнений автопилот мог бы потратить недельные потолки заново.")
+
+
+def lock_info():
+    """(время, кто) текущей блокировки или None. Старый формат — просто время."""
+    try:
+        raw = LOCK_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    try:
+        d = json.loads(raw)
+        return dt.datetime.fromisoformat(d["at"]), d.get("owner") or "?", d.get("id")
+    except (ValueError, KeyError, TypeError):
+        try:
+            return dt.datetime.fromisoformat(raw), "wb_bids.py", None
+        except ValueError:
+            return dt.datetime.now() - dt.timedelta(days=1), "?", None   # мусор в файле — считаем устаревшей
+
+
+def lock_acquire(owner, wait_min=0):
+    """Общая блокировка автопилота и стража (создаётся атомарно). Чужая свежая — ждём до wait_min минут.
+    Возвращает True, если блокировка наша."""
+    global _lock_id
+    deadline = time.time() + wait_min * 60
+    told = False
+    while True:
+        try:
+            fd = os.open(str(LOCK_FILE), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            _lock_id = f"{os.getpid()}-{time.time():.0f}"
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"at": dt.datetime.now().isoformat(timespec="seconds"), "owner": owner,
+                                    "pid": os.getpid(), "id": _lock_id}))
+            return True
+        except FileExistsError:
+            info = lock_info()
+            if info is None:
+                continue                                   # файл только что удалили — пробуем снова
+            at, who, _ = info
+            if dt.datetime.now() - at > dt.timedelta(minutes=LOCK_MAX_AGE_MIN):
+                log(f"! Блокировка от {who} ({at:%d.%m %H:%M}) старше {LOCK_MAX_AGE_MIN} мин — процесс, видимо, упал; снимаю.")
+                try:
+                    LOCK_FILE.unlink()
+                except OSError:
+                    pass
+                continue
+            if time.time() >= deadline:
+                return False
+            if not told:
+                log(f"  Сейчас работает {who} (с {at:%H:%M}) — жду, пока закончит (до {wait_min} мин)…")
+                told = True
+            time.sleep(20)
+        except OSError:
+            return False
+
+
+def lock_release():
+    """Снимает блокировку, только если она наша."""
+    info = lock_info()
+    if _lock_id and info and info[2] == _lock_id:
+        try:
+            LOCK_FILE.unlink()
+        except OSError:
+            pass
 
 
 def pk(cid, nm):
@@ -471,7 +584,16 @@ def pk(cid, nm):
 
 
 def save_state(state):
-    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
+    """Атомарно: пишем во временный файл и подменяем — оборванная запись не испортит состояние.
+    Предыдущая версия остаётся в STATE_PREV."""
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
+    if STATE_FILE.exists():
+        try:
+            shutil.copyfile(STATE_FILE, STATE_PREV)
+        except OSError:
+            pass
+    os.replace(tmp, STATE_FILE)
 
 
 def day_base(state, kind, cid, nm, sub):
@@ -900,9 +1022,9 @@ def plan_cabinet(cab, token, rules, state):
             for cid in paused:
                 nm_ = (camps[cid].get("settings") or {}).get("name")
                 b = buds.get(cid)
-                if thr and b is not None and b < thr:
+                if thr and b is not None and b < PAUSED_MONEY_BELOW:
                     todo[cid] = dict(DEFAULTS, **rules["*"], _resume=True)
-                    log(f"  «{nm_}» {cid} на паузе, бюджет {fm_rub(b)} ₽ < {thr} ₽ — похоже, кончились деньги: пополню и запущу.")
+                    log(f"  «{nm_}» {cid} на паузе, бюджет {fm_rub(b)} ₽ — кончились деньги: пополню и запущу.")
                 else:
                     log(f"  «{nm_}» {cid} на паузе, в бюджете {fm_rub(b) if b is not None else '?'} ₽ — паузу, видимо, "
                         "поставили вы: не трогаю.")
@@ -923,7 +1045,7 @@ def plan_cabinet(cab, token, rules, state):
 
     # общий недельный потолок пополнений на кабинет ("_week_budget"): сумма по всем его кампаниям за 7 дней
     cab_cap = rules.get("_week_budget")
-    cab_left = [cab_cap - sum(topped_week(state, c) for c in todo) if cab_cap else None]
+    cab_left = [cab_cap - topped_cabinet(state, cab, camps) if cab_cap else None]
     if cab_cap:
         log(f"  Недельный бюджет пополнений кабинета: {cab_cap} ₽, за 7 дней уже {cab_cap - cab_left[0]:.0f} ₽.")
     involved = set(todo) | {r.get("clusters_from_id") for r in todo.values()} | {r.get("route_from_id") for r in todo.values()}
@@ -1114,6 +1236,7 @@ def plan_cabinet(cab, token, rules, state):
                         if current and nb and nb > current:
                             nb, reason = current, f"{int(v['clicks'])} кликов без заказов — не повышаю, проверить карточку"
                 # для часовой проверки wb_guard.py: потолок и правила товара на момент этого прогона
+                CAPS_CAB[pk(cid, nm)] = cab
                 CAPS.setdefault(pk(cid, nm), {})[placement] = {
                     "cap": cap, "pay": pay, "target": target, "step": step, "clicks": int(v["clicks"]),
                     "max_raise": r["max_raise_pct"], "max_drop": r.get("max_drop_pct"), "fixed": fixed,
@@ -1350,6 +1473,8 @@ def plan_cabinet(cab, token, rules, state):
             short = max(limit_need - (bud or 0), 0)       # сколько не хватает бюджета, чтобы WB принял новый лимит
             if bud is None:
                 log("    ! Бюджет кампании не получен — пополнение пропускаю.")
+            elif a.get("_status") == 11 and bud >= PAUSED_MONEY_BELOW:
+                log(f"    Кампания на паузе, в бюджете {fm_rub(bud)} ₽ — паузу, видимо, поставили вы: не пополняю и не запускаю.")
             elif short > 0:
                 week = topped_week(state, cid)
                 today_ = topped_week(state, cid, days=1)
@@ -1358,9 +1483,18 @@ def plan_cabinet(cab, token, rules, state):
                                      r["topup_day_cap"] - today_, r["topup_week_cap"] - week))
                 if amount < need:
                     newlim = int(max(bud + max(amount, 0), 0) // 100 * 100)
-                    plan["limits"][-1]["new"]["dailyLimit"] = newlim * 100
-                    log(f"    ! Бюджет {fm_rub(bud)} ₽ меньше нового лимита {limit_need:.0f} ₽, а пополнить можно только на "
-                        f"{max(amount, 0)} ₽ (потолки) — ставлю лимит {newlim} ₽, полный поставлю при следующем запуске.")
+                    old_l = plan["limits"][-1]["old"]
+                    cur_l = (old_l.get("dailyLimit") or 0) if old_l.get("enabled") else 0
+                    floor_l = max(cur_l, int(cfg.get("minDailyLimit") or 0), 100 * 100)
+                    if newlim * 100 <= floor_l:
+                        plan["limits"].pop()
+                        log(f"    ! Бюджет {fm_rub(bud)} ₽ меньше нового лимита {limit_need:.0f} ₽, а пополнить можно только на "
+                            f"{max(amount, 0)} ₽ (потолки) — лимит не меняю ("
+                            + (f"остаётся {rub(cur_l)} ₽" if cur_l else "выключен") + "), новый поставлю при следующем запуске.")
+                    else:
+                        plan["limits"][-1]["new"]["dailyLimit"] = newlim * 100
+                        log(f"    ! Бюджет {fm_rub(bud)} ₽ меньше нового лимита {limit_need:.0f} ₽, а пополнить можно только на "
+                            f"{max(amount, 0)} ₽ (потолки) — ставлю лимит {newlim} ₽, полный поставлю при следующем запуске.")
                 if amount >= 100:
                     start = can_start and a.get("_status") in (4, 11)
                     log(f"    Бюджет: {fm_rub(bud)} ₽ — WB не ставит дневной лимит больше бюджета → пополнить на {amount} ₽ "
@@ -1546,26 +1680,65 @@ def topped_week(state, cid, days=7):
     return sum(t["sum"] for t in state.get("topups", {}).get(str(cid), []) if t["date"] >= since)
 
 
+def topped_cabinet(state, cab, known_ids, days=7):
+    """Сколько пополнено за 7 дней по ВСЕМ кампаниям кабинета — и по тем, что уже сняты с правил или на паузе.
+    У старых записей кабинета нет — их узнаём по известным кампаниям кабинета (known_ids)."""
+    since = (dt.date.today() - dt.timedelta(days=days - 1)).isoformat()
+    known = {str(c) for c in known_ids}
+    known |= {c for c, t in (state.get("topup_rules") or {}).items() if t.get("cabinet") == cab}
+    known |= {c for c, m in (state.get("managed") or {}).items() if m.get("cabinet") == cab}
+    total = 0
+    for cid, recs in (state.get("topups") or {}).items():
+        for t in recs:
+            if t["date"] >= since and (t.get("cabinet") == cab or (not t.get("cabinet") and cid in known)):
+                total += t["sum"]
+    return total
+
+
 def apply_topups(token, items, state):
-    """Пополнить бюджеты. Деньги не возвращаются — отката нет. Записывает пополнения в состояние (для потолка)."""
+    """Пополнить бюджеты. Деньги не возвращаются — отката нет. Записывает пополнения в состояние (для потолка) и
+    сохраняет его после КАЖДОГО пополнения. Запрос не повторяется: если WB не ответил, смотрим бюджет — вырос ли."""
     ok = 0
     for i in items:
         pace(token, "deposit", 1.1)
+        rec = {"date": dt.date.today().isoformat(), "sum": i["amount"], "cabinet": i["cabinet"]}
         try:
             res = call("POST", ADV + "/adv/v1/budget/deposit", token, params={"id": i["advert_id"]}, what="Пополнение бюджета",
-                       body={"sum": int(i["amount"]), "type": SOURCE_TYPE[i["source"]], "return": True})
+                       body={"sum": int(i["amount"]), "type": SOURCE_TYPE[i["source"]], "return": True}, retry=False)
         except ApiError as e:
-            log(f"  ✗ «{i['name']}»: пополнение не прошло — {e}")
-            continue
+            if e.status != UNCLEAR and not (isinstance(e.status, int) and e.status >= 500):
+                log(f"  ✗ «{i['name']}»: пополнение не прошло — {e}")
+                continue
+            # ответ потерялся — повторять нельзя (деньги ушли бы дважды); проверяем бюджет
+            time.sleep(5)
+            try:
+                now = get_budgets(token, [i["advert_id"]]).get(i["advert_id"])
+            except ApiError:
+                now = None
+            before = i.get("budget_before")
+            if now is not None and before is not None and now >= before + i["amount"] * 0.8:
+                log(f"  ✓ «{i['name']}»: WB не ответил, но бюджет вырос {fm_rub(before)} → {fm_rub(now)} ₽ — пополнение прошло.")
+                res = {"total": now}
+            elif now is not None and before is not None:
+                log(f"  ✗ «{i['name']}»: WB не ответил, бюджет не вырос ({fm_rub(now)} ₽) — пополнение не прошло; "
+                    "повторю при следующем запуске.")
+                continue
+            else:
+                rec["unclear"] = True
+                state.setdefault("topups", {}).setdefault(str(i["advert_id"]), []).append(rec)
+                save_state(state)
+                log(f"  ? «{i['name']}»: WB не ответил и бюджет проверить не удалось — считаю, что +{i['amount']} ₽ прошло "
+                    "(чтобы не пополнить дважды). Проверьте бюджет кампании в кабинете WB.")
+                continue
         ok += 1
-        state.setdefault("topups", {}).setdefault(str(i["advert_id"]), []).append(
-            {"date": dt.date.today().isoformat(), "sum": i["amount"]})
+        state.setdefault("topups", {}).setdefault(str(i["advert_id"]), []).append(rec)
+        save_state(state)
         total = res.get("total") if isinstance(res, dict) else None
         log(f"  ✓ «{i['name']}»: +{i['amount']} ₽" + (f", бюджет теперь {fm_rub(num(total))} ₽" if total is not None else ""))
         if i.get("start"):
             pace(token, "start", 1.1)
             try:
-                call("GET", ADV + "/adv/v0/start", token, params={"id": i["advert_id"]}, what="Запуск кампании")
+                call("GET", ADV + "/adv/v0/start", token, params={"id": i["advert_id"]}, what="Запуск кампании", retry=False)
                 log(f"  ✓ «{i['name']}»: запущена после пополнения")
             except ApiError as e:
                 log(f"  ✗ «{i['name']}»: не запустилась — {e}")
@@ -1660,7 +1833,7 @@ def run_apply(cabs, plan, key, state, reverse=False):
                         d.pop(i["query"], None)
                     else:
                         d[i["query"]] = dt.date.today().isoformat()
-            STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
+            save_state(state)
         if sel["minus"]:
             done = apply_minus(tok, sel["minus"], key)
             res.append(f"минус-фразы {len(done)}/{len(sel['minus'])} товаров")
@@ -1706,6 +1879,7 @@ def main():
             p = plan_cabinet(cab, cabs[cab], rules, state)
         except ApiError as e:
             log(f"  ✗ {cab}: {e}")
+            FAILED_CABS.add(cab)
             continue
         for k in plan:
             plan[k] += p[k]
@@ -1734,8 +1908,26 @@ def main():
             log("! Часть данных не загрузилась (см. «!» выше) — --apply сейчас откажется применять.")
         log("Это пробный прогон. Применить: python wb_bids.py --apply")
     if apply and not DATA_PROBLEMS:
-        state["caps"] = {"at": dt.datetime.now().isoformat(timespec="seconds"), "items": CAPS}   # для wb_guard.py
-        state["topup_rules"] = TOPUP_RULES
+        # для wb_guard.py. Кабинет, который в этом запуске упал с ошибкой, сохраняет прежние потолки и правила —
+        # иначе страж до следующего удачного запуска перестал бы его пополнять и вести ставки.
+        old_caps = state.get("caps") or {}
+        caps_cab = {k: v for k, v in (old_caps.get("cab") or {}).items()}
+        caps_cab.update(CAPS_CAB)
+        items = dict(CAPS)
+        rules_ = dict(TOPUP_RULES)
+        if FAILED_CABS:
+            for k, v in (old_caps.get("items") or {}).items():
+                # кабинет неизвестен (запись до этого обновления) — тоже сохраняю: страж сверяет потолки только с
+                # кампаниями своего кабинета, лишняя запись ни на что не влияет
+                if k not in items and caps_cab.get(k) in FAILED_CABS | {None}:
+                    items[k] = v
+            for k, v in (state.get("topup_rules") or {}).items():
+                if k not in rules_ and v.get("cabinet") in FAILED_CABS:
+                    rules_[k] = v
+            log(f"Для часовой проверки сохраняю прежние потолки кабинетов с ошибкой: {', '.join(sorted(FAILED_CABS))}.")
+        state["caps"] = {"at": dt.datetime.now().isoformat(timespec="seconds"), "items": items,
+                         "cab": {k: v for k, v in caps_cab.items() if k in items}}
+        state["topup_rules"] = rules_
         man = state.setdefault("managed", {})
         for cid, cab_ in MANAGED.items():
             man[str(cid)] = {"cabinet": cab_, "seen": dt.date.today().isoformat()}
@@ -1745,14 +1937,15 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        LOCK_FILE.write_text(dt.datetime.now().isoformat(timespec="seconds"), encoding="utf-8")
-    except OSError:
-        pass
+    # Блокировку берёт только то, что меняет кабинет (--apply, --rollback); пробный прогон её не трогает.
+    if "--apply" in sys.argv or "--rollback" in sys.argv:
+        if not lock_acquire("wb_bids.py", wait_min=25):
+            log(f"{dt.datetime.now():%d.%m.%Y %H:%M} — ✗ Блокировка занята (работает wb_guard.py или другой wb_bids.py) "
+                "больше 25 мин — ничего не меняю, запустите позже.")
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write("\n".join(out) + "\n\n")
+            sys.exit(1)
     try:
         main()
     finally:
-        try:
-            LOCK_FILE.unlink()
-        except OSError:
-            pass
+        lock_release()
