@@ -19,6 +19,9 @@ r"""Новый эталон WB по заполненной форме маржи
   * цель достигается ценой до скидки при нынешней скидке карточки, если та в коридоре
     35–50%; иначе скидка — на ближайшую границу. Цена до скидки — вверх до рубля, чтобы
     цена со скидкой была не ниже цели;
+  * снижение цены для покупателя — ШАГАМИ не больше --max-drop (33%) за раз: WB от 50% одним
+    изменением не применяет, а больше порога карантина категории (33,3% по умолчанию) — в
+    карантин. Каждый --send делает следующий шаг от нынешней цены; --adopt ждёт конца шагов;
   * цена на WB — одна на карточку (nmID). Размеры от разных артикулов 1С на одной карточке —
     себестоимость СРЕДНЯЯ по этим артикулам, маржинальность заданная; разная маржинальность
     у них — карточку не трогаем и называем.
@@ -109,7 +112,7 @@ def list_for(target: int, cur_disc: int | None, lo: int, hi: int) -> tuple[int, 
     return math.ceil(target * 100 / (100 - d) - 1e-9), d
 
 
-def build_plan(db, arts: dict, cats: dict, live: dict, lo: int, hi: int) -> list:
+def build_plan(db, arts: dict, cats: dict, live: dict, lo: int, hi: int, max_drop: float = 33) -> list:
     """PlanCard на каждую карточку WB, где форма задаёт маржинальность.
 
     На одной карточке бывают размеры от РАЗНЫХ артикулов 1С («2403» и «2425 b (2403)») с
@@ -156,6 +159,14 @@ def build_plan(db, arts: dict, cats: dict, live: dict, lo: int, hi: int) -> list
                 pc.target = target_sale(cost, next(iter(margins)), max(c["comm"]))
                 pc.cost_rub = round(cost, 2)
                 pc.averaged = len(costs) > 1
+                pc.final_target = pc.target
+                floor = math.ceil(cur.sale * (1 - max_drop / 100) - 1e-9) if cur.sale else 0
+                if pc.target < floor:
+                    # WB не применяет снижение цены для покупателя на 50% и больше одним
+                    # изменением, а снижение больше порога категории (33,3% по умолчанию)
+                    # уводит в карантин. Снижаем ШАГАМИ от нынешней цены; следующий --send
+                    # сделает следующий шаг.
+                    pc.target, pc.step = floor, True
                 pc.new_list, pc.disc = list_for(pc.target, cur.discount, lo, hi)
             out.append(pc)
     return out
@@ -183,6 +194,9 @@ def main(argv=None) -> int:
     ap.add_argument("--xlsx", default="")
     ap.add_argument("--disc-min", type=int, default=35)
     ap.add_argument("--disc-max", type=int, default=50)
+    ap.add_argument("--max-drop", type=float, default=33,
+                    help="наибольшее снижение цены для покупателя за один шаг, %% (WB: от 50%% не применяет, "
+                         "больше порога карантина — в карантин)")
     ap.add_argument("--send", action="store_true")
     ap.add_argument("--verify", action="store_true")
     ap.add_argument("--adopt", action="store_true",
@@ -198,19 +212,25 @@ def main(argv=None) -> int:
     live, accs = wrd.load(Path(args.after) if args.after else wrd._live_db())
     db = SessionLocal()
     try:
-        cards = build_plan(db, arts, cats, live, args.disc_min, args.disc_max)
+        cards = build_plan(db, arts, cats, live, args.disc_min, args.disc_max, args.max_drop)
     finally:
         db.rollback()
         db.close()
     if args.verify or args.adopt:
+        steps = [c for c in cards if getattr(c, "step", False)]
+        if steps:
+            print(f"Снижаются по шагам, ещё не у цели: {len(steps)} — следующий шаг: --send")
+            for c in steps[:10]:
+                print(f"    {c.account}: {c.nm} {c.article}: сейчас со скидкой {c.old_sale}, цель {c.final_target}")
+        cards = [c for c in cards if not getattr(c, "step", False)]
         bad = [c for c in cards if not c.skip and not (
             live.get((c.account_id, c.nm)) and live[(c.account_id, c.nm)].price == c.new_list
             and live[(c.account_id, c.nm)].discount == c.disc)]
         wrd.verify_plan(cards, live, accs)
         if not args.adopt:
             return 0
-        if bad and not args.force:
-            print(f"\nЭталон НЕ записан: не совпадает {len(bad)}. Записать всё равно (то, что WB держит "
+        if (bad or steps) and not args.force:
+            print(f"\nЭталон НЕ записан: не совпадает {len(bad)}, по шагам {len(steps)}. Записать всё равно (то, что WB держит "
                   f"сейчас, станет эталоном): добавьте --force")
             return 1
         return adopt(accs)
@@ -235,6 +255,12 @@ def main(argv=None) -> int:
         for c in big:
             print(f"    {c.account}: {c.nm} {c.article}: {c.old_list} / {c.old_sale} -> {c.new_list}, скидка {c.disc}%,"
                   f" со скидкой {c.target} ({(c.target / c.old_sale - 1) * 100:+.1f}%)")
+    stepping = [c for c in go if getattr(c, "step", False)]
+    if stepping:
+        print(f"\nСнижаются ПО ШАГАМ (за раз не больше {args.max_drop:g}% цены для покупателя): {len(stepping)}."
+              f" Этот шаг — до промежуточной цены; дальше: --send ещё раз, когда WB применит.")
+        for c in stepping[:10]:
+            print(f"    {c.account}: {c.nm} {c.article}: со скидкой {c.old_sale} -> {c.target} (цель {c.final_target})")
     skipped = [c for c in cards if c.skip]
     if skipped:
         print(f"\nНЕ отправляются ({len(skipped)}):")
