@@ -58,7 +58,7 @@ def test_out_of_corridor_moves_the_list_price_to_the_nearest_bound(db, tmp_path)
     # Ламода: цель 3450; при 5000 нужна скидка 31% < 35% — цена до скидки 3450 / 0,65 = 5308, скидка 35%
     assert lam["Цель со скидкой, ₽"] == 3450 and lam["Что сделать"] == "поднять цену до скидки"
     assert lam["Новая цена до скидки, ₽"] == 5308 and lam["Новая скидка, %"] == 35.0
-    assert lam["Изменение цены для покупателя, %"] == round((3450 - 4500) * 100 / 4500, 1)
+    assert lam["Изменение цены после скидки продавца, %"] == round((3450 - 4500) * 100 / 4500, 1)
 
 
 def test_article_without_wb_has_no_etalon_and_nothing_changes(db, tmp_path):
@@ -127,3 +127,28 @@ def test_wb_card_with_different_sale_prices_per_size_is_marked_for_per_size_only
     h = rows[0]
     mark = {r[h.index("ID_1С")]: r[h.index("Карточка")] for r in rows[1:]}
     assert mark["s"] and mark["l"] and not mark["m"] and not mark["x"]
+
+
+def test_lamoda_only_uses_recorded_wb_etalon(db, tmp_path):
+    """Эталон WB — записанная эталонная цена после скидки продавца, а не нынешняя."""
+    from decimal import Decimal
+    from priceapp.models import Account, ReferencePrice
+    _setup(db)
+    w1 = db.query(Account).filter_by(name="ИП 1").one()
+    w2 = db.query(Account).filter_by(name="ИП 2").one()
+    # эталон: ИП 1 — 6000 / 50% = 3000, ИП 2 — 10000 / 30% = 7000 -> средняя 5000, Ламода 5000 x 0,69 = 3450
+    db.add(ReferencePrice(account_id=w1.id, item_id="a1", ref_price=6000, discount=Decimal("0.5")))
+    db.add(ReferencePrice(account_id=w2.id, item_id="a1", ref_price=10000, discount=Decimal("0.3")))
+    db.commit()
+    out = tmp_path / "l.xlsx"
+    env = {**os.environ, "PYTHONIOENCODING": "cp1251"}
+    r = subprocess.run([sys.executable, str(ROOT / "scripts" / "etalon_prices.py"), "--only", "lamoda",
+                        "--xlsx", str(out)], capture_output=True, env=env, cwd=ROOT)
+    assert r.returncode == 0, r.stderr.decode("utf-8", "replace")
+    text = r.stdout.decode("cp1251")
+    assert "из записанного эталона — 2 SKU" in text and "Яндекс KIT" not in text
+    book = load_workbook(out)
+    assert book.sheetnames == ["Сводка", "Ламода"]
+    rows = list(book["Ламода"].iter_rows(values_only=True))
+    lam = dict(zip(rows[0], rows[1]))
+    assert lam["Эталон WB после скидки продавца (средняя), ₽"] == 5000 and lam["Цель со скидкой, ₽"] == 3450
