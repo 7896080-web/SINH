@@ -159,6 +159,24 @@ class OnecBarcode(Base):
     color = Column(String(100), nullable=False, default="")
 
 
+class SyncBarcode(Base):
+    """Привязка «баркод -> SKU 1С», сделанная в Sync Admin мимо справочника 1С: файлом
+    (`excel_import`), переподвязкой (`excel_repoint`) или догадкой по пулу (`pool_match`).
+    Снимок выгрузки «Мэппинг» Sync Admin (`mapping.load_sync_mapping`), заменяется целиком.
+    Так репрайсер считает цену по тому же товару 1С, по которому Sync Admin ведёт остатки
+    и заказы (`mapping._build`)."""
+    __tablename__ = "sync_barcodes"
+    id = Column(Integer, primary_key=True)
+    barcode = Column(String(64), nullable=False, unique=True, index=True)
+    item_id = Column(String(64), nullable=False, index=True)
+    article = Column(String(200), nullable=False, default="")
+    name = Column(String(500), nullable=False, default="")
+    size = Column(String(100), nullable=False, default="")
+    color = Column(String(100), nullable=False, default="")
+    source = Column(String(32), nullable=False, default="")
+    loaded_at = Column(DateTime, nullable=False, default=now_utc)
+
+
 class OnecCost(Base):
     """Себестоимость SKU 1С в ДОЛЛАРАХ («Цена СС» поступлений, регистр
     «Себестоимость номенклатуры»). Снимок по команде EXPORT_COST_PRICES:

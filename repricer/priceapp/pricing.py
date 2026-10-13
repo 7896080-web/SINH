@@ -269,6 +269,12 @@ def article_map(db: Session) -> dict[str, str]:
         for item_id, article in db.query(OnecBarcode.item_id, OnecBarcode.article):
             if item_id not in out or (not out[item_id] and article):
                 out[item_id] = (article or "").strip()
+        # SKU, привязанный в Sync Admin, которого нет в нашем снимке справочника, —
+        # артикул из выгрузки «Мэппинг» (`mapping.load_sync_mapping`).
+        from priceapp.models import SyncBarcode
+        for item_id, article in db.query(SyncBarcode.item_id, SyncBarcode.article):
+            if not out.get(item_id) and article:
+                out[item_id] = article.strip()
         cache["article_map"] = out
     return cache["article_map"]
 

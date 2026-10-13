@@ -8,6 +8,11 @@
    один размер на площадке с несколькими баркодами. Если сопоставленные баркоды
    пула ведут к ОДНОМУ SKU 1С, остальные баркоды пула относятся к нему же
    (так работает автопривязка sync_admin). Ведут к разным — пул не мержим.
+0. **Мэппинг Sync Admin** (`SyncBarcode`, снимок выгрузки «Мэппинг»): привязки, которые
+   Sync Admin сделал мимо справочника 1С. Файлом (`excel_import`) и переподвязкой
+   (`excel_repoint`) — решение человека, они главнее справочника, как и в Sync Admin.
+   Догадка по пулу (`pool_match`) — только для баркода, которого в справочнике нет:
+   справочник 1С в Sync Admin перебивает догадку, и здесь так же.
 3. **Подтверждённые человеком связи** (`ManualLink`, страница «Сопоставление»
    по правилам артикулов) — для баркодов, которых в справочнике 1С нет вовсе.
    Существующую связь по баркоду справочника они не перебивают никогда.
@@ -23,19 +28,21 @@ from dataclasses import dataclass, field
 from sqlalchemy.orm import Session
 
 from priceapp import settings
-from priceapp.models import ManualLink, OnecBarcode, PlatformItem
+from priceapp.models import ManualLink, OnecBarcode, PlatformItem, SyncBarcode
 from priceapp.timeutils import now_utc
 
 BARCODE_DICT_FIELDS = 6
 
 STATUS_LABELS = {
+    "sync": "по мэппингу Sync Admin",
     "ok": "сопоставлен по баркоду",
     "pool": "по пулу размера",
     "manual": "подтверждён вручную",
     "not_in_1c": "нет в 1С",
     "ambiguous": "баркод у нескольких SKU 1С",
 }
-MAPPED = ("ok", "pool", "manual")
+MAPPED = ("ok", "pool", "manual", "sync")
+SYNC_GUESS = "pool_match"          # догадка Sync Admin по пулу — справочник 1С её перебивает
 
 
 class MappingError(ValueError):
@@ -132,6 +139,73 @@ def owners_of(db: Session, barcodes) -> dict[str, set[str]]:
     return out
 
 
+def sync_of(db: Session, barcodes) -> dict[str, tuple[str, str]]:
+    """баркод -> (SKU 1С, источник) по мэппингу Sync Admin."""
+    out: dict[str, tuple[str, str]] = {}
+    barcodes = list(set(barcodes))
+    for i in range(0, len(barcodes), 500):
+        for b in db.query(SyncBarcode.barcode, SyncBarcode.item_id, SyncBarcode.source).filter(
+                SyncBarcode.barcode.in_(barcodes[i:i + 500])):
+            out[b.barcode] = (b.item_id, b.source)
+    return out
+
+
+SYNC_HEAD = ("ID_1С", "Баркод")
+SYNC_SOURCES = {"excel_import", "excel_repoint", SYNC_GUESS}
+
+
+def parse_sync_mapping(data: bytes) -> list[dict]:
+    """Выгрузка «Мэппинг» Sync Admin (мэппинг_баркодов.xlsx): ID_1С, Баркод, Артикул,
+    Наименование, Размер, Цвет, Источник, Добавлен. Берём только привязки, сделанные в
+    Sync Admin (`SYNC_SOURCES`): строки «выгрузка из 1С» / 1c_dict / 1c_export — тот же
+    справочник 1С, что у нас, — пропускаются."""
+    import io
+
+    from openpyxl import load_workbook
+    try:
+        book = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    except Exception as e:
+        raise MappingError(f"файл не читается как Excel: {e}") from None
+    ws = book.worksheets[0]
+    it = ws.iter_rows(values_only=True)
+    head = [str(c or "").strip() for c in next(it, ())]
+    if not all(h in head for h in SYNC_HEAD):
+        raise MappingError("это не выгрузка «Мэппинг» Sync Admin: нет колонок «ID_1С» и «Баркод»")
+    ix = {h: head.index(h) for h in head if h}
+    def cell(r, name):
+        i = ix.get(name)
+        return str(r[i]).strip() if i is not None and i < len(r) and r[i] is not None else ""
+    rows = []
+    for r in it:
+        src = cell(r, "Источник")
+        item, barcode = cell(r, "ID_1С"), cell(r, "Баркод")
+        if not item or not barcode or src not in SYNC_SOURCES:
+            continue
+        rows.append({"item_id": item[:64], "barcode": barcode[:64], "article": cell(r, "Артикул")[:200],
+                     "name": cell(r, "Наименование")[:500], "size": cell(r, "Размер")[:100],
+                     "color": cell(r, "Цвет")[:100], "source": src})
+    return rows
+
+
+def load_sync_mapping(db: Session, rows: list[dict]) -> dict:
+    """Заменить снимок мэппинга Sync Admin. Не коммитит. Пустой — отказ: иначе пустой файл
+    стёр бы все ручные привязки. Баркод в Sync Admin один на товар — повтор берём первым."""
+    if not rows:
+        raise MappingError("в файлах нет привязок Sync Admin (источник excel_import / excel_repoint / "
+                           "pool_match) — выгрузите «Мэппинг» с отбором по источнику")
+    seen: dict[str, dict] = {}
+    for r in rows:
+        seen.setdefault(r["barcode"], r)
+    db.query(SyncBarcode).delete(synchronize_session=False)
+    now = now_utc()
+    db.bulk_insert_mappings(SyncBarcode, [{**r, "loaded_at": now} for r in seen.values()])
+    forget(db)
+    by = defaultdict(int)
+    for r in seen.values():
+        by[r["source"]] += 1
+    return {"rows": len(seen), "by_source": dict(by)}
+
+
 def build(db: Session, account_id: int) -> list[MapRow]:
     """Статус каждой строки каталога кабинета. Сборка дорогая (на кабинете в
     150 тыс. строк — секунды), поэтому в пределах транзакции считается один раз
@@ -155,16 +229,22 @@ def _build(db: Session, account_id: int) -> list[MapRow]:
     owners = owners_of(db, [i.barcode for i in items])
     manual = {m.barcode: m.item_id for m in
               db.query(ManualLink).filter(ManualLink.account_id == account_id)}
+    sync = sync_of(db, [i.barcode for i in items])
 
     rows: list[MapRow] = []
     for it in items:
         own = owners.get(it.barcode, set())
-        if len(own) == 1:
+        s = sync.get(it.barcode)
+        if s is not None and s[1] != SYNC_GUESS:
+            rows.append(MapRow(it, "sync", s[0]))
+        elif len(own) == 1:
             rows.append(MapRow(it, "ok", next(iter(own))))
         elif len(own) > 1:
             rows.append(MapRow(it, "ambiguous", others=sorted(own)))
         elif it.barcode in manual:
             rows.append(MapRow(it, "manual", manual[it.barcode]))
+        elif s is not None:
+            rows.append(MapRow(it, "sync", s[0]))
         else:
             rows.append(MapRow(it, "not_in_1c"))
 
@@ -174,7 +254,7 @@ def _build(db: Session, account_id: int) -> list[MapRow]:
         if r.item.external_id:
             pools[r.item.external_id].append(r)
     for pool in pools.values():
-        targets = {r.item_id for r in pool if r.status in ("ok", "manual")}
+        targets = {r.item_id for r in pool if r.status in ("ok", "manual", "sync")}
         if len(targets) != 1 or any(r.status == "ambiguous" for r in pool):
             continue
         target = next(iter(targets))
