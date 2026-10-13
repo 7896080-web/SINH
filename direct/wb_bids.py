@@ -116,7 +116,7 @@ RULES = {
                                "topup_below": 100, "topup_amount": 100, "topup_day_cap": 100, "topup_week_cap": 500},
     },
     "Караман": {
-        "_week_budget": 12000,      # 7 000 — эксперимент + 5 000 — новинки 40842612 (решение 14.10.2026)
+        "_week_budget": 14100,      # 9 100 — эксперимент + 5 000 — новинки 40842612 (решения 14.10.2026)
         # новинки за клики, «Кампания от 10.10.2026», запущена пользователем 14.10.2026: свой бюджет 5 000 ₽/нед
         "40842612": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True, "daily_limit": 700,
                      "topup_below": 700, "topup_amount": 700, "topup_day_cap": 700, "topup_week_cap": 5000},
@@ -124,10 +124,11 @@ RULES = {
         "40769334": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True, "daily_limit": 300,
                      "topup_below": 300, "topup_amount": 300, "topup_day_cap": 300, "topup_week_cap": 2100},   # куртки
         # пуховики 2651/2717/2718 — ЗА ПОКАЗЫ (решение 14.10.2026): 40769350 за клики (≈3 505 ₽/заказ) — на паузе,
-        # новая кампания за показы с теми же товарами; дневного лимита у WB нет — пополнения по 200 ₽ в сутки
+        # новая кампания за показы с теми же товарами; дневного лимита у WB нет — пополнения по 500 ₽ в сутки
+        # (как куртки за клики в Ребрике — равные деньги для честного сравнения; было 200 ₽ — мало, решение 14.10.2026)
         # «Караман пуховики показы» — создана 14.10.2026 через wb_create.py
         "40955797": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True,
-                                    "topup_below": 200, "topup_amount": 200, "topup_day_cap": 200, "topup_week_cap": 1400},
+                                    "topup_below": 500, "topup_amount": 500, "topup_day_cap": 500, "topup_week_cap": 3500},
         "40769357": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True, "daily_limit": 150,
                      "topup_below": 150, "topup_amount": 150, "topup_day_cap": 150, "topup_week_cap": 1050},   # 256250
         "40769361": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True, "daily_limit": 150,
