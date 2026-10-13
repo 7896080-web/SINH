@@ -116,3 +116,27 @@ def test_card_with_two_1c_articles_uses_average_cost_and_skips_different_margins
     arts["2425 b (2403)"]["over"]["ИП 1"] = 3.0
     (c,) = m.build_plan(db, arts, {}, live, 35, 50)
     assert c.skip.startswith("у артикулов карточки разная маржинальность")
+
+
+def test_adopt_refuses_on_mismatch_then_records_etalon_and_enables_rule(db, tmp_path, capsys):
+    from priceapp import reference, settings
+    from priceapp.models import ReferencePrice
+    w, form = _setup(db, tmp_path)
+    settings.put(db, settings.REF_ENABLED, "0")              # как после --send
+    db.commit()
+    m = _mod()
+    after = str(engine.url).replace("sqlite:///", "")
+    assert m.main(["--form", str(form), "--adopt", "--after", after]) == 1     # WB держит ещё старое
+    assert "Эталон НЕ записан" in capsys.readouterr().out
+    db.expire_all()
+    assert reference.enabled(db) is False and db.query(ReferencePrice).count() == 0
+    # WB применил план
+    plan = {"111": (14193, 7806), "222": (13940, 7806), "333": (10770, 5385)}
+    for it in db.query(PlatformItem):
+        it.current_price, it.current_sale_price = plan[it.external_id.split(":")[0]]
+    db.commit()
+    assert m.main(["--form", str(form), "--adopt", "--after", after]) == 0
+    db.expire_all()
+    assert reference.enabled(db) is True
+    assert {r.ref_price for r in db.query(ReferencePrice)} == {14193, 13940, 10770}
+    assert {r.nm_id: r.discount for r in db.query(ReferenceDiscount)} == {"111": 45, "222": 44, "333": 50}

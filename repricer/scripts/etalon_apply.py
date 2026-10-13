@@ -4,7 +4,10 @@ r"""Новый эталон WB по заполненной форме маржи
       ПЛАН: по каждой карточке WB — цена до скидки и скидка; ничего не отправляет
   ... --send      отправить план на WB (спросит подтверждение)
   ... --verify    дошёл ли план (по ценам, которые программа загрузила с WB после отправки)
-  после сверки:   .venv\Scripts\python.exe scripts\reference_tool.py adopt-current — записать эталон
+  ... --adopt     сверить и, если всё дошло, записать эталон и включить правило эталонной цены
+
+--send ВЫКЛЮЧАЕТ правило эталонной цены до --adopt: иначе оно, увидев новую цену до скидки
+при старом эталоне, вернуло бы старую (13.10 так ушло 3831 возврат).
 
 Правило (задано владельцем 13.10):
   * маржинальность кабинета для артикула — самая частная заполненная: «<кабинет>:
@@ -40,7 +43,7 @@ except Exception:
 import priceapp  # noqa: E402,F401  (.env читается на импорте)
 import wb_restore_discount as wrd  # noqa: E402
 from etalon_cost import model_of  # noqa: E402
-from priceapp import mapping  # noqa: E402
+from priceapp import mapping, reference, settings  # noqa: E402
 from priceapp.database import SessionLocal  # noqa: E402
 from priceapp.models import Account  # noqa: E402
 from priceapp.pricing import article_map, article_of, get_rule, item_facts  # noqa: E402
@@ -158,6 +161,22 @@ def build_plan(db, arts: dict, cats: dict, live: dict, lo: int, hi: int) -> list
     return out
 
 
+def adopt(accs: dict) -> int:
+    """Новый эталон: цены и скидки, которые WB держит сейчас, — эталонными; правило — включить."""
+    from priceapp import discount_guard
+    db = SessionLocal()
+    try:
+        st = reference.adopt_current(db, actor="etalon_apply")
+        disc = discount_guard.adopt(db, actor="etalon_apply")
+        settings.put(db, settings.REF_ENABLED, "1")
+        db.commit()
+    finally:
+        db.close()
+    print(f"\nЭталон записан: цен {st['recorded']}; скидок " + ", ".join(f"{k} {v}" for k, v in disc.items())
+          + ". Правило эталонной цены ВКЛЮЧЕНО.")
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Новый эталон WB по форме маржинальности")
     ap.add_argument("--form", required=True)
@@ -166,6 +185,9 @@ def main(argv=None) -> int:
     ap.add_argument("--disc-max", type=int, default=50)
     ap.add_argument("--send", action="store_true")
     ap.add_argument("--verify", action="store_true")
+    ap.add_argument("--adopt", action="store_true",
+                    help="после чистой сверки: записать эталон и включить правило эталонной цены")
+    ap.add_argument("--force", action="store_true", help="с --adopt: записать эталон и при несовпадениях")
     ap.add_argument("--yes", action="store_true", help="не спрашивать подтверждение (для проверок)")
     ap.add_argument("--after", default="", help="база «сейчас» (по умолчанию рабочая)")
     args = ap.parse_args(argv)
@@ -180,8 +202,18 @@ def main(argv=None) -> int:
     finally:
         db.rollback()
         db.close()
-    if args.verify:
-        return wrd.verify_plan(cards, live, accs)
+    if args.verify or args.adopt:
+        bad = [c for c in cards if not c.skip and not (
+            live.get((c.account_id, c.nm)) and live[(c.account_id, c.nm)].price == c.new_list
+            and live[(c.account_id, c.nm)].discount == c.disc)]
+        wrd.verify_plan(cards, live, accs)
+        if not args.adopt:
+            return 0
+        if bad and not args.force:
+            print(f"\nЭталон НЕ записан: не совпадает {len(bad)}. Записать всё равно (то, что WB держит "
+                  f"сейчас, станет эталоном): добавьте --force")
+            return 1
+        return adopt(accs)
     go = [c for c in cards if not c.skip]
     print(f"Форма {args.form}: артикулов {len(arts)}; кабинеты {', '.join(cabs)}. "
           f"Скидка в коридоре {args.disc_min}-{args.disc_max}%.")
@@ -238,14 +270,20 @@ def main(argv=None) -> int:
             return 0
     db = SessionLocal()
     try:
+        # Правило эталонной цены, увидев новую (более низкую) цену до скидки при старом
+        # эталоне, решит, что цену занизила площадка, и ВЕРНЁТ старую — 13.10 так ушло 3831
+        # возврат. Выключаем его до записи нового эталона (--adopt включит обратно).
+        if reference.enabled(db):
+            settings.put(db, settings.REF_ENABLED, "0")
+            db.commit()
+            print("Правило эталонной цены ВЫКЛЮЧЕНО до записи нового эталона (--adopt включит его).")
         for name, res in wrd.send_plan(db, cards).items():
             print(f"  {name}: {res}")
     finally:
         db.close()
-    print("\nДальше: перезапустите программу (загрузит цены WB), затем\n"
-          f"  .venv\\Scripts\\python.exe scripts\\etalon_apply.py --form {args.form} --verify\n"
-          "и, если «НЕ совпадает: 0», запишите эталон:\n"
-          "  .venv\\Scripts\\python.exe scripts\\reference_tool.py adopt-current")
+    print("\nДальше: через 10 минут перезапустите программу (загрузит цены WB), затем\n"
+          f"  .venv\\Scripts\\python.exe scripts\\etalon_apply.py --form {args.form} --adopt\n"
+          "— сверит и, если всё дошло, запишет эталон и включит правило эталонной цены.")
     return 0
 
 
