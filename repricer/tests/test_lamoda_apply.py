@@ -104,3 +104,19 @@ def test_article_filter_sends_only_that_article(db, monkeypatch):
     monkeypatch.setattr(m, "send", lambda _db, cards, days: sent.extend(c.parent for c in cards) or {})
     assert m.main(["--send", "--yes", "--article", "200"]) == 0
     assert sent == ["MP2"]
+
+
+def test_verify_refuses_prices_loaded_before_the_last_send(db, capsys):
+    from datetime import timedelta
+    from priceapp import audit
+    from priceapp.timeutils import now_utc
+    lam = _setup(db)
+    lam.prices_loaded_at = now_utc() - timedelta(minutes=5)
+    audit.log(db, "lamoda_apply", "lamoda_prices", lam.name, "отправлено")
+    db.commit()
+    m = _mod()
+    assert m.main(["--verify"]) == 2
+    assert "загружены РАНЬШЕ последней отправки" in capsys.readouterr().out
+    lam.prices_loaded_at = now_utc() + timedelta(minutes=1)
+    db.commit()
+    assert m.main(["--verify"]) == 1          # свежая загрузка — сверяет (MP1, MP2 не по плану)
