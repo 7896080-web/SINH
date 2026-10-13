@@ -95,3 +95,24 @@ def test_script_shows_plan_and_sends_nothing_without_send(db, tmp_path):
     text = r.stdout.decode("cp1251")
     assert "Карточек к отправке: 3" in text and "Ничего не отправлено" in text
     assert load_workbook(out).sheetnames == ["ИП 1"]
+
+
+def test_card_with_two_1c_articles_uses_average_cost_and_skips_different_margins(db, tmp_path):
+    w = F.account(db, "wb", "ИП 1", commission=48)
+    F.manual_rate(db, "100")
+    F.sku(db, "a", "2403", "M", barcodes=["a1"], cost_usd=13.3)
+    F.sku(db, "b", "2425 b (2403)", "L", barcodes=["b1"], cost_usd=14.16)
+    F.item(db, w, "a1", "2403", external_id="777:1"); F.item(db, w, "b1", "2403", external_id="777:2")
+    for it in db.query(PlatformItem):
+        it.current_price, it.current_sale_price = 9690, 4845          # 50%
+    db.commit()
+    m = _mod()
+    live, _ = m.wrd.load(Path(str(engine.url).replace("sqlite:///", "")))
+    arts = {"2403": {"category": "Д", "cost_rub": 1330.0, "art": None, "over": {"ИП 1": 2.8}},
+            "2425 b (2403)": {"category": "Д", "cost_rub": 1416.0, "art": None, "over": {"ИП 1": 2.8}}}
+    (c,) = m.build_plan(db, arts, {}, live, 35, 50)
+    # средняя (1330 + 1416) / 2 = 1373; 1373 x 2,8 / 0,52 = 7393,08 -> 7394
+    assert c.averaged and c.cost_rub == 1373 and c.target == 7394 and not c.skip
+    arts["2425 b (2403)"]["over"]["ИП 1"] = 3.0
+    (c,) = m.build_plan(db, arts, {}, live, 35, 50)
+    assert c.skip.startswith("у артикулов карточки разная маржинальность")

@@ -16,8 +16,9 @@ r"""Новый эталон WB по заполненной форме маржи
   * цель достигается ценой до скидки при нынешней скидке карточки, если та в коридоре
     35–50%; иначе скидка — на ближайшую границу. Цена до скидки — вверх до рубля, чтобы
     цена со скидкой была не ниже цели;
-  * цена на WB — одна на карточку (nmID). Если у размеров карточки цели разные (разные
-    артикулы 1С на одной карточке) — карточку не трогаем и называем.
+  * цена на WB — одна на карточку (nmID). Размеры от разных артикулов 1С на одной карточке —
+    себестоимость СРЕДНЯЯ по этим артикулам, маржинальность заданная; разная маржинальность
+    у них — карточку не трогаем и называем.
 """
 from __future__ import annotations
 
@@ -106,7 +107,13 @@ def list_for(target: int, cur_disc: int | None, lo: int, hi: int) -> tuple[int, 
 
 
 def build_plan(db, arts: dict, cats: dict, live: dict, lo: int, hi: int) -> list:
-    """PlanCard на каждую карточку WB, где форма задаёт маржинальность."""
+    """PlanCard на каждую карточку WB, где форма задаёт маржинальность.
+
+    На одной карточке бывают размеры от РАЗНЫХ артикулов 1С («2403» и «2425 b (2403)») с
+    разной себестоимостью, а цена на WB одна. Тогда себестоимость карточки — СРЕДНЯЯ по её
+    артикулам, маржинальность — заданная (решение владельца 13.10). Разная маржинальность у
+    артикулов одной карточки — карточку не трогаем и называем: выбирать за человека нельзя.
+    Комиссия — наибольшая среди размеров карточки (обычно она одна)."""
     rule = get_rule(db, "wb")
     articles = article_map(db)
     out = []
@@ -114,40 +121,39 @@ def build_plan(db, arts: dict, cats: dict, live: dict, lo: int, hi: int) -> list
         cards: dict[str, dict] = {}
         for item_id, rows in mapping.account_items(db, a.id).items():
             art = model_of(article_of(articles, item_id))
-            m = margin_for(arts, cats, art, a.name)
-            cost = (arts.get(art) or {}).get("cost_rub")
             facts = item_facts(rule, rows)
             for r in rows:
                 nm = (r.external_id or "").split(":")[0]
                 if not nm.isdigit():
                     continue
-                c = cards.setdefault(nm, {"targets": set(), "arts": set(), "why": ""})
-                c["arts"].add(art)
-                if m is None:
-                    continue
-                if not cost:
-                    c["why"] = "нет себестоимости в форме"
-                elif facts.commission is None:
-                    c["why"] = "нет комиссии"
-                else:
-                    c["targets"].add(target_sale(cost, m, facts.commission))
+                c = cards.setdefault(nm, {"arts": {}, "comm": []})
+                c["arts"][art] = (margin_for(arts, cats, art, a.name), (arts.get(art) or {}).get("cost_rub"))
+                if facts.commission is not None:
+                    c["comm"].append(facts.commission)
         for nm, c in sorted(cards.items(), key=lambda kv: (sorted(kv[1]["arts"]), kv[0])):
             cur = live.get((a.id, nm))
+            given = {art: v for art, v in c["arts"].items() if v[0] is not None}
+            if not given:
+                continue                                # маржинальность не задана — не трогаем
             pc = wrd.PlanCard(a.id, a.name, nm, ", ".join(sorted(c["arts"]))[:120],
                               cur.price if cur else 0, cur.sale if cur else 0)
-            if not c["targets"]:
-                if c["why"]:
-                    pc.skip = c["why"]
-                    out.append(pc)
-                continue                                # маржинальность не задана — не трогаем
-            if len(c["targets"]) > 1:
-                pc.skip = f"у размеров карточки разные цели ({', '.join(map(str, sorted(c['targets'])))})"
+            margins = {v[0] for v in given.values()}
+            costs = [v[1] for v in given.values() if v[1]]
+            if len(margins) > 1:
+                pc.skip = "у артикулов карточки разная маржинальность (" + ", ".join(
+                    f"{art} {v[0]:g}" for art, v in sorted(given.items())) + ")"
+            elif len(costs) < len(given):
+                pc.skip = "нет себестоимости в форме"
+            elif not c["comm"]:
+                pc.skip = "нет комиссии"
             elif cur is None:
                 pc.skip = "карточки нет в загруженных ценах WB"
             else:
-                t = next(iter(c["targets"]))
-                pc.new_list, pc.disc = list_for(t, cur.discount, lo, hi)
-                pc.target = t
+                cost = sum(costs) / len(costs)
+                pc.target = target_sale(cost, next(iter(margins)), max(c["comm"]))
+                pc.cost_rub = round(cost, 2)
+                pc.averaged = len(costs) > 1
+                pc.new_list, pc.disc = list_for(pc.target, cur.discount, lo, hi)
             out.append(pc)
     return out
 
@@ -188,7 +194,8 @@ def main(argv=None) -> int:
         up = sum(1 for x in ch if x > 0.5)
         dn = sum(1 for x in ch if x < -0.5)
         med = sorted(ch)[len(ch) // 2] if ch else 0
-        print(f"  {name}: {len(cs)}; цена со скидкой: дешевле {dn}, дороже {up}, без изменений {len(ch) - up - dn}; "
+        av = sum(1 for c in cs if getattr(c, "averaged", False))
+        print(f"  {name}: {len(cs)} (из них по средней себестоимости артикулов — {av}); цена со скидкой: дешевле {dn}, дороже {up}, без изменений {len(ch) - up - dn}; "
               f"медиана {med:+.1f}%")
     big = sorted((c for c in go if c.old_sale), key=lambda c: abs(c.target / c.old_sale - 1), reverse=True)[:15]
     if big:
@@ -209,12 +216,13 @@ def main(argv=None) -> int:
             ws = book.create_sheet(name[:31])
             ws.append(["Артикул WB", "Артикул", "Сейчас: цена до скидки", "Сейчас: со скидкой",
                        "Новая цена до скидки", "Новая скидка, %", "Цель со скидкой", "Изменение, %",
-                       "Не отправляется"])
+                       "Себестоимость карточки, руб", "Средняя по артикулам", "Не отправляется"])
             for c in cards:
                 if c.account == name:
                     t = getattr(c, "target", None)
                     ws.append([int(c.nm), c.article, c.old_list or None, c.old_sale or None, c.new_list, c.disc, t,
-                               round((t / c.old_sale - 1) * 100, 1) if t and c.old_sale else None, c.skip])
+                               round((t / c.old_sale - 1) * 100, 1) if t and c.old_sale else None,
+                               getattr(c, "cost_rub", None), "да" if getattr(c, "averaged", False) else "", c.skip])
         book.save(args.xlsx)
         print(f"\nФайл: {args.xlsx}")
     if not args.send:
