@@ -18,6 +18,8 @@ r"""Вернуть на WB скидку продавца, которую сме�
 Карточки, у которых изменилась и цена до скидки, не отправляются — прежняя скидка от
 другой цены дала бы другую цену для покупателя; они печатаются отдельно.
 Скидка на WB — целый процент на карточку (nmID), не на размер.
+Отправленная скидка записывается эталонной (`priceapp/discount_guard.py`): программа потом
+сама вернёт её, если WB сменит скидку снова (автоакцией).
 """
 from __future__ import annotations
 
@@ -198,7 +200,7 @@ def load_plan(path: Path, db, after: dict, lo: int, hi: int) -> list[PlanCard]:
 
 def send_plan(db, cards: list[PlanCard], factory=None) -> dict[str, str]:
     """Цена до скидки и скидка на карточку WB (nmID)."""
-    from priceapp import accounts, audit
+    from priceapp import accounts, audit, discount_guard
     from priceapp.models import Account
     from priceapp.platforms import WB_PRICES
     out = {}
@@ -222,6 +224,8 @@ def send_plan(db, cards: list[PlanCard], factory=None) -> dict[str, str]:
                 errors.append(str(data.get("errorText") or "WB вернул error=true")[:200])
                 continue
             sent += len(chunk)
+            for c in chunk:
+                discount_guard.record(db, acc.id, c.nm, c.disc)
         out[acc.name] = f"отправлено карточек: {sent}" + (f"; ошибки: {'; '.join(errors)}" if errors else "")
         audit.log(db, "wb_restore_discount", "wb_corridor_prices", acc.name, out[acc.name][:500])
         db.commit()
@@ -310,7 +314,7 @@ def plan(before: dict, after: dict) -> tuple[list[tuple[Card, Card]], list[tuple
 
 def send(db, restore: list[tuple[Card, Card]], factory=None) -> dict[str, str]:
     """Прежняя скидка на WB — только поле discount, цену до скидки не передаём."""
-    from priceapp import accounts, audit
+    from priceapp import accounts, audit, discount_guard
     from priceapp.models import Account
     from priceapp.platforms import WB_PRICES
     out = {}
@@ -336,6 +340,8 @@ def send(db, restore: list[tuple[Card, Card]], factory=None) -> dict[str, str]:
                 errors.append(str(data.get("errorText") or "WB вернул error=true")[:200])
                 continue
             sent += len(chunk)
+            for b, _ in chunk:
+                discount_guard.record(db, acc.id, b.nm, b.discount)
         out[acc.name] = f"скидка возвращена: {sent} карточек" + (f"; ошибки: {'; '.join(errors)}" if errors else "")
         audit.log(db, "wb_restore_discount", "wb_restore_discount", acc.name, out[acc.name][:500])
         db.commit()

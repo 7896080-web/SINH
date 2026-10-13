@@ -30,6 +30,7 @@ REF_POLL_NOW = "ref_poll_now"
 # Kit следует за WB (`follow.py`): включено ли, на сколько % цена Kit ниже средней цены WB для
 # покупателя, при каком смещении средней пересчитываем наценку, до какого шага (% к последней
 # отправленной цене) подтверждаем сами, и когда опросить площадки после отправки цен на WB.
+DISCOUNT_GUARD_ENABLED = "discount_guard_enabled"
 FOLLOW_ENABLED = "follow_enabled"
 FOLLOW_PERCENT = "follow_percent"
 FOLLOW_TOLERANCE = "follow_tolerance"
@@ -64,6 +65,7 @@ DEFAULTS = {
     ETALON_WB_DISCOUNT: "31",
     ETALON_DISC_MIN: "35",
     ETALON_DISC_MAX: "50",
+    DISCOUNT_GUARD_ENABLED: "1",
     FOLLOW_ENABLED: "1",
     FOLLOW_PERCENT: "10",
     FOLLOW_TOLERANCE: "1",
