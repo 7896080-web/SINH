@@ -177,3 +177,21 @@ def test_big_drop_goes_in_steps_and_adopt_waits_for_the_end(db, tmp_path, capsys
     b.save(f)
     assert m.main(["--form", str(f), "--adopt", "--after", str(after)]) == 1
     assert "по шагам 1" in capsys.readouterr().out
+
+
+def test_send_skips_cards_that_already_hold_the_plan(db, tmp_path, capsys):
+    """WB отвечает 400 на загрузку, где все цены уже стоят: такие карточки не отправляем."""
+    w, form = _setup(db, tmp_path)
+    plan = {"111": (14193, 7806), "222": (13940, 7806)}         # 333 ещё старая
+    for it in db.query(PlatformItem):
+        nm = it.external_id.split(":")[0]
+        if nm in plan:
+            it.current_price, it.current_sale_price = plan[nm]
+    db.commit()
+    m = _mod()
+    sent = []
+    m.wrd.send_plan = lambda _db, cards: sent.extend(c.nm for c in cards if not c.skip) or {}
+    after = str(engine.url).replace("sqlite:///", "")
+    assert m.main(["--form", str(form), "--send", "--yes", "--after", after]) == 0
+    assert sent == ["333"]
+    assert "Уже стоят на WB по плану, не отправляются: 2" in capsys.readouterr().out
