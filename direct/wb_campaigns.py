@@ -135,7 +135,7 @@ def run_cabinet(cab, token, with_finished):
     c_rows, p_rows = [], []
     nm_places = defaultdict(list)     # (nm, место) → активные кампании
     warn = []
-    order = sorted(ids, key=lambda i: ({9: 0, 11: 1, 4: 2, 7: 3}.get(camps[i]["_status"], 9), str(camps[i]["settings"].get("name"))))
+    order = sorted(ids, key=lambda i: ({9: 0, 11: 1, 4: 2, 7: 3}.get(camps[i]["_status"], 9), str((camps[i].get("settings") or {}).get("name"))))
     log(f"\n=== 1. Кампании ===")
     for i in order:
         a = camps[i]

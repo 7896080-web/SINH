@@ -105,7 +105,9 @@ def drange(d1, d2):
 
 
 def connect():
-    con = sqlite3.connect(DB)
+    # другая программа пишет или читает — подождать до минуты, а не упасть «база занята».
+    # (WAL не включаю: дашборд и отчёты открывают базу «только чтение», с WAL это может не работать.)
+    con = sqlite3.connect(DB, timeout=60)
     con.executescript(SCHEMA)
     return con
 
@@ -269,8 +271,8 @@ def save_funnel(con, cab, prods, day, keep, current):
 
 
 def funnel_day(con, cab, token, day, keep):
-    """Воронка всех товаров за один день (1 запрос на 1000 товаров)."""
-    offset = 0
+    """Воронка всех товаров за один день (1 запрос на 1000 товаров). Возвращает число товаров в ответе."""
+    offset, total = 0, 0
     while True:
         pace(token, "funnel", 21)
         body = {"selectedPeriod": per(day, day), "nmIds": [], "brandNames": [], "subjectIds": [], "tagIds": [],
@@ -280,9 +282,11 @@ def funnel_day(con, cab, token, day, keep):
                     what="Воронка за день") or {}
         prods = (data.get("data") or {}).get("products") or []
         save_funnel(con, cab, prods, day, keep, current=(day == Y))
+        total += len(prods)
         if len(prods) < 1000:
             break
         offset += 1000
+    return total
 
 
 def funnel_history(con, cab, token, nms, d1, d2):
@@ -309,6 +313,7 @@ def funnel_history(con, cab, token, nms, d1, d2):
 def texts_day(con, cab, token, nms, day):
     """Позиции и воронка по каждому поисковому запросу товаров за один день."""
     items = search_texts(token, nms, day, day, QUERIES_PER_NM)
+    saved = 0
     for it in items:
         q = (it.get("text") or "").strip().lower()
         nm = it.get("nmId")
@@ -323,10 +328,13 @@ def texts_day(con, cab, token, nms, day):
             "p_opens": cur(it.get("openCard"), "percentile"), "p_cart": cur(it.get("openToCart"), "percentile"),
             "p_order": cur(it.get("cartToOrder"), "percentile"), "p_orders": cur(it.get("orders"), "percentile"),
             "price": num((it.get("price") or {}).get("minPrice")) or None})
+        saved += 1
+    return saved
 
 
 def details_day(con, cab, token, nms, day):
-    """Средняя позиция, видимость, переходы из поиска по товарам за один день."""
+    """Средняя позиция, видимость, переходы из поиска по товарам за один день. Возвращает число строк."""
+    saved = 0
     for part in chunks(nms, 50):
         body = {"currentPeriod": per(day, day), "nmIds": part, "orderBy": {"field": "openCard", "mode": "desc"},
                 "positionCluster": "all", "includeSubstitutedSKUs": True, "includeSearchTexts": True,
@@ -339,6 +347,8 @@ def details_day(con, cab, token, nms, day):
                     "visibility": cur(p.get("visibility")), "search_opens": num(cur(p.get("openCard"))),
                     "search_carts": num(cur(p.get("addToCart"))), "search_orders": num(cur(p.get("orders"))),
                     "is_ad": 1 if p.get("isAdvertised") else 0})
+                saved += 1
+    return saved
 
 
 def report_nm(con, cab, token, nm, d1, d2):
@@ -487,8 +497,8 @@ def collect(con, cab, token, window):
     keep = set(tracked)
     for d in need_f:
         try:
-            funnel_day(con, cab, token, d, keep)
-            mark(con, cab, "funnel", [d])
+            if funnel_day(con, cab, token, d, keep):     # пустой ответ WB — день не помечаю, спрошу в следующий раз
+                mark(con, cab, "funnel", [d])
         except ApiError as e:
             log(f"  ! воронка за {d:%d.%m}: {e}")
             break
@@ -505,9 +515,9 @@ def collect(con, cab, token, window):
         if not state["ok"]:
             return False
         try:
-            fn(*args)
+            n = fn(*args)
             con.commit()
-            return True
+            return n is None or n > 0          # пустой ответ — день не помечать собранным, спросить в следующий раз
         except ApiError as e:
             if e.status in (401, 402, 403):
                 state["ok"] = False
@@ -634,7 +644,9 @@ def product_stats(nm, D, orders30):
     s["ad_pos_now"] = med(val(ad, NOW, "ad_pos"))
     st = D["stock"].get(nm)
     s["stock_wb"], s["stock_mp"] = (st[1], st[2]) if st else (None, None)
-    s["stock_days"] = s["stock_wb"] / (s["orders7"] / 7) if (s["stock_wb"] is not None and s["orders7"]) else None
+    # работаем по FBS: в наличии = склады WB + свой склад
+    s["stock_tot"] = None if (s["stock_wb"] is None and s["stock_mp"] is None) else (s["stock_wb"] or 0) + (s["stock_mp"] or 0)
+    s["stock_days"] = s["stock_tot"] / (s["orders7"] / 7) if (s["stock_tot"] is not None and s["orders7"]) else None
     pw = sw = dn = dp = 0.0
     for q, qr in D["Q"].get(nm, {}).items():
         for d in W7:
@@ -693,11 +705,12 @@ def query_stats(D, tracked):
 
 def causes(p):
     c = []
-    if p["stock_wb"] is not None:
-        if p["stock_wb"] <= 0:
-            c.append("на складах WB 0 шт" + (f" (на своём {p['stock_mp']:.0f})" if p["stock_mp"] else ""))
+    if p.get("stock_tot") is not None:
+        if p["stock_tot"] <= 0:
+            c.append("товара нет в наличии (ни на WB, ни на своём складе)")
         elif p["stock_days"] is not None and p["stock_days"] < 7:
-            c.append(f"остаток на WB {p['stock_wb']:.0f} шт — на {p['stock_days']:.0f} дн.")
+            c.append(f"в наличии {p['stock_tot']:.0f} шт (WB {fm(p['stock_wb'])}, свой {fm(p['stock_mp'])}) — "
+                     f"на {p['stock_days']:.0f} дн.")
     if p["ready_now"] and p["ready_before"] and p["ready_now"] - p["ready_before"] >= 12:
         c.append(f"доставка дольше: {p['ready_before']:.0f} → {p['ready_now']:.0f} ч")
     if p["price_now"] and p["price_before"] and p["price_now"] / p["price_before"] - 1 >= 0.05:

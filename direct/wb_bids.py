@@ -47,6 +47,13 @@ from pathlib import Path
 
 import requests
 
+# Вывод в консоль Windows (cp1251) или в файл без UTF-8 не должен падать на ₽ ═ ✓: непечатаемое заменяется «?».
+try:
+    if sys.stdout is not None and (sys.stdout.encoding or "").lower().replace("-", "") != "utf8":
+        sys.stdout.reconfigure(errors="replace")
+except (AttributeError, ValueError):
+    pass
+
 # ============================ НАСТРОЙКИ ============================
 # Кабинет (как в wb_tokens.txt) → кампания (ID или уникальная часть названия) → правила.
 # target: позиции в поиске "1-2", "3-10" или "11-34".
@@ -447,6 +454,9 @@ def load_buyout(cab, token, nm_ids, vendor):
         log(f"  Выкуп: мало истории ({tn:.0f} заказов за {BUYOUT_TO_DAYS}–{BUYOUT_FROM_DAYS} дн. назад) — потолок без поправки.")
         return
     avg = tb / tn
+    if avg <= 0:
+        log("  Выкуп: за период ни одного выкупа — потолок без поправки (проверьте отчёт выкупа).")
+        return
     rows = []
     for nm, (b, c) in got.items():
         share = (b + BUYOUT_PRIOR * avg) / (b + c + BUYOUT_PRIOR)
@@ -969,7 +979,13 @@ def new_bid(current, rec, cap, mn, step, max_raise, base=None, max_drop=None):
             if new < floor_:
                 new = floor_
                 reason += f", снижение ограничено −{max_drop}% в сутки"
-    new = int(math.floor(new / step) * step)
+    if new == rec and rec <= cap:
+        # ставка = рекомендации WB: округляем ВВЕРХ до шага (12,5 → 13 ₽), иначе чуть не дотянем до нужных мест,
+        # но не выше окупаемого потолка
+        up = int(math.ceil(new / step) * step)
+        new = up if up <= cap else int(math.floor(new / step) * step)
+    else:
+        new = int(math.floor(new / step) * step)
     if mn and new < mn:
         new = mn
         reason = "окупаемая ставка ниже минимальной WB → минимальная" if cap < mn else reason
@@ -1079,6 +1095,12 @@ def plan_cabinet(cab, token, rules, state):
                 started.append(nm)
             elif q <= 0:
                 since.pop(str(nm), None)
+    # товар, убранный из-за малого остатка и не рекламируемый в других кампаниях: отсчёт начнётся заново после
+    # возвращения — иначе автоминус включился бы сразу, судя запросы по периоду, когда товара почти не было
+    in_ads = {nm for cid in involved for nm in nms_of[cid]}
+    for k in was_trimmed:
+        if k[1] not in in_ads:
+            since.pop(str(k[1]), None)
 
     # размеры: доля спроса, которую закрывают размеры в наличии
     cover = {}
@@ -1675,6 +1697,20 @@ def get_budgets(token, ids):
     return res
 
 
+def prune_state(state, keep_days=35):
+    """Файл состояния не должен расти бесконечно: пополнения старше 35 дней (потолки смотрят 7 дней) и кампании,
+    которыми автопилот не управлял больше 35 дней, — убрать."""
+    since = (dt.date.today() - dt.timedelta(days=keep_days)).isoformat()
+    tops = state.get("topups") or {}
+    for cid in list(tops):
+        tops[cid] = [t for t in tops[cid] if t.get("date", "") >= since]
+        if not tops[cid]:
+            del tops[cid]
+    man = state.get("managed") or {}
+    for cid in [c for c, m in man.items() if (m.get("seen") or "") < since]:
+        del man[cid]
+
+
 def topped_week(state, cid, days=7):
     since = (dt.date.today() - dt.timedelta(days=days - 1)).isoformat()
     return sum(t["sum"] for t in state.get("topups", {}).get(str(cid), []) if t["date"] >= since)
@@ -1847,10 +1883,18 @@ def main():
     cabs = load_tokens()
     state = load_state()
     if "--rollback" in sys.argv:
-        files = sorted(BACKUP_DIR.glob("bids_*.json"))
-        if not files:
-            sys.exit("Резервных копий нет.")
-        plan = json.loads(files[-1].read_text(encoding="utf-8"))
+        # последняя копия, в которой есть что откатывать (в копии только с пополнениями откатывать нечего)
+        files, plan = sorted(BACKUP_DIR.glob("bids_*.json")), None
+        for f in reversed(files):
+            try:
+                p_ = json.loads(f.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if any(p_.get(k) for k in ("bids", "cluster_bids", "minus", "limits", "trim", "untrim")):
+                files, plan = [f], p_
+                break
+        if not plan:
+            sys.exit("Резервных копий с изменениями, которые можно откатить, нет.")
         plan.setdefault("cluster_bids", [])
         plan.setdefault("minus", [])
         plan.setdefault("limits", [])
@@ -1860,6 +1904,7 @@ def main():
         log(f"{dt.datetime.now():%d.%m.%Y %H:%M} — ОТКАТ по {files[-1].name}")
         run_apply(cabs, plan, "old", state, reverse=True)
         save_state(state)     # список убранных товаров («trimmed») после отката
+        files[-1].rename(files[-1].with_suffix(".rolled_back"))     # повторный откат не вернёт то же самое ещё раз
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write("\n".join(out) + "\n\n")
         return
@@ -1931,6 +1976,7 @@ def main():
         man = state.setdefault("managed", {})
         for cid, cab_ in MANAGED.items():
             man[str(cid)] = {"cabinet": cab_, "seen": dt.date.today().isoformat()}
+        prune_state(state)
         save_state(state)     # ставки на начало дня и отсчёт наличия на WB — только при настоящем применении
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write("\n".join(out) + "\n\n")

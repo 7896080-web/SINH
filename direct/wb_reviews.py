@@ -104,6 +104,8 @@ def run_cabinet(cab, token, mods):
         art = str(pd.get("supplierArticle") or "")
         if mods and not any(m in art.lower() for m in mods):
             continue
+        if not f.get("productValuation"):
+            continue          # отзыв без оценки — не портит среднюю и долю плохих
         rows.append({"f": f, "art": art or str(pd.get("nmId")), "nm": pd.get("nmId"), "size": str(pd.get("size") or "?"),
                      "val": f.get("productValuation") or 0, "match": (f.get("matchingSize") or "").strip().lower(),
                      "status": f.get("orderStatus") or "", "themes": themes(f)})
