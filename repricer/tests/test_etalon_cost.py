@@ -46,3 +46,26 @@ def test_cost_is_the_top_of_all_colors_and_margin_is_from_current_wb_price(db, t
     assert g["k1"]["Маржинальность (от макс)"] == 2.25 and g["k1"]["Маржинальность (от своей)"] == 2.81
     assert g["k2"]["Маржинальность (от макс)"] == 1.8
     assert db.query(PriceChange).count() == 0
+
+
+def test_form_has_fill_columns_and_price_formulas(db, tmp_path):
+    w = F.account(db, "wb", "ИП 1", commission=25)
+    F.manual_rate(db, "100")
+    F.sku(db, "k1", "256250-015", "M", "Бежевый", barcodes=["b1"], cost_usd=20)
+    F.item(db, w, "b1", "256250-015", external_id="1:1")
+    for it in db.query(PlatformItem):
+        it.current_price, it.current_sale_price = 13559, 7500
+    db.commit()
+    out = tmp_path / "f.xlsx"
+    r = subprocess.run([sys.executable, str(ROOT / "scripts" / "etalon_cost.py"), "--xlsx", str(out)],
+                       capture_output=True, cwd=ROOT, env={**os.environ, "PYTHONIOENCODING": "cp1251"})
+    assert r.returncode == 0, r.stderr.decode("utf-8", "replace")
+    book = load_workbook(out)
+    assert book.sheetnames == ["Артикулы", "Категории", "Товары WB", "Как заполнять"]
+    ws = book["Артикулы"]
+    h = [c.value for c in ws[1]]
+    for name in ("Маржинальность артикула", "ИП 1: маржинальность (если иная)", "ИП 1: новая цена со скидкой"):
+        assert name in h
+    f = ws.cell(2, h.index("ИП 1: новая цена со скидкой") + 1).value
+    assert f.startswith("=IF(") and "ROUNDUP($D2*" in f and "Категории!" in f
+    assert book["Категории"].cell(1, 4).value == "Маржинальность категории"
