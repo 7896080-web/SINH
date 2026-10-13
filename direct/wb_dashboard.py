@@ -290,6 +290,8 @@ function setTheme(t) {
 document.querySelectorAll("[data-theme-btn]").forEach(b => b.onclick = () => setTheme(b.dataset.themeBtn));
 
 // ---------- данные за период ----------
+// дата по часам компьютера (toISOString даёт UTC: с 00:00 до 03:00 по Москве это ещё «вчера»)
+function localISO(d) { return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10); }
 function dateList(end, n) {
   const out = []; const d = new Date(end + "T00:00:00Z");
   for (let i = n - 1; i >= 0; i--) { const x = new Date(d); x.setUTCDate(d.getUTCDate() - i); out.push(x.toISOString().slice(0, 10)); }
@@ -299,7 +301,7 @@ function lastDate(cab) {
   let m = "";
   for (const r of D.ad[cab] || []) if (r[1] > m) m = r[1];
   for (const r of D.fn[cab] || []) if (r[1] > m) m = r[1];
-  return m || new Date().toISOString().slice(0, 10);
+  return m || localISO(new Date());
 }
 function aggregate(cab, dates) {
   const set = new Set(dates);
@@ -454,7 +456,7 @@ function renderAutopilot() {
   if (g.length) h("p", {class: "note", style: "margin-top:10px"}, box, "Часовая проверка за последние запуски с изменениями: ставок ↑ " + g.reduce((a, r) => a + r.up, 0) + ", ↓ " + g.reduce((a, r) => a + r.down, 0) + " (запусков с изменениями: " + g.length + ")");
   // пополнения против потолка
   const tb2 = $("#ap-topups"); tb2.textContent = "";
-  const since = new Date(); since.setDate(since.getDate() - 6); const s7 = since.toISOString().slice(0, 10);
+  const since = new Date(); since.setDate(since.getDate() - 6); const s7 = localISO(since);
   const rules = Object.entries(A.rules).filter(([c, r]) => !state.cab || !r.cabinet || r.cabinet === state.cab);
   if (!rules.length) h("div", {class: "empty"}, tb2, "Правил пополнения пока нет — появятся после wb_bids.py --apply.");
   rules.sort((a, b) => (a[1].name || "").localeCompare(b[1].name || "")).forEach(([cid, r]) => {

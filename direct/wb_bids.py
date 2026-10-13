@@ -41,6 +41,7 @@ import math
 import os
 import shutil
 import sys
+import threading
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -228,11 +229,59 @@ REACH = {"1-2": "reachMax", "3-10": "reachMedium", "11-34": "reachMin"}
 
 S = requests.Session()
 out = []
+PARALLEL = True     # кабинеты считаются одновременно (лимиты WB — у каждого продавца свои): запуск в ~3 раза быстрее
+_tl = threading.local()          # в потоке кабинета: свой журнал (печатается целиком по порядку) и своё соединение
+_file_lock = threading.Lock()    # запись общих файлов (кэш размеров, образец ответа) из разных потоков
 
 
 def log(s=""):
+    buf = getattr(_tl, "buf", None)
+    if buf is not None:
+        buf.append(str(s))
+        return
     print(s)
     out.append(str(s))
+
+
+def progress(msg, end="\r"):
+    """Строка «идёт работа…» — только в обычном режиме (при параллельном счёте строки разных кабинетов смешались бы)."""
+    if getattr(_tl, "buf", None) is None:
+        print(msg, end=end, flush=True)
+
+
+def run_parallel(jobs):
+    """jobs: [(имя, функция)]. Запускает одновременно, журнал каждого печатает целиком в исходном порядке.
+    Возвращает {имя: ("ok", результат) | ("err", исключение)}."""
+    if not PARALLEL or len(jobs) < 2:
+        res = {}
+        for name, fn in jobs:
+            try:
+                res[name] = ("ok", fn())
+            except Exception as e:      # noqa: BLE001 — разбирает вызывающий
+                res[name] = ("err", e)
+        return res
+    res, bufs = {}, {}
+
+    def worker(name, fn):
+        _tl.buf, _tl.session = [], requests.Session()
+        try:
+            res[name] = ("ok", fn())
+        except Exception as e:          # noqa: BLE001
+            res[name] = ("err", e)
+        finally:
+            bufs[name] = _tl.buf
+            _tl.buf = None
+    threads = [threading.Thread(target=worker, args=(n, f), daemon=True) for n, f in jobs]
+    print(f"Считаю кабинеты одновременно: {', '.join(n for n, _ in jobs)} — журнал каждого появится, когда он закончит…",
+          flush=True)
+    for t in threads:
+        t.start()
+    for (name, _), t in zip(jobs, threads):
+        t.join()
+        for line in bufs.get(name, []):
+            print(line)
+            out.append(line)
+    return res
 
 
 class ApiError(Exception):
@@ -260,7 +309,8 @@ def call(method, url, token, params=None, body=None, what="", retry=True):
     WB точно не выполнил (429, не удалось соединиться); тайм-аут или ошибка 5xx → ApiError(status=UNCLEAR)."""
     for attempt in range(6):
         try:
-            r = S.request(method, url, headers={"Authorization": token}, params=params, json=body, timeout=120)
+            r = getattr(_tl, "session", S).request(method, url, headers={"Authorization": token}, params=params,
+                                                   json=body, timeout=120)
         except requests.RequestException as e:
             if not retry and not isinstance(e, requests.ConnectTimeout):
                 raise ApiError(f"{what}: WB не ответил ({e.__class__.__name__}) — запрос мог пройти", UNCLEAR)
@@ -778,13 +828,13 @@ def get_sizes(token, nm_ids):
     y = dt.date.today() - dt.timedelta(days=1)
     todo_n = sum(1 for nm in nm_ids if not fresh(cache.get(str(nm))))
     if todo_n:
-        print(f"  Размеры: запрашиваю {todo_n} тов. (WB — раз в 20 с, ≈{todo_n * 20 // 60 + 1} мин; дальше 6 ч из кэша)…", flush=True)
+        progress(f"  Размеры: запрашиваю {todo_n} тов. (WB — раз в 20 с, ≈{todo_n * 20 // 60 + 1} мин; дальше 6 ч из кэша)…", end="\n")
     k = 0
     for nm in nm_ids:
         e = cache.get(str(nm))
         if not fresh(e):
             k += 1
-            print(f"    размеры {k}/{todo_n}", end="\r", flush=True)
+            progress(f"    размеры {k}/{todo_n}")
             pace(token, "sizes", 20.5)
             body = {"nmID": nm, "currentPeriod": {"start": (y - dt.timedelta(days=SIZE_DAYS - 1)).isoformat(),
                                                   "end": y.isoformat()},
@@ -806,13 +856,21 @@ def get_sizes(token, nm_ids):
             e = cache[str(nm)] = {"at": now.isoformat(timespec="seconds"), "sizes": sizes}
         res[nm] = e["sizes"]
     if todo_n:
-        print(" " * 60, end="\r", flush=True)
+        progress(" " * 60)
     if failed:
         log(f"  ! Размеры не получены для {failed} тов. — для них правило размеров не применяется.")
-    try:
-        SIZE_CACHE.write_text(json.dumps(cache, ensure_ascii=False, indent=1), encoding="utf-8")
-    except OSError:
-        pass
+    with _file_lock:     # другой кабинет мог записать кэш, пока этот считал, — дописываем, а не затираем
+        try:
+            disk = json.loads(SIZE_CACHE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            disk = {}
+        disk.update({k: v for k, v in cache.items() if fresh(v)})
+        try:
+            tmp = SIZE_CACHE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(disk, ensure_ascii=False, indent=1), encoding="utf-8")
+            os.replace(tmp, SIZE_CACHE)
+        except OSError:
+            pass
     return res
 
 
@@ -853,16 +911,17 @@ REC_SAMPLE = HERE / "wb_bids_rec_sample.json"   # образец ответа WB
 
 def get_rec(token, aid, nm):
     if (aid, nm) not in _rec_cache:
-        print(f"    рекомендации WB: {len(_rec_cache) + 1}-й товар…", end="\r", flush=True)
+        progress(f"    рекомендации WB: {len(_rec_cache) + 1}-й товар…")
         pace(token, "rec", 12.5)
         data = call("GET", ADV + "/api/advert/v0/bids/recommendations", token,
                     params={"nmId": nm, "advertId": aid}, what=f"Рекомендованные ставки {nm}") or {}
-        print(" " * 60, end="\r", flush=True)
+        progress(" " * 60)
         if not _rec_cache:   # первый ответ за запуск сохраняем как образец (токенов в нём нет)
-            try:
-                REC_SAMPLE.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
-            except OSError:
-                pass
+            with _file_lock:
+                try:
+                    REC_SAMPLE.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+                except OSError:
+                    pass
         _rec_cache[(aid, nm)] = data if isinstance(data, dict) else {}
     return _rec_cache[(aid, nm)]
 
@@ -1151,6 +1210,16 @@ def plan_cabinet(cab, token, rules, state):
     planned_cluster = defaultdict(set)   # (cid, nm) → запросы, на которые будут стоять ставки
     check_card = []                      # товары с кликами без заказов — проверить карточку
     returned_now = defaultdict(set)      # (cid, nm) → запросы, которые в этом запуске возвращаются в клики
+
+    # бюджеты и дневные лимиты всех кампаний — одним запросом на кабинет (раньше — по запросу на кампанию)
+    want_lim = [c for c in order if todo[c]["daily_limit"] and (camps[c].get("settings") or {}).get("payment_type") == "cpc"]
+    lim_err = None
+    try:
+        lims_all = get_limits(token, want_lim) if want_lim else {}
+    except ApiError as e:
+        lims_all, lim_err = None, e
+    want_bud = [c for c in order if todo[c].get("topup_below")]
+    buds_all = get_budgets(token, want_bud) if want_bud else {}
 
     for cid in order:
         r, a = todo[cid], camps[cid]
@@ -1460,11 +1529,11 @@ def plan_cabinet(cab, token, rules, state):
             if pay != "cpc":
                 log("    ! Дневной лимит WB даёт только кампаниям с оплатой за клики — пропускаю.")
             else:
-                try:
-                    lim = get_limits(token, [cid]).get(cid) or {}
-                except ApiError as e:
-                    log(f"    ! {e}")
+                if lims_all is None:
+                    log(f"    ! {lim_err}")
                     lim = None
+                else:
+                    lim = lims_all.get(cid) or {}
                 if lim is not None:
                     want = int(r["daily_limit"] * 100)
                     min_dl = int(cfg.get("minDailyLimit") or 0)
@@ -1491,7 +1560,7 @@ def plan_cabinet(cab, token, rules, state):
                                      "day_cap": r["topup_day_cap"], "week_cap": r["topup_week_cap"],
                                      "source": r["topup_source"], "start": can_start, "cab_cap": cab_cap}
             cab_lim = (lambda x: min(x, cab_left[0])) if cab_cap else (lambda x: x)
-            bud = get_budgets(token, [cid]).get(cid)
+            bud = buds_all.get(cid)
             short = max(limit_need - (bud or 0), 0)       # сколько не хватает бюджета, чтобы WB принял новый лимит
             if bud is None:
                 log("    ! Бюджет кампании не получен — пополнение пропускаю.")
@@ -1916,14 +1985,19 @@ def main():
         log(f"Юнит-экономика: лимиты цены заказа для {len(UNIT_LIMITS)} товаров (wb_unit_economics.csv).")
     print("Рекомендации WB отдаёт по одному товару раз в 12 секунд — на кампанию уходит несколько минут.")
     plan = {"bids": [], "cluster_bids": [], "minus": [], "limits": [], "trim": [], "untrim": [], "topup": []}
+    jobs = []
     for cab, rules in RULES.items():
         if cab not in cabs:
             log(f"\n✗ Кабинет «{cab}» есть в RULES, но нет в wb_tokens.txt")
             continue
-        try:
-            p = plan_cabinet(cab, cabs[cab], rules, state)
-        except ApiError as e:
-            log(f"  ✗ {cab}: {e}")
+        jobs.append((cab, lambda cab=cab, rules=rules: plan_cabinet(cab, cabs[cab], rules, state)))
+    results = run_parallel(jobs)
+    for cab, _ in jobs:
+        kind, p = results[cab]
+        if kind == "err":
+            if not isinstance(p, ApiError):
+                raise p                 # ошибка в программе, а не ответ WB — остановиться, ничего не применять
+            log(f"  ✗ {cab}: {p}")
             FAILED_CABS.add(cab)
             continue
         for k in plan:

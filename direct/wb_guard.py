@@ -33,7 +33,8 @@
          python wb_guard.py --apply      (применить)
          python wb_guard.py --rollback   (вернуть ставки последнего запуска)
 По расписанию — каждый час с --apply (см. wb_schedule.ps1). Токен с категорией «Продвижение».
-Время: WB отдаёт рекомендации раз в 12 с — при REC_MAX = 40 проверка идёт ≈9 минут.
+Время: WB отдаёт рекомендации раз в 12 с на кабинет; кабинеты проверяются одновременно — ≈9–10 минут (по самому
+большому кабинету, REC_MAX = 40).
 Результат: вывод на экран + wb_guard_log.txt (дописывается).
 """
 import datetime as dt
@@ -249,17 +250,25 @@ def run(cabs, apply):
         return
 
     changes, losing, topups, checked = [], [], [], 0
-    for cab, token in cabs.items():
-        try:   # ID кампаний у WB уникальны: в каждом кабинете проверяются только его кампании
-            ch, lo, n, tp = plan_cabinet(cab, token, caps["items"], state, REC_MAX_BY_CAB.get(cab, REC_MAX_OTHER))
-        except B.ApiError as e:
-            log(f"  ✗ {cab}: {e}")
+    # кабинеты — одновременно (у каждого продавца свои лимиты WB); ID кампаний у WB уникальны: в каждом кабинете
+    # проверяются только его кампании
+    jobs = [(cab, lambda cab=cab, token=token: plan_cabinet(cab, token, caps["items"], state,
+                                                           REC_MAX_BY_CAB.get(cab, REC_MAX_OTHER)))
+            for cab, token in cabs.items()]
+    results = B.run_parallel(jobs)
+    for cab, _ in jobs:
+        kind, res = results[cab]
+        if kind == "err":
+            if not isinstance(res, B.ApiError):
+                raise res
+            log(f"  ✗ {cab}: {res}")
             continue
+        ch, lo, n, tp = res
         changes += ch
         losing += lo
         topups += tp
         checked += n
-    print(" " * 60, end="\r")
+    B.progress(" " * 60)
     log(f"  Сверено с рекомендацией WB: {checked} тов.; изменений ставок: {len(changes)}.")
     for it in changes:
         arrow = "↑" if it["new"] > it["old"] else "↓"
