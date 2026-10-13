@@ -51,6 +51,12 @@
   (`bidMinorUnits`, только персональный токен) или `/adv/v0/normquery/bids` (рубли).
 - Минус-фразы: `POST /adv/v0/normquery/set-minus` **заменяет весь список** пары (кампания, товар), до 1000 фраз.
   Сначала `get-minus`, потом дописывать. Состояние «что добавил скрипт» — `wb_bids_state.json`.
+- Поисковые кластеры (`/adv/v0/normquery/*`) — по сути только у кампаний **за показы**. У кампаний за клики в кабинете
+  нет ни кластеров, ни минус-фраз (подтвердил пользователь 14.10), WB списков по ним не отдаёт; `wb_bids.py` шаг
+  минус-фраз для них пропускает. Ключи JSON: `normquery/list` — camelCase (`advertId`, `nmId`, ответ
+  `items[].normQueries{active, excluded, archived}`, только кластеры с ≥ 100 показами); `get-minus`, `set-minus`,
+  `get-bids`, `stats` — snake_case (`advert_id`, `nm_id`, `norm_query(ies)`). `get-bids` → `bids[]` с `bid` (₽) и
+  `bid_kopecks` — только ручная ставка за показы. Отчёт по кластерам — `wb_clusters.py` (только чтение).
 - Дневной лимит — только для оплаты за клики: `PUT /api/advert/v0/daily-limits`, суммы в копейках.
 - Создание кампании: `POST /adv/v2/seacat/save-ad` (до 50 товаров), ставки при создании — минимальные.
   Пополнение бюджета: `POST /adv/v1/budget/deposit?id=` (`type`: 0 счёт, 1 баланс, 3 бонусы).
