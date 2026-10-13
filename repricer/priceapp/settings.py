@@ -26,6 +26,9 @@ REF_ENABLED = "ref_enabled"
 REF_DROP_PERCENT = "ref_drop_percent"
 REF_RATE_PERCENT = "ref_rate_percent"
 REF_POLL_NOW = "ref_poll_now"
+REF_MAX_RAISE_PERCENT = "ref_max_raise_percent"
+WB_MAX_DROP_PERCENT = "wb_max_drop_percent"
+FOLLOW_WB_SNAPSHOT = "follow_wb_snapshot"
 
 # Kit следует за WB (`follow.py`): включено ли, на сколько % цена Kit ниже средней цены WB для
 # покупателя, при каком смещении средней пересчитываем наценку, до какого шага (% к последней
@@ -62,6 +65,9 @@ DEFAULTS = {
     REF_DROP_PERCENT: "10",
     REF_RATE_PERCENT: "2",
     REF_POLL_NOW: "0",
+    REF_MAX_RAISE_PERCENT: "50",
+    WB_MAX_DROP_PERCENT: "33",
+    FOLLOW_WB_SNAPSHOT: "",
     ETALON_WB_DISCOUNT: "31",
     ETALON_DISC_MIN: "35",
     ETALON_DISC_MAX: "50",

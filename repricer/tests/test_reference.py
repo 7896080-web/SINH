@@ -73,38 +73,80 @@ def test_adopt_sent_records_prices_sent_before_the_rule(db):
     assert st["recorded"] == 1 and db.query(ReferencePrice).one().source == "adopt"
 
 
-def test_restore_when_platform_lowers_price_more_than_10_percent(db):
+class _Wb:
+    def __init__(self):
+        self.calls = []
+
+    def _post(self, url, body):
+        self.calls.append(body)
+        return {"error": False}
+
+
+def _run(db, wb=None):
+    wb = wb or _Wb()
+    acc_ids = [a.id for a in db.query(__import__("priceapp.models", fromlist=["Account"]).Account)]
+    for i in acc_ids:
+        a = db.get(__import__("priceapp.models", fromlist=["Account"]).Account, i)
+        if not db.query(__import__("priceapp.models", fromlist=["ApiCredential"]).ApiCredential).filter_by(
+                account_id=a.id).first():
+            acc_mod.set_credential(db, a, "token", "t")
+    db.commit()
+    return reference.run(db, client_factory=lambda p, c: wb), wb
+
+
+def test_restore_when_sale_price_drops_more_than_10_percent(db):
+    """Эталон — цена после скидки продавца; возврат — эталонной парой одним заданием WB."""
     acc = _setup(db)
-    _ref(db, acc, 2009)                                           # к получению 1506,75; порог 1356,07
-    _cur(db, 1950)                                                # 1462,5 — падение 3% — в порядке
-    assert reference.run(db)["restored"] == 0 and db.query(PriceChange).count() == 0
-    _cur(db, 1700)                                                # 1275 — падение 15,4%
-    st = reference.run(db)
+    _ref(db, acc, 2009)                                           # скидка 0 — эталон 2009, порог 1808
+    _cur(db, 1950)                                                # падение 3% — в порядке
+    st, wb = _run(db)
+    assert st["restored"] == 0 and wb.calls == []
+    _cur(db, 1700)                                                # падение 15,4%
+    st, wb = _run(db)
     assert st["restored"] == 1 and st["eaten"] == 0
-    ch = db.query(PriceChange).one()
-    assert (ch.status, ch.source, ch.new_price, ch.old_price, ch.item_id) == ("approved", "reference", 2009, 1700, "u1")
-    assert "возврат эталонной цены 2009" in ch.note
-    assert reference.run(db)["restored"] == 0 and db.query(PriceChange).count() == 1    # уже в очереди
+    assert wb.calls == [{"data": [{"nmID": 5, "price": 2009, "discount": 0}]}]
+    assert db.query(PriceChange).count() == 0                     # мимо очереди — одним заданием
+    db.expire_all()
+    row = db.query(PlatformItem).filter_by(barcode="b1").one()
+    assert (row.current_price, row.current_sale_price) == (2009, 2009)   # Kit в этом опросе видит эталон
+    st, wb = _run(db)
+    assert st["restored"] == 0 and wb.calls == []                 # уже на месте
 
 
-def test_discount_drop_is_attention_not_a_send(db):
+def test_discount_drop_by_platform_is_returned_too(db):
+    """Автоакция: цена до скидки та же, скидку подняла площадка — возвращается и скидка."""
+    acc = _setup(db, current=(2500, 2000))                        # скидка 20% — эталон 2009 x 0,8 = 1607
+    _ref(db, acc, 2009)
+    _cur(db, 2009, sale=1100)                                     # площадка поставила скидку ~45%
+    st, wb = _run(db)
+    assert st["restored"] == 1 and wb.calls == [{"data": [{"nmID": 5, "price": 2009, "discount": 20}]}]
+
+
+def test_return_raising_price_more_than_50_percent_is_attention_not_a_send(db):
+    """13.10: «возврат» эталона 472 479 при цене 158 281 — ошибочный эталон, не занижение."""
     acc = _setup(db)
     _ref(db, acc, 2009)
-    _cur(db, 2009, sale=1500)                                     # цена в списке та же, скидка продавца съела выручку
-    st = reference.run(db)
-    assert st["restored"] == 0 and st["eaten"] == 1 and db.query(PriceChange).count() == 0
+    _cur(db, 1000)                                                # возврат подняли бы на 101%
+    st, wb = _run(db)
+    assert st["restored"] == 0 and st["eaten"] == 1 and wb.calls == []
+    from priceapp.models import AuditLog
+    assert "НЕ возвращено" in db.query(AuditLog).filter_by(action="reference_big").one().details
+    settings.put(db, settings.REF_MAX_RAISE_PERCENT, "150")
+    db.commit()
+    assert _run(db)[0]["restored"] == 1
 
 
 def test_never_lowers_price_and_keeps_human_decision(db):
     acc = _setup(db)
     _ref(db, acc, 2009)
     _cur(db, 3000)                                                # площадка подняла — не трогаем
-    assert reference.run(db)["restored"] == 0
+    st, wb = _run(db)
+    assert st["restored"] == 0 and wb.calls == []
     _cur(db, 1700)
     db.add(PriceChange(item_id="u1", account_id=acc.id, barcode="b1", new_price=5000, status="approved", decided_by="op"))
     db.commit()
-    reference.run(db)
-    assert [(c.new_price, c.status) for c in db.query(PriceChange)] == [(5000, "approved")]
+    st, wb = _run(db)
+    assert wb.calls == [] and [(c.new_price, c.status) for c in db.query(PriceChange)] == [(5000, "approved")]
 
 
 def test_rate_move_over_2_percent_recomputes_reference(db):
@@ -126,11 +168,11 @@ def test_rate_move_over_2_percent_recomputes_reference(db):
 def test_rate_move_then_first_rule_applies(db):
     acc = _setup(db)
     _ref(db, acc, 2009)
-    _cur(db, 1700)                                                # площадка уже занижена
+    _cur(db, 1700)                                                # площадка уже занизила
     f.manual_rate(db, "82.4")
-    st = reference.run(db)
+    st, wb = _run(db)
     assert st["revalued"] == 1 and st["restored"] == 1
-    assert db.query(PriceChange).one().new_price == 2069          # возвращается уже ПЕРЕСЧИТАННАЯ эталонная
+    assert wb.calls[0]["data"][0]["price"] == 2069                # возвращается уже ПЕРЕСЧИТАННАЯ эталонная
 
 
 def test_rate_fall_lowers_reference_but_sends_nothing(db):
@@ -174,7 +216,7 @@ def test_wb_poll_loads_prices_then_runs_rule_and_skips_fresh_prices(db, monkeypa
     db.commit()
     calls = []
     monkeypatch.setattr(jobs.accounts, "load_prices", lambda db_, a, c: calls.append("prices") or {"truncated": False})
-    monkeypatch.setattr(jobs.reference, "run", lambda db_: calls.append("rule") or
+    monkeypatch.setattr(jobs.reference, "run", lambda db_, client_factory=None: calls.append("rule") or
                         {"accounts": 1, "revalued": 0, "restored": 0, "eaten": 0, "disabled": False})
     jobs.job_wb_poll(lambda p, c: _FakeWb())
     assert calls == ["prices", "rule"]
