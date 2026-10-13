@@ -3,6 +3,8 @@
 #   • wb_bids.py --apply — 3 раза в день: 08:00, 13:00, 18:00;
 #   • wb_guard.py --apply — каждый час в :40 с 07:40 до 23:40: ставка за рекомендацией WB и минимумом, не выше
 #     окупаемого потолка, вниз и вверх сразу (≈10 минут).
+#   • wb_positions.py — каждый день в 06:00 (позиции, воронка, реклама по дням → wb_history.db; ≈1 час на 3 кабинета;
+#     только чтение), чтобы к автопилоту в 8:00 и к утру дашборд был свежим (решение 14.10.2026);
 #   • после каждого запуска — пересборка дашборда wb_dashboard.html (python wb_dashboard.py --no-open), 13.10.2026.
 # Установить:  powershell -ExecutionPolicy Bypass -File C:\direct\wb_schedule.ps1
 # Проверить:   Get-ScheduledTask -TaskName "AWER_WB_*"
@@ -12,7 +14,7 @@
 param([switch]$Remove)
 
 $dir = "C:\direct"
-$names = @("AWER_WB_bids", "AWER_WB_guard")
+$names = @("AWER_WB_bids", "AWER_WB_guard", "AWER_WB_positions")
 
 if ($Remove) {
     foreach ($n in $names) { Unregister-ScheduledTask -TaskName $n -Confirm:$false -ErrorAction SilentlyContinue }
@@ -23,9 +25,9 @@ if ($Remove) {
 $py = (Get-Command python -ErrorAction SilentlyContinue).Source
 if (-not $py) { Write-Host "Не найден python. Установите Python или проверьте, что команда python работает."; exit 1 }
 
-function Make-Action($script) {
+function Make-Action($script, $extra = "--apply") {
     # после скрипта (даже если он упал) пересобрать дашборд — страница всегда показывает последнее состояние
-    $cmd = "/c set PYTHONIOENCODING=utf-8&& cd /d $dir && `"$py`" $script --apply >> wb_sched_out.txt 2>&1 & `"$py`" wb_dashboard.py --no-open >> wb_sched_out.txt 2>&1"
+    $cmd = "/c set PYTHONIOENCODING=utf-8&& cd /d $dir && `"$py`" $script $extra >> wb_sched_out.txt 2>&1 & `"$py`" wb_dashboard.py --no-open >> wb_sched_out.txt 2>&1"
     New-ScheduledTaskAction -Execute "cmd.exe" -Argument $cmd -WorkingDirectory $dir
 }
 
@@ -41,6 +43,11 @@ $guardTrigger.Repetition = $rep.Repetition
 $guardSet = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 25)
 Register-ScheduledTask -TaskName "AWER_WB_guard" -Action (Make-Action "wb_guard.py") -Trigger $guardTrigger `
     -Settings $guardSet -Description "Часовая проверка ставок WB (wb_guard.py --apply)" -Force | Out-Null
+
+$posSet = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 2)
+Register-ScheduledTask -TaskName "AWER_WB_positions" -Action (Make-Action "wb_positions.py" "") `
+    -Trigger (New-ScheduledTaskTrigger -Daily -At "06:00") -Settings $posSet `
+    -Description "Позиции и воронка WB (wb_positions.py, только чтение), каждый день в 6:00" -Force | Out-Null
 
 Write-Host "Готово. Python: $py"
 Get-ScheduledTask -TaskName "AWER_WB_*" | ForEach-Object {
