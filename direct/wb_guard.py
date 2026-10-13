@@ -41,7 +41,9 @@ from collections import defaultdict
 import wb_bids as B
 
 # ---------------- НАСТРОЙКИ ----------------
-REC_MAX = 40                # сколько товаров за проверку сверять с рекомендацией WB (самые кликабельные)
+REC_MAX = 40                # сколько товаров за проверку сверять с рекомендацией WB (самые кликабельные) — основной кабинет
+REC_MAX_BY_CAB = {"Яворская": 40}   # по кабинетам; остальным — REC_MAX_OTHER (WB отдаёт рекомендацию раз в 12 с)
+REC_MAX_OTHER = 15
 CAPS_MAX_AGE_HOURS = 48     # потолки из wb_bids.py старше — не доверяю, ничего не меняю
 LOCK_MAX_AGE_HOURS = 2      # файл wb_bids.running старше — считаю, что автопилот упал, и работаю
 # -------------------------------------------
@@ -79,23 +81,30 @@ def plan_topups(cab, token, camps, state):
     Кампания на паузе с бюджетом ниже порога (кончились деньги) — пополнить и запустить, если автопилот ею управлял."""
     rules = {int(k): v for k, v in (state.get("topup_rules") or {}).items() if v.get("cabinet") == cab}
     ids = [cid for cid, t in rules.items() if cid in camps and (camps[cid].get("_status") == 9 or
-                                                                (camps[cid].get("_status") == 11 and t.get("start")))]
+                                                                (camps[cid].get("_status") in (4, 11) and t.get("start")))]
     if not ids:
         return []
     buds = B.get_budgets(token, ids)
     res = []
+    # общий недельный бюджет пополнений кабинета (как в wb_bids.py: "_week_budget")
+    cab_cap = next((t.get("cab_cap") for t in rules.values() if t.get("cab_cap")), None)
+    cab_left = cab_cap - sum(B.topped_week(state, c) for c in rules) if cab_cap else None
     for cid in ids:
         t, bud = rules[cid], buds.get(cid)
         if bud is None or bud >= t["below"]:
             continue
         amount = min(t["amount"], t["day_cap"] - B.topped_week(state, cid, days=1), t["week_cap"] - B.topped_week(state, cid))
-        paused = camps[cid].get("_status") == 11
+        if cab_cap:
+            amount = min(amount, cab_left)
+        paused = camps[cid].get("_status") in (4, 11)
         if amount < 100:
             log(f"  ! «{t['name']}»: бюджет {B.fm_rub(bud)} ₽, но потолок пополнений исчерпан — не пополняю"
                 + (" (кампания стоит на паузе)" if paused else ""))
             continue
         res.append({"cabinet": cab, "advert_id": cid, "name": t["name"], "amount": amount, "source": t["source"],
                     "budget_before": bud, "start": paused})
+        if cab_cap:
+            cab_left -= amount
     return res
 
 
@@ -200,19 +209,19 @@ def main():
         write_log()
         return
 
-    changes, losing, topups, budget = [], [], [], REC_MAX
+    changes, losing, topups, checked = [], [], [], 0
     for cab, token in cabs.items():
         try:   # ID кампаний у WB уникальны: в каждом кабинете проверяются только его кампании
-            ch, lo, n, tp = plan_cabinet(cab, token, caps["items"], state, budget)
+            ch, lo, n, tp = plan_cabinet(cab, token, caps["items"], state, REC_MAX_BY_CAB.get(cab, REC_MAX_OTHER))
         except B.ApiError as e:
             log(f"  ✗ {cab}: {e}")
             continue
         changes += ch
         losing += lo
         topups += tp
-        budget = max(budget - n, 0)
+        checked += n
     print(" " * 60, end="\r")
-    log(f"  Сверено с рекомендацией WB: {REC_MAX - budget} тов.; изменений ставок: {len(changes)}.")
+    log(f"  Сверено с рекомендацией WB: {checked} тов.; изменений ставок: {len(changes)}.")
     for it in changes:
         arrow = "↑" if it["new"] > it["old"] else "↓"
         log(f"  {arrow} «{it['campaign']}» {it['nm_id']}: {B.rub(it['old'])} → {B.rub(it['new'])}"

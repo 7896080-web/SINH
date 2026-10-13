@@ -91,6 +91,36 @@ RULES = {
         #                        "base_bid": "min", "max_cost_per_order": 600},
         #    …и в правило "27643 клик" добавить:  "route_from": "27643 поиск показы"
     },
+    # ── Эксперимент 14–27.10.2026 (решение пользователя): одни и те же модели-новинки, Ребрик — только за показы,
+    #    Караман — только за клики. Ставки по рекомендации WB (follow_rec, места 3–10), без окупаемого потолка;
+    #    деньги держит недельный бюджет пополнений 7 000 ₽ на кабинет ("_week_budget") и дневные лимиты (за клики).
+    #    Кампании другого типа в этих кабинетах — на паузе. Сравнить 27.10: цена заказа, заказы, выкуп.
+    "Ребрик": {
+        "_week_budget": 7000,
+        # за показы дневного лимита у WB нет — расход держат пополнения малыми порциями (порог = сумма = потолок в сутки)
+        "40863039": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True,   # куртки
+                     "topup_below": 500, "topup_amount": 500, "topup_day_cap": 500, "topup_week_cap": 3500},
+        "40863019": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True,   # 256250 + ZJYM
+                     "topup_below": 300, "topup_amount": 300, "topup_day_cap": 300, "topup_week_cap": 2000},
+        "Ребрик 2101 показы": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True,
+                               "topup_below": 150, "topup_amount": 150, "topup_day_cap": 150, "topup_week_cap": 1000},
+        "Ребрик TC26 показы": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True,
+                               "topup_below": 100, "topup_amount": 100, "topup_day_cap": 100, "topup_week_cap": 500},
+    },
+    "Караман": {
+        "_week_budget": 7000,
+        # дневной лимит = порог = сумма пополнения = потолок в сутки; за неделю — лимит × 7 (в сумме 7 000 ₽)
+        "40769334": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True, "daily_limit": 300,
+                     "topup_below": 300, "topup_amount": 300, "topup_day_cap": 300, "topup_week_cap": 2100},   # куртки
+        "40769350": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True, "daily_limit": 200,
+                     "topup_below": 200, "topup_amount": 200, "topup_day_cap": 200, "topup_week_cap": 1400},   # пуховики
+        "40769357": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True, "daily_limit": 150,
+                     "topup_below": 150, "topup_amount": 150, "topup_day_cap": 150, "topup_week_cap": 1050},   # 256250
+        "40769361": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True, "daily_limit": 150,
+                     "topup_below": 150, "topup_amount": 150, "topup_day_cap": 150, "topup_week_cap": 1050},   # ZJYM
+        "40769369": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True, "daily_limit": 200,
+                     "topup_below": 200, "topup_amount": 200, "topup_day_cap": 200, "topup_week_cap": 1400},   # 2101
+    },
 }
 DEFAULTS = {
     "target": "3-10",
@@ -259,7 +289,7 @@ def load_unit_limits():
     p = HERE / "wb_unit_economics.csv"
     res = {}
     auto_cabs = {cab for cab, rules in RULES.items() for k, rule in rules.items()
-                 if k != "_except" and dict(DEFAULTS, **rule)["max_cost_per_order"] == "auto"}
+                 if not k.startswith("_") and dict(DEFAULTS, **rule)["max_cost_per_order"] == "auto"}
     if not p.exists():
         if auto_cabs:
             log(f"! Нет файла wb_unit_economics.csv, а в RULES стоит \"auto\" ({', '.join(sorted(auto_cabs))}) — "
@@ -475,6 +505,8 @@ def get_campaigns(token):
 
 def find(camps, key):
     key = str(key).strip()
+    if key.isdigit() and int(key) in camps:      # номер кампании — только она, без совпадений в названиях
+        return [int(key)]
     return [cid for cid, a in camps.items()
             if str(cid) == key or key.lower() in str((a.get("settings") or {}).get("name", "")).lower()]
 
@@ -815,7 +847,7 @@ def plan_cabinet(cab, token, rules, state):
     todo = {}
     explicit = {}
     for k, v in rules.items():
-        if k in ("*", "_except"):
+        if k == "*" or k.startswith("_"):     # служебные ключи: "_except", "_week_budget"
             continue
         if v.get("until") and dt.date.today().isoformat() > v["until"]:
             log(f"  Правило «{k}» действовало до {v['until']} — теперь кампания на общих правилах.")
@@ -871,6 +903,11 @@ def plan_cabinet(cab, token, rules, state):
                 if not r[k + "_id"]:
                     log(f"  ! {k} = «{r[k]}» для «{camps[cid]['settings'].get('name')}»: кампания не найдена однозначно.")
 
+    # общий недельный потолок пополнений на кабинет ("_week_budget"): сумма по всем его кампаниям за 7 дней
+    cab_cap = rules.get("_week_budget")
+    cab_left = [cab_cap - sum(topped_week(state, c) for c in todo) if cab_cap else None]
+    if cab_cap:
+        log(f"  Недельный бюджет пополнений кабинета: {cab_cap} ₽, за 7 дней уже {cab_cap - cab_left[0]:.0f} ₽.")
     involved = set(todo) | {r.get("clusters_from_id") for r in todo.values()} | {r.get("route_from_id") for r in todo.values()}
     involved.discard(None)
     # статистику WB отдаёт только для статусов 7, 9, 11; «готовая к запуску» (4) в пакете могла бы сорвать весь запрос
@@ -971,7 +1008,7 @@ def plan_cabinet(cab, token, rules, state):
         camp_ctr = smooth(c_clicks, c_views, PRIOR_CTR, K_VIEWS)
         log(f"\n  ▶ {name} (ID {cid}) — {'единая' if unified else 'ручная'} ставка, "
             f"{'за клики' if pay == 'cpc' else 'за показы'}, цель {target}, "
-            f"{'заказ до ' + str(r['max_cost_per_order']) + ' ₽' + (' × выкуп товара' if any(k[0] == cab for k in BUYOUT) else '') if r['max_cost_per_order'] != 'auto' else 'цена заказа — из юнит-экономики'}, "
+            f"{'ставка по рекомендации WB (эксперимент, без окупаемого потолка)' if r.get('follow_rec') else 'заказ до ' + str(r['max_cost_per_order']) + ' ₽' + (' × выкуп товара' if any(k[0] == cab for k in BUYOUT) else '') if r['max_cost_per_order'] != 'auto' else 'цена заказа — из юнит-экономики'}, "
             f"конверсия {camp_cr * 100:.1f}%" + (f"; режим запуска новинки до {r['_until']}" if r.get("_until") else ""))
 
         # ---- товары с малым остатком: убрать из кампании ----
@@ -1022,6 +1059,8 @@ def plan_cabinet(cab, token, rules, state):
                 ctr = smooth(v["clicks"], v["views"], camp_ctr, K_VIEWS)
                 econ = mcpo(cab, r, nm) * cr * 100 * (1 if pay == "cpc" else ctr * 1000)
                 cap = int(min(econ, cap_abs))
+                if r.get("follow_rec"):     # эксперимент: ставка по рекомендации WB, деньги держат бюджет и лимиты
+                    cap = cap_abs
                 fixed = True    # ставку задаёт правило (нет в наличии / нет размеров / «минимальная»), не рекомендация
                 s_info = (stock or {}).get(nm) or {}
                 current, mn = cur_all.get(nm, {}).get(key_cur), mins.get(nm) or 0
@@ -1281,7 +1320,8 @@ def plan_cabinet(cab, token, rules, state):
                              or camps[cid].get("_status") == 9)
             TOPUP_RULES[str(cid)] = {"cabinet": cab, "name": name, "below": r["topup_below"], "amount": r["topup_amount"],
                                      "day_cap": r["topup_day_cap"], "week_cap": r["topup_week_cap"],
-                                     "source": r["topup_source"], "start": can_start}
+                                     "source": r["topup_source"], "start": can_start, "cab_cap": cab_cap}
+            cab_lim = (lambda x: min(x, cab_left[0])) if cab_cap else (lambda x: x)
             bud = get_budgets(token, [cid]).get(cid)
             short = max(limit_need - (bud or 0), 0)       # сколько не хватает бюджета, чтобы WB принял новый лимит
             if bud is None:
@@ -1290,35 +1330,41 @@ def plan_cabinet(cab, token, rules, state):
                 week = topped_week(state, cid)
                 today_ = topped_week(state, cid, days=1)
                 need = int(math.ceil(short / 100) * 100)
-                amount = min(max(need, r["topup_amount"] if bud < r["topup_below"] else 0),
-                             r["topup_day_cap"] - today_, r["topup_week_cap"] - week)
+                amount = cab_lim(min(max(need, r["topup_amount"] if bud < r["topup_below"] else 0),
+                                     r["topup_day_cap"] - today_, r["topup_week_cap"] - week))
                 if amount < need:
                     newlim = int(max(bud + max(amount, 0), 0) // 100 * 100)
                     plan["limits"][-1]["new"]["dailyLimit"] = newlim * 100
                     log(f"    ! Бюджет {fm_rub(bud)} ₽ меньше нового лимита {limit_need:.0f} ₽, а пополнить можно только на "
                         f"{max(amount, 0)} ₽ (потолки) — ставлю лимит {newlim} ₽, полный поставлю при следующем запуске.")
                 if amount >= 100:
-                    start = can_start and a.get("_status") == 11
+                    start = can_start and a.get("_status") in (4, 11)
                     log(f"    Бюджет: {fm_rub(bud)} ₽ — WB не ставит дневной лимит больше бюджета → пополнить на {amount} ₽ "
                         f"из «{SOURCE_RU[r['topup_source']]}» (сегодня уже {fm_rub(today_)} из {r['topup_day_cap']} ₽, "
                         f"за 7 дней {fm_rub(week)} из {r['topup_week_cap']} ₽)" + (" и запустить кампанию" if start else "") + ".")
                     plan["topup"].append({"cabinet": cab, "advert_id": cid, "name": name, "amount": amount,
                                           "source": r["topup_source"], "budget_before": bud, "start": start})
+                    if cab_cap:
+                        cab_left[0] -= amount
             elif bud >= r["topup_below"]:
                 log(f"    Бюджет: {fm_rub(bud)} ₽ — пополнять не нужно (порог {r['topup_below']} ₽).")
             else:
                 week = topped_week(state, cid)
                 today_ = topped_week(state, cid, days=1)
-                amount = min(r["topup_amount"], r["topup_day_cap"] - today_, r["topup_week_cap"] - week)
+                amount = cab_lim(min(r["topup_amount"], r["topup_day_cap"] - today_, r["topup_week_cap"] - week))
                 if amount < 100:     # меньше 100 ₽ не пополняем — дневной или недельный потолок исчерпан
                     log(f"    ! Бюджет {fm_rub(bud)} ₽ ниже порога, но потолок исчерпан: сегодня пополнено на {fm_rub(today_)} "
-                        f"из {r['topup_day_cap']} ₽, за 7 дней на {fm_rub(week)} из {r['topup_week_cap']} ₽ — не пополняю.")
+                        f"из {r['topup_day_cap']} ₽, за 7 дней на {fm_rub(week)} из {r['topup_week_cap']} ₽"
+                        + (f", недельный бюджет кабинета: осталось {max(cab_left[0], 0):.0f} из {cab_cap} ₽" if cab_cap else "")
+                        + " — не пополняю.")
                 else:
-                    start = can_start and a.get("_status") == 11
+                    start = can_start and a.get("_status") in (4, 11)
                     log(f"    Бюджет: {fm_rub(bud)} ₽ < {r['topup_below']} ₽ → пополнить на {amount} ₽ из «{SOURCE_RU[r['topup_source']]}» "
                         f"(сегодня уже {fm_rub(today_)} из {r['topup_day_cap']} ₽, за 7 дней {fm_rub(week)} из {r['topup_week_cap']} ₽)" + (" и запустить кампанию" if start else "") + ".")
                     plan["topup"].append({"cabinet": cab, "advert_id": cid, "name": name, "amount": amount,
                                           "source": r["topup_source"], "budget_before": bud, "start": start})
+                    if cab_cap:
+                        cab_left[0] -= amount
     if check_card:
         log("\n  Проверить карточку (много кликов, ни одного заказа — дело скорее в фото, цене, размерах или отзывах, "
             "а не в ставке; ставку таким товарам не повышаю):")
