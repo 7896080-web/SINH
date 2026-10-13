@@ -102,9 +102,11 @@ RULES = {
                      "topup_below": 500, "topup_amount": 500, "topup_day_cap": 500, "topup_week_cap": 3500},
         "40863019": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True,   # 256250 + ZJYM
                      "topup_below": 300, "topup_amount": 300, "topup_day_cap": 300, "topup_week_cap": 2000},
-        "Ребрик 2101 показы": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True,
+        # «Ребрик 2101 показы» — создана 14.10.2026 через wb_create.py
+        "40955628": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True,
                                "topup_below": 150, "topup_amount": 150, "topup_day_cap": 150, "topup_week_cap": 1000},
-        "Ребрик TC26 показы": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True,
+        # «Ребрик TC26 показы» — создана 14.10.2026 через wb_create.py
+        "40955524": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True,
                                "topup_below": 100, "topup_amount": 100, "topup_day_cap": 100, "topup_week_cap": 500},
     },
     "Караман": {
