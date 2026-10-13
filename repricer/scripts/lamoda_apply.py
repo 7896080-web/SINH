@@ -217,6 +217,19 @@ def main(argv=None) -> int:
                       f" сама поднять цену до скидки, не зная о скидке Ламоды. Проверьте «Кабинеты».")
         go = [c for c in cards if not c.skip]
         if args.verify:
+            # Отправка сразу пишет у нас новые цены, поэтому по загрузке ДО неё сверка сравнила
+            # бы план сам с собой и показала «всё держит», ничего не проверив (13.10 так и вышло).
+            from priceapp.models import AuditLog
+            stale = []
+            for a in accs:
+                last = (db.query(AuditLog.at).filter(AuditLog.action == "lamoda_prices", AuditLog.object == a.name)
+                        .order_by(AuditLog.at.desc()).first())
+                if last and (not a.prices_loaded_at or a.prices_loaded_at < last[0]):
+                    stale.append(f"{a.name}: последняя отправка {last[0]}, цены загружены {a.prices_loaded_at or '-'}")
+            if stale:
+                print("\nСверять не по чему: цены с Ламоды загружены РАНЬШЕ последней отправки.\n  "
+                      + "\n  ".join(stale) + "\nПерезапустите программу (она загрузит цены) и повторите --verify.")
+                return 2
             ok = [c for c in go if c.already]
             bad = [c for c in go if not c.already]
             print(f"\nДержит план: {len(ok)}; НЕ держит: {len(bad)}")
