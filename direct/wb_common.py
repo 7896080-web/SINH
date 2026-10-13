@@ -133,18 +133,24 @@ def load_tokens(only=None):
         text = raw.decode("utf-8-sig")
     except UnicodeDecodeError:
         text = raw.decode("cp1251")
-    cabs = {}
+    cabs, seen = {}, []
     for line in text.splitlines():
-        line = line.strip()
+        line = line.strip().lstrip("\ufeff")
         if line and not line.startswith("#") and "=" in line:
             name, tok = line.split("=", 1)
             tok = tok.strip().strip('"').strip("'")
+            seen.append((name.strip(), len(tok)))
             if len(tok) >= 20:
                 cabs[name.strip()] = tok
+    norm = lambda x: " ".join(str(x).replace("\u00a0", " ").split()).lower()
     if only:
-        cabs = {k: v for k, v in cabs.items() if k == only}
+        cabs = {k: v for k, v in cabs.items() if norm(k) == norm(only)}
     if not cabs:
-        sys.exit("В wb_tokens.txt нет подходящих токенов.")
+        # подсказка без токенов: только названия и длина того, что стоит после «=»
+        hint = "; ".join(f"«{n}» — {'токен ' + str(l) + ' символов' if l >= 20 else 'токена нет или он слишком короткий (' + str(l) + ' симв.)'}"
+                         for n, l in seen) or "ни одной строки вида «Название = токен»"
+        sys.exit("В wb_tokens.txt нет подходящих токенов" + (f" для кабинета «{only}»" if only else "") +
+                 f". В файле {TOKENS_FILE} найдено: {hint}. Проверьте, что файл сохранён и название совпадает.")
     return cabs
 
 
