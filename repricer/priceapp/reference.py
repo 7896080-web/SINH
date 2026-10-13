@@ -1,33 +1,32 @@
 """Эталонная цена кабинетов WB и её защита.
 
-Эталонная цена SKU — ПОСЛЕДНЯЯ цена, которую программа отправила на карточку
-(`dispatch.run_account` записывает её сюда после каждой принятой площадкой отправки;
-цены, ушедшие до появления правила, подхватывает `adopt_sent`). Две части правила:
+ЭТАЛОН — цена ПОСЛЕ СКИДКИ ПРОДАВЦА (решение владельца 13.10): пара «цена до скидки +
+скидка продавца», которую мы поставили на карточку. Хранится `ReferencePrice.ref_price`
+(цена до скидки) и `ReferencePrice.discount` (скидка); эталон = их произведение
+(`ref_sale`). Пишется после каждой принятой площадкой отправки (`dispatch.run_account`),
+командой `reference_tool.py adopt-current` / `etalon_apply.py --adopt` — то, что WB держит
+сейчас, и `adopt_sent` для цен, ушедших до появления правила.
 
-1. «Площадка снизила цену». «К получению» по ТЕКУЩЕЙ цене площадки (с её скидкой
-   продавца и комиссией) ниже «к получению» по эталонной больше чем на `ref_drop_percent`
-   (10%) — эталонная цена ВОЗВРАЩАЕТСЯ: программа сама ставит её в отправку
-   (`PriceChange` со статусом approved, источник «reference»; уходит так же, как любая
-   подтверждённая цена). Только если цена на площадке (в списке) ниже эталонной — вернуть
-   можно только вверх. Если цена в списке не тронута, а «к получению» упало из-за скидки
-   продавца или акции, цена не помогает: это «внимание», не отправка.
-2. «Курс». Курс ушёл от курса, по которому посчитана эталонная, больше чем на
-   `ref_rate_percent` (2%) — эталонная пересчитывается по наценке на ТЕКУЩЕМ курсе, затем
-   работает правило 1. Сама по себе цена на площадке при этом не меняется: уйдёт она,
-   только если «к получению» уже ниже новой эталонной больше чем на 10%.
+1. «Площадка занизила цену». Цена после скидки продавца по ТЕКУЩИМ ценам WB ниже эталонной
+   больше чем на `ref_drop_percent` (10%) — неважно, что сменилось: цена до скидки, скидка
+   (автоакция) или оба. Эталонная пара ВОЗВРАЩАЕТСЯ одним заданием WB на карточку, только
+   вверх. Возврат, поднимающий цену больше чем на `ref_max_raise_percent` (50%), не
+   отправляется, а уходит во «Внимание»: так выглядит ошибочный эталон, а не занижение.
+2. «Курс». Курс ушёл от курса эталонной больше чем на `ref_rate_percent` (2%) — эталонная
+   цена до скидки пересчитывается по наценке на ТЕКУЩЕМ курсе, затем работает правило 1.
 
 Только кабинеты WB. Опрос площадки — при запуске программы и раз в 6 часов
 (`workers/jobs.job_wb_poll`), а также сразу, когда курс ушёл за порог.
 """
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 
 from sqlalchemy.orm import Session
 
 from priceapp import audit, rates, settings
 from priceapp.models import Account, PriceChange, PriceChangeStatus, ReferencePrice
-from priceapp.pricing import BLOCK_FLOOR, _dec, get_rule, item_facts, markup, payout
+from priceapp.pricing import _dec, get_rule, item_facts, payout
 from priceapp.timeutils import now_utc
 
 SOURCE = "reference"
@@ -159,36 +158,65 @@ def rate_moved(db: Session) -> bool:
     return any(abs(cur.usd_rub / v - 1) > thr for v in seen)
 
 
-def classify(r: dict, ref: ReferencePrice, drop: Decimal) -> str | None:
-    """`below` — цену вернуть; `eaten` — «к получению» упало, а цена в списке не ниже
-    эталонной (скидка или акция) — отправка не поможет; None — всё в порядке."""
-    cur_payout = r.get("current_payout")
-    if cur_payout is None or ref.ref_payout is None:
+def max_raise_percent(db: Session) -> Decimal:
+    return _pct(db, settings.REF_MAX_RAISE_PERCENT, "50")
+
+
+def ref_sale(ref: ReferencePrice) -> int | None:
+    """Эталон — цена ПОСЛЕ скидки продавца: эталонная цена до скидки × (1 − эталонная скидка)."""
+    if not ref.ref_price:
         return None
-    if _dec(cur_payout) >= _dec(ref.ref_payout) * (1 - drop / 100):
+    return int((Decimal(ref.ref_price) * (1 - _dec(ref.discount or 0))).quantize(Decimal(1), ROUND_HALF_UP))
+
+
+def ref_discount_int(ref: ReferencePrice) -> int:
+    """Скидка эталона целым процентом, как её держит WB."""
+    return int((_dec(ref.discount or 0) * 100).quantize(Decimal(1), ROUND_HALF_UP))
+
+
+def classify(r: dict, ref: ReferencePrice, drop: Decimal, max_raise: Decimal = Decimal(50)) -> str | None:
+    """`below` — цена после скидки продавца ниже эталонной больше чем на `drop` %: вернуть;
+    `big` — вернуть надо, но возврат поднял бы её больше чем на `max_raise` % — это скорее
+    ошибка эталона, чем занижение площадкой: «Внимание», не отправка; None — в порядке."""
+    target, cur = ref_sale(ref), r.get("current_sale")
+    if not target or not cur:
         return None
-    cur = r.get("current")
-    if cur and cur < ref.ref_price and r.get("block_reason") != BLOCK_FLOOR:
-        return "below"
-    return "eaten"
+    if Decimal(cur) >= Decimal(target) * (1 - drop / 100):
+        return None
+    if Decimal(target) > Decimal(cur) * (1 + max_raise / 100):
+        return "big"
+    return "below"
 
 
 def _clear_poll_flag(db: Session) -> None:
     settings.put(db, settings.REF_POLL_NOW, "0")
 
 
-def run(db: Session, product_rows=None, actor: str = "программа") -> dict:
-    """Пересчёт эталонных по курсу и возврат цен, которые площадка занизила.
-    Работает по уже загруженным текущим ценам — к площадкам не обращается. Коммит порциями."""
+def _nm(item) -> str:
+    nm = (getattr(item, "external_id", "") or "").split(":")[0]
+    return nm if nm.isdigit() else ""
+
+
+def run(db: Session, product_rows=None, actor: str = "программа", client_factory=None) -> dict:
+    """Пересчёт эталонных по курсу и возврат эталонной цены ПОСЛЕ СКИДКИ ПРОДАВЦА там, где
+    площадка её занизила — ценой до скидки, скидкой (автоакция) или обоими.
+
+    Возврат — той же парой, что записана эталоном: цена до скидки + скидка, одним заданием
+    WB на карточку (nmID), только вверх. Возврат, поднимающий цену больше чем на
+    `max_raise_percent` (50%), не отправляется: 13.10 правило «вернуло» по 3164M эталон
+    472 479 при цене 158 281 — эталон был ошибочным, и поднимать цену втрое без человека
+    нельзя. Такое — «Внимание». Отправка прошла — цены карточки у нас сразу правятся на
+    отправленные (правило «Kit следует за WB» в этом же опросе видит эталонную цену).
+    Коммит по кабинету."""
     if product_rows is None:
         from priceapp.routers.prices import product_rows
-    st = {"accounts": 0, "revalued": 0, "restored": 0, "eaten": 0, "disabled": False}
+    st = {"accounts": 0, "revalued": 0, "restored": 0, "eaten": 0, "disabled": False, "errors": []}
     if not enabled(db):
         st["disabled"] = True
         return st
     rate = rates.current(db)
     rate_thr = rate_percent(db) / 100
-    drop = drop_percent(db)
+    drop, max_raise = drop_percent(db), max_raise_percent(db)
     now = now_utc()
     for a in db.query(Account).filter(Account.is_active.is_(True), Account.platform.in_(PLATFORMS)).all():
         refs = {r.item_id: r for r in db.query(ReferencePrice).filter(ReferencePrice.account_id == a.id)}
@@ -198,7 +226,9 @@ def run(db: Session, product_rows=None, actor: str = "программа") -> di
         busy = {i for (i,) in db.query(PriceChange.item_id).filter(
             PriceChange.account_id == a.id, PriceChange.is_test.is_(False),
             PriceChange.status == PriceChangeStatus.approved.value)}
-        restored = revalued = 0
+        revalued = 0
+        cards: dict[str, dict] = {}
+        big: list[str] = []
         for r in product_rows(db, a):
             ref = refs.get(r["item_id"])
             if ref is None:
@@ -212,44 +242,81 @@ def run(db: Session, product_rows=None, actor: str = "программа") -> di
                 ref.source = "rate"
                 ref.set_at = now
                 revalued += 1
-            # 2. Площадка занизила цену — вернуть эталонную (только вверх).
-            kind = classify(r, ref, drop)
-            if kind == "eaten":
-                st["eaten"] += 1
-            if kind != "below" or r["item_id"] in busy:
+            if r["item_id"] in busy:
                 continue
-            got = markup(Decimal(ref.ref_price) * (1 - _dec(ref.discount)), r["cost_rub"], _dec(ref.commission_percent)) \
-                if r.get("cost_rub") and ref.commission_percent is not None else (None, None)
-            db.add(PriceChange(
-                item_id=r["item_id"], account_id=a.id, barcode=r["platform"].barcode,
-                cost_usd=r["cost_usd"], usd_rub=rate.usd_rub if rate else None, cost_rub=r["cost_rub"],
-                commission_percent=ref.commission_percent, old_price=r["current"], new_price=ref.ref_price,
-                markup_rub=got[0], markup_coef=got[1], source=SOURCE,
-                status=PriceChangeStatus.approved.value,
-                note=(f"площадка держит {r['current']} ₽, к получению {_dec(r['current_payout']):.0f} ₽ ниже эталонных "
-                      f"{_dec(ref.ref_payout):.0f} ₽ больше чем на {drop.normalize()}% — возврат эталонной цены "
-                      f"{ref.ref_price} ₽")[:255],
-                decided_by=actor, decided_at=now))
-            busy.add(r["item_id"])
-            restored += 1
-            if (restored + revalued) % COMMIT_EVERY == 0:
-                db.commit()
-        st["restored"] += restored
+            # 2. Площадка занизила цену после скидки продавца — вернуть эталонную (только вверх).
+            kind = classify(r, ref, drop, max_raise)
+            nm = _nm(r.get("platform"))
+            if kind is None or not nm:
+                continue
+            if kind == "big":
+                big.append(f"{nm}: {r.get('current_sale')} -> {ref_sale(ref)}")
+                continue
+            c = cards.get(nm)
+            if c is None or ref.ref_price > c["ref"].ref_price:
+                cards[nm] = {"ref": ref, "cur": r.get("current_sale")}
         st["revalued"] += revalued
-        if restored or revalued:
-            audit.log(db, actor, "reference_run", a.name,
-                      f"эталонных пересчитано по курсу: {revalued}; возвращено цен: {restored}")
+        st["eaten"] += len(big)
+        if big:
+            audit.log(db, actor, "reference_big", a.name,
+                      f"эталон выше нынешней цены после скидки больше чем на {max_raise.normalize()}% — НЕ возвращено, "
+                      f"проверьте эталон ({len(big)}): " + "; ".join(big[:20]))
+        restored = _send(db, a, cards, client_factory, st, actor) if cards else 0
+        st["restored"] += restored
+        if revalued:
+            audit.log(db, actor, "reference_run", a.name, f"эталонных пересчитано по курсу: {revalued}")
         db.commit()
     return st
+
+
+def _send(db: Session, a: Account, cards: dict, client_factory, st: dict, actor: str) -> int:
+    """Эталонная пара (цена до скидки + скидка) на карточки WB одним заданием на пачку."""
+    from priceapp import accounts
+    from priceapp.models import PlatformItem
+    from priceapp.platforms import WB_PRICES
+    try:
+        client = accounts.client_for(db, a, client_factory)
+    except Exception as e:
+        st["errors"].append(f"{a.name}: {e}"[:200])
+        return 0
+    items = list(cards.items())
+    done = []
+    for start in range(0, len(items), 1000):
+        chunk = items[start:start + 1000]
+        body = {"data": [{"nmID": int(nm), "price": int(c["ref"].ref_price), "discount": ref_discount_int(c["ref"])}
+                         for nm, c in chunk]}
+        try:
+            data = client._post(f"{WB_PRICES}/api/v2/upload/task", body)
+        except Exception as e:
+            st["errors"].append(f"{a.name}: {e}"[:200])
+            continue
+        if isinstance(data, dict) and data.get("error"):
+            st["errors"].append(f"{a.name}: {data.get('errorText') or 'WB вернул error=true'}"[:200])
+            continue
+        done += chunk
+    for nm, c in done:
+        price, d = int(c["ref"].ref_price), ref_discount_int(c["ref"])
+        for it in db.query(PlatformItem).filter(PlatformItem.account_id == a.id,
+                                                PlatformItem.external_id.like(f"{nm}:%")):
+            it.current_price = price
+            it.current_sale_price = int((Decimal(price) * (100 - d) / 100).quantize(Decimal(1), ROUND_HALF_UP))
+    if done:
+        sample = "; ".join(f"{nm}: {c['cur']} -> {ref_sale(c['ref'])}" for nm, c in done[:20])
+        audit.log(db, actor, "reference_run", a.name,
+                  f"возвращена эталонная цена после скидки продавца: {len(done)} карточек — {sample}"
+                  + (" …" if len(done) > 20 else ""))
+    return len(done)
 
 
 def summary(st: dict) -> str:
     if st.get("disabled"):
         return "Правило эталонной цены выключено (настройка ref_enabled)."
     if not st.get("accounts"):
-        return "Эталонных цен WB пока нет: правило начнёт работать после первой отправки цен."
+        return "Эталонных цен WB пока нет: правило начнёт работать после записи эталона."
     parts = [f"Эталонные цены WB ({st['accounts']} каб.): пересчитано по курсу — {st['revalued']}; "
-             f"возвращено цен — {st['restored']}"]
+             f"возвращено цен после скидки продавца — {st['restored']}"]
     if st["eaten"]:
-        parts.append(f"«к получению» упало из-за скидки продавца или акции, цена не помогает — {st['eaten']}")
+        parts.append(f"эталон выше нынешней цены больше допустимого, не возвращено — {st['eaten']} (проверьте эталон)")
+    if st.get("errors"):
+        parts.append("ошибки: " + "; ".join(st["errors"]))
     return "; ".join(parts) + "."

@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta
 
-from priceapp import accounts, backup, discount_guard, dispatch, follow, guard, onec, platforms, rates, reference, settings
+from priceapp import accounts, backup, dispatch, follow, guard, onec, platforms, rates, reference, settings
 from priceapp.database import SessionLocal
 from priceapp.models import Account, ApiCredential, OnecTask, OnecTaskStatus
 from priceapp.timeutils import now_utc, today_local
@@ -208,16 +208,15 @@ def job_wb_poll(client_factory=None, max_age: timedelta = WB_PRICES_MAX_AGE) -> 
             except Exception as e:
                 db.rollback()
                 notes.append(f"{acc.name}: цены не загружены — {e}"[:200])
-        # Скидку — ДО правила «Kit следует за WB»: оно берёт цену WB после скидки, и
-        # скидка, которую поставила автоакция WB, иначе увела бы за собой Kit.
-        dst = discount_guard.run(db, client_factory)
-        logger.info("%s", discount_guard.summary(dst))
-        notes += dst["errors"]
-        st = reference.run(db)
+        # Эталон — цена после скидки продавца; правило возвращает и цену до скидки, и
+        # скидку (автоакцию). ДО правила «Kit следует за WB»: оно берёт цену WB после
+        # скидки, и занижение площадкой иначе увело бы за собой Kit.
+        st = reference.run(db, client_factory=client_factory)
         logger.info("%s", reference.summary(st))
+        notes += st.get("errors", [])
         fst = follow.run(db)
         logger.info("%s", follow.summary(fst))
-        if st["restored"] or fst.get("approved") or dst["restored"]:
+        if st["restored"] or fst.get("approved"):
             from priceapp import overview
             overview.mark_dirty(db)
         beat(db, "wb_poll", True, "; ".join(notes))

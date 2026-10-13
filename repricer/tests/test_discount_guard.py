@@ -78,15 +78,15 @@ def test_guard_can_be_disabled(db):
     assert discount_guard.run(db, lambda p, c: wb)["disabled"] is True and wb.calls == []
 
 
-def test_wb_poll_checks_discount_before_kit_follows(db, monkeypatch):
+def test_wb_poll_runs_reference_rule_before_kit_follows(db, monkeypatch):
+    """Скидку теперь возвращает правило эталонной цены (эталон — цена после скидки продавца);
+    оно обязано идти ДО «Kit следует за WB»."""
     from priceapp.workers import jobs
     _setup(db)
     calls = []
     monkeypatch.setattr(jobs.accounts, "load_prices", lambda db_, a, c: calls.append("prices") or {"truncated": False})
-    monkeypatch.setattr(jobs.discount_guard, "run", lambda db_, f=None: calls.append("discount") or
-                        {"accounts": 0, "restored": 0, "errors": [], "disabled": False})
-    monkeypatch.setattr(jobs.reference, "run", lambda db_: calls.append("rule") or
-                        {"accounts": 0, "revalued": 0, "restored": 0, "eaten": 0, "disabled": False})
+    monkeypatch.setattr(jobs.reference, "run", lambda db_, client_factory=None: calls.append("rule") or
+                        {"accounts": 0, "revalued": 0, "restored": 0, "eaten": 0, "disabled": False, "errors": []})
     monkeypatch.setattr(jobs.follow, "run", lambda db_: calls.append("follow") or {"approved": 0})
     jobs.job_wb_poll(lambda p, c: None)
-    assert calls == ["prices", "discount", "rule", "follow"]
+    assert calls == ["prices", "rule", "follow"]

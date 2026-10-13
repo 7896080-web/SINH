@@ -75,6 +75,35 @@ def wb_average(db: Session) -> dict[str, float]:
     return {art: sum(v) / len(v) for art, v in vals.items()}
 
 
+def _wb_loaded_at(db: Session) -> str:
+    """Когда загружены цены WB — метка опроса: по ней отличаем НОВЫЙ опрос от повторного
+    прогона правила на тех же ценах."""
+    ts = [a.prices_loaded_at for a in db.query(Account).filter(
+        Account.is_active.is_(True), Account.platform.in_(SOURCE_PLATFORMS)) if a.prices_loaded_at]
+    return max(ts).isoformat() if ts else ""
+
+
+def confirmed_average(db: Session, avg: dict[str, float], tol: Decimal) -> dict[str, float]:
+    """Только артикулы, у которых средняя цена WB ПОДТВЕРДИЛАСЬ вторым опросом (в пределах
+    `follow_tolerance`). 13.10 за час на WB побывали цены, выставленные по ошибке (до 236 240 ₽
+    за пуховик), и Kit каждый раз шёл за ними — 3 500 изменений. Одно случайное значение WB
+    больше не уводит Kit: цена должна продержаться два опроса. Снимок прошлого опроса — в
+    настройке `follow_wb_snapshot`; коммитит вызывающий."""
+    import json
+    at = _wb_loaded_at(db)
+    try:
+        snap = json.loads(settings.get(db, settings.FOLLOW_WB_SNAPSHOT) or "{}")
+    except ValueError:
+        snap = {}
+    if snap.get("at") != at:
+        snap = {"at": at, "avg": avg, "prev": snap.get("avg") or {}}
+        settings.put(db, settings.FOLLOW_WB_SNAPSHOT, json.dumps(snap, ensure_ascii=False))
+    prev = snap.get("prev") or {}
+    t = float(tol)
+    return {art: v for art, v in avg.items()
+            if prev.get(art) and abs(v / prev[art] - 1) * 100 <= t}
+
+
 def wanted_margin(avg: float, cost: float, commission: Decimal, pct: Decimal) -> Decimal:
     """Маржинальность, при которой цена Kit = (1 − pct)·avg: цена = себестоимость × m / (1 − комиссия)."""
     price = avg * float(1 - pct / 100)
@@ -96,11 +125,13 @@ def run(db: Session, actor: str = ACTOR) -> dict:
     if not enabled(db):
         st["disabled"] = True
         return st
-    avg = wb_average(db)
-    if not avg:
+    seen = wb_average(db)
+    if not seen:
         st["nodata"] = True
         return st
     pct, tol, step = percent(db), tolerance(db), max_step(db)
+    avg = confirmed_average(db, seen, tol)
+    st["waiting"] = len(seen) - len(avg)
     for a in db.query(Account).filter(Account.is_active.is_(True), Account.platform.in_(TARGET_PLATFORMS)).all():
         st["accounts"] += 1
         rule = get_rule(db, a.platform)
@@ -185,4 +216,5 @@ def summary(st: dict) -> str:
     if st.get("nodata"):
         return "Следование Kit за WB: цен WB для покупателя нет."
     return (f"Kit следует за WB: маржинальностей пересчитано — {st['margins']}; в отправку — {st['approved']}; "
-            f"на ручное подтверждение — {st['manual']}.")
+            f"на ручное подтверждение — {st['manual']}"
+            + (f"; ждут подтверждения цены WB вторым опросом — {st['waiting']}" if st.get("waiting") else "") + ".")

@@ -26,6 +26,17 @@ MAX_ATTEMPTS = 5
 # Такое не отправляется, а отклоняется с причиной — подтвердить заново.
 STALE_AFTER = timedelta(hours=24)
 RETRY_MINUTES = (1, 2, 5, 15)
+# Между шагами большого снижения на WB: площадке нужно время применить шаг.
+STEP_PAUSE = timedelta(minutes=10)
+
+
+def _max_drop(db: Session) -> Decimal:
+    from priceapp import settings
+    try:
+        v = Decimal((settings.get(db, settings.WB_MAX_DROP_PERCENT) or "33").replace(",", "."))
+    except Exception:
+        v = Decimal(33)
+    return v if 0 < v < 50 else Decimal(33)
 
 
 def _retry_delay(attempts: int) -> timedelta:
@@ -122,6 +133,8 @@ def run_account(db: Session, account: Account, client) -> dict:
         cards.setdefault(card_key(account.platform, row) or row.barcode, []).append((ch, row))
 
     items_out, by_barcode, card_of_barcode, card_price, floored, waiting = [], {}, {}, {}, 0, 0
+    stepping: dict[str, int] = {}                           # карточка -> цель, к которой идём шагами
+    max_drop = _max_drop(db)
     for key, queued in cards.items():
         if any(ch.next_attempt_at is not None and ch.next_attempt_at > now for ch, _ in queued):
             waiting += len(queued)
@@ -160,6 +173,18 @@ def run_account(db: Session, account: Account, client) -> dict:
                 ch.note = problem[:255]
                 floored += 1
             continue
+        # WB: снижение цены на 50% и больше одним изменением не применяется, а больше порога
+        # карантина категории (33,3% по умолчанию) — уходит в карантин. Большое снижение —
+        # ШАГАМИ не больше `wb_max_drop_percent` от нынешней цены карточки; позиция остаётся
+        # в очереди и через `STEP_PAUSE` уходит следующим шагом, пока не дойдёт до цели.
+        if account.platform == "wb":
+            cur = max((r.current_price for sib in members.get(key, set()) for r in items.get(sib, [])
+                       if card_key(account.platform, r) == key and r.current_price), default=None)
+            floor_step = (int((Decimal(cur) * (1 - max_drop / 100)).to_integral_value(rounding="ROUND_CEILING"))
+                          if cur else None)
+            if floor_step and price < floor_step:
+                stepping[key] = price
+                price = floor_step
         card_price[key] = price
         for ch, row in queued:
             sale = None
@@ -182,11 +207,21 @@ def run_account(db: Session, account: Account, client) -> dict:
     terminal = {b: e.get("detail", "") for e in result.get("errors", []) if e.get("terminal")
                 for b in e.get("items", [])}
     accepted_cards: dict[str, int] = {}
+    stepped_cards: dict[str, int] = {}
     for barcode, ch in by_barcode.items():
         ch.attempts += 1
         if barcode in terminal and barcode not in ok:
             ch.status = PriceChangeStatus.error.value
             ch.last_error = str(terminal[barcode])[:400]
+            continue
+        if barcode in ok and card_of_barcode[barcode] in stepping:
+            key = card_of_barcode[barcode]
+            step = card_price[key]
+            ch.attempts -= 1                                  # шаг — не неудачная попытка
+            ch.next_attempt_at = now_utc() + STEP_PAUSE
+            ch.note = (f"снижение шагами: отправлено {step} ₽, цель {stepping[key]} ₽ — "
+                       f"следующий шаг через {int(STEP_PAUSE.total_seconds() // 60)} мин")[:255]
+            stepped_cards[key] = step
             continue
         if barcode in ok:
             price = int(sent_prices.get(barcode, card_price[card_of_barcode[barcode]]))
@@ -212,8 +247,20 @@ def run_account(db: Session, account: Account, client) -> dict:
             if sib not in latest:
                 _record_sent(db, sib, account.id, price)
                 reference.record(db, account, sib, price, items.get(sib) or [], rule, rate)
+    # Шаг принят — цены карточки у нас сразу на шаге: следующий шаг считается от него, а не
+    # от цены до шага (иначе ушёл бы тот же шаг ещё раз). Не применит WB — следующий шаг он
+    # просто не примет, а опрос WB вернёт настоящие цены.
+    for key, step in stepped_cards.items():
+        for sib in members.get(key, set()):
+            for r in items.get(sib, []):
+                if card_key(account.platform, r) == key and r.current_price:
+                    disc = (Decimal(1) - Decimal(r.current_sale_price) / Decimal(r.current_price)
+                            if r.current_sale_price else Decimal(0))
+                    r.current_price = step
+                    r.current_sale_price = int((Decimal(step) * (1 - disc)).quantize(Decimal(1), rounding="ROUND_HALF_UP"))
     db.commit()
-    return {"sent": len(ok & set(by_barcode)), "tried": len(by_barcode), "floored": floored, "waiting": waiting}
+    return {"sent": len(ok & set(by_barcode)), "tried": len(by_barcode), "floored": floored, "waiting": waiting,
+            "stepped": len(stepped_cards)}
 
 
 def run(db: Session, client_factory=None) -> dict:
