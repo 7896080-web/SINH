@@ -1,7 +1,9 @@
 """Цены Kit и Ламоды от эталона WB через скидку продавца — ТОЛЬКО ЧТЕНИЕ, ничего не отправляет.
 
-Логика (задана владельцем 12.10):
-  * эталон по артикулу 1С = средняя по всем кабинетам WB ЦЕНА ПРОДАВЦА СО СКИДКОЙ минус 31%;
+Логика (задана владельцем 12.10, уточнена 13.10):
+  * эталон по артикулу 1С = средняя по всем кабинетам WB ЭТАЛОННАЯ цена после скидки продавца
+    (записанная `etalon_apply.py --adopt`; где её нет — нынешняя) минус 31%;
+  * Ламода — эталон; за WB сама НЕ следует: план и файл, отправка — отдельно;
   * цель — цена ПОСЛЕ скидки продавца: Kit = эталон − 10%, Ламода = эталон;
   * цель достигается СКИДКОЙ продавца на площадке: при нынешней цене до скидки
     нужная скидка = 1 − цель / цена до скидки; коридор скидки — 35–50%;
@@ -9,6 +11,7 @@
     на ближнюю границу коридора (35% или 50%).
 
     C:\\repricer\\.venv\\Scripts\\python.exe C:\\repricer\\scripts\\etalon_prices.py --xlsx C:\\repricer\\эталон_цены.xlsx
+    ... --only lamoda --xlsx C:\\repricer\\план_ламода.xlsx      только Ламода: лист «Сводка» по категориям и «Ламода»
     ... --wb-discount 31 --kit -10 --lamoda 0 --disc-min 35 --disc-max 50
 
 WB — источник эталона: цена СО СКИДКОЙ продавца на нём не меняется; меняются цена до
@@ -56,12 +59,28 @@ def _accounts(db, platform):
             .order_by(Account.name).all())
 
 
-def etalon(db, articles, wb_discount: Decimal) -> dict[str, Decimal]:
+def etalon(db, articles, wb_discount: Decimal, stats: dict | None = None) -> dict[str, Decimal]:
+    """Эталон по артикулу 1С = средняя по всем кабинетам WB ЭТАЛОННАЯ цена после скидки
+    продавца (записанная `etalon_apply.py --adopt` / `reference_tool.py adopt-current`) минус
+    `wb_discount` %. Где эталона WB ещё нет — нынешняя цена после скидки продавца."""
+    from priceapp import reference
+    from priceapp.models import ReferencePrice
     rule = get_rule(db, "wb")
     vals: dict[str, list[int]] = {}
+    st = stats if stats is not None else {}
+    st.setdefault("ref", 0)
+    st.setdefault("current", 0)
     for a in _accounts(db, "wb"):
+        refs = {r.item_id: r for r in db.query(ReferencePrice).filter(ReferencePrice.account_id == a.id)}
         for item_id, rows in mapping.account_items(db, a.id).items():
-            sale = item_facts(rule, rows).sale
+            ref = refs.get(item_id)
+            sale = reference.ref_sale(ref) if ref is not None else None
+            if sale:
+                st["ref"] += 1
+            else:
+                sale = item_facts(rule, rows).sale
+                if sale:
+                    st["current"] += 1
             if sale:
                 vals.setdefault(article_of(articles, item_id), []).append(sale)
     return {art: Decimal(sum(v)) / len(v) * (1 - wb_discount / 100) for art, v in vals.items()}
@@ -207,6 +226,8 @@ def main() -> int:
     ap.add_argument("--disc-max", type=Decimal, default=Decimal(50))
     ap.add_argument("--wb-disc-min", type=Decimal, default=None, help="коридор скидки на WB (по умолчанию как у остальных)")
     ap.add_argument("--wb-disc-max", type=Decimal, default=None)
+    ap.add_argument("--only", choices=("kit", "lamoda"), default="",
+                    help="только эта площадка (без листа WB)")
     ap.add_argument("--show", type=int, default=15, help="примеров на площадку в консоли")
     ap.add_argument("--xlsx", default="", help="сохранить расчёт в .xlsx")
     args = ap.parse_args()
@@ -222,12 +243,15 @@ def main() -> int:
         info = {}
         for b in db.query(OnecBarcode):
             info.setdefault(b.item_id, b)
-        et = etalon(db, articles, args.wb_discount)
+        est: dict = {}
+        et = etalon(db, articles, args.wb_discount, est)
         print(f"Эталон: средняя цена продавца со скидкой на WB минус {args.wb_discount}% — {len(et)} артикулов. "
               f"Коридор скидки продавца {lo}–{hi}%. НИЧЕГО НЕ ОТПРАВЛЯЕТСЯ.")
         wlo = args.wb_disc_min if args.wb_disc_min is not None else lo
         whi = args.wb_disc_max if args.wb_disc_max is not None else hi
-        wb = wb_rows(db, et, args.wb_discount, articles, costs, info, rate.usd_rub, wlo, whi)
+        print(f"Эталон WB (цена после скидки продавца): из записанного эталона — {est['ref']} SKU, "
+              f"из нынешней цены (эталона нет) — {est['current']} SKU.")
+        wb = [] if args.only else wb_rows(db, et, args.wb_discount, articles, costs, info, rate.usd_rub, wlo, whi)
         if wb:
             print(f"\n=== Wildberries — цена со скидкой продавца НЕ меняется; цена до скидки и скидка — "
                   f"под коридор {wlo}–{whi}%. Товаров {len(wb)}")
@@ -266,6 +290,8 @@ def main() -> int:
                       f"{r['list']}, скидка {_pct(r['disc'])}%, со скидкой {r['current_sale']} (без изменений)")
         rows = []
         for platform, shift in (("kit", args.kit), ("lamoda", args.lamoda)):
+            if args.only and platform != args.only:
+                continue
             if not _accounts(db, platform):
                 print(f"\n{PLATFORMS[platform]}: активных кабинетов нет.")
                 continue
@@ -280,7 +306,7 @@ def main() -> int:
                 if cnt.get(act):
                     print(f"  {cnt[act]:6d}  {act}")
             if ch:
-                print(f"  цена для покупателя изменится: медиана {statistics.median(ch):+.1f}%, "
+                print(f"  цена после скидки продавца изменится: медиана {statistics.median(ch):+.1f}%, "
                       f"от {min(ch):+.1f}% до {max(ch):+.1f}%")
             bf = sum(1 for r in items if r["below_floor"])
             if bf:
@@ -296,12 +322,14 @@ def main() -> int:
         if args.xlsx:
             from priceapp.excel import xlsx_bytes
             head = ["Площадка", "Кабинет", "Категория", "Артикул", "Размер", "Цвет", "ID_1С",
-                    "Эталон (WB −%), ₽", "Цель со скидкой, ₽", "Сейчас: цена до скидки, ₽",
+                    "Эталон WB после скидки продавца (средняя), ₽", f"Эталон (WB −{args.wb_discount}%), ₽",
+                    "Цель со скидкой, ₽", "Сейчас: цена до скидки, ₽",
                     "Сейчас: цена со скидкой, ₽", "Сейчас: скидка, %", "Что сделать",
-                    "Новая цена до скидки, ₽", "Новая скидка, %", "Изменение цены для покупателя, %",
+                    "Новая цена до скидки, ₽", "Новая скидка, %", "Изменение цены после скидки продавца, %",
                     "Маржинальность по цели", "Ниже пола", "Комиссия, %"]
             data = [[PLATFORMS[r["platform"]], r["account"], r["category"], r["article"], r["size"], r["color"],
-                     r["item_id"], _f(r["etalon"], 0), r["target"], r["current_list"], r["current_sale"],
+                     r["item_id"], _f(r["etalon"] / (1 - args.wb_discount / 100), 0) if r["etalon"] is not None else None,
+                     _f(r["etalon"], 0), r["target"], r["current_list"], r["current_sale"],
                      _pct(r["current_disc"]), r["action"], r["list"], _pct(r["disc"]),
                      _f(r["change"], 1), _f(r["margin"]), "да" if r["below_floor"] else "",
                      _f(r["commission"])]
@@ -309,7 +337,25 @@ def main() -> int:
             from openpyxl import load_workbook
             import io
             book = load_workbook(io.BytesIO(xlsx_bytes(head, data)))
-            book.active.title = "Kit и Ламода"
+            book.active.title = {"lamoda": "Ламода", "kit": "Kit"}.get(args.only, "Kit и Ламода")
+            # Сводка по категориям: как изменится цена после скидки продавца
+            sv = book.create_sheet("Сводка", 0)
+            sv.append(["Площадка", "Категория", "Товаров", "С эталоном", "Дешевле", "Дороже", "Без изменений",
+                       "Изменение: медиана, %", "мин, %", "макс, %", "Ниже пола"])
+            groups: dict[tuple, list[dict]] = {}
+            for r in rows:
+                groups.setdefault((PLATFORMS[r["platform"]], r["category"]), []).append(r)
+            for (plat, cat), rs in sorted(groups.items(), key=lambda kv: (kv[0][0], -len(kv[1]))):
+                ch = [r["change"] for r in rs if r["change"] is not None]
+                sv.append([plat, cat, len(rs), sum(1 for r in rs if r["target"]),
+                           sum(1 for x in ch if x < -0.5), sum(1 for x in ch if x > 0.5),
+                           sum(1 for x in ch if -0.5 <= x <= 0.5),
+                           _f(statistics.median(ch), 1) if ch else None, _f(min(ch), 1) if ch else None,
+                           _f(max(ch), 1) if ch else None, sum(1 for r in rs if r["below_floor"])])
+            if args.only:
+                book.save(args.xlsx)
+                print(f"\nФайл: {args.xlsx}")
+                return 0
             ws = book.create_sheet("WB")
             ws.append(["Кабинет", "Категория", "Артикул", "Размер", "Цвет", "ID_1С", "Сейчас: цена до скидки, ₽",
                        "Сейчас: цена со скидкой, ₽", "Сейчас: скидка, %", "Средняя со скидкой по WB, ₽",
