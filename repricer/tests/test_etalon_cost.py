@@ -69,3 +69,23 @@ def test_form_has_fill_columns_and_price_formulas(db, tmp_path):
     f = ws.cell(2, h.index("ИП 1: новая цена со скидкой") + 1).value
     assert f.startswith("=IF(") and "ROUNDUP($D2*" in f and "Категории!" in f
     assert book["Категории"].cell(1, 4).value == "Маржинальность категории"
+
+
+def test_top_cost_only_from_skus_mapped_to_platform_cards(db, tmp_path):
+    """Под «2101» в 1С и пиджак за 33,52 $, и свитшот за 8,66 $; на площадке только свитшот —
+    пиджак верхней планкой быть не должен."""
+    w = F.account(db, "wb", "ИП 1", commission=25)
+    F.manual_rate(db, "100")
+    F.sku(db, "jacket", "2101-008", "48", "Зелёный", barcodes=["j1"], cost_usd=33.52)   # на площадке нет
+    F.sku(db, "sweat", "2101-100", "L", "Коричневый", barcodes=["s1"], cost_usd=8.66)
+    F.item(db, w, "s1", "2101-100", external_id="1:1")
+    for it in db.query(PlatformItem):
+        it.current_price, it.current_sale_price = 9429, 5280
+    db.commit()
+    out = tmp_path / "m.xlsx"
+    r = subprocess.run([sys.executable, str(ROOT / "scripts" / "etalon_cost.py"), "--xlsx", str(out)],
+                       capture_output=True, cwd=ROOT, env={**os.environ, "PYTHONIOENCODING": "cp1251"})
+    assert r.returncode == 0, r.stderr.decode("utf-8", "replace")
+    rows = list(load_workbook(out)["Артикулы"].iter_rows(values_only=True))
+    row = dict(zip(rows[0], rows[1]))
+    assert row["Артикул"] == "2101" and row["Себестоимость макс, $"] == 8.66
