@@ -211,4 +211,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if "--apply" in sys.argv or "--rollback" in sys.argv:
+        from wb_bids import lock_acquire, lock_release    # общая блокировка с автопилотом и часовой проверкой
+        if not lock_acquire("wb_trim.py", wait_min=25):
+            sys.exit("✗ Сейчас применяет wb_bids.py или wb_guard.py больше 25 мин — ничего не меняю, запустите позже.")
+        try:
+            main()
+        finally:
+            lock_release()
+    else:
+        main()

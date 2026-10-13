@@ -23,7 +23,10 @@
 Безопасность:
   • без --apply — пробный прогон: только показывает;
   • --apply сохраняет резервную копию в wb_guard_backups\\, --rollback возвращает ставки последнего запуска;
-  • пока идёт wb_bids.py (файл wb_bids.running), проверка ничего не делает;
+  • общая блокировка с wb_bids.py (файл wb_bids.running): пока применяет автопилот — проверка пропускается,
+    пока применяет проверка — автопилот ждёт её окончания;
+  • кампанию на паузе, в бюджете которой есть деньги (≥ PAUSED_MONEY_BELOW в wb_bids.py), не пополняет и не
+    запускает — паузу поставили вы;
   • потолки старше 2 суток (автопилот давно не применялся) — ничего не меняет, только сообщает.
 
 Запуск:  python wb_guard.py              (пробный прогон)
@@ -45,22 +48,11 @@ REC_MAX = 40                # сколько товаров за проверк�
 REC_MAX_BY_CAB = {"Яворская": 40}   # по кабинетам; остальным — REC_MAX_OTHER (WB отдаёт рекомендацию раз в 12 с)
 REC_MAX_OTHER = 15
 CAPS_MAX_AGE_HOURS = 48     # потолки из wb_bids.py старше — не доверяю, ничего не меняю
-LOCK_MAX_AGE_HOURS = 2      # файл wb_bids.running старше — считаю, что автопилот упал, и работаю
 # -------------------------------------------
 
 BACKUP_DIR = B.HERE / "wb_guard_backups"
 LOG_FILE = B.HERE / "wb_guard_log.txt"
 log = B.log
-
-
-def busy():
-    if not B.LOCK_FILE.exists():
-        return False
-    try:
-        t = dt.datetime.fromisoformat(B.LOCK_FILE.read_text(encoding="utf-8").strip())
-    except (OSError, ValueError):
-        return True
-    return dt.datetime.now() - t < dt.timedelta(hours=LOCK_MAX_AGE_HOURS)
 
 
 def write_log():
@@ -86,12 +78,15 @@ def plan_topups(cab, token, camps, state):
         return []
     buds = B.get_budgets(token, ids)
     res = []
-    # общий недельный бюджет пополнений кабинета (как в wb_bids.py: "_week_budget")
+    # общий недельный бюджет пополнений кабинета (как в wb_bids.py: "_week_budget") — по всем кампаниям кабинета
     cab_cap = next((t.get("cab_cap") for t in rules.values() if t.get("cab_cap")), None)
-    cab_left = cab_cap - sum(B.topped_week(state, c) for c in rules) if cab_cap else None
+    cab_left = cab_cap - B.topped_cabinet(state, cab, camps) if cab_cap else None
     for cid in ids:
         t, bud = rules[cid], buds.get(cid)
         if bud is None or bud >= t["below"]:
+            continue
+        if camps[cid].get("_status") == 11 and bud >= B.PAUSED_MONEY_BELOW:
+            log(f"  «{t['name']}» на паузе, в бюджете {B.fm_rub(bud)} ₽ — паузу, видимо, поставили вы: не пополняю и не запускаю.")
             continue
         amount = min(t["amount"], t["day_cap"] - B.topped_week(state, cid, days=1), t["week_cap"] - B.topped_week(state, cid))
         if cab_cap:
@@ -178,22 +173,52 @@ def main():
         if not files:
             sys.exit("Резервных копий нет.")
         items = json.loads(files[-1].read_text(encoding="utf-8"))
-        log(f"{dt.datetime.now():%d.%m.%Y %H:%M} — ОТКАТ по {files[-1].name}: вернуть {len(items)} ставок "
-            "(применяется сразу; если автопилот после этого уже менял ставки — они будут перезаписаны)")
-        for cab in sorted({i["cabinet"] for i in items}):
-            if cab in cabs:
-                n = B.apply_bids(cabs[cab], [i for i in items if i["cabinet"] == cab], "old")
-                log(f"  {cab}: возвращено ставок {n}")
+        log(f"{dt.datetime.now():%d.%m.%Y %H:%M} — ОТКАТ по {files[-1].name}: {len(items)} ставок (применяется сразу). "
+            "Ставки, которые после этого уже поменял автопилот или вы, не трогаю.")
+        if not B.lock_acquire("wb_guard.py --rollback", wait_min=25):
+            log("  ✗ Блокировка занята больше 25 мин — откат не сделан, запустите позже.")
+            write_log()
+            return
+        try:
+            for cab in sorted({i["cabinet"] for i in items}):
+                if cab not in cabs:
+                    continue
+                camps = B.get_campaigns(cabs[cab])
+                todo, moved = [], 0
+                for i in (x for x in items if x["cabinet"] == cab):
+                    a = camps.get(i["advert_id"]) or {}
+                    cur = next(((s.get("bids_kopecks") or {}).get("search" if i["placement"] == "combined" else i["placement"])
+                                for s in a.get("nm_settings") or [] if s.get("nm_id") == i["nm_id"]), None)
+                    if cur == i["new"]:
+                        todo.append(i)
+                    else:
+                        moved += 1
+                n = B.apply_bids(cabs[cab], todo, "old") if todo else 0
+                log(f"  {cab}: возвращено ставок {n}" + (f"; не тронуто {moved} — их уже изменили после проверки" if moved else ""))
+            files[-1].rename(files[-1].with_suffix(".rolled_back"))
+            log("  Внимание: следующая часовая проверка снова поведёт ставки за рекомендацией WB. Чтобы этого не было, "
+                "отключите задачу: Disable-ScheduledTask -TaskName AWER_WB_guard")
+        finally:
+            B.lock_release()
         write_log()
         return
 
     apply = "--apply" in sys.argv
     log(f"{dt.datetime.now():%d.%m.%Y %H:%M} — часовая проверка ставок WB "
         f"({'ПРИМЕНЕНИЕ' if apply else 'пробный прогон, ничего не меняется'})")
-    if busy():
-        log("  Сейчас работает wb_bids.py — проверку пропускаю.")
+    if apply and not B.lock_acquire("wb_guard.py"):
+        info = B.lock_info()
+        log(f"  Сейчас применяет {info[1] if info else 'wb_bids.py'} — проверку пропускаю.")
         write_log()
         return
+    try:
+        run(cabs, apply)
+    finally:
+        if apply:
+            B.lock_release()
+
+
+def run(cabs, apply):
     state = B.load_state()
     caps = state.get("caps") or {}
     try:

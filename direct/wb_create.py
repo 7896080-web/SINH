@@ -46,11 +46,16 @@ class ApiError(Exception):
         self.status = status
 
 
-def call(method, url, token, params=None, body=None, what=""):
+def call(method, url, token, params=None, body=None, what="", retry=True):
+    """retry=False — создание кампании, пополнение, запуск: повтор после тайм-аута создал бы вторую кампанию или
+    пополнил дважды. Повторяется только то, что WB точно не выполнил (429, не удалось соединиться)."""
     for attempt in range(5):
         try:
             r = S.request(method, url, headers={"Authorization": token}, params=params, json=body, timeout=120)
         except requests.RequestException as e:
+            if not retry and not isinstance(e, requests.ConnectTimeout):
+                raise ApiError(f"{what}: WB не ответил ({e.__class__.__name__}) — запрос мог пройти, проверьте в кабинете WB "
+                               "и НЕ запускайте команду повторно, пока не убедитесь")
             if attempt < 3:
                 time.sleep(5)
                 continue
@@ -69,6 +74,9 @@ def call(method, url, token, params=None, body=None, what=""):
                 raise ApiError(f"{what}: WB просит подождать {wait / 60:.0f} мин — нужен Персональный токен.")
             time.sleep(wait + 1)
             continue
+        if r.status_code >= 500 and not retry:
+            raise ApiError(f"{what}: ошибка WB {r.status_code} — запрос мог пройти, проверьте в кабинете WB "
+                           "и НЕ запускайте команду повторно, пока не убедитесь", r.status_code)
         if r.status_code >= 500 and attempt < 3:
             time.sleep(10)
             continue
@@ -167,7 +175,7 @@ def main():
             return
         try:
             res = call("POST", ADV + "/adv/v1/budget/deposit", token, params={"id": a.deposit},
-                       body={"sum": int(a.budget), "type": SOURCES[a.source], "return": True}, what="Пополнение бюджета")
+                       body={"sum": int(a.budget), "type": SOURCES[a.source], "return": True}, what="Пополнение бюджета", retry=False)
             total = (res or {}).get("total") if isinstance(res, dict) else None
             print(f"{cab}: бюджет кампании {a.deposit} пополнен на {a.budget} ₽{f', теперь {total} ₽' if total is not None else ''}.")
         except ApiError as e:
@@ -182,7 +190,7 @@ def main():
                   "\nВыполнить: добавьте --apply")
             return
         try:
-            call("GET", ADV + path, token, params={"id": cid}, what="Запуск" if a.start else "Пауза")
+            call("GET", ADV + path, token, params={"id": cid}, what="Запуск" if a.start else "Пауза", retry=False)
             print(f"{cab}: кампания {cid} {'запущена' if a.start else 'поставлена на паузу'}.")
         except ApiError as e:
             print(f"✗ {e}")
@@ -251,14 +259,14 @@ def main():
 
     body = {"name": a.name, "nms": take, "bid_type": "manual", "payment_type": a.pay, "placement_types": where}
     try:
-        cid = call("POST", ADV + "/adv/v2/seacat/save-ad", token, body=body, what="Создание кампании")
+        cid = call("POST", ADV + "/adv/v2/seacat/save-ad", token, body=body, what="Создание кампании", retry=False)
     except ApiError as e:
         sys.exit(f"✗ {e}")
     print(f"\n✓ Создана кампания ID {cid} (готова к запуску, ставки минимальные).")
     if a.budget:
         try:
             res = call("POST", ADV + "/adv/v1/budget/deposit", token, params={"id": cid},
-                       body={"sum": int(a.budget), "type": SOURCES[a.source], "return": True}, what="Пополнение бюджета")
+                       body={"sum": int(a.budget), "type": SOURCES[a.source], "return": True}, what="Пополнение бюджета", retry=False)
             total = (res or {}).get("total") if isinstance(res, dict) else None
             print(f"✓ Бюджет пополнен{f', теперь {total} ₽' if total is not None else ''}.")
         except ApiError as e:
