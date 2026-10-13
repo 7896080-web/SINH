@@ -13,7 +13,7 @@
   • ставки на отдельные кластеры (/adv/v0/normquery/get-bids, /api/advert/v1/normquery/bids) — только у кампаний
     за показы с РУЧНОЙ ставкой.
 
-Что показывает (по каждому кабинету, за последние N дней, по умолчанию 14):
+Что показывает (только активные кампании; с --all — и на паузе; по каждому кабинету, за последние N дней, по умолчанию 14):
   1. Для каждой кампании: тип оплаты и ставки, сколько кластеров активно / исключено, отдаёт ли WB статистику.
   2. По каждому товару — кластеры с наибольшим расходом: показы, клики, CTR, корзины, заказы, расход, цена заказа,
      средняя позиция, статус (активен / исключён), ставка на кластер (если ручная).
@@ -24,6 +24,7 @@
          python wb_clusters.py 30                    (за 30 дней)
          python wb_clusters.py --cabinet "Ребрик"
          python wb_clusters.py --campaign 40863019   (одна кампания)
+         python wb_clusters.py --all                 (вместе с кампаниями на паузе)
 Нужна категория токена «Продвижение».
 Результат: вывод на экран + wb_clusters_report.txt, wb_clusters.csv (все кластеры)
 """
@@ -117,11 +118,11 @@ def nq_bids(token, pairs):
 
 def run_cabinet(cab, token, only):
     log(f"\n══════════ {cab} ══════════")
-    camps = campaigns(token, statuses=(9, 11))
+    camps = campaigns(token, statuses=(9, 11) if "--all" in sys.argv else (9,))
     if only:
         camps = {k: v for k, v in camps.items() if str(k) == str(only)}
     if not camps:
-        log("  Кампаний нет.")
+        log("  Активных кампаний нет." if "--all" not in sys.argv else "  Кампаний нет.")
         return []
     d2 = YESTERDAY
     d1 = d2 - dt.timedelta(days=DAYS - 1)
