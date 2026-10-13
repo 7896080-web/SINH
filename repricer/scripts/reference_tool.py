@@ -6,6 +6,10 @@ r"""Служебная утилита эталонных цен WB (запуск
   status       сколько эталонных цен по кабинетам, настройки правила, курс эталонных и текущий
   run          один прогон правила (пересчёт по курсу + возврат цен) по уже загруженным ценам
   enable / disable   включить или выключить правило
+  adopt-discount     нынешние скидки WB (загруженные программой) — эталонными; программа будет
+                     возвращать их, если WB сменит скидку сам (автоакцией)
+  discount-check     где скидка на WB сейчас не эталонная (по загруженным ценам; ничего не шлёт)
+  discount-on / discount-off   включить или выключить проверку скидки
 """
 import sys
 from pathlib import Path
@@ -14,9 +18,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import os
 os.environ.setdefault("REPRICER_SESSION_SECRET", "x" * 32)
 
-from priceapp import rates, reference, settings          # noqa: E402
+from priceapp import discount_guard, rates, reference, settings          # noqa: E402
 from priceapp.database import Base, SessionLocal, engine  # noqa: E402
-from priceapp.models import Account, ReferencePrice      # noqa: E402
+from priceapp.models import Account, ReferenceDiscount, ReferencePrice      # noqa: E402
 
 
 def main(argv):
@@ -28,6 +32,20 @@ def main(argv):
             print(reference.adopt_sent(db))
         elif cmd == "run":
             print(reference.summary(reference.run(db, actor="reference_tool")))
+        elif cmd == "adopt-discount":
+            for name, n in discount_guard.adopt(db, actor="reference_tool").items():
+                print(f"{name}: эталонных скидок {n}")
+        elif cmd == "discount-check":
+            from priceapp.models import Account as A
+            for a in db.query(A).filter(A.platform == "wb"):
+                bad = discount_guard.mismatches(db, a)
+                print(f"{a.name}: скидка не эталонная у {len(bad)} карточек (цены загружены {a.prices_loaded_at})")
+                for nm, cur, ref, _ in bad[:10]:
+                    print(f"    {nm}: сейчас {cur}%, эталонная {ref}%")
+        elif cmd in ("discount-on", "discount-off"):
+            settings.put(db, settings.DISCOUNT_GUARD_ENABLED, "1" if cmd == "discount-on" else "0")
+            db.commit()
+            print("проверка скидки WB:", "включена" if cmd == "discount-on" else "выключена")
         elif cmd in ("enable", "disable"):
             settings.put(db, settings.REF_ENABLED, "1" if cmd == "enable" else "0")
             db.commit()
@@ -40,7 +58,10 @@ def main(argv):
             for a in db.query(Account).filter(Account.platform == "wb"):
                 rows = db.query(ReferencePrice).filter(ReferencePrice.account_id == a.id).all()
                 rates_ = sorted({str(r.usd_rub) for r in rows})
-                print(f"{a.name}: эталонных цен {len(rows)}; курсы эталонных {rates_}; цены загружены {a.prices_loaded_at}")
+                nd = db.query(ReferenceDiscount).filter(ReferenceDiscount.account_id == a.id).count()
+                print(f"{a.name}: эталонных цен {len(rows)}; курсы эталонных {rates_}; эталонных скидок {nd}; "
+                      f"цены загружены {a.prices_loaded_at}")
+            print("проверка скидки:", "включена" if discount_guard.enabled(db) else "ВЫКЛЮЧЕНА")
     finally:
         db.close()
 

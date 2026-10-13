@@ -79,6 +79,8 @@ def test_send_puts_only_nm_and_discount(db, tmp_path):
     assert url.endswith("/api/v2/upload/task")
     assert body == {"data": [{"nmID": 111, "discount": 50}, {"nmID": 222, "discount": 40}]}
     assert db.query(AuditLog).filter(AuditLog.action == "wb_restore_discount").count() == 1
+    from priceapp.models import ReferenceDiscount      # отправленная скидка — эталонная для проверки скидки
+    assert {r.nm_id: r.discount for r in db.query(ReferenceDiscount)} == {"111": 50, "222": 40}
 
 
 def test_from_report_file_maps_1c_sku_to_card_and_sends_nothing_without_send(db, tmp_path):
@@ -155,3 +157,5 @@ def test_plan_sends_list_and_discount_per_card_and_skips_unsafe_cards(db, tmp_pa
     assert res["ИП 1"] == "отправлено карточек: 2"
     assert calls == [{"data": [{"nmID": 111, "price": 10000, "discount": 50},
                                {"nmID": 222, "price": 9230, "discount": 35}]}]
+    from priceapp.models import ReferenceDiscount
+    assert {r.nm_id: r.discount for r in db.query(ReferenceDiscount)} == {"111": 50, "222": 35}

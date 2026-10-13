@@ -400,6 +400,21 @@ class ReferencePrice(Base):
     set_at = Column(DateTime, nullable=False, default=now_utc)
 
 
+class ReferenceDiscount(Base):
+    """ЭТАЛОННАЯ скидка продавца карточки WB (nmID) — та, которую мы поставили
+    (`discount_guard.py`). WB умеет менять скидку сам — автоакцией из календаря акций, — и
+    цена для покупателя тогда уходит мимо нас, а правило эталонной цены этого не видит: цена
+    до скидки при этом не меняется. Скидка на WB одна на карточку и целая."""
+    __tablename__ = "reference_discounts"
+    __table_args__ = (UniqueConstraint("account_id", "nm_id", name="uq_reference_discount"),)
+    id = Column(Integer, primary_key=True)
+    account_id = Column(Integer, ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False)
+    nm_id = Column(String(32), nullable=False)
+    discount = Column(Integer, nullable=False)
+    source = Column(String(16), nullable=False, default="adopt")   # adopt / sent
+    set_at = Column(DateTime, nullable=False, default=now_utc)
+
+
 class CardEcon(Base):
     """Экономика строки «карточка площадки + артикул 1С» кабинета, которой нет в отчётах площадки
     через API: доля выплаты от цены продавца `k`, цена покупателя / цена продавца `w`, логистика с
