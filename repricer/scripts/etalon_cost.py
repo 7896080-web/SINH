@@ -82,6 +82,132 @@ def wb_rows(db, articles, costs, per_art, info, usd: Decimal) -> list[dict]:
     return out
 
 
+FILL = "FFF2CC"
+CAB_COLS = 5           # на кабинет: комиссия, цена сейчас, маржинальность сейчас, новая цена, изменение
+
+
+def _col(n: int) -> str:
+    from openpyxl.utils import get_column_letter
+    return get_column_letter(n)
+
+
+def build_form(rows: list[dict], per_art: dict, usd: Decimal, accs: list[str], path: str) -> None:
+    """Форма «маржинальность по артикулам WB». Жёлтое заполняет владелец: маржинальность
+    категории (лист «Категории»), артикула и — если нужна иная — артикула в кабинете.
+    Действует самая частная заполненная. Новая цена со скидкой считается формулой Excel
+    тем же правилом, что потом применит программа:
+        цена со скидкой = себестоимость артикула, руб × маржинальность / (1 − комиссия кабинета).
+    Цену программа пересчитает сама по этим ячейкам — формулы только для глаз."""
+    from openpyxl import Workbook
+    from openpyxl.comments import Comment
+    from openpyxl.styles import Alignment, Font, PatternFill
+    fill = PatternFill("solid", fgColor=FILL)
+    bold = Font(bold=True)
+    book = Workbook()
+
+    by_model: dict[str, list[dict]] = {}
+    for r in rows:
+        by_model.setdefault(r["model"], []).append(r)
+    cat_of = {m: rs[0]["category"] for m, rs in by_model.items()}
+
+    # --- Категории
+    wc = book.active
+    wc.title = "Категории"
+    wc.append(["Категория", "Артикулов", "Маржинальность сейчас (медиана)", "Маржинальность категории"])
+    cats = sorted({c for c in cat_of.values()})
+    for c in cats:
+        rs = [r for r in rows if r["category"] == c]
+        wc.append([c, len({r["model"] for r in rs}), _f(_med(r["margin"] for r in rs)), None])
+    for n in range(2, len(cats) + 2):
+        wc.cell(n, 4).fill = fill
+    ncat = len(cats) + 1
+
+    # --- Артикулы
+    ws = book.create_sheet("Артикулы", 0)
+    head = ["Артикул", "Категория", "Себестоимость макс, $", "Себестоимость макс, руб", "Себестоимость мин, $",
+            "Маржинальность артикула"]
+    for a in accs:
+        head += [f"{a}: маржинальность (если иная)"]
+    for a in accs:
+        head += [f"{a}: комиссия, %", f"{a}: цена со скидкой сейчас", f"{a}: маржинальность сейчас",
+                 f"{a}: новая цена со скидкой", f"{a}: изменение, %"]
+    ws.append(head)
+    for c in range(1, len(head) + 1):
+        ws.cell(1, c).font = bold
+        ws.cell(1, c).alignment = Alignment(wrap_text=True, vertical="top")
+    ART_M = 6
+    first_over = ART_M + 1
+    first_cab = first_over + len(accs)
+    for n, model in enumerate(sorted(by_model, key=lambda m: (cat_of[m], m)), start=2):
+        rs = by_model[model]
+        d = per_art.get(model)
+        line = [model, cat_of[model], _f(d["max"]) if d else None, _f(d["max"] * usd) if d else None,
+                _f(d["min"]) if d else None, None] + [None] * len(accs)
+        for a in accs:
+            mine = [r for r in rs if r["account"] == a]
+            if not mine:
+                line += [None] * CAB_COLS
+                continue
+            line += [_f(_med(r["commission"] for r in mine)), _med(r["sale"] for r in mine),
+                     _f(_med(r["margin"] for r in mine)), None, None]
+        ws.append(line)
+        ws.cell(n, ART_M).fill = fill
+        for k in range(len(accs)):
+            ws.cell(n, first_over + k).fill = fill
+        cat_lookup = f'IFERROR(VLOOKUP($B{n},Категории!$A$2:$D${ncat},4,FALSE),"")'
+        for k, a in enumerate(accs):
+            base = first_cab + k * CAB_COLS
+            comm, now, newp, chg = _col(base), _col(base + 1), _col(base + 3), _col(base + 4)
+            if ws.cell(n, base).value is None or d is None:
+                continue
+            over = _col(first_over + k)
+            m = (f'IF({over}{n}<>"",{over}{n},IF($F{n}<>"",$F{n},'
+                 f'IF(OR({cat_lookup}="",{cat_lookup}=0),"",{cat_lookup})))')
+            ws[f"{newp}{n}"] = f'=IF({m}="","",ROUNDUP($D{n}*{m}/(1-{comm}{n}/100),0))'
+            ws[f"{chg}{n}"] = f'=IF(OR({newp}{n}="",{now}{n}=""),"",ROUND(({newp}{n}/{now}{n}-1)*100,1))'
+    ws.freeze_panes = ws.cell(2, 3)
+    ws.cell(1, ART_M).comment = Comment("Заполните: маржинальность = к получению / себестоимость. "
+                                        "Пусто — берётся маржинальность категории.", "программа")
+    widths = {1: 18, 2: 18}
+    for c in range(1, len(head) + 1):
+        ws.column_dimensions[_col(c)].width = widths.get(c, 13)
+    wc.column_dimensions["A"].width = 26
+    for c in "BCD":
+        wc.column_dimensions[c].width = 16
+
+    # --- Товары WB (справочно)
+    ws2 = book.create_sheet("Товары WB")
+    ws2.append(["Кабинет", "Категория", "Артикул (без цвета)", "Артикул 1С", "Размер", "Цвет", "ID_1С",
+                "Цена до скидки", "Цена со скидкой", "Скидка, %", "Комиссия, %", "К получению, руб",
+                "Себестоимость SKU, $", "Себестоимость артикула (макс), $",
+                "Себестоимость артикула, руб", "Маржинальность (от макс)", "Маржинальность (от своей)"])
+    for r in sorted(rows, key=lambda r: (r["category"], r["model"], r["article"], r["size"], r["account"])):
+        ws2.append([r["account"], r["category"], r["model"], r["article"], r["size"], r["color"],
+                    r["item_id"], r["list"], r["sale"],
+                    _f(r["disc"] * 100, 1) if r["disc"] is not None else None, _f(r["commission"]),
+                    _f(r["payout"], 0), _f(r["cost_usd"]), _f(r["cost_max_usd"]),
+                    _f(r["cost_max_rub"], 0), _f(r["margin"]), _f(r["margin_own"])])
+
+    # --- Как заполнять
+    wh = book.create_sheet("Как заполнять")
+    for line in (
+        "Маржинальность = к получению / себестоимость артикула (к получению = цена со скидкой x (1 - комиссия)).",
+        "Себестоимость артикула — НАИБОЛЬШАЯ среди всех его размеров и цветов (1С), в рублях по текущему курсу.",
+        "Жёлтые ячейки заполняете вы. Действует самая частная заполненная:",
+        "  1) «<кабинет>: маржинальность (если иная)» на листе «Артикулы»;",
+        "  2) «Маржинальность артикула» на листе «Артикулы»;",
+        "  3) «Маржинальность категории» на листе «Категории».",
+        "Пусто везде — у артикула цена не меняется.",
+        "Новая цена со скидкой = себестоимость, руб x маржинальность / (1 - комиссия кабинета), вверх до рубля.",
+        "Колонки «новая цена» и «изменение» — формулы, только для глаз: программа пересчитает сама.",
+        "Колонки и названия листов не переименовывайте — файл прочитает программа.",
+        f"Курс: {usd}.",
+    ):
+        wh.append([line])
+    wh.column_dimensions["A"].width = 110
+    book.save(path)
+
+
 def _f(v, nd=2):
     return None if v is None else round(float(v), nd)
 
@@ -150,41 +276,8 @@ def main(argv=None) -> int:
                       f"{r['cost_usd']} $ -> маржинальность {_f(r['margin'])} (от своей {_f(r['margin_own'])})")
 
         if args.xlsx:
-            from openpyxl import Workbook
-            book = Workbook()
-            ws = book.active
-            ws.title = "Артикулы"
-            ws.append(["Артикул", "Категория", "Себестоимость макс, $", "Себестоимость мин, $", "Разброс, %",
-                       "Себестоимость макс, руб", "SKU с себестоимостью"]
-                      + [f"{a}: цена со скидкой (медиана)" for a in accs]
-                      + [f"{a}: маржинальность (медиана)" for a in accs]
-                      + ["Маржинальность мин", "Маржинальность макс"])
-            by_model: dict[str, list[dict]] = {}
-            for r in rows:
-                by_model.setdefault(r["model"], []).append(r)
-            for model in sorted(by_model):
-                rs = by_model[model]
-                d = per_art.get(model)
-                ms = [r["margin"] for r in rs if r["margin"] is not None]
-                ws.append([model, rs[0]["category"], _f(d["max"]) if d else None, _f(d["min"]) if d else None,
-                           _f((d["max"] / d["min"] - 1) * 100, 1) if d else None,
-                           _f(d["max"] * usd) if d else None, d["skus"] if d else 0]
-                          + [_med(r["sale"] for r in rs if r["account"] == a) for a in accs]
-                          + [_f(_med(r["margin"] for r in rs if r["account"] == a)) for a in accs]
-                          + [_f(min(ms)) if ms else None, _f(max(ms)) if ms else None])
-            ws2 = book.create_sheet("Товары WB")
-            ws2.append(["Кабинет", "Категория", "Артикул (без цвета)", "Артикул 1С", "Размер", "Цвет", "ID_1С",
-                        "Цена до скидки", "Цена со скидкой", "Скидка, %", "Комиссия, %", "К получению, руб",
-                        "Себестоимость SKU, $", "Себестоимость артикула (макс), $",
-                        "Себестоимость артикула, руб", "Маржинальность (от макс)", "Маржинальность (от своей)"])
-            for r in sorted(rows, key=lambda r: (r["category"], r["model"], r["article"], r["size"], r["account"])):
-                ws2.append([r["account"], r["category"], r["model"], r["article"], r["size"], r["color"],
-                            r["item_id"], r["list"], r["sale"],
-                            _f(r["disc"] * 100, 1) if r["disc"] is not None else None, _f(r["commission"]),
-                            _f(r["payout"], 0), _f(r["cost_usd"]), _f(r["cost_max_usd"]),
-                            _f(r["cost_max_rub"], 0), _f(r["margin"]), _f(r["margin_own"])])
-            book.save(args.xlsx)
-            print(f"\nФайл: {args.xlsx}")
+            build_form(rows, per_art, usd, accs, args.xlsx)
+            print(f"\nФайл: {args.xlsx} — проставьте маржинальность (жёлтые колонки) и пришлите обратно.")
     finally:
         db.rollback()
         db.close()
