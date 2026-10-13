@@ -17,6 +17,7 @@
     .venv\\Scripts\\python.exe scripts\\lamoda_apply.py --xlsx C:\\repricer\\ламода_отправка.xlsx
         план, ничего не отправляет
     ... --send --limit 3          сначала проба на трёх карточках
+    ... --send --article 32481    проба на одном артикуле
     ... --send                    всё (спросит ДА; --yes — без вопроса)
     ... --verify                  после перезапуска программы: держит ли Ламода план
 
@@ -198,12 +199,16 @@ def main(argv=None) -> int:
     ap.add_argument("--send", action="store_true")
     ap.add_argument("--yes", action="store_true")
     ap.add_argument("--limit", type=int, default=0, help="отправить только первые N карточек (проба)")
+    ap.add_argument("--article", default="", help="только карточки, где артикул 1С содержит этот текст (проба)")
     ap.add_argument("--verify", action="store_true", help="сверить план с ценами, загруженными с Ламоды")
     args = ap.parse_args(argv)
     lo, hi = args.disc_min, args.disc_max
     db = SessionLocal()
     try:
         cards = build_plan(db, lo, hi, args.wb_discount)
+        if args.article:
+            cards = [c for c in cards if args.article.lower() in c.articles.lower()]
+            print(f"Только артикул «{args.article}»: карточек {len(cards)}")
         accs = db.query(Account).filter(Account.platform == "lamoda", Account.is_active.is_(True)).all()
         for a in accs:
             print(f"{a.name}: цены загружены с Ламоды {a.prices_loaded_at or '-'}")
