@@ -159,3 +159,41 @@ def test_plan_sends_list_and_discount_per_card_and_skips_unsafe_cards(db, tmp_pa
                                {"nmID": 222, "price": 9230, "discount": 35}]}]
     from priceapp.models import ReferenceDiscount
     assert {r.nm_id: r.discount for r in db.query(ReferenceDiscount)} == {"111": 50, "222": 35}
+
+
+def test_verify_compares_plan_with_loaded_wb_prices(db, tmp_path, capsys):
+    from openpyxl import Workbook
+    w = F.account(db, "wb", "ИП 1")
+    F.sku(db, "s1", "A1", barcodes=["a1"]); F.sku(db, "s3", "A2", barcodes=["b1"])
+    F.item(db, w, "a1", "A1", external_id="111:1"); F.item(db, w, "b1", "A2", external_id="222:1")
+    # WB уже держит план у 111 (10000, 50%), у 222 — нет (план 9230 / 35%, а там 9000 / 33%)
+    _set(db, {"a1": (10000, 5000), "b1": (9000, 6000)})
+    book = Workbook()
+    ws = book.active
+    ws.title = "WB"
+    ws.append(["Кабинет", "ID_1С", "Сейчас: цена до скидки, ₽", "Сейчас: цена со скидкой, ₽"])
+    ws.append(["ИП 1", "s1", 10000, 5000]); ws.append(["ИП 1", "s3", 9000, 6000])
+    f = tmp_path / "et.xlsx"
+    book.save(f)
+    after_path = Path(str(engine.url).replace("sqlite:///", ""))
+    assert wbrd.main(["--plan-xlsx", str(f), "--verify", "--after", str(after_path)]) == 0
+    out = capsys.readouterr().out
+    assert "совпадает с планом: 1; НЕ совпадает: 1" in out and "222" in out and "план 9230, скидка 35%" in out
+
+
+def test_adopt_current_makes_loaded_wb_prices_and_discounts_the_new_etalon(db):
+    from priceapp import discount_guard, reference
+    from priceapp.models import ReferenceDiscount, ReferencePrice
+    w = F.account(db, "wb", "ИП 1")
+    F.manual_rate(db, "100")
+    F.sku(db, "s1", "A1", barcodes=["a1"], cost_usd=10)
+    F.item(db, w, "a1", "A1", external_id="111:1")
+    _set(db, {"a1": (13710, 6855)})
+    db.add(ReferencePrice(account_id=w.id, item_id="s1", ref_price=13989))   # старый эталон
+    db.commit()
+    st = reference.adopt_current(db)
+    discount_guard.adopt(db)
+    db.expire_all()
+    ref = db.query(ReferencePrice).one()
+    assert st["recorded"] == 1 and ref.ref_price == 13710 and ref.source == "adopt"
+    assert {r.nm_id: r.discount for r in db.query(ReferenceDiscount)} == {"111": 50}

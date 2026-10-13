@@ -5,6 +5,7 @@ r"""Вернуть на WB скидку продавца, которую сме�
       показать, где скидка сейчас не та, что была в копии; ничего не отправляет
   ... --plan-xlsx эталон.xlsx         по отчёту эталона: цена до скидки и скидка под коридор
                                       35–50%, цена со скидкой — как в «Сейчас» (не растёт)
+  ... --plan-xlsx эталон.xlsx --verify   дошёл ли план: сверка с ценами, загруженными с WB
   ... --from-xlsx эталон.xlsx         то же, но «как было» — из отчёта эталона (лист «WB»,
                                       колонки «Сейчас: цена до скидки / со скидкой»)
   ... --xlsx скидки.xlsx              то же плюс файл (лист на кабинет)
@@ -143,7 +144,7 @@ def corridor(old_list: int, old_sale: int, lo: int, hi: int) -> tuple[int, int]:
     return int(Decimal(old_sale) * 100 // (100 - bound)), bound
 
 
-def load_plan(path: Path, db, after: dict, lo: int, hi: int) -> list[PlanCard]:
+def load_plan(path: Path, db, after: dict, lo: int, hi: int, check_live: bool = True) -> list[PlanCard]:
     """План по отчёту эталона: «как было» — колонки «Сейчас: …» листа «WB»; по карточке
     (nmID) цена до скидки и скидка под коридор. Карточку НЕ трогаем, если цены размеров в
     отчёте разные (цена уходит одна на карточку — дешёвые размеры подорожали бы) или если
@@ -190,7 +191,7 @@ def load_plan(path: Path, db, after: dict, lo: int, hi: int) -> list[PlanCard]:
             c.skip = "цены до скидки у размеров разные"
         elif live is None:
             c.skip = "карточки нет в загруженных ценах WB"
-        elif live.price != old_list:
+        elif check_live and live.price != old_list:
             c.skip = f"цена до скидки на WB сменилась с отчёта: было {old_list}, сейчас {live.price}"
         else:
             c.new_list, c.disc = corridor(old_list, old_sale, lo, hi)
@@ -232,15 +233,49 @@ def send_plan(db, cards: list[PlanCard], factory=None) -> dict[str, str]:
     return out
 
 
+def verify_plan(cards: list[PlanCard], after: dict, accs: dict) -> int:
+    """Дошло ли: держит ли WB (по ценам, загруженным программой) ту цену до скидки и скидку,
+    что были в плане. Ничего не отправляет."""
+    print("Сверка плана с ценами WB, загруженными программой:")
+    for name, t in accs.values():
+        print(f"  {name}: цены загружены с WB {t or '-'}")
+    ok, bad = 0, []
+    for c in cards:
+        if c.skip:
+            continue
+        live = after.get((c.account_id, c.nm))
+        if live and live.price == c.new_list and live.discount == c.disc:
+            ok += 1
+        else:
+            bad.append((c, live))
+    print(f"\nсовпадает с планом: {ok}; НЕ совпадает: {len(bad)}")
+    per: dict[str, int] = {}
+    for c, _ in bad:
+        per[c.account] = per.get(c.account, 0) + 1
+    for name, n in per.items():
+        print(f"  {name}: не совпадает {n}")
+    for c, live in bad[:20]:
+        now = f"{live.price}, скидка {live.discount}%" if live else "нет в загруженных"
+        print(f"    {c.account}: {c.nm} {c.article}: план {c.new_list}, скидка {c.disc}% — на WB {now}")
+    if bad:
+        print("\nЕсли цены загружены раньше, чем WB применил отправку, перезапустите программу и повторите.")
+    else:
+        print("\nВсё на месте. Новый эталон: .venv\\Scripts\\python.exe scripts\\reference_tool.py adopt-current")
+    return 0
+
+
 def run_plan(args, after_path: Path) -> int:
     after, accs_a = load(after_path)
     from priceapp.database import SessionLocal
     db = SessionLocal()
     try:
-        cards = load_plan(Path(args.plan_xlsx), db, after, args.disc_min, args.disc_max)
+        cards = load_plan(Path(args.plan_xlsx), db, after, args.disc_min, args.disc_max,
+                          check_live=not args.verify)
     finally:
         db.rollback()
         db.close()
+    if args.verify:
+        return verify_plan(cards, after, accs_a)
     go = [c for c in cards if not c.skip]
     print(f"План по отчёту {args.plan_xlsx}: цена со скидкой — как в колонке «Сейчас: цена со скидкой», "
           f"скидка в коридоре {args.disc_min}–{args.disc_max}%.")
@@ -371,6 +406,7 @@ def main(argv=None) -> int:
     ap.add_argument("--send", action="store_true", help="отправить прежнюю скидку на WB")
     ap.add_argument("--disc-min", type=int, default=35)
     ap.add_argument("--disc-max", type=int, default=50)
+    ap.add_argument("--verify", action="store_true", help="с --plan-xlsx: сверить план с ценами WB, ничего не шлёт")
     ap.add_argument("--yes", action="store_true", help="не спрашивать подтверждение (для проверок)")
     args = ap.parse_args(argv)
     after_path = Path(args.after) if args.after else _live_db()

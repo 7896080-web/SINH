@@ -6,6 +6,9 @@ r"""Служебная утилита эталонных цен WB (запуск
   status       сколько эталонных цен по кабинетам, настройки правила, курс эталонных и текущий
   run          один прогон правила (пересчёт по курсу + возврат цен) по уже загруженным ценам
   enable / disable   включить или выключить правило
+  adopt-current      НОВЫЙ ЭТАЛОН WB: цены до скидки и скидки, которые площадка держит сейчас
+                     (загруженные программой), — эталонными. Перед этим перезапустите программу,
+                     чтобы она загрузила свежие цены, и сверьте их (wb_restore_discount.py --verify)
   adopt-discount     нынешние скидки WB (загруженные программой) — эталонными; программа будет
                      возвращать их, если WB сменит скидку сам (автоакцией)
   discount-check     где скидка на WB сейчас не эталонная (по загруженным ценам; ничего не шлёт)
@@ -32,6 +35,14 @@ def main(argv):
             print(reference.adopt_sent(db))
         elif cmd == "run":
             print(reference.summary(reference.run(db, actor="reference_tool")))
+        elif cmd == "adopt-current":
+            from priceapp.models import Account as A
+            for a in db.query(A).filter(A.platform == "wb", A.is_active.is_(True)):
+                print(f"{a.name}: цены загружены с WB {a.prices_loaded_at}")
+            st = reference.adopt_current(db, actor="reference_tool")
+            print(f"эталонных цен записано: {st['recorded']} (без цены на WB: {st['skipped']})")
+            for name, n in discount_guard.adopt(db, actor="reference_tool").items():
+                print(f"{name}: эталонных скидок {n}")
         elif cmd == "adopt-discount":
             for name, n in discount_guard.adopt(db, actor="reference_tool").items():
                 print(f"{name}: эталонных скидок {n}")

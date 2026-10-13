@@ -121,6 +121,34 @@ def adopt_sent(db: Session, account: Account | None = None) -> dict:
     return st
 
 
+def adopt_current(db: Session, actor: str = "программа") -> dict:
+    """Новый эталон WB: эталонной становится цена до скидки, которую площадка держит СЕЙЧАС
+    (загруженная программой при последнем опросе), — у каждого SKU каждого кабинета.
+    Делается, когда цены на WB выставлены как надо (скриптом wb_restore_discount.py или
+    руками в кабинете), а программа их уже загрузила. Уже записанный эталон
+    перезаписывается. Коммитит."""
+    from priceapp import mapping
+    st = {"accounts": 0, "recorded": 0, "skipped": 0}
+    rate = rates.current(db)
+    for a in db.query(Account).filter(Account.is_active.is_(True), Account.platform.in_(PLATFORMS)).all():
+        st["accounts"] += 1
+        rule = get_rule(db, a.platform)
+        n = 0
+        for item_id, rows in mapping.account_items(db, a.id).items():
+            price = max((r.current_price for r in rows if r is not None and r.current_price), default=None)
+            if price and record(db, a, item_id, price, rows, rule, rate, source="adopt"):
+                n += 1
+                if n % COMMIT_EVERY == 0:
+                    db.commit()
+            else:
+                st["skipped"] += 1
+        st["recorded"] += n
+        audit.log(db, actor, "reference_adopt_current", a.name,
+                  f"новый эталон: эталонных цен {n} (цены загружены {a.prices_loaded_at})")
+        db.commit()
+    return st
+
+
 def rate_moved(db: Session) -> bool:
     """Есть эталонная цена, посчитанная по курсу, который ушёл от текущего дальше порога."""
     cur = rates.current(db)
