@@ -95,3 +95,12 @@ def test_card_at_plan_is_not_sent_and_verify_reports(db, tmp_path):
                        capture_output=True, env=env, cwd=ROOT)
     assert r.returncode == 1
     assert "Держит план: 1; НЕ держит: 1" in r.stdout.decode("cp1251")
+
+
+def test_article_filter_sends_only_that_article(db, monkeypatch):
+    _setup(db)
+    m = _mod()
+    sent = []
+    monkeypatch.setattr(m, "send", lambda _db, cards, days: sent.extend(c.parent for c in cards) or {})
+    assert m.main(["--send", "--yes", "--article", "200"]) == 0
+    assert sent == ["MP2"]
