@@ -42,7 +42,7 @@ Wildberries (реклама, продажи, юнит-экономика, пои
 | Метрика / Вебмастер / Доставка | `metrika_report.py`, `metrika_brands.py`, `metrika_direct_breakdown.py`, `metrika_costs.py`, `webmaster_report.py`, `yandex_delivery_report.py`, `crm_buyout_report.py` | — |
 | Wildberries | `wb_positions.py`, `wb_daily.py`, `wb_unit.py`, `wb_queries.py`, `wb_ads_report.py`, `wb_organic.py`, `wb_weekday.py`, `wb_weekly.py`, `wb_hours.py`, `wb_cancels.py`, `wb_reviews.py`, `wb_clusters.py`, `wb_campaigns.py`, `wb_dashboard.py` | `wb_bids.py` (автопилот), `wb_guard.py` (ставки за рекомендацией WB, раз в час), `wb_create.py`, `wb_trim.py`, `wb_minus.py` (минус-фразы вручную) |
 
-Общие модули: `wb_common.py` (WB API), `yandex_token.py` (токены Яндекса). Отчёты пишутся в `*.txt` / `*.csv`
+Общие модули: `wb_common.py` (WB API), `yandex_token.py` (токены Яндекса), `wb_run.py` (запуск по расписанию). Отчёты пишутся в `*.txt` / `*.csv`
 рядом со скриптами. История WB (позиции, запросы, воронка, реклама по дням) — `wb_history.db` (SQLite, только
 чтение для анализа; не удалять). Графики позиций — `wb_positions.html`.
 
