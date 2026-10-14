@@ -481,7 +481,7 @@ def test_send_says_it_replaced_old_proposals_and_menu_has_one_main_path(client, 
     page = client.get("/attention").text
     nav = page.split("<nav>", 1)[1].split("</nav>", 1)[0]
     assert nav.index("Цены товаров") < nav.index("Правила и журнал")
-    assert "Пересчёт всех цен" in client.get("/prices?view=proposals").text
+    assert "Предложения цен" in client.get("/prices?view=proposals").text
     assert client.get("/prices").text.count("Правила площадок") >= 1
 
 

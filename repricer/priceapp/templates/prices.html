@@ -3,8 +3,8 @@
 {% block content %}
 {% import "_guides.html" as guides %}
 <h1>Правила и журнал</h1>
-<p class="muted">Цены выставляют и передают на площадки на странице <a href="/sku-prices">«Цены товаров»</a> — это основной путь.
-Здесь — правила площадок, журнал отправок, текущие цены по кабинету и ручные цены, сравнение площадок и пересчёт всех цен разом.
+<p class="muted">Цены выставляют и передают на площадки на странице <a href="/sku-prices">«Цены товаров»</a>; кто сейчас ставит цены
+на каждой площадке — на <a href="/attention">«Внимании»</a>. Здесь — правила площадок, журнал отправок, текущие цены по кабинету и ручные цены, сравнение площадок и предложения цен.
 Маржинальность = к получению / себестоимость ₽ (со скидкой продавца); подробно — <a href="/help/prices">«Справка»</a>.
 {% if rate %}Курс: <b>{{ rate.usd_rub|money(4) }} ₽</b> ({{ rate.label }}).{% else %}<span class="bad">Курса нет — расчёт невозможен (страница «Курс $»).</span>{% endif %}</p>
 
@@ -13,7 +13,7 @@
   <a class="btn {{ '' if view == 'log' else 'secondary' }}" href="/prices?view=log">Журнал отправок</a>
   <a class="btn {{ '' if view == 'products' else 'secondary' }}" href="/prices?view=products">Текущие и ручные цены</a>
   <a class="btn {{ '' if view == 'compare' else 'secondary' }}" href="/prices?view=compare">Сравнение площадок</a>
-  <a class="btn {{ '' if view == 'proposals' else 'secondary' }}" href="/prices?view=proposals">Пересчёт всех цен{% if open_count %} ({{ open_count }}){% endif %}</a>
+  <a class="btn {{ '' if view == 'proposals' else 'secondary' }}" href="/prices?view=proposals">Предложения цен{% if open_count %} ({{ open_count }}){% endif %}</a>
 </div>
 {% if rate_shift %}<div class="flash warn">Курс ушёл на {{ rate_shift.pct }}% от курса последнего расчёта
 ({{ rate_shift.was|money(4) }} → {{ rate_shift.now|money(4) }} ₽) — новые цены видны на <a href="/sku-prices?flt=changes">«Ценах товаров»</a> (отбор «новая цена ≠ текущей»), там же их и передавать. Порог — на странице «Курс $».</div>{% endif %}
@@ -211,6 +211,12 @@ function bulkConfirm() {
   нерешённые предложения и ничего не отправляет, подтверждение — ниже. Обычная работа с ценами — на
   <a href="/sku-prices">«Ценах товаров»</a>; «Передать» там снимает предложения по тем же товарам, чтобы не ушло два решения.</span>
 </form>
+{% if open_count %}<form method="post" action="/prices/reject-all" class="row card"
+  onsubmit="return confirm('Отклонить все {{ open_count }} предложений, ждущих решения? На площадки ничего не уйдёт. Подтверждённые и уже отправленные не затрагиваются.')">
+  <button class="secondary">Отклонить все ожидающие ({{ open_count }})</button>
+  <span class="muted">Убирает накопившиеся предложения разом — например, Kit от промежуточных цен WB, пока шли шаги снижения.
+  Нужные появятся снова: Kit — после двух опросов WB, остальное — по «Рассчитать».</span>
+</form>{% endif %}
 {% endif %}
 <form method="get" action="/prices" class="row" style="margin-bottom:8px">
   <input type="hidden" name="view" value="{{ view }}">

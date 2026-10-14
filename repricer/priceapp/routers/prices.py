@@ -985,6 +985,11 @@ def approve_changes(request: Request, form=Depends(posted_form), db: Session = D
         return _back("proposals", account_id=account_id)
     approved, refused = 0, {}
     for ch in db.query(PriceChange).filter(PriceChange.id.in_(ids), PriceChange.is_test.is_(False)):
+        if ch.account and ch.account.platform == "lamoda":
+            # Обычная отправка несёт только цену до скидки — скидку и её даты Ламоде ставит
+            # scripts/lamoda_apply.py, и цена без них сбила бы её.
+            refused[LAMODA_REFUSED] = refused.get(LAMODA_REFUSED, 0) + 1
+            continue
         reason = approve(ch, user.username, confirm_large)
         if reason is None:
             approved += 1
@@ -998,6 +1003,24 @@ def approve_changes(request: Request, form=Depends(posted_form), db: Session = D
         msg += " Не подтверждено: " + "; ".join(f"{n} — {r}" for r, n in refused.items()) + "."
     flash(request, msg, "warn" if refused else "ok")
     return _back("proposals", account_id=account_id)
+
+
+LAMODA_REFUSED = "Ламода — цены ставит scripts\\lamoda_apply.py (цена со скидкой и даты скидки)"
+
+
+@router.post("/prices/reject-all")
+def reject_all(request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Отклонить ВСЕ предложения, ждущие решения (предложено и заблокировано). Подтверждённые не
+    трогаем: они уже в очереди, у WB там же ждут своего шага снижения."""
+    n = 0
+    for ch in db.query(PriceChange).filter(PriceChange.status.in_(OPEN), PriceChange.is_test.is_(False)):
+        ch.status = PriceChangeStatus.rejected.value
+        ch.decided_by, ch.decided_at = user.username, now_utc()
+        n += 1
+    audit.log(db, user.username, "price_rejected_all", f"{n} шт", "все ожидающие решения предложения")
+    db.commit()
+    flash(request, f"Отклонено предложений: {n}. На площадки ничего не отправлено.", "ok" if n else "warn")
+    return _back("proposals")
 
 
 @router.post("/prices/reject")
