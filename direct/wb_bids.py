@@ -125,7 +125,7 @@ RULES = {
                      "topup_below": 600, "topup_amount": 600, "topup_day_cap": 600, "topup_week_cap": 4200},
         # «Ребрик 2101 показы» — создана 14.10.2026 через wb_create.py
         "40955628": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True,
-                               "topup_below": 150, "topup_amount": 150, "topup_day_cap": 150, "topup_week_cap": 1000},
+                               "topup_below": 150, "topup_amount": 150, "topup_day_cap": 150, "topup_week_cap": 2000},
         # «Ребрик TC26 показы» — создана 14.10.2026 через wb_create.py
         "40955524": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True,
                                "topup_below": 100, "topup_amount": 100, "topup_day_cap": 100, "topup_week_cap": 1000},
