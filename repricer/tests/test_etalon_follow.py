@@ -150,3 +150,23 @@ def test_difference_within_tolerance_is_not_a_divergence(client, db):
     log = []
     st = etalon.follow_all(db, client_factory=lambda p, c: Fake(log))
     assert set(st["sent"]) == {"КИТ"}                                   # Ламода в допуске — не трогаем
+
+
+def test_scheduled_wb_poll_at_0005_once_per_night(db):
+    from datetime import datetime
+    from priceapp.workers import jobs
+    assert jobs.parse_poll_at("00:05, 12:30; x") == [(0, 5), (12, 30)]
+    assert jobs.scheduled_wb_poll_due(datetime(2026, 10, 15, 0, 3)) is False      # ещё рано
+    assert jobs.scheduled_wb_poll_due(datetime(2026, 10, 15, 0, 6)) is True       # наступило
+    assert jobs.scheduled_wb_poll_due(datetime(2026, 10, 15, 0, 7)) is False      # уже было
+    assert jobs.scheduled_wb_poll_due(datetime(2026, 10, 15, 15, 0)) is False     # опоздали больше 3 ч
+    assert jobs.scheduled_wb_poll_due(datetime(2026, 10, 16, 0, 5)) is True       # следующая ночь
+
+
+def test_poll_now_button_requests_wb_poll(client, db):
+    _setup(db)
+    r = client.post("/etalon/poll-now")
+    assert "Опрос WB начнётся" in r.text
+    db.expire_all()
+    assert settings.get(db, settings.REF_POLL_NOW) == "1"
+    assert "в 00:05" in client.get("/etalon").text

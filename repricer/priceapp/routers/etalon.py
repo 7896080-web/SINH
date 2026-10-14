@@ -95,7 +95,8 @@ def page(request: Request, q: str = "", flt: str = "", art: str = "", new: str =
     return render(request, "etalon.html", user, "etalon", rows=rows[:ROWS_LIMIT], total=len(rows),
                   limit=ROWS_LIMIT, q=q, flt=flt, followers=followers, counts=counts, names=PLATFORMS,
                   shifts={p: settings.get(db, etalon.SHIFT_KEYS[p]) for p in etalon.FOLLOWERS},
-                  lo=lo, hi=hi, auto=etalon.auto_enabled(db), tol=etalon.tolerance(db), max_step=etalon.max_step(db),
+                  lo=lo, hi=hi, auto=etalon.auto_enabled(db), tol=etalon.tolerance(db),
+                  poll_at=settings.get(db, settings.WB_POLL_AT), wb_poll=_last_poll(db), max_step=etalon.max_step(db),
                   sale_days=settings.get(db, settings.ETALON_LAMODA_SALE_DAYS), preview=preview,
                   with_etalon=sum(1 for e in ets.values() if e.sale))
 
@@ -127,6 +128,14 @@ def save_settings(request: Request, form=Depends(posted_form), db: Session = Dep
     if tol and tol != settings.get(db, settings.ETALON_TOLERANCE_RUB):
         changes.append(f"допуск: {settings.get(db, settings.ETALON_TOLERANCE_RUB)} -> {tol} ₽")
         settings.put(db, settings.ETALON_TOLERANCE_RUB, tol)
+    poll_at = str(form.get("poll_at") or "").strip()
+    if poll_at != settings.get(db, settings.WB_POLL_AT):
+        from priceapp.workers.jobs import parse_poll_at
+        if poll_at and not parse_poll_at(poll_at):
+            flash(request, "Время опроса WB — «чч:мм», несколько через запятую (например 00:05).", "warn")
+            return _back()
+        changes.append(f"опрос WB: {settings.get(db, settings.WB_POLL_AT) or '—'} -> {poll_at or '—'}")
+        settings.put(db, settings.WB_POLL_AT, poll_at)
     auto = "1" if form.get("auto") == "1" else "0"
     if auto != settings.get(db, settings.ETALON_FOLLOW_AUTO):
         changes.append(f"автоследование: {'включено' if auto == '1' else 'выключено'}")
@@ -135,6 +144,27 @@ def save_settings(request: Request, form=Depends(posted_form), db: Session = Dep
         audit.log(db, user.username, "etalon_settings", "", "; ".join(changes))
     db.commit()
     flash(request, "Сохранено: " + "; ".join(changes) if changes else "Ничего не изменилось.", "ok")
+    return _back()
+
+
+def _last_poll(db: Session) -> str:
+    from priceapp.models import WorkerHeartbeat
+    hb = db.get(WorkerHeartbeat, "wb_poll")
+    at = hb.last_run_at if hb else None
+    if not at:
+        return ""
+    from datetime import timezone
+    return at.replace(tzinfo=timezone.utc).astimezone().strftime("%d.%m %H:%M")
+
+
+@router.post("/etalon/poll-now")
+def poll_now(request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Опросить WB вне расписания: свежие цены, возврат эталона, следование площадок."""
+    settings.put(db, settings.REF_POLL_NOW, "1")
+    audit.log(db, user.username, "wb_poll_now", "", "опрос WB по кнопке")
+    db.commit()
+    flash(request, "Опрос WB начнётся в течение минуты: загрузятся свежие цены, где площадка или акция занизила "
+                   "цену больше допустимого — вернётся эталон. Обновите страницу через 2–5 минут.", "ok")
     return _back()
 
 
