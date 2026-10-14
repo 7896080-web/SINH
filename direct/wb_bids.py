@@ -217,6 +217,9 @@ MINUS_MAX_PER_RUN = 20              # не больше стольких нов�
 # (сверка с MPSTATS, решение пользователя 15.10.2026)
 MINUS_SPEND_ORDERS = 1.5            # потрачено на запрос ≥ 1,5 допустимой цены заказа товара, заказов нет — в минус
 MINUS_MIN_VIEWS = 1000              # низкий CTR судим не раньше стольких показов запроса
+MINUS_RETEST_DAYS = 45              # запрос, который автопилот сам отправил в минус, через столько дней возвращается на
+                                    # перепроверку (спрос сезонный: то, что не продавало в сентябре, может продавать в
+                                    # ноябре); снова не окупился — в минус, следующая перепроверка вдвое позже (до 180 дн.)
 MINUS_LOW_CTR = 0.5                 # CTR запроса ниже половины среднего CTR товара в кампании, заказов нет, потрачено
                                     # ≥ половины допустимой цены заказа — в минус
 RETURN_FACTOR = 1.5                 # "top": запрос возвращается в клики, если заказ за показы дороже лимита в 1,5 раза
@@ -1648,7 +1651,21 @@ def plan_cabinet(cab, token, rules, state):
                 key = pk(cid, nm)
                 current = list(cur_minus.get((cid, nm), []))
                 cur_set = set(current)
-                add_auto, add_route, rem_route = [], [], []
+                add_auto, add_route, rem_route, rem_auto = [], [], [], []
+                # перепроверка: запросы, которые автопилот сам отправил в минус давно, — вернуть (кроме «не наша аудитория»)
+                if r["auto_minus"]:
+                    at = (state.get("minus_auto_at") or {}).get(key) or {}
+                    tries = (state.get("minus_retests") or {}).get(key) or {}
+                    for q in sorted(set(state["minus_auto"].get(key, [])) & cur_set):
+                        if negative(q):
+                            continue
+                        m_since = at.get(q)
+                        if not m_since:                # записи до 15.10.2026 без даты — отсчёт с сегодняшнего дня
+                            state.setdefault("minus_auto_at", {}).setdefault(key, {})[q] = dt.date.today().isoformat()
+                            continue
+                        wait = min(MINUS_RETEST_DAYS * 2 ** tries.get(q, 0), 180)
+                        if (dt.date.today() - dt.date.fromisoformat(m_since)).days >= wait:
+                            rem_auto.append(q)
                 # маршрутизация
                 prev_route = set(state["minus_route"].get(key, []))
                 for q in sorted(route_want.get(nm, set()) - cur_set):
@@ -1702,13 +1719,14 @@ def plan_cabinet(cab, token, rules, state):
                             break
                         add_auto.append(q)
                         added_total += 1
-                if add_auto or add_route or rem_route:
-                    new = [q for q in current if q not in rem_route] + add_route + add_auto
+                if add_auto or add_route or rem_route or rem_auto:
+                    new = [q for q in current if q not in rem_route and q not in rem_auto] + add_route + add_auto
                     if len(new) > 1000:
                         log(f"    ! У товара {nm} больше 1000 минус-фраз — новые не добавляю.")
                         continue
                     plan["minus"].append({"cabinet": cab, "advert_id": cid, "nm_id": nm, "old": current, "new": new,
                                           "add_auto": add_auto, "add_route": add_route, "rem_route": rem_route,
+                                          "rem_auto": rem_auto,
                                           "stats": {q: cl.get((cid, nm), {}).get(q) for q in add_auto},
                                           "why": {q: why_q.get(q) for q in add_auto} if r["auto_minus"] else {}})
             items = [m for m in plan["minus"] if m["advert_id"] == cid]
@@ -1723,6 +1741,10 @@ def plan_cabinet(cab, token, rules, state):
                         log(f"      + {m['nm_id']:>11} {cut(q, 40):40} передан в «{r['route_from']}»")
                     for q in m["rem_route"]:
                         log(f"      − {m['nm_id']:>11} {cut(q, 40):40} возвращён (в «{r['route_from']}» ставки больше нет)")
+                    for q in m.get("rem_auto") or []:
+                        m_since = ((state.get("minus_auto_at") or {}).get(pk(cid, m["nm_id"])) or {}).get(q, "?")
+                        log(f"      − {m['nm_id']:>11} {cut(q, 40):40} возвращён на перепроверку (в минусе с {m_since}; "
+                            "снова не окупится — уйдёт в минус)")
             elif cur_minus is not None:
                 log("    Минус-фразы: добавлять нечего.")
             for note in held_notes:
@@ -1960,12 +1982,25 @@ def update_state(state, minus_items, reverse=False):
         key = pk(m["advert_id"], m["nm_id"])
         auto = set(state["minus_auto"].get(key, []))
         route = set(state["minus_route"].get(key, []))
+        at = state.setdefault("minus_auto_at", {}).setdefault(key, {})       # когда запрос ушёл в автоминус
+        tries = state.setdefault("minus_retests", {}).setdefault(key, {})   # сколько раз возвращали на перепроверку
+        rem_auto = set(m.get("rem_auto") or [])
         if not reverse:
-            auto |= set(m["add_auto"])
+            auto = (auto | set(m["add_auto"])) - rem_auto
             route = (route | set(m["add_route"])) - set(m["rem_route"])
+            for q in m["add_auto"]:
+                at[q] = dt.date.today().isoformat()
+            for q in rem_auto:
+                at.pop(q, None)
+                tries[q] = tries.get(q, 0) + 1
         else:
-            auto -= set(m["add_auto"])
+            auto = (auto - set(m["add_auto"])) | rem_auto
             route = (route - set(m["add_route"])) | set(m["rem_route"])
+            for q in m["add_auto"]:
+                at.pop(q, None)
+            for q in rem_auto:
+                at[q] = dt.date.today().isoformat()
+                tries[q] = max(tries.get(q, 1) - 1, 0)
         state["minus_auto"][key] = sorted(auto)
         state["minus_route"][key] = sorted(route)
     save_state(state)
@@ -2483,7 +2518,9 @@ def main():
     up = sum(1 for c in plan["bids"] if c["new"] > (c["old"] or 0))
     n_minus = sum(len(m["add_auto"]) + len(m["add_route"]) for m in plan["minus"])
     log(f"\nИтого: ставки товаров {len(plan['bids'])} (↑{up} ↓{len(plan['bids']) - up}), "
-        f"ставки запросов {len(plan['cluster_bids'])}, новых минус-фраз {n_minus}, дневных лимитов {len(plan['limits'])}, "
+        f"ставки запросов {len(plan['cluster_bids'])}, новых минус-фраз {n_minus}"
+        + (f" (на перепроверку из минуса {n_back})" if (n_back := sum(len(m.get("rem_auto") or []) for m in plan["minus"])) else "")
+        + f", дневных лимитов {len(plan['limits'])}, "
         f"убрать товаров с малым остатком {len(plan['trim'])}, вернуть {len(plan['untrim'])}, "
         f"пополнить бюджетов {sum(1 for t in plan['topup'] if t['amount'])} на {sum(t['amount'] for t in plan['topup'])} ₽"
         + (f", запустить снова {sum(1 for t in plan['topup'] if not t['amount'])}" if any(not t['amount'] for t in plan['topup']) else "")
