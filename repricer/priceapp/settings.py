@@ -50,6 +50,10 @@ ETALON_FOLLOW_AUTO = "etalon_follow_auto"
 ETALON_LAMODA_SALE_DAYS = "etalon_lamoda_sale_days"
 # Разница цены после скидки с целью не больше стольких рублей — не расхождение (округление, курс).
 ETALON_TOLERANCE_RUB = "etalon_tolerance_rub"
+# Опрос WB (цены + возврат эталона) ещё и в эти часы по местному времени — «чч:мм» через запятую.
+# Акции WB стартуют в полночь: без опроса в 00:05 их цены жили бы до ближайшего опроса раз в 6 часов.
+WB_POLL_AT = "wb_poll_at"
+WB_POLL_SLOT_DONE = "wb_poll_slot_done"
 
 # Эталон WB (`pricing.etalon_prices`): цена продавца со скидкой на WB минус этот %;
 # допустимая скидка продавца на площадке (вне — цена до скидки не считается); «от
@@ -95,6 +99,8 @@ DEFAULTS = {
     ETALON_FOLLOW_AUTO: "0",
     ETALON_LAMODA_SALE_DAYS: "365",
     ETALON_TOLERANCE_RUB: "100",
+    WB_POLL_AT: "00:05",
+    WB_POLL_SLOT_DONE: "",
     COST_NORMALIZE: "1",
 }
 

@@ -166,6 +166,44 @@ def _older_than_ts(raw: str) -> bool:
         return False
 
 
+SLOT_WINDOW = timedelta(hours=3)     # опоздали (программа стояла) больше чем на 3 часа — слот пропущен
+
+
+def parse_poll_at(raw: str) -> list[tuple[int, int]]:
+    """«00:05, 12:30» -> [(0, 5), (12, 30)]; неразборчивое — пропускаем."""
+    out = []
+    for part in (raw or "").replace(";", ",").split(","):
+        hh, _, mm = part.strip().partition(":")
+        if hh.isdigit() and mm.isdigit() and int(hh) < 24 and int(mm) < 60:
+            out.append((int(hh), int(mm)))
+    return out
+
+
+def scheduled_wb_poll_due(now: datetime | None = None) -> bool:
+    """Наступил час опроса WB по расписанию (`wb_poll_at`, местное время), и в этот слот опроса
+    ещё не было. Отметка слота — в настройке, переживает перезапуск."""
+    from priceapp.timeutils import local_now
+    now = now or local_now().replace(tzinfo=None)
+    db = SessionLocal()
+    try:
+        done = settings.get(db, settings.WB_POLL_SLOT_DONE)
+        for hh, mm in parse_poll_at(settings.get(db, settings.WB_POLL_AT)):
+            slot = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+            if slot > now:
+                slot -= timedelta(days=1)
+            key = slot.strftime("%Y-%m-%d %H:%M")
+            if now - slot < SLOT_WINDOW and done < key:
+                settings.put(db, settings.WB_POLL_SLOT_DONE, key)
+                db.commit()
+                return True
+        return False
+    except Exception:
+        db.rollback()
+        return False
+    finally:
+        db.close()
+
+
 def wb_poll_requested() -> bool:
     """Просили опросить WB вне расписания (курс ушёл за порог эталонных цен; цены ушли на WB и пора
     пересчитать Kit). Флаги снимаются."""

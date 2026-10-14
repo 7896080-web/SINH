@@ -10,7 +10,8 @@
 - текущие цены площадок — ПРИ КАЖДОМ запуске (площадка меняет цену сама не чаще
   раза в сутки, но пока программа была выключена, могла поменять) и раз в сутки,
   после них — проверка диапазонов безопасности акций;
-- опрос WB (текущие цены кабинетов + правило эталонной цены) — при запуске и раз в 6 часов,
+- опрос WB (текущие цены кабинетов + правило эталонной цены) — при запуске, раз в 6 часов и в часы
+  `wb_poll_at` (по умолчанию 00:05 — акции WB стартуют в полночь),
   а также сразу, если курс ушёл от курса эталонных цен больше чем на 2% (`reference.py`);
 - копия базы — через 10 минут после запуска, не чаще раза в сутки.
 
@@ -75,7 +76,8 @@ def _heavy_loop() -> None:
             jobs.job_daily_refresh(force_prices=last["refresh"] is None)
             last["refresh"] = now
         if now - started >= REFRESH_FIRST_AFTER and (
-                last["wb"] is None or now - last["wb"] >= WB_POLL_EVERY or jobs.wb_poll_requested()):
+                last["wb"] is None or now - last["wb"] >= WB_POLL_EVERY or jobs.wb_poll_requested()
+                or jobs.scheduled_wb_poll_due()):
             jobs.job_wb_poll()
             last["wb"] = time.monotonic()
         if last["attention"] is None or now - last["attention"] >= ATTENTION_EVERY or jobs.attention_dirty():

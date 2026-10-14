@@ -42,6 +42,9 @@
   {% for p in followers %}{% set k = counts[p] %}
   <span style="margin-left:12px">{{ names[p] }}: держат эталон {{ k.same }}, расходятся <b>{{ k.diff }}</b>{% if k.big %} (из них с шагом больше {{ max_step|int }}% — {{ k.big }}){% endif %}{% if k.skip %}, не отправляются {{ k.skip }}{% endif %}.</span>
   {% else %}<span class="muted">Ни одна площадка не следует за эталоном — задайте сдвиг ниже.</span>{% endfor %}
+  <form method="post" action="/etalon/poll-now" style="display:inline;margin-left:12px">
+    <button class="secondary" title="Свежие цены WB и возврат эталона там, где акция или площадка занизила цену">Опросить WB сейчас</button></form>
+  <span class="muted">{% if wb_poll %}последний опрос {{ wb_poll }}; {% endif %}по расписанию — при запуске, раз в 6 часов{% if poll_at %} и в {{ poll_at }}{% endif %}.</span>
   {% set total_diff = counts.values()|sum(attribute='diff') %}
   {% if total_diff %}<form method="post" action="/etalon/follow-now" style="display:inline;margin-left:12px"
     onsubmit="return confirm('Отправить на площадки цены от эталона по {{ total_diff }} карточкам (включая большой шаг)?')">
@@ -53,6 +56,7 @@
   {% for p in ('kit', 'lamoda', 'ozon') %}<label>{{ names[p] }}: эталон −, %<input name="shift_{{ p }}" value="{{ shifts[p] }}" inputmode="decimal" style="width:60px" placeholder="не следует"></label>{% endfor %}
   <label>Скидка от, %<input name="lo" value="{{ lo }}" style="width:50px"></label>
   <label>до, %<input name="hi" value="{{ hi }}" style="width:50px"></label>
+  <label title="Акции WB стартуют в полночь — опрос в 00:05 сразу вернёт эталон. Несколько — через запятую">Опрос WB в, чч:мм<input name="poll_at" value="{{ poll_at }}" style="width:90px" placeholder="00:05"></label>
   <label title="Разница цены после скидки с целью в этих пределах — не расхождение (округление, курс)">Допуск, ₽<input name="tol" value="{{ tol }}" style="width:60px"></label>
   <label style="flex-direction:row;gap:6px;align-items:center"><input type="checkbox" name="auto" value="1" {% if auto %}checked{% endif %}>
     автоматически при каждом опросе WB</label>
