@@ -415,6 +415,7 @@ def main():
         log(f"  Сейчас применяет {info[1] if info else 'wb_bids.py'} — проверку пропускаю.")
         write_log()
         return
+    B.busy_mark("wb_guard.py")          # сборщик рекомендаций пока ждёт: лимит WB общий
     try:
         run(cabs, apply)
     finally:
@@ -453,8 +454,10 @@ def run(cabs, apply):
     changes, losing, topups, checked, pauses = [], [], [], 0, []
     # кабинеты — одновременно (у каждого продавца свои лимиты WB); ID кампаний у WB уникальны: в каждом кабинете
     # проверяются только его кампании
-    jobs = [(cab, lambda cab=cab, token=token: plan_cabinet(cab, token, caps["items"], state,
-                                                           REC_MAX_BY_CAB.get(cab, REC_MAX_OTHER)))
+    # из базы сборщика рекомендации берутся без запросов к WB — тогда сверяю с ними все товары, а не только самые
+    # кликабельные (недостающие в базе спрошу у WB сам — их ограничивает REC_DEADLINE_MIN)
+    rec_max = (lambda cab: 10 ** 6) if B.COLLECTOR_MODE == "use" else (lambda cab: REC_MAX_BY_CAB.get(cab, REC_MAX_OTHER))
+    jobs = [(cab, lambda cab=cab, token=token: plan_cabinet(cab, token, caps["items"], state, rec_max(cab)))
             for cab, token in fresh.items()]
     results = B.run_parallel(jobs)
     if apply and not B.lock_mine():

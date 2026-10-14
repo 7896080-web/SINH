@@ -11,7 +11,8 @@
   • после автопилота (wb_bids.py) — раз в сутки пробный прогон wb_budget.py: предложения по бюджету для дашборда
     (только расчёт, ничего не меняет; если предложения старше BUDGET_EVERY_H часов);
   • после wb_positions.py — библиотека успешных запросов для SEO (wb_seo_queries.py, только база истории);
-  • после скрипта — всегда пересборка дашборда (python wb_dashboard.py --no-open).
+  • после скрипта — пересборка дашборда (python wb_dashboard.py --no-open); кроме сборщика рекомендаций
+    wb_collector.py — он идёт каждые 15 минут, дашборд и так пересобирается каждый час после проверки.
 
 Запуск:  pythonw wb_run.py wb_bids.py --apply --timeout 55
          pythonw wb_run.py wb_positions.py --timeout 110
@@ -117,7 +118,8 @@ def main():
             run(["wb_budget.py"], BUDGET_TIMEOUT_MIN, f)          # без --apply: только предложения для дашборда
         if args[0] == "wb_positions.py" and (HERE / "wb_seo_queries.py").exists():
             run(["wb_seo_queries.py"], 5, f)                      # библиотека успешных запросов (только база, без WB)
-        run(["wb_dashboard.py", "--no-open"], 5, f)
+        if args[0] != "wb_collector.py":
+            run(["wb_dashboard.py", "--no-open"], 5, f)
 
 
 if __name__ == "__main__":
