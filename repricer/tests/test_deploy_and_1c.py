@@ -137,3 +137,19 @@ def test_server_script_only_adds_folders_and_a_key():
     assert r"results\pricing" in s and r"archive\pricing" in s and "AppendAllText" in s
     assert "sshd_config" not in s.replace("sshd_config, порт", "")   # конфиг SSH не трогает
     assert "Restart-Service" not in s and "WriteAllText" not in s      # ключ «Маркировки» не затирается
+
+
+def test_server_move_scripts():
+    """Перенос на сервер: экспорт выключает программу на ПК ДО копии базы, сервер ставит
+    службу на 127.0.0.1 и переводит обмен с 1С с SFTP на локальные папки."""
+    exp = (DEPLOY / "export_for_server.ps1").read_text(encoding="utf-8-sig")
+    assert exp.index("Stop-Process") < exp.index("src.backup(dst)")
+    assert "MOVED_TO_SERVER.txt" in exp and '"ssh"' in exp and '".venv"' in exp
+    for name in ("run_repricer.ps1", "update_workstation.ps1"):
+        assert "MOVED_TO_SERVER.txt" in (DEPLOY / name).read_text(encoding="utf-8-sig"), name
+    inst = (DEPLOY / "install_server.ps1").read_text(encoding="utf-8-sig")
+    assert "REPRICER_ONEC_SFTP_" in inst and r"REPRICER_ONEC_RESULTS_DIR=$SyncRoot\results\pricing" in inst
+    assert "--host 127.0.0.1" in inst and "AppRotateFiles" in inst and "sync_admin" in inst
+    assert "chrome.exe" in inst and "iexplore" not in inst
+    upd = (DEPLOY / "update_server.ps1").read_text(encoding="utf-8-sig")
+    assert upd.index("nssm stop") < upd.index("make_backup") < upd.index("pytest") < upd.rindex("nssm start $Service")

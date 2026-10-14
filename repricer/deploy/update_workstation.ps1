@@ -20,6 +20,9 @@ $Root = Split-Path $PSScriptRoot -Parent
 Set-Location $Root
 $venvPy = Join-Path $Root ".venv\Scripts\python.exe"
 if (-not (Test-Path $venvPy)) { Fail "Нет $venvPy — сначала install_workstation.ps1" }
+if (Test-Path (Join-Path $Root "MOVED_TO_SERVER.txt")) {
+    Fail "Программа перенесена на сервер (MOVED_TO_SERVER.txt) — здесь не обновляю и не запускаю. На сервере: deploy\update_server.ps1"
+}
 
 # Остановить запущенную программу: миграция на живой базе и старый код в
 # памяти — плохое сочетание. Ищем именно наш uvicorn по порту в командной строке.
