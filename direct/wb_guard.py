@@ -177,6 +177,7 @@ def write_spend_log(rows):
 def plan_cabinet(cab, token, caps, state, budget):
     """Возвращает (изменения, «минимум выше окупаемого», сверено, пополнения). budget — сколько ещё товаров
     можно сверить с рекомендацией."""
+    B._tl.cab = cab                    # для строки «идёт работа» и сбоев данных по кабинету
     by_c = defaultdict(dict)
     for key, zones in caps.items():
         cid, nm = key.split(":")

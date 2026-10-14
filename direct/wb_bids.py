@@ -274,6 +274,8 @@ REACH = {"1-2": "reachMax", "3-10": "reachMedium", "11-34": "reachMin"}
 S = requests.Session()
 out = []
 PARALLEL = True     # кабинеты считаются одновременно (лимиты WB — у каждого продавца свои): запуск в ~3 раза быстрее
+REC_COUNT = {}                   # {кабинет: запрошено рекомендаций WB} — для строки «идёт работа»
+PROGRESS_EVERY = 60              # с, как часто печатать её при ручном запуске
 _tl = threading.local()          # в потоке кабинета: свой журнал (печатается целиком по порядку) и своё соединение
 _file_lock = threading.Lock()    # запись общих файлов (кэш размеров, образец ответа) из разных потоков
 
@@ -320,6 +322,17 @@ def run_parallel(jobs):
           flush=True)
     for t in threads:
         t.start()
+    # вручную в консоли — раз в минуту строка «идёт работа», чтобы не казалось, что всё зависло
+    # (по расписанию вывод идёт в файл — там её нет)
+    live = bool(getattr(sys.stdout, "isatty", lambda: False)())
+    t0 = time.time()
+    while live and any(t.is_alive() for t in threads):
+        threads[[t.is_alive() for t in threads].index(True)].join(timeout=PROGRESS_EVERY)
+        if any(t.is_alive() for t in threads):
+            done = [n for (n, _), t in zip(jobs, threads) if not t.is_alive()]
+            busy = [f"{n} (рекомендаций WB: {REC_COUNT.get(n, 0)})" for (n, _), t in zip(jobs, threads) if t.is_alive()]
+            print(f"  … {(time.time() - t0) / 60:.0f} мин: считаю — {', '.join(busy)}"
+                  + (f"; готово — {', '.join(done)}" if done else ""), flush=True)
     for (name, _), t in zip(jobs, threads):
         t.join()
         for line in bufs.get(name, []):
@@ -1007,6 +1020,8 @@ REC_SAMPLE = HERE / "wb_bids_rec_sample.json"   # образец ответа WB
 def get_rec(token, aid, nm):
     if (aid, nm) not in _rec_cache:
         progress(f"    рекомендации WB: {len(_rec_cache) + 1}-й товар…")
+        cab_ = getattr(_tl, "cab", None)
+        REC_COUNT[cab_] = REC_COUNT.get(cab_, 0) + 1
         pace(token, "rec", 12.5)
         data = call("GET", ADV + "/api/advert/v0/bids/recommendations", token,
                     params={"nmId": nm, "advertId": aid}, what=f"Рекомендованные ставки {nm}") or {}
