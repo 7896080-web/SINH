@@ -5,7 +5,9 @@
 #     окупаемого потолка, вниз и вверх сразу (≈10 минут).
 #   • wb_positions.py — каждый день в 06:00 (позиции, воронка, реклама по дням → wb_history.db; ≈1 час на 3 кабинета;
 #     только чтение), чтобы к автопилоту в 8:00 и к утру дашборд был свежим (решение 14.10.2026);
-#   • после каждого запуска — пересборка дашборда wb_dashboard.html (python wb_dashboard.py --no-open), 13.10.2026.
+#   • после каждого запуска — пересборка дашборда wb_dashboard.html (python wb_dashboard.py --no-open), 13.10.2026;
+#   • wb_collector.py — каждые 15 минут с 07:00 до 24:00: рекомендованные ставки и размеры в базу wb_rec.db
+#     (только чтение WB; решение 15.10.2026). Дашборд после него не пересобирается.
 # С 14.10.2026 задания запускают pythonw.exe wb_run.py <скрипт> (без окна; своё ограничение по времени, после
 # которого зависший скрипт останавливается и снимается его блокировка; журналы > 5 МБ переносятся в *.old.txt).
 # Работают и от батареи ноутбука. Переустановить после обновления: ту же команду «Установить».
@@ -17,7 +19,7 @@
 param([switch]$Remove)
 
 $dir = "C:\direct"
-$names = @("AWER_WB_bids", "AWER_WB_guard", "AWER_WB_positions")
+$names = @("AWER_WB_bids", "AWER_WB_guard", "AWER_WB_positions", "AWER_WB_collector")
 
 if ($Remove) {
     foreach ($n in $names) { Unregister-ScheduledTask -TaskName $n -Confirm:$false -ErrorAction SilentlyContinue }
@@ -59,6 +61,15 @@ $posSet = Make-Settings (New-TimeSpan -Hours 2)
 Register-ScheduledTask -TaskName "AWER_WB_positions" -Action (Make-Action "wb_positions.py" "" 110) `
     -Trigger (New-ScheduledTaskTrigger -Daily -At "06:00") -Settings $posSet `
     -Description "Позиции и воронка WB (wb_positions.py, только чтение), каждый день в 6:00" -Force | Out-Null
+
+if (Test-Path (Join-Path $dir "wb_collector.py")) {
+    $colTrigger = New-ScheduledTaskTrigger -Daily -At "07:00"
+    $colRep = New-ScheduledTaskTrigger -Once -At "07:00" -RepetitionInterval (New-TimeSpan -Minutes 15) -RepetitionDuration (New-TimeSpan -Hours 17)
+    $colTrigger.Repetition = $colRep.Repetition
+    $colSet = Make-Settings (New-TimeSpan -Minutes 16)
+    Register-ScheduledTask -TaskName "AWER_WB_collector" -Action (Make-Action "wb_collector.py" "" 14) -Trigger $colTrigger `
+        -Settings $colSet -Description "Сборщик рекомендаций и размеров WB (wb_collector.py, только чтение), каждые 15 мин" -Force | Out-Null
+}
 
 Write-Host "Готово. Python: $pyw (без окна, через wb_run.py)"
 Get-ScheduledTask -TaskName "AWER_WB_*" | ForEach-Object {

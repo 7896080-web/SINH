@@ -40,6 +40,7 @@ import json
 import math
 import os
 import shutil
+import sqlite3
 import sys
 import threading
 import time
@@ -947,6 +948,23 @@ def stock_label(s):
 SIZE_CACHE = HERE / "wb_sizes_cache.json"
 
 
+def fetch_sizes(token, nm):
+    """Размеры одного товара: [{"name", "orders", "stock"}] — заказы за SIZE_DAYS и остаток (склады WB + свой склад,
+    если COUNT_FBS_STOCK). Без пауз — их ставит вызывающий (WB: раз в 20 с). Ошибка — ApiError."""
+    y = dt.date.today() - dt.timedelta(days=1)
+    body = {"nmID": nm, "currentPeriod": {"start": (y - dt.timedelta(days=SIZE_DAYS - 1)).isoformat(),
+                                          "end": y.isoformat()},
+            "stockType": "" if COUNT_FBS_STOCK else "wb", "orderBy": {"field": "ordersCount", "mode": "desc"},
+            "includeOffice": False}
+    data = call("POST", ANA + "/api/v2/stocks-report/products/sizes", token, body=body, what=f"Размеры {nm}") or {}
+    sizes = []
+    for z in ((data.get("data") or {}).get("sizes") or []):
+        m = z.get("metrics") or {}
+        sizes.append({"name": str(z.get("name") or z.get("chrtID")), "orders": num(m.get("ordersCount")),
+                      "stock": num(m.get("stockCount"))})
+    return sizes
+
+
 def get_sizes(token, nm_ids):
     """{nm: [{"name", "orders", "stock"}]} — заказы за SIZE_DAYS и текущий остаток по каждому размеру
     (склады WB + свой склад, если COUNT_FBS_STOCK). Кэш на SIZE_CACHE_HOURS. Сбой — пустой результат и пометка."""
@@ -957,7 +975,12 @@ def get_sizes(token, nm_ids):
     now = dt.datetime.now()
     fresh = lambda e: e and now - dt.datetime.fromisoformat(e["at"]) < dt.timedelta(hours=SIZE_CACHE_HOURS)
     res, failed = {}, 0
-    y = dt.date.today() - dt.timedelta(days=1)
+    if COLLECTOR_MODE == "use":           # размеры от сборщика (он обновляет их раз в 2 ч) — если свежее своих
+        for nm in nm_ids:
+            c = collector_snapshot()["sizes"].get(nm)
+            e = cache.get(str(nm))
+            if c and fresh({"at": c[0]}) and (not e or c[0] > e.get("at", "")):
+                cache[str(nm)] = {"at": c[0], "sizes": c[1]}
     todo_n = sum(1 for nm in nm_ids if not fresh(cache.get(str(nm))))
     if todo_n:
         progress(f"  Размеры: запрашиваю {todo_n} тов. (WB — раз в 20 с, ≈{todo_n * 20 // 60 + 1} мин; дальше 6 ч из кэша)…", end="\n")
@@ -968,23 +991,15 @@ def get_sizes(token, nm_ids):
             k += 1
             progress(f"    размеры {k}/{todo_n}")
             pace(token, "sizes", 20.5)
-            body = {"nmID": nm, "currentPeriod": {"start": (y - dt.timedelta(days=SIZE_DAYS - 1)).isoformat(),
-                                                  "end": y.isoformat()},
-                    "stockType": "" if COUNT_FBS_STOCK else "wb", "orderBy": {"field": "ordersCount", "mode": "desc"},
-                    "includeOffice": False}
             try:
-                data = call("POST", ANA + "/api/v2/stocks-report/products/sizes", token, body=body,
-                            what=f"Размеры {nm}") or {}
+                sizes = fetch_sizes(token, nm)
             except ApiError as ex:
                 failed += 1
                 if failed == 1:
                     log(f"  ! {ex} — размеры не учтены.")
                 continue
-            sizes = []
-            for z in ((data.get("data") or {}).get("sizes") or []):
-                m = z.get("metrics") or {}
-                sizes.append({"name": str(z.get("name") or z.get("chrtID")), "orders": num(m.get("ordersCount")),
-                              "stock": num(m.get("stockCount"))})
+            if COLLECTOR_MODE == "check":
+                check_against_collector("sizes", nm, sizes)
             e = cache[str(nm)] = {"at": now.isoformat(timespec="seconds"), "sizes": sizes}
         res[nm] = e["sizes"]
     if todo_n:
@@ -1054,6 +1069,7 @@ def note_rec(cab, cid, nm, pay, target, rec, cur, mn):
 
 
 def write_rec_log():
+    write_check_log()
     if not REC_LOG:
         return
     import csv
@@ -1074,6 +1090,135 @@ def write_rec_log():
             REC_LOG.clear()
         except OSError as e:
             log(f"! История рекомендаций не записана: {e}")
+
+
+# ---------- сборщик wb_collector.py: рекомендации и размеры в базе wb_rec.db (решение пользователя 15.10.2026) ----------
+# Сборщик каждые 15 минут (7:00–24:00) спрашивает WB о рекомендованных ставках всех товаров кампаний и о размерах и
+# складывает ответы в базу. Режим чтения базы автопилотом и часовой проверкой:
+#   "check" — первые сутки: спрашивают WB сами, как раньше, и сверяют ответ с базой (wb_rec_check.csv) — проверка,
+#             что сборщик кладёт то же, что отдаёт WB;
+#   "use"   — берут из базы рекомендации моложе REC_CACHE_MIN мин и размеры моложе SIZE_CACHE_HOURS ч; WB — только
+#             недостающее. Сборщик остановился — данные стареют, и скрипты сами спрашивают WB, как раньше;
+#   "off"   — базу не читают.
+COLLECTOR_MODE = "check"
+COLLECTOR_DB = HERE / "wb_rec.db"
+CHECK_FILE = HERE / "wb_rec_check.csv"
+CHECK_MAX_AGE_MIN = 60          # сверять с записью сборщика не старше (рекомендации WB меняются в течение дня)
+BUSY_FILE = HERE / "wb_api.busy"   # автопилот или страж сейчас спрашивают WB — сборщик ждёт (лимит рекомендаций общий)
+COLLECTOR_SCHEMA = """
+CREATE TABLE IF NOT EXISTS rec (advert_id INTEGER, nm INTEGER, cab TEXT, pay TEXT, at TEXT, data TEXT,
+                                PRIMARY KEY (advert_id, nm));
+CREATE TABLE IF NOT EXISTS rec_hist (at TEXT, cab TEXT, advert_id INTEGER, nm INTEGER, pay TEXT,
+                                     r12 INTEGER, r310 INTEGER, r1134 INTEGER);
+CREATE INDEX IF NOT EXISTS rec_hist_at ON rec_hist (at);
+CREATE INDEX IF NOT EXISTS rec_hist_pair ON rec_hist (advert_id, nm, at);
+CREATE TABLE IF NOT EXISTS sizes (nm INTEGER PRIMARY KEY, cab TEXT, at TEXT, data TEXT);
+CREATE TABLE IF NOT EXISTS runs (cab TEXT PRIMARY KEY, started TEXT, finished TEXT, info TEXT);
+"""
+_coll = None
+_coll_lock = threading.Lock()
+CHECK_ROWS = []
+
+
+def collector_connect():
+    con = sqlite3.connect(str(COLLECTOR_DB), timeout=30, check_same_thread=False)
+    con.execute("PRAGMA journal_mode=WAL")      # читать можно, пока сборщик пишет
+    con.executescript(COLLECTOR_SCHEMA)
+    return con
+
+
+def age_min(at):
+    try:
+        return (dt.datetime.now() - dt.datetime.fromisoformat(at)).total_seconds() / 60
+    except (TypeError, ValueError):
+        return None
+
+
+def collector_snapshot():
+    """Последнее, что сборщик положил в базу: {"rec": {(кампания, товар): (время, ответ WB)}, "sizes": {товар:
+    (время, размеры)}} — читается один раз за запуск. Базы нет или она не читается — пусто (спросим WB сами)."""
+    global _coll
+    with _coll_lock:
+        if _coll is None:
+            _coll = {"rec": {}, "sizes": {}}
+            if COLLECTOR_MODE != "off" and COLLECTOR_DB.exists():
+                try:
+                    con = sqlite3.connect(str(COLLECTOR_DB), timeout=10)
+                    try:
+                        for aid, nm, at, data in con.execute("SELECT advert_id, nm, at, data FROM rec"):
+                            _coll["rec"][(aid, nm)] = (at, json.loads(data))
+                        for nm, at, data in con.execute("SELECT nm, at, data FROM sizes"):
+                            _coll["sizes"][nm] = (at, json.loads(data))
+                    finally:
+                        con.close()
+                except (sqlite3.Error, ValueError) as e:
+                    log(f"  ! База сборщика {COLLECTOR_DB.name} не прочиталась ({e}) — спрашиваю WB сам.")
+                    _coll = {"rec": {}, "sizes": {}}
+        return _coll
+
+
+def rec_levels(data, pay):
+    """(места 1–2, 3–10, 11–34) рекомендованной ставки в копейках — для истории и сверки."""
+    f = (lambda k: rec_cpc(data, CPC_LEVEL[k])) if pay == "cpc" else (lambda k: rec_cpm(data, CPM_LEVEL[k]))
+    return tuple(f(k) for k in ("1-2", "3-10", "11-34"))
+
+
+def check_against_collector(kind, key, mine):
+    """Режим "check": свой ответ WB против записи сборщика (если она не старше CHECK_MAX_AGE_MIN)."""
+    snap = collector_snapshot()["rec" if kind == "rec" else "sizes"].get(key)
+    if not snap:
+        return
+    a = age_min(snap[0])
+    if a is None or a > CHECK_MAX_AGE_MIN:
+        return
+    if kind == "rec":
+        m = (rec_levels(mine, "cpc")[1], rec_levels(mine, "cpm")[1])
+        c = (rec_levels(snap[1], "cpc")[1], rec_levels(snap[1], "cpm")[1])
+    else:
+        norm = lambda zs: sorted((str(z.get("name")), z.get("orders"), z.get("stock")) for z in zs or [])
+        m, c = norm(mine), norm(snap[1])
+    CHECK_ROWS.append({"время": dt.datetime.now().isoformat(timespec="seconds"), "кабинет": getattr(_tl, "cab", "") or "",
+                       "что": "рекомендация" if kind == "rec" else "размеры",
+                       "кампания": key[0] if kind == "rec" else "", "товар": key[1] if kind == "rec" else key,
+                       "возраст записи сборщика, мин": round(a, 1),
+                       "WB сейчас": json.dumps(m, ensure_ascii=False), "в базе сборщика": json.dumps(c, ensure_ascii=False),
+                       "совпало": "да" if m == c else "нет"})
+
+
+def write_check_log():
+    if not CHECK_ROWS:
+        return
+    import csv
+    with _file_lock:
+        try:
+            new = not CHECK_FILE.exists()
+            with open(CHECK_FILE, "a", encoding="utf-8-sig" if new else "utf-8", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=list(CHECK_ROWS[0]), delimiter=";")
+                if new:
+                    w.writeheader()
+                w.writerows(CHECK_ROWS)
+            CHECK_ROWS.clear()
+        except OSError as e:
+            log(f"! Сверка со сборщиком не записана: {e}")
+
+
+def busy_mark(owner):
+    """Отметка «спрашиваю WB» для сборщика: пока она стоит (и процесс жив), сборщик не тратит общий лимит."""
+    try:
+        BUSY_FILE.write_text(json.dumps({"pid": os.getpid(), "owner": owner,
+                                         "at": dt.datetime.now().isoformat(timespec="seconds")}), encoding="utf-8")
+    except OSError:
+        return
+    import atexit
+    atexit.register(busy_clear)
+
+
+def busy_clear():
+    try:
+        if json.loads(BUSY_FILE.read_text(encoding="utf-8")).get("pid") == os.getpid():
+            BUSY_FILE.unlink()
+    except (OSError, ValueError, AttributeError):
+        pass
 
 
 # Рекомендованные ставки WB: 5 запросов в минуту на продавца (интервал 12 с, всплеск 5 — swagger WB, проверено 15.10.2026),
@@ -1141,21 +1286,31 @@ def save_rec_cache():
             pass
 
 
+def fetch_rec_raw(token, aid, nm):
+    """Один запрос рекомендаций WB (без пауз — их ставит вызывающий: pace_burst)."""
+    data = call("GET", ADV + "/api/advert/v0/bids/recommendations", token,
+                params={"nmId": nm, "advertId": aid}, what=f"Рекомендованные ставки {nm}") or {}
+    return data if isinstance(data, dict) else {}
+
+
 def _fetch_rec(token, aid, nm):
     hit = _rec_disk_load().get(f"{aid}:{nm}") or {}
-    try:
-        age = (dt.datetime.now() - dt.datetime.fromisoformat(hit.get("at") or "")).total_seconds() / 60
-    except ValueError:
-        age = None
-    if age is not None and 0 <= age < REC_CACHE_MIN and isinstance(hit.get("data"), dict) and hit["data"]:
-        return hit["data"]                           # свежий ответ из прошлого запуска (стража или автопилота)
+    best = (hit.get("at"), hit.get("data")) if isinstance(hit.get("data"), dict) and hit["data"] else (None, None)
+    if COLLECTOR_MODE == "use":                      # запись сборщика — если она свежее своей
+        c = collector_snapshot()["rec"].get((aid, nm))
+        if c and c[1] and (best[0] is None or c[0] > best[0]):
+            best = c
+    age = age_min(best[0]) if best[0] else None
+    if age is not None and 0 <= age < REC_CACHE_MIN:
+        return best[1]                               # свежий ответ из прошлого запуска (сборщика, стража или автопилота)
     progress(f"    рекомендации WB: {len(_rec_cache) + 1}-й товар…")
     cab_ = getattr(_tl, "cab", None)
     REC_COUNT[cab_] = REC_COUNT.get(cab_, 0) + 1
     pace_burst(token, "rec", REC_INTERVAL, REC_BURST)
-    data = call("GET", ADV + "/api/advert/v0/bids/recommendations", token,
-                params={"nmId": nm, "advertId": aid}, what=f"Рекомендованные ставки {nm}") or {}
+    data = fetch_rec_raw(token, aid, nm)
     progress(" " * 60)
+    if COLLECTOR_MODE == "check" and data:
+        check_against_collector("rec", (aid, nm), data)
     if not _rec_fresh:   # первый ответ за запуск сохраняем как образец (токенов в нём нет)
         with _file_lock:
             try:
@@ -2795,6 +2950,7 @@ def main():
 
     apply = "--apply" in sys.argv
     log(f"{dt.datetime.now():%d.%m.%Y %H:%M} — {'ПРИМЕНЕНИЕ' if apply else 'пробный прогон, ничего не меняется'}")
+    busy_mark("wb_bids.py")             # сборщик рекомендаций пока ждёт: лимит WB общий
     UNIT_LIMITS.update(load_unit_limits())
     if UNIT_LIMITS:
         log(f"Юнит-экономика: лимиты цены заказа для {len(UNIT_LIMITS)} товаров (wb_unit_economics.csv).")

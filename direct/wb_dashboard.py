@@ -175,11 +175,53 @@ def load_recs():
     return {"rows": rows[:60], "since": first}
 
 
+def load_collector():
+    """Сборщик рекомендаций и размеров (wb_collector.py → wb_rec.db): последний проход по кабинетам, сколько
+    рекомендаций свежие, и сверка с автопилотом/проверкой за сутки (wb_rec_check.csv)."""
+    import csv
+    import re
+    import sqlite3
+    res = {"mode": None, "runs": [], "check": {}}
+    try:
+        m = re.search(r'^COLLECTOR_MODE = "(\w+)"', (HERE / "wb_bids.py").read_text(encoding="utf-8"), re.M)
+        res["mode"] = m.group(1) if m else None
+    except OSError:
+        pass
+    f = HERE / "wb_rec.db"
+    if f.exists():
+        try:
+            con = sqlite3.connect(str(f), timeout=10)
+            try:
+                edge = (dt.datetime.now() - dt.timedelta(minutes=30)).isoformat(timespec="seconds")
+                fresh = dict(con.execute("SELECT cab, COUNT(*) FROM rec WHERE at >= ? GROUP BY cab", (edge,)).fetchall())
+                for cab, fin, info in con.execute("SELECT cab, finished, info FROM runs ORDER BY cab"):
+                    i = json.loads(info or "{}")
+                    res["runs"].append({"cab": cab, "at": fin, "pairs": i.get("pairs", 0), "fresh": fresh.get(cab, 0),
+                                        "err": i.get("err") or ""})
+            finally:
+                con.close()
+        except (sqlite3.Error, ValueError):
+            pass
+    c = HERE / "wb_rec_check.csv"
+    if c.exists():
+        edge = (dt.datetime.now() - dt.timedelta(hours=24)).isoformat(timespec="seconds")
+        try:
+            raw = c.read_bytes().decode("utf-8-sig", errors="replace").splitlines()
+        except OSError:
+            raw = []
+        for r in csv.DictReader(raw, delimiter=";"):
+            if (r.get("время") or "") >= edge:
+                k = res["check"].setdefault(r.get("что") or "?", [0, 0])
+                k[1] += 1
+                k[0] += r.get("совпало") == "да"
+    return res
+
+
 def main():
     if sys.stdout is None:          # запуск ярлыком через pythonw.exe — консоли нет, print некуда писать
         sys.stdout = sys.stderr = open(HERE / "wb_dashboard_log.txt", "a", encoding="utf-8")
     data = {"generated": dt.datetime.now().strftime("%d.%m.%Y %H:%M"), **load_db(), "autopilot": load_autopilot(),
-            "recs": load_recs(), "seo": load_seo(),
+            "recs": load_recs(), "seo": load_seo(), "collector": load_collector(),
             "has_db": DB.exists()}
     payload = json.dumps(data, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
     OUT.write_text(TEMPLATE.replace("__DATA__", payload), encoding="utf-8")
@@ -318,7 +360,7 @@ pre { white-space: pre-wrap; font: 12px/1.45 ui-monospace, Consolas, monospace; 
   <section class="card" id="seo-sec" style="margin-bottom:16px"><h2>Успешные поисковые запросы (для SEO)</h2>
     <p class="note" id="seo-note"></p><div id="seo"></div></section>
   <section class="card" id="rec-sec" style="margin-bottom:16px"><h2>Цена рекламы: рекомендации WB</h2>
-    <p class="note" id="rec-note"></p><div id="recs"></div></section>
+    <p class="note" id="col-note"></p><p class="note" id="rec-note"></p><div id="recs"></div></section>
   <section class="card" id="bud-sec" style="margin-bottom:16px"><h2>Бюджет по окупаемости</h2>
     <p class="note" id="bud-note"></p><div id="bud"></div></section>
   <section id="prod-sec" class="card">
@@ -571,7 +613,21 @@ function renderSeo() {
 }
 
 // ---------- цена рекламы: рекомендации WB ----------
+function renderCollector() {
+  const C = D.collector || {runs: []}, el = $("#col-note");
+  const runs = (C.runs || []).filter(r => !state.cab || r.cab === state.cab);
+  if (!runs.length) { el.textContent = "Сборщик рекомендаций (wb_collector.py) ещё не запускался — рекомендации автопилот и проверка спрашивают у WB сами."; return; }
+  const mode = {use: "автопилот и проверка берут рекомендации и размеры из его базы", check: "сверка: автопилот и проверка пока спрашивают WB сами и сравнивают с базой", off: "база не используется"}[C.mode] || "";
+  const parts = runs.map(r => r.cab + ": проход в " + r.at.slice(11, 16) + ", свежих (до 30 мин) " + r.fresh + " из " + r.pairs + (r.err ? " — ошибка: " + r.err.slice(0, 80) : ""));
+  const chk = Object.entries(C.check || {}).map(([k, v]) => k + " — совпало " + v[0] + " из " + v[1]);
+  el.textContent = "Сборщик рекомендаций (каждые 15 мин): " + parts.join("; ") + (mode ? ". Режим — " + mode : "") + (chk.length ? ". Сверка за сутки (все кабинеты): " + chk.join(", ") + "." : ".");
+  const old = runs.some(r => (Date.now() - new Date(r.at).getTime()) > 45 * 60000);
+  el.style.color = old ? "var(--bad)" : "";
+  if (old) el.textContent += " Сборщик давно не работал — проверьте задание AWER_WB_collector в Планировщике.";
+}
+
 function renderRecs() {
+  renderCollector();
   const R = D.recs || {rows: []}, box = $("#recs"); box.textContent = "";
   const rows = (R.rows || []).filter(r => !state.cab || r[0] === state.cab);
   $("#rec-note").textContent = "Сколько WB советует ставить для нужных мест: последние 3 дня против 8–14 дней назад (медианы), только изменения от 15%. Рост — реклама дорожает: цена заказа вырастет, если конверсия та же." + (R.since ? " История — с " + ddmm(R.since) + "." : "");
