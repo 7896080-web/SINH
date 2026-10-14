@@ -10,6 +10,7 @@
   • журналы не растут бесконечно: больше MAX_LOG_MB — текущий переименовывается в *.old.txt (прежний .old удаляется);
   • после автопилота (wb_bids.py) — раз в сутки пробный прогон wb_budget.py: предложения по бюджету для дашборда
     (только расчёт, ничего не меняет; если предложения старше BUDGET_EVERY_H часов);
+  • после wb_positions.py — библиотека успешных запросов для SEO (wb_seo_queries.py, только база истории);
   • после скрипта — всегда пересборка дашборда (python wb_dashboard.py --no-open).
 
 Запуск:  pythonw wb_run.py wb_bids.py --apply --timeout 55
@@ -114,6 +115,8 @@ def main():
         early = (dt.datetime.now() - start).total_seconds() / 60 < 60 - BUDGET_TIMEOUT_MIN - 8
         if args[0] == "wb_bids.py" and early and budget_stale() and (HERE / "wb_budget.py").exists():
             run(["wb_budget.py"], BUDGET_TIMEOUT_MIN, f)          # без --apply: только предложения для дашборда
+        if args[0] == "wb_positions.py" and (HERE / "wb_seo_queries.py").exists():
+            run(["wb_seo_queries.py"], 5, f)                      # библиотека успешных запросов (только база, без WB)
         run(["wb_dashboard.py", "--no-open"], 5, f)
 
 

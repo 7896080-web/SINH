@@ -115,6 +115,28 @@ def load_autopilot():
     return ap
 
 
+def load_seo():
+    """Библиотека успешных запросов (wb_seo_queries.py): успешные сейчас по категориям и число задач SEO по кабинетам."""
+    import csv
+    res = {"lib": [], "tasks": {}}
+    for name, key in (("wb_seo_library.csv", "lib"), ("wb_seo_tasks.csv", "tasks")):
+        f = HERE / name
+        if not f.exists():
+            continue
+        try:
+            rows = list(csv.DictReader(f.read_bytes().decode("utf-8-sig", errors="replace").splitlines(), delimiter=";"))
+        except (OSError, csv.Error):
+            continue
+        if key == "lib":
+            res["lib"] = [[r.get("категория"), r.get("запрос"), r.get("частота в неделю"), r.get("заказы за период"),
+                           r.get("конверсия"), r.get("доля без рекламы"), r.get("впервые успешный")]
+                          for r in rows if r.get("статус") == "успешный"][:300]
+        else:
+            for r in rows:
+                res["tasks"][r.get("кабинет")] = res["tasks"].get(r.get("кабинет"), 0) + 1
+    return res
+
+
 def load_recs():
     """Рекомендованные ставки WB (wb_rec_history.csv, пишут wb_bids.py и wb_guard.py): медиана за последние 3 дня против
     медианы 8–14 дней назад, по кампании и товару. Только заметные изменения (±15%)."""
@@ -157,7 +179,7 @@ def main():
     if sys.stdout is None:          # запуск ярлыком через pythonw.exe — консоли нет, print некуда писать
         sys.stdout = sys.stderr = open(HERE / "wb_dashboard_log.txt", "a", encoding="utf-8")
     data = {"generated": dt.datetime.now().strftime("%d.%m.%Y %H:%M"), **load_db(), "autopilot": load_autopilot(),
-            "recs": load_recs(),
+            "recs": load_recs(), "seo": load_seo(),
             "has_db": DB.exists()}
     payload = json.dumps(data, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
     OUT.write_text(TEMPLATE.replace("__DATA__", payload), encoding="utf-8")
@@ -293,6 +315,8 @@ pre { white-space: pre-wrap; font: 12px/1.45 ui-monospace, Consolas, monospace; 
     <div class="card"><h2>Пополнения бюджетов за 7 дней</h2><p class="note">Сколько автопилот перевёл с «Баланса» против недельного потолка кампании</p><div id="ap-topups"></div>
       <h2 style="margin-top:14px">Последняя часовая проверка</h2><pre id="ap-guard"></pre></div>
   </div>
+  <section class="card" id="seo-sec" style="margin-bottom:16px"><h2>Успешные поисковые запросы (для SEO)</h2>
+    <p class="note" id="seo-note"></p><div id="seo"></div></section>
   <section class="card" id="rec-sec" style="margin-bottom:16px"><h2>Цена рекламы: рекомендации WB</h2>
     <p class="note" id="rec-note"></p><div id="recs"></div></section>
   <section class="card" id="bud-sec" style="margin-bottom:16px"><h2>Бюджет по окупаемости</h2>
@@ -526,6 +550,26 @@ function renderAutopilot() {
   $("#ap-guard").textContent = A.guard_last.length ? A.guard_last.join("\n") : "Часовая проверка ещё не запускалась.";
 }
 
+// ---------- успешные запросы (wb_seo_queries.py) ----------
+function renderSeo() {
+  const S = D.seo || {lib: [], tasks: {}}, box = $("#seo"); box.textContent = "";
+  const nt = state.cab ? (S.tasks[state.cab] || 0) : Object.values(S.tasks).reduce((a, b) => a + b, 0);
+  $("#seo-note").textContent = "Запросы, по которым товары категории продают лучше всего (все кабинеты вместе, 30 дней). Полный список — wb_seo_library.csv; что добавить в названия похожих товаров" + (state.cab ? " этого кабинета" : "") + " — wb_seo_tasks.csv (задач: " + nt + ").";
+  if (!S.lib.length) { h("div", {class: "empty", style: "padding:12px 0"}, box, "Библиотеки пока нет — её каждый день после wb_positions.py собирает wb_seo_queries.py."); return; }
+  const by = {}; S.lib.forEach(r => (by[r[0]] || (by[r[0]] = [])).push(r));
+  Object.entries(by).forEach(([cat, rows]) => {
+    h("h3", {style: "font-size:13px;margin:10px 0 4px"}, box, cat);
+    const tb = h("table", {}, h("div", {class: "scroll", style: "max-height:240px"}, box)), tr = h("tr", {}, h("thead", {}, tb));
+    ["Запрос", "В неделю", "Заказы", "Конверсия", "Без рекламы", "Успешный с"].forEach((x, i) => h("th", {class: i ? "" : "l"}, tr, x));
+    const body = h("tbody", {}, tb);
+    const n = (v) => parseFloat(String(v || "").replace(",", "."));
+    rows.slice(0, 10).forEach(r => { const row = h("tr", {}, body);
+      h("td", {class: "l"}, row, r[1]); h("td", {}, row, isNaN(n(r[2])) ? "—" : fmt0.format(n(r[2])));
+      h("td", {}, row, isNaN(n(r[3])) ? "—" : fmt0.format(n(r[3]))); h("td", {}, row, isNaN(n(r[4])) ? "—" : pct(n(r[4])));
+      h("td", {}, row, isNaN(n(r[5])) ? "—" : pct(n(r[5]))); h("td", {}, row, r[6] ? ddmm(r[6]) : "—"); });
+  });
+}
+
 // ---------- цена рекламы: рекомендации WB ----------
 function renderRecs() {
   const R = D.recs || {rows: []}, box = $("#recs"); box.textContent = "";
@@ -607,7 +651,7 @@ function renderProducts(agg, cab) {
 function render() {
   $("#sub").textContent = "собрано " + D.generated;
   document.querySelectorAll("#period button").forEach(b => b.setAttribute("aria-pressed", String(+b.dataset.d === state.days)));
-  if (!D.has_db || !state.cab) { $("#nodb").hidden = false; $("#main").hidden = true; $("#prod-sec").hidden = true; renderAutopilot(); renderRecs(); renderBudget(); return; }
+  if (!D.has_db || !state.cab) { $("#nodb").hidden = false; $("#main").hidden = true; $("#prod-sec").hidden = true; renderAutopilot(); renderSeo(); renderRecs(); renderBudget(); return; }
   const cab = state.cab, end = lastDate(cab), dates = dateList(end, state.days), prevDates = dateList(dateList(end, state.days + 1)[0], state.days);
   $("#range").textContent = ddmm(dates[0]) + " – " + ddmm(end) + "." + end.slice(0, 4) + " (последний день в данных)";
   const A = aggregate(cab, dates), B = aggregate(cab, prevDates), t = A.tot, p = B.tot;
@@ -641,6 +685,7 @@ function render() {
   chart($("#c-pos"), {dates, kind: "line", invert: true, endLabels: true, fmt: (v) => v == null ? "—" : fmt0.format(v), fmtAxis: (v) => fmt0.format(v), label: "Позиция в поиске",
     series: top.map((x, i) => ({name: (names[x.nm] || [String(x.nm)])[0] || String(x.nm), color: colors[i], vals: dates.map(d => (posBy[x.nm] || {})[d] ?? null)}))});
   renderAutopilot();
+  renderSeo();
   renderRecs();
   renderBudget();
   renderProducts(A, cab);
