@@ -6,7 +6,8 @@
   • wb_bids_state.json, wb_bids_backups\\, wb_guard_backups\\, журналы — что делали автопилот и часовая проверка.
 
 На странице (фильтр периода 7 / 14 / 30 / 90 дней и кабинета — сверху, действует на всё):
-  1. Плитки: расход рекламы, заказы с рекламы, цена заказа с рекламы, все заказы, доля рекламы в заказах (ДРР) —
+  1. Плитки: расход рекламы, заказы с рекламы, цена заказа с рекламы, все заказы, ДРР общий (реклама ÷ все заказы),
+     ДРР рекламный (реклама ÷ заказы с рекламы, выручка — заказы × средняя цена), доля заказов с рекламы —
      с изменением к прошлому такому же периоду и мини-графиком.
   2. Графики по дням: расход; все заказы и заказы с рекламы; цена заказа с рекламы;
      позиция в поиске (медиана) у 4 товаров с наибольшим расходом.
@@ -172,7 +173,7 @@ h1 { font-size: 20px; margin: 0; font-weight: 600; }
 .seg button[aria-pressed="true"] { background: var(--ink); color: var(--surface); }
 select, input[type=search] { font: inherit; color: var(--ink); background: var(--surface); border: 1px solid var(--ring); border-radius: 8px; padding: 6px 10px; }
 .spacer { flex: 1; }
-.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin-bottom: 16px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(155px, 1fr)); gap: 12px; margin-bottom: 16px; }
 .card { background: var(--surface); border: 1px solid var(--ring); border-radius: 12px; padding: 14px 16px; min-width: 0; }
 .tile .label { color: var(--ink2); font-size: 13px; }
 .tile .value { font-size: 26px; font-weight: 600; margin: 2px 0; }
@@ -346,8 +347,8 @@ function sparkline(parent, vals, color) {
   const lp = xs[xs.length - 1];
   el("circle", {cx: X(lp[0]), cy: Y(lp[1]), r: 3, fill: color}, svg);
 }
-function tile(parent, label, value, cur, prev, upIsGood, series) {
-  const t = h("div", {class: "card tile"}, parent);
+function tile(parent, label, value, cur, prev, upIsGood, series, hint) {
+  const t = h("div", hint ? {class: "card tile", title: hint} : {class: "card tile"}, parent);
   h("div", {class: "label"}, t, label);
   h("div", {class: "value"}, t, value);
   let txt = "нет данных за прошлый период", cls = "delta";
@@ -524,13 +525,16 @@ function renderProducts(agg, cab) {
     p.cpo = p.adOrders ? p.spend / p.adOrders : null; p.cr = p.clicks ? p.adOrders / p.clicks : null;
     p.cpc = p.clicks ? p.spend / p.clicks : null; p.pos = lastPos[p.nm] ? lastPos[p.nm][1] : null;
     const s = stock[p.nm]; p.stock = s ? (s[0] || 0) + (s[1] || 0) : null;
+    p.drr = p.sum ? p.spend / p.sum : null;
+    p.drrAd = p.orders && p.adOrders ? p.spend / (p.adOrders * p.sum / p.orders) : null;
   });
   const q = $("#q").value.trim().toLowerCase();
   const rows = prods.filter(p => !q || String(p.nm).includes(q) || (p.vendor + " " + p.title).toLowerCase().includes(q));
   rows.sort((a, b) => { const x = a[sortKey], y = b[sortKey]; if (x == null) return 1; if (y == null) return -1; return (typeof x === "string" ? x.localeCompare(y) : x - y) * sortDir; });
   const cols = [["nm", "Артикул WB", (v) => String(v), "l"], ["vendor", "Арт. продавца", (v) => v, "l"], ["spend", "Расход", money], ["clicks", "Клики", num],
     ["cpc", "₽ за клик", (v) => v == null ? "—" : fmt1.format(v)], ["adOrders", "Заказы с рекламы", num], ["cpo", "Цена заказа", money], ["cr", "Конверсия", pct],
-    ["orders", "Все заказы", num], ["pos", "Позиция", (v) => v == null ? "—" : fmt0.format(v)], ["stock", "Остаток WB+свой", num]];
+    ["orders", "Все заказы", num], ["drr", "ДРР общий", pct], ["drrAd", "ДРР рекл.", pct],
+    ["pos", "Позиция", (v) => v == null ? "—" : fmt0.format(v)], ["stock", "Остаток WB+свой", num]];
   const tb = $("#prod"); tb.textContent = "";
   const tr = h("tr", {}, h("thead", {}, tb));
   cols.forEach(([k, t, f, c]) => { const th = h("th", {class: c || "", scope: "col", tabindex: "0", "aria-sort": k === sortKey ? (sortDir > 0 ? "ascending" : "descending") : "none"}, tr, t + (k === sortKey ? (sortDir > 0 ? " ↑" : " ↓") : ""));
@@ -557,7 +561,16 @@ function render() {
   tile(tiles, "Цена заказа с рекламы", money(cpo), cpo, cpoP, false, dates.map(d => A.day[d].adOrders ? A.day[d].spend / A.day[d].adOrders : null));
   tile(tiles, "Все заказы", num(t.orders), t.orders, p.orders, true, day("orders"));
   const drr = t.sum ? t.spend / t.sum : null, drrP = p.sum ? p.spend / p.sum : null;
-  tile(tiles, "Доля рекламы в заказах (ДРР)", pct(drr), drr, drrP, false, dates.map(d => A.day[d].sum ? A.day[d].spend / A.day[d].sum : null));
+  tile(tiles, "ДРР общий", pct(drr), drr, drrP, false, dates.map(d => A.day[d].sum ? A.day[d].spend / A.day[d].sum : null),
+    "Расход рекламы ÷ сумма ВСЕХ заказов (с рекламы и без): сколько реклама стоит от всех продаж");
+  // выручка заказов с рекламы ≈ заказы с рекламы × средняя цена заказа товара (WB в историю её не отдаёт)
+  const adRev = (x) => Object.values(x.prod).reduce((a, q) => a + (q.orders ? q.adOrders * q.sum / q.orders : 0), 0);
+  const ra = adRev(A), rb = adRev(B), drrAd = ra ? t.spend / ra : null, drrAdP = rb ? p.spend / rb : null;
+  tile(tiles, "ДРР рекламный", pct(drrAd), drrAd, drrAdP, false, dates.map(d => { const x = A.day[d]; return x.orders && x.adOrders ? x.spend / (x.adOrders * x.sum / x.orders) : null; }),
+    "Расход рекламы ÷ сумма заказов С РЕКЛАМЫ (заказы с рекламы × средняя цена заказа товара — оценка)");
+  const share = t.orders ? t.adOrders / t.orders : null, shareP = p.orders ? p.adOrders / p.orders : null;
+  tile(tiles, "Доля с рекламы", pct(share), share, shareP, null, dates.map(d => A.day[d].orders ? A.day[d].adOrders / A.day[d].orders : null),
+    "Какая часть всех заказов пришла с рекламы");
   const s1 = css("--s1"), s2 = css("--s2"), s3 = css("--s3"), s4 = css("--s4");
   chart($("#c-spend"), {dates, kind: "bar", fmt: money, label: "Расход рекламы по дням", series: [{name: "Расход", color: s1, vals: day("spend")}]});
   chart($("#c-orders"), {dates, kind: "line", endLabels: true, label: "Заказы по дням", series: [
