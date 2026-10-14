@@ -71,6 +71,22 @@ except (AttributeError, ValueError):
 #   Дневной лимит WB даёт только кампаниям за клики; у кампаний за показы он пропускается.
 EXP_MAX_CPC = 20   # эксперимент Ребрик/Караман, кампании за клики: ставка за WB, но не дороже 20 ₽ за клик (решение
                    # 14.10.2026: WB просил до 55 ₽ за клик для товаров со 137 кликами без заказов; остальным хватает 8–18 ₽)
+# ── Распределение бюджета по часам (решение пользователя 14.10.2026; уточнить по снимкам ≈7–10.11) ──
+# Кампания за клики, у которой дневной лимит кончится раньше конца дня (прогноз по тому, сколько уже потрачено
+# к этому часу), — ставка снижается, пока расход опережает график спроса; догнала график — снова по рекомендации.
+# График — доля дневного спроса по часам, общий по 3 кабинетам (заказы за 90 дн., wb_dayparts.py, 14.10.2026).
+PACING = True
+PACE_WD = [2.49, 0.65, 0.76, 0.52, 1.31, 1.44, 2.24, 3.67, 5.10, 5.74, 4.73, 5.64,     # будни, % заказов в час
+           5.82, 5.92, 5.12, 5.03, 4.84, 5.57, 5.23, 6.21, 6.41, 6.91, 4.78, 3.86]
+PACE_WE = [2.35, 0.61, 0.72, 0.31, 0.78, 0.86, 1.63, 2.66, 3.70, 5.17, 4.26, 5.08,     # сб и вс
+           6.40, 6.51, 5.63, 6.41, 6.18, 7.11, 5.51, 6.55, 6.76, 6.59, 4.55, 3.68]
+PACE_STEPS = [(0.15, 0.70), (0.05, 0.85)]   # опережает график больше чем на 15 п. п. → ставка ×0,7; на 5–15 → ×0,85
+PACE_MIN_SHARE = 0.12       # раньше, чем набралось 12% дневного спроса (≈ до 7–8 утра), прогноз ненадёжен — не трогать
+PACE_LIMITED = 1.05         # «денег не хватит»: прогноз расхода за день больше лимита на 5%+
+# кампании эксперимента Ребрик/Караман до его конца не трогаем — иначе сравнение «за клики / за показы» исказится
+PACING_SKIP_UNTIL = {"40769287": "2026-10-27", "40769334": "2026-10-27", "40769357": "2026-10-27",
+                     "40769361": "2026-10-27", "40769369": "2026-10-27"}
+
 RULES = {
     "Яворская": {
         "*": {"target": "3-10", "max_cost_per_order": 600, "daily_limit": 1000, "auto_minus": True,
@@ -1237,6 +1253,13 @@ def plan_cabinet(cab, token, rules, state):
         step = steps[pay]
         target = r["target"] if r["target"] in CPC_LEVEL else "3-10"
         cap_abs = int((r["max_bid_cpc"] if pay == "cpc" else r["max_bid_cpm"]) * 100)
+        pace_m, pace_why = 1.0, ""
+        if pay == "cpc" and r.get("pacing", True) and lims_all:
+            lm = lims_all.get(cid) or {}
+            if lm.get("enabled") and lm.get("spentToday") is not None:
+                pace_m, pace_why = pace_factor(cid, num(lm["spentToday"]) / 100, num(lm.get("dailyLimit")) / 100)
+                if pace_m < 1:
+                    log(f"    График расхода: {pace_why}.")
         nms = nms_of[cid]
         c_clicks = sum(v["clicks"] for (x, _), v in stats.items() if x == cid)
         c_orders = sum(v["orders"] for (x, _), v in stats.items() if x == cid)
@@ -1327,6 +1350,10 @@ def plan_cabinet(cab, token, rules, state):
                                          day_base(state, "bids", cid, nm, placement), r.get("max_drop_pct"))
                     if r.get("follow_rec") and reason.startswith("потолок по цене заказа"):
                         reason = reason.replace("потолок по цене заказа", f"потолок ставки {cap / 100:.0f} ₽")
+                    if pace_m < 1 and nb:
+                        nb2 = paced(nb, pace_m, mn, step)
+                        if nb2 != nb:
+                            nb, reason = nb2, f"{reason}; график расхода ×{pace_m}"
                     if size_short(nm) == "hold" and current and nb and nb > current:
                         nb, reason = current, f"мало ходовых размеров (закрыто {cover[nm][0]:.0%} спроса) — не повышаю"
                     if r.get("stop_clicks") and v["clicks"] >= r["stop_clicks"] and not v["orders"]:
@@ -1802,6 +1829,43 @@ def deposit_amount(want, day_cap, today_, week_cap, week, cab_left=None, min_dep
         room = min(room, cab_left)
     amount = min(max(want, min_dep), room)
     return int(math.ceil(amount)) if amount >= min_dep else 0
+
+
+def pace_target(now=None):
+    """Доля дневного спроса, которая обычно набирается к этому моменту (будни / выходные)."""
+    now = now or dt.datetime.now()
+    prof = PACE_WE if now.weekday() >= 5 else PACE_WD
+    tot = sum(prof)
+    h = now.hour
+    return (sum(prof[:h]) + prof[h] * now.minute / 60) / tot
+
+
+def pace_factor(cid, spent, limit, now=None):
+    """(множитель ставки, пояснение). spent и limit — ₽ за сегодня. 1.0 — не вмешиваться."""
+    if not PACING or not limit or spent is None:
+        return 1.0, ""
+    until = PACING_SKIP_UNTIL.get(str(cid))
+    if until and dt.date.today().isoformat() <= until:
+        return 1.0, ""
+    tgt = pace_target(now)
+    if tgt < PACE_MIN_SHARE or spent >= limit * 0.97:
+        return 1.0, ""
+    frac = spent / limit
+    if spent / tgt <= limit * PACE_LIMITED:
+        return 1.0, ""                                   # до конца дня денег хватает
+    ahead = frac - tgt
+    for gap, m in PACE_STEPS:
+        if ahead > gap:
+            return m, (f"потрачено {frac:.0%} лимита при {tgt:.0%} дневного спроса к этому часу — ставка ×{m}, "
+                       "чтобы деньги дошли до вечера")
+    return 1.0, ""
+
+
+def paced(nb, m, mn, step):
+    """Ставка с поправкой на график расхода (не ниже минимальной WB)."""
+    if nb is None or m >= 1:
+        return nb
+    return max(int(mn or 0), int(math.floor(nb * m / step) * step))
 
 
 def topped_week(state, cid, days=7):

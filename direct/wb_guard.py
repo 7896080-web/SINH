@@ -53,6 +53,7 @@ CAPS_MAX_AGE_HOURS = 48     # потолки из wb_bids.py старше — н
 
 SPEND_LOG = B.HERE / "wb_spend_hourly.csv"   # расход кампаний по часам (только запись наблюдений; см. wb_pacing.py)
 SNAPSHOTS = {}                                # {кабинет: [строки]} — заполняется в потоках кабинетов
+PACE = {}                                     # {кабинет: {кампания: {m, why}}} — график расхода (wb_bids.pace_factor)
 BACKUP_DIR = B.HERE / "wb_guard_backups"
 LOG_FILE = B.HERE / "wb_guard_log.txt"
 log = B.log
@@ -173,9 +174,25 @@ def plan_cabinet(cab, token, caps, state, budget):
         nms = [x[1] for x in cand if x[0] == cid and x[2] == zone]
         for nm, v in B.get_min_bids(token, cid, nms, (a.get("settings") or {}).get("payment_type"), zone).items():
             mins[(cid, nm, zone)] = v
+    # график расхода: кампании за клики, у которых дневной лимит кончится раньше вечера, — ставка ниже
+    today = dt.date.today().isoformat()
+    prev = {k: v for k, v in (state.get("pacing") or {}).items() if v.get("date") == today}
+    pace = {}
+    for row in SNAPSHOTS.get(cab, []):
+        if row.get("оплата") == "cpc" and row.get("потрачено сегодня ₽") != "" and row.get("дневной лимит ₽") != "":
+            m, why = B.pace_factor(row["кампания"], row["потрачено сегодня ₽"], row["дневной лимит ₽"])
+            pace[row["кампания"]] = {"m": m, "why": why}
+            if m < 1:
+                log(f"  ⏱ «{row['название']}»: {why}.")
+            elif (prev.get(str(row["кампания"])) or {}).get("m", 1) < 1:
+                log(f"  ⏱ «{row['название']}»: расход вернулся к графику — ставки снова по рекомендации WB.")
+    PACE[cab] = pace
+    # такие кампании (и те, где ставку снижали раньше сегодня) сверяются целиком, а не только самые кликабельные
+    pace_all = {cid for cid, p in pace.items() if p["m"] < 1 or (prev.get(str(cid)) or {}).get("m", 1) < 1}
     # рекомендации — самым кликабельным, не «зафиксированным» правилом
     rec_ok = {(x[0], x[1], x[2]) for x in sorted((x for x in cand if not x[3].get("fixed")),
                                                   key=lambda x: -(x[3].get("clicks") or 0))[:budget]}
+    rec_ok |= {(x[0], x[1], x[2]) for x in cand if x[0] in pace_all and not x[3].get("fixed")}
     changes, losing, checked = [], [], 0
     for cid, nm, zone, c, a in sorted(cand, key=lambda x: (x[0], -(x[3].get("clicks") or 0))):
         st = a.get("settings") or {}
@@ -205,6 +222,11 @@ def plan_cabinet(cab, token, caps, state, budget):
                                     B.day_base(state, "bids", cid, nm, zone), c.get("max_drop"))
                 if c.get("no_raise") and nb > cur:
                     nb, why = cur, "не повышаю (мало размеров или много кликов без заказов)"
+                pm = (pace.get(cid) or {}).get("m", 1.0)
+                if pm < 1:
+                    nb2 = B.paced(nb, pm, mn, step)
+                    if nb2 != nb:
+                        nb, why = nb2, f"{why}; график расхода ×{pm}"
                 if B.changed(nb, cur, step):
                     changes.append({**base, "new": nb, "rec": rec, "why": why})
                 continue
@@ -305,6 +327,13 @@ def run(cabs, apply):
     snap = [r for cab, _ in jobs for r in SNAPSHOTS.get(cab, [])]
     if snap:
         write_spend_log(snap)
+    if apply:
+        pst = state.setdefault("pacing", {})
+        for cab, _ in jobs:
+            for cid, p in PACE.get(cab, {}).items():
+                pst[str(cid)] = {"date": dt.date.today().isoformat(), "m": p["m"],
+                                 "at": dt.datetime.now().isoformat(timespec="minutes")}
+        B.save_state(state)
     for cab, _ in jobs:
         kind, res = results[cab]
         if kind == "err":
