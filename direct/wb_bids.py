@@ -68,7 +68,9 @@ except (AttributeError, ValueError):
 #   "_except": [ID или часть названия, …] — активные кампании, которые автопилот не трогает (например, на время теста).
 #   "until": "ГГГГ-ММ-ДД" в правиле кампании — правило действует до этой даты включительно, потом кампания
 #   переходит на общие правила "*" (режим запуска новинок: дороже допустимый заказ на 2–3 недели).
-#   Дневной лимит WB даёт только кампаниям за клики; у кампаний за показы он пропускается.
+#   Дневной лимит: у кампаний за клики его ставит WB; у кампаний за показы WB его не даёт — держит часовая проверка
+#   wb_guard.py: потрачено за сегодня ≈ лимит (или по темпу уйдёт за него до следующей проверки) → пауза до утра,
+#   в 7:40 следующего дня — запуск (решение пользователя 15.10.2026: все способы оптимизации для обоих типов).
 EXP_MAX_CPC = 20   # эксперимент Ребрик/Караман, кампании за клики: ставка за WB, но не дороже 20 ₽ за клик (решение
                    # 14.10.2026: WB просил до 55 ₽ за клик для товаров со 137 кликами без заказов; остальным хватает 8–18 ₽)
 # ── Распределение бюджета по часам (решение пользователя 14.10.2026; уточнить по снимкам ≈7–10.11) ──
@@ -132,19 +134,20 @@ RULES = {
         # новинки за клики, «Кампания от 10.10.2026», запущена пользователем 14.10.2026: свой бюджет 5 000 ₽/нед
         "40842596": {"target": "3-10", "follow_rec": True, "max_bid_cpc": EXP_MAX_CPC, "auto_minus": False, "start_after_topup": True, "daily_limit": 700,
                      "topup_below": 700, "topup_amount": 700, "topup_day_cap": 700, "topup_week_cap": 5000},
-        # за показы дневного лимита у WB нет — расход держат пополнения малыми порциями (порог = сумма = потолок в сутки)
+        # за показы дневного лимита у WB нет — держит wb_guard.py паузой (решение 15.10.2026: с 14.10 пополнение не меньше
+        # 1 000 ₽, и тысяча уходила за ≈2 ч вечером); лимит = недельный потолок пополнений ÷ 7
         # куртки — ЗА КЛИКИ (решение 14.10.2026 по сравнению 40769287 Ребрика ≈606 ₽/заказ и 40769350 Карамана ≈3 505 ₽):
         # 40769287 включена обратно, кампания за показы на эти же куртки 40863039 — на паузе (в правила не входит)
         "40769287": {"target": "3-10", "follow_rec": True, "max_bid_cpc": EXP_MAX_CPC, "auto_minus": False, "start_after_topup": True, "daily_limit": 500,
                      "topup_below": 500, "topup_amount": 500, "topup_day_cap": 500, "topup_week_cap": 3500},
         # джемперы 256250 + ZJYM: бюджет ×2 (решение 14.10.2026) — 600 ₽/сутки, как 300 + 300 у Карамана за клики
-        "40863019": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True,
+        "40863019": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True, "daily_limit": 600,
                      "topup_below": 600, "topup_amount": 600, "topup_day_cap": 600, "topup_week_cap": 4200},
         # «Ребрик 2101 показы» — создана 14.10.2026 через wb_create.py
-        "40955628": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True,
+        "40955628": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True, "daily_limit": 300,
                                "topup_below": 150, "topup_amount": 150, "topup_day_cap": 150, "topup_week_cap": 2000},
         # «Ребрик TC26 показы» — создана 14.10.2026 через wb_create.py
-        "40955524": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True,
+        "40955524": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True, "daily_limit": 150,
                                "topup_below": 100, "topup_amount": 100, "topup_day_cap": 100, "topup_week_cap": 1000},
     },
     "Караман": {
@@ -159,7 +162,7 @@ RULES = {
         # новая кампания за показы с теми же товарами; дневного лимита у WB нет — пополнения по 500 ₽ в сутки
         # (как куртки за клики в Ребрике — равные деньги для честного сравнения; было 200 ₽ — мало, решение 14.10.2026)
         # «Караман пуховики показы» — создана 14.10.2026 через wb_create.py
-        "40955797": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True,
+        "40955797": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True, "daily_limit": 500,
                                     "topup_below": 500, "topup_amount": 500, "topup_day_cap": 500, "topup_week_cap": 3500},
         "40769357": {"target": "3-10", "follow_rec": True, "max_bid_cpc": EXP_MAX_CPC, "auto_minus": False, "start_after_topup": True, "daily_limit": 300,
                      "topup_below": 300, "topup_amount": 300, "topup_day_cap": 300, "topup_week_cap": 2100},   # 256250
@@ -1209,9 +1212,14 @@ def plan_cabinet(cab, token, rules, state):
             for cid in paused:
                 nm_ = (camps[cid].get("settings") or {}).get("name")
                 b = buds.get(cid)
-                if thr and b is not None and b < PAUSED_MONEY_BELOW:
+                if limit_paused(state, cid) == dt.date.today().isoformat():
+                    log(f"  «{nm_}» {cid} на паузе по дневному лимиту — запустит часовая проверка утром.")
+                elif thr and b is not None and b < PAUSED_MONEY_BELOW:
                     todo[cid] = dict(DEFAULTS, **rules["*"], _resume=True)
                     log(f"  «{nm_}» {cid} на паузе, бюджет {fm_rub(b)} ₽ — кончились деньги: пополню и запущу.")
+                elif thr and b is not None and limit_paused(state, cid):
+                    todo[cid] = dict(DEFAULTS, **rules["*"], _resume=True)
+                    log(f"  «{nm_}» {cid} вчера встала на паузу по дневному лимиту — запущу.")
                 elif thr and b is not None and start_retry(state, cid):
                     todo[cid] = dict(DEFAULTS, **rules["*"], _resume=True)
                     log(f"  «{nm_}» {cid} на паузе, бюджет {fm_rub(b)} ₽ — её пополнили {start_pending(state, cid)}, "
@@ -1339,6 +1347,10 @@ def plan_cabinet(cab, token, rules, state):
         lims_all, lim_err = None, e
     want_bud = [c for c in order if todo[c].get("topup_below")]
     buds_all = get_budgets(token, want_bud) if want_bud else {}
+    # кампании за показы с дневным лимитом: расход за сегодня (лимит держит пауза в wb_guard.py; здесь — график расхода)
+    want_cpm = [c for c in order if todo[c]["daily_limit"] and (camps[c].get("settings") or {}).get("payment_type") != "cpc"
+                and camps[c].get("_status") == 9]
+    cpm_spent = spent_today(token, want_cpm) if want_cpm and PACING else {}
 
     for cid in order:
         r, a = todo[cid], camps[cid]
@@ -1357,6 +1369,8 @@ def plan_cabinet(cab, token, rules, state):
                 # лимит — тот, что будет после этого запуска: автопилот ставит лимит из правила (если он задан)
                 lim_rub = r.get("daily_limit") or num(lm.get("dailyLimit")) / 100
                 pace_m, pace_why = pace_factor(cid, num(lm["spentToday"]) / 100, lim_rub)
+        elif pay != "cpc" and r.get("pacing", True) and cid in cpm_spent:      # за показы — по своему дневному лимиту
+            pace_m, pace_why = pace_factor(cid, cpm_spent[cid], r["daily_limit"])
         pace_prev = ((state.get("pacing") or {}).get(str(cid)) or {})
         pace_prev = pace_prev.get("m", 1.0) if pace_prev.get("date") == dt.date.today().isoformat() else 1.0
         nms = nms_of[cid]
@@ -1666,7 +1680,9 @@ def plan_cabinet(cab, token, rules, state):
         limit_need = 0     # ₽: WB не ставит дневной лимит больше бюджета кампании («insufficient campaign budget»)
         if r["daily_limit"]:
             if pay != "cpc":
-                log("    ! Дневной лимит WB даёт только кампаниям с оплатой за клики — пропускаю.")
+                log(f"    Дневной лимит {r['daily_limit']} ₽: у кампаний за показы его держит часовая проверка — пауза, "
+                    "когда потрачен, запуск утром"
+                    + (f" (сегодня потрачено {fm_rub(cpm_spent[cid])} ₽)." if cid in cpm_spent else "."))
             else:
                 if lims_all is None:
                     log(f"    ! {lim_err}")
@@ -1704,6 +1720,12 @@ def plan_cabinet(cab, token, rules, state):
             short = max(limit_need - (bud or 0), 0)       # сколько не хватает бюджета, чтобы WB принял новый лимит
             if bud is None:
                 log("    ! Бюджет кампании не получен — пополнение пропускаю.")
+            elif a.get("_status") == 11 and limit_paused(state, cid) == dt.date.today().isoformat():
+                log("    На паузе по дневному лимиту до утра — не пополняю и не запускаю.")
+            elif a.get("_status") == 11 and limit_paused(state, cid) and bud >= PAUSED_MONEY_BELOW:
+                log(f"    Вчера встала на паузу по дневному лимиту (в бюджете {fm_rub(bud)} ₽) — запустить.")
+                plan["topup"].append({"cabinet": cab, "advert_id": cid, "name": name, "amount": 0,
+                                      "source": r["topup_source"], "budget_before": bud, "start": True})
             elif a.get("_status") in (4, 11) and bud >= PAUSED_MONEY_BELOW and start_retry(state, cid):
                 log(f"    Кампанию пополнили {start_pending(state, cid)}, а запуск тогда не прошёл (в бюджете {fm_rub(bud)} ₽) — "
                     "запустить снова, без пополнения.")
@@ -1935,6 +1957,9 @@ def prune_state(state, keep_days=35):
     pend = state.get("start_pending") or {}
     for cid in [c for c, d in pend.items() if d < since]:
         del pend[cid]
+    lp = state.get("limit_paused") or {}
+    for cid in [c for c, v in lp.items() if (v.get("date") or "") < since]:
+        del lp[cid]
 
 
 MIN_DEPOSIT = 1000   # WB не принимает пополнение бюджета меньше 1 000 ₽ («minimum deposit amount is 1000», 14.10.2026)
@@ -2062,6 +2087,89 @@ def live_topup(cab, cid, camps):
             "week_cap": r["topup_week_cap"], "cab_cap": rules.get("_week_budget")}
 
 
+CPM_LIMIT_FULL = 0.97     # кампания за показы потратила столько от дневного лимита — пауза до утра
+CPM_OVERSHOOT = 1.15      # …или по темпу последнего часа к следующей проверке потратит больше лимита × 1,15 — пауза сейчас
+
+
+def spent_today(token, ids):
+    """Потрачено сегодня, ₽: {кампания: сумма}. У кампаний за показы дневного лимита WB нет — держим его сами (пауза),
+    поэтому расход нужен и для них: сначала «дневные лимиты» (spentToday, если WB отдаёт его и для показов), иначе
+    статистика кампании за сегодня. Не узнали — кампании нет в ответе (тогда ничего не делаем)."""
+    res = {}
+    if not ids:
+        return res
+    try:
+        for cid, a in get_limits(token, ids).items():
+            if a.get("spentToday") is not None:
+                res[cid] = num(a["spentToday"]) / 100
+    except ApiError:
+        pass
+    rest = [c for c in ids if c not in res]
+    today = dt.date.today().isoformat()
+    for part in chunks(rest, 50):
+        pace(token, "fullstats", 21)
+        try:
+            data = call("GET", ADV + "/adv/v3/fullstats", token, what="Статистика за сегодня",
+                        params={"ids": ",".join(map(str, part)), "beginDate": today, "endDate": today})
+        except ApiError as e:
+            log(f"  ! {e} — расход за сегодня у кампаний за показы неизвестен, дневной лимит не проверяю.")
+            continue
+        for item in data or []:
+            s = 0.0
+            for day in item.get("days") or []:
+                for app in day.get("apps") or []:
+                    for n in app.get("nms") or []:
+                        s += num(n.get("sum"))
+            res[item.get("advertId")] = s
+        for cid in part:                       # статистика есть, а кампании в ней нет — сегодня показов не было
+            if data is not None and cid not in res:
+                res[cid] = 0.0
+    return res
+
+
+def limit_paused(state, cid):
+    """Дата, когда кампанию за показы поставили на паузу по дневному лимиту (или None)."""
+    return ((state.get("limit_paused") or {}).get(str(cid)) or {}).get("date")
+
+
+def cpm_limit_check(cid, spent, limit, state, now=None):
+    """(пора ставить на паузу?, пояснение). Темп — по прошлому замеру этого дня (state["cpm_spent"])."""
+    now = now or dt.datetime.now()
+    if spent is None or not limit:
+        return False, ""
+    if spent >= limit * CPM_LIMIT_FULL:
+        return True, f"потрачено {fm_rub(spent)} из {fm_rub(limit)} ₽ дневного лимита"
+    prev = (state.get("cpm_spent") or {}).get(str(cid)) or {}
+    try:
+        t0 = dt.datetime.fromisoformat(prev.get("at") or "")
+    except ValueError:
+        t0 = None
+    if t0 and t0.date() == now.date() and spent >= (prev.get("spent") or 0):
+        hours = (now - t0).total_seconds() / 3600
+        if 0.25 <= hours <= 3:
+            rate = (spent - (prev.get("spent") or 0)) / hours
+            if spent + rate * 1.0 > limit * CPM_OVERSHOOT:
+                return True, (f"потрачено {fm_rub(spent)} из {fm_rub(limit)} ₽, тратит ≈{fm_rub(rate)} ₽/ч — до следующей "
+                              "проверки ушла бы за лимит")
+    return False, ""
+
+
+def pause_campaign(token, i, state):
+    """Пауза по дневному лимиту (кампании за показы). Запрос можно повторять — денег не тратит."""
+    pace(token, "start", 1.1)
+    try:
+        call("GET", ADV + "/adv/v0/pause", token, params={"id": i["advert_id"]}, what="Пауза кампании")
+    except ApiError as e:
+        log(f"  ✗ «{i['name']}»: пауза не встала — {e}")
+        return False
+    state.setdefault("limit_paused", {})[str(i["advert_id"])] = {
+        "date": dt.date.today().isoformat(), "at": dt.datetime.now().strftime("%H:%M"),
+        "spent": i.get("spent"), "limit": i.get("limit")}
+    save_state(state)
+    log(f"  ⏸ «{i['name']}»: на паузе до утра — {i.get('why')}")
+    return True
+
+
 def start_campaign(token, i, state):
     """Запустить кампанию после пополнения. Запуск можно повторять (денег не тратит), поэтому запрос с повторами.
     Не вышло — запомнить: следующий запуск автопилота или часовой проверки попробует снова."""
@@ -2075,8 +2183,11 @@ def start_campaign(token, i, state):
         log(f"  ✗ «{i['name']}»: не запустилась — {e}. Попробую запустить снова при следующем запуске.")
         return False
     pend.pop(str(i["advert_id"]), None)
+    resumed = (state.get("limit_paused") or {}).pop(str(i["advert_id"]), None)
     save_state(state)
-    log(f"  ✓ «{i['name']}»: запущена" + (" после пополнения" if i["amount"] else " (пополнена раньше, запуск тогда не прошёл)"))
+    log(f"  ✓ «{i['name']}»: запущена" + (" после пополнения" if i["amount"] else
+                                          " (новый день — дневной лимит снова доступен)" if resumed else
+                                          " (пополнена раньше, запуск тогда не прошёл)"))
     return True
 
 
