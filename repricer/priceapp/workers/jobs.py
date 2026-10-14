@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta
 
-from priceapp import accounts, backup, dispatch, follow, guard, onec, platforms, rates, reference, settings
+from priceapp import accounts, backup, dispatch, etalon, follow, guard, onec, platforms, rates, reference, settings
 from priceapp.database import SessionLocal
 from priceapp.models import Account, ApiCredential, OnecTask, OnecTaskStatus
 from priceapp.timeutils import now_utc, today_local
@@ -196,6 +196,9 @@ def job_wb_poll(client_factory=None, max_age: timedelta = WB_PRICES_MAX_AGE) -> 
     notes = []
     try:
         poll_platforms = ["wb"] + (list(follow.TARGET_PLATFORMS) if follow.enabled(db) else [])
+        if etalon.auto_enabled(db):
+            # площадки идут за эталоном — их текущие цены нужны свежими, чтобы видеть, что разошлось
+            poll_platforms = ["wb", *etalon.FOLLOWERS]
         for acc in db.query(Account).filter(Account.is_active.is_(True), Account.platform.in_(poll_platforms)):
             if db.query(ApiCredential.id).filter(ApiCredential.account_id == acc.id).first() is None:
                 continue
@@ -214,8 +217,15 @@ def job_wb_poll(client_factory=None, max_age: timedelta = WB_PRICES_MAX_AGE) -> 
         st = reference.run(db, client_factory=client_factory)
         logger.info("%s", reference.summary(st))
         notes += st.get("errors", [])
-        fst = follow.run(db)
-        logger.info("%s", follow.summary(fst))
+        if etalon.auto_enabled(db):
+            # Все площадки следуют за эталоном (страница «Эталонные цены»); прежнее правило
+            # «Kit за ценой WB для покупателя» тогда не работает — две логики двигали бы одну цену.
+            est = etalon.follow_all(db, client_factory)
+            logger.info("%s", etalon.summary(est))
+            fst = {"approved": sum(1 for _ in est.get("sent", {}))}
+        else:
+            fst = follow.run(db)
+            logger.info("%s", follow.summary(fst))
         if st["restored"] or fst.get("approved"):
             from priceapp import overview
             overview.mark_dirty(db)

@@ -52,6 +52,7 @@ STATUS_LABELS = {
 }
 SOURCE_LABELS = {**pricing.SOURCE_LABELS, "rollback": "возврат прежней цены",
                  "guard": "возврат по диапазону безопасности",
+                 "etalon": "новый эталон",
                  # прежние схемы — для старых строк журнала
                  "platform": "цена площадки", "base": "от базовой"}
 PRICE_STATUS_LABELS = {"QUARANTINE": "на карантине у площадки", "ERROR": "площадка: ошибка цены",

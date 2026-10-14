@@ -40,6 +40,14 @@ FOLLOW_PERCENT = "follow_percent"
 FOLLOW_TOLERANCE = "follow_tolerance"
 FOLLOW_MAX_STEP = "follow_max_step"
 FOLLOW_DUE_AT = "follow_due_at"
+# Площадки следуют за эталоном WB (`etalon.py`, страница «Эталонные цены»): цена после скидки
+# продавца на площадке = эталон − N%; пусто — площадка за эталоном не следует. Скидка продавца —
+# целая, в коридоре ETALON_DISC_MIN–MAX (ниже). Автоследование при опросе WB — отдельный выключатель.
+ETALON_SHIFT_KIT = "etalon_shift_kit"
+ETALON_SHIFT_LAMODA = "etalon_shift_lamoda"
+ETALON_SHIFT_OZON = "etalon_shift_ozon"
+ETALON_FOLLOW_AUTO = "etalon_follow_auto"
+ETALON_LAMODA_SALE_DAYS = "etalon_lamoda_sale_days"
 
 # Эталон WB (`pricing.etalon_prices`): цена продавца со скидкой на WB минус этот %;
 # допустимая скидка продавца на площадке (вне — цена до скидки не считается); «от
@@ -79,6 +87,11 @@ DEFAULTS = {
     FOLLOW_TOLERANCE: "1",
     FOLLOW_MAX_STEP: "50",
     FOLLOW_DUE_AT: "",
+    ETALON_SHIFT_KIT: "45",
+    ETALON_SHIFT_LAMODA: "31",
+    ETALON_SHIFT_OZON: "",
+    ETALON_FOLLOW_AUTO: "0",
+    ETALON_LAMODA_SALE_DAYS: "365",
     COST_NORMALIZE: "1",
 }
 
