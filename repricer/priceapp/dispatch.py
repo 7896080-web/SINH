@@ -220,7 +220,13 @@ def run_account(db: Session, account: Account, client) -> dict:
     result = client.push_prices(items_out) if items_out else {"ok": [], "errors": [], "sent_prices": {}}
     ok = set(result.get("ok", []))
     sent_prices = result.get("sent_prices") or {}
-    errors_text = str(result.get("errors"))[:400]
+    errors_text = str(result.get("errors"))[:400] if result.get("errors") else ""
+    # Причина по КАЖДОЙ позиции, если площадка её назвала: иначе у всех строк пачки — ошибки
+    # чужих товаров, и про свою в 400 символах может не остаться ни слова (аудит 14.10).
+    own_error: dict[str, str] = {}
+    for e in result.get("errors", []):
+        for b in e.get("items", []) if isinstance(e, dict) else []:
+            own_error.setdefault(b, str(e.get("detail", e)))
     # Отказ, который не переживёт повтор (площадка назвала позицию и причину), —
     # закрываем сразу: пять попыток в заведомо тот же ответ только оттянут момент,
     # когда человек узнает.
@@ -255,10 +261,11 @@ def run_account(db: Session, account: Account, client) -> dict:
             accepted_cards[card_of_barcode[barcode]] = price
         elif ch.attempts < MAX_ATTEMPTS:
             ch.next_attempt_at = now_utc() + _retry_delay(ch.attempts)
-            ch.last_error = f"попытка {ch.attempts} из {MAX_ATTEMPTS}: {errors_text}"
+            ch.last_error = f"попытка {ch.attempts} из {MAX_ATTEMPTS}: {own_error.get(barcode) or errors_text}"[:400]
         else:
             ch.status = PriceChangeStatus.error.value
-            ch.last_error = f"не отправлено за {ch.attempts} попыток: {errors_text}"
+            ch.last_error = (f"не отправлено за {ch.attempts} попыток: "
+                             f"{own_error.get(barcode) or errors_text or 'площадка не ответила по этой позиции'}")[:400]
     # Остальные размеры принятой карточки теперь тоже стоят по её цене — так и
     # запоминаем: иначе лимит шага у них считался бы от прежнего числа, а диапазон
     # безопасности считал бы цену карточки «не нашей».

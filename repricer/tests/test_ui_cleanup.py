@@ -174,3 +174,29 @@ def test_queued_price_can_be_cancelled_from_the_log(client, db):
     assert "не уйдёт" in r.text
     db.expire_all()
     assert db.query(PriceChange).one().status == "rejected"
+
+
+def test_who_sets_prices_follows_the_settings(client, db):
+    """Аудит 14.10: карточка была зашитым текстом — сдвиги поменяли, а она писала прежнее."""
+    from priceapp import settings
+    F.account(db, "wb", "ИП 1")
+    settings.put(db, settings.ETALON_SHIFT_KIT, "40")
+    settings.put(db, settings.ETALON_SHIFT_OZON, "20")
+    db.commit()
+    page = client.get("/attention").text
+    assert "эталон − 40%" in page and "эталон − 20%" in page and "эталон − 45%" not in page
+
+
+def test_exchange_archive_is_pruned_by_age(tmp_path):
+    import os
+    import time
+
+    from priceapp import exchange
+    old = tmp_path / "pricing" / "2026" / "dict_old.txt"
+    new = tmp_path / "pricing" / "dict_new.txt"
+    old.parent.mkdir(parents=True)
+    old.write_text("x")
+    new.write_text("y")
+    t = time.time() - 61 * 86400
+    os.utime(old, (t, t))
+    assert exchange.prune_archive(tmp_path) == 1 and new.exists() and not old.exists()

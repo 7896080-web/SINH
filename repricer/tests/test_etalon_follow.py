@@ -74,8 +74,10 @@ def test_big_drop_goes_in_steps_through_the_queue(db):
     wb_body = next(x[2] for x in log if x[0] == "post" and "upload/task" in x[1])
     # 5000 −33% = 3350 со скидкой 50% -> 6700 сейчас; цель 2000 -> 4000 — очередью, шагами
     assert wb_body["data"][0]["price"] == 6700
-    ch = db.query(PriceChange).filter_by(account_id=w.id).one()
+    ch = db.query(PriceChange).filter_by(account_id=w.id, status="approved").one()
     assert (ch.status, ch.new_price, ch.source) == ("approved", 4000, "etalon")
+    first = db.query(PriceChange).filter_by(account_id=w.id, status="sent").one()     # первый шаг — в журнале
+    assert first.new_price == 6700
     ref = db.query(ReferencePrice).filter_by(account_id=w.id).one()
     assert ref.ref_price == 4000                              # эталон — сразу финальный
 
@@ -226,7 +228,7 @@ def test_new_etalon_cancels_queued_follower_price(db):
                        source="follow"))
     db.commit()
     etalon.set_etalon(db, "100", 4000, "оператор", client_factory=lambda p, c: Fake([]))
-    ch = db.query(PriceChange).filter_by(account_id=kit.id).one()
+    ch = db.query(PriceChange).filter_by(account_id=kit.id, source="follow").one()
     assert ch.status == "rejected" and "новый эталон" in ch.note
 
 
@@ -260,3 +262,33 @@ def test_lamoda_error_without_sku_does_not_fail_the_whole_batch(db):
     res = etalon.send_followers(db, cards, client_factory=lambda p, c: LamFake(log))
     assert "отправлено карточек: 1 из 2" in res["Ламода"] and "MP2" not in res["Ламода"].split(";")[0]
     assert len([x for x in log if "nomenclatures" in x[1]]) == 3          # пачка + по одной
+
+
+def test_etalon_sends_are_visible_in_the_send_log(client, db):
+    """Аудит 14.10: смена эталона и следование уходили мимо очереди и не попадали в «Журнал отправок»."""
+    w, kit, lam = _setup(db)
+    etalon.set_etalon(db, "100", 4000, "оператор", client_factory=lambda p, c: Fake([]))
+    sent = {(c.account_id, c.source) for c in db.query(PriceChange).filter_by(status="sent")}
+    assert {(w.id, "etalon"), (kit.id, "etalon_follow"), (lam.id, "etalon_follow")} <= sent
+    page = client.get("/prices?view=log").text
+    assert "новый эталон" in page and "за эталоном" in page
+
+
+def test_excel_import_refuses_a_tenfold_typo(client, db, monkeypatch):
+    import io
+    from openpyxl import Workbook
+    from priceapp import accounts
+    from priceapp.routers import etalon as page
+    _setup(db)
+    log = []
+    monkeypatch.setattr(accounts, "client_for", lambda db, a, factory=None: Fake(log))
+    wb = Workbook()
+    ws = wb.active
+    ws.append(page.HEAD)
+    ws.append(["100", "x", 5000, 50000])
+    buf = io.BytesIO()
+    wb.save(buf)
+    r = client.post("/etalon/import", files={"file": ("e.xlsx", buf.getvalue())})
+    assert "больше 50%" in r.text and not log
+    db.expire_all()
+    assert db.query(ReferencePrice).one().ref_price == 10000

@@ -29,7 +29,7 @@ from sqlalchemy.orm import Session
 from priceapp import mapping, rates, reference, settings
 from priceapp.models import (Account, CardEcon, OnecBarcode, OnecCost, ProductPrice, ReferencePrice)
 from priceapp.platforms import PLATFORMS, card_key
-from priceapp.pricing import (BLOCK_FLOOR, KIND_MARGIN, _dec, article_of, decide_for, item_facts, load_inputs,
+from priceapp.pricing import (BLOCK_FLOOR, KIND_MARGIN, SRC_CABINET, _dec, article_of, decide_for, item_facts, load_inputs,
                               target_for)
 
 # --- параметры расчёта (страница «Утверждение цен», в Excel — лист «Параметры») -----------------------------
@@ -571,6 +571,7 @@ def import_workbook(db: Session, user, data: bytes, accounts_: list[Account], ap
         c_card = idx.get("Карточка WB (nmID)")
         c_net, c_k, c_w = idx.get("Нетто-продаж за 7 нед., шт"), idx.get("k"), idx.get("W/P")
         c_f, c_how = idx.get("Логистика+прочее на ед., ₽"), idx.get("Откуда параметры")
+        c_eff, c_src = idx.get("Наценка артикула в репрайсере сейчас"), idx.get("Где задана")
         margins: dict[str, list] = {}
         clears = set()
         econ_rows = []
@@ -583,7 +584,14 @@ def import_workbook(db: Session, user, data: bytes, accounts_: list[Account], ap
                 clears.add(art)
             else:
                 v = _num(raw)
-                if v is not None:
+                # Выгрузка кладёт в колонку ДЕЙСТВУЮЩУЮ маржинальность, в том числе унаследованную
+                # от категории или площадки. Если человек её не трогал (то же число, задано не на
+                # артикуле кабинета) — не делаем её своей: иначе правка категории перестала бы
+                # действовать на артикул молча (аудит 14.10, тот же класс, что п.3 аудита 08.10).
+                inherited = (c_src is not None and c_eff is not None and len(r) > max(c_src, c_eff)
+                             and str(r[c_src] or "") != SRC_CABINET and v is not None
+                             and str(r[c_eff] or "") == f"маржинальность {float(v):g}")
+                if v is not None and not inherited:
                     margins.setdefault(art, []).append(v)
             if c_card is not None and c_k is not None and r[c_card] is not None:
                 econ_rows.append((str(r[c_card]).strip().split(".")[0], art, _num(r[c_net]) if c_net is not None else None,

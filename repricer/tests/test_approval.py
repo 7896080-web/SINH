@@ -272,3 +272,48 @@ def test_lamoda_default_logistics_is_49_per_unit_and_overridable(db):
     assert r["F"] == 49.0
     st.put(db, st.f_key("lamoda") if hasattr(st, "f_key") else "econ_f_lamoda", "100"); db.commit()
     assert _rows(db, acc)["A1"]["F"] == 100.0
+
+
+def test_roundtrip_does_not_make_inherited_margin_own(client, db):
+    """Аудит 14.10: выгрузил и загрузил без правок — маржинальность категории стала своей у
+    артикула кабинета, и правка категории дальше на него молча не действовала."""
+    from priceapp.models import CategoryTarget
+    f.manual_rate(db, "80")
+    acc = f.account(db, platform="wb", name="ИП Яворская", commission=25)
+    f.rule(db, acc, base_coef="2.5", min_markup_coef="1.3", max_change_percent=1000)
+    f.sku(db, "u1", "A1", "S", barcodes=["b1"], cost_usd="10")
+    f.item(db, acc, "b1", "A1-WB", external_id="5:1", size="S")
+    row = db.query(PlatformItem).one()
+    row.category, row.current_price, row.current_sale_price = "Свитшоты", 4000, 2000
+    db.add(CategoryTarget(platform="wb", account_id=0, category="Свитшоты", kind="margin", value=Decimal("1.8")))
+    db.commit()
+    data = client.get(f"/approval/export?account_id={acc.id}").content
+    client.post(f"/approval/import?account_id={acc.id}", files={"file": ("a.xlsx", data)})
+    db.expire_all()
+    assert db.query(ArticleCoef).count() == 0
+
+
+def test_workbook_of_one_platform_never_lands_in_a_namesake_on_another(client, db):
+    """Аудит 14.10: у WB и Ozon одноимённые ИП — книга Ozon ложилась в WB."""
+    f.manual_rate(db, "80")
+    wb = f.account(db, platform="wb", name="ИП Яворская", commission=25)
+    oz = f.account(db, platform="ozon", name="ИП Яворская", commission=25)
+    for a in (wb, oz):
+        f.rule(db, a, base_coef="2.5", min_markup_coef="1.3", max_change_percent=1000)
+    f.sku(db, "u1", "A1", "S", barcodes=["b1"], cost_usd="10")
+    f.item(db, wb, "b1", "A1-WB", external_id="5:1", size="S")
+    f.item(db, oz, "b1", "A1-OZ", external_id="77", size="S")
+    for r in db.query(PlatformItem):
+        r.current_price, r.current_sale_price = 4000, 4000
+    db.add(ArticleCoef(article="A1", platform="ozon", account_id=oz.id, coef=Decimal("2.2"), kind="margin"))
+    db.commit()
+    book = load_workbook(io.BytesIO(client.get(f"/approval/export?account_id={oz.id}").content))
+    ws = book[approval.sheet_name(oz)]
+    hdr = [c.value for c in ws[approval.HEADER_ROW]]
+    col = next(i for i, h in enumerate(hdr) if h and str(h).startswith("Маржинальность (к получению")) + 1
+    ws.cell(approval.HEADER_ROW + 1, col, 3.0)
+    buf = io.BytesIO()
+    book.save(buf)
+    client.post(f"/approval/import?account_id={oz.id}", files={"file": ("a.xlsx", buf.getvalue())})
+    db.expire_all()
+    assert [(c.platform, c.account_id, c.coef) for c in db.query(ArticleCoef)] == [("ozon", oz.id, Decimal("3.000"))]

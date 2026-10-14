@@ -113,6 +113,8 @@ def job_daily_refresh(client_factory=None, force_prices: bool = False) -> None:
         if onec.epf_ready(db) and _older_than(settings.get(db, settings.DICT_LOADED_AT), REFRESH_EVERY):
             onec.enqueue_dict(db)
             db.commit()
+        from priceapp import config, exchange
+        exchange.prune_archive(config.ONEC_ARCHIVE_DIR)
         for acc in db.query(Account).filter(Account.is_active.is_(True)):
             if db.query(ApiCredential.id).filter(ApiCredential.account_id == acc.id).first() is None:
                 continue

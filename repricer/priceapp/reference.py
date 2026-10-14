@@ -305,6 +305,9 @@ def _send(db: Session, a: Account, cards: dict, client_factory, st: dict, actor:
         price, d = int(c["ref"].ref_price), ref_discount_int(c["ref"])
         for item_id in c.get("items", ()):
             _record_sent(db, item_id, a.id, price)   # цена наша — диапазон безопасности не должен её «возвращать»
+        from priceapp.etalon import journal_sent
+        journal_sent(db, a.id, sorted(c.get("items", ())), "", None, price, SOURCE,
+                     f"возврат эталона: площадка держала {c['cur']} ₽ после скидки, скидка {d}%", actor)
         for it in db.query(PlatformItem).filter(PlatformItem.account_id == a.id,
                                                 PlatformItem.external_id.like(f"{nm}:%")):
             it.current_price = price

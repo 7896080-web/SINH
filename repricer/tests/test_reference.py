@@ -105,7 +105,8 @@ def test_restore_when_sale_price_drops_more_than_10_percent(db):
     st, wb = _run(db)
     assert st["restored"] == 1 and st["eaten"] == 0
     assert wb.calls == [{"data": [{"nmID": 5, "price": 2009, "discount": 0}]}]
-    assert db.query(PriceChange).count() == 0                     # мимо очереди — одним заданием
+    # мимо очереди — одним заданием; в «Журнале отправок» — одна строка «отправлено»
+    assert [c.status for c in db.query(PriceChange)] == ["sent"]
     db.expire_all()
     row = db.query(PlatformItem).filter_by(barcode="b1").one()
     assert (row.current_price, row.current_sale_price) == (2009, 2009)   # Kit в этом опросе видит эталон
