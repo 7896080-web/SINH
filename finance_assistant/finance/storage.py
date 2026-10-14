@@ -1,0 +1,687 @@
+"""SQLite-хранилище: карты, статьи, расходы, выписки, состояние диалога.
+
+Суммы — положительные копейки (int). Записываются только расходы
+(kind = expense, purpose: business | personal). Поступления и переводы между
+своими счетами не записываются — они видны в выписке.
+"""
+
+import json
+import re
+import sqlite3
+from dataclasses import dataclass
+
+BUSINESS, PERSONAL = "business", "personal"
+# Тип карты/счёта: личная карта владельца или расчётный счёт ИП (с бизнес-картой).
+PERSONAL_CARD, BUSINESS_ACCOUNT = "personal", "business"
+# reimbursement — записи прежней версии («возмещение от бизнеса»); новые не создаются,
+# в итоги не входят.
+EXPENSE, REIMBURSEMENT = "expense", "reimbursement"
+
+DEFAULT_CATEGORIES = [
+    "Закупка товара",
+    "Логистика и доставка",
+    "Маркетплейсы: комиссии и услуги",
+    "Реклама и продвижение",
+    "Упаковка и расходники",
+    "Аренда",
+    "Связь, сервисы, подписки",
+    "Подрядчики и зарплата",
+    "Налоги и взносы",
+    "Банковские комиссии",
+    "Транспорт и такси",
+    "Прочее",
+]
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS cards (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    last4 TEXT NOT NULL DEFAULT '',  -- последние 4 цифры карт и счетов через пробел
+    bank TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL DEFAULT 'personal' CHECK (kind IN ('personal', 'business'))
+);
+CREATE TABLE IF NOT EXISTS categories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE
+);
+CREATE TABLE IF NOT EXISTS expenses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    op_date TEXT NOT NULL,
+    amount INTEGER NOT NULL CHECK (amount > 0),
+    kind TEXT NOT NULL CHECK (kind IN ('expense', 'reimbursement')),
+    purpose TEXT NOT NULL CHECK (purpose IN ('business', 'personal')),
+    card_id INTEGER NOT NULL REFERENCES cards(id),
+    category_id INTEGER REFERENCES categories(id),
+    merchant TEXT NOT NULL DEFAULT '',
+    description TEXT NOT NULL DEFAULT '',
+    receipt_path TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS ix_expenses_date ON expenses(op_date);
+CREATE TABLE IF NOT EXISTS statements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    card_id INTEGER NOT NULL REFERENCES cards(id),
+    month TEXT NOT NULL,
+    total_in INTEGER,
+    total_out INTEGER,
+    UNIQUE (card_id, month)
+);
+CREATE TABLE IF NOT EXISTS statement_lines (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    statement_id INTEGER NOT NULL REFERENCES statements(id) ON DELETE CASCADE,
+    op_date TEXT NOT NULL,
+    op_time TEXT NOT NULL DEFAULT '',
+    amount INTEGER NOT NULL CHECK (amount > 0),
+    direction TEXT NOT NULL CHECK (direction IN ('in', 'out')),
+    description TEXT NOT NULL DEFAULT '',
+    own_transfer INTEGER NOT NULL DEFAULT 0,
+    suggested_category TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS ix_statement_lines_key
+    ON statement_lines(statement_id, op_date, amount, direction);
+-- Перемещения денег между своими счетами: не расход и не доход, но их нужно
+-- вычесть из «пришло»/«ушло» по картам, иначе личные траты посчитаются неверно.
+-- to_card_id / from_card_id пусты, если второй счёт не ведётся в боте.
+CREATE TABLE IF NOT EXISTS transfers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    op_date TEXT NOT NULL,
+    amount INTEGER NOT NULL CHECK (amount > 0),
+    from_card_id INTEGER REFERENCES cards(id),
+    to_card_id INTEGER REFERENCES cards(id),
+    description TEXT NOT NULL DEFAULT '',
+    receipt_path TEXT NOT NULL DEFAULT '',
+    seen_out INTEGER NOT NULL DEFAULT 0,  -- присылали скриншот списания
+    seen_in INTEGER NOT NULL DEFAULT 0,   -- присылали скриншот зачисления
+    CHECK (from_card_id IS NOT NULL OR to_card_id IS NOT NULL)
+);
+CREATE INDEX IF NOT EXISTS ix_transfers_date ON transfers(op_date);
+-- Отпечатки уже обработанных файлов: тот же скриншот или выписку узнаём до
+-- обращения к Claude. key — sha256 содержимого или id файла в Telegram;
+-- ref — что из него получилось: "e:12" (расход), "t:3" (перевод),
+-- "s:<карта>:<месяц|period>" (выписка).
+CREATE TABLE IF NOT EXISTS seen_files (
+    key TEXT NOT NULL,
+    ref TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (key, ref)
+);
+-- Привязка однотипных расходов к статьям: получатель → статья. Запоминается,
+-- когда вы сами выбираете или меняете статью; следующие расходы этого
+-- получателя получают её без вопроса. merchant_key — имя без «ООО», кавычек
+-- и регистра (см. _merchant_key).
+CREATE TABLE IF NOT EXISTS category_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    merchant_key TEXT NOT NULL UNIQUE,
+    merchant TEXT NOT NULL,
+    category_id INTEGER NOT NULL REFERENCES categories(id)
+);
+CREATE TABLE IF NOT EXISTS chat_state (
+    chat_id INTEGER PRIMARY KEY,
+    state TEXT NOT NULL
+);
+"""
+
+
+# Безликие описания операций, а не получатели: правило по ним поймало бы
+# все оплаты подряд (в выписке банка «Россия» у всех оплат описание
+# «Оплата по QR-коду через СБП»).
+GENERIC_MERCHANTS = ("оплатапоqr", "черезсбп", "переводпономеру", "переводсбп",
+                     "оплататоваров", "оплатауслуг", "переводсредств", "переводсебе",
+                     "переводнакарту", "переводскарты", "пополнение", "снятие", "покупка",
+                     "повыписке", "платёжпо", "платежпо")
+
+
+def _merchant_key(name: str) -> str:
+    """«ООО „СДЭК-Глобал“» и «сдэк глобал» — один получатель."""
+    text = "".join(ch for ch in (name or "").lower() if ch.isalnum() or ch == " ")
+    words = [w for w in text.split() if w not in ("ооо", "ао", "пао", "ип", "зао", "оао")]
+    return "".join(words)
+
+
+@dataclass
+class Card:
+    id: int
+    name: str
+    last4: str
+    bank: str
+    kind: str = PERSONAL_CARD
+
+    @property
+    def is_business(self) -> bool:
+        return self.kind == BUSINESS_ACCOUNT
+
+    @property
+    def numbers(self) -> list[str]:
+        """У одной «карты» бывает несколько номеров: сама карта и её счёт
+        (ВТБ: «Карта для жизни •1234» и «Мастер-счет •5678» — одни деньги)."""
+        return self.last4.split()
+
+    @property
+    def label(self) -> str:
+        base = f"{self.name} ·{self.numbers[0]}" if self.numbers else self.name
+        return base + (" (бизнес-счёт)" if self.is_business else "")
+
+
+@dataclass
+class Expense:
+    id: int
+    op_date: str
+    amount: int
+    kind: str
+    purpose: str
+    card_id: int
+    card: str
+    category: str | None
+    merchant: str
+    description: str
+    receipt_path: str
+    card_kind: str = PERSONAL_CARD
+
+
+@dataclass
+class Transfer:
+    id: int
+    op_date: str
+    amount: int
+    from_card_id: int | None
+    to_card_id: int | None
+    from_card: str | None
+    to_card: str | None
+    description: str
+    receipt_path: str
+
+    @property
+    def route(self) -> str:
+        return f"{self.from_card or 'другой ваш счёт'} → {self.to_card or 'другой ваш счёт'}"
+
+
+@dataclass
+class StatementLine:
+    id: int
+    op_date: str
+    amount: int
+    direction: str
+    description: str
+    own_transfer: bool
+    suggested_category: str = ""
+    op_time: str = ""
+
+
+class Storage:
+    def __init__(self, path: str):
+        # Бот обрабатывает апдейты по одному, но распознавание идёт в рабочем
+        # потоке (asyncio.to_thread), поэтому соединение делим между потоками.
+        self.conn = sqlite3.connect(path, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA foreign_keys = ON")
+        self.conn.executescript(SCHEMA)
+        self._add_missing_columns()
+        self._ensure_autoincrement()
+        if not self.conn.execute("SELECT 1 FROM categories").fetchone():
+            with self.conn:
+                self.conn.executemany(
+                    "INSERT INTO categories (name) VALUES (?)", [(c,) for c in DEFAULT_CATEGORIES]
+                )
+
+    def close(self):
+        self.conn.close()
+
+    # Номера записей не должны переиспользоваться: на них ссылаются кнопки под
+    # старыми сообщениями, отпечатки файлов и списки к /biz. Без AUTOINCREMENT
+    # SQLite после удаления последней записи выдаёт её номер новой — и старая
+    # кнопка «Удалить» сработала бы на другую запись.
+    _AUTOINCREMENT_TABLES = ("cards", "categories", "expenses", "statements", "statement_lines",
+                             "transfers", "category_rules")
+
+    def _ensure_autoincrement(self):
+        """Базы прежних версий: пересобрать таблицы с AUTOINCREMENT (данные сохраняются)."""
+        wanted = {m.group(1): m.group(0) for m in re.finditer(
+            r"CREATE TABLE IF NOT EXISTS (\w+) \(.*?\n\)", SCHEMA, re.S)}
+        todo = [t for t in self._AUTOINCREMENT_TABLES
+                if "AUTOINCREMENT" not in (self.conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (t,)
+                ).fetchone()["sql"] or "")]
+        if not todo:
+            return
+        self.conn.commit()
+        self.conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            with self.conn:
+                # Всё в одной транзакции (CREATE TABLE сам её не открывает): сбой
+                # посередине откатывается целиком и не оставляет «table__new».
+                self.conn.execute("BEGIN")
+                for table in todo:
+                    self.conn.execute(f"DROP TABLE IF EXISTS {table}__new")  # от прежнего сбоя
+                    columns = [r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")]
+                    create = wanted[table].replace(f"IF NOT EXISTS {table} (", f"{table}__new (", 1)
+                    self.conn.execute(create)
+                    new_cols = {r["name"] for r in self.conn.execute(
+                        f"PRAGMA table_info({table}__new)")}
+                    cols = ", ".join(c for c in columns if c in new_cols)
+                    self.conn.execute(f"INSERT INTO {table}__new ({cols}) SELECT {cols} FROM {table}")
+                    self.conn.execute(f"DROP TABLE {table}")
+                    self.conn.execute(f"ALTER TABLE {table}__new RENAME TO {table}")
+            self.conn.executescript(SCHEMA)  # вернуть индексы удалённых таблиц
+        finally:
+            self.conn.execute("PRAGMA foreign_keys = ON")
+
+    def _add_missing_columns(self):
+        """Базы, созданные прошлыми версиями, дополняем новыми колонками."""
+        added = {("cards", "kind"): "TEXT NOT NULL DEFAULT 'personal'",
+                 ("statement_lines", "suggested_category"): "TEXT NOT NULL DEFAULT ''",
+                 ("statement_lines", "op_time"): "TEXT NOT NULL DEFAULT ''",
+                 ("transfers", "seen_out"): "INTEGER NOT NULL DEFAULT 0",
+                 ("transfers", "seen_in"): "INTEGER NOT NULL DEFAULT 0"}
+        for (table, column), ddl in added.items():
+            have = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+            if column not in have:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+        self.conn.commit()
+
+    # --- карты ---------------------------------------------------------
+
+    def add_card(self, name: str, last4: str = "", bank: str = "",
+                 kind: str = PERSONAL_CARD) -> Card:
+        with self.conn:
+            cur = self.conn.execute(
+                "INSERT INTO cards (name, last4, bank, kind) VALUES (?, ?, ?, ?)",
+                (name, last4, bank, kind),
+            )
+        return self.card(cur.lastrowid)
+
+    def add_card_number(self, card_id: int, number: str):
+        card = self.card(card_id)
+        if card and number not in card.numbers:
+            with self.conn:
+                self.conn.execute("UPDATE cards SET last4 = ? WHERE id = ?",
+                                  (" ".join(card.numbers + [number]), card_id))
+
+    def cards(self) -> list[Card]:
+        return [Card(**dict(r)) for r in self.conn.execute("SELECT * FROM cards ORDER BY id")]
+
+    def card(self, card_id: int) -> Card | None:
+        row = self.conn.execute("SELECT * FROM cards WHERE id = ?", (card_id,)).fetchone()
+        return Card(**dict(row)) if row else None
+
+    def card_in_use_by_dialog(self, card_id: int) -> bool:
+        """Карта нужна незаконченному вопросу или идущей сверке."""
+        for (raw,) in self.conn.execute("SELECT state FROM chat_state"):
+            state = json.loads(raw)
+            if state.get("statement", {}).get("card_id") == card_id:
+                return True
+            for d in state.get("drafts", []):
+                sides = (d.get("transfer") or {})
+                if card_id in (d.get("card_id"), sides.get("from"), sides.get("to")):
+                    return True
+        return False
+
+    def delete_card(self, card_id: int) -> bool:
+        """Удаляет только карту без записей — иначе потеряется история."""
+        used = self.conn.execute(
+            "SELECT 1 FROM expenses WHERE card_id = ? UNION SELECT 1 FROM statements WHERE card_id = ?"
+            " UNION SELECT 1 FROM transfers WHERE from_card_id = ? OR to_card_id = ?",
+            (card_id, card_id, card_id, card_id),
+        ).fetchone()
+        if used:
+            return False
+        with self.conn:
+            self.conn.execute("DELETE FROM cards WHERE id = ?", (card_id,))
+        return True
+
+    # --- статьи --------------------------------------------------------
+
+    def categories(self) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT id, name FROM categories ORDER BY id").fetchall()
+
+    def category_id(self, name: str) -> int | None:
+        row = self.conn.execute("SELECT id FROM categories WHERE name = ?", (name,)).fetchone()
+        return row["id"] if row else None
+
+    def add_category(self, name: str) -> int:
+        with self.conn:
+            cur = self.conn.execute("INSERT OR IGNORE INTO categories (name) VALUES (?)", (name,))
+        return cur.lastrowid or self.category_id(name)
+
+    # --- операции ------------------------------------------------------
+
+    def add_expense(self, *, op_date, amount, card_id, kind=EXPENSE, purpose=BUSINESS,
+                    category_id=None, merchant="", description="", receipt_path="") -> int:
+        with self.conn:
+            cur = self.conn.execute(
+                "INSERT INTO expenses (op_date, amount, kind, purpose, card_id, category_id,"
+                " merchant, description, receipt_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (op_date, amount, kind, purpose, card_id, category_id, merchant, description,
+                 receipt_path),
+            )
+        return cur.lastrowid
+
+    def update_expense(self, expense_id: int, **fields):
+        allowed = {"purpose", "category_id", "card_id", "op_date", "amount", "kind", "receipt_path"}
+        assert set(fields) <= allowed, fields
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        with self.conn:
+            self.conn.execute(
+                f"UPDATE expenses SET {sets} WHERE id = ?", (*fields.values(), expense_id)
+            )
+
+    def delete_expense(self, expense_id: int) -> bool:
+        # Удалили запись — тот же скриншот снова можно прислать и записать.
+        self.forget_ref(f"e:{expense_id}")
+        with self.conn:
+            return self.conn.execute("DELETE FROM expenses WHERE id = ?", (expense_id,)).rowcount > 0
+
+    _EXPENSE_SELECT = (
+        "SELECT e.id, e.op_date, e.amount, e.kind, e.purpose, e.card_id, c.name AS card,"
+        " g.name AS category, e.merchant, e.description, e.receipt_path, c.kind AS card_kind"
+        " FROM expenses e JOIN cards c ON c.id = e.card_id"
+        " LEFT JOIN categories g ON g.id = e.category_id"
+    )
+
+    def expense(self, expense_id: int) -> Expense | None:
+        row = self.conn.execute(self._EXPENSE_SELECT + " WHERE e.id = ?", (expense_id,)).fetchone()
+        return Expense(**dict(row)) if row else None
+
+    def expenses(self, month: str, card_id: int | None = None) -> list[Expense]:
+        sql = self._EXPENSE_SELECT + " WHERE substr(e.op_date, 1, 7) = ?"
+        params: list = [month]
+        if card_id is not None:
+            sql += " AND e.card_id = ?"
+            params.append(card_id)
+        sql += " ORDER BY e.op_date, e.id"
+        return [Expense(**dict(r)) for r in self.conn.execute(sql, params)]
+
+    def find_duplicates(self, *, op_date, amount, card_id, merchant="") -> list[Expense]:
+        """Похожие записи: та же сумма, дата ±1 день (банк может провести оплату
+        на следующий день) и та же карта — или тот же получатель, если карту
+        при первой записи выбрали другую."""
+        rows = self.conn.execute(
+            self._EXPENSE_SELECT + " WHERE e.amount = ?"
+            " AND abs(julianday(e.op_date) - julianday(?)) <= 1 ORDER BY e.id",
+            (amount, op_date),
+        ).fetchall()
+        key = _merchant_key(merchant)
+        return [Expense(**dict(r)) for r in rows
+                if r["card_id"] == card_id or (key and _merchant_key(r["merchant"]) == key)]
+
+    def expenses_between(self, start: str, end: str) -> list[Expense]:
+        return [Expense(**dict(r)) for r in self.conn.execute(
+            self._EXPENSE_SELECT + " WHERE e.op_date BETWEEN ? AND ? ORDER BY e.op_date, e.id",
+            (start, end))]
+
+    def expenses_of_merchant(self, merchant: str) -> list[Expense]:
+        key = _merchant_key(merchant)
+        if not key:
+            return []
+        rows = self.conn.execute(self._EXPENSE_SELECT + " WHERE e.merchant != '' ORDER BY e.id")
+        return [Expense(**dict(r)) for r in rows if _merchant_key(r["merchant"]) == key]
+
+    # --- правила «получатель → статья» ---------------------------------
+
+    def rule_for(self, merchant: str) -> int | None:
+        key = _merchant_key(merchant)
+        if not key:
+            return None
+        row = self.conn.execute("SELECT category_id FROM category_rules WHERE merchant_key = ?",
+                                (key,)).fetchone()
+        return row["category_id"] if row else None
+
+    def set_rule(self, merchant: str, category_id: int) -> bool:
+        """Запомнить статью для получателя. False — имя слишком общее для правила."""
+        key = _merchant_key(merchant)
+        if len(key) < 3 or any(marker in key for marker in GENERIC_MERCHANTS):
+            return False
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO category_rules (merchant_key, merchant, category_id) VALUES (?, ?, ?)"
+                " ON CONFLICT (merchant_key) DO UPDATE SET category_id = excluded.category_id,"
+                " merchant = excluded.merchant",
+                (key, merchant.strip(), category_id))
+        return True
+
+    def rules(self) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT r.id, r.merchant, c.name AS category FROM category_rules r"
+            " JOIN categories c ON c.id = r.category_id ORDER BY c.name, r.merchant").fetchall()
+
+    def delete_rule(self, rule_id: int) -> bool:
+        with self.conn:
+            return self.conn.execute("DELETE FROM category_rules WHERE id = ?",
+                                     (rule_id,)).rowcount > 0
+
+    # --- отпечатки файлов ----------------------------------------------
+
+    def remember_files(self, keys: list[str], ref: str):
+        with self.conn:
+            self.conn.executemany("INSERT OR IGNORE INTO seen_files (key, ref) VALUES (?, ?)",
+                                  [(k, ref) for k in keys])
+
+    def seen_refs(self, keys: list[str], prefix: str) -> list[str]:
+        """Во что уже превращался файл с любым из этих отпечатков (только живые ссылки)."""
+        if not keys:
+            return []
+        rows = self.conn.execute(
+            f"SELECT DISTINCT ref FROM seen_files WHERE key IN ({','.join('?' * len(keys))})"
+            " AND ref LIKE ? ORDER BY created_at, ref", (*keys, prefix + "%"),
+        ).fetchall()
+        refs = []
+        for (ref,) in rows:
+            kind, _, rest = ref.partition(":")
+            alive = (kind == "e" and self.expense(int(rest))) or \
+                    (kind == "t" and self.transfer(int(rest))) or kind == "s"
+            if alive:
+                refs.append(ref)
+        return refs
+
+    def forget_ref(self, ref: str):
+        with self.conn:
+            self.conn.execute("DELETE FROM seen_files WHERE ref = ?", (ref,))
+
+    # --- переводы между своими счетами --------------------------------
+
+    _TRANSFER_SELECT = (
+        "SELECT t.id, t.op_date, t.amount, t.from_card_id, t.to_card_id,"
+        " a.name AS from_card, b.name AS to_card, t.description, t.receipt_path"
+        " FROM transfers t LEFT JOIN cards a ON a.id = t.from_card_id"
+        " LEFT JOIN cards b ON b.id = t.to_card_id"
+    )
+
+    def add_transfer(self, *, op_date, amount, from_card_id, to_card_id, description="",
+                     receipt_path="", seen_side: str = "") -> int:
+        with self.conn:
+            cur = self.conn.execute(
+                "INSERT INTO transfers (op_date, amount, from_card_id, to_card_id, description,"
+                " receipt_path, seen_out, seen_in) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (op_date, amount, from_card_id, to_card_id, description, receipt_path,
+                 int(seen_side == "out"), int(seen_side == "in")),
+            )
+        return cur.lastrowid
+
+    def transfer_seen_sides(self, transfer_id: int) -> set[str]:
+        row = self.conn.execute("SELECT seen_out, seen_in FROM transfers WHERE id = ?",
+                                (transfer_id,)).fetchone()
+        return {s for s, flag in (("out", row["seen_out"]), ("in", row["seen_in"])) if flag}
+
+    def mark_transfer_seen(self, transfer_id: int, side: str):
+        column = {"out": "seen_out", "in": "seen_in"}[side]
+        with self.conn:
+            self.conn.execute(f"UPDATE transfers SET {column} = 1 WHERE id = ?", (transfer_id,))
+
+    def transfer(self, transfer_id: int) -> Transfer | None:
+        row = self.conn.execute(self._TRANSFER_SELECT + " WHERE t.id = ?", (transfer_id,)).fetchone()
+        return Transfer(**dict(row)) if row else None
+
+    def transfers(self, month: str, card_id: int | None = None) -> list[Transfer]:
+        sql = self._TRANSFER_SELECT + " WHERE substr(t.op_date, 1, 7) = ?"
+        params: list = [month]
+        if card_id is not None:
+            sql += " AND (t.from_card_id = ? OR t.to_card_id = ?)"
+            params += [card_id, card_id]
+        sql += " ORDER BY t.op_date, t.id"
+        return [Transfer(**dict(r)) for r in self.conn.execute(sql, params)]
+
+    def find_same_transfer(self, *, op_date, amount, from_card_id, to_card_id) -> Transfer | None:
+        """Тот же перевод, присланный со второй стороны (списание и зачисление)."""
+        for t in self.conn.execute(
+            self._TRANSFER_SELECT + " WHERE t.amount = ?"
+            # ±3 дня, как при сверке: межбанковский перевод зачисляют и через выходные.
+            " AND abs(julianday(t.op_date) - julianday(?)) <= 3", (amount, op_date)
+        ).fetchall():
+            t = Transfer(**dict(t))
+            merged_from = from_card_id or t.from_card_id
+            merged_to = to_card_id or t.to_card_id
+            if merged_from is not None and merged_from == merged_to:
+                continue  # склейка дала бы перевод «с карты на ту же карту» — это другой перевод
+            if ((from_card_id is None or t.from_card_id in (None, from_card_id))
+                    and (to_card_id is None or t.to_card_id in (None, to_card_id))):
+                return t
+        return None
+
+    def update_transfer(self, transfer_id: int, **fields):
+        assert set(fields) <= {"from_card_id", "to_card_id", "receipt_path"}, fields
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        with self.conn:
+            self.conn.execute(f"UPDATE transfers SET {sets} WHERE id = ?",
+                              (*fields.values(), transfer_id))
+
+    def delete_transfer(self, transfer_id: int) -> bool:
+        self.forget_ref(f"t:{transfer_id}")
+        with self.conn:
+            return self.conn.execute("DELETE FROM transfers WHERE id = ?",
+                                     (transfer_id,)).rowcount > 0
+
+    # --- выписки -------------------------------------------------------
+
+    def statement_id(self, card_id: int, month: str) -> int:
+        with self.conn:
+            self.conn.execute(
+                "INSERT OR IGNORE INTO statements (card_id, month) VALUES (?, ?)", (card_id, month)
+            )
+        return self.conn.execute(
+            "SELECT id FROM statements WHERE card_id = ? AND month = ?", (card_id, month)
+        ).fetchone()["id"]
+
+    def reset_statement(self, card_id: int, month: str):
+        self.forget_ref(f"s:{card_id}:{month}")
+        self.forget_ref(f"s:{card_id}:period")  # файл за несколько месяцев тоже можно прислать снова
+        with self.conn:
+            self.conn.execute(
+                "DELETE FROM statements WHERE card_id = ? AND month = ?", (card_id, month)
+            )
+
+    def add_statement_lines(self, statement_id: int, lines: list[dict]) -> int:
+        """Добавить строки выписки, не задваивая уже загруженные.
+
+        Две одинаковые покупки в один день — это две строки, поэтому сравниваем
+        количество: если в новом файле таких строк N, а в базе уже M, добавляем
+        только N − M. Так повторно присланный скриншот ничего не задвоит, а
+        настоящие одинаковые операции не потеряются.
+        """
+        groups: dict[tuple, list[dict]] = {}
+        for ln in lines:
+            key = (ln["op_date"], ln.get("op_time", ""), ln["amount"], ln["direction"],
+                   ln.get("description", ""))
+            groups.setdefault(key, []).append(ln)
+        added = 0
+        with self.conn:
+            for (op_date, op_time, amount, direction, description), group in groups.items():
+                have = self.conn.execute(
+                    "SELECT COUNT(*) FROM statement_lines WHERE statement_id = ? AND op_date = ?"
+                    " AND op_time = ? AND amount = ? AND direction = ? AND description = ?",
+                    (statement_id, op_date, op_time, amount, direction, description),
+                ).fetchone()[0]
+                for ln in group[have:]:
+                    self.conn.execute(
+                        "INSERT INTO statement_lines (statement_id, op_date, op_time, amount,"
+                        " direction, description, own_transfer, suggested_category)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (statement_id, op_date, op_time, amount, direction, description,
+                         int(ln.get("own_transfer", False)), ln.get("suggested_category", "")),
+                    )
+                    added += 1
+        return added
+
+    def set_statement_totals(self, statement_id: int, total_in=None, total_out=None):
+        with self.conn:
+            if total_in is not None:
+                self.conn.execute("UPDATE statements SET total_in = ? WHERE id = ?",
+                                  (total_in, statement_id))
+            if total_out is not None:
+                self.conn.execute("UPDATE statements SET total_out = ? WHERE id = ?",
+                                  (total_out, statement_id))
+
+    def statement(self, card_id: int, month: str) -> tuple[sqlite3.Row, list[StatementLine]] | None:
+        head = self.conn.execute(
+            "SELECT * FROM statements WHERE card_id = ? AND month = ?", (card_id, month)
+        ).fetchone()
+        if not head:
+            return None
+        lines = [
+            StatementLine(r["id"], r["op_date"], r["amount"], r["direction"], r["description"],
+                          bool(r["own_transfer"]), r["suggested_category"], r["op_time"])
+            for r in self.conn.execute(
+                "SELECT * FROM statement_lines WHERE statement_id = ? ORDER BY op_date, op_time, id",
+                (head["id"],),
+            )
+        ]
+        return head, lines
+
+    def card_lines(self, card_id: int) -> list[StatementLine]:
+        """Все строки всех выписок карты — для сопоставления через границу месяца."""
+        return [
+            StatementLine(r["id"], r["op_date"], r["amount"], r["direction"], r["description"],
+                          bool(r["own_transfer"]), r["suggested_category"], r["op_time"])
+            for r in self.conn.execute(
+                "SELECT l.* FROM statement_lines l JOIN statements s ON s.id = l.statement_id"
+                " WHERE s.card_id = ? ORDER BY l.op_date, l.op_time, l.id", (card_id,))
+        ]
+
+    def card_expenses(self, card_id: int) -> list[Expense]:
+        return [Expense(**dict(r)) for r in self.conn.execute(
+            self._EXPENSE_SELECT + " WHERE e.card_id = ? ORDER BY e.op_date, e.id", (card_id,))]
+
+    def card_transfers(self, card_id: int) -> list[Transfer]:
+        return [Transfer(**dict(r)) for r in self.conn.execute(
+            self._TRANSFER_SELECT + " WHERE t.from_card_id = ? OR t.to_card_id = ?"
+            " ORDER BY t.op_date, t.id", (card_id, card_id))]
+
+    def statement_line(self, line_id: int) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT l.*, s.card_id, s.month FROM statement_lines l"
+            " JOIN statements s ON s.id = l.statement_id WHERE l.id = ?", (line_id,)
+        ).fetchone()
+
+    def mark_line_own_transfer(self, line_id: int):
+        """Строка выписки — перевод между своими счетами (не расход)."""
+        with self.conn:
+            self.conn.execute("UPDATE statement_lines SET own_transfer = 1, suggested_category = ''"
+                              " WHERE id = ?", (line_id,))
+
+    def clear_suggestion(self, line_id: int):
+        with self.conn:
+            self.conn.execute(
+                "UPDATE statement_lines SET suggested_category = '' WHERE id = ?", (line_id,))
+
+    def months_with_data(self) -> list[str]:
+        rows = self.conn.execute(
+            "SELECT substr(op_date, 1, 7) AS m FROM expenses"
+            " UNION SELECT month FROM statements ORDER BY m"
+        ).fetchall()
+        return [r["m"] for r in rows]
+
+    # --- состояние диалога ---------------------------------------------
+
+    def get_state(self, chat_id: int) -> dict:
+        row = self.conn.execute("SELECT state FROM chat_state WHERE chat_id = ?", (chat_id,)).fetchone()
+        return json.loads(row["state"]) if row else {}
+
+    def set_state(self, chat_id: int, state: dict):
+        with self.conn:
+            if state:
+                self.conn.execute(
+                    "INSERT INTO chat_state (chat_id, state) VALUES (?, ?)"
+                    " ON CONFLICT (chat_id) DO UPDATE SET state = excluded.state",
+                    (chat_id, json.dumps(state, ensure_ascii=False)),
+                )
+            else:
+                self.conn.execute("DELETE FROM chat_state WHERE chat_id = ?", (chat_id,))

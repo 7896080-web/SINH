@@ -1,0 +1,79 @@
+"""Регрессии по аудиту хранилища: номера не переиспользуются, миграция, правила."""
+import sqlite3
+
+from finance.storage import SCHEMA, Storage
+
+
+def test_ids_not_reused_after_delete(tmp_path):
+    db = Storage(str(tmp_path / "f.db"))
+    card = db.add_card("Сбер", "1111", "Сбер")
+    first = db.add_expense(op_date="2026-09-01", amount=100, card_id=card.id)
+    db.delete_expense(first)
+    assert db.add_expense(op_date="2026-09-02", amount=200, card_id=card.id) != first
+
+
+def test_old_database_migrated_to_autoincrement(tmp_path):
+    path = str(tmp_path / "old.db")
+    conn = sqlite3.connect(path)
+    conn.executescript(SCHEMA.replace(" AUTOINCREMENT", ""))
+    conn.executescript("""
+        INSERT INTO cards (id, name, last4, bank) VALUES (1, 'Сбер', '1111', 'Сбер');
+        INSERT INTO categories (id, name) VALUES (1, 'Прочее');
+        INSERT INTO expenses (id, op_date, amount, kind, purpose, card_id, category_id)
+            VALUES (7, '2026-09-01', 500, 'expense', 'business', 1, 1);
+        INSERT INTO statements (id, card_id, month) VALUES (3, 1, '2026-09');
+        INSERT INTO statement_lines (id, statement_id, op_date, amount, direction)
+            VALUES (9, 3, '2026-09-01', 500, 'out');
+    """)
+    conn.commit()
+    conn.close()
+    db = Storage(path)
+    sql = db.conn.execute("SELECT sql FROM sqlite_master WHERE name = 'expenses'").fetchone()[0]
+    assert "AUTOINCREMENT" in sql
+    e = db.expense(7)
+    assert (e.amount, e.card, e.category) == (500, "Сбер", "Прочее")
+    assert [ln.id for ln in db.statement(1, "2026-09")[1]] == [9]
+    assert db.conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert db.conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+    db.delete_expense(7)
+    assert db.add_expense(op_date="2026-09-02", amount=1, card_id=1) == 8
+    db.close()
+    Storage(path).close()  # повторное открытие — миграция не нужна и не ломает
+
+
+def test_generic_descriptions_never_become_rules(tmp_path):
+    db = Storage(str(tmp_path / "f.db"))
+    cat = db.category_id("Прочее")
+    for name in ("Оплата по QR-коду через СБП", "Перевод по номеру телефона через СБП",
+                 "Оплата товаров и услуг", "ИП", "по выписке"):
+        assert not db.set_rule(name, cat), name
+    assert db.set_rule("СКБ Контур", cat)
+
+
+import pytest  # noqa: E402
+
+from finance.money import parse_amount  # noqa: E402
+
+
+@pytest.mark.parametrize("text, kopecks", [
+    ("1 234,50", 123450), ("1234.5", 123450), ("1.234,56", 123456), ("1,234.56", 123456),
+    ("1 234,56", 123456), ("−110", -11000), ("1.234.567", 123456700),
+    ("2 950,00 ₽", 295000), ("500 руб.", 50000), ("-0,05", -5),
+])
+def test_parse_amount_bank_formats(text, kopecks):
+    assert parse_amount(text) == kopecks
+
+
+@pytest.mark.parametrize("text", ["1E30", "1e5", "9" * 29, "abc", "1,2,3", "", "nan", "--5", "."])
+def test_parse_amount_rejects(text):
+    with pytest.raises(ValueError):
+        parse_amount(text)
+
+
+def test_huge_amount_in_dialog_does_not_crash(env):
+    from conftest import CHAT, png, payment
+    db, rec, flow = env
+    rec.payments.append(payment(currency="USD"))
+    flow.on_files(CHAT, [png()], "")
+    r, again = flow.on_text(CHAT, "1E30")
+    assert "Не понял сумму" in r.text and "Какая сумма" in again.text
