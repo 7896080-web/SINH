@@ -604,19 +604,53 @@ def lock_info():
         return None
     try:
         d = json.loads(raw)
-        return dt.datetime.fromisoformat(d["at"]), d.get("owner") or "?", d.get("id")
+        return dt.datetime.fromisoformat(d["at"]), d.get("owner") or "?", d.get("id"), d.get("pid")
     except (ValueError, KeyError, TypeError):
         try:
-            return dt.datetime.fromisoformat(raw), "wb_bids.py", None
+            return dt.datetime.fromisoformat(raw), "wb_bids.py", None, None
         except ValueError:
-            return dt.datetime.now() - dt.timedelta(days=1), "?", None   # мусор в файле — считаем устаревшей
+            # пусто или мусор: файл, возможно, как раз пишется — судим по времени его изменения
+            try:
+                return dt.datetime.fromtimestamp(LOCK_FILE.stat().st_mtime), "?", None, None
+            except OSError:
+                return None
+
+
+def pid_alive(pid):
+    """Жив ли процесс (на Windows — через OpenProcess; os.kill(pid, 0) там ЗАВЕРШИЛ бы процесс)."""
+    if not pid:
+        return False
+    try:
+        if os.name == "nt":
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            h = k32.OpenProcess(0x1000, False, int(pid))      # PROCESS_QUERY_LIMITED_INFORMATION
+            if not h:
+                return False
+            code = ctypes.c_ulong()
+            ok = k32.GetExitCodeProcess(h, ctypes.byref(code))
+            k32.CloseHandle(h)
+            return bool(ok) and code.value == 259             # STILL_ACTIVE
+        os.kill(int(pid), 0)
+        return True
+    except PermissionError:
+        return True
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def lock_mine():
+    """Блокировка всё ещё наша (её не сняли как устаревшую, пока мы считали)."""
+    info = lock_info()
+    return bool(_lock_id) and bool(info) and info[2] == _lock_id
 
 
 def lock_acquire(owner, wait_min=0):
     """Общая блокировка автопилота и стража (создаётся атомарно). Чужая свежая — ждём до wait_min минут.
     Возвращает True, если блокировка наша."""
     global _lock_id
-    deadline = time.time() + wait_min * 60
+    start = time.time()
+    deadline = start + wait_min * 60
     told = False
     while True:
         try:
@@ -630,8 +664,11 @@ def lock_acquire(owner, wait_min=0):
             info = lock_info()
             if info is None:
                 continue                                   # файл только что удалили — пробуем снова
-            at, who, _ = info
-            if dt.datetime.now() - at > dt.timedelta(minutes=LOCK_MAX_AGE_MIN):
+            at, who, _, pid = info
+            old = dt.datetime.now() - at
+            # старая блокировка живого процесса (ноутбук спал посреди проверки) — не отбираем; совсем старую (номер
+            # процесса мог достаться другой программе) — снимаем всё равно
+            if old > dt.timedelta(minutes=LOCK_MAX_AGE_MIN) and (not pid_alive(pid) or old > dt.timedelta(minutes=3 * LOCK_MAX_AGE_MIN)):
                 log(f"! Блокировка от {who} ({at:%d.%m %H:%M}) старше {LOCK_MAX_AGE_MIN} мин — процесс, видимо, упал; снимаю.")
                 try:
                     LOCK_FILE.unlink()
@@ -644,8 +681,10 @@ def lock_acquire(owner, wait_min=0):
                 log(f"  Сейчас работает {who} (с {at:%H:%M}) — жду, пока закончит (до {wait_min} мин)…")
                 told = True
             time.sleep(20)
-        except OSError:
-            return False
+        except OSError:                                    # Windows: файл удаляется или занят антивирусом — подождать
+            if time.time() >= max(deadline, start + 10):
+                return False
+            time.sleep(1)
 
 
 def lock_release():
@@ -672,7 +711,14 @@ def save_state(state):
             shutil.copyfile(STATE_FILE, STATE_PREV)
         except OSError:
             pass
-    os.replace(tmp, STATE_FILE)
+    for attempt in range(6):
+        try:
+            os.replace(tmp, STATE_FILE)
+            return
+        except PermissionError:      # Windows: файл на миг открыт антивирусом, индексатором или дашбордом — подождать
+            if attempt == 5:
+                raise
+            time.sleep(0.5)
 
 
 def day_base(state, kind, cid, nm, sub):
@@ -730,8 +776,13 @@ def find(camps, key):
             if str(cid) == key or key.lower() in str((a.get("settings") or {}).get("name", "")).lower()]
 
 
-# Сбои загрузки данных, без которых ставки считать нельзя. Если список не пуст, --apply ничего не меняет.
+# Сбои загрузки данных, без которых ставки считать нельзя: [(кабинет, что случилось)]. --apply не меняет кабинет
+# с таким сбоем (остальные применяются); сбой вне кабинета (None) — не меняет ничего.
 DATA_PROBLEMS = []
+
+
+def data_problem(msg):
+    DATA_PROBLEMS.append((getattr(_tl, "cab", None), msg))
 
 
 def nm_stats(token, ids):
@@ -746,7 +797,7 @@ def nm_stats(token, ids):
                         what="Статистика кампаний")
         except ApiError as e:
             log(f"  ! {e} — считаю по конверсии по умолчанию.")
-            DATA_PROBLEMS.append(f"статистика кампаний не загрузилась ({e})")
+            data_problem(f"статистика кампаний не загрузилась ({e})")
             continue
         for item in data or []:
             aid = item.get("advertId")
@@ -784,7 +835,7 @@ def cluster_stats(token, pairs):
         except ApiError as e:
             if days == 7:
                 log(f"  ! {e}")
-                DATA_PROBLEMS.append(f"статистика запросов не загрузилась ({e})")
+                data_problem(f"статистика запросов не загрузилась ({e})")
             res.clear()
     return res
 
@@ -809,7 +860,7 @@ def get_stock(token, nm_ids):
                                        "orders": num(sel.get("orderCount"))}
     except ApiError as e:
         log(f"  ! {e} — остатки неизвестны, минимальные ставки «по остаткам» не ставлю.")
-        DATA_PROBLEMS.append(f"остатки не загрузились ({e})")
+        data_problem(f"остатки не загрузились ({e})")
         return None
     return res
 
@@ -1076,6 +1127,7 @@ def changed(new, cur, step):
 
 
 def plan_cabinet(cab, token, rules, state):
+    _tl.cab = cab                           # для data_problem: в каком кабинете сбой
     log(f"\n══════════ {cab} ══════════")
     plan = {"bids": [], "cluster_bids": [], "minus": [], "limits": [], "trim": [], "untrim": [], "topup": []}
     camps = get_campaigns(token)
@@ -1120,6 +1172,10 @@ def plan_cabinet(cab, token, rules, state):
                 if thr and b is not None and b < PAUSED_MONEY_BELOW:
                     todo[cid] = dict(DEFAULTS, **rules["*"], _resume=True)
                     log(f"  «{nm_}» {cid} на паузе, бюджет {fm_rub(b)} ₽ — кончились деньги: пополню и запущу.")
+                elif thr and b is not None and start_retry(state, cid):
+                    todo[cid] = dict(DEFAULTS, **rules["*"], _resume=True)
+                    log(f"  «{nm_}» {cid} на паузе, бюджет {fm_rub(b)} ₽ — её пополнили {start_pending(state, cid)}, "
+                        "а запуск не прошёл: запущу.")
                 else:
                     log(f"  «{nm_}» {cid} на паузе, в бюджете {fm_rub(b) if b is not None else '?'} ₽ — паузу, видимо, "
                         "поставили вы: не трогаю.")
@@ -1258,9 +1314,11 @@ def plan_cabinet(cab, token, rules, state):
         if pay == "cpc" and r.get("pacing", True) and lims_all:
             lm = lims_all.get(cid) or {}
             if lm.get("enabled") and lm.get("spentToday") is not None:
-                pace_m, pace_why = pace_factor(cid, num(lm["spentToday"]) / 100, num(lm.get("dailyLimit")) / 100)
-                if pace_m < 1:
-                    log(f"    График расхода: {pace_why}.")
+                # лимит — тот, что будет после этого запуска: автопилот поднимает его до правила и никогда не снижает
+                lim_rub = max(num(lm.get("dailyLimit")) / 100, r.get("daily_limit") or 0)
+                pace_m, pace_why = pace_factor(cid, num(lm["spentToday"]) / 100, lim_rub)
+        pace_prev = ((state.get("pacing") or {}).get(str(cid)) or {})
+        pace_prev = pace_prev.get("m", 1.0) if pace_prev.get("date") == dt.date.today().isoformat() else 1.0
         nms = nms_of[cid]
         c_clicks = sum(v["clicks"] for (x, _), v in stats.items() if x == cid)
         c_orders = sum(v["orders"] for (x, _), v in stats.items() if x == cid)
@@ -1269,8 +1327,10 @@ def plan_cabinet(cab, token, rules, state):
         camp_ctr = smooth(c_clicks, c_views, PRIOR_CTR, K_VIEWS)
         log(f"\n  ▶ {name} (ID {cid}) — {'единая' if unified else 'ручная'} ставка, "
             f"{'за клики' if pay == 'cpc' else 'за показы'}, цель {target}, "
-            f"{'ставка по рекомендации WB (эксперимент, без окупаемого потолка)' if r.get('follow_rec') else 'заказ до ' + str(r['max_cost_per_order']) + ' ₽' + (' × выкуп товара' if any(k[0] == cab for k in BUYOUT) else '') if r['max_cost_per_order'] != 'auto' else 'цена заказа — из юнит-экономики'}, "
+            f"{'ставка по рекомендации WB (эксперимент, без окупаемого потолка)' if r.get('follow_rec') else 'заказ до ' + str(r['max_cost_per_order']) + ' ₽' + (' × выкуп товара' if any(k[0] == cab for k in list(BUYOUT)) else '') if r['max_cost_per_order'] != 'auto' else 'цена заказа — из юнит-экономики'}, "
             f"конверсия {camp_cr * 100:.1f}%" + (f"; режим запуска новинки до {r['_until']}" if r.get("_until") else ""))
+        if pace_m < 1:
+            log(f"    График расхода: {pace_why}.")
 
         # ---- товары с малым остатком: убрать из кампании ----
         if r.get("min_stock") and stock is not None:
@@ -1296,7 +1356,9 @@ def plan_cabinet(cab, token, rules, state):
                 for i in back:
                     plan["untrim"].append({"cabinet": cab, "advert_id": cid, "nm_id": i["nm_id"],
                                            "bid_type": i.get("bid_type") or a.get("bid_type"),
-                                           "bids_kopecks": i.get("bids_kopecks") or {}})
+                                           # ставка на момент уборки могла быть выше нынешнего потолка — не выше потолка
+                                           "bids_kopecks": {k: min(v, cap_abs) if isinstance(v, (int, float)) else v
+                                                            for k, v in (i.get("bids_kopecks") or {}).items()}})
 
         # ---- ставки товаров ----
         if unified:
@@ -1344,7 +1406,7 @@ def plan_cabinet(cab, token, rules, state):
                                 log(f"      ({nm}: WB не дал ставку для мест {target}, беру для 3–10)")
                         if rec is None and data:
                             log(f"      ! {nm}: не понял ответ WB с рекомендацией (образец — {REC_SAMPLE.name}), ставку не трогаю.")
-                            DATA_PROBLEMS.append(f"непонятный формат рекомендаций WB — см. {REC_SAMPLE.name}")
+                            data_problem(f"непонятный формат рекомендаций WB — см. {REC_SAMPLE.name}")
                     except ApiError as e:
                         log(f"      ! {e}")
                     nb, reason = new_bid(current, rec, cap, mn, step, r["max_raise_pct"],
@@ -1352,9 +1414,10 @@ def plan_cabinet(cab, token, rules, state):
                     if r.get("follow_rec") and reason.startswith("потолок по цене заказа"):
                         reason = reason.replace("потолок по цене заказа", f"потолок ставки {cap / 100:.0f} ₽")
                     if pace_m < 1 and nb:
-                        nb2 = paced(nb, pace_m, mn, step)
+                        nb2 = paced(nb, pace_m, mn, step, current, pace_prev)
                         if nb2 != nb:
-                            nb, reason = nb2, f"{reason}; график расхода ×{pace_m}"
+                            nb, reason = nb2, f"{reason}; график расхода ×{pace_m}" + (
+                                " — расход впереди графика, не повышаю" if nb2 == current else "")
                     if size_short(nm) == "hold" and current and nb and nb > current:
                         nb, reason = current, f"мало ходовых размеров (закрыто {cover[nm][0]:.0%} спроса) — не повышаю"
                     if r.get("stop_clicks") and v["clicks"] >= r["stop_clicks"] and not v["orders"]:
@@ -1596,12 +1659,22 @@ def plan_cabinet(cab, token, rules, state):
                                      "day_cap": r["topup_day_cap"], "week_cap": r["topup_week_cap"],
                                      "source": r["topup_source"], "start": can_start, "cab_cap": cab_cap,
                                      "min_deposit": min_dep}
+            note_broken_topups(state, cid, name)
             bud = buds_all.get(cid)
             short = max(limit_need - (bud or 0), 0)       # сколько не хватает бюджета, чтобы WB принял новый лимит
             if bud is None:
                 log("    ! Бюджет кампании не получен — пополнение пропускаю.")
+            elif a.get("_status") in (4, 11) and bud >= PAUSED_MONEY_BELOW and start_retry(state, cid):
+                log(f"    Кампанию пополнили {start_pending(state, cid)}, а запуск тогда не прошёл (в бюджете {fm_rub(bud)} ₽) — "
+                    "запустить снова, без пополнения.")
+                plan["topup"].append({"cabinet": cab, "advert_id": cid, "name": name, "amount": 0,
+                                      "source": r["topup_source"], "budget_before": bud, "start": True})
             elif a.get("_status") == 11 and bud >= PAUSED_MONEY_BELOW:
-                log(f"    Кампания на паузе, в бюджете {fm_rub(bud)} ₽ — паузу, видимо, поставили вы: не пополняю и не запускаю.")
+                if start_pending(state, cid):
+                    log(f"    ! Кампанию пополнили {start_pending(state, cid)}, но запустить так и не удалось (в бюджете "
+                        f"{fm_rub(bud)} ₽) — запустите её в кабинете WB вручную.")
+                else:
+                    log(f"    Кампания на паузе, в бюджете {fm_rub(bud)} ₽ — паузу, видимо, поставили вы: не пополняю и не запускаю.")
             elif short > 0:
                 week = topped_week(state, cid)
                 today_ = topped_week(state, cid, days=1)
@@ -1629,7 +1702,8 @@ def plan_cabinet(cab, token, rules, state):
                         f"из «{SOURCE_RU[r['topup_source']]}» (сегодня уже {fm_rub(today_)} из {r['topup_day_cap']} ₽, "
                         f"за 7 дней {fm_rub(week)} из {r['topup_week_cap']} ₽)" + (" и запустить кампанию" if start else "") + ".")
                     plan["topup"].append({"cabinet": cab, "advert_id": cid, "name": name, "amount": amount,
-                                          "source": r["topup_source"], "budget_before": bud, "start": start})
+                                          "source": r["topup_source"], "budget_before": bud, "start": start,
+                                          "enough": max(limit_need, r["topup_below"])})
                     if cab_cap:
                         cab_left[0] -= amount
             elif bud >= r["topup_below"]:
@@ -1650,7 +1724,8 @@ def plan_cabinet(cab, token, rules, state):
                     log(f"    Бюджет: {fm_rub(bud)} ₽ < {r['topup_below']} ₽ → пополнить на {amount} ₽ из «{SOURCE_RU[r['topup_source']]}» "
                         f"(сегодня уже {fm_rub(today_)} из {r['topup_day_cap']} ₽, за 7 дней {fm_rub(week)} из {r['topup_week_cap']} ₽)" + (" и запустить кампанию" if start else "") + ".")
                     plan["topup"].append({"cabinet": cab, "advert_id": cid, "name": name, "amount": amount,
-                                          "source": r["topup_source"], "budget_before": bud, "start": start})
+                                          "source": r["topup_source"], "budget_before": bud, "start": start,
+                                          "enough": r["topup_below"]})
                     if cab_cap:
                         cab_left[0] -= amount
     if check_card:
@@ -1779,7 +1854,7 @@ def update_state(state, minus_items, reverse=False):
             route = (route - set(m["add_route"])) | set(m["rem_route"])
         state["minus_auto"][key] = sorted(auto)
         state["minus_route"][key] = sorted(route)
-    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
+    save_state(state)
 
 
 SOURCE_TYPE = {"account": 0, "balance": 1, "bonus": 3}
@@ -1817,6 +1892,9 @@ def prune_state(state, keep_days=35):
     man = state.get("managed") or {}
     for cid in [c for c, m in man.items() if (m.get("seen") or "") < since]:
         del man[cid]
+    pend = state.get("start_pending") or {}
+    for cid in [c for c, d in pend.items() if d < since]:
+        del pend[cid]
 
 
 MIN_DEPOSIT = 1000   # WB не принимает пополнение бюджета меньше 1 000 ₽ («minimum deposit amount is 1000», 14.10.2026)
@@ -1862,11 +1940,15 @@ def pace_factor(cid, spent, limit, now=None):
     return 1.0, ""
 
 
-def paced(nb, m, mn, step):
-    """Ставка с поправкой на график расхода (не ниже минимальной WB)."""
+def paced(nb, m, mn, step, cur=None, prev_m=1.0):
+    """Ставка с поправкой на график расхода (не ниже минимальной WB). Пока расход опережает график, ставка не растёт
+    выше текущей (cur) — кроме ослабления поправки за день (была ×0,7, стала ×0,85: prev_m < m)."""
     if nb is None or m >= 1:
         return nb
-    return max(int(mn or 0), int(math.floor(nb * m / step) * step))
+    res = max(int(mn or 0), int(math.floor(nb * m / step) * step))
+    if cur and res > cur and m <= prev_m:
+        res = max(int(cur), int(mn or 0))
+    return res
 
 
 def topped_week(state, cid, days=7):
@@ -1889,53 +1971,139 @@ def topped_cabinet(state, cab, known_ids, days=7):
     return total
 
 
+START_PENDING_DAYS = 2   # пополнили, а запустить не удалось: столько дней пробовать запустить снова (без пополнения)
+
+
+def start_pending(state, cid):
+    """Дата, когда кампанию пополнили, а запустить не удалось, или None."""
+    return (state.get("start_pending") or {}).get(str(cid))
+
+
+def start_retry(state, cid):
+    """Кампания на паузе с деньгами — это «паузу поставили вы», КРОМЕ случая, когда мы её пополнили, а запуск не прошёл
+    (сбой WB): тогда её нужно запустить снова, иначе 1 000 ₽ так и лежат в бюджете остановленной кампании."""
+    d = start_pending(state, cid)
+    return bool(d) and d >= (dt.date.today() - dt.timedelta(days=START_PENDING_DAYS)).isoformat()
+
+
+def note_broken_topups(state, cid, name):
+    """Пополнение, которое оборвалось на середине (процесс остановили во время запроса): деньги могли уйти. Оно уже
+    учтено в потолках; сообщаем один раз и помечаем как «неясное»."""
+    for t in (state.get("topups") or {}).get(str(cid), []):
+        if t.pop("pending", None):
+            t["unclear"] = True
+            log(f"    ? «{name}»: пополнение на {t['sum']} ₽ {t.get('at') or t['date']} оборвалось на середине — считаю, что "
+                "прошло (учтено в потолках). Проверьте бюджет кампании в кабинете WB.")
+
+
+def live_topup(cab, cid, camps):
+    """Правила пополнения кампании по RULES в этом файле прямо сейчас. Страж берёт правила из последнего --apply
+    автопилота (до 14 ч назад) — уменьшенный вами потолок без этой сверки до того бы не действовал.
+    None — кампании в правилах больше нет или пополнение у неё выключено."""
+    rules = RULES.get(cab) or {}
+    today = dt.date.today().isoformat()
+    r = None
+    for k, v in rules.items():
+        if k == "*" or k.startswith("_") or (v.get("until") and today > v["until"]):
+            continue
+        if cid in find(camps, k):
+            r = {**DEFAULTS, **rules.get("*", {}), **v}
+            break
+    if r is None and "*" in rules and cid not in {c for k in rules.get("_except") or [] for c in find(camps, k)}:
+        r = dict(DEFAULTS, **rules["*"])
+    if not r or not r.get("topup_below"):
+        return None
+    return {"below": r["topup_below"], "amount": r["topup_amount"], "day_cap": r["topup_day_cap"],
+            "week_cap": r["topup_week_cap"], "cab_cap": rules.get("_week_budget")}
+
+
+def start_campaign(token, i, state):
+    """Запустить кампанию после пополнения. Запуск можно повторять (денег не тратит), поэтому запрос с повторами.
+    Не вышло — запомнить: следующий запуск автопилота или часовой проверки попробует снова."""
+    pend = state.setdefault("start_pending", {})
+    pace(token, "start", 1.1)
+    try:
+        call("GET", ADV + "/adv/v0/start", token, params={"id": i["advert_id"]}, what="Запуск кампании")
+    except ApiError as e:
+        pend.setdefault(str(i["advert_id"]), dt.date.today().isoformat())
+        save_state(state)
+        log(f"  ✗ «{i['name']}»: не запустилась — {e}. Попробую запустить снова при следующем запуске.")
+        return False
+    pend.pop(str(i["advert_id"]), None)
+    save_state(state)
+    log(f"  ✓ «{i['name']}»: запущена" + (" после пополнения" if i["amount"] else " (пополнена раньше, запуск тогда не прошёл)"))
+    return True
+
+
 def apply_topups(token, items, state):
-    """Пополнить бюджеты. Деньги не возвращаются — отката нет. Записывает пополнения в состояние (для потолка) и
-    сохраняет его после КАЖДОГО пополнения. Запрос не повторяется: если WB не ответил, смотрим бюджет — вырос ли."""
+    """Пополнить бюджеты. Деньги не возвращаются — отката нет.
+      • Перед пополнением бюджет перечитывается: прочитанный при планировании мог устареть на 20–50 мин.
+      • Запись о пополнении сохраняется ДО запроса (пометка pending): если процесс оборвётся посреди запроса, потолки
+        её всё равно учтут. Отказ WB — запись удаляется; успех — пометка снимается.
+      • Запрос не повторяется: если WB не ответил, смотрим, вырос ли бюджет.
+      • amount = 0 — кампанию пополнили раньше, а запуск не прошёл: только запустить."""
     ok = 0
+    tops = state.setdefault("topups", {})
+
+    def drop(cid, rec):
+        lst = tops.get(str(cid), [])
+        lst[:] = [x for x in lst if x is not rec]
+        if not lst:
+            tops.pop(str(cid), None)
+        save_state(state)
+
     for i in items:
+        cid = i["advert_id"]
+        if not i["amount"]:
+            if i.get("start"):
+                start_campaign(token, i, state)
+            continue
+        fresh = get_budgets(token, [cid]).get(cid)
+        if fresh is not None and i.get("enough") is not None and fresh >= i["enough"]:
+            log(f"  «{i['name']}»: в бюджете уже {fm_rub(fresh)} ₽ (было {fm_rub(i.get('budget_before') or 0)} ₽ при расчёте) — "
+                "пополнение не нужно.")
+            continue
+        before = fresh if fresh is not None else i.get("budget_before")
+        rec = {"date": dt.date.today().isoformat(), "sum": i["amount"], "cabinet": i["cabinet"],
+               "at": dt.datetime.now().strftime("%d.%m %H:%M"), "pending": True}
+        tops.setdefault(str(cid), []).append(rec)
+        save_state(state)              # не сохранилось (файл занят) — исключение, деньги не отправлены
         pace(token, "deposit", 1.1)
-        rec = {"date": dt.date.today().isoformat(), "sum": i["amount"], "cabinet": i["cabinet"]}
         try:
-            res = call("POST", ADV + "/adv/v1/budget/deposit", token, params={"id": i["advert_id"]}, what="Пополнение бюджета",
+            res = call("POST", ADV + "/adv/v1/budget/deposit", token, params={"id": cid}, what="Пополнение бюджета",
                        body={"sum": int(i["amount"]), "type": SOURCE_TYPE[i["source"]], "return": True}, retry=False)
         except ApiError as e:
             if e.status != UNCLEAR and not (isinstance(e.status, int) and e.status >= 500):
+                drop(cid, rec)
                 log(f"  ✗ «{i['name']}»: пополнение не прошло — {e}")
                 continue
             # ответ потерялся — повторять нельзя (деньги ушли бы дважды); проверяем бюджет
             time.sleep(5)
-            try:
-                now = get_budgets(token, [i["advert_id"]]).get(i["advert_id"])
-            except ApiError:
-                now = None
-            before = i.get("budget_before")
+            now = get_budgets(token, [cid]).get(cid)
             if now is not None and before is not None and now >= before + i["amount"] * 0.8:
                 log(f"  ✓ «{i['name']}»: WB не ответил, но бюджет вырос {fm_rub(before)} → {fm_rub(now)} ₽ — пополнение прошло.")
                 res = {"total": now}
             elif now is not None and before is not None:
+                drop(cid, rec)
                 log(f"  ✗ «{i['name']}»: WB не ответил, бюджет не вырос ({fm_rub(now)} ₽) — пополнение не прошло; "
                     "повторю при следующем запуске.")
                 continue
             else:
+                rec.pop("pending", None)
                 rec["unclear"] = True
-                state.setdefault("topups", {}).setdefault(str(i["advert_id"]), []).append(rec)
                 save_state(state)
                 log(f"  ? «{i['name']}»: WB не ответил и бюджет проверить не удалось — считаю, что +{i['amount']} ₽ прошло "
                     "(чтобы не пополнить дважды). Проверьте бюджет кампании в кабинете WB.")
+                if i.get("start"):
+                    start_campaign(token, i, state)
                 continue
+        rec.pop("pending", None)
         ok += 1
-        state.setdefault("topups", {}).setdefault(str(i["advert_id"]), []).append(rec)
         save_state(state)
         total = res.get("total") if isinstance(res, dict) else None
         log(f"  ✓ «{i['name']}»: +{i['amount']} ₽" + (f", бюджет теперь {fm_rub(num(total))} ₽" if total is not None else ""))
         if i.get("start"):
-            pace(token, "start", 1.1)
-            try:
-                call("GET", ADV + "/adv/v0/start", token, params={"id": i["advert_id"]}, what="Запуск кампании", retry=False)
-                log(f"  ✓ «{i['name']}»: запущена после пополнения")
-            except ApiError as e:
-                log(f"  ✗ «{i['name']}»: не запустилась — {e}")
+            start_campaign(token, i, state)
     save_state(state)
     return ok
 
@@ -1997,7 +2165,10 @@ def run_apply(cabs, plan, key, state, reverse=False):
             if reverse:
                 log("  Пополнения бюджета не откатываются — деньги уже в бюджетах кампаний.")
             else:
-                res.append(f"пополнено бюджетов {apply_topups(tok, sel['topup'], state)}/{len(sel['topup'])}")
+                n_dep = sum(1 for i in sel["topup"] if i["amount"])
+                n_ok = apply_topups(tok, sel["topup"], state)
+                if n_dep:
+                    res.append(f"пополнено бюджетов {n_ok}/{n_dep}")
         if sel.get("trim"):
             res.append(f"{'возвращено' if reverse else 'убрано'} товаров {apply_trim(tok, sel['trim'], reverse)}/{len(sel['trim'])}")
             tr = state.setdefault("trimmed", {})
@@ -2081,12 +2252,21 @@ def main():
             continue
         jobs.append((cab, lambda cab=cab, rules=rules: plan_cabinet(cab, cabs[cab], rules, state)))
     results = run_parallel(jobs)
+    # кабинет, у которого не загрузилась часть данных, не применяется (ставки были бы посчитаны вслепую), остальные — да
+    bad = {c for c, _ in DATA_PROBLEMS}
     for cab, _ in jobs:
         kind, p = results[cab]
         if kind == "err":
             if not isinstance(p, ApiError):
                 raise p                 # ошибка в программе, а не ответ WB — остановиться, ничего не применять
             log(f"  ✗ {cab}: {p}")
+            FAILED_CABS.add(cab)
+            continue
+        if apply and cab in bad:
+            log(f"\n✗ {cab}: НЕ ПРИМЕНЯЮ — часть данных не загрузилась, ставки были бы посчитаны вслепую:")
+            for msg in dict.fromkeys(m for c, m in DATA_PROBLEMS if c == cab):
+                log(f"  — {msg}")
+            log(f"  В кабинете «{cab}» ничего не изменено; часовая проверка ведёт его по прежним потолкам.")
             FAILED_CABS.add(cab)
             continue
         for k in plan:
@@ -2097,10 +2277,17 @@ def main():
     log(f"\nИтого: ставки товаров {len(plan['bids'])} (↑{up} ↓{len(plan['bids']) - up}), "
         f"ставки запросов {len(plan['cluster_bids'])}, новых минус-фраз {n_minus}, дневных лимитов {len(plan['limits'])}, "
         f"убрать товаров с малым остатком {len(plan['trim'])}, вернуть {len(plan['untrim'])}, "
-        f"пополнить бюджетов {len(plan['topup'])} на {sum(t['amount'] for t in plan['topup'])} ₽.")
-    if apply and DATA_PROBLEMS:
+        f"пополнить бюджетов {sum(1 for t in plan['topup'] if t['amount'])} на {sum(t['amount'] for t in plan['topup'])} ₽"
+        + (f", запустить снова {sum(1 for t in plan['topup'] if not t['amount'])}" if any(not t['amount'] for t in plan['topup']) else "")
+        + ".")
+    blind = apply and None in bad          # сбой вне кабинета — не применять ничего
+    if apply and not lock_mine():
+        log("\n✗ НЕ ПРИМЕНЯЮ: общую блокировку снял другой процесс, пока шёл расчёт (иначе два процесса меняли бы "
+            "кабинеты одновременно). Запустите позже ещё раз.")
+        blind = True
+    elif blind:
         log("\n✗ НЕ ПРИМЕНЯЮ: часть данных не загрузилась, ставки были бы посчитаны вслепую:")
-        for msg in dict.fromkeys(DATA_PROBLEMS):
+        for msg in dict.fromkeys(m for _, m in DATA_PROBLEMS):
             log(f"  — {msg}")
         log("В кабинетах ничего не изменено. Запустите позже ещё раз.")
     elif apply and any(plan.values()):
@@ -2113,27 +2300,38 @@ def main():
         log("Откат: python wb_bids.py --rollback")
     elif any(plan.values()):
         if DATA_PROBLEMS:
-            log("! Часть данных не загрузилась (см. «!» выше) — --apply сейчас откажется применять.")
+            log("! Часть данных не загрузилась (см. «!» выше) — --apply сейчас не изменит кабинет(ы): "
+                + ", ".join(sorted(c or "все" for c in bad)) + ".")
         log("Это пробный прогон. Применить: python wb_bids.py --apply")
-    if apply and not DATA_PROBLEMS:
+    if apply and not blind:
         # для wb_guard.py. Кабинет, который в этом запуске упал с ошибкой, сохраняет прежние потолки и правила —
         # иначе страж до следующего удачного запуска перестал бы его пополнять и вести ставки.
         old_caps = state.get("caps") or {}
         caps_cab = {k: v for k, v in (old_caps.get("cab") or {}).items()}
         caps_cab.update(CAPS_CAB)
-        items = dict(CAPS)
+        # потолки кабинета с ошибкой посчитаны не до конца или вслепую — берём прежние (ниже)
+        items = {k: v for k, v in CAPS.items() if CAPS_CAB.get(k) not in FAILED_CABS}
         rules_ = dict(TOPUP_RULES)
         if FAILED_CABS:
             for k, v in (old_caps.get("items") or {}).items():
                 # кабинет неизвестен (запись до этого обновления) — тоже сохраняю: страж сверяет потолки только с
                 # кампаниями своего кабинета, лишняя запись ни на что не влияет
-                if k not in items and caps_cab.get(k) in FAILED_CABS | {None}:
+                if k not in items and (old_caps.get("cab") or {}).get(k) in FAILED_CABS | {None}:
                     items[k] = v
+                    caps_cab[k] = (old_caps.get("cab") or {}).get(k)
             for k, v in (state.get("topup_rules") or {}).items():
                 if k not in rules_ and v.get("cabinet") in FAILED_CABS:
                     rules_[k] = v
             log(f"Для часовой проверки сохраняю прежние потолки кабинетов с ошибкой: {', '.join(sorted(FAILED_CABS))}.")
-        state["caps"] = {"at": dt.datetime.now().isoformat(timespec="seconds"), "items": items,
+        # время потолков — по каждому кабинету: у кабинета с ошибкой остаётся прежнее, чтобы страж перестал верить
+        # его потолкам через 48 ч, а не вёл их бессрочно
+        now_s = dt.datetime.now().isoformat(timespec="seconds")
+        cab_at = {c: v for c, v in (old_caps.get("cab_at") or {}).items() if c in FAILED_CABS}
+        for c in FAILED_CABS:
+            if c not in cab_at and old_caps.get("at"):
+                cab_at[c] = old_caps["at"]
+        cab_at.update({c: now_s for c, _ in jobs if c not in FAILED_CABS})
+        state["caps"] = {"at": now_s, "cab_at": cab_at, "items": items,
                          "cab": {k: v for k, v in caps_cab.items() if k in items}}
         state["topup_rules"] = rules_
         man = state.setdefault("managed", {})
