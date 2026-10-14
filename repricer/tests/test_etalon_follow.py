@@ -132,3 +132,21 @@ def test_excel_import_sets_new_etalons(client, db):
     assert "новый эталон у 1 артикулов" in r.text
     db.expire_all()
     assert db.query(ReferencePrice).one().ref_price == 8000
+
+
+def test_difference_within_tolerance_is_not_a_divergence(client, db):
+    w, kit, lam = _setup(db)
+    row = db.query(PlatformItem).filter_by(account_id=lam.id).one()
+    row.current_price, row.current_sale_price = 6900, 3451            # цель 3450 — разница 1 ₽
+    db.commit()
+    plan = {c.platform: c for c in etalon.follower_plan(db)}
+    assert plan["lamoda"].follows and not plan["lamoda"].same
+    settings.put(db, settings.ETALON_TOLERANCE_RUB, "0")
+    db.commit()
+    assert not {c.platform: c for c in etalon.follower_plan(db)}["lamoda"].follows
+    settings.put(db, settings.ETALON_TOLERANCE_RUB, "100")
+    settings.put(db, settings.ETALON_FOLLOW_AUTO, "1")
+    db.commit()
+    log = []
+    st = etalon.follow_all(db, client_factory=lambda p, c: Fake(log))
+    assert set(st["sent"]) == {"КИТ"}                                   # Ламода в допуске — не трогаем

@@ -48,6 +48,8 @@ ETALON_SHIFT_LAMODA = "etalon_shift_lamoda"
 ETALON_SHIFT_OZON = "etalon_shift_ozon"
 ETALON_FOLLOW_AUTO = "etalon_follow_auto"
 ETALON_LAMODA_SALE_DAYS = "etalon_lamoda_sale_days"
+# Разница цены после скидки с целью не больше стольких рублей — не расхождение (округление, курс).
+ETALON_TOLERANCE_RUB = "etalon_tolerance_rub"
 
 # Эталон WB (`pricing.etalon_prices`): цена продавца со скидкой на WB минус этот %;
 # допустимая скидка продавца на площадке (вне — цена до скидки не считается); «от
@@ -92,6 +94,7 @@ DEFAULTS = {
     ETALON_SHIFT_OZON: "",
     ETALON_FOLLOW_AUTO: "0",
     ETALON_LAMODA_SALE_DAYS: "365",
+    ETALON_TOLERANCE_RUB: "100",
     COST_NORMALIZE: "1",
 }
 
