@@ -115,10 +115,49 @@ def load_autopilot():
     return ap
 
 
+def load_recs():
+    """Рекомендованные ставки WB (wb_rec_history.csv, пишут wb_bids.py и wb_guard.py): медиана за последние 3 дня против
+    медианы 8–14 дней назад, по кампании и товару. Только заметные изменения (±15%)."""
+    import csv
+    f = HERE / "wb_rec_history.csv"
+    if not f.exists():
+        return {"rows": [], "since": None}
+    today = dt.date.today()
+    now_from = (today - dt.timedelta(days=3)).isoformat()
+    old_from, old_to = (today - dt.timedelta(days=14)).isoformat(), (today - dt.timedelta(days=8)).isoformat()
+    grp, first = {}, None
+    try:
+        raw = f.read_bytes().decode("utf-8-sig", errors="replace").splitlines()
+    except OSError:
+        return {"rows": [], "since": None}
+    for r in csv.DictReader(raw, delimiter=";"):
+        d = (r.get("время") or "")[:10]
+        try:
+            v = float(str(r.get("рекомендация ₽") or "").replace(",", "."))
+        except ValueError:
+            continue
+        first = min(first, d) if first else d
+        g = grp.setdefault((r.get("кабинет"), r.get("кампания"), r.get("товар"), r.get("оплата")), ([], []))
+        if d >= now_from:
+            g[0].append(v)
+        elif old_from <= d <= old_to:
+            g[1].append(v)
+    med = lambda xs: sorted(xs)[len(xs) // 2]
+    rows = []
+    for (cab, cid, nm, pay), (a, b) in grp.items():
+        if a and b:
+            ch = med(a) / med(b) - 1 if med(b) else 0
+            if abs(ch) >= 0.15:
+                rows.append([cab, cid, nm, pay, med(a), med(b), ch])
+    rows.sort(key=lambda x: -abs(x[6]))
+    return {"rows": rows[:60], "since": first}
+
+
 def main():
     if sys.stdout is None:          # запуск ярлыком через pythonw.exe — консоли нет, print некуда писать
         sys.stdout = sys.stderr = open(HERE / "wb_dashboard_log.txt", "a", encoding="utf-8")
     data = {"generated": dt.datetime.now().strftime("%d.%m.%Y %H:%M"), **load_db(), "autopilot": load_autopilot(),
+            "recs": load_recs(),
             "has_db": DB.exists()}
     payload = json.dumps(data, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
     OUT.write_text(TEMPLATE.replace("__DATA__", payload), encoding="utf-8")
@@ -254,6 +293,8 @@ pre { white-space: pre-wrap; font: 12px/1.45 ui-monospace, Consolas, monospace; 
     <div class="card"><h2>Пополнения бюджетов за 7 дней</h2><p class="note">Сколько автопилот перевёл с «Баланса» против недельного потолка кампании</p><div id="ap-topups"></div>
       <h2 style="margin-top:14px">Последняя часовая проверка</h2><pre id="ap-guard"></pre></div>
   </div>
+  <section class="card" id="rec-sec" style="margin-bottom:16px"><h2>Цена рекламы: рекомендации WB</h2>
+    <p class="note" id="rec-note"></p><div id="recs"></div></section>
   <section class="card" id="bud-sec" style="margin-bottom:16px"><h2>Бюджет по окупаемости</h2>
     <p class="note" id="bud-note"></p><div id="bud"></div></section>
   <section id="prod-sec" class="card">
@@ -485,6 +526,23 @@ function renderAutopilot() {
   $("#ap-guard").textContent = A.guard_last.length ? A.guard_last.join("\n") : "Часовая проверка ещё не запускалась.";
 }
 
+// ---------- цена рекламы: рекомендации WB ----------
+function renderRecs() {
+  const R = D.recs || {rows: []}, box = $("#recs"); box.textContent = "";
+  const rows = (R.rows || []).filter(r => !state.cab || r[0] === state.cab);
+  $("#rec-note").textContent = "Сколько WB советует ставить для нужных мест: последние 3 дня против 8–14 дней назад (медианы), только изменения от 15%. Рост — реклама дорожает: цена заказа вырастет, если конверсия та же." + (R.since ? " История — с " + ddmm(R.since) + "." : "");
+  if (!rows.length) { h("div", {class: "empty", style: "padding:12px 0"}, box, R.since ? "Заметных изменений нет (или истории меньше двух недель)." : "Истории пока нет — её пишут автопилот и часовая проверка при каждом запуске."); return; }
+  const names = D.products[state.cab] || {};
+  const tb = h("table", {}, h("div", {class: "scroll", style: "max-height:320px"}, box)), tr = h("tr", {}, h("thead", {}, tb));
+  ["Товар", "Кампания", "Оплата", "Было", "Сейчас", "Изменение"].forEach((x, i) => h("th", {class: i < 3 ? "l" : ""}, tr, x));
+  const body = h("tbody", {}, tb);
+  rows.forEach(r => { const row = h("tr", {}, body);
+    h("td", {class: "l"}, row, r[2] + (names[r[2]] && names[r[2]][0] ? " · " + names[r[2]][0] : ""));
+    h("td", {class: "l"}, row, String(r[1])); h("td", {class: "l"}, row, r[3] === "cpc" ? "за клик" : "за 1000 показов");
+    h("td", {}, row, fmt1.format(r[5]) + " ₽"); h("td", {}, row, fmt1.format(r[4]) + " ₽");
+    h("td", {style: "color:var(" + (r[6] > 0 ? "--bad" : "--good") + ")"}, row, (r[6] > 0 ? "+" : "") + fmt0.format(r[6] * 100) + "%"); });
+}
+
 // ---------- бюджет по окупаемости (wb_budget.py) ----------
 function renderBudget() {
   const B = D.autopilot.budget, box = $("#bud"); box.textContent = "";
@@ -549,7 +607,7 @@ function renderProducts(agg, cab) {
 function render() {
   $("#sub").textContent = "собрано " + D.generated;
   document.querySelectorAll("#period button").forEach(b => b.setAttribute("aria-pressed", String(+b.dataset.d === state.days)));
-  if (!D.has_db || !state.cab) { $("#nodb").hidden = false; $("#main").hidden = true; $("#prod-sec").hidden = true; renderAutopilot(); renderBudget(); return; }
+  if (!D.has_db || !state.cab) { $("#nodb").hidden = false; $("#main").hidden = true; $("#prod-sec").hidden = true; renderAutopilot(); renderRecs(); renderBudget(); return; }
   const cab = state.cab, end = lastDate(cab), dates = dateList(end, state.days), prevDates = dateList(dateList(end, state.days + 1)[0], state.days);
   $("#range").textContent = ddmm(dates[0]) + " – " + ddmm(end) + "." + end.slice(0, 4) + " (последний день в данных)";
   const A = aggregate(cab, dates), B = aggregate(cab, prevDates), t = A.tot, p = B.tot;
@@ -583,6 +641,7 @@ function render() {
   chart($("#c-pos"), {dates, kind: "line", invert: true, endLabels: true, fmt: (v) => v == null ? "—" : fmt0.format(v), fmtAxis: (v) => fmt0.format(v), label: "Позиция в поиске",
     series: top.map((x, i) => ({name: (names[x.nm] || [String(x.nm)])[0] || String(x.nm), color: colors[i], vals: dates.map(d => (posBy[x.nm] || {})[d] ?? null)}))});
   renderAutopilot();
+  renderRecs();
   renderBudget();
   renderProducts(A, cab);
 }

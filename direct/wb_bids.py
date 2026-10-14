@@ -1040,6 +1040,41 @@ _rec_cache = {}
 REC_SAMPLE = HERE / "wb_bids_rec_sample.json"   # образец ответа WB с рекомендациями — для сверки формата
 
 
+REC_HISTORY = HERE / "wb_rec_history.csv"   # рекомендованные ставки WB при каждом запуске — динамика цены рекламы
+REC_LOG = []
+
+
+def note_rec(cab, cid, nm, pay, target, rec, cur, mn):
+    """Запомнить рекомендацию WB (копейки) — пишется в wb_rec_history.csv в конце запуска (write_rec_log)."""
+    if rec:
+        REC_LOG.append({"время": dt.datetime.now().strftime("%Y-%m-%d %H:%M"), "кабинет": cab, "кампания": cid,
+                        "товар": nm, "оплата": pay, "места": target, "рекомендация ₽": round(rec / 100, 2),
+                        "ставка ₽": round(cur / 100, 2) if cur else "", "минимум WB ₽": round(mn / 100, 2) if mn else ""})
+
+
+def write_rec_log():
+    if not REC_LOG:
+        return
+    import csv
+    with _file_lock:
+        try:
+            if REC_HISTORY.exists() and REC_HISTORY.stat().st_size > 15 * 1024 * 1024:   # ≈ полгода — начать новый
+                old = REC_HISTORY.with_name(REC_HISTORY.stem + ".old.csv")
+                if old.exists():
+                    old.unlink()
+                REC_HISTORY.rename(old)
+            new = not REC_HISTORY.exists()
+            with open(REC_HISTORY, "a", encoding="utf-8-sig" if new else "utf-8", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=list(REC_LOG[0]), delimiter=";")
+                if new:
+                    w.writeheader()
+                for r in REC_LOG:
+                    w.writerow({k: (str(v).replace(".", ",") if isinstance(v, float) else v) for k, v in r.items()})
+            REC_LOG.clear()
+        except OSError as e:
+            log(f"! История рекомендаций не записана: {e}")
+
+
 def get_rec(token, aid, nm):
     if (aid, nm) not in _rec_cache:
         progress(f"    рекомендации WB: {len(_rec_cache) + 1}-й товар…")
@@ -1533,6 +1568,7 @@ def plan_cabinet(cab, token, rules, state):
                             data_problem(f"непонятный формат рекомендаций WB — см. {REC_SAMPLE.name}")
                     except ApiError as e:
                         log(f"      ! {e}")
+                    note_rec(cab, cid, nm, pay, target, rec, current, mn)
                     nb, reason = new_bid(current, rec, cap, mn, step, r["max_raise_pct"],
                                          day_base(state, "bids", cid, nm, placement), r.get("max_drop_pct"))
                     if r.get("follow_rec") and reason.startswith("потолок по цене заказа"):
@@ -2689,6 +2725,7 @@ def main():
             man[str(cid)] = {"cabinet": cab_, "seen": dt.date.today().isoformat()}
         prune_state(state)
         save_state(state)     # ставки на начало дня и отсчёт наличия на WB — только при настоящем применении
+    write_rec_log()
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write("\n".join(out) + "\n\n")
 

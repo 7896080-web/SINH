@@ -72,6 +72,7 @@ log = B.log
 
 
 def write_log():
+    B.write_rec_log()
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write("\n".join(B.out) + "\n\n")
 
@@ -313,6 +314,7 @@ def plan_cabinet(cab, token, caps, state, budget):
             except B.ApiError as e:
                 log(f"  ! {e}")
                 rec = None
+            B.note_rec(cab, cid, nm, c.get("pay") or st.get("payment_type"), c.get("target") or "3-10", rec, cur, mn)
             if rec:
                 step = c.get("step") or 1
                 nb, why = B.new_bid(cur, rec, cap, mn or 0, step, c.get("max_raise"),
