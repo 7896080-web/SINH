@@ -1197,6 +1197,9 @@ def plan_cabinet(cab, token, rules, state):
             f"через {MINUS_AFTER_RESTOCK_DAYS} дн. (слова «не наша аудитория» — сразу).")
 
     cfg = get_config(token)
+    # минимальное пополнение — из настроек WB (minTopUp, в копейках), но не меньше MIN_DEPOSIT, на котором WB уже
+    # отказывал; если WB поднимет минимум — возьмём его, а не будем получать отказы
+    min_dep = max(MIN_DEPOSIT, num(cfg.get("minTopUp")) / 100)
     steps = {"cpc": int(cfg.get("cpcStep") or 100), "cpm": int(cfg.get("cpmStep") or 100)}
 
     # статистика запросов нужна для auto_minus, cluster_bids и источников "top"
@@ -1563,7 +1566,8 @@ def plan_cabinet(cab, token, rules, state):
                              or camps[cid].get("_status") == 9)
             TOPUP_RULES[str(cid)] = {"cabinet": cab, "name": name, "below": r["topup_below"], "amount": r["topup_amount"],
                                      "day_cap": r["topup_day_cap"], "week_cap": r["topup_week_cap"],
-                                     "source": r["topup_source"], "start": can_start, "cab_cap": cab_cap}
+                                     "source": r["topup_source"], "start": can_start, "cab_cap": cab_cap,
+                                     "min_deposit": min_dep}
             bud = buds_all.get(cid)
             short = max(limit_need - (bud or 0), 0)       # сколько не хватает бюджета, чтобы WB принял новый лимит
             if bud is None:
@@ -1576,7 +1580,7 @@ def plan_cabinet(cab, token, rules, state):
                 need = int(math.ceil(short / 100) * 100)
                 amount = deposit_amount(max(need, r["topup_amount"] if bud < r["topup_below"] else 0),
                                         r["topup_day_cap"], today_, r["topup_week_cap"], week,
-                                        cab_left[0] if cab_cap else None)
+                                        cab_left[0] if cab_cap else None, min_dep)
                 if amount < need:
                     newlim = int(max(bud + max(amount, 0), 0) // 100 * 100)
                     old_l = plan["limits"][-1]["old"]
@@ -1591,7 +1595,7 @@ def plan_cabinet(cab, token, rules, state):
                         plan["limits"][-1]["new"]["dailyLimit"] = newlim * 100
                         log(f"    ! Бюджет {fm_rub(bud)} ₽ меньше нового лимита {limit_need:.0f} ₽, а пополнить можно только на "
                             f"{max(amount, 0)} ₽ (потолки) — ставлю лимит {newlim} ₽, полный поставлю при следующем запуске.")
-                if amount >= MIN_DEPOSIT:
+                if amount >= min_dep:
                     start = can_start and a.get("_status") in (4, 11)
                     log(f"    Бюджет: {fm_rub(bud)} ₽ — WB не ставит дневной лимит больше бюджета → пополнить на {amount} ₽ "
                         f"из «{SOURCE_RU[r['topup_source']]}» (сегодня уже {fm_rub(today_)} из {r['topup_day_cap']} ₽, "
@@ -1606,9 +1610,9 @@ def plan_cabinet(cab, token, rules, state):
                 week = topped_week(state, cid)
                 today_ = topped_week(state, cid, days=1)
                 amount = deposit_amount(r["topup_amount"], r["topup_day_cap"], today_, r["topup_week_cap"], week,
-                                        cab_left[0] if cab_cap else None)
+                                        cab_left[0] if cab_cap else None, min_dep)
                 if not amount:       # до потолка осталось меньше 1 000 ₽ — WB такое пополнение не примет
-                    log(f"    ! Бюджет {fm_rub(bud)} ₽ ниже порога, но до потолка меньше {MIN_DEPOSIT} ₽ (меньше WB не принимает): "
+                    log(f"    ! Бюджет {fm_rub(bud)} ₽ ниже порога, но до потолка меньше {min_dep:.0f} ₽ (меньше WB не принимает): "
                         f"сегодня пополнено на {fm_rub(today_)} "
                         f"из {r['topup_day_cap']} ₽, за 7 дней на {fm_rub(week)} из {r['topup_week_cap']} ₽"
                         + (f", недельный бюджет кабинета: осталось {max(cab_left[0], 0):.0f} из {cab_cap} ₽" if cab_cap else "")
@@ -1790,14 +1794,14 @@ def prune_state(state, keep_days=35):
 MIN_DEPOSIT = 1000   # WB не принимает пополнение бюджета меньше 1 000 ₽ («minimum deposit amount is 1000», 14.10.2026)
 
 
-def deposit_amount(want, day_cap, today_, week_cap, week, cab_left=None):
+def deposit_amount(want, day_cap, today_, week_cap, week, cab_left=None, min_dep=MIN_DEPOSIT):
     """Сколько пополнить (решение пользователя 14.10.2026): не меньше MIN_DEPOSIT; недельный потолок кампании и кабинета —
     строго; дневной потолок меньше 1 000 ₽ можно превысить до 1 000. Возвращает 0, если пополнять нельзя."""
-    room = min(max(day_cap, MIN_DEPOSIT) - today_, week_cap - week)
+    room = min(max(day_cap, min_dep) - today_, week_cap - week)
     if cab_left is not None:
         room = min(room, cab_left)
-    amount = min(max(want, MIN_DEPOSIT), room)
-    return int(amount) if amount >= MIN_DEPOSIT else 0
+    amount = min(max(want, min_dep), room)
+    return int(math.ceil(amount)) if amount >= min_dep else 0
 
 
 def topped_week(state, cid, days=7):
