@@ -300,7 +300,7 @@ def run(cabs, apply):
             log(f"  {cab}: изменено ставок {n} из {sum(1 for i in changes if i['cabinet'] == cab)}")
         B.save_state(state)
         log("  Откат: python wb_guard.py --rollback")
-    elif changes or topups:
+    elif not apply and (changes or topups):
         log("  Это пробный прогон. Применить: python wb_guard.py --apply")
     write_log()
 
