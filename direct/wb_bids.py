@@ -1086,6 +1086,10 @@ REC_BURST = 5
 REC_CACHE_MIN = 45
 REC_CACHE_FILE = HERE / "wb_rec_cache.json"
 _bucket = {}
+_bucket_locks = {}        # своя блокировка на каждое ведро: фоновая подгрузка и основной расчёт кабинета делят один лимит
+_rec_lock = threading.Lock()
+_rec_inflight = {}        # (кампания, товар) → threading.Event: ответ уже запрашивается в другом потоке — подождать его
+_rec_main = set()         # кабинеты, где основной расчёт сам дошёл до рекомендаций (фоновая подгрузка там больше не нужна)
 _rec_disk = None          # {"кампания:товар": {"at": ISO, "data": ответ WB}} — загружается при первом обращении
 _rec_fresh = {}           # то, что получено в этом запуске, — дописывается в файл в конце (save_rec_cache)
 
@@ -1093,14 +1097,15 @@ _rec_fresh = {}           # то, что получено в этом запус
 def pace_burst(token, key, interval, burst):
     """Ведро на burst запросов, пополняется по одному раз в interval секунд (как считает WB)."""
     k = (token[-16:], key)
-    now = time.time()
-    tokens, t0 = _bucket.get(k, (float(burst), now))
-    tokens = min(float(burst), tokens + (now - t0) / interval)
-    if tokens < 1:
-        time.sleep((1 - tokens) * interval)
+    with _bucket_locks.setdefault(k, threading.Lock()):
         now = time.time()
-        tokens = 1.0
-    _bucket[k] = (tokens - 1, now)
+        tokens, t0 = _bucket.get(k, (float(burst), now))
+        tokens = min(float(burst), tokens + (now - t0) / interval)
+        if tokens < 1:
+            time.sleep((1 - tokens) * interval)
+            now = time.time()
+            tokens = 1.0
+        _bucket[k] = (tokens - 1, now)
 
 
 def _rec_disk_load():
@@ -1136,33 +1141,75 @@ def save_rec_cache():
             pass
 
 
+def _fetch_rec(token, aid, nm):
+    hit = _rec_disk_load().get(f"{aid}:{nm}") or {}
+    try:
+        age = (dt.datetime.now() - dt.datetime.fromisoformat(hit.get("at") or "")).total_seconds() / 60
+    except ValueError:
+        age = None
+    if age is not None and 0 <= age < REC_CACHE_MIN and isinstance(hit.get("data"), dict) and hit["data"]:
+        return hit["data"]                           # свежий ответ из прошлого запуска (стража или автопилота)
+    progress(f"    рекомендации WB: {len(_rec_cache) + 1}-й товар…")
+    cab_ = getattr(_tl, "cab", None)
+    REC_COUNT[cab_] = REC_COUNT.get(cab_, 0) + 1
+    pace_burst(token, "rec", REC_INTERVAL, REC_BURST)
+    data = call("GET", ADV + "/api/advert/v0/bids/recommendations", token,
+                params={"nmId": nm, "advertId": aid}, what=f"Рекомендованные ставки {nm}") or {}
+    progress(" " * 60)
+    if not _rec_fresh:   # первый ответ за запуск сохраняем как образец (токенов в нём нет)
+        with _file_lock:
+            try:
+                REC_SAMPLE.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+            except OSError:
+                pass
+    data = data if isinstance(data, dict) else {}
+    if data:                    # пустой ответ (ошибка, лимит) не запоминаем — следующий запуск спросит снова
+        _rec_fresh[f"{aid}:{nm}"] = {"at": dt.datetime.now().isoformat(timespec="seconds"), "data": data}
+    return data
+
+
 def get_rec(token, aid, nm):
-    if (aid, nm) not in _rec_cache:
-        hit = _rec_disk_load().get(f"{aid}:{nm}") or {}
-        try:
-            age = (dt.datetime.now() - dt.datetime.fromisoformat(hit.get("at") or "")).total_seconds() / 60
-        except ValueError:
-            age = None
-        if age is not None and 0 <= age < REC_CACHE_MIN and isinstance(hit.get("data"), dict) and hit["data"]:
-            _rec_cache[(aid, nm)] = hit["data"]          # свежий ответ из прошлого запуска (стража или автопилота)
-            return _rec_cache[(aid, nm)]
-        progress(f"    рекомендации WB: {len(_rec_cache) + 1}-й товар…")
-        cab_ = getattr(_tl, "cab", None)
-        REC_COUNT[cab_] = REC_COUNT.get(cab_, 0) + 1
-        pace_burst(token, "rec", REC_INTERVAL, REC_BURST)
-        data = call("GET", ADV + "/api/advert/v0/bids/recommendations", token,
-                    params={"nmId": nm, "advertId": aid}, what=f"Рекомендованные ставки {nm}") or {}
-        progress(" " * 60)
-        if not _rec_fresh:   # первый ответ за запуск сохраняем как образец (токенов в нём нет)
-            with _file_lock:
-                try:
-                    REC_SAMPLE.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
-                except OSError:
-                    pass
-        _rec_cache[(aid, nm)] = data if isinstance(data, dict) else {}
-        if _rec_cache[(aid, nm)]:   # пустой ответ (ошибка, лимит) не запоминаем — следующий запуск спросит снова
-            _rec_fresh[f"{aid}:{nm}"] = {"at": dt.datetime.now().isoformat(timespec="seconds"), "data": _rec_cache[(aid, nm)]}
-    return _rec_cache[(aid, nm)]
+    """Рекомендация WB по товару кампании. Безопасно из нескольких потоков: если этот товар уже запрашивает фоновая
+    подгрузка (start_rec_prefetch), ждёт её ответа, а не спрашивает второй раз."""
+    key = (aid, nm)
+    if not getattr(_tl, "prefetch", False):
+        _rec_main.add(getattr(_tl, "cab", None))       # основной расчёт дошёл до рекомендаций — фон больше не нужен
+    while True:
+        with _rec_lock:
+            if key in _rec_cache:
+                return _rec_cache[key]
+            ev = _rec_inflight.get(key)
+            if ev is None:
+                ev = _rec_inflight[key] = threading.Event()
+                break
+        ev.wait(180)                 # ответ придёт в другом потоке; не пришёл (ошибка) — спрошу сам на следующем круге
+    try:
+        _rec_cache[key] = _fetch_rec(token, aid, nm)
+    finally:
+        with _rec_lock:
+            _rec_inflight.pop(key, None)
+        ev.set()
+    return _rec_cache[key]
+
+
+def start_rec_prefetch(cab, token, pairs):
+    """Пока основной расчёт кабинета грузит выкуп, размеры (WB отдаёт их по одному товару раз в 20 с — у Яворской
+    ≈10 мин), настройки и статистику запросов, рекомендации WB (у них свой лимит) уже запрашиваются в фоне — по
+    порядку, в каком понадобятся. Как только расчёт сам дошёл до рекомендаций, фон останавливается: дальше лимит
+    у них общий, и быстрее от второго потока не станет. Ошибку фона не показываю — расчёт спросит товар сам и сообщит."""
+    if not pairs:
+        return
+
+    def worker():
+        _tl.buf, _tl.session, _tl.cab, _tl.prefetch = [], requests.Session(), cab, True
+        for aid, nm in pairs:
+            if cab in _rec_main:
+                break
+            try:
+                get_rec(token, aid, nm)
+            except Exception:       # noqa: BLE001 — см. описание
+                pass
+    threading.Thread(target=worker, daemon=True).start()
 
 
 def _kop(v):
@@ -1380,6 +1427,7 @@ def overlap_warning(camps):
 
 def plan_cabinet(cab, token, rules, state):
     _tl.cab = cab                           # для data_problem: в каком кабинете сбой
+    _rec_main.discard(cab)
     log(f"\n══════════ {cab} ══════════")
     plan = {"bids": [], "cluster_bids": [], "minus": [], "limits": [], "trim": [], "untrim": [], "topup": []}
     camps = get_campaigns(token)
@@ -1472,6 +1520,22 @@ def plan_cabinet(cab, token, rules, state):
     def no_stock(nm):
         q = available((stock or {}).get(nm))
         return q is not None and q <= 0
+
+    # рекомендации WB — в фоне, пока грузятся выкуп, размеры и статистика запросов (свой лимит у каждого метода);
+    # те же товары и тот же порядок, что ниже в расчёте ставок: без «нет в наличии», убираемых по малому остатку
+    # и кампаний с минимальной ставкой
+    pre = []
+    for cid in sorted(todo, key=lambda c: 0 if todo[c]["cluster_bids"] else 1):
+        r_ = todo[cid]
+        if r_["base_bid"] == "min":
+            continue
+        nms_ = nms_of[cid]
+        if r_.get("min_stock") and stock is not None:
+            low_ = {nm for nm in nms_ if available(stock.get(nm)) is not None and available(stock.get(nm)) < r_["min_stock"]}
+            if len(low_) < len(nms_):
+                nms_ = [nm for nm in nms_ if nm not in low_]
+        pre += [(cid, nm) for nm in nms_ if not no_stock(nm)]
+    start_rec_prefetch(cab, token, pre)
 
     # с какого дня товар непрерывно в наличии (WB + FBS) (для автоминуса). Меняется только в памяти —
     # в wb_bids_state.json попадает лишь при --apply; пробный прогон ничего не записывает.
@@ -2102,6 +2166,7 @@ def plan_cabinet(cab, token, rules, state):
             "а не в ставке; ставку таким товарам не повышаю):")
         for c in check_card:
             log(f"    • {c}")
+    _rec_main.add(cab)                  # фоновая подгрузка рекомендаций этого кабинета больше не нужна
     return plan
 
 
@@ -2733,7 +2798,8 @@ def main():
     UNIT_LIMITS.update(load_unit_limits())
     if UNIT_LIMITS:
         log(f"Юнит-экономика: лимиты цены заказа для {len(UNIT_LIMITS)} товаров (wb_unit_economics.csv).")
-    print("Рекомендации WB отдаёт по одному товару: 5 сразу, дальше раз в 12 секунд (свежие — из прошлого запуска).")
+    print("Рекомендации WB отдаёт по одному товару: 5 сразу, дальше раз в 12 секунд (свежие — из прошлого запуска; "
+          "пока грузятся остатки и размеры — уже в фоне).")
     plan = {"bids": [], "cluster_bids": [], "minus": [], "limits": [], "trim": [], "untrim": [], "topup": []}
     jobs = []
     for cab, rules in RULES.items():

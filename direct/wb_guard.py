@@ -109,6 +109,7 @@ def plan_topups(cab, token, camps, state):
         if live is None:
             log(f"  «{t['name']}»: в RULES wb_bids.py пополнение этой кампании больше не задано — не пополняю.")
             continue
+        raised = any(live[k] > t[k] for k in ("amount", "day_cap", "week_cap"))   # потолки в RULES подняли после --apply
         for k in ("below", "amount", "day_cap", "week_cap"):
             t[k] = min(t[k], live[k])
         B.note_broken_topups(state, cid, t["name"])
@@ -137,7 +138,9 @@ def plan_topups(cab, token, camps, state):
         if not amount:
             log(f"  ! «{t['name']}»: бюджет {B.fm_rub(bud)} ₽, но до потолка пополнений меньше {t.get('min_deposit') or B.MIN_DEPOSIT:.0f} ₽ "
                 "(меньше WB не принимает) — не пополняю"
-                + (" (кампания стоит на паузе)" if paused else ""))
+                + (" (кампания стоит на паузе)" if paused else "")
+                + (". Потолки в RULES с последнего запуска автопилота с --apply подняли — проверка берёт меньшие, "
+                   "пока автопилот их не применит (по расписанию 8:00, 13:00, 18:00)" if raised else ""))
             continue
         res.append({"cabinet": cab, "advert_id": cid, "name": t["name"], "amount": amount, "source": t["source"],
                     "budget_before": bud, "start": paused, "enough": t["below"]})
