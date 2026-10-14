@@ -51,6 +51,8 @@ REC_MAX_OTHER = 15
 CAPS_MAX_AGE_HOURS = 48     # потолки из wb_bids.py старше — не доверяю, ничего не меняю
 # -------------------------------------------
 
+SPEND_LOG = B.HERE / "wb_spend_hourly.csv"   # расход кампаний по часам (только запись наблюдений; см. wb_pacing.py)
+SNAPSHOTS = {}                                # {кабинет: [строки]} — заполняется в потоках кабинетов
 BACKUP_DIR = B.HERE / "wb_guard_backups"
 LOG_FILE = B.HERE / "wb_guard_log.txt"
 log = B.log
@@ -104,6 +106,45 @@ def plan_topups(cab, token, camps, state):
     return res
 
 
+def spend_snapshot(cab, token, camps):
+    """Снимок «сколько потрачено к этому часу»: бюджет каждой активной / на паузе кампании и, у кампаний за клики,
+    потрачено сегодня и дневной лимит. Только чтение — два запроса на кабинет. Для оценки равномерного расхода."""
+    ids = [cid for cid, a in camps.items() if a.get("_status") in (9, 11)]
+    if not ids:
+        return []
+    buds = B.get_budgets(token, ids)
+    cpc = [cid for cid in ids if (camps[cid].get("settings") or {}).get("payment_type") == "cpc"]
+    try:
+        lims = B.get_limits(token, cpc) if cpc else {}
+    except B.ApiError:
+        lims = {}
+    now = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+    rows = []
+    for cid in ids:
+        st = camps[cid].get("settings") or {}
+        lim = lims.get(cid) or {}
+        rows.append({"время": now, "кабинет": cab, "кампания": cid, "название": st.get("name") or "",
+                     "оплата": st.get("payment_type") or "", "статус": camps[cid].get("_status"),
+                     "бюджет ₽": buds.get(cid, ""),
+                     "потрачено сегодня ₽": B.num(lim.get("spentToday")) / 100 if lim.get("spentToday") is not None else "",
+                     "дневной лимит ₽": B.num(lim.get("dailyLimit")) / 100 if lim.get("enabled") else ""})
+    return rows
+
+
+def write_spend_log(rows):
+    import csv
+    new = not SPEND_LOG.exists()
+    try:
+        with open(SPEND_LOG, "a", encoding="utf-8-sig" if new else "utf-8", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(rows[0]), delimiter=";")
+            if new:
+                w.writeheader()
+            for r in rows:
+                w.writerow({k: (str(v).replace(".", ",") if isinstance(v, float) else v) for k, v in r.items()})
+    except OSError as e:
+        log(f"  ! Расход по часам не записан: {e}")
+
+
 def plan_cabinet(cab, token, caps, state, budget):
     """Возвращает (изменения, «минимум выше окупаемого», сверено, пополнения). budget — сколько ещё товаров
     можно сверить с рекомендацией."""
@@ -112,6 +153,10 @@ def plan_cabinet(cab, token, caps, state, budget):
         cid, nm = key.split(":")
         by_c[int(cid)][int(nm)] = zones
     camps = B.get_campaigns(token)
+    try:
+        SNAPSHOTS[cab] = spend_snapshot(cab, token, camps)
+    except B.ApiError as e:
+        log(f"  ! {cab}: снимок расхода не получен — {e}")
     topups = plan_topups(cab, token, camps, state)
     cand = []                          # (кампания, товар, зона, данные кампании) — только активные кампании
     for cid, items in by_c.items():
@@ -256,6 +301,9 @@ def run(cabs, apply):
                                                            REC_MAX_BY_CAB.get(cab, REC_MAX_OTHER)))
             for cab, token in cabs.items()]
     results = B.run_parallel(jobs)
+    snap = [r for cab, _ in jobs for r in SNAPSHOTS.get(cab, [])]
+    if snap:
+        write_spend_log(snap)
     for cab, _ in jobs:
         kind, res = results[cab]
         if kind == "err":
