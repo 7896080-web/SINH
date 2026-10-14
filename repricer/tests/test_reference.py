@@ -130,7 +130,8 @@ def test_return_raising_price_more_than_50_percent_is_attention_not_a_send(db):
     st, wb = _run(db)
     assert st["restored"] == 0 and st["eaten"] == 1 and wb.calls == []
     from priceapp.models import AuditLog
-    assert "НЕ возвращено" in db.query(AuditLog).filter_by(action="reference_big").one().details
+    details = db.query(AuditLog).filter_by(action="reference_big").one().details
+    assert "НЕ возвращено" in details and "на 50%" in details               # не «5E+1%»
     settings.put(db, settings.REF_MAX_RAISE_PERCENT, "150")
     db.commit()
     assert _run(db)[0]["restored"] == 1

@@ -231,7 +231,7 @@ def run(db: Session, product_rows=None, actor: str = "программа", clien
             PriceChange.status == PriceChangeStatus.approved.value)}
         revalued = 0
         cards: dict[str, dict] = {}
-        big: list[str] = []
+        big: dict[str, str] = {}                 # по карточке: строка на каждый размер повторяла бы одно и то же
         for r in product_rows(db, a):
             ref = refs.get(r["item_id"])
             if ref is None:
@@ -254,7 +254,7 @@ def run(db: Session, product_rows=None, actor: str = "программа", clien
             if kind is None or not nm:
                 continue
             if kind == "big":
-                big.append(f"{nm}: {r.get('current_sale')} -> {ref_sale(ref)}")
+                big.setdefault(nm, f"{nm}: {r.get('current_sale')} -> {ref_sale(ref)}")
                 continue
             c = cards.get(nm)
             if c is None or ref.ref_price > c["ref"].ref_price:
@@ -263,8 +263,8 @@ def run(db: Session, product_rows=None, actor: str = "программа", clien
         st["eaten"] += len(big)
         if big:
             audit.log(db, actor, "reference_big", a.name,
-                      f"эталон выше нынешней цены после скидки больше чем на {max_raise.normalize()}% — НЕ возвращено, "
-                      f"проверьте эталон ({len(big)}): " + "; ".join(big[:20]))
+                      f"эталон выше нынешней цены после скидки больше чем на {format(max_raise.normalize(), 'f')}% — НЕ возвращено, "
+                      f"проверьте эталон ({len(big)}): " + "; ".join(list(big.values())[:20]))
         restored = _send(db, a, cards, client_factory, st, actor) if cards else 0
         st["restored"] += restored
         if revalued:
