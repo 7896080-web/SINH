@@ -238,6 +238,31 @@ PRIOR_CTR, K_VIEWS = 0.03, 1000     # CTR в поиске по умолчани�
 ADV = "https://advert-api.wildberries.ru"
 ANA = "https://seller-analytics-api.wildberries.ru"
 HERE = Path(__file__).resolve().parent
+BUDGET_OVERRIDES = HERE / "wb_budget_overrides.json"   # лимиты, поднятые wb_budget.py --apply (поверх RULES)
+BUDGET_KEYS = ("daily_limit", "topup_day_cap", "topup_week_cap")
+
+
+def apply_budget_overrides(rules):
+    """Поднятые wb_budget.py лимиты — поверх RULES. Только эти ключи; правило кампании, которой в RULES нет явно
+    (идёт по «*»), создаётся и наследует «*». Файла нет или он испорчен — RULES как есть."""
+    try:
+        d = json.loads(BUDGET_OVERRIDES.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    for cab, items in (d.get("items") or {}).items():
+        if cab not in rules or not isinstance(items, dict):
+            continue
+        for key, ov in items.items():
+            if key == "_week_budget":
+                if isinstance(ov, (int, float)):
+                    rules[cab]["_week_budget"] = ov
+            elif isinstance(ov, dict):
+                rules[cab].setdefault(key, {}).update({k: v for k, v in ov.items() if k in BUDGET_KEYS})
+    return d
+
+
+RULES_BASE = json.loads(json.dumps(RULES))     # RULES без поднятых wb_budget.py лимитов (для сравнения и отката)
+BUDGET_OV = apply_budget_overrides(RULES)
 TOKENS_FILE = HERE / "wb_tokens.txt"
 BACKUP_DIR = HERE / "wb_bids_backups"
 STATE_FILE = HERE / "wb_bids_state.json"
@@ -804,7 +829,7 @@ def nm_stats(token, ids):
             for day in item.get("days") or []:
                 for app in day.get("apps") or []:
                     for n in app.get("nms") or []:
-                        for k in ("views", "clicks", "orders", "sum"):
+                        for k in ("views", "clicks", "orders", "sum", "sum_price"):
                             cn[(aid, n.get("nmId"))][k] += num(n.get(k))
     return cn
 
@@ -1314,8 +1339,8 @@ def plan_cabinet(cab, token, rules, state):
         if pay == "cpc" and r.get("pacing", True) and lims_all:
             lm = lims_all.get(cid) or {}
             if lm.get("enabled") and lm.get("spentToday") is not None:
-                # лимит — тот, что будет после этого запуска: автопилот поднимает его до правила и никогда не снижает
-                lim_rub = max(num(lm.get("dailyLimit")) / 100, r.get("daily_limit") or 0)
+                # лимит — тот, что будет после этого запуска: автопилот ставит лимит из правила (если он задан)
+                lim_rub = r.get("daily_limit") or num(lm.get("dailyLimit")) / 100
                 pace_m, pace_why = pace_factor(cid, num(lm["spentToday"]) / 100, lim_rub)
         pace_prev = ((state.get("pacing") or {}).get(str(cid)) or {})
         pace_prev = pace_prev.get("m", 1.0) if pace_prev.get("date") == dt.date.today().isoformat() else 1.0
@@ -1996,21 +2021,26 @@ def note_broken_topups(state, cid, name):
                 "прошло (учтено в потолках). Проверьте бюджет кампании в кабинете WB.")
 
 
+def live_rule(cab, cid, camps):
+    """Правило кампании по RULES прямо сейчас (с DEFAULTS и «*»), или None — кампании в правилах нет."""
+    rules = RULES.get(cab) or {}
+    today = dt.date.today().isoformat()
+    for k, v in rules.items():
+        if k == "*" or k.startswith("_") or (v.get("until") and today > v["until"]):
+            continue
+        if cid in find(camps, k):
+            return {**DEFAULTS, **rules.get("*", {}), **v}
+    if "*" in rules and cid not in {c for k in rules.get("_except") or [] for c in find(camps, k)}:
+        return dict(DEFAULTS, **rules["*"])
+    return None
+
+
 def live_topup(cab, cid, camps):
     """Правила пополнения кампании по RULES в этом файле прямо сейчас. Страж берёт правила из последнего --apply
     автопилота (до 14 ч назад) — уменьшенный вами потолок без этой сверки до того бы не действовал.
     None — кампании в правилах больше нет или пополнение у неё выключено."""
     rules = RULES.get(cab) or {}
-    today = dt.date.today().isoformat()
-    r = None
-    for k, v in rules.items():
-        if k == "*" or k.startswith("_") or (v.get("until") and today > v["until"]):
-            continue
-        if cid in find(camps, k):
-            r = {**DEFAULTS, **rules.get("*", {}), **v}
-            break
-    if r is None and "*" in rules and cid not in {c for k in rules.get("_except") or [] for c in find(camps, k)}:
-        r = dict(DEFAULTS, **rules["*"])
+    r = live_rule(cab, cid, camps)
     if not r or not r.get("topup_below"):
         return None
     return {"below": r["topup_below"], "amount": r["topup_amount"], "day_cap": r["topup_day_cap"],
