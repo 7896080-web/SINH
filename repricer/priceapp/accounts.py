@@ -9,9 +9,25 @@ from priceapp.models import Account, ApiCredential, PlatformItem
 from priceapp.timeutils import now_utc
 
 
-def credentials(db: Session, account: Account) -> dict[str, str]:
-    return {c.field_name: decrypt_value(c.encrypted_value)
-            for c in db.query(ApiCredential).filter(ApiCredential.account_id == account.id)}
+UNREADABLE = "не расшифрован — впишите ключ заново"
+
+
+def credentials(db: Session, account: Account, strict: bool = True) -> dict[str, str]:
+    """Ключи кабинета. Сменился `REPRICER_SECRETS_KEY` (перенос базы, новый .env) — старые
+    ключи не расшифровать: `strict` даёт понятную ошибку с именем кабинета (у `InvalidToken`
+    текста нет вовсе, и в журнале оставалось «WB: »), иначе — пометка вместо значения, чтобы
+    страница «API-ключи» открылась и ключи можно было вписать заново (раньше — 500)."""
+    from cryptography.fernet import InvalidToken
+    out = {}
+    for c in db.query(ApiCredential).filter(ApiCredential.account_id == account.id):
+        try:
+            out[c.field_name] = decrypt_value(c.encrypted_value)
+        except InvalidToken:
+            if strict:
+                raise RuntimeError(f"{account.name}: ключ «{c.field_name}» {UNREADABLE} на странице «API-ключи» "
+                                   "(сменился REPRICER_SECRETS_KEY)") from None
+            out[c.field_name] = UNREADABLE
+    return out
 
 
 def set_credential(db: Session, account: Account, field: str, value: str) -> bool:

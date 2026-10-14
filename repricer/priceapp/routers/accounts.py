@@ -31,8 +31,9 @@ def _back():
 def page(request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     rows = []
     for a in db.query(Account).order_by(Account.platform, Account.name):
-        creds = acc_mod.credentials(db, a)
-        rows.append({"account": a, "fields": [(f, label, mask_value(creds.get(f, "")))
+        creds = acc_mod.credentials(db, a, strict=False)
+        rows.append({"account": a, "fields": [(f, label, creds.get(f, "") if creds.get(f) == acc_mod.UNREADABLE
+                                                else mask_value(creds.get(f, "")))
                                                for f, label in platforms.CREDENTIAL_FIELDS[a.platform]],
                      "items": db.query(PlatformItem).filter(PlatformItem.account_id == a.id).count()})
     return render(request, "accounts.html", user, "accounts", rows=rows, platforms=platforms.PLATFORMS)

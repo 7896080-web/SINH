@@ -270,7 +270,9 @@ function bulkConfirm() {
   <td class="num {{ 'bad' if c.markup_rub is not none and c.markup_rub < 0 else '' }}">{{ c.markup_rub|money }} ₽<div class="muted">маржин. {{ c.markup_coef|money }}</div></td>
   <td><span class="badge {{ 'ok' if c.status == 'sent' else ('bad' if c.status in ('blocked','error') else 'warn') }}">{{ status_labels[c.status] }}</span>
     {% if c.block_reason %}<div class="muted">{{ block_labels[c.block_reason] }}</div>{% endif %}
-    {% if c.note %}<div class="muted">{{ c.note }}</div>{% endif %}{% if c.last_error %}<div class="muted">{{ c.last_error }}</div>{% endif %}</td>
+    {% if c.note %}<div class="muted">{{ c.note }}</div>{% endif %}{% if c.last_error %}<div class="muted">{{ c.last_error }}</div>{% endif %}
+    {% if view == 'log' and c.status == 'approved' %}<form method="post" action="/prices/reject" style="display:inline"><input type="hidden" name="ids" value="{{ c.id }}"><input type="hidden" name="back" value="log">
+      <button class="secondary" style="padding:1px 6px;font-size:12px" title="Цена ещё не ушла — снять её из очереди" onclick="return confirm('Отменить отправку этой цены? На площадке останется нынешняя.')">отменить</button></form>{% endif %}</td>
   {% if view == 'log' %}<td class="muted">{{ (c.sent_at or c.decided_at or c.created_at)|local('%d.%m %H:%M') }}{% if c.decided_by %}<br>{{ c.decided_by }}{% endif %}</td>{% endif %}
 </tr>{% endfor %}
 </table></div>

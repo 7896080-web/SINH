@@ -81,12 +81,12 @@ print("DONE", written, "of", len(FILES))
 PS = r'''# ===== {tag}: патч репрайсера для C:\repricer =====
 # Запуск файлом:
 #   powershell -ExecutionPolicy Bypass -File C:\repricer\{tag}_patch.ps1
-# Потом:
-#   powershell -ExecutionPolicy Bypass -File C:\repricer\deploy\update_workstation.ps1
+# Потом (от администратора):
+#   powershell -ExecutionPolicy Bypass -File C:\repricer\deploy\update_server.ps1 -Tag {tag}
 param([string]$Root = "C:\repricer", [switch]$Force)
 $ErrorActionPreference = "Stop"
 $py = Join-Path $Root ".venv\Scripts\python.exe"
-if (-not (Test-Path $py)) {{ Write-Host "Нет $py — сначала install_workstation.ps1" -ForegroundColor Red; exit 1 }}
+if (-not (Test-Path $py)) {{ Write-Host "Нет $py — сначала install_server.ps1" -ForegroundColor Red; exit 1 }}
 $b = @'
 {body}
 '@ -replace "\s",""
@@ -101,7 +101,7 @@ if ($LASTEXITCODE -ne 0) {{ Write-Host "Не удалось распаковат
 if ($Force) {{ & $py $apply $Root --force }} else {{ & $py $apply $Root }}
 if ($LASTEXITCODE -ne 0) {{ Write-Host "Патч НЕ применён — файлы не изменены" -ForegroundColor Red; Remove-Item $b64, $apply -ErrorAction SilentlyContinue; exit 1 }}
 Remove-Item $b64, $apply -ErrorAction SilentlyContinue
-Write-Host "Патч {tag} применён. Теперь: на сервере deploy\update_server.ps1 (от администратора), на офисном компьютере deploy\update_workstation.ps1" -ForegroundColor Green
+Write-Host "Патч {tag} применён. Теперь от администратора: powershell -ExecutionPolicy Bypass -File $Root\deploy\update_server.ps1 -Tag {tag}" -ForegroundColor Green
 '''
 
 

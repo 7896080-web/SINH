@@ -294,7 +294,7 @@ def run(db: Session, client_factory=None) -> dict:
         try:
             client = accounts.client_for(db, account, client_factory)
         except Exception as e:
-            stats[account.name] = {"error": str(e)}
+            stats[account.name] = {"error": str(e) or type(e).__name__}
             continue
         try:
             stats[account.name] = run_account(db, account, client)

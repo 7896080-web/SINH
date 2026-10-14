@@ -678,6 +678,12 @@ def send(request: Request, form=Depends(posted_form), db: Session = Depends(get_
                 # сменила после нас, не исправлялась бы никогда.
                 if d.new_price == (c["current"] if c["current"] else c["last_sent"]):
                     same += 1
+                    # Цена и так стоит — но прежнее решение в очереди её бы сменило: человек
+                    # передал «оставить как есть», и это решение главнее (аудит 14.10).
+                    for old in earlier.pop((r["item_id"], acc.id), []):
+                        old.status = PriceChangeStatus.rejected.value
+                        old.note = "снято передачей со страницы «Цены товаров»: цена уже стоит на площадке"
+                        superseded += 1
                     continue
                 for old in earlier.pop((r["item_id"], acc.id), []):
                     old.status = PriceChangeStatus.rejected.value

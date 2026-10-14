@@ -1,7 +1,8 @@
 """Копия базы — штатным механизмом SQLite на живой базе, с проверкой чтением.
 
 Компьютер выключают на ночь, поэтому копия снимается через 10 минут после
-запуска и не чаще раза в сутки. Хранится 14 последних. Ключ шифрования
+запуска и не чаще раза в сутки. Хранится всё за последние сутки и по копии на день
+за 14 дней (`names_to_drop`). Ключ шифрования
 (REPRICER_SECRETS_KEY) в копию не попадает и храниться рядом с ней не должен.
 """
 from __future__ import annotations
@@ -14,8 +15,33 @@ from priceapp import config
 from priceapp.database import DATABASE_URL
 
 MIN_GAP = timedelta(hours=20)
-KEEP = 14
+KEEP = 14                       # календарных дней: по копии на день
+KEEP_ALL_WITHIN = timedelta(hours=24)
 PREFIX = "repricer-"
+
+
+def names_to_drop(files: list[Path], now: datetime | None = None) -> list[Path]:
+    """Что удалить: всё моложе суток не трогаем (копию снимает и накат, а отменять обычно
+    хотят ровно то, что сделали только что); старше — по ОДНОЙ на календарный день, последнюю
+    за день, за `KEEP` дней. «14 последних файлов» при частых накатах вытесняли суточные
+    копии за два-три дня (аудит 14.10). Файл с неразборчивым именем не трогаем никогда —
+    его мог положить человек."""
+    now = now or datetime.now()
+    by_day: dict[str, list[tuple[datetime, Path]]] = {}
+    for f in files:
+        try:
+            t = datetime.strptime(f.stem[len(PREFIX):], "%Y%m%d-%H%M%S")
+        except ValueError:
+            continue
+        if now - t < KEEP_ALL_WITHIN:
+            continue
+        by_day.setdefault(t.strftime("%Y%m%d"), []).append((t, f))
+    drop = []
+    days = sorted(by_day, reverse=True)
+    for i, day in enumerate(days):
+        kept = sorted(by_day[day])
+        drop += [f for _, f in (kept if i >= KEEP else kept[:-1])]
+    return drop
 
 
 def _db_path() -> Path | None:
@@ -28,7 +54,8 @@ def last_backup() -> datetime | None:
     files = sorted(config.BACKUP_DIR.glob(f"{PREFIX}*.db")) if config.BACKUP_DIR.exists() else []
     if not files:
         return None
-    return datetime.fromtimestamp(files[-1].stat().st_mtime, tz=timezone.utc).replace(tzinfo=None)
+    newest = max(f.stat().st_mtime for f in files)      # не «последний по имени»: имя бывает ручным
+    return datetime.fromtimestamp(newest, tz=timezone.utc).replace(tzinfo=None)
 
 
 def make_backup() -> str:
@@ -57,6 +84,6 @@ def make_backup() -> str:
         tmp.rename(tmp.with_suffix(".bad"))
         return f"копия не прошла проверку: {ok}"
     tmp.rename(dst)
-    for old in sorted(config.BACKUP_DIR.glob(f"{PREFIX}*.db"))[:-KEEP]:
+    for old in names_to_drop(sorted(config.BACKUP_DIR.glob(f"{PREFIX}*.db"))):
         old.unlink(missing_ok=True)
     return ""
