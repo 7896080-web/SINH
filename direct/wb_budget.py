@@ -124,7 +124,7 @@ def starved_days(days, pay):
             continue
         seen += 1
         out = None
-        if pay == "cpc":
+        if pay == "cpc" or any(f(r.get("дневной лимит ₽")) for _, r in rows):    # за показы — свой лимит (пауза)
             for h, r in rows:
                 s_, lim = f(r.get("потрачено сегодня ₽")), f(r.get("дневной лимит ₽"))
                 if s_ is not None and lim and s_ >= lim * 0.97:
