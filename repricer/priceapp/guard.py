@@ -26,7 +26,7 @@ from sqlalchemy.orm import Session
 
 from priceapp import audit, rates
 from priceapp.models import Account, PriceChange, PriceChangeStatus
-from priceapp.pricing import BLOCK_FLOOR, OPEN, _dec
+from priceapp.pricing import OPEN, _dec
 from priceapp.timeutils import now_utc
 
 SOURCE = "guard"
@@ -42,8 +42,10 @@ def classify(r: dict, a: Account) -> str | None:
         if r.get("last_sent") and r.get("current") == r["last_sent"]:
             return "eaten"
         price, new_m = r.get("price"), r.get("markup_coef")
+        # Ни пол, ни лимит шага: заблокированное расчётом без человека не уходит никогда —
+        # опечатка в наценке иначе ушла бы на площадку ценой в разы выше.
         if (price and r.get("current") and price > r["current"] and new_m is not None and new_m >= lo
-                and r.get("block_reason") != BLOCK_FLOOR):
+                and not r.get("block_reason")):
             return "below"
         return "stuck"
     if a.guard_max_margin is not None and m > _dec(a.guard_max_margin):
@@ -64,8 +66,8 @@ def run(db: Session, product_rows=None, actor: str = "программа") -> di
     rate = rates.current(db)
     now = now_utc()
     for a in db.query(Account).filter(Account.is_active.is_(True)).all():
-        if a.guard_min_margin is None and a.guard_max_margin is None:
-            continue
+        if (a.guard_min_margin is None and a.guard_max_margin is None) or a.platform == "lamoda":
+            continue                      # Ламоде цену ставит страница «Эталонные цены»
         st["accounts"] += 1
         busy = {i for (i,) in db.query(PriceChange.item_id).filter(
             PriceChange.account_id == a.id, PriceChange.is_test.is_(False),
@@ -103,8 +105,8 @@ def preview(db: Session, product_rows=None) -> dict:
         from priceapp.routers.prices import product_rows
     st = {"restored": 0, "eaten": 0, "stuck": 0, "above": 0, "accounts": 0}
     for a in db.query(Account).filter(Account.is_active.is_(True)).all():
-        if a.guard_min_margin is None and a.guard_max_margin is None:
-            continue
+        if (a.guard_min_margin is None and a.guard_max_margin is None) or a.platform == "lamoda":
+            continue                      # Ламоде цену ставит страница «Эталонные цены»
         st["accounts"] += 1
         for r in product_rows(db, a):
             kind = classify(r, a)

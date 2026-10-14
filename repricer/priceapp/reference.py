@@ -258,7 +258,8 @@ def run(db: Session, product_rows=None, actor: str = "программа", clien
                 continue
             c = cards.get(nm)
             if c is None or ref.ref_price > c["ref"].ref_price:
-                cards[nm] = {"ref": ref, "cur": r.get("current_sale")}
+                cards[nm] = {"ref": ref, "cur": r.get("current_sale"), "items": c["items"] if c else set()}
+            cards[nm]["items"].add(r["item_id"])
         st["revalued"] += revalued
         st["eaten"] += len(big)
         if big:
@@ -299,8 +300,11 @@ def _send(db: Session, a: Account, cards: dict, client_factory, st: dict, actor:
             st["errors"].append(f"{a.name}: {data.get('errorText') or 'WB вернул error=true'}"[:200])
             continue
         done += chunk
+    from priceapp.dispatch import _record_sent
     for nm, c in done:
         price, d = int(c["ref"].ref_price), ref_discount_int(c["ref"])
+        for item_id in c.get("items", ()):
+            _record_sent(db, item_id, a.id, price)   # цена наша — диапазон безопасности не должен её «возвращать»
         for it in db.query(PlatformItem).filter(PlatformItem.account_id == a.id,
                                                 PlatformItem.external_id.like(f"{nm}:%")):
             it.current_price = price

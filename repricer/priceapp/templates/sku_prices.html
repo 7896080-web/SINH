@@ -28,7 +28,7 @@
 
 <div class="row saved-filters" style="margin-bottom:10px">
   {% for sf in saved_filters %}<span class="chip"><a href="{{ sf.url }}">{{ sf.name }}</a>
-    <form method="post" action="/filters/{{ sf.id }}/delete" style="display:inline"><button class="chip-x" title="Удалить отбор" onclick="return confirm('Удалить отбор «{{ sf.name }}»?')">×</button></form></span>{% endfor %}
+    <form method="post" action="/filters/{{ sf.id }}/delete" style="display:inline"><button class="chip-x" title="Удалить отбор" onclick="return confirm('Удалить отбор «{{ sf.name|js }}»?')">×</button></form></span>{% endfor %}
   {% if sc %}<form method="post" action="/filters/save" class="row" style="gap:6px">
     <input type="hidden" name="url" value="{{ current_url }}">
     <input name="name" placeholder="имя отбора" style="width:160px" required>
@@ -77,13 +77,13 @@
     <div class="row">
       <label style="flex-direction:row;gap:6px;align-items:center"><input type="checkbox" name="all_filtered" value="1" id="all-filtered"> весь отбор — {{ total }} {{ 'кат.' if by == 'category' else 'арт.' }}</label>
       <label>1. Наценка {{ 'категории' if by == 'category' else 'артикула' }}<select name="action">{% for k, v in actions.items() %}<option value="{{ k }}">{{ v }}</option>{% endfor %}</select></label>
-      <label>вид<select name="kind">{% for k, v in kinds.items() %}<option value="{{ k }}" {% if (by == 'category') == (k == KIND_MARGIN) %}selected{% endif %}>{{ v }}</option>{% endfor %}</select></label>
+      <label>вид<select name="kind">{% for k, v in kinds.items() %}<option value="{{ k }}" {% if k == (KIND_MARGIN if by == 'category' else 'coef') %}selected{% endif %}>{{ v }}</option>{% endfor %}</select></label>
       <label>значение<input name="value" inputmode="decimal" style="width:70px" placeholder="{{ '1,8' if by == 'category' else '2,5' }}"></label>
       <button type="submit" onclick="return selConfirm('bulk', 'Установить наценку', '{{ 'категорий' if by == 'category' else 'артикулов' }} (все их размеры)', true)">Установить</button>
       <span style="width:16px"></span>
       {% if sc.platform == 'lamoda' %}<span class="warn">Передать на Ламоду отсюда нельзя — цены Ламоды ставит <code>lamoda_apply.py</code>.</span>{% else %}
       <label style="flex-direction:row;gap:6px;align-items:center"><input type="checkbox" name="confirm_large" value="1"> включая изменения больше лимита</label>
-      <button type="submit" formaction="/sku-prices/send" data-sel-clear onclick="return selConfirm('bulk', 'ПЕРЕДАТЬ НОВЫЕ ЦЕНЫ на площадку «{{ sc.label }}»', '{{ 'категорий' if by == 'category' else 'артикулов' }} (все их размеры)', true)">2. Передать на площадки</button>{% endif %}
+      <button type="submit" formaction="/sku-prices/send" data-sel-clear onclick="return selConfirm('bulk', 'ПЕРЕДАТЬ НОВЫЕ ЦЕНЫ на площадку «{{ sc.label|js }}»', '{{ 'категорий' if by == 'category' else 'артикулов' }} (все их размеры)', true)">2. Передать на площадки</button>{% endif %}
     </div>
     <div class="row" style="margin-top:6px"><span class="sel-count muted" data-for="bulk"></span>
       <button type="button" class="secondary sel-clear" data-for="bulk" style="padding:2px 8px;font-size:12px">Снять отметки</button></div>
@@ -105,20 +105,20 @@
   {% if by == 'category' %}
   <td class="art"><b>{{ g.key }}</b><div class="muted">{{ g.articles|length }} арт. · {{ g.rows|length }} разм.</div></td>
   <td class="num">{{ g.commission }}<div class="muted">{{ 'по тарифу' if g.tariff_known else 'из правила' }}</div></td>
-  <td class="mk">{% if g.key != '(без категории)' %}<select form="row{{ n }}" name="kind" class="kind">{% for k, v in kinds.items() %}<option value="{{ k }}" {% if (g.own_kind or KIND_MARGIN) == k %}selected{% endif %}>{{ 'маржинальность' if k == KIND_MARGIN else '× от базовой' }}</option>{% endfor %}</select><input form="row{{ n }}" name="value" value="{{ ru(g.own_value) if g.own_value is not none else '' }}" placeholder="—" inputmode="decimal" style="width:56px"><button form="row{{ n }}" class="secondary" style="padding:4px 8px">ok</button>{% endif %}
+  <td class="mk">{% if g.key != '(без категории)' %}<select form="row{{ n }}" name="kind" class="kind">{% for k, v in kinds.items() %}<option value="{{ k }}" {% if (g.own_kind or KIND_MARGIN) == k %}selected{% endif %}>{{ v }}</option>{% endfor %}</select><input form="row{{ n }}" name="value" value="{{ ru(g.own_value) if g.own_value is not none else '' }}" placeholder="—" inputmode="decimal" style="width:56px"><button form="row{{ n }}" class="secondary" style="padding:4px 8px">ok</button>{% endif %}
     <div class="muted">{% if g.own_value is not none %}задано на категорию{% else %}у категории своей нет — действует {{ target_text(g.kind, g.coef) if not g.articles_own else 'умолчание площадки' }}{% endif %}{% if g.articles_own %}; у {{ g.articles_own }} из {{ g.articles|length }} арт. своя наценка — она главнее{% endif %}</div>
     {% if g.cat_cabinets %}<div class="muted" title="У этих кабинетов своя наценка этой категории — заданная здесь в них не действует">своя у: {{ g.cat_cabinets|join(', ') }}</div>{% endif %}</td>
   {% else %}
   <td class="art"><b>{{ g.key }}</b><div class="muted">{{ g.name }}</div>
     <div class="muted">{% if g.category %}{{ g.category }} · {% endif %}{% if g.colors %}{{ g.colors|join(', ') }} · {% endif %}{{ g.rows|length }} разм.{% if g.sizes and g.sizes|length <= 8 %}: {{ g.sizes|join(', ') }}{% endif %}</div></td>
   <td class="num">{{ g.base }}<div class="muted" style="font-size:12px">{{ g.cost }} $</div></td>
-  <td class="mk"><select form="row{{ n }}" name="kind" class="kind">{% for k, v in kinds.items() %}<option value="{{ k }}" {% if (g.kind or 'coef') == k %}selected{% endif %}>{{ 'маржинальность' if k == KIND_MARGIN else '× от базовой' }}</option>{% endfor %}</select><input form="row{{ n }}" name="value" value="{{ ru(g.coef) if g.coef is not none and g.source == own_level else '' }}"
+  <td class="mk"><select form="row{{ n }}" name="kind" class="kind">{% for k, v in kinds.items() %}<option value="{{ k }}" {% if (g.kind or 'coef') == k %}selected{% endif %}>{{ v }}</option>{% endfor %}</select><input form="row{{ n }}" name="value" value="{{ ru(g.coef) if g.coef is not none and g.source == own_level else '' }}"
       placeholder="{{ ru(g.coef) if g.coef is not none else '—' }}" inputmode="decimal" style="width:56px"
       title="Пусто — наценка категории или умолчание площадки"><button form="row{{ n }}" class="secondary" style="padding:4px 8px">ok</button>
     <div class="muted">{{ target_text(g.kind, g.coef) }} · {{ sources.get(g.source, 'разные') }}</div>
     {% if g.own_cabinets and not sc.account_id %}<div class="muted" title="У этих кабинетов своя наценка — она главнее площадочной">своя у: {{ g.own_cabinets|join(', ') }}</div>{% endif %}
     {% if g.manual %}<div class="warn" title="Ручная цена кабинета главнее наценки — пока она есть, уходит она">ручная {{ g.manual_prices }} ₽
-      <button form="manual{{ n }}" class="secondary" style="padding:1px 6px;font-size:12px" onclick="return confirm('Снять ручную цену у «{{ g.key }}»? Тогда будет действовать наценка.')">снять</button></div>{% endif %}</td>
+      <button form="manual{{ n }}" class="secondary" style="padding:1px 6px;font-size:12px" onclick="return confirm('Снять ручную цену у «{{ g.key|js }}»? Тогда будет действовать наценка.')">снять</button></div>{% endif %}</td>
   {% endif %}
   <td class="num"><b>{{ g.price }}</b>{% if '–' in g.price and sc.platform != 'kit' %}<div class="muted" style="font-size:12px" title="Цена ставится на карточку целиком: уходит наибольшая из её размеров">на карточку — {{ g.card_price }}</div>{% endif %}<div class="{{ 'bad' if g.floor else 'muted' }}">{{ g.margin }}</div>
     {% if g.tariff_missing %}<div class="warn" style="font-size:12px" title="Комиссия взята из правила площадки: тариф для товара не загружен. Обновите каталог (WB) или текущие цены (Ozon).">тариф неизвестен</div>{% endif %}

@@ -47,6 +47,19 @@ def local(v, fmt: str = "%d.%m %H:%M") -> str:
 
 templates.env.filters["local"] = local
 
+
+def js(v) -> "Markup":
+    """Значение внутрь JS-строки в одинарных кавычках в HTML-атрибуте (`confirm('…')`).
+    Обычное экранирование Jinja делает из `'` `&#39;`, браузер раскодирует его ОБРАТНО до
+    разбора JS — и артикул O'NEIL рвал строку: обработчик падал, форма уходила без вопроса."""
+    import json
+
+    from markupsafe import Markup
+    return Markup.escape(json.dumps(str(v), ensure_ascii=False)[1:-1].replace("'", "\\'"))
+
+
+templates.env.filters["js"] = js
+
 NAV = [
     ("attention", "/attention", "Внимание"),
     ("etalon", "/etalon", "Эталонные цены"),

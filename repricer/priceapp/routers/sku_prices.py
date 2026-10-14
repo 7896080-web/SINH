@@ -38,7 +38,7 @@ from priceapp.models import (ArticleCoef, CategoryTarget, OnecBarcode, OnecCost,
                              ProductPrice, User)
 from priceapp.pages import render
 from priceapp.platforms import PLATFORMS
-from priceapp.pricing import (BLOCK_FLOOR, BLOCK_MAX_CHANGE, KIND_COEF, KIND_LABELS, KIND_MARGIN, OPEN,
+from priceapp.pricing import (BLOCK_FLOOR, BLOCK_MAX_CHANGE, KIND_COEF, KIND_ETALON, KIND_LABELS, KIND_MARGIN, OPEN,
                               SOURCE_LABELS, SRC_ARTICLE, SRC_CABINET, SRC_CAT_CABINET, SRC_CATEGORY, SRC_DEFAULT, SRC_MANUAL,
                               _dec, _ru, article_of, base_price, change_percent, decide_for, item_facts,
                               load_inputs, markup, target_for)
@@ -71,7 +71,7 @@ NO_CATEGORY = "(без категории)"
 SCOPE_COL = "Где (код)"
 KIND_COL = "Вид наценки"
 VALUE_COL = "Наценка"
-KIND_BY_LABEL = {v: k for k, v in KIND_LABELS.items()} | {"коэффициент": KIND_COEF, "к": KIND_COEF,
+KIND_BY_LABEL = {v.lower(): k for k, v in KIND_LABELS.items()} | {"коэффициент": KIND_COEF, "к": KIND_COEF,
                                                           "м": KIND_MARGIN, "coef": KIND_COEF,
                                                           "margin": KIND_MARGIN}
 
@@ -112,9 +112,10 @@ def _keep(src) -> dict:
 
 def _dec_or_none(text: str) -> Decimal | None:
     try:
-        return Decimal(text.replace(",", ".")) if text.strip() else None
+        v = Decimal(text.replace(",", ".")) if text.strip() else None
     except InvalidOperation:
         return None
+    return v if v is None or v.is_finite() else None     # «nan», «inf» — не число, а не 500
 
 
 def _money(v) -> str:
@@ -139,6 +140,8 @@ def span(values, money: bool = False) -> str:
 def target_text(kind: str | None, value) -> str:
     if value is None:
         return "—"
+    if kind == KIND_ETALON:
+        return f"эталон WB {'+' if value >= 0 else ''}{_ru(value)}%"
     return (f"маржинальность {_ru(value)}" if kind == KIND_MARGIN else f"× {_ru(value)} от базовой")
 
 

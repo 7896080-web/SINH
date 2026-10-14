@@ -29,7 +29,7 @@
   </table>
   {% if preview.wb|selectattr('skip')|list %}<p class="bad">Ниже пола — эталон не запишется. Поднимите цену или проверьте себестоимость.</p>
   {% else %}
-  <form method="post" action="/etalon/set" class="row" onsubmit="return confirm('Новый эталон {{ preview.art }}: {{ preview.sale }} ₽ — отправить на WB и все площадки?')">
+  <form method="post" action="/etalon/set" class="row" onsubmit="return confirm('Новый эталон {{ preview.art|js }}: {{ preview.sale }} ₽ — отправить на WB и все площадки?')">
     <input type="hidden" name="art" value="{{ preview.art }}"><input type="hidden" name="sale" value="{{ preview.sale }}">
     <button>Применить на все площадки</button>
     <a class="btn secondary" href="/etalon?q={{ preview.art }}">Отмена</a>

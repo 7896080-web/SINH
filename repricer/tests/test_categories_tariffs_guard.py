@@ -230,6 +230,7 @@ def test_guard_restores_when_platform_lowered_price_and_flags_eaten(client, db):
     # b3: цена наша (2529 — её мы и отправляли), но скидка 40% съела маржинальность — ценой не исправить
     # b2: 9000 — маржинальность выше «до»
     db.add(ProductPrice(item_id="u3", account_id=a1.id, last_sent_price=2529))
+    db.add(ProductPrice(item_id="u1", account_id=a1.id, last_sent_price=3309))   # 3309 — наша, площадка опустила
     _prices(db, a1, b1=(2000, 2000), b3=(2529, 1517), b2=(9000, 9000))
     st = guard.run(db)
     assert (st["restored"], st["eaten"], st["above"]) == (1, 1, 1)
@@ -281,6 +282,7 @@ def test_guard_never_lowers_price_and_keeps_human_decision(client, db):
 def test_guard_preview_writes_nothing_and_run_asks(client, db):
     a1, _ = _wb(client, db)
     client.post(f"/prices/guard/{a1.id}", data={"guard_min_margin": "1,5", "guard_max_margin": ""})
+    db.add(ProductPrice(item_id="u1", account_id=a1.id, last_sent_price=3309))
     _prices(db, a1, b1=(2000, 2000))
     r = client.post("/prices/guard-preview")
     assert "вернётся цен — 1" in r.text and db.query(PriceChange).count() == 0
@@ -609,3 +611,39 @@ def test_rule_default_check_by_tariffs_and_kit_still_blocked(client, db):
     f.account(db, "kit", "КИТ", commission=20)
     r = client.post("/prices/rules/kit", data={**RULE, "commission_percent": "20", "base_coef": "1,5"})
     assert "не сохранено" in r.text                          # у Kit комиссия из правила и есть настоящая
+
+
+def test_guard_never_queues_a_price_blocked_by_step_limit(client, db):
+    """Аудит 14.10: опечатка в наценке (×10) — расчёт блокирует лимитом шага, а диапазон
+    безопасности раньше ставил её в очередь сам, и она уходила на площадку."""
+    a1, a2 = _wb(client, db)
+    client.post(f"/prices/guard/{a1.id}", data={"guard_min_margin": "1,5", "guard_max_margin": "3"})
+    _prices(db, a1, b1=(2000, 2000))                              # нашей отправки нет — шаг от 2000
+    st = guard.run(db)
+    assert st["restored"] == 0 and st["stuck"] >= 1
+    assert not db.query(PriceChange).filter_by(status="approved").count()
+
+
+def test_size_without_any_price_still_has_its_floor_checked(db):
+    """Аудит 14.10: у XL нет ни нашей отправки, ни текущей цены (новая карточка, кабинет до
+    загрузки цен) — его пол всё равно проверяется: цена уходит на всю карточку."""
+    acc = _card(db)                                            # XL: пол 2826, S подтверждён за 1999
+    push = _Push()
+    dispatch.run_account(db, acc, push)
+    ch = db.query(PriceChange).one()
+    assert push.items == [] and ch.status == "blocked" and "A1 XL" in ch.note
+
+
+def test_lamoda_is_never_sent_by_the_common_queue(db):
+    """Аудит 14.10: подтверждённая цена Ламоды (файл предложений, диапазон безопасности) уходила
+    голой `price` и сбивала скидку. Ламоде цену ставит только страница «Эталонные цены»."""
+    f.manual_rate(db)
+    lam = f.account(db, "lamoda", "Ламода", commission=40)
+    f.sku(db, "s", "A1", "S", barcodes=["bs"], cost_usd="10")
+    f.item(db, lam, "bs", "A1", external_id="P1:s", size="S")
+    db.add(PriceChange(item_id="s", account_id=lam.id, barcode="bs", new_price=4999, status="approved"))
+    db.commit()
+    push = _Push()
+    assert dispatch.run_account(db, lam, push) == {"refused": 1}
+    ch = db.query(PriceChange).one()
+    assert push.items == [] and ch.status == "rejected" and "Эталонные цены" in ch.note

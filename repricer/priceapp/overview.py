@@ -333,6 +333,25 @@ def _health(db: Session, a: Attention) -> None:
                   "/diagnostics")
 
 
+def live_errors(db: Session):
+    """Отказы площадки, которые ещё что-то значат: после них по той же паре товар+кабинет цена
+    не уходила ни очередью, ни страницей «Эталонные цены» (та пишет только «последнюю
+    отправку»). Запись `error` сама статуса не меняет никогда, и без этого отбора срочная
+    строка «Внимания» горела бы вечно и только росла — её перестали бы читать."""
+    from sqlalchemy import and_, exists, func
+    from sqlalchemy.orm import aliased
+
+    from priceapp.models import ProductPrice
+    later = aliased(PriceChange)
+    return db.query(PriceChange).filter(
+        PriceChange.is_test.is_(False), PriceChange.status == PriceChangeStatus.error.value,
+        ~exists().where(and_(later.account_id == PriceChange.account_id, later.item_id == PriceChange.item_id,
+                             later.status == PriceChangeStatus.sent.value, later.id > PriceChange.id)),
+        ~exists().where(and_(ProductPrice.account_id == PriceChange.account_id,
+                             ProductPrice.item_id == PriceChange.item_id,
+                             ProductPrice.last_sent_at > func.coalesce(PriceChange.decided_at, PriceChange.created_at))))
+
+
 def attention(db: Session, product_rows, background_alive: bool = False) -> Attention:
     """Что требует внимания, по убыванию цены ошибки. Лёгкое (курс, предложения,
     свежесть данных, фоновые задания) — сразу; счётчики по товарам — из кэша, если
@@ -348,9 +367,9 @@ def attention(db: Session, product_rows, background_alive: bool = False) -> Atte
                       f"{shift['now']:.2f} ₽) — новые цены видны на «Ценах товаров», там их и передавать",
               "/sku-prices?flt=changes")
     base = PriceChange.is_test.is_(False)
-    n = db.query(PriceChange).filter(base, PriceChange.status == PriceChangeStatus.error.value).count()
+    n = live_errors(db).count()
     if n:
-        a.add("bad", "Площадка не приняла цену", "/prices?view=log&status=error", n)
+        a.add("bad", "Площадка не приняла цену (и с тех пор цена туда не уходила)", "/prices?view=log&status=error", n)
     n = db.query(PriceChange).filter(base, PriceChange.status == "proposed").count()
     if n:
         a.add("warn", "Предложения цен ждут решения (Kit за WB, пересчёт) — подтвердить или отклонить", "/prices?view=proposals&status=proposed", n)
