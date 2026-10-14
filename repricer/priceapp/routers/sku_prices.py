@@ -452,7 +452,9 @@ def page(request: Request, scope: str = Query(""), art: str = Query(""), barcode
     cats = categories_in(db, sc) if sc else []
     db.commit()
     queued = sum(1 for g in groups[:ROWS_LIMIT] if g["last"] and g["last"]["status"] == "approved")
-    return render(request, "sku_prices.html", user, "sku_prices", groups=groups[:ROWS_LIMIT], total=len(groups),
+    from priceapp import etalon as etalon_mod
+    return render(request, "sku_prices.html", user, "sku_prices", how_cfg=etalon_mod.how_now_cfg(db),
+                  groups=groups[:ROWS_LIMIT], total=len(groups),
                   queued=queued,
                   skus=sum(len(g["rows"]) for g in groups), scopes=scopes(db), sc=sc, rule=rule,
                   filters=FILTERS, actions=ACTIONS, views=VIEWS, kinds=KIND_LABELS, sources=SOURCE_LABELS,

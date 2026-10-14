@@ -53,7 +53,8 @@ STATUS_LABELS = {
 }
 SOURCE_LABELS = {**pricing.SOURCE_LABELS, "rollback": "возврат прежней цены",
                  "guard": "возврат по диапазону безопасности",
-                 "etalon": "новый эталон",
+                 "etalon": "новый эталон", "etalon_follow": "за эталоном",
+                 "reference": "возврат эталона WB", "follow": "Kit за WB",
                  # прежние схемы — для старых строк журнала
                  "platform": "цена площадки", "base": "от базовой"}
 PRICE_STATUS_LABELS = {"QUARANTINE": "на карантине у площадки", "ERROR": "площадка: ошибка цены",
@@ -982,8 +983,11 @@ def approve_changes(request: Request, form=Depends(posted_form), db: Session = D
     confirm_large = form.get("confirm_large") == "true"
     if form.get("all_filtered") == "1":
         # Весь отбор, а не 500 видимых строк: тот же запрос, что рисует страницу.
-        ids = [c.id for c in _changes_query(db, "proposals", account_id, str(form.get("status") or ""),
-                                            str(form.get("q") or "")).limit(BULK_LIMIT)]
+        q = _changes_query(db, "proposals", account_id, str(form.get("status") or ""), str(form.get("q") or ""))
+        if q.count() > BULK_LIMIT:
+            flash(request, f"В отборе больше {BULK_LIMIT} предложений — сузьте отбор. Ничего не подтверждено.", "warn")
+            return _back("proposals", account_id=account_id)
+        ids = [c.id for c in q]
     if not ids:
         flash(request, "Ничего не выбрано.", "warn")
         return _back("proposals", account_id=account_id)
@@ -1031,8 +1035,12 @@ def reject_changes(request: Request, form=Depends(posted_form), db: Session = De
                          user: User = Depends(get_current_user)):
     ids, account_id = _ids(form), str(form.get("account_id") or "")
     if form.get("all_filtered") == "1":
-        ids = [c.id for c in _changes_query(db, "proposals", account_id, str(form.get("status") or ""),
-                                            str(form.get("q") or "")).limit(BULK_LIMIT)]
+        q = _changes_query(db, "proposals", account_id, str(form.get("status") or ""), str(form.get("q") or ""))
+        if q.count() > BULK_LIMIT:
+            flash(request, f"В отборе больше {BULK_LIMIT} предложений — сузьте отбор или «Отклонить все ожидающие». "
+                           "Ничего не отклонено.", "warn")
+            return _back("proposals", account_id=account_id)
+        ids = [c.id for c in q]
     n = 0
     for ch in db.query(PriceChange).filter(PriceChange.id.in_(ids), PriceChange.is_test.is_(False),
                                            PriceChange.status.in_(OPEN + ("approved",))):

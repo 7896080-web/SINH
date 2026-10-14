@@ -238,7 +238,9 @@ def import_file(request: Request, account_id: str = Query(""), file: UploadFile 
     if not data:
         flash(request, "Файл пустой — выберите .xlsx, выгруженный этой страницей.", "warn")
         return _back(acc.id if acc else "")
-    res = approval.import_workbook(db, user, data, accs)
+    # Только кабинеты площадки открытого кабинета: лист сопоставляется по имени, а у WB и Ozon
+    # бывают одноимённые ИП — книга Ozon ложилась в WB (аудит 14.10).
+    res = approval.import_workbook(db, user, data, [a for a in accs if acc is None or a.platform == acc.platform])
     audit.log(db, user.username, "approval_import", acc.name if acc else "",
               f"листов {res['sheets']}, маржинальностей {res['changed']}, экономики строк {res['econ']}, ошибок {len(res['errors'])}")
     db.commit()

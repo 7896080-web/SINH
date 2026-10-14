@@ -214,6 +214,7 @@ def import_file(request: Request, file: UploadFile = File(...), db: Session = De
         flash(request, f"В файле нет колонки «{HEAD[0]}» — выгрузите файл этой страницей («Выгрузить в Excel»).", "error")
         return _back()
     ets = etalon.etalons(db)
+    lim = float(etalon.max_step(db))
     todo, bad = [], []
     seen: set[str] = set()
     for r in data:
@@ -229,6 +230,10 @@ def import_file(request: Request, file: UploadFile = File(...), db: Session = De
             bad.append(f"{art}: «{new}» не число")
         elif art not in ets or not ets[art].cards:
             bad.append(f"{art}: на WB нет карточек")
+        elif ets[art].sale and abs(Decimal(sale) / Decimal(ets[art].sale) - 1) * 100 > lim:
+            # Опечатка ×10 в файле уходила бы сразу на WB и все площадки. Крупное — по одному на
+            # странице, с предпросмотром того, что уйдёт (аудит 14.10).
+            bad.append(f"{art}: {ets[art].sale} -> {sale} ₽ — изменение больше {lim:g}%, задайте на странице")
         elif sale != ets[art].sale:
             todo.append((art, sale))
     if len(todo) > IMPORT_LIMIT:
@@ -236,11 +241,13 @@ def import_file(request: Request, file: UploadFile = File(...), db: Session = De
         return _back()
     done, refused = 0, []
     for art, sale in todo:
-        rep = etalon.set_etalon(db, art, sale, user.username)
+        rep = etalon.set_etalon(db, art, sale, user.username, snapshot=False)
         if any("не записан" in r.lower() for r in rep):
             refused.append(next(r for r in rep if "не записан" in r.lower()))
         else:
             done += 1
+    from priceapp.reference import snapshot_if_dirty
+    snapshot_if_dirty(db, f"эталон из файла: {done} артикулов")
     msg = f"Из файла: новый эталон у {done} артикулов, отправлено на WB и площадки-последователи."
     if refused or bad:
         msg += " Не применено: " + "; ".join((refused + bad)[:5]) + (" …" if len(refused) + len(bad) > 5 else "")

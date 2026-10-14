@@ -181,3 +181,26 @@ def current():
                             config.ONEC_SFTP_TASKS, config.ONEC_SFTP_RESULTS,
                             config.ONEC_SFTP_ARCHIVE, config.ONEC_ARCHIVE_DIR)
     return LocalExchange(config.ONEC_TASKS_DIR, config.ONEC_RESULTS_DIR, config.ONEC_ARCHIVE_DIR)
+
+
+ARCHIVE_KEEP_DAYS = 60
+
+
+def prune_archive(root: Path, days: int = ARCHIVE_KEEP_DAYS) -> int:
+    """Удалить из архива обмена файлы старше `days` суток (по времени изменения). Архив никто
+    не чистил: справочник баркодов — десятки МБ в сутки на ОБЩЕМ диске с базой, 1С и
+    sync_admin; кончится место — разом встанут запись в базу, копия и обмен (аудит 14.10).
+    Чистка sync_admin подкаталоги не трогает. Сбой на файле не мешает остальным."""
+    import time
+    if not root.exists():
+        return 0
+    cutoff = time.time() - days * 86400
+    n = 0
+    for f in root.rglob("*"):
+        try:
+            if f.is_file() and f.stat().st_mtime < cutoff:
+                f.unlink()
+                n += 1
+        except OSError:
+            continue
+    return n

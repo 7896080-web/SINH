@@ -28,7 +28,9 @@ def page(request: Request, db: Session = Depends(get_db), user: User = Depends(g
     db.commit()     # get_rule мог завести правило площадки по умолчанию
     order = {"bad": 0, "warn": 1, "ok": 2}
     items = sorted(att.items, key=lambda i: order.get(i.level, 3))
+    from priceapp import etalon
     return render(request, "attention.html", user, "attention", items=items, rate=rates.current(db),
+                  how_cfg=etalon.how_now_cfg(db),
                   heavy_at=_local(att.heavy_at), heavy_dirty=att.heavy_dirty)
 
 

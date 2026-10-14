@@ -291,6 +291,19 @@ def _lamoda_body(cards: list[FCard], days: int) -> tuple[dict, str, str]:
          "saleStart": iso(start), "saleEnd": iso(end)} for c in cards]}, iso(start), iso(end))
 
 
+def journal_sent(db: Session, account_id: int, item_ids, barcode: str, old: int | None, new: int,
+                 source: str, note: str, actor: str) -> None:
+    """Отправка мимо очереди (эталон, следование, возврат эталона) — строкой «отправлено» в
+    «Журнале отправок»: иначе основной путь цен WB, Kit и Ламоды не был виден ни там, ни в
+    «Последней отправке» (аудит 14.10). Курс не пишем: это не расчёт, и «курс изменился с
+    последнего расчёта» сравнивал бы с ним."""
+    now = now_utc()
+    for item_id in item_ids:
+        db.add(PriceChange(item_id=item_id, account_id=account_id, barcode=barcode or "", old_price=old,
+                           new_price=new, source=source, status=PriceChangeStatus.sent.value,
+                           decided_by=actor, decided_at=now, sent_at=now, attempts=1, note=note[:255]))
+
+
 def send_followers(db: Session, cards: list[FCard], client_factory=None, actor: str = ACTOR) -> dict[str, str]:
     """Отправить последователям цену до скидки и цену со скидкой (Ozon — цену). Принятое сразу
     правим у нас как текущее и как отправленное. Коммитит по кабинету."""
@@ -354,6 +367,9 @@ def send_followers(db: Session, cards: list[FCard], client_factory=None, actor: 
                 r.current_sale_price = c.target if a.platform in WITH_DISCOUNT else c.new_list
             for item_id in c.item_ids:
                 _record_sent(db, item_id, a.id, c.new_list)
+            journal_sent(db, a.id, c.item_ids, c.rows[0].barcode if c.rows else "", c.cur_list, c.new_list,
+                         "etalon_follow", f"за эталоном: цена со скидкой {c.target} ₽"
+                         + (f", скидка {c.disc}%" if c.disc is not None else ""), actor)
         out[a.name] = f"отправлено карточек: {len(sent)} из {len(group)}" + (
             f"; ошибки ({len(errors)}): " + "; ".join(errors[:5]) if errors else "")
         sample = ", ".join(f"{c.key} {c.cur_sale}->{c.target}" for c in sent[:15])
@@ -386,7 +402,7 @@ def wb_plan(db: Session, et: Etalon, sale: int) -> list[dict]:
     return out
 
 
-def set_etalon(db: Session, art: str, sale: int, actor: str, client_factory=None) -> list[str]:
+def set_etalon(db: Session, art: str, sale: int, actor: str, client_factory=None, snapshot: bool = True) -> list[str]:
     """Новый эталон артикула: WB — сразу (первый шаг при большом снижении, остальное — очередью),
     запись эталона, затем последователи. Возвращает строки отчёта; карточку ниже пола не трогает
     и называет. Коммитит."""
@@ -456,6 +472,9 @@ def set_etalon(db: Session, art: str, sale: int, actor: str, client_factory=None
             c, price = p["card"], p["step"] or p["new_list"]
             for item_id in c.item_ids:
                 _record_sent(db, item_id, a.id, price)   # иначе диапазон безопасности счёл бы цену «не нашей»
+            journal_sent(db, a.id, c.item_ids, c.rows[0].barcode if c.rows else "", c.cur_list, price, SOURCE,
+                         f"новый эталон {sale} ₽: скидка {p['disc']}%" + (", первый шаг снижения" if p["step"] else ""),
+                         actor)
             for r in c.rows:
                 r.current_price = price
                 r.current_sale_price = int((Decimal(price) * (100 - p["disc"]) / 100).quantize(Decimal(1), ROUND_HALF_UP))
@@ -472,7 +491,8 @@ def set_etalon(db: Session, art: str, sale: int, actor: str, client_factory=None
                           + (f" (снижение шагами: сейчас {price} ₽)" if p["step"] else ""))
         audit.log(db, actor, "etalon_set", a.name, f"{art}: новый эталон {sale} ₽; " + "; ".join(report[-len(group):])[:900])
         db.commit()
-    snapshot_if_dirty(db, "эталон изменён вручную")
+    if snapshot:      # импорт файла снимает ОДНУ копию в конце, а не полную на каждый артикул
+        snapshot_if_dirty(db, "эталон изменён вручную")
     if wb_failed:
         return wb_failed + report + [f"{art}: площадки-последователи НЕ отправлены — сначала цена на WB. "
                                      "Повторите смену эталона, когда WB будет доступен."]
@@ -521,6 +541,15 @@ def follow_all(db: Session, client_factory=None) -> dict:
     if cards:
         st["sent"] = send_followers(db, cards, client_factory)
     return st
+
+
+def how_now_cfg(db: Session) -> dict:
+    """Для карточки «Кто сейчас ставит цены»: сдвиги площадок и автоследование — из настроек."""
+    def pct(p):
+        v = shift(db, p)
+        return None if v is None else format(v.normalize(), "f")
+    return {"kit": pct("kit"), "lamoda": pct("lamoda"), "ozon": pct("ozon"), "auto": auto_enabled(db),
+            "max_step": format(max_step(db).normalize(), "f")}
 
 
 def summary(st: dict) -> str:

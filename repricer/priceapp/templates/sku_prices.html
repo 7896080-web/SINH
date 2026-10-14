@@ -14,7 +14,7 @@
 .art-table td.last { white-space:normal; min-width:90px; font-size:13px; }
 </style>
 <h1>Цены товаров</h1>
-{% if sc %}{{ guides.how_now_line(sc.platform) }}{% endif %}
+{% if sc %}{{ guides.how_now_line(sc.platform, how_cfg) }}{% endif %}
 {{ guides.sku_prices() }}
 <p><b>1.</b> Выберите, где (площадка или кабинет) → <b>2.</b> задайте наценку артикулам или категориям → <b>3.</b> проверьте
 новую цену и маржинальность → <b>4.</b> «Передать на площадки».

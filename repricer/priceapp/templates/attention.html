@@ -3,7 +3,7 @@
 {% block content %}
 {% import "_guides.html" as guides %}
 <h1>Что требует внимания</h1>
-{{ guides.how_now() }}
+{{ guides.how_now(how_cfg) }}
 {{ guides.attention() }}
 <p class="muted">Всё, что ждёт решения или говорит о расхождении, — сначала самое дорогое. Каждая строка ведёт прямо к своим
 товарам. {% if rate %}Курс: <b>{{ rate.usd_rub|money(4) }} ₽</b> ({{ rate.label }}).{% endif %}</p>
