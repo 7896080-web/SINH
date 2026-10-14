@@ -40,7 +40,7 @@ Wildberries (реклама, продажи, юнит-экономика, пои
 |---|---|---|
 | Директ | `direct_check.py`, `direct_before_after.py [дата]`, `direct_deep_report.py`, `direct_feeds.py`, `direct_frequency.py`, `direct_campaigns.py` | `direct_stage1.py`, `direct_age_45_54.py`, `direct_awer_jackets.py` |
 | Метрика / Вебмастер / Доставка | `metrika_report.py`, `metrika_brands.py`, `metrika_direct_breakdown.py`, `metrika_costs.py`, `webmaster_report.py`, `yandex_delivery_report.py`, `crm_buyout_report.py` | — |
-| Wildberries | `wb_positions.py`, `wb_daily.py`, `wb_unit.py`, `wb_queries.py`, `wb_ads_report.py`, `wb_organic.py`, `wb_weekday.py`, `wb_weekly.py`, `wb_hours.py`, `wb_cancels.py`, `wb_reviews.py`, `wb_clusters.py`, `wb_pacing.py`, `wb_dayparts.py`, `wb_campaigns.py`, `wb_dashboard.py` | `wb_bids.py` (автопилот), `wb_guard.py` (ставки за рекомендацией WB, раз в час), `wb_create.py`, `wb_trim.py`, `wb_minus.py` (минус-фразы вручную) |
+| Wildberries | `wb_positions.py`, `wb_daily.py`, `wb_unit.py`, `wb_queries.py`, `wb_ads_report.py`, `wb_organic.py`, `wb_weekday.py`, `wb_weekly.py`, `wb_hours.py`, `wb_cancels.py`, `wb_reviews.py`, `wb_clusters.py`, `wb_pacing.py`, `wb_dayparts.py`, `wb_campaigns.py`, `wb_dashboard.py` | `wb_bids.py` (автопилот), `wb_guard.py` (ставки за рекомендацией WB, раз в час), `wb_create.py`, `wb_trim.py`, `wb_minus.py` (минус-фразы вручную), `wb_budget.py` (бюджет по окупаемости) |
 
 Общие модули: `wb_common.py` (WB API), `yandex_token.py` (токены Яндекса), `wb_run.py` (запуск по расписанию). Отчёты пишутся в `*.txt` / `*.csv`
 рядом со скриптами. История WB (позиции, запросы, воронка, реклама по дням) — `wb_history.db` (SQLite, только
