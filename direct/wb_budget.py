@@ -27,7 +27,8 @@
   python wb_budget.py --rollback          — вернуть лимиты, какие были до последнего --apply (сразу)
 Деньги в кампании этот скрипт не переводит и ставки не меняет — только лимиты и потолки, по которым работают
 wb_bids.py и wb_guard.py. Токен с категориями «Продвижение» и «Аналитика». Время — 1–3 минуты на кабинет.
-Результат: вывод на экран + wb_budget_report.txt
+Результат: вывод на экран + wb_budget_report.txt + wb_budget_proposals.json (его показывает дашборд
+wb_dashboard.py; по расписанию пробный прогон идёт раз в день после утреннего автопилота — см. wb_run.py).
 """
 import csv
 import datetime as dt
@@ -59,6 +60,7 @@ SPEND_LOG = HERE / "wb_spend_hourly.csv"
 OVERRIDES = B.BUDGET_OVERRIDES
 BACKUPS = HERE / "wb_budget_backups"
 REPORT = HERE / "wb_budget_report.txt"
+PROPOSALS = HERE / "wb_budget_proposals.json"   # последние предложения — для дашборда
 log = B.log
 rub = B.fm_rub
 
@@ -285,7 +287,7 @@ def plan_cabinet(cab, token, state, ov):
                     text=f"заказ {rub(cpo)} ₽ при допустимых {rub(allowed)} ₽; {why_s} → +{step:.0%}: "
                          + ", ".join(f"{LABEL[k]} {rub(cur.get(k) or 0)} → {rub(v)} ₽" for k, v in new.items())
                          + f". Это до +{rub(add_week)} ₽ в неделю ≈ +{more:.0f} заказов (каждый доп. заказ считаю дороже "
-                           f"среднего в {MARGINAL:g} раза)")
+                           f"среднего в {str(MARGINAL).replace('.', ',')} раза)")
         out.append(prop)
     if cab_cap and not exp_on:
         add = sum(p.get("add_week") or 0 for p in out if p.get("action") == "raise" and "topup_week_cap" in p["new"])
@@ -320,25 +322,51 @@ def apply(props, ov, only):
     path.write_text(json.dumps(ov, ensure_ascii=False, indent=1), encoding="utf-8")
     items, raised = ov.setdefault("items", {}), ov.setdefault("raised", {})
     n = 0
+    done, add_cab = set(), defaultdict(int)
     for p in props:
-        if p["action"] == "hold" or (only and str(p["advert_id"]) not in only and p["advert_id"] != "_week_budget"):
+        if p["action"] == "hold" or p["advert_id"] == "_week_budget" or (only and str(p["advert_id"]) not in only):
             continue
         cab, key = p["cabinet"], str(p["advert_id"])
-        if key == "_week_budget":
-            items.setdefault(cab, {})["_week_budget"] = p["new"]["_week_budget"]
-        elif p["action"] == "raise":
+        if p["action"] == "raise":
             items.setdefault(cab, {}).setdefault(key, {}).update(p["new"])
             raised[key] = {"date": dt.date.today().isoformat(), "prev": {k: v for k, v in p["cur"].items() if v},
                            "cpo": p["cpo"], "allowed": p["allowed"]}
-        else:                          # revert: прежние значения; совпадают с RULES — запись убираем
+            if "topup_week_cap" in p["new"]:
+                add_cab[cab] += p.get("add_week") or 0
+        else:                          # revert: прежние значения
             items.setdefault(cab, {})[key] = dict(p["new"])
             raised.pop(key, None)
+        done.add(key)
         n += 1
+    # недельный бюджет кабинета — на сумму прибавки только тех кампаний, что записаны сейчас
+    for p in props:
+        if p["advert_id"] == "_week_budget" and add_cab.get(p["cabinet"]):
+            items.setdefault(p["cabinet"], {})["_week_budget"] = up100(p["cur"]["_week_budget"] + add_cab[p["cabinet"]])
+            done.add("_week_budget")
+            n += 1
     ov["at"] = dt.datetime.now().isoformat(timespec="seconds")
     save_overrides(ov)
+    save_proposals(props, done)
     log(f"\n  Записано изменений: {n} (резервная копия {path.name}). Действуют с ближайшего запуска автопилота (8:00, "
         "13:00 или 18:00): он поставит новые дневные лимиты, а часовая проверка после него — пополнения по новым "
         "потолкам. Откат: python wb_budget.py --rollback")
+
+
+def save_proposals(props, applied_ids=()):
+    """Предложения последнего расчёта — для дашборда (только данные, без токенов)."""
+    items = []
+    for p in props:
+        it = {k: p.get(k) for k in ("cabinet", "advert_id", "name", "action", "text", "cpo", "allowed", "cur", "new",
+                                    "add_week", "step")}
+        it["applied"] = str(p.get("advert_id")) in applied_ids
+        items.append(it)
+    try:
+        tmp = PROPOSALS.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"at": dt.datetime.now().isoformat(timespec="minutes"), "items": items},
+                                  ensure_ascii=False, indent=1, default=str), encoding="utf-8")
+        os.replace(tmp, PROPOSALS)
+    except OSError as e:
+        log(f"  ! Предложения для дашборда не сохранены: {e}")
 
 
 def rollback():
@@ -374,6 +402,7 @@ def main():
         except B.ApiError as e:
             log(f"  ✗ {cab}: {e}")
     has = show(props)
+    save_proposals(props)
     if not SPEND_LOG.exists():
         log("\n  Часовых снимков расхода (wb_spend_hourly.csv) ещё нет — их пишет wb_guard.py с 14.10.2026.")
     if not has:

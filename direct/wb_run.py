@@ -8,6 +8,8 @@
   • своё ограничение по времени: если скрипт завис, он останавливается здесь (а не обрывом cmd, после которого
     python мог остаться висеть), в журнал пишется, что случилось, и снимается его блокировка wb_bids.running;
   • журналы не растут бесконечно: больше MAX_LOG_MB — текущий переименовывается в *.old.txt (прежний .old удаляется);
+  • после автопилота (wb_bids.py) — раз в сутки пробный прогон wb_budget.py: предложения по бюджету для дашборда
+    (только расчёт, ничего не меняет; если предложения старше BUDGET_EVERY_H часов);
   • после скрипта — всегда пересборка дашборда (python wb_dashboard.py --no-open).
 
 Запуск:  pythonw wb_run.py wb_bids.py --apply --timeout 55
@@ -26,6 +28,9 @@ OUT = HERE / "wb_sched_out.txt"
 LOGS = ["wb_sched_out.txt", "wb_bids_log.txt", "wb_guard_log.txt"]
 MAX_LOG_MB = 5
 LOCK_FILE = HERE / "wb_bids.running"
+BUDGET_FILE = HERE / "wb_budget_proposals.json"
+BUDGET_EVERY_H = 20      # предложения по бюджету пересчитываются не чаще (обычно — после автопилота в 8:00)
+BUDGET_TIMEOUT_MIN = 15
 NO_WINDOW = 0x08000000 if os.name == "nt" else 0      # CREATE_NO_WINDOW: дочерний python без окна
 
 
@@ -84,6 +89,13 @@ def run(args, timeout_min, f):
         return -1
 
 
+def budget_stale():
+    try:
+        return (dt.datetime.now().timestamp() - BUDGET_FILE.stat().st_mtime) > BUDGET_EVERY_H * 3600
+    except OSError:
+        return True
+
+
 def main():
     args = sys.argv[1:]
     timeout = 55
@@ -95,8 +107,13 @@ def main():
         print(__doc__)
         return
     rotate()
+    start = dt.datetime.now()
     with open(OUT, "a", encoding="utf-8") as f:
         run(args, timeout, f)
+        # задаче в планировщике дан 1 час: пересчёт бюджета — только если после него ещё успеет дашборд
+        early = (dt.datetime.now() - start).total_seconds() / 60 < 60 - BUDGET_TIMEOUT_MIN - 8
+        if args[0] == "wb_bids.py" and early and budget_stale() and (HERE / "wb_budget.py").exists():
+            run(["wb_budget.py"], BUDGET_TIMEOUT_MIN, f)          # без --apply: только предложения для дашборда
         run(["wb_dashboard.py", "--no-open"], 5, f)
 
 
