@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session
 from priceapp import accounts as acc_mod, audit, mapping, overview, platforms, rates, settings
 from priceapp.database import get_db
 from priceapp.deps import get_current_user, posted_form
+from priceapp.dispatch import LAMODA_REFUSED
 from priceapp.excel import ExcelReadError, read_xlsx_rows, xlsx_response
 from priceapp.flash import flash
 from priceapp.models import (Account, ApiCredential, OnecBarcode, OnecCost, PlatformItem, PlatformRule,
@@ -449,8 +450,8 @@ def product_rows(db: Session, account: Account, q: str = "", flt: str = "",
     rate = rates.current(db)
     ql = q.strip().lower()
     try:
-        lo = Decimal(coef_min.replace(",", ".")) if coef_min.strip() else None
-        hi = Decimal(coef_max.replace(",", ".")) if coef_max.strip() else None
+        from priceapp.routers.sku_prices import _dec_or_none
+        lo, hi = _dec_or_none(coef_min), _dec_or_none(coef_max)
     except InvalidOperation:
         lo = hi = None
     rows = []
@@ -849,7 +850,9 @@ def import_changes(request: Request, file: UploadFile = File(...), db: Session =
             errors.append(f"строка {i}: предложение «{raw_id}» не найдено")
             continue
         if decision == "да":
-            reason = approve(ch, user.username, _cell(row.get(LARGE_COL)).lower() == "да")
+            acc = db.get(Account, ch.account_id)
+            reason = (LAMODA_REFUSED if acc is not None and acc.platform == "lamoda"
+                      else approve(ch, user.username, _cell(row.get(LARGE_COL)).lower() == "да"))
             if reason:
                 errors.append(f"строка {i} (#{ch.id}): {reason}")
             else:
@@ -1006,7 +1009,6 @@ def approve_changes(request: Request, form=Depends(posted_form), db: Session = D
     return _back("proposals", account_id=account_id)
 
 
-LAMODA_REFUSED = "Ламода — цены ставит scripts\\lamoda_apply.py (цена со скидкой и даты скидки)"
 
 
 @router.post("/prices/reject-all")

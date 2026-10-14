@@ -207,6 +207,29 @@ class FCard:
         return (Decimal(self.target) / Decimal(self.cur_sale) - 1) * 100
 
 
+WB_REFUSED = "эталон НЕ записан — WB не принял отправку:"
+
+
+def floor_problem(rule, commission, rate, costs: dict, item_ids, new_list: int, disc_pct) -> str:
+    """Пол карточки по каждому её размеру — с теми же отказами, что при отправке очередью
+    (`dispatch.run_account`): без курса пол не проверить — не отправляем; комиссия не задана
+    или вне 0–99,99 — тоже (иначе деление на ноль или отрицательный пол). Размер без
+    себестоимости пол не ограничивает, как и в очереди. Пусто — можно отправлять."""
+    if rate is None:
+        return "нет курса доллара — пол не проверить (страница «Курс $»)"
+    if commission is None or not Decimal(0) <= Decimal(commission) < Decimal(100):
+        return f"комиссия {commission if commission is not None else 'не задана'} — пол не проверить (правила площадки)"
+    d = Decimal(disc_pct or 0) / 100
+    for item_id in item_ids:
+        base = base_price(costs.get(item_id), rate.usd_rub)
+        if base is None:
+            continue
+        floor = floor_price(base, rule, commission, d)
+        if new_list < floor:
+            return f"ниже пола: минимум {floor} ₽ до скидки" + (f" при скидке {disc_pct}%" if disc_pct else "")
+    return ""
+
+
 def follower_plan(db: Session, ets: dict[str, Etalon] | None = None, only: set | None = None) -> list[FCard]:
     """Карточки площадок-последователей, их цель и что уйдёт. `only` — только эти артикулы."""
     ets = ets if ets is not None else etalons(db)
@@ -252,16 +275,8 @@ def follower_plan(db: Session, ets: dict[str, Etalon] | None = None, only: set |
                 else:
                     c.new_list, c.disc = c.target, None
                 # пол — по каждому размеру карточки, со скидкой, которая уйдёт
-                d = Decimal(c.disc or 0) / 100
-                for item_id in c.item_ids:
-                    base = base_price(costs.get(item_id), rate.usd_rub if rate else None)
-                    facts = item_facts(rule, [r for r in c.rows])
-                    if base is None or facts.commission is None:
-                        continue
-                    floor = floor_price(base, rule, facts.commission, d)
-                    if c.new_list < floor:
-                        c.skip = f"ниже пола: минимум {floor} ₽ до скидки"
-                        break
+                c.skip = floor_problem(rule, item_facts(rule, c.rows).commission, rate, costs,
+                                       c.item_ids, c.new_list, c.disc)
                 out.append(c)
     return out
 
@@ -354,16 +369,8 @@ def wb_plan(db: Session, et: Etalon, sale: int) -> list[dict]:
         step = None
         if step_sale and sale < step_sale:
             step = math.ceil(Decimal(step_sale) * 100 / (100 - d))
-        skip = ""
         facts = item_facts(rule, c.rows)
-        for item_id in c.item_ids:
-            base = base_price(costs.get(item_id), rate.usd_rub if rate else None)
-            if base is None or facts.commission is None:
-                continue
-            floor = floor_price(base, rule, facts.commission, Decimal(d) / 100)
-            if new_list < floor:
-                skip = f"ниже пола: минимум {floor} ₽ до скидки при скидке {d}%"
-                break
+        skip = floor_problem(rule, facts.commission, rate, costs, c.item_ids, new_list, d)
         out.append({"card": c, "new_list": new_list, "disc": d, "step": step, "skip": skip,
                     "commission": facts.commission})
     return out
@@ -386,7 +393,7 @@ def set_etalon(db: Session, art: str, sale: int, actor: str, client_factory=None
         return [f"{art}: эталон {sale} ₽ не записан — {p['card'].account.name} {p['card'].nm}: {p['skip']}"
                 for p in blocked]
     rate = rates.current(db)
-    report = []
+    report, wb_failed = [], []
     now = now_utc()
     by_acc: dict[int, list[dict]] = {}
     for p in plan:
@@ -427,12 +434,18 @@ def set_etalon(db: Session, art: str, sale: int, actor: str, client_factory=None
             if isinstance(data, dict) and data.get("error"):
                 raise RuntimeError(data.get("errorText") or "WB вернул error=true")
         except Exception as e:
-            report.append(f"{a.name}: эталон записан, но WB не принял отправку — {e}"[:300]
-                          + ". Правило эталона вернёт цену при следующем опросе WB.")
-            db.commit()
+            # Не приняла WB — у этого кабинета не меняется НИЧЕГО: ни эталон, ни снятые решения.
+            # Записанный эталон при прежней цене на WB никто бы не вернул (возврат — только вверх),
+            # а последователи ушли бы к цене, которой на WB нет.
+            name = a.name
+            db.rollback()
+            wb_failed.append(f"{WB_REFUSED} {name}: {e}"[:300])
             continue
+        from priceapp.dispatch import _record_sent
         for p in group:
             c, price = p["card"], p["step"] or p["new_list"]
+            for item_id in c.item_ids:
+                _record_sent(db, item_id, a.id, price)   # иначе диапазон безопасности счёл бы цену «не нашей»
             for r in c.rows:
                 r.current_price = price
                 r.current_sale_price = int((Decimal(price) * (100 - p["disc"]) / 100).quantize(Decimal(1), ROUND_HALF_UP))
@@ -450,7 +463,19 @@ def set_etalon(db: Session, art: str, sale: int, actor: str, client_factory=None
         audit.log(db, actor, "etalon_set", a.name, f"{art}: новый эталон {sale} ₽; " + "; ".join(report[-len(group):])[:900])
         db.commit()
     snapshot_if_dirty(db, "эталон изменён вручную")
+    if wb_failed:
+        return wb_failed + report + [f"{art}: площадки-последователи НЕ отправлены — сначала цена на WB. "
+                                     "Повторите смену эталона, когда WB будет доступен."]
     fol = [c for c in follower_plan(db, etalons(db), only={art}) if not c.skip and not c.same]
+    # прежние решения последователей по этим товарам — сняты: очередь иначе отправила бы их поверх эталона
+    for c in fol:
+        for ch in db.query(PriceChange).filter(PriceChange.account_id == c.account.id,
+                                               PriceChange.item_id.in_(c.item_ids), PriceChange.is_test.is_(False),
+                                               PriceChange.status.in_(OPEN + (PriceChangeStatus.approved.value,))):
+            ch.status = PriceChangeStatus.rejected.value
+            ch.decided_by, ch.decided_at = actor, now
+            ch.note = "снято: новый эталон"
+    db.commit()
     for name, res in send_followers(db, fol, client_factory, actor).items():
         report.append(f"{name}: {res}")
     skipped = [c for c in follower_plan(db, only={art}) if c.skip]
@@ -466,15 +491,20 @@ def follow_all(db: Session, client_factory=None) -> dict:
     if not st["enabled"]:
         return st
     lim = max_step(db)
+    busy = {(a, i) for a, i in db.query(PriceChange.account_id, PriceChange.item_id).filter(
+        PriceChange.is_test.is_(False), PriceChange.status == PriceChangeStatus.approved.value)}
     cards = []
     for c in follower_plan(db):
         if c.skip:
-            st["floor"] += c.skip.startswith("ниже пола")
+            st["floor"] += 1
             continue
         if c.follows:
             continue
+        if any((c.account.id, i) in busy for i in c.item_ids):
+            continue                      # подтверждённое человеком ещё в очереди — его решение главнее
         ch = c.change_pct
-        if ch is not None and abs(ch) > lim:
+        # текущая цена неизвестна — шаг не проверить: ждём человека, как и крупный шаг
+        if ch is None or abs(ch) > lim:
             st["big"] += 1
             continue
         cards.append(c)
@@ -488,7 +518,7 @@ def summary(st: dict) -> str:
         return "Автоследование за эталоном выключено (страница «Эталонные цены»)."
     parts = [f"{k}: {v}" for k, v in st.get("sent", {}).items()] or ["расхождений с эталоном нет"]
     if st.get("big"):
-        parts.append(f"ждут подтверждения (шаг больше допустимого): {st['big']}")
+        parts.append(f"ждут подтверждения (шаг больше допустимого или текущая цена неизвестна): {st['big']}")
     if st.get("floor"):
-        parts.append(f"ниже пола, не отправлено: {st['floor']}")
+        parts.append(f"не отправлено (пол, курс или комиссия): {st['floor']}")
     return "Следование за эталоном: " + "; ".join(parts) + "."

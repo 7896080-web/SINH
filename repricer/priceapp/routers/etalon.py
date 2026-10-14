@@ -176,7 +176,9 @@ def set_one(request: Request, form=Depends(posted_form), db: Session = Depends(g
         flash(request, "Не указан артикул или новый эталон.", "warn")
         return _back()
     report = etalon.set_etalon(db, art, sale, user.username)
-    flash(request, f"Эталон {art} -> {sale} ₽. " + " · ".join(report), "ok")
+    failed = any("не записан" in r.lower() for r in report)
+    flash(request, (f"Эталон {art} НЕ изменён. " if failed else f"Эталон {art} -> {sale} ₽. ") + " · ".join(report),
+          "warn" if failed or any("не отправлено" in r for r in report) else "ok")
     return _back(q=art)
 
 
@@ -213,11 +215,16 @@ def import_file(request: Request, file: UploadFile = File(...), db: Session = De
         return _back()
     ets = etalon.etalons(db)
     todo, bad = [], []
+    seen: set[str] = set()
     for r in data:
         art, new = str(r.get(HEAD[0]) or "").strip(), r.get(HEAD[3])
         if not art or new in (None, ""):
             continue                                  # пусто — без изменений
         sale = _int(new)
+        if art in seen:
+            bad.append(f"{art}: повтор строки — применена первая")
+            continue
+        seen.add(art)
         if sale is None:
             bad.append(f"{art}: «{new}» не число")
         elif art not in ets or not ets[art].cards:
@@ -230,11 +237,11 @@ def import_file(request: Request, file: UploadFile = File(...), db: Session = De
     done, refused = 0, []
     for art, sale in todo:
         rep = etalon.set_etalon(db, art, sale, user.username)
-        if rep and "не записан" in rep[0]:
-            refused.append(rep[0])
+        if any("не записан" in r.lower() for r in rep):
+            refused.append(next(r for r in rep if "не записан" in r.lower()))
         else:
             done += 1
-    msg = f"Из файла: новый эталон у {done} артикулов, на все площадки отправлено."
+    msg = f"Из файла: новый эталон у {done} артикулов, отправлено на WB и площадки-последователи."
     if refused or bad:
         msg += " Не применено: " + "; ".join((refused + bad)[:5]) + (" …" if len(refused) + len(bad) > 5 else "")
     flash(request, msg, "warn" if refused or bad else "ok")

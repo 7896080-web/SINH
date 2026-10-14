@@ -22,6 +22,9 @@ router = APIRouter()
 def page(request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     from priceapp.workers import background
     att = overview.attention(db, product_rows, background_alive=background.heavy_alive())
+    for name in background.dead_threads():
+        att.add("bad", f"Фоновый поток остановлен: {name} — цены и обмен с 1С стоят; "
+                       "перезапустите службу repricer (nssm restart repricer)", "/diagnostics")
     db.commit()     # get_rule мог завести правило площадки по умолчанию
     order = {"bad": 0, "warn": 1, "ok": 2}
     items = sorted(att.items, key=lambda i: order.get(i.level, 3))

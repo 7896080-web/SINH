@@ -117,11 +117,13 @@ def test_page_preview_and_settings(client, db):
     assert "/etalon" in nav
 
 
-def test_excel_import_sets_new_etalons(client, db):
+def test_excel_import_sets_new_etalons(client, db, monkeypatch):
     import io
     from openpyxl import Workbook
+    from priceapp import accounts
     from priceapp.routers import etalon as page
     _setup(db)
+    monkeypatch.setattr(accounts, "client_for", lambda db, a, factory=None: Fake([]))
     wb = Workbook()
     ws = wb.active
     ws.append(page.HEAD)
@@ -170,3 +172,67 @@ def test_poll_now_button_requests_wb_poll(client, db):
     db.expire_all()
     assert settings.get(db, settings.REF_POLL_NOW) == "1"
     assert "в 00:05" in client.get("/etalon").text
+
+
+class WbDown(Fake):
+    def _post(self, url, body):
+        if "upload/task" in url:
+            raise RuntimeError("429 Too Many Requests")
+        return super()._post(url, body)
+
+
+def test_wb_refusal_changes_nothing_and_followers_wait(db):
+    """Аудит 14.10: WB не принял снижение — раньше эталон записывался, а Kit и Ламода уходили
+    вниз; вернуть WB было нечем (возврат эталона — только вверх)."""
+    w, kit, lam = _setup(db)
+    log = []
+    rep = etalon.set_etalon(db, "100", 4000, "оператор", client_factory=lambda p, c: WbDown(log))
+    db.expire_all()
+    assert db.query(ReferencePrice).filter_by(account_id=w.id).one().ref_price == 10000
+    assert not [x for x in log if x[0] == "push" or "nomenclatures" in str(x)]
+    assert any("НЕ записан" in r for r in rep) and any("НЕ отправлены" in r for r in rep)
+    assert (db.query(PlatformItem).filter_by(account_id=kit.id).one().current_sale_price) == 4000
+
+
+def test_no_rate_or_bad_commission_means_floor_unknown_and_nothing_goes(db):
+    from priceapp import settings as st
+    w, kit, lam = _setup(db, cost_usd=10)
+    st.put(db, st.RATE_MANUAL, "")
+    db.commit()
+    plan = etalon.follower_plan(db)
+    assert all("нет курса" in c.skip for c in plan)
+    F.manual_rate(db, "100")
+    from priceapp.pricing import get_rule
+    get_rule(db, "kit").commission_percent = Decimal(100)
+    db.commit()
+    plan = {c.platform: c for c in etalon.follower_plan(db)}         # раньше — DivisionByZero
+    assert "комиссия" in plan["kit"].skip and not plan["lamoda"].skip
+
+
+def test_auto_follow_waits_when_current_price_is_unknown(db):
+    w, kit, lam = _setup(db)
+    row = db.query(PlatformItem).filter_by(account_id=kit.id).one()
+    row.current_price = row.current_sale_price = None
+    settings.put(db, settings.ETALON_FOLLOW_AUTO, "1")
+    db.commit()
+    log = []
+    st = etalon.follow_all(db, client_factory=lambda p, c: Fake(log))
+    assert "КИТ" not in st["sent"] and st["big"] == 1
+
+
+def test_new_etalon_cancels_queued_follower_price(db):
+    w, kit, lam = _setup(db)
+    db.add(PriceChange(item_id="s1", account_id=kit.id, barcode="b1", new_price=5200, status="approved",
+                       source="follow"))
+    db.commit()
+    etalon.set_etalon(db, "100", 4000, "оператор", client_factory=lambda p, c: Fake([]))
+    ch = db.query(PriceChange).filter_by(account_id=kit.id).one()
+    assert ch.status == "rejected" and "новый эталон" in ch.note
+
+
+def test_new_etalon_is_recorded_as_our_last_sent_on_wb(db):
+    from priceapp.models import ProductPrice
+    w, kit, lam = _setup(db)
+    etalon.set_etalon(db, "100", 4000, "оператор", client_factory=lambda p, c: Fake([]))
+    pp = db.query(ProductPrice).filter_by(account_id=w.id, item_id="s1").one()
+    assert pp.last_sent_price == 8000

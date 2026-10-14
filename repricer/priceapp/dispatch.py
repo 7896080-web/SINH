@@ -54,6 +54,10 @@ def _record_sent(db: Session, item_id: str, account_id: int, price: int) -> None
     pp.last_sent_at = now_utc()
 
 
+LAMODA_REFUSED = ("Ламода — цены ставит страница «Эталонные цены» (цена со скидкой и даты скидки); "
+                  "общая отправка шлёт только цену и сбила бы скидку")
+
+
 def _commission_ok(c) -> bool:
     return c is not None and Decimal(0) <= c < Decimal(100)
 
@@ -67,6 +71,20 @@ def run_account(db: Session, account: Account, client) -> dict:
     подтверждённый дешёвый размер утянул бы карточку — а с ней и дорогой размер —
     ниже его пола, и никто бы этого не проверил."""
     from priceapp import mapping
+
+    if account.platform == "lamoda":
+        # Ламоде нужна цена со скидкой и даты скидки — их ставит страница «Эталонные цены»;
+        # голая `price` отсюда сбила бы скидку. Отказ здесь — одна точка на ВСЕ пути
+        # (кнопка, файл предложений, диапазон безопасности).
+        refused = (db.query(PriceChange)
+                   .filter(PriceChange.account_id == account.id,
+                           PriceChange.status == PriceChangeStatus.approved.value,
+                           PriceChange.is_test.is_(False)).all())
+        for ch in refused:
+            ch.status = PriceChangeStatus.rejected.value
+            ch.note = LAMODA_REFUSED[:255]
+        db.commit()
+        return {"refused": len(refused)} if refused else {}
 
     approved = (db.query(PriceChange)
                 .filter(PriceChange.account_id == account.id,
@@ -149,7 +167,9 @@ def run_account(db: Session, account: Account, client) -> dict:
                 desired[sib] = p
         price = max(desired.values())
         problem = None
-        for item_id in desired:
+        # Пол — у КАЖДОГО размера карточки, в том числе у того, чьей цены мы не знаем
+        # (новая карточка, кабинет до загрузки цен): цена уйдёт на всю карточку.
+        for item_id in sorted(set(desired) | members.get(key, set())):
             facts = item_facts(rule, items.get(item_id, []))
             if not _commission_ok(facts.commission):
                 problem = (f"комиссия {facts.commission}% у «{size_label(item_id)}» вне 0–99,99 — "

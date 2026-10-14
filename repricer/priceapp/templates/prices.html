@@ -19,7 +19,7 @@
 ({{ rate_shift.was|money(4) }} → {{ rate_shift.now|money(4) }} ₽) — новые цены видны на <a href="/sku-prices?flt=changes">«Ценах товаров»</a> (отбор «новая цена ≠ текущей»), там же их и передавать. Порог — на странице «Курс $».</div>{% endif %}
 <div class="row saved-filters" style="margin-bottom:10px">
   {% for sf in saved_filters if view != 'rules' %}<span class="chip"><a href="{{ sf.url }}">{{ sf.name }}</a>
-    <form method="post" action="/filters/{{ sf.id }}/delete" style="display:inline"><button class="chip-x" title="Удалить отбор" onclick="return confirm('Удалить отбор «{{ sf.name }}»?')">×</button></form></span>{% endfor %}
+    <form method="post" action="/filters/{{ sf.id }}/delete" style="display:inline"><button class="chip-x" title="Удалить отбор" onclick="return confirm('Удалить отбор «{{ sf.name|js }}»?')">×</button></form></span>{% endfor %}
   {% if view not in ('rules', 'compare') %}<form method="post" action="/filters/save" class="row" style="gap:6px">
     <input type="hidden" name="url" value="{{ current_url }}">
     <input name="name" placeholder="имя отбора" style="width:160px" required>

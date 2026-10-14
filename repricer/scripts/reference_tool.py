@@ -17,6 +17,10 @@ r"""Служебная утилита эталонных цен WB (запуск
 import sys
 from pathlib import Path
 
+# Консоль Windows — cp1251: символ из имени кабинета или ответа площадки, которого в ней нет,
+# ронял бы вывод на полуслове. «?» вместо символа лучше трассировки.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(errors="replace")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import os
 os.environ.setdefault("REPRICER_SESSION_SECRET", "x" * 32)

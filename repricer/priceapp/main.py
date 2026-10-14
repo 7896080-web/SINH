@@ -50,18 +50,27 @@ async def mark_attention_dirty(request: Request, call_next):
     счётчики «Внимания» по товарам после него устарели. Пометка дешёвая; пересчёт
     делает фон."""
     response = await call_next(request)
-    if request.method == "POST" and response.status_code < 500 and request.url.path not in ("/login", "/logout"):
-        from priceapp import overview
-        from priceapp.database import SessionLocal
-        db = SessionLocal()
-        try:
-            overview.mark_dirty(db)
-            db.commit()
-        except Exception:
-            db.rollback()
-        finally:
-            db.close()
+    if (request.method == "POST" and response.status_code < 500
+            and request.url.path not in ("/login", "/logout", "/attention/refresh")):
+        # Запись — в пуле потоков: при занятой базе синхронный commit держал бы единственный
+        # цикл событий до 30 с, и замирал бы весь интерфейс (аудит 14.10). «Пересчитать сейчас»
+        # только что посчитал всё — помечать его результат устаревшим незачем.
+        from starlette.concurrency import run_in_threadpool
+        await run_in_threadpool(_mark_dirty)
     return response
+
+
+def _mark_dirty() -> None:
+    from priceapp import overview
+    from priceapp.database import SessionLocal
+    db = SessionLocal()
+    try:
+        overview.mark_dirty(db)
+        db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
 
 
 app.mount("/static", StaticFiles(directory=str(Path(__file__).resolve().parent / "static")),

@@ -20,6 +20,8 @@ def health(db: Session = Depends(get_db)):
         db.execute(text("SELECT 1"))
     except Exception as e:
         return JSONResponse({"ok": False, "db": str(e)[:200]}, status_code=503)
+    from priceapp.workers import background
     stale = stale_workers(db)
-    body = {"ok": not stale, "stale": stale}
-    return JSONResponse(body, status_code=200 if not stale else 503)
+    dead = background.dead_threads()
+    body = {"ok": not stale and not dead, "stale": stale, "dead_threads": dead}
+    return JSONResponse(body, status_code=200 if body["ok"] else 503)

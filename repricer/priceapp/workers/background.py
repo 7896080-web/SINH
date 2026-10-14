@@ -49,20 +49,44 @@ def heavy_alive() -> bool:
     return _heavy is not None and _heavy.is_alive()
 
 
+def fast_alive() -> bool:
+    return _thread is not None and _thread.is_alive()
+
+
+def dead_threads() -> list[str]:
+    """Какие фоновые потоки должны работать, но умерли (пусто, если фон не запускали)."""
+    if _thread is None:
+        return []
+    return [name for name, alive in (("быстрый (1С, отправка, курс, копия)", fast_alive()),
+                                     ("тяжёлый (обновление, опрос WB, «Внимание»)", heavy_alive())) if not alive]
+
+
+def _safe(fn, *args, **kwargs):
+    """Задание не роняет поток НИКОГДА. Сами задания ловят свои ошибки, но отметка heartbeat
+    пишется из `except` и при занятой или сломанной базе падает сама — а исключение вне
+    цикла навсегда останавливало поток: отправка цен, 1С и копия стояли до перезапуска
+    службы, а процесс оставался живым, и NSSM этого не видел (аудит 14.10)."""
+    try:
+        return fn(*args, **kwargs)
+    except Exception:
+        logger.exception("фоновое задание %s упало", getattr(fn, "__name__", fn))
+        return None
+
+
 def _loop() -> None:
     started = time.monotonic()
     last = {"dispatch": 0.0, "rate": -RATE_EVERY}
     while not _stop.is_set():
         now = time.monotonic()
-        jobs.job_onec_exchange()
+        _safe(jobs.job_onec_exchange)
         if now - last["rate"] >= RATE_EVERY:
-            jobs.job_rate()
+            _safe(jobs.job_rate)
             last["rate"] = now
         if now - last["dispatch"] >= DISPATCH_EVERY:
-            jobs.job_price_dispatch()
+            _safe(jobs.job_price_dispatch)
             last["dispatch"] = now
         if now - started >= BACKUP_FIRST_AFTER:
-            jobs.job_backup()
+            _safe(jobs.job_backup)
         _stop.wait(TICK)
 
 
@@ -73,15 +97,15 @@ def _heavy_loop() -> None:
         now = time.monotonic()
         if now - started >= REFRESH_FIRST_AFTER and (
                 last["refresh"] is None or now - last["refresh"] >= REFRESH_EVERY):
-            jobs.job_daily_refresh(force_prices=last["refresh"] is None)
+            _safe(jobs.job_daily_refresh, force_prices=last["refresh"] is None)
             last["refresh"] = now
         if now - started >= REFRESH_FIRST_AFTER and (
-                last["wb"] is None or now - last["wb"] >= WB_POLL_EVERY or jobs.wb_poll_requested()
-                or jobs.scheduled_wb_poll_due()):
-            jobs.job_wb_poll()
+                last["wb"] is None or now - last["wb"] >= WB_POLL_EVERY or _safe(jobs.wb_poll_requested)
+                or _safe(jobs.scheduled_wb_poll_due)):
+            _safe(jobs.job_wb_poll)
             last["wb"] = time.monotonic()
-        if last["attention"] is None or now - last["attention"] >= ATTENTION_EVERY or jobs.attention_dirty():
-            jobs.job_attention()
+        if last["attention"] is None or now - last["attention"] >= ATTENTION_EVERY or _safe(jobs.attention_dirty):
+            _safe(jobs.job_attention)
             last["attention"] = time.monotonic()
         _stop.wait(HEAVY_TICK)
 

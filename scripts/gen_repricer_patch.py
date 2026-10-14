@@ -128,11 +128,18 @@ def main() -> None:
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     repo = Path(__file__).resolve().parent.parent
+    # Патч собирается из КОММИТА, а не из рабочей папки: иначе на боевой сервер уехал бы
+    # непроверенный, возможно недописанный код, а следующий патч отказал бы по этим файлам
+    # как «изменены на месте» (аудит 14.10).
+    dirty = subprocess.run(["git", "status", "--porcelain", "--", "repricer"], cwd=repo, check=True,
+                           capture_output=True).stdout.decode("utf-8").strip()
+    if dirty:
+        raise SystemExit("В repricer/ есть незакоммиченные изменения — сначала коммит:\n" + dirty)
     names = subprocess.run(["git", "-c", "core.quotepath=off", "ls-files", "-z", "repricer"],
                            cwd=repo, check=True, capture_output=True).stdout.decode("utf-8").split("\0")
     files = []
     for name in sorted(n for n in names if n):
-        data = (repo / name).read_bytes()
+        data = subprocess.run(["git", "show", f"HEAD:{name}"], cwd=repo, check=True, capture_output=True).stdout
         files.append((name[len("repricer/"):], hashlib.sha256(data).hexdigest(),
                       base64.b64encode(data).decode("ascii")))
     src = APPLY.format(tag=args.tag, files=files, known=known_versions(repo, [f[0] for f in files])).encode("utf-8")
