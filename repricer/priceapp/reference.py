@@ -14,7 +14,8 @@
    отправляется, а уходит во «Внимание»: так выглядит ошибочный эталон, а не занижение.
 2. «Курс». Курс ушёл от курса эталонной больше чем на `ref_rate_percent` (2%) — эталон
    пересчитывается ПО КУРСУ (× новый / прежний, скидка та же), затем работает правило 1.
-   Скачок больше 20% — эталоны не трогаются, запись в журнал (скорее опечатка в курсе).
+   Скачок больше 20% — повторный запрос к ЦБ: подтвердил — пересчёт, нет — в следующий раз
+   (ручной курс повторно не запросить — у него скачок не применяется, запись в журнал).
 
 Только кабинеты WB. Опрос площадки — при запуске программы и раз в 6 часов
 (`workers/jobs.job_wb_poll`), а также сразу, когда курс ушёл за порог.
@@ -32,7 +33,8 @@ from priceapp.timeutils import now_utc
 
 SOURCE = "reference"
 PLATFORMS = ("wb",)
-MAX_RATE_JUMP = Decimal("0.2")
+MAX_RATE_JUMP = Decimal("0.2")             # скачок курса — повторный запрос к ЦБ перед пересчётом
+RATE_CONFIRM_TOLERANCE = Decimal("0.005")   # повторный ответ ЦБ «тот же», если разница не больше 0,5%
 COMMIT_EVERY = 500
 
 
@@ -202,7 +204,32 @@ def _nm(item) -> str:
     return nm if nm.isdigit() else ""
 
 
-def run(db: Session, product_rows=None, actor: str = "программа", client_factory=None) -> dict:
+def confirm_rate_jump(db: Session, rate, cbr_session=None) -> tuple[object, bool, str]:
+    """Курс ушёл от курса эталонов больше чем на `MAX_RATE_JUMP` — повторный запрос к ЦБ.
+    Подтвердил тот же курс — скачок настоящий, эталоны пересчитываются (решение владельца
+    14.10: курс берётся у ЦБ автоматически, ограничение снимается повторным запросом).
+    Не ответил или дал другое число — в этот раз не пересчитываем: следующий опрос спросит
+    снова. Ручной курс повторно не запросить — у него защита от опечатки остаётся.
+    -> (курс, подтверждён ли скачок, пояснение)."""
+    if rate is None:
+        return rate, False, ""
+    seen = {_dec(r) for (r,) in db.query(ReferencePrice.usd_rub).distinct() if r}
+    if not any(abs(_dec(rate.usd_rub) / v - 1) > MAX_RATE_JUMP for v in seen):
+        return rate, False, ""
+    if rate.source != "cbr":
+        return rate, False, "курс задан вручную — проверьте его на странице «Курс $»"
+    try:
+        row = rates.fetch_cbr(db, cbr_session)
+    except Exception as e:
+        return rate, False, f"повторный запрос к ЦБ не удался ({e}) — спросим при следующем опросе"[:300]
+    fresh = _dec(row.usd_rub)
+    if abs(fresh / _dec(rate.usd_rub) - 1) <= RATE_CONFIRM_TOLERANCE:
+        return rates.current(db), True, f"повторный запрос к ЦБ подтвердил курс {fresh}"
+    return rates.current(db), False, (f"повторный запрос к ЦБ дал {fresh} вместо {rate.usd_rub} — "
+                                      "пересчитаем, когда курс подтвердится")
+
+
+def run(db: Session, product_rows=None, actor: str = "программа", client_factory=None, cbr_session=None) -> dict:
     """Пересчёт эталонных по курсу и возврат эталонной цены ПОСЛЕ СКИДКИ ПРОДАВЦА там, где
     площадка её занизила — ценой до скидки, скидкой (автоакция) или обоими.
 
@@ -220,6 +247,11 @@ def run(db: Session, product_rows=None, actor: str = "программа", clien
         st["disabled"] = True
         return st
     rate = rates.current(db)
+    rate, jump_confirmed, jump_note = confirm_rate_jump(db, rate, cbr_session)
+    if jump_confirmed:
+        audit.log(db, actor, "reference_rate_jump", "",
+                  f"курс ушёл больше чем на {int(MAX_RATE_JUMP * 100)}% от курса эталонов; {jump_note} — "
+                  "эталоны пересчитываются")
     rate_thr = rate_percent(db) / 100
     drop, max_raise = drop_percent(db), max_raise_percent(db)
     now = now_utc()
@@ -246,7 +278,7 @@ def run(db: Session, product_rows=None, actor: str = "программа", clien
             # и правило 2 само поднимало WB (проба: +93% без человека; аудит 14.10).
             if rate is not None and ref.usd_rub and ref.ref_price:
                 ratio = _dec(rate.usd_rub) / _dec(ref.usd_rub)
-                if abs(ratio - 1) > MAX_RATE_JUMP:
+                if abs(ratio - 1) > MAX_RATE_JUMP and not jump_confirmed:
                     rate_jumps.add(f"{ref.usd_rub} -> {rate.usd_rub}")
                 elif abs(ratio - 1) > rate_thr:
                     ref.ref_price = int((Decimal(ref.ref_price) * ratio).to_integral_value(rounding=ROUND_HALF_UP))
@@ -273,11 +305,11 @@ def run(db: Session, product_rows=None, actor: str = "программа", clien
             cards[nm]["items"].add(r["item_id"])
         st["revalued"] += revalued
         if rate_jumps:
-            # Скачок больше `MAX_RATE_JUMP` — скорее опечатка в ручном курсе, чем рынок: эталоны не
-            # трогаем, пусть решает человек (страница «Курс $»).
+            # Скачок больше `MAX_RATE_JUMP` не подтвердился повторным запросом к ЦБ (или курс
+            # ручной) — в этот раз эталоны не трогаем; следующий опрос спросит ЦБ снова.
             audit.log(db, actor, "reference_rate_jump", a.name,
-                      f"курс ушёл больше чем на {int(MAX_RATE_JUMP * 100)}% от курса эталона ({'; '.join(sorted(rate_jumps))[:300]}) — "
-                      "эталоны НЕ пересчитаны: проверьте курс")
+                      f"курс ушёл больше чем на {int(MAX_RATE_JUMP * 100)}% от курса эталона "
+                      f"({'; '.join(sorted(rate_jumps))[:200]}) — эталоны НЕ пересчитаны: {jump_note}"[:1000])
         st["eaten"] += len(big)
         if big:
             audit.log(db, actor, "reference_big", a.name,

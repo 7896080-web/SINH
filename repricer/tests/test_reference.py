@@ -295,7 +295,8 @@ def test_rate_move_scales_a_manual_etalon_and_never_replaces_it(db):
     assert st["revalued"] == 1 and ref.ref_price == 4120 and wb.calls == []   # 4000 × 1,03; площадка держит 2500
 
 
-def test_rate_jump_over_20_percent_is_not_applied(db):
+def test_manual_rate_jump_over_20_percent_is_not_applied(db):
+    """Ручной курс повторно у ЦБ не запросить — у него скачок остаётся защитой от опечатки."""
     acc = _setup(db)
     _ref(db, acc, 2009)
     f.manual_rate(db, "8.15")                                     # опечатка вместо 81,5
@@ -304,3 +305,48 @@ def test_rate_jump_over_20_percent_is_not_applied(db):
     from priceapp.models import AuditLog
     assert st["revalued"] == 0 and db.query(ReferencePrice).one().ref_price == 2009
     assert db.query(AuditLog).filter_by(action="reference_rate_jump").count() == 1
+
+
+def _cbr(db, value, days_ago=0):
+    from datetime import date, timedelta
+
+    from priceapp import settings
+    from priceapp.models import ExchangeRate
+    settings.put(db, settings.RATE_MODE, "cbr")
+    row = ExchangeRate(rate_date=date(2026, 10, 14) - timedelta(days=days_ago), source="cbr", usd_rub=Decimal(value))
+    db.add(row)
+    db.commit()
+    return row
+
+
+def test_cbr_rate_jump_is_confirmed_by_a_second_request_and_applied(db, monkeypatch):
+    """Решение владельца 14.10: курс берётся у ЦБ; скачок больше 20% — повторный запрос к ЦБ,
+    подтвердился — эталоны пересчитываются."""
+    from priceapp import rates
+    from priceapp.models import AuditLog
+    acc = _setup(db)
+    _cbr(db, "80", days_ago=1)
+    _ref(db, acc, 2009)                                           # эталон по курсу 80
+    row = _cbr(db, "100")                                         # +25%
+    calls = []
+    monkeypatch.setattr(rates, "fetch_cbr", lambda db, session=None: calls.append(1) or row)
+    st, wb = _run(db)
+    db.expire_all()
+    assert calls == [1] and st["revalued"] == 1
+    assert db.query(ReferencePrice).one().ref_price == 2511        # 2009 × 100 / 80 = 2511,25
+    assert "подтвердил" in db.query(AuditLog).filter_by(action="reference_rate_jump").one().details
+
+
+def test_cbr_rate_jump_waits_when_second_request_fails(db, monkeypatch):
+    from priceapp import rates
+    acc = _setup(db)
+    _cbr(db, "80", days_ago=1)
+    _ref(db, acc, 2009)
+    _cbr(db, "100")
+
+    def down(db, session=None):
+        raise rates.RateError("ЦБ недоступен")
+    monkeypatch.setattr(rates, "fetch_cbr", down)
+    st, wb = _run(db)
+    db.expire_all()
+    assert st["revalued"] == 0 and db.query(ReferencePrice).one().ref_price == 2009
