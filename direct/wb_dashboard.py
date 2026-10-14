@@ -63,7 +63,12 @@ def load_db():
 
 
 def load_autopilot():
-    ap = {"runs": [], "guard_runs": [], "topups": [], "rules": {}, "caps_at": None, "guard_last": [], "bids_last": None}
+    ap = {"runs": [], "guard_runs": [], "topups": [], "rules": {}, "caps_at": None, "guard_last": [], "bids_last": None,
+          "budget": None}
+    try:                                   # предложения wb_budget.py (пробный прогон раз в сутки после автопилота)
+        ap["budget"] = json.loads((HERE / "wb_budget_proposals.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        pass
     try:
         state = json.loads(STATE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -207,6 +212,13 @@ pre { white-space: pre-wrap; font: 12px/1.45 ui-monospace, Consolas, monospace; 
 .status { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; }
 .status i { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
 .muted { color: var(--muted); }
+.bud { display: flex; gap: 10px; align-items: flex-start; padding: 8px 0; border-bottom: 1px solid var(--grid); font-size: 13px; }
+.bud .mk { font-weight: 700; width: 16px; flex: none; } .bud .mk.up { color: var(--good); } .bud .mk.down { color: var(--bad); }
+.bud .tx { flex: 1; min-width: 0; } .bud .tx b { font-weight: 600; }
+.bud code { display: inline-block; margin-top: 4px; font: 12px ui-monospace, Consolas, monospace; background: var(--page);
+  border: 1px solid var(--grid); border-radius: 6px; padding: 2px 6px; user-select: all; overflow-wrap: anywhere; }
+.bud .done { color: var(--good); font-size: 12px; }
+.hold { font-size: 12.5px; color: var(--ink2); padding: 3px 0; }
 </style>
 </head>
 <body>
@@ -241,6 +253,8 @@ pre { white-space: pre-wrap; font: 12px/1.45 ui-monospace, Consolas, monospace; 
     <div class="card"><h2>Пополнения бюджетов за 7 дней</h2><p class="note">Сколько автопилот перевёл с «Баланса» против недельного потолка кампании</p><div id="ap-topups"></div>
       <h2 style="margin-top:14px">Последняя часовая проверка</h2><pre id="ap-guard"></pre></div>
   </div>
+  <section class="card" id="bud-sec" style="margin-bottom:16px"><h2>Бюджет по окупаемости</h2>
+    <p class="note" id="bud-note"></p><div id="bud"></div></section>
   <section id="prod-sec" class="card">
     <div class="filters" style="margin:0 0 8px"><h2 style="margin:0">Товары за период</h2><span class="spacer"></span><input type="search" id="q" placeholder="Поиск: артикул или название" aria-label="Поиск товара"></div>
     <div class="scroll"><table id="prod"></table></div>
@@ -470,6 +484,35 @@ function renderAutopilot() {
   $("#ap-guard").textContent = A.guard_last.length ? A.guard_last.join("\n") : "Часовая проверка ещё не запускалась.";
 }
 
+// ---------- бюджет по окупаемости (wb_budget.py) ----------
+function renderBudget() {
+  const B = D.autopilot.budget, box = $("#bud"); box.textContent = "";
+  if (!B) {
+    $("#bud-note").textContent = "";
+    h("div", {class: "empty"}, box, "Предложений пока нет — их раз в сутки после утреннего автопилота считает wb_budget.py (или запустите: python wb_budget.py).");
+    return;
+  }
+  const at = B.at.slice(8, 10) + "." + B.at.slice(5, 7) + " " + B.at.slice(11, 16);
+  $("#bud-note").textContent = "Расчёт от " + at + ". Окупаемым кампаниям, которым не хватает денег, — прибавка лимитов; не окупившуюся прибавку — вернуть. Сам расчёт ничего не меняет: применить — командой под предложением (в C:\\direct), откат — python wb_budget.py --rollback.";
+  const mine = (B.items || []).filter(p => !state.cab || p.cabinet === state.cab);
+  const act = mine.filter(p => p.action !== "hold"), hold = mine.filter(p => p.action === "hold");
+  if (!act.length) h("div", {class: "empty", style: "padding:12px 0"}, box, "Прибавлять сейчас некому" + (state.cab ? " в этом кабинете" : "") + " — причины ниже.");
+  act.forEach(p => {
+    const row = h("div", {class: "bud"}, box);
+    h("span", {class: "mk " + (p.action === "raise" ? "up" : "down")}, row, p.action === "raise" ? "▲" : "▼");
+    const tx = h("div", {class: "tx"}, row);
+    h("b", {}, tx, (p.name || p.advert_id) + (p.advert_id !== "_week_budget" ? " (" + p.advert_id + ")" : ""));
+    h("div", {}, tx, p.text);
+    if (p.applied) h("div", {class: "done"}, tx, "✓ записано — действует с ближайшего запуска автопилота");
+    else if (p.advert_id !== "_week_budget") h("code", {}, tx, "python wb_budget.py --apply --only " + p.advert_id);
+    else h("div", {class: "muted", style: "font-size:12px"}, tx, "Поднимется вместе с прибавкой кампаний кабинета.");
+  });
+  if (hold.length) {
+    const d = h("details", {}, box); h("summary", {}, d, "Без прибавки: " + hold.length + " — почему");
+    hold.forEach(p => h("div", {class: "hold"}, d, "· " + (state.cab ? "" : p.cabinet + ": ") + (p.name || p.advert_id) + " — " + p.text));
+  }
+}
+
 // ---------- товары ----------
 let sortKey = "spend", sortDir = -1;
 function renderProducts(agg, cab) {
@@ -502,7 +545,7 @@ function renderProducts(agg, cab) {
 function render() {
   $("#sub").textContent = "собрано " + D.generated;
   document.querySelectorAll("#period button").forEach(b => b.setAttribute("aria-pressed", String(+b.dataset.d === state.days)));
-  if (!D.has_db || !state.cab) { $("#nodb").hidden = false; $("#main").hidden = true; $("#prod-sec").hidden = true; renderAutopilot(); return; }
+  if (!D.has_db || !state.cab) { $("#nodb").hidden = false; $("#main").hidden = true; $("#prod-sec").hidden = true; renderAutopilot(); renderBudget(); return; }
   const cab = state.cab, end = lastDate(cab), dates = dateList(end, state.days), prevDates = dateList(dateList(end, state.days + 1)[0], state.days);
   $("#range").textContent = ddmm(dates[0]) + " – " + ddmm(end) + "." + end.slice(0, 4) + " (последний день в данных)";
   const A = aggregate(cab, dates), B = aggregate(cab, prevDates), t = A.tot, p = B.tot;
@@ -527,6 +570,7 @@ function render() {
   chart($("#c-pos"), {dates, kind: "line", invert: true, endLabels: true, fmt: (v) => v == null ? "—" : fmt0.format(v), fmtAxis: (v) => fmt0.format(v), label: "Позиция в поиске",
     series: top.map((x, i) => ({name: (names[x.nm] || [String(x.nm)])[0] || String(x.nm), color: colors[i], vals: dates.map(d => (posBy[x.nm] || {})[d] ?? null)}))});
   renderAutopilot();
+  renderBudget();
   renderProducts(A, cab);
 }
 // фильтры
