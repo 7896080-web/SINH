@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+{% block title %}Эталонные цены{% endblock %}
+{% block content %}
+{% macro rub(v) %}{% if v is none %}—{% else %}{{ '{:,}'.format(v).replace(',', ' ') }}{% endif %}{% endmacro %}
+<style>
+.et-table td { vertical-align:top; font-size:13px; }
+.et-table .sub { color:var(--muted); font-size:12px; white-space:nowrap; }
+.et-table tr.diff td:first-child { border-left:3px solid var(--warn, #c80); }
+.et-new input { width:86px; }
+.et-plan td { padding:3px 10px 3px 0; }
+</style>
+<h1>Эталонные цены</h1>
+<p class="muted">Эталон — цена WB <b>после скидки продавца</b>, средняя по карточкам всех кабинетов WB. Все площадки
+следуют за ним: цена после скидки продавца = эталон − сдвиг площадки, скидка — целая, в коридоре {{ lo }}–{{ hi }}%.
+Сменили эталон здесь — новая цена уходит сразу на WB и на все площадки-последователи.</p>
+
+{% if preview %}
+<div class="card" style="border-color:var(--accent, #36c)">
+  <h2 style="margin-top:0">{{ preview.art }}: эталон {{ rub(preview.et.sale) }} → <b>{{ rub(preview.sale) }} ₽</b></h2>
+  <table class="et-plan">
+    {% for p in preview.wb %}<tr><td><b>WB</b> {{ p.card.account.name }}</td><td>карточка {{ p.card.nm }}</td>
+      <td>сейчас {{ rub(p.card.cur_list) }} / {{ rub(p.card.cur_sale) }}</td>
+      <td>→ <b>{{ rub(p.new_list) }}</b>, скидка {{ p.disc }}% = {{ rub(preview.sale) }}</td>
+      <td>{% if p.skip %}<span class="badge bad">{{ p.skip }}</span>{% elif p.step %}<span class="badge warn">снижение шагами, сейчас {{ rub(p.step) }}</span>{% endif %}</td></tr>{% endfor %}
+    {% for c in preview.fol %}<tr><td><b>{{ names[c.platform] }}</b> {{ c.account.name }}</td><td>{{ c.key }}</td>
+      <td>сейчас {{ rub(c.cur_list) }} / {{ rub(c.cur_sale) }}</td>
+      <td>{% if c.target %}→ <b>{{ rub(c.new_list) }}</b>{% if c.disc is not none %}, скидка {{ c.disc }}% = {{ rub(c.target) }}{% endif %}{% endif %}</td>
+      <td>{% if c.skip %}<span class="badge bad">{{ c.skip }}</span>{% elif c.same %}<span class="badge ok">уже так</span>{% endif %}</td></tr>{% endfor %}
+  </table>
+  {% if preview.wb|selectattr('skip')|list %}<p class="bad">Ниже пола — эталон не запишется. Поднимите цену или проверьте себестоимость.</p>
+  {% else %}
+  <form method="post" action="/etalon/set" class="row" onsubmit="return confirm('Новый эталон {{ preview.art }}: {{ preview.sale }} ₽ — отправить на WB и все площадки?')">
+    <input type="hidden" name="art" value="{{ preview.art }}"><input type="hidden" name="sale" value="{{ preview.sale }}">
+    <button>Применить на все площадки</button>
+    <a class="btn secondary" href="/etalon?q={{ preview.art }}">Отмена</a>
+  </form>{% endif %}
+</div>
+{% endif %}
+
+<div class="card">
+  <b>Сейчас:</b> артикулов с эталоном — {{ with_etalon }}.
+  {% for p in followers %}{% set k = counts[p] %}
+  <span style="margin-left:12px">{{ names[p] }}: держат эталон {{ k.same }}, расходятся <b>{{ k.diff }}</b>{% if k.big %} (из них с шагом больше {{ max_step|int }}% — {{ k.big }}){% endif %}{% if k.skip %}, не отправляются {{ k.skip }}{% endif %}.</span>
+  {% else %}<span class="muted">Ни одна площадка не следует за эталоном — задайте сдвиг ниже.</span>{% endfor %}
+  {% set total_diff = counts.values()|sum(attribute='diff') %}
+  {% if total_diff %}<form method="post" action="/etalon/follow-now" style="display:inline;margin-left:12px"
+    onsubmit="return confirm('Отправить на площадки цены от эталона по {{ total_diff }} карточкам (включая большой шаг)?')">
+    <button>Привести все площадки к эталону ({{ total_diff }})</button></form>{% endif %}
+</div>
+
+<details class="card" {% if not followers %}open{% endif %}><summary><b>Настройки следования</b> — сдвиг по площадкам, коридор скидки, автоматически</summary>
+<form method="post" action="/etalon/settings" class="row" style="margin-top:8px">
+  {% for p in ('kit', 'lamoda', 'ozon') %}<label>{{ names[p] }}: эталон −, %<input name="shift_{{ p }}" value="{{ shifts[p] }}" inputmode="decimal" style="width:60px" placeholder="не следует"></label>{% endfor %}
+  <label>Скидка от, %<input name="lo" value="{{ lo }}" style="width:50px"></label>
+  <label>до, %<input name="hi" value="{{ hi }}" style="width:50px"></label>
+  <label style="flex-direction:row;gap:6px;align-items:center"><input type="checkbox" name="auto" value="1" {% if auto %}checked{% endif %}>
+    автоматически при каждом опросе WB</label>
+  <button class="secondary">Сохранить</button>
+</form>
+<p class="muted" style="margin-bottom:0">Пусто в сдвиге — площадка за эталоном не следует. «Автоматически» — при опросе WB программа сама
+приводит площадки к эталону, но не больше чем на {{ max_step|int }}% за раз (крупнее — кнопкой выше). Пока выключено, Kit идёт за WB
+по прежнему правилу. Ламоде скидка ставится на {{ sale_days }} дней.</p>
+</details>
+
+<details class="card"><summary><b>Excel</b> — сменить эталон многим артикулам файлом</summary>
+<div class="row" style="margin-top:8px">
+  <a class="btn secondary" href="/etalon/export">Выгрузить в Excel</a>
+  <form method="post" action="/etalon/import" enctype="multipart/form-data" class="row"
+    onsubmit="return confirm('Применить новые эталоны из файла — цены сразу уйдут на WB и все площадки?')">
+    <label>Файл с заполненной колонкой «Новый эталон, ₽» (пусто — без изменений)<input type="file" name="file" accept=".xlsx" required></label>
+    <button class="secondary">Загрузить и применить</button>
+  </form>
+</div></details>
+
+<form method="get" action="/etalon" class="row" style="margin-bottom:8px">
+  <label>Артикул или название<input name="q" value="{{ q }}" placeholder="27643"></label>
+  <label>Показать<select name="flt" onchange="this.form.submit()">
+    <option value="">все</option><option value="diff" {% if flt == 'diff' %}selected{% endif %}>расходятся с эталоном</option>
+    <option value="noetalon" {% if flt == 'noetalon' %}selected{% endif %}>без эталона</option></select></label>
+  <button class="secondary">Найти</button>
+</form>
+
+<div class="scroll"><table class="et-table">
+<tr><th>Артикул</th><th class="num">Эталон, ₽</th><th>WB по кабинетам</th>
+{% for p in followers %}<th>{{ names[p] }} (−{{ shifts[p] }}%)</th>{% endfor %}<th>Новый эталон</th></tr>
+{% for r in rows %}{% set et = r.et %}
+<tr class="{{ 'diff' if r.diff else '' }}">
+  <td><b>{{ et.article }}</b><div class="sub" style="white-space:normal;max-width:220px">{{ et.name }}</div></td>
+  <td class="num"><b>{{ rub(et.sale) }}</b></td>
+  <td>{% for c in et.cards %}<div class="sub">{{ c.account.name }} {{ c.nm }}: {% if c.ref_sale %}{{ rub(c.ref_list) }} −{{ c.ref_disc }}% = {{ rub(c.ref_sale) }}{% else %}эталона нет{% endif %}
+    {% if c.cur_sale and c.ref_sale and c.cur_sale != c.ref_sale %} · <span class="warn">сейчас {{ rub(c.cur_sale) }}</span>{% endif %}</div>{% endfor %}</td>
+  {% for p in followers %}<td>{% for c in r.fol.get(p, []) %}<div class="sub">
+    {% if c.skip %}<span class="bad">{{ c.skip }}</span>{% elif c.same %}<span class="ok">{{ rub(c.target) }} ✓</span>{% else %}
+    сейчас {{ rub(c.cur_sale) }} → <b>{{ rub(c.target) }}</b>{% endif %}</div>{% else %}<span class="muted">—</span>{% endfor %}</td>{% endfor %}
+  <td class="et-new"><form method="get" action="/etalon" class="row" style="gap:4px">
+    <input type="hidden" name="art" value="{{ et.article }}"><input type="hidden" name="q" value="{{ q }}">
+    <input name="new" inputmode="numeric" placeholder="{{ et.sale or '' }}"><button class="secondary" style="padding:4px 8px">Показать</button></form></td>
+</tr>
+{% else %}<tr><td colspan="{{ 4 + followers|length }}" class="muted">Нет артикулов под этот отбор.</td></tr>{% endfor %}
+</table></div>
+<p class="muted">{% if total > rows|length %}Показаны первые {{ rows|length }} из {{ total }} — уточните поиск или выгрузите Excel.{% else %}Артикулов: {{ total }}.{% endif %}
+«Показать» ничего не отправляет — сначала видно, что уйдёт на каждую площадку, затем «Применить на все площадки».</p>
+{% endblock %}

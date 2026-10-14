@@ -49,6 +49,7 @@ templates.env.filters["local"] = local
 
 NAV = [
     ("attention", "/attention", "Внимание"),
+    ("etalon", "/etalon", "Эталонные цены"),
     ("sku_prices", "/sku-prices", "Цены товаров"),
     # «Утверждение цен» (/approval) из меню убрано 14.10: цены WB задаёт эталон по форме
     # маржинальности, Kit идёт за WB сам. Страница открывается по прямой ссылке.
