@@ -25,7 +25,7 @@ import math
 from collections import defaultdict
 
 from wb_common import (HERE, ApiError, YESTERDAY, ad_stats, arg_cabinet, campaigns, cut, fm, funnel, load_tokens,
-                       load_unit, log, num, pct, read_csv, save_log, stat_rows, to_float, write_csv)
+                       load_unit, log, num, pct, read_csv, save_log, stat_rows, to_float, write_csv, each_cabinet)
 
 
 def age_days(name):
@@ -51,7 +51,7 @@ def day(s):
 
 def analyze(cab, token):
     log(f"\n{'═' * 20} {cab} {'═' * 20}")
-    print("  заказы и продажи (WB отдаёт раз в минуту)...")
+    print(f"  {cab}: заказы и продажи (WB отдаёт раз в минуту)...", flush=True)
     orders = stat_rows(token, "orders", P1)
     sales = stat_rows(token, "sales", P1)
     O = defaultdict(lambda: defaultdict(float))      # (день, артикул) → заказы
@@ -80,7 +80,7 @@ def analyze(cab, token):
         elif str(r.get("saleID") or "").startswith("R"):
             o["returns"] += 1
 
-    print("  реклама...")
+    print(f"  {cab}: реклама...", flush=True)
     try:
         camps = campaigns(token, changed_since=P1.isoformat())
         ad_day, _ = ad_stats(token, list(camps), P1, Y) if camps else ({}, {})
@@ -94,7 +94,7 @@ def analyze(cab, token):
         o["ad_sum"] += v["sum_price"]
 
     nms = sorted({nm for (_, nm) in O if nm})
-    print("  остатки...")
+    print(f"  {cab}: остатки...", flush=True)
     try:
         stock = funnel(token, Y, Y, nms) if nms else {}
     except ApiError as e:
@@ -250,12 +250,11 @@ def main():
     cabs = load_tokens(arg_cabinet())
     log(f"Ежедневный отчёт WB: {len(cabs)} каб.")
     allp, alla = [], []
-    for cab, token in cabs.items():
-        try:
-            p, a = analyze(cab, token)
-        except ApiError as e:
-            log(f"  ✗ {cab}: {e}")
+    for cab, res, err in each_cabinet(cabs, analyze):      # кабинеты опрашиваются одновременно
+        if err is not None:
+            log(f"  ✗ {cab}: {err}")
             continue
+        p, a = res
         allp += p
         alla += a
     write_csv("wb_daily_products.csv", allp)

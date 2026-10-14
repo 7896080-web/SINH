@@ -7,7 +7,9 @@ import csv
 import datetime as dt
 import json
 import sys
+import threading
 import time
+import traceback
 from collections import defaultdict
 from pathlib import Path
 
@@ -25,6 +27,7 @@ TODAY = dt.date.today()
 YESTERDAY = TODAY - dt.timedelta(days=1)
 
 S = requests.Session()
+_tl = threading.local()   # в потоке кабинета (run_cabinets): свой журнал и своё соединение с WB
 _out = []
 WARNINGS = []     # данные загрузились не полностью — цифры отчёта занижены (пишется в начало и конец отчёта)
 
@@ -37,8 +40,62 @@ except (AttributeError, ValueError):
 
 
 def log(s=""):
+    buf = getattr(_tl, "buf", None)
+    if buf is not None:      # кабинет собирается в своём потоке — его журнал выводится целиком, когда он закончит
+        buf.append(str(s))
+        return
     print(s)
     _out.append(str(s))
+
+
+def run_cabinets(jobs):
+    """jobs: [(кабинет, функция)] — запустить одновременно: лимиты WB у каждого продавца свои, поэтому три кабинета
+    собираются почти за время одного. Возвращает {кабинет: (строки журнала, результат, ошибка или None, текст
+    ошибки)}; журнал выводит вызывающий — по порядку кабинетов, чтобы строки разных кабинетов не перемешались."""
+    res = {}
+
+    def worker(name, fn):
+        _tl.buf, _tl.session = [], requests.Session()
+        out, err, tb = None, None, ""
+        try:
+            out = fn()
+        except Exception as e:          # noqa: BLE001 — разбирает вызывающий
+            err, tb = e, traceback.format_exc()
+        finally:
+            res[name] = (_tl.buf, out, err, tb)
+            _tl.buf = None
+    threads = [threading.Thread(target=worker, args=(n, f), daemon=True) for n, f in jobs]
+    for t in threads:
+        t.start()
+    for t in threads:
+        while t.is_alive():
+            t.join(1)                   # с паузами — чтобы Ctrl+C в консоли срабатывал сразу
+    return res
+
+
+def each_cabinet(cabs, fn, parallel=True):
+    """По кабинетам по порядку: (кабинет, fn(кабинет, токен), ошибка WB или None). Несколько кабинетов — опрашиваются
+    одновременно, журнал каждого выводится целиком по порядку. Ошибка WB (ApiError) — кабинет пропускает вызывающий;
+    иной сбой: по одному кабинету — падает, как раньше; при одновременном опросе — в отчёт «данные неполные»,
+    подробности на экран, остальные кабинеты считаются дальше."""
+    if not parallel or len(cabs) < 2:
+        for cab, token in cabs.items():
+            try:
+                yield cab, fn(cab, token), None
+            except ApiError as e:
+                yield cab, None, e
+        return
+    print(f"Опрашиваю кабинеты одновременно: {', '.join(cabs)} — журнал каждого появится, когда опрошу все…",
+          flush=True)
+    res = run_cabinets([(cab, lambda c=cab, t=token: fn(c, t)) for cab, token in cabs.items()])
+    for cab in cabs:
+        lines, out, err, tb = res[cab]
+        for line in lines:
+            log(line)
+        if err is not None and not isinstance(err, ApiError):
+            print(tb, file=sys.stderr)
+            warn_incomplete(f"{cab}: сбой {type(err).__name__}: {err} — кабинет пропущен")
+        yield cab, out, err
 
 
 def warn_incomplete(msg):
@@ -82,7 +139,7 @@ CATEGORY_HINT = {ADV: "Продвижение", ANA: "Аналитика", STAT:
 def call(method, url, token, params=None, body=None, what=""):
     for attempt in range(6):
         try:
-            r = S.request(method, url, headers={"Authorization": token}, params=params, json=body, timeout=180)
+            r = (getattr(_tl, "session", None) or S).request(method, url, headers={"Authorization": token}, params=params, json=body, timeout=180)
         except requests.RequestException as e:
             if attempt < 3:
                 time.sleep(5)
