@@ -1076,22 +1076,92 @@ def write_rec_log():
             log(f"! История рекомендаций не записана: {e}")
 
 
+# Рекомендованные ставки WB: 5 запросов в минуту на продавца (интервал 12 с, всплеск 5 — swagger WB, проверено 15.10.2026),
+# по одному товару за запрос, пакетного метода нет. Ускорение: первые REC_BURST запросов — сразу, дальше раз в
+# REC_INTERVAL с; ответы запоминаются на диске на REC_CACHE_MIN минут — автопилот и часовая проверка берут друг у друга
+# свежие (страж в 7:40 спросил главные товары — автопилот в 8:00 их не переспрашивает). Упёрлись в лимит (другой
+# процесс или сервис тратит те же 5 в минуту) — call() ждёт столько, сколько скажет WB, и повторяет.
+REC_INTERVAL = 12.5
+REC_BURST = 5
+REC_CACHE_MIN = 45
+REC_CACHE_FILE = HERE / "wb_rec_cache.json"
+_bucket = {}
+_rec_disk = None          # {"кампания:товар": {"at": ISO, "data": ответ WB}} — загружается при первом обращении
+_rec_fresh = {}           # то, что получено в этом запуске, — дописывается в файл в конце (save_rec_cache)
+
+
+def pace_burst(token, key, interval, burst):
+    """Ведро на burst запросов, пополняется по одному раз в interval секунд (как считает WB)."""
+    k = (token[-16:], key)
+    now = time.time()
+    tokens, t0 = _bucket.get(k, (float(burst), now))
+    tokens = min(float(burst), tokens + (now - t0) / interval)
+    if tokens < 1:
+        time.sleep((1 - tokens) * interval)
+        now = time.time()
+        tokens = 1.0
+    _bucket[k] = (tokens - 1, now)
+
+
+def _rec_disk_load():
+    global _rec_disk
+    if _rec_disk is None:
+        with _file_lock:
+            if _rec_disk is None:
+                try:
+                    _rec_disk = json.loads(REC_CACHE_FILE.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    _rec_disk = {}
+    return _rec_disk
+
+
+def save_rec_cache():
+    """Дописать полученные в этом запуске рекомендации в общий файл (старше 6 ч — выбросить)."""
+    if not _rec_fresh:
+        return
+    with _file_lock:
+        try:
+            try:
+                disk = json.loads(REC_CACHE_FILE.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                disk = {}
+            disk.update(_rec_fresh)
+            edge = (dt.datetime.now() - dt.timedelta(hours=6)).isoformat(timespec="seconds")
+            disk = {k: v for k, v in disk.items() if (v.get("at") or "") >= edge}
+            tmp = REC_CACHE_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(disk, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, REC_CACHE_FILE)
+            _rec_fresh.clear()
+        except OSError:
+            pass
+
+
 def get_rec(token, aid, nm):
     if (aid, nm) not in _rec_cache:
+        hit = _rec_disk_load().get(f"{aid}:{nm}") or {}
+        try:
+            age = (dt.datetime.now() - dt.datetime.fromisoformat(hit.get("at") or "")).total_seconds() / 60
+        except ValueError:
+            age = None
+        if age is not None and 0 <= age < REC_CACHE_MIN and isinstance(hit.get("data"), dict) and hit["data"]:
+            _rec_cache[(aid, nm)] = hit["data"]          # свежий ответ из прошлого запуска (стража или автопилота)
+            return _rec_cache[(aid, nm)]
         progress(f"    рекомендации WB: {len(_rec_cache) + 1}-й товар…")
         cab_ = getattr(_tl, "cab", None)
         REC_COUNT[cab_] = REC_COUNT.get(cab_, 0) + 1
-        pace(token, "rec", 12.5)
+        pace_burst(token, "rec", REC_INTERVAL, REC_BURST)
         data = call("GET", ADV + "/api/advert/v0/bids/recommendations", token,
                     params={"nmId": nm, "advertId": aid}, what=f"Рекомендованные ставки {nm}") or {}
         progress(" " * 60)
-        if not _rec_cache:   # первый ответ за запуск сохраняем как образец (токенов в нём нет)
+        if not _rec_fresh:   # первый ответ за запуск сохраняем как образец (токенов в нём нет)
             with _file_lock:
                 try:
                     REC_SAMPLE.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
                 except OSError:
                     pass
         _rec_cache[(aid, nm)] = data if isinstance(data, dict) else {}
+        if _rec_cache[(aid, nm)]:   # пустой ответ (ошибка, лимит) не запоминаем — следующий запуск спросит снова
+            _rec_fresh[f"{aid}:{nm}"] = {"at": dt.datetime.now().isoformat(timespec="seconds"), "data": _rec_cache[(aid, nm)]}
     return _rec_cache[(aid, nm)]
 
 
@@ -2663,7 +2733,7 @@ def main():
     UNIT_LIMITS.update(load_unit_limits())
     if UNIT_LIMITS:
         log(f"Юнит-экономика: лимиты цены заказа для {len(UNIT_LIMITS)} товаров (wb_unit_economics.csv).")
-    print("Рекомендации WB отдаёт по одному товару раз в 12 секунд — на кампанию уходит несколько минут.")
+    print("Рекомендации WB отдаёт по одному товару: 5 сразу, дальше раз в 12 секунд (свежие — из прошлого запуска).")
     plan = {"bids": [], "cluster_bids": [], "minus": [], "limits": [], "trim": [], "untrim": [], "topup": []}
     jobs = []
     for cab, rules in RULES.items():
@@ -2762,6 +2832,7 @@ def main():
         prune_state(state)
         save_state(state)     # ставки на начало дня и отсчёт наличия на WB — только при настоящем применении
     write_rec_log()
+    save_rec_cache()
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write("\n".join(out) + "\n\n")
 

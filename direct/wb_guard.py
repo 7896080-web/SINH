@@ -74,6 +74,7 @@ log = B.log
 
 def write_log():
     B.write_rec_log()
+    B.save_rec_cache()
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write("\n".join(B.out) + "\n\n")
 
