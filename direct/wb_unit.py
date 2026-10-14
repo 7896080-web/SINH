@@ -23,7 +23,8 @@ import datetime as dt
 from collections import defaultdict
 
 from wb_common import (ApiError, TODAY, ad_stats, arg_cabinet, arg_int, campaigns, cut, finance_rows, fm,
-                       funnel, load_tokens, log, mature_buyout, num, pct, read_csv, save_log, to_float, write_csv)
+                       funnel, load_tokens, log, mature_buyout, num, pct, read_csv, save_log, to_float, write_csv,
+                       each_cabinet)
 
 # ======================== НАСТРОЙКИ ========================
 TAX_SHARE = 0.105         # налоги от выручки: УСН «доходы» 6% + НДС 5% ≈ 10,5% — уточните у бухгалтера
@@ -75,7 +76,7 @@ def ensure_cost_template(products):
 
 def analyze(cab, token, costs_nm, costs_vendor):
     log(f"\n{'═' * 20} {cab} {'═' * 20}")
-    print("  отчёт реализации (WB отдаёт 1 раз в минуту)...")
+    print(f"  {cab}: отчёт реализации (WB отдаёт 1 раз в минуту)...", flush=True)
     rows = finance_rows(token, D1, D2)
     if not rows:
         log("  Отчёт реализации за период пуст — возможно, отчёты за последние дни ещё не сформированы.")
@@ -116,7 +117,7 @@ def analyze(cab, token, costs_nm, costs_vendor):
     overhead = g["logistics"] + g["storage"] + g["acceptance"] + g["penalty"] + g["deduction"] - g["other"]
     tot_retail = sum(max(v["retail"], 0) for v in A.values())
 
-    print("  выкуп по артикулам и реклама...")
+    print(f"  {cab}: выкуп по артикулам и реклама...", flush=True)
     try:
         buy, buy_avg = mature_buyout(token)
     except ApiError as e:
@@ -236,11 +237,10 @@ def main():
     log(f"Юнит-экономика WB: {len(cabs)} каб., {DAYS} дн. Налоги {TAX_SHARE:.1%} от выручки, "
         f"себестоимость по умолчанию {DEFAULT_COGS_SHARE:.0%} от цены.")
     allrows, products, done = [], {}, set()
-    for cab, token in cabs.items():
-        try:
-            rows = analyze(cab, token, costs_nm, costs_vendor)
-        except ApiError as e:
-            log(f"  ✗ {cab}: {e} — прежняя юнит-экономика кабинета в wb_unit_economics.csv сохранена.")
+    # кабинеты опрашиваются одновременно
+    for cab, rows, err in each_cabinet(cabs, lambda c, t: analyze(c, t, costs_nm, costs_vendor)):
+        if err is not None:
+            log(f"  ✗ {cab}: {err} — прежняя юнит-экономика кабинета в wb_unit_economics.csv сохранена.")
             continue
         if not rows:
             log(f"  Прежняя юнит-экономика кабинета «{cab}» в wb_unit_economics.csv сохранена.")

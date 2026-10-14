@@ -22,7 +22,7 @@
     конверсия хуже конкурентов; новые продающие запросы; запросы в топе, где стоит проверить, нужна ли реклама;
   • wb_positions.html — графики позиций и воронки по товарам (открыть двойным щелчком в браузере).
 
-Запуск:  python wb_positions.py                       (все кабинеты; обычно 5–15 минут на кабинет)
+Запуск:  python wb_positions.py                       (все кабинеты одновременно; обычно 5–15 минут на все)
          python wb_positions.py --cabinet "Яворская"
          python wb_positions.py --backfill 30           (догрузить историю за 30 дней; первый запуск сам берёт 14)
          python wb_positions.py --report                (только отчёт по уже собранной истории, без запросов к WB)
@@ -38,11 +38,12 @@ import math
 import sqlite3
 import statistics
 import sys
+import threading
 from collections import defaultdict
 
 from wb_common import (ADV, ANA, HERE, JAM_KEY, JAM_LIMIT, TODAY, YESTERDAY, ApiError, arg_cabinet, call, campaigns,
-                       chunks, cut, fm, funnel, load_tokens, log, num, pace, read_csv, save_log, search_texts,
-                       to_float, write_csv)
+                       chunks, cut, fm, funnel, load_tokens, log, num, pace, read_csv, run_cabinets, save_log,
+                       search_texts, to_float, warn_incomplete, write_csv)
 
 # ======================== НАСТРОЙКИ ========================
 TOP_NMS = 40              # отслеживать: лучшие по заказам за 30 дней + рекламируемые + из wb_watch.csv
@@ -50,6 +51,7 @@ MAX_NMS = 60              # но не больше стольких товаро
 MEDIAN_NMS = 20           # по скольким лучшим товарам брать медианную позицию товара (≈20 секунд на товар)
 QUERIES_PER_NM = 100      # запросов на товар: 100 — «Джем Продвинутый/Премиальный»; на «Стандарте» скрипт возьмёт 30
 FIRST_BACKFILL = 14       # история при первом запуске; в этом же окне скрипт сам дозаполняет пропущенные дни
+PARALLEL = True           # кабинеты собираются одновременно (лимиты WB — у каждого продавца свои): в ~3 раза быстрее
 NOW_DAYS, BEFORE_DAYS = 3, 7           # «сейчас» — медиана за 3 последних дня; «было» — за 7 дней до них
 POS_DROP_ABS, POS_DROP_REL = 5, 0.30   # «позиция упала»: хуже минимум на 5 мест и на 30%
 TOP_POS = 10              # «топ» по запросу
@@ -107,9 +109,35 @@ def drange(d1, d2):
 def connect():
     # другая программа пишет или читает — подождать до минуты, а не упасть «база занята».
     # (WAL не включаю: дашборд и отчёты открывают базу «только чтение», с WAL это может не работать.)
-    con = sqlite3.connect(DB, timeout=60)
+    # check_same_thread=False: при сборе кабинетов одновременно соединение одно, запросы к нему идут по очереди (DbQueue)
+    con = sqlite3.connect(DB, timeout=60, check_same_thread=False)
     con.executescript(SCHEMA)
     return con
+
+
+class _Rows(list):
+    def fetchone(self):
+        return self[0] if self else None
+
+    def fetchall(self):
+        return list(self)
+
+
+class DbQueue:
+    """Одно соединение с базой на все потоки кабинетов: запросы выполняются по очереди, ответ читается сразу.
+    Одно соединение — нет ошибок «база занята» между своими же потоками; запись идемпотентная (upsert),
+    а «день собран» отмечается только после данных — общий commit разных кабинетов ничего не ломает."""
+
+    def __init__(self, con):
+        self.con, self.lock = con, threading.RLock()
+
+    def execute(self, *a):
+        with self.lock:
+            return _Rows(self.con.execute(*a).fetchall())
+
+    def commit(self):
+        with self.lock:
+            self.con.commit()
 
 
 def upsert(con, table, keys, row):
@@ -212,13 +240,17 @@ def arg_value(name):
     return None
 
 
+_watch_lock = threading.Lock()
+
+
 def load_watch(cab):
     """wb_watch.csv: кабинет;артикул WB;запрос;цель позиции;заметка → {артикул: {запрос: цель}}."""
     p = HERE / WATCH_FILE
-    if not p.exists():
-        p.write_text("кабинет;артикул WB;запрос;цель позиции;заметка\n"
-                     "#пример;123456789;куртка мужская зимняя;10;строки, которые начинаются с #, скрипт пропускает\n",
-                     encoding="utf-8-sig")
+    with _watch_lock:                        # кабинеты собираются одновременно — шаблон создаёт кто-то один
+        if not p.exists():
+            p.write_text("кабинет;артикул WB;запрос;цель позиции;заметка\n"
+                         "#пример;123456789;куртка мужская зимняя;10;строки, которые начинаются с #, скрипт пропускает\n",
+                         encoding="utf-8-sig")
     res = {}
     for r in read_csv(WATCH_FILE):
         c = (r.get("кабинет") or "").strip()
@@ -455,10 +487,14 @@ def ad_queries_day(con, cab, token, pairs, day):
             "ad_pos": g["pos_w"] / g["w"] if g["w"] else None})
 
 
+def step(cab, text):
+    print(f"  {cab}: {text}...", flush=True)
+
+
 def collect(con, cab, token, window):
     d_from = Y - dt.timedelta(days=window - 1)
     days = drange(d_from, Y)
-    print("  товары, остатки, кампании...")
+    step(cab, "товары, остатки, кампании")
     f30 = funnel(token, Y - dt.timedelta(days=29), Y)
     for nm, v in f30.items():
         upsert(con, "products", ("cab", "nm"), {"cab": cab, "nm": nm, "vendor": v.get("vendor"),
@@ -493,7 +529,7 @@ def collect(con, cab, token, window):
     log(f"  Отслеживаю {len(tracked)} товаров (медиана товара — по {len(med_nms)}). Запросов к «Джему» ≈{jam_calls}, "
         f"WB разрешает 3 в минуту → ≈{jam_calls / 3 + 1:.0f} мин.")
 
-    print("  воронка по дням...")
+    step(cab, "воронка по дням")
     keep = set(tracked)
     for d in need_f:
         try:
@@ -528,18 +564,18 @@ def collect(con, cab, token, window):
                 log(f"  ! {label}: {e}")
             return False
 
-    print("  позиции по поисковым запросам...")
+    step(cab, "позиции по поисковым запросам")
     for d in need_t:
         if jam_step(f"запросы за {d:%d.%m}", texts_day, con, cab, token, tracked, d):
             mark(con, cab, "texts", [d])
     lim = JAM_LIMIT.get(token[-16:])
     if lim:
         meta_set(con, f"jam_limit:{cab}", lim)
-    print("  позиции товаров...")
+    step(cab, "позиции товаров")
     for d in need_d:
         if jam_step(f"позиции товаров за {d:%d.%m}", details_day, con, cab, token, tracked, d):
             mark(con, cab, "details", [d])
-    print("  медианная позиция товаров...")
+    step(cab, "медианная позиция товаров")
     for nm in [0] + med_nms:
         got = fetched(con, cab, f"report:{nm}")
         need = sorted({d for d in days if iso(d) not in got} | {Y})
@@ -547,13 +583,13 @@ def collect(con, cab, token, window):
         if jam_step("медианная позиция " + (str(nm) if nm else "кабинета"), report_nm, con, cab, token, nm, d1, Y):
             mark(con, cab, f"report:{nm}", drange(d1, Y))
     if any(watch.values()):
-        print("  мои запросы...")
+        step(cab, "мои запросы")
         for nm, qs in watch.items():
             if qs:
                 jam_step(f"мои запросы {nm}", watch_orders, con, cab, token, nm, list(qs), Y - dt.timedelta(days=6), Y)
 
     if camps:
-        print("  реклама...")
+        step(cab, "реклама")
         need_a = sorted({d for d in days if iso(d) not in fetched(con, cab, "ads")} | {Y})
         try:
             ads_collect(con, cab, token, list(camps), need_a[0], Y)
@@ -1136,25 +1172,43 @@ def build_html(sections):
 
 # ---------------- запуск ----------------
 
+def collect_cab(db, cab, token, bf):
+    first = not fetched(db, cab, "texts")
+    window = int(bf) if (bf and bf.isdigit()) else FIRST_BACKFILL
+    window = max(1, min(window, 365))
+    if first or bf:
+        log(f"  Догружаю историю за {window} дн.")
+    try:
+        collect(db, cab, token, window if (first or bf) else FIRST_BACKFILL)
+    except ApiError as e:
+        log(f"  ✗ {cab}: {e}")
+
+
 def main():
     report_only = "--report" in sys.argv
     bf = arg_value("--backfill")
     cabs = load_tokens(arg_cabinet())
     con = connect()
+    db = DbQueue(con)
     log(f"Позиции и воронка WB: {len(cabs)} каб." + (" Только отчёт по сохранённой истории." if report_only else ""))
+    pre, failed = {}, []
+    if not report_only and PARALLEL and len(cabs) > 1:
+        print(f"Собираю кабинеты одновременно: {', '.join(cabs)} — журнал каждого появится, когда соберу все…",
+              flush=True)
+        pre = run_cabinets([(cab, lambda c=cab, t=token: collect_cab(db, c, t, bf)) for cab, token in cabs.items()])
     allp, allq, alla, sections = [], [], [], []
     for cab, token in cabs.items():
         log(f"\n{'═' * 20} {cab} {'═' * 20}")
-        if not report_only:
-            first = not fetched(con, cab, "texts")
-            window = int(bf) if (bf and bf.isdigit()) else FIRST_BACKFILL
-            window = max(1, min(window, 365))
-            if first or bf:
-                log(f"  Догружаю историю за {window} дн.")
-            try:
-                collect(con, cab, token, window if (first or bf) else FIRST_BACKFILL)
-            except ApiError as e:
-                log(f"  ✗ {cab}: {e}")
+        if cab in pre:
+            lines, _, err, tb = pre[cab]
+            for line in lines:
+                log(line)
+            if err is not None:
+                failed.append(cab)
+                print(tb, file=sys.stderr)
+                warn_incomplete(f"{cab}: сбор прерван сбоем ({type(err).__name__}: {err}) — позиции за сегодня неполные")
+        elif not report_only:
+            collect_cab(db, cab, token, bf)
         tracked = meta_get(con, f"tracked:{cab}", [])
         if not tracked:
             log("  Истории нет — запустите без --report.")
@@ -1164,6 +1218,7 @@ def main():
         allq += q
         alla += a
         sections.append(sec)
+    con.commit()
     cleanup(con)
     con.close()
     write_csv("wb_positions_products.csv", allp)
@@ -1175,6 +1230,8 @@ def main():
     save_log("wb_positions_report.txt")
     print("\nСохранено: wb_positions_report.txt, wb_positions.html (графики — открыть в браузере), "
           "wb_positions_products.csv, wb_positions_queries.csv, wb_positions_actions.csv; история — wb_history.db")
+    if failed:
+        sys.exit(f"Сбор прерван сбоем: {', '.join(failed)} — подробности выше.")
 
 
 if __name__ == "__main__":
