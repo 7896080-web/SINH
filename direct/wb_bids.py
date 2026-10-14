@@ -69,6 +69,8 @@ except (AttributeError, ValueError):
 #   "until": "ГГГГ-ММ-ДД" в правиле кампании — правило действует до этой даты включительно, потом кампания
 #   переходит на общие правила "*" (режим запуска новинок: дороже допустимый заказ на 2–3 недели).
 #   Дневной лимит WB даёт только кампаниям за клики; у кампаний за показы он пропускается.
+EXP_MAX_CPC = 20   # эксперимент Ребрик/Караман, кампании за клики: ставка за WB, но не дороже 20 ₽ за клик (решение
+                   # 14.10.2026: WB просил до 55 ₽ за клик для товаров со 137 кликами без заказов; остальным хватает 8–18 ₽)
 RULES = {
     "Яворская": {
         "*": {"target": "3-10", "max_cost_per_order": 600, "daily_limit": 1000, "auto_minus": True,
@@ -111,12 +113,12 @@ RULES = {
     "Ребрик": {
         "_week_budget": 14200,      # 9 200 — эксперимент (джемперы ×2) + 5 000 — новинки 40842596 (решения 14.10.2026)
         # новинки за клики, «Кампания от 10.10.2026», запущена пользователем 14.10.2026: свой бюджет 5 000 ₽/нед
-        "40842596": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True, "daily_limit": 700,
+        "40842596": {"target": "3-10", "follow_rec": True, "max_bid_cpc": EXP_MAX_CPC, "auto_minus": False, "start_after_topup": True, "daily_limit": 700,
                      "topup_below": 700, "topup_amount": 700, "topup_day_cap": 700, "topup_week_cap": 5000},
         # за показы дневного лимита у WB нет — расход держат пополнения малыми порциями (порог = сумма = потолок в сутки)
         # куртки — ЗА КЛИКИ (решение 14.10.2026 по сравнению 40769287 Ребрика ≈606 ₽/заказ и 40769350 Карамана ≈3 505 ₽):
         # 40769287 включена обратно, кампания за показы на эти же куртки 40863039 — на паузе (в правила не входит)
-        "40769287": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True, "daily_limit": 500,
+        "40769287": {"target": "3-10", "follow_rec": True, "max_bid_cpc": EXP_MAX_CPC, "auto_minus": False, "start_after_topup": True, "daily_limit": 500,
                      "topup_below": 500, "topup_amount": 500, "topup_day_cap": 500, "topup_week_cap": 3500},
         # джемперы 256250 + ZJYM: бюджет ×2 (решение 14.10.2026) — 600 ₽/сутки, как 300 + 300 у Карамана за клики
         "40863019": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True,
@@ -131,10 +133,10 @@ RULES = {
     "Караман": {
         "_week_budget": 16200,      # 11 200 — эксперимент (джемперы ×2) + 5 000 — новинки 40842612 (решения 14.10.2026)
         # новинки за клики, «Кампания от 10.10.2026», запущена пользователем 14.10.2026: свой бюджет 5 000 ₽/нед
-        "40842612": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True, "daily_limit": 700,
+        "40842612": {"target": "3-10", "follow_rec": True, "max_bid_cpc": EXP_MAX_CPC, "auto_minus": False, "start_after_topup": True, "daily_limit": 700,
                      "topup_below": 700, "topup_amount": 700, "topup_day_cap": 700, "topup_week_cap": 5000},
         # дневной лимит = порог = сумма пополнения = потолок в сутки; за неделю — лимит × 7 (в сумме 7 000 ₽)
-        "40769334": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True, "daily_limit": 300,
+        "40769334": {"target": "3-10", "follow_rec": True, "max_bid_cpc": EXP_MAX_CPC, "auto_minus": False, "start_after_topup": True, "daily_limit": 300,
                      "topup_below": 300, "topup_amount": 300, "topup_day_cap": 300, "topup_week_cap": 2100},   # куртки
         # пуховики 2651/2717/2718 — ЗА ПОКАЗЫ (решение 14.10.2026): 40769350 за клики (≈3 505 ₽/заказ) — на паузе,
         # новая кампания за показы с теми же товарами; дневного лимита у WB нет — пополнения по 500 ₽ в сутки
@@ -142,11 +144,11 @@ RULES = {
         # «Караман пуховики показы» — создана 14.10.2026 через wb_create.py
         "40955797": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True,
                                     "topup_below": 500, "topup_amount": 500, "topup_day_cap": 500, "topup_week_cap": 3500},
-        "40769357": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True, "daily_limit": 300,
+        "40769357": {"target": "3-10", "follow_rec": True, "max_bid_cpc": EXP_MAX_CPC, "auto_minus": False, "start_after_topup": True, "daily_limit": 300,
                      "topup_below": 300, "topup_amount": 300, "topup_day_cap": 300, "topup_week_cap": 2100},   # 256250
-        "40769361": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True, "daily_limit": 300,
+        "40769361": {"target": "3-10", "follow_rec": True, "max_bid_cpc": EXP_MAX_CPC, "auto_minus": False, "start_after_topup": True, "daily_limit": 300,
                      "topup_below": 300, "topup_amount": 300, "topup_day_cap": 300, "topup_week_cap": 2100},   # ZJYM
-        "40769369": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True, "daily_limit": 200,
+        "40769369": {"target": "3-10", "follow_rec": True, "max_bid_cpc": EXP_MAX_CPC, "auto_minus": False, "start_after_topup": True, "daily_limit": 200,
                      "topup_below": 200, "topup_amount": 200, "topup_day_cap": 200, "topup_week_cap": 1400},   # 2101
     },
 }
@@ -1320,6 +1322,8 @@ def plan_cabinet(cab, token, rules, state):
                         log(f"      ! {e}")
                     nb, reason = new_bid(current, rec, cap, mn, step, r["max_raise_pct"],
                                          day_base(state, "bids", cid, nm, placement), r.get("max_drop_pct"))
+                    if r.get("follow_rec") and reason.startswith("потолок по цене заказа"):
+                        reason = reason.replace("потолок по цене заказа", f"потолок ставки {cap / 100:.0f} ₽")
                     if size_short(nm) == "hold" and current and nb and nb > current:
                         nb, reason = current, f"мало ходовых размеров (закрыто {cover[nm][0]:.0%} спроса) — не повышаю"
                     if r.get("stop_clicks") and v["clicks"] >= r["stop_clicks"] and not v["orders"]:
