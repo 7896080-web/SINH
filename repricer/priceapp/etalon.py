@@ -71,6 +71,12 @@ def auto_enabled(db: Session) -> bool:
     return settings.get(db, settings.ETALON_FOLLOW_AUTO) == "1"
 
 
+def tolerance(db: Session) -> int:
+    """Рублей разницы с целью, которые расхождением не считаются (округление, курс)."""
+    v = _dec(settings.get(db, settings.ETALON_TOLERANCE_RUB))
+    return int(v) if v is not None and v >= 0 else 100
+
+
 def max_step(db: Session) -> Decimal:
     return _dec(settings.get(db, settings.FOLLOW_MAX_STEP)) or Decimal(50)
 
@@ -175,6 +181,7 @@ class FCard:
     new_list: int | None = None
     disc: int | None = None
     skip: str = ""
+    tol: int = 0                 # допуск, ₽: разница цены после скидки с целью в его пределах — не расхождение
 
     @property
     def same(self) -> bool:
@@ -183,6 +190,15 @@ class FCard:
         if self.platform in WITH_DISCOUNT:
             return self.cur_list == self.new_list and self.cur_sale == self.target
         return self.cur_list == self.target
+
+    @property
+    def follows(self) -> bool:
+        """Держит эталон с допуском: цена после скидки отличается от цели не больше чем на `tol` ₽.
+        Так считают счётчики, «Привести к эталону» и автоследование; смена эталона руками
+        отправляет при любом отличии (`same`)."""
+        if self.skip or self.target is None or not self.cur_sale:
+            return self.same
+        return abs(self.cur_sale - self.target) <= self.tol
 
     @property
     def change_pct(self) -> Decimal | None:
@@ -196,6 +212,7 @@ def follower_plan(db: Session, ets: dict[str, Etalon] | None = None, only: set |
     ets = ets if ets is not None else etalons(db)
     articles = article_map(db)
     lo, hi = corridor(db)
+    tol = tolerance(db)
     rate = rates.current(db)
     costs = {c.item_id: c.cost_usd for c in db.query(OnecCost)}
     out: list[FCard] = []
@@ -216,7 +233,7 @@ def follower_plan(db: Session, ets: dict[str, Etalon] | None = None, only: set |
                         continue
                     c = cards.get(key)
                     if c is None:
-                        c = cards[key] = FCard(platform, a, key, [], [], set())
+                        c = cards[key] = FCard(platform, a, key, [], [], set(), tol=tol)
                     c.rows.append(r)
                     if item_id not in c.item_ids:
                         c.item_ids.append(item_id)
@@ -454,7 +471,7 @@ def follow_all(db: Session, client_factory=None) -> dict:
         if c.skip:
             st["floor"] += c.skip.startswith("ниже пола")
             continue
-        if c.same:
+        if c.follows:
             continue
         ch = c.change_pct
         if ch is not None and abs(ch) > lim:

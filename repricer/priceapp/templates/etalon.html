@@ -53,11 +53,12 @@
   {% for p in ('kit', 'lamoda', 'ozon') %}<label>{{ names[p] }}: эталон −, %<input name="shift_{{ p }}" value="{{ shifts[p] }}" inputmode="decimal" style="width:60px" placeholder="не следует"></label>{% endfor %}
   <label>Скидка от, %<input name="lo" value="{{ lo }}" style="width:50px"></label>
   <label>до, %<input name="hi" value="{{ hi }}" style="width:50px"></label>
+  <label title="Разница цены после скидки с целью в этих пределах — не расхождение (округление, курс)">Допуск, ₽<input name="tol" value="{{ tol }}" style="width:60px"></label>
   <label style="flex-direction:row;gap:6px;align-items:center"><input type="checkbox" name="auto" value="1" {% if auto %}checked{% endif %}>
     автоматически при каждом опросе WB</label>
   <button class="secondary">Сохранить</button>
 </form>
-<p class="muted" style="margin-bottom:0">Пусто в сдвиге — площадка за эталоном не следует. «Автоматически» — при опросе WB программа сама
+<p class="muted" style="margin-bottom:0">Цена, отличающаяся от цели не больше чем на {{ tol }} ₽, расхождением не считается и сама не переотправляется. Пусто в сдвиге — площадка за эталоном не следует. «Автоматически» — при опросе WB программа сама
 приводит площадки к эталону, но не больше чем на {{ max_step|int }}% за раз (крупнее — кнопкой выше). Пока выключено, Kit идёт за WB
 по прежнему правилу. Ламоде скидка ставится на {{ sale_days }} дней.</p>
 </details>
@@ -88,9 +89,9 @@
   <td><b>{{ et.article }}</b><div class="sub" style="white-space:normal;max-width:220px">{{ et.name }}</div></td>
   <td class="num"><b>{{ rub(et.sale) }}</b></td>
   <td>{% for c in et.cards %}<div class="sub">{{ c.account.name }} {{ c.nm }}: {% if c.ref_sale %}{{ rub(c.ref_list) }} −{{ c.ref_disc }}% = {{ rub(c.ref_sale) }}{% else %}эталона нет{% endif %}
-    {% if c.cur_sale and c.ref_sale and c.cur_sale != c.ref_sale %} · <span class="warn">сейчас {{ rub(c.cur_sale) }}</span>{% endif %}</div>{% endfor %}</td>
+    {% if c.cur_sale and c.ref_sale and (c.cur_sale - c.ref_sale)|abs > tol %} · <span class="warn">сейчас {{ rub(c.cur_sale) }}</span>{% endif %}</div>{% endfor %}</td>
   {% for p in followers %}<td>{% for c in r.fol.get(p, []) %}<div class="sub">
-    {% if c.skip %}<span class="bad">{{ c.skip }}</span>{% elif c.same %}<span class="ok">{{ rub(c.target) }} ✓</span>{% else %}
+    {% if c.skip %}<span class="bad">{{ c.skip }}</span>{% elif c.follows %}<span class="ok" title="сейчас {{ rub(c.cur_sale) }}, цель {{ rub(c.target) }} — в пределах допуска">{{ rub(c.cur_sale) }} ✓</span>{% else %}
     сейчас {{ rub(c.cur_sale) }} → <b>{{ rub(c.target) }}</b>{% endif %}</div>{% else %}<span class="muted">—</span>{% endfor %}</td>{% endfor %}
   <td class="et-new"><form method="get" action="/etalon" class="row" style="gap:4px">
     <input type="hidden" name="art" value="{{ et.article }}"><input type="hidden" name="q" value="{{ q }}">

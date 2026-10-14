@@ -51,13 +51,14 @@ def _rows(db: Session, q: str, flt: str):
         k = counts[c.platform]
         if c.skip:
             k["skip"] += 1
-        elif c.same:
+        elif c.follows:
             k["same"] += 1
         else:
             k["diff"] += 1
             if c.change_pct is not None and abs(c.change_pct) > lim:
                 k["big"] += 1
     rows = []
+    tol = etalon.tolerance(db)
     ql = q.strip().lower()
     for art in sorted(ets):
         et = ets[art]
@@ -66,8 +67,8 @@ def _rows(db: Session, q: str, flt: str):
         if ql and ql not in art.lower() and ql not in (et.name or "").lower():
             continue
         fol = by_art.get(art, {})
-        diff = any(not c.skip and not c.same for cs in fol.values() for c in cs) or any(
-            c.ref_sale and c.cur_sale and abs(c.cur_sale / c.ref_sale - 1) > 0.01 for c in et.cards)
+        diff = any(not c.skip and not c.follows for cs in fol.values() for c in cs) or any(
+            c.ref_sale and c.cur_sale and abs(c.cur_sale - c.ref_sale) > tol for c in et.cards)
         if flt == "diff" and not diff:
             continue
         if flt == "noetalon" and et.sale:
@@ -94,7 +95,7 @@ def page(request: Request, q: str = "", flt: str = "", art: str = "", new: str =
     return render(request, "etalon.html", user, "etalon", rows=rows[:ROWS_LIMIT], total=len(rows),
                   limit=ROWS_LIMIT, q=q, flt=flt, followers=followers, counts=counts, names=PLATFORMS,
                   shifts={p: settings.get(db, etalon.SHIFT_KEYS[p]) for p in etalon.FOLLOWERS},
-                  lo=lo, hi=hi, auto=etalon.auto_enabled(db), max_step=etalon.max_step(db),
+                  lo=lo, hi=hi, auto=etalon.auto_enabled(db), tol=etalon.tolerance(db), max_step=etalon.max_step(db),
                   sale_days=settings.get(db, settings.ETALON_LAMODA_SALE_DAYS), preview=preview,
                   with_etalon=sum(1 for e in ets.values() if e.sale))
 
@@ -119,6 +120,13 @@ def save_settings(request: Request, form=Depends(posted_form), db: Session = Dep
         if str(v) != settings.get(db, key):
             changes.append(f"{key}: {settings.get(db, key)} -> {v}")
             settings.put(db, key, str(v))
+    tol = str(form.get("tol") or "").strip()
+    if tol and _int(tol) is None and tol != "0":
+        flash(request, "Допуск — целое число рублей.", "warn")
+        return _back()
+    if tol and tol != settings.get(db, settings.ETALON_TOLERANCE_RUB):
+        changes.append(f"допуск: {settings.get(db, settings.ETALON_TOLERANCE_RUB)} -> {tol} ₽")
+        settings.put(db, settings.ETALON_TOLERANCE_RUB, tol)
     auto = "1" if form.get("auto") == "1" else "0"
     if auto != settings.get(db, settings.ETALON_FOLLOW_AUTO):
         changes.append(f"автоследование: {'включено' if auto == '1' else 'выключено'}")
@@ -145,7 +153,7 @@ def set_one(request: Request, form=Depends(posted_form), db: Session = Depends(g
 @router.post("/etalon/follow-now")
 def follow_now(request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Привести все площадки к эталону — включая большой шаг (решение человека)."""
-    cards = [c for c in etalon.follower_plan(db) if not c.skip and not c.same]
+    cards = [c for c in etalon.follower_plan(db) if not c.skip and not c.follows]
     if not cards:
         flash(request, "Все площадки уже держат эталон — отправлять нечего.", "ok")
         return _back()
