@@ -89,12 +89,12 @@ def plan_topups(cab, token, camps, state):
         if camps[cid].get("_status") == 11 and bud >= B.PAUSED_MONEY_BELOW:
             log(f"  «{t['name']}» на паузе, в бюджете {B.fm_rub(bud)} ₽ — паузу, видимо, поставили вы: не пополняю и не запускаю.")
             continue
-        amount = min(t["amount"], t["day_cap"] - B.topped_week(state, cid, days=1), t["week_cap"] - B.topped_week(state, cid))
-        if cab_cap:
-            amount = min(amount, cab_left)
+        amount = B.deposit_amount(t["amount"], t["day_cap"], B.topped_week(state, cid, days=1), t["week_cap"],
+                                  B.topped_week(state, cid), cab_left if cab_cap else None)
         paused = camps[cid].get("_status") in (4, 11)
-        if amount < 100:
-            log(f"  ! «{t['name']}»: бюджет {B.fm_rub(bud)} ₽, но потолок пополнений исчерпан — не пополняю"
+        if not amount:
+            log(f"  ! «{t['name']}»: бюджет {B.fm_rub(bud)} ₽, но до потолка пополнений меньше {B.MIN_DEPOSIT} ₽ "
+                "(меньше WB не принимает) — не пополняю"
                 + (" (кампания стоит на паузе)" if paused else ""))
             continue
         res.append({"cabinet": cab, "advert_id": cid, "name": t["name"], "amount": amount, "source": t["source"],
