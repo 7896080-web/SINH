@@ -18,7 +18,8 @@
        • товары, которым автопилот сознательно держит минимальную ставку (нет в наличии и т. п.), не трогает.
   3. Бюджеты: меньше порога → пополнить по тем же правилам и потолкам (в сутки/неделю), что у автопилота; кампания,
      вставшая на паузу из-за пустого бюджета, после пополнения запускается. Пополнения не откатываются.
-  4. Дневной лимит кампаний за показы (у WB его нет, держим сами): потрачено сегодня ≥ 97% лимита из RULES или по
+  4. Дневной лимит кампаний за показы (у WB его нет, держим сами) и кампаний за клики, у которых лимит в RULES ниже
+     минимума WB (1 000 ₽): потрачено сегодня ≥ 97% лимита из RULES или по
      темпу последнего часа к следующей проверке ушло бы за лимит больше чем на 15% — пауза до утра; первая проверка
      следующего дня (7:40) запускает снова. Такую паузу автопилот и проверка знают как свою (state["limit_paused"]).
 Лимиты, минус-фразы, ставки по запросам, уборка товаров — только wb_bids.py.
@@ -164,13 +165,22 @@ def spend_snapshot(cab, token, camps, state=None):
             if r and r.get("daily_limit"):
                 cpm_lim[cid] = r["daily_limit"]
     cpm_spent = B.spent_today(token, sorted(cpm_lim)) if cpm_lim else {}
+    # кампании за клики, у которых лимит в RULES меньше, чем WB даёт поставить (минимум WB — 1 000 ₽ в сутки): свой лимит
+    # держим так же паузой (решение пользователя 15.10.2026 — равные условия для обоих типов кампаний)
+    for cid in cpc:
+        r = B.live_rule(cab, cid, camps)
+        lim = lims.get(cid) or {}
+        if r and r.get("daily_limit") and lim.get("enabled") and lim.get("spentToday") is not None \
+                and r["daily_limit"] * 100 < B.num(lim.get("dailyLimit")):
+            cpm_lim[cid] = r["daily_limit"]
+            cpm_spent[cid] = B.num(lim["spentToday"]) / 100
     # запасной способ (WB не отдал расход за сегодня): бюджет на первой проверке дня + пополнения после неё − бюджет сейчас.
     # Ночь до первой проверки (7:40) не видна — это оценка снизу.
     est = set()
     if state is not None:
         dbud = state.setdefault("day_budget", {})
         today = dt.date.today().isoformat()
-        for cid in cpm_lim:
+        for cid in [c for c in cpm_lim if c not in cpc]:
             b = buds.get(cid)
             if b is None:
                 continue
@@ -186,7 +196,7 @@ def spend_snapshot(cab, token, camps, state=None):
     for cid in ids:
         st = camps[cid].get("settings") or {}
         lim = lims.get(cid) or {}
-        if cid in cpm_lim:
+        if cid in cpm_lim:                     # свой лимит (показы; клики — если он ниже минимума WB)
             spent_, limit_ = cpm_spent.get(cid, ""), cpm_lim[cid]
         else:
             spent_ = B.num(lim.get("spentToday")) / 100 if lim.get("spentToday") is not None else ""
