@@ -26,23 +26,27 @@ from pathlib import Path
 
 import requests
 
+from yandex_token import crm_config, yandex_token
+
 CAMPAIGNS = {712220172: "ЕПК Сети КО", 712219913: "ЕПК Сети ТО"}
 AGE = "AGE_45_54"
 NEW_PERCENT = -20            # −20% → BidModifier 80
 
-for a in sys.argv[1:]:
+for raw in sys.argv[1:]:
+    if raw in ("--apply", "--rollback"):
+        continue
+    a = raw.replace("−", "-").replace("–", "-").replace("—", "-").strip().rstrip("%")   # «−30», «-30%» — тоже
     if re.fullmatch(r"\d+", a):
         raise SystemExit(f"Укажите знак: -{a} (снизить ставку на {a}%) или +{a} (повысить). Число без знака не принимаю.")
     if re.fullmatch(r"[-+]\d+", a):
         NEW_PERCENT = int(a)
+    else:
+        raise SystemExit(f"Не понял «{raw}». Можно: -30 (снизить на 30%), +10, --apply, --rollback.")
 NEW_MODIFIER = 100 + NEW_PERCENT
 if not 0 <= NEW_MODIFIER <= 1300:
     raise SystemExit(f"Недопустимое значение {NEW_PERCENT}%: можно от −100% до +1200%.")
 
-cfg = json.loads((Path.home() / "AWER CRM" / "config.json").read_text(encoding="utf-8"))
-TOKEN, LOGIN = cfg.get("yandex_oauth_token", ""), cfg.get("direct_client_login", "")
-if not TOKEN:
-    raise SystemExit("В CRM не сохранён токен Яндекса (Маркетинг → Подключение к Яндексу).")
+TOKEN, LOGIN = yandex_token(), crm_config().get("direct_client_login", "")
 HEADERS = {"Authorization": f"Bearer {TOKEN}", "Accept-Language": "ru"}
 if LOGIN:
     HEADERS["Client-Login"] = LOGIN
@@ -124,16 +128,25 @@ def apply(found):
     to_set = [{"Id": m["Id"], "BidModifier": NEW_MODIFIER} for m in found.values()
               if m and m["DemographicsAdjustment"]["BidModifier"] != NEW_MODIFIER]
     if to_set:
-        report(f"изменено на {pct(NEW_MODIFIER)} ({len(to_set)} шт.)",
-               call("bidmodifiers", "set", {"BidModifiers": to_set}).get("SetResults", []))
+        try:
+            report(f"изменено на {pct(NEW_MODIFIER)} ({len(to_set)} шт.)",
+                   call("bidmodifiers", "set", {"BidModifiers": to_set}).get("SetResults", []))
+        except RuntimeError as e:
+            print(f"  ✗ изменение: {e} — проверьте в кабинете (откат вернёт прежние значения в любом случае)")
     for cid, m in found.items():
         if m is None:
-            res = call("bidmodifiers", "add", {"BidModifiers": [{
-                "CampaignId": cid, "DemographicsAdjustments": [{"Age": AGE, "BidModifier": NEW_MODIFIER}]}]}
-            ).get("AddResults", [])
+            try:
+                res = call("bidmodifiers", "add", {"BidModifiers": [{
+                    "CampaignId": cid, "DemographicsAdjustments": [{"Age": AGE, "BidModifier": NEW_MODIFIER}]}]}
+                ).get("AddResults", [])
+            except RuntimeError as e:
+                print(f"  ✗ {CAMPAIGNS[cid]}: добавление: {e} — если корректировка всё же появилась, откат её не уберёт; "
+                      "проверьте в кабинете")
+                continue
             if report(f"{CAMPAIGNS[cid]}: добавлено {pct(NEW_MODIFIER)}", res):
                 for r in res:
                     backup["added_ids"] += r.get("Ids") or []
+            path.write_text(json.dumps(backup, ensure_ascii=False, indent=1), encoding="utf-8")
     path.write_text(json.dumps(backup, ensure_ascii=False, indent=1), encoding="utf-8")
 
     print("\nПроверка после изменения:")
@@ -175,4 +188,4 @@ if __name__ == "__main__":
     elif "--apply" in sys.argv:
         apply(found)
     else:
-        print(f"\nЭто пробный прогон — ничего не изменено. Применить: python direct_age_45_54.py --apply")
+        print(f"\nЭто пробный прогон — ничего не изменено. Применить: python direct_age_45_54.py {NEW_PERCENT:+d} --apply")

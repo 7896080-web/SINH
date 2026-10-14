@@ -67,7 +67,10 @@ if not COUNTER_ID:
     match = [c for c in counters if SITE in (c.get("site") or "")]
     if not match:
         raise SystemExit(f"Счётчик для {SITE} не найден. Впишите нужный ID в COUNTER_ID.")
-    COUNTER_ID = str(match[0]["id"])
+    # основной счётчик сайта — 110246968 (CLAUDE.md); если его нет среди подходящих — первый подходящий
+    COUNTER_ID = next((str(c["id"]) for c in match if str(c["id"]) == "110246968"), str(match[0]["id"]))
+    if len(match) > 1:
+        log(f"Для {SITE} несколько счётчиков — беру {COUNTER_ID}.")
 log(f"\nРаботаем со счётчиком {COUNTER_ID}")
 
 # 2. Цели
@@ -77,7 +80,12 @@ for g in goals:
     log(f"  {g['id']} | {g.get('name')} | тип {g.get('type')}")
 
 base = ["ym:s:visits", "ym:s:users", "ym:s:bounceRate", "ym:s:pageDepth", "ym:s:avgVisitDurationSeconds"]
-goal_metrics = [f"ym:s:goal{g['id']}reaches" for g in goals[:8]]
+# в отчёты — 8 целей (Метрика отдаёт до 20 метрик за раз): цель «покупка» (579065793) — всегда первой
+PURCHASE_GOAL = 579065793
+goals_sorted = sorted(goals, key=lambda g: g["id"] != PURCHASE_GOAL)
+goal_metrics = [f"ym:s:goal{g['id']}reaches" for g in goals_sorted[:8]]
+if len(goals) > 8:
+    log(f"  В отчётах ниже — первые 8 целей (покупка первой), остальные {len(goals) - 8} не показаны.")
 
 # 3. Отчёты
 report("Источники трафика", ["ym:s:lastsignTrafficSource"], base, sort="-ym:s:visits")

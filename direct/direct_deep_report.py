@@ -20,7 +20,8 @@ from yandex_token import yandex_token, crm_config
 TOKEN = yandex_token()   # из настроек AWER CRM
 CFG = crm_config()
 CLIENT_LOGIN = CFG.get("direct_client_login", "")   # из настроек CRM, если задан
-COINVEST = float(CFG.get("coinvest_multiplier") or 2.0)   # соинвест Яндекса: реальные деньги = расход ÷ COINVEST
+# соинвест Яндекса: реальные деньги = расход ÷ COINVEST. Не задан в CRM — ×2 до 31.12.2026, потом ×1 (без соинвеста)
+COINVEST = float(CFG.get("coinvest_multiplier") or (2.0 if time.strftime("%Y-%m-%d") <= "2026-12-31" else 1.0))
 PERIOD = "LAST_30_DAYS"
 
 # Цели Метрики (счётчик 110246968)

@@ -23,6 +23,8 @@ from urllib.parse import urlsplit, urlunsplit
 
 import requests
 
+from yandex_token import crm_config, yandex_token
+
 KO, TO = 712220172, 712219913
 HREF_MAP = {  # группа КО -> (какие старые пути менять, новый путь)
     # объявление «на осень и весну» — на демисезонные куртки AWER (7 моделей на биопухе)
@@ -32,10 +34,9 @@ HREF_MAP = {  # группа КО -> (какие старые пути меня�
 TO_GROUP = "Мужские куртки - Новая ЦА"
 KEEP_BRANDS = ["AWER", "Awer", "Black Vinyil", "Black Vinyl"]
 
-cfg = json.loads((Path.home() / "AWER CRM" / "config.json").read_text(encoding="utf-8"))
-H = {"Authorization": f"Bearer {cfg['yandex_oauth_token']}", "Accept-Language": "ru"}
-if cfg.get("direct_client_login"):
-    H["Client-Login"] = cfg["direct_client_login"]
+H = {"Authorization": f"Bearer {yandex_token()}", "Accept-Language": "ru"}
+if crm_config().get("direct_client_login"):
+    H["Client-Login"] = crm_config()["direct_client_login"]
 API = "https://api.direct.yandex.com/json/v5/"
 BACKUP = Path(__file__).resolve().with_name("direct_backups")   # рядом со скриптом, откуда бы ни запускали
 BACKUP.mkdir(exist_ok=True)

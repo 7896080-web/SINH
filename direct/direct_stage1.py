@@ -10,17 +10,30 @@
   python direct_stage1.py --apply    — применить (перед этим сохраняется резервная копия)
   python direct_stage1.py --rollback — вернуть как было по последней резервной копии
 Если менять нечего, --apply ничего не делает и новую резервную копию не создаёт —
-иначе она стала бы «последней» и откат к состоянию до этапа 1 был бы потерян.
-Откат не трогает стратегию, если её тип с тех пор сменился (иначе сбросится обучение).
+иначе она стала бы «последней» и откат к состоянию до этапа 1 был бы потерян. Повторный --apply, когда этап 1 уже
+применялся, — только с --again (по той же причине).
+
+Возраст 45–54 этим скриптом больше не управляется (с 14.10.2026): им занимается direct_age_45_54.py. Иначе любой
+повторный --apply возвращал бы −20%, а откат этапа 1 стирал бы значение, поставленное позже.
+
+Откат (сразу, без пробного прогона) возвращает:
+  • недельный бюджет — только его: остальная стратегия (тип, цель, ограничения) остаётся как сейчас; если тип
+    стратегии с тех пор сменился — бюджет не трогает (верните вручную);
+  • площадки — убирает из запрещённых только те, что добавил этап 1; запрещённые позже остаются;
+  • корректировки, которые добавил или изменил этап 1 (планшеты, регионы, возраст до 24), — кроме 45–54.
+Каждый шаг отдельно: сбой одного не останавливает остальные, в конце — итог.
 
 Токен берётся из настроек AWER CRM (Маркетинг → Подключение к Яндексу).
 """
+import copy
 import json
 import sys
 import time
 from pathlib import Path
 
 import requests
+
+from yandex_token import crm_config, yandex_token
 
 # ---------------- НАСТРОЙКИ ----------------
 CAMPAIGNS = {
@@ -43,10 +56,11 @@ TABLET_MODIFIER = 0          # 0 = −100%
 DEMOGRAPHICS = {
     (None, "AGE_0_17"): 0,              # −100%, как было
     (None, "AGE_18_24"): 0,             # −100%, как было
-    (None, "AGE_45_54"): 80,            # −20% (06.10 было −50%, 10.10 смягчено direct_age_45_54.py)
 }
 # Эти корректировки не трогаем: где есть — остаются как есть, где нет — не добавляются.
-KEEP_AS_IS = {("GENDER_FEMALE", "AGE_55")}
+# 45–54 ведёт direct_age_45_54.py (06.10 этап 1 поставил −50%, 10.10 смягчено до −20%).
+KEEP_AS_IS = {("GENDER_FEMALE", "AGE_55"), (None, "AGE_45_54")}
+AGE_SEPARATE = "AGE_45_54"
 # Регионы (id геобазы Яндекса): 100 = без изменений, 70 = −30%, 50 = −50%.
 # Более конкретный регион перекрывает общий, поэтому Москве явно ставим 100.
 REGION_MODIFIERS = {
@@ -60,10 +74,7 @@ REGION_MODIFIERS = {
 }
 # -------------------------------------------
 
-cfg = json.loads((Path.home() / "AWER CRM" / "config.json").read_text(encoding="utf-8"))
-TOKEN, LOGIN = cfg.get("yandex_oauth_token", ""), cfg.get("direct_client_login", "")
-if not TOKEN:
-    raise SystemExit("В CRM не сохранён токен Яндекса (Маркетинг → Подключение к Яндексу).")
+TOKEN, LOGIN = yandex_token(), crm_config().get("direct_client_login", "")
 HEADERS = {"Authorization": f"Bearer {TOKEN}", "Accept-Language": "ru"}
 if LOGIN:
     HEADERS["Client-Login"] = LOGIN
@@ -206,9 +217,20 @@ def has_changes(camps, mods):
 
 def apply(camps, mods):
     stamp = time.strftime("%Y%m%d_%H%M%S")
-    backup = {"campaigns": camps, "bidmodifiers": mods, "added_bidmodifier_ids": []}
+    backup = {"campaigns": camps, "bidmodifiers": mods, "added_bidmodifier_ids": [], "changed": [], "deleted": [],
+              "unclear": []}
     path = BACKUP_DIR / f"backup_{stamp}.json"
-    path.write_text(json.dumps(backup, ensure_ascii=False, indent=1), encoding="utf-8")
+
+    def save():          # после каждого шага: если скрипт оборвётся, откат знает, что уже сделано
+        path.write_text(json.dumps(backup, ensure_ascii=False, indent=1), encoding="utf-8")
+
+    def failed(title, e):
+        print(f"  ✗ {title}: {e}")
+        if "нет ответа" in str(e):     # запрос мог дойти — запомнить, чтобы проверить руками
+            backup["unclear"].append(f"{title}: {e}")
+            save()
+
+    save()
     print(f"\nРезервная копия: {path}")
 
     # 1. Бюджет + запрещённые площадки
@@ -234,10 +256,9 @@ def apply(camps, mods):
     try:
         report_results("campaigns.update", call("campaigns", "update", {"Campaigns": items}).get("UpdateResults", []))
     except RuntimeError as e:
-        print(f"  ✗ {e}")
+        failed("campaigns.update", e)
 
     # 2. Корректировки
-    added, changed, deleted = [], [], []
     for cid in CAMPAIGNS:
         if cid not in camps:
             continue
@@ -248,17 +269,19 @@ def apply(camps, mods):
                 report_results(f"{name}: удаление пол/возраст",
                                call("bidmodifiers", "delete", {"SelectionCriteria": {"Ids": [m["Id"] for m in d]}})
                                .get("DeleteResults", []))
-                deleted += d
+                backup["deleted"] += d
+                save()
             except RuntimeError as e:
-                print(f"  ✗ {name}: удаление: {e}")
+                failed(f"{name}: удаление пол/возраст", e)
         if st:
             try:
                 report_results(f"{name}: изменение пол/возраст",
                                call("bidmodifiers", "set", {"BidModifiers": [{"Id": m["Id"], "BidModifier": v} for m, v in st]})
                                .get("SetResults", []))
-                changed += [{"Id": m["Id"], "BidModifier": m["DemographicsAdjustment"]["BidModifier"]} for m, v in st]
+                backup["changed"] += [{"Id": m["Id"], "BidModifier": m["DemographicsAdjustment"]["BidModifier"]} for m, v in st]
+                save()
             except RuntimeError as e:
-                print(f"  ✗ {name}: изменение: {e}")
+                failed(f"{name}: изменение пол/возраст", e)
         have = {m.get("Type") for m in mods if m.get("CampaignId") == cid}
         groups = []
         if ad:
@@ -274,14 +297,15 @@ def apply(camps, mods):
                 res = call("bidmodifiers", "add", {"BidModifiers": [item]}).get("AddResults", [])
                 report_results(f"{name}: {title}", res)
                 for r in res:
-                    added += r.get("Ids") or []
+                    backup["added_bidmodifier_ids"] += r.get("Ids") or []
+                save()
             except RuntimeError as e:
-                print(f"  ✗ {name}: {title}: {e}")
-    backup["changed"] = changed
-    backup["deleted"] = deleted
-    backup["added_bidmodifier_ids"] = added
-    path.write_text(json.dumps(backup, ensure_ascii=False, indent=1), encoding="utf-8")
-    print(f"\nГотово. Добавлено корректировок: {len(added)}. Для отката: python direct_stage1.py --rollback")
+                failed(f"{name}: {title}", e)
+    save()
+    print(f"\nГотово. Добавлено корректировок: {len(backup['added_bidmodifier_ids'])}. Для отката: python direct_stage1.py --rollback")
+    if backup["unclear"]:
+        print("  ! Директ не ответил на шаги (могли пройти, а откат их не знает) — проверьте в кабинете: "
+              + "; ".join(backup["unclear"]))
 
 
 def rollback():
@@ -290,36 +314,79 @@ def rollback():
         raise SystemExit("Резервных копий нет.")
     b = json.loads(files[-1].read_text(encoding="utf-8"))
     print(f"Откат по {files[-1]}")
-    if b.get("added_bidmodifier_ids"):
-        report_results("bidmodifiers.delete",
-                       call("bidmodifiers", "delete", {"SelectionCriteria": {"Ids": b["added_bidmodifier_ids"]}})
-                       .get("DeleteResults", []))
-    if b.get("changed"):
-        report_results("bidmodifiers.set (возврат значений)",
-                       call("bidmodifiers", "set", {"BidModifiers": b["changed"]}).get("SetResults", []))
-    for m in b.get("deleted") or []:
+    now_camps, now_mods = get_state()
+    by_id = {m.get("Id"): m for m in now_mods}
+    done, failed_steps = [], []
+
+    def step(title, fn):
+        try:
+            fn()
+            done.append(title)
+        except RuntimeError as e:          # один сбой не останавливает остальные шаги
+            print(f"  ✗ {title}: {e}")
+            failed_steps.append(title)
+
+    def is_age_separate(mod_id):
+        m = by_id.get(mod_id) or {}
+        return (m.get("DemographicsAdjustment") or {}).get("Age") == AGE_SEPARATE
+
+    added = [i for i in b.get("added_bidmodifier_ids") or [] if not is_age_separate(i)]
+    changed = [x for x in b.get("changed") or [] if not is_age_separate(x["Id"])]
+    deleted = [m for m in b.get("deleted") or [] if (m.get("DemographicsAdjustment") or {}).get("Age") != AGE_SEPARATE]
+    skipped = (len(b.get("added_bidmodifier_ids") or []) - len(added)) + (len(b.get("changed") or []) - len(changed)) \
+        + (len(b.get("deleted") or []) - len(deleted))
+    if skipped:
+        print(f"  Корректировку 45–54 не трогаю ({skipped} шт.): ею управляет direct_age_45_54.py "
+              "(вернуть её прежнее значение — python direct_age_45_54.py --rollback).")
+    if added:
+        step("удалить добавленные корректировки", lambda: report_results(
+            "bidmodifiers.delete", call("bidmodifiers", "delete", {"SelectionCriteria": {"Ids": added}}).get("DeleteResults", [])))
+    if changed:
+        step("вернуть прежние значения корректировок", lambda: report_results(
+            "bidmodifiers.set (возврат значений)", call("bidmodifiers", "set", {"BidModifiers": changed}).get("SetResults", [])))
+    for m in deleted:
         d = m["DemographicsAdjustment"]
         item = ({"Gender": d["Gender"]} if d.get("Gender") else {}) | {"Age": d["Age"], "BidModifier": d["BidModifier"]}
-        report_results("bidmodifiers.add (возврат удалённой)",
-                       call("bidmodifiers", "add", {"BidModifiers": [{"CampaignId": m["CampaignId"],
-                                                                       "DemographicsAdjustments": [item]}]})
-                       .get("AddResults", []))
-    now_camps, _ = get_state()
-    items = []
+        step(f"вернуть удалённую корректировку {d['Age']}", lambda m=m, item=item: report_results(
+            "bidmodifiers.add (возврат удалённой)",
+            call("bidmodifiers", "add", {"BidModifiers": [{"CampaignId": m["CampaignId"], "DemographicsAdjustments": [item]}]})
+            .get("AddResults", [])))
+    kinds = lambda s: ((s.get("Search") or {}).get("BiddingStrategyType"), (s.get("Network") or {}).get("BiddingStrategyType"))
     for cid, c in b["campaigns"].items():
+        now_c = now_camps.get(int(cid)) or {}
+        name = CAMPAIGNS.get(int(cid), cid)
+        # площадки: убрать из запрещённых только добавленные этапом 1
         old_sites = ((c.get("ExcludedSites") or {}).get("Items")) or []
-        # пустой список в API задаётся как null
-        item = {"Id": int(cid), "ExcludedSites": {"Items": old_sites} if old_sites else None}
-        strat = network_strategy(c)
-        now = network_strategy(now_camps.get(int(cid)) or {})
-        kinds = lambda s: ((s.get("Search") or {}).get("BiddingStrategyType"), (s.get("Network") or {}).get("BiddingStrategyType"))
-        if strat and kinds(strat) == kinds(now):
-            item["TextCampaign"] = {"BiddingStrategy": strat}
-        elif strat:
-            print(f"  ! {cid}: стратегия с тех пор сменилась ({kinds(strat)} → {kinds(now)}) — её не трогаю, "
-                  "иначе сбросится обучение. Бюджет верните вручную, если нужно.")
-        items.append(item)
-    report_results("campaigns.update", call("campaigns", "update", {"Campaigns": items}).get("UpdateResults", []))
+        now_sites = ((now_c.get("ExcludedSites") or {}).get("Items")) or []
+        keep = [s for s in now_sites if not (s in EXCLUDE and s not in old_sites)]
+        item = {"Id": int(cid)}
+        if keep != now_sites:
+            item["ExcludedSites"] = {"Items": keep} if keep else None      # пустой список в API задаётся как null
+            print(f"  {name}: из запрещённых площадок убираю {len(now_sites) - len(keep)} (добавленные этапом 1)")
+        # недельный бюджет: только он, в текущей стратегии
+        old_s, now_s = network_strategy(c), network_strategy(now_c)
+        okey = next((k for k, v in (old_s.get("Network") or {}).items() if isinstance(v, dict)), None)
+        nkey = next((k for k, v in (now_s.get("Network") or {}).items() if isinstance(v, dict)), None)
+        old_lim = ((old_s.get("Network") or {}).get(okey) or {}).get("WeeklySpendLimit") if okey else None
+        if old_s and (kinds(old_s) != kinds(now_s) or okey != nkey):
+            print(f"  ! {name}: стратегия с тех пор сменилась ({kinds(old_s)} → {kinds(now_s)}) — бюджет не трогаю "
+                  "(иначе сбросится обучение). Верните его вручную, если нужно.")
+        elif old_lim and nkey:
+            cur_lim = now_s["Network"][nkey].get("WeeklySpendLimit")
+            if cur_lim != old_lim:
+                new_s = copy.deepcopy(now_s)
+                new_s["Network"][nkey]["WeeklySpendLimit"] = old_lim
+                item["TextCampaign"] = {"BiddingStrategy": new_s}
+                print(f"  {name}: недельный бюджет {(cur_lim or 0) / 1_000_000:,.0f} → {old_lim / 1_000_000:,.0f} ₽ без НДС "
+                      "(остальная стратегия — как сейчас)".replace(",", " "))
+        if len(item) > 1:
+            step(f"{name}: бюджет и площадки", lambda item=item: report_results(
+                "campaigns.update", call("campaigns", "update", {"Campaigns": [item]}).get("UpdateResults", [])))
+    print(f"\nИтог отката: сделано шагов {len(done)}" + (f"; НЕ сделано: {', '.join(failed_steps)} — "
+                                                        "проверьте в кабинете Директа" if failed_steps else "."))
+    if b.get("unclear"):
+        print("  ! При применении Директ не ответил на шаги: " + "; ".join(b["unclear"])
+              + " — если они прошли, откат их не вернул; проверьте в кабинете.")
 
 
 if __name__ == "__main__":
@@ -330,6 +397,10 @@ if __name__ == "__main__":
     show_plan(camps, mods)
     if not has_changes(camps, mods):
         print("\nВсё уже как в настройках этапа 1 — менять нечего. Резервная копия не создаётся.")
+    elif "--apply" in sys.argv and sorted(BACKUP_DIR.glob("backup_*.json")) and "--again" not in sys.argv:
+        print(f"\nЭтап 1 уже применялся (последняя копия: {sorted(BACKUP_DIR.glob('backup_*.json'))[-1].name}). "
+              "Новая копия станет «последней», и откат будет возвращать уже не к состоянию до этапа 1. "
+              "Если всё же нужно: python direct_stage1.py --apply --again")
     elif "--apply" in sys.argv:
         apply(camps, mods)
     else:

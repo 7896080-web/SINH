@@ -13,6 +13,14 @@ import os
 import sys
 from pathlib import Path
 
+# Вывод в консоль Windows (cp1251) или в файл без UTF-8 не должен обрывать скрипт на ✓ ✗ → ₽ −: непечатаемое
+# заменяется «?». Важно для откатов: раньше первый же ✓ после первой записи останавливал откат на середине.
+try:
+    if sys.stdout is not None and (sys.stdout.encoding or "").lower().replace("-", "") != "utf8":
+        sys.stdout.reconfigure(errors="replace")
+except (AttributeError, ValueError):
+    pass
+
 CRM_CONFIG = Path.home() / "AWER CRM" / "config.json"
 DELIVERY_FILE = Path(__file__).resolve().with_name("yandex_delivery_token.txt")
 
