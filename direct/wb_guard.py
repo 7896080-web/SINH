@@ -92,10 +92,11 @@ def plan_topups(cab, token, camps, state):
             log(f"  «{t['name']}» на паузе, в бюджете {B.fm_rub(bud)} ₽ — паузу, видимо, поставили вы: не пополняю и не запускаю.")
             continue
         amount = B.deposit_amount(t["amount"], t["day_cap"], B.topped_week(state, cid, days=1), t["week_cap"],
-                                  B.topped_week(state, cid), cab_left if cab_cap else None)
+                                  B.topped_week(state, cid), cab_left if cab_cap else None,
+                                  t.get("min_deposit") or B.MIN_DEPOSIT)
         paused = camps[cid].get("_status") in (4, 11)
         if not amount:
-            log(f"  ! «{t['name']}»: бюджет {B.fm_rub(bud)} ₽, но до потолка пополнений меньше {B.MIN_DEPOSIT} ₽ "
+            log(f"  ! «{t['name']}»: бюджет {B.fm_rub(bud)} ₽, но до потолка пополнений меньше {t.get('min_deposit') or B.MIN_DEPOSIT:.0f} ₽ "
                 "(меньше WB не принимает) — не пополняю"
                 + (" (кампания стоит на паузе)" if paused else ""))
             continue
