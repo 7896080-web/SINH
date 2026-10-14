@@ -163,7 +163,7 @@ def test_rate_move_over_2_percent_recomputes_reference(db):
     db.expire_all()
     ref = db.query(ReferencePrice).one()
     assert st["revalued"] == 1 and ref.usd_rub == Decimal("82.4000")
-    assert ref.ref_price == 2069 and ref.source == "rate"        # 10 $ × 82,4 × 2,5 = 2060 → вверх до шага 10, минус 1 = 2069
+    assert ref.ref_price == 2069 and ref.source == "rate"        # по курсу: 2009 × 82,4 / 80 = 2069,3
     assert st["restored"] == 0                                    # цена площадки (2500) не ниже новой эталонной
 
 
@@ -279,3 +279,28 @@ def test_dispatch_send_saves_etalon_copy(db):
     after = set(config.ETALON_DIR.glob("etalon_*.xlsx"))
     new = after - before
     assert len(new) == 1 and "отправка" in next(iter(new)).name
+
+
+def test_rate_move_scales_a_manual_etalon_and_never_replaces_it(db):
+    """Аудит 14.10: пересчёт по курсу ЗАМЕНЯЛ эталон ценой по наценке — ручной эталон 4000 стал
+    15 459, и тем же прогоном WB поднялся на 93% без человека. Теперь эталон × курс."""
+    acc = _setup(db)
+    ref = _ref(db, acc, 4000)
+    ref.source = "manual"
+    db.commit()
+    f.manual_rate(db, "82.4")                                     # +3%
+    st, wb = _run(db)
+    db.expire_all()
+    ref = db.query(ReferencePrice).one()
+    assert st["revalued"] == 1 and ref.ref_price == 4120 and wb.calls == []   # 4000 × 1,03; площадка держит 2500
+
+
+def test_rate_jump_over_20_percent_is_not_applied(db):
+    acc = _setup(db)
+    _ref(db, acc, 2009)
+    f.manual_rate(db, "8.15")                                     # опечатка вместо 81,5
+    st, wb = _run(db)
+    db.expire_all()
+    from priceapp.models import AuditLog
+    assert st["revalued"] == 0 and db.query(ReferencePrice).one().ref_price == 2009
+    assert db.query(AuditLog).filter_by(action="reference_rate_jump").count() == 1

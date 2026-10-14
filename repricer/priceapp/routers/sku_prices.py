@@ -715,7 +715,7 @@ def send(request: Request, form=Depends(posted_form), db: Session = Depends(get_
     db.commit()
     what = "категориям" if keep["by"] == "category" else "артикулам"
     parts = [f"{sc['label']}: передано на отправку {queued} цен по {len(chosen)} {what} — уйдут в течение пары "
-             "минут, итог — «Цены» → «Журнал»"]
+             "минут, итог — «Правила и журнал» → «Журнал отправок»"]
     if same:
         parts.append(f"уже стоит на площадке — {same}")
     if superseded:

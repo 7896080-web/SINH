@@ -200,3 +200,18 @@ def test_exchange_archive_is_pruned_by_age(tmp_path):
     t = time.time() - 61 * 86400
     os.utime(old, (t, t))
     assert exchange.prune_archive(tmp_path) == 1 and new.exists() and not old.exists()
+
+
+def test_orphan_markups_can_be_seen_and_deleted(client, db):
+    """Аудит 14.10: находка «наценки-сироты» вела туда, где их нет, и горела вечно."""
+    from decimal import Decimal
+
+    from priceapp.models import ArticleCoef
+    F.account(db, "wb", "ИП 1")
+    db.add(ArticleCoef(article="ПРОПАВШИЙ-1", platform="wb", account_id=0, coef=Decimal("2"), kind="coef"))
+    db.commit()
+    assert "/orphans" in client.post("/attention/refresh").text
+    assert "ПРОПАВШИЙ-1" in client.get("/orphans").text
+    r = client.post("/orphans/delete")
+    assert "Удалено наценок без товаров: 1" in r.text
+    assert db.query(ArticleCoef).count() == 0

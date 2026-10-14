@@ -8,9 +8,10 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 
-from priceapp import overview, rates
+from priceapp import audit, overview, platforms, rates
 from priceapp.database import get_db
 from priceapp.deps import get_current_user
+from priceapp.flash import flash
 from priceapp.models import User
 from priceapp.pages import render
 from priceapp.routers.prices import product_rows
@@ -48,3 +49,24 @@ def refresh(request: Request, db: Session = Depends(get_db), user: User = Depend
     """Пересчитать счётчики по товарам сейчас — на большом каталоге это до минуты."""
     overview.refresh_heavy(db, product_rows)
     return RedirectResponse("/attention", status_code=303)
+
+
+@router.get("/orphans")
+def orphans(request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Наценки, не находящие ни одного товара, — список и удаление."""
+    arts, cats = overview.orphan_rows(db)
+    return render(request, "orphans.html", user, "attention", arts=arts, cats=cats, names=platforms.PLATFORMS)
+
+
+@router.post("/orphans/delete")
+def orphans_delete(request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    arts, cats = overview.orphan_rows(db)
+    text = "; ".join([f"{c.article} ({c.platform}, каб. {c.account_id}) {c.kind} {c.coef}" for c in arts]
+                     + [f"{c.platform}: {c.category} {c.kind} {c.value}" for c in cats])
+    for c in [*arts, *cats]:
+        db.delete(c)
+    audit.log(db, user.username, "orphans_deleted", f"{len(arts) + len(cats)} шт", text[:1000])
+    db.commit()
+    flash(request, f"Удалено наценок без товаров: {len(arts) + len(cats)}. Цены не менялись — эти наценки "
+                   "ни на один товар не действовали.", "ok")
+    return RedirectResponse("/orphans", status_code=303)

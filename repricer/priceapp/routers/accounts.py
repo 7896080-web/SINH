@@ -51,7 +51,7 @@ def create(request: Request, form=Depends(posted_form), db: Session = Depends(ge
     db.flush()
     audit.log(db, user.username, "account_created", f"{name} ({platform})")
     db.commit()
-    flash(request, f"Кабинет «{name}» заведён. Впишите ключи и комиссию площадки (страница «Цены» → «Правила»).", "ok")
+    flash(request, f"Кабинет «{name}» заведён. Впишите ключи и комиссию площадки (страница «Правила и журнал» → «Правила площадок»).", "ok")
     return _back()
 
 
