@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Наценки без товаров{% endblock %}
+{% block content %}
+<h1>Наценки без товаров</h1>
+<p class="muted">Эти наценки не действуют ни на один товар: артикула больше нет в справочнике 1С, а категории —
+в каталогах площадок (её переименовали). Товары, на которые они действовали раньше, считаются по наценке категории
+или по умолчанию площадки. Удаление цены не меняет — проверьте только, не нужно ли задать наценку заново под новым
+именем на «Ценах товаров».</p>
+{% if arts or cats %}
+<div class="scroll"><table>
+<tr><th>Что</th><th>Площадка</th><th>Кабинет</th><th>Наценка</th></tr>
+{% for c in arts %}<tr><td>артикул <b>{{ c.article }}</b></td><td>{{ names.get(c.platform, c.platform) }}</td>
+  <td>{{ 'вся площадка' if not c.account_id else c.account_id }}</td><td>{{ c.kind }} {{ c.coef|plain }}</td></tr>{% endfor %}
+{% for c in cats %}<tr><td>категория <b>{{ c.category }}</b></td><td>{{ names.get(c.platform, c.platform) }}</td>
+  <td>{{ 'вся площадка' if not c.account_id else c.account_id }}</td><td>{{ c.kind }} {{ c.value|plain }}</td></tr>{% endfor %}
+</table></div>
+<form method="post" action="/orphans/delete" style="margin-top:10px"
+  onsubmit="return confirm('Удалить {{ arts|length + cats|length }} наценок без товаров? Цены не изменятся.')">
+  <button class="danger">Удалить все ({{ arts|length + cats|length }})</button></form>
+{% else %}
+<div class="card muted">Наценок без товаров нет.</div>
+{% endif %}
+{% endblock %}

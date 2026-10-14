@@ -242,31 +242,43 @@ def _heavy(db: Session, product_rows) -> list[Item]:
     return a.items
 
 
+def orphan_rows(db: Session) -> tuple[list, list]:
+    """(наценки артикулов, наценки категорий), не находящие ни одного товара. Один отбор и для
+    находки «Внимания», и для страницы, где их удаляют: разойдись они, страница удаляла бы не то,
+    что насчитала находка."""
+    from priceapp.models import ArticleCoef, CategoryTarget
+    from priceapp.pricing import article_map
+    arts = db.query(ArticleCoef).all()
+    lost_arts = []
+    if arts:
+        am = article_map(db)
+        known = set(am.values()) | set(am)
+        lost_arts = [c for c in arts if c.article not in known]
+    cats = db.query(CategoryTarget).all()
+    lost_cats = []
+    if cats:
+        present = {(p, c) for p, c in db.query(Account.platform, PlatformItem.category)
+                   .join(PlatformItem, PlatformItem.account_id == Account.id).distinct()}
+        lost_cats = [c for c in cats if (c.platform, c.category) not in present]
+    return lost_arts, lost_cats
+
+
 def _orphans(db: Session) -> list[Item]:
     """Наценки, которые не находят ни одного товара: ключ — строка (артикул 1С,
     название категории площадки), и переименование на той стороне молча роняет
     товары на умолчание площадки."""
-    from priceapp.models import ArticleCoef, CategoryTarget
-    from priceapp.pricing import article_map
+    # Разбирают на своей странице: на «Ценах товаров» таких строк нет вовсе, и находка
+    # горела вечно (аудит 14.10).
     out = []
-    arts = db.query(ArticleCoef).all()
-    if arts:
-        known = set(article_map(db).values()) | set(article_map(db))
-        lost = sorted({c.article for c in arts if c.article not in known})
-        if lost:
-            out.append(Item("warn", "Наценки артикулов, которых больше нет в справочнике 1С: "
-                                    + ", ".join(lost[:10]) + (" …" if len(lost) > 10 else ""),
-                            "/sku-prices", len(lost)))
-    cats = db.query(CategoryTarget).all()
-    if cats:
-        present = {(p, c) for p, c in db.query(Account.platform, PlatformItem.category)
-                   .join(PlatformItem, PlatformItem.account_id == Account.id).distinct()}
-        lost = sorted({f"{platforms.PLATFORMS.get(c.platform, c.platform)}: {c.category}" for c in cats
-                       if (c.platform, c.category) not in present})
-        if lost:
-            out.append(Item("warn", "Наценки категорий, которых больше нет в каталогах (площадка переименовала?) — "
-                                    "товары ушли на умолчание: " + "; ".join(lost[:10]),
-                            "/sku-prices?by=category", len(lost)))
+    lost_arts, lost_cats = orphan_rows(db)
+    lost = sorted({c.article for c in lost_arts})
+    if lost:
+        out.append(Item("warn", "Наценки артикулов, которых больше нет в справочнике 1С: "
+                                + ", ".join(lost[:10]) + (" …" if len(lost) > 10 else ""), "/orphans", len(lost)))
+    lost = sorted({f"{platforms.PLATFORMS.get(c.platform, c.platform)}: {c.category}" for c in lost_cats})
+    if lost:
+        out.append(Item("warn", "Наценки категорий, которых больше нет в каталогах (площадка переименовала?) — "
+                                "товары ушли на умолчание: " + "; ".join(lost[:10]), "/orphans", len(lost)))
     return out
 
 

@@ -23,6 +23,15 @@ async def lifespan(app: FastAPI):
         ensure_defaults(db)
     finally:
         db.close()
+    # Журнал фоновых заданий: uvicorn настраивает только свои логгеры, и INFO программы не
+    # писалось нигде (аудит 14.10). Под NSSM поток ошибок уходит в logs\repricer.err.log.
+    import logging
+    app_log = logging.getLogger("repricer")
+    if not app_log.handlers:
+        h = logging.StreamHandler()
+        h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        app_log.addHandler(h)
+        app_log.setLevel(logging.INFO)
     background = os.environ.get("REPRICER_BACKGROUND", "1") != "0"
     if background:
         from priceapp.workers import background as bg

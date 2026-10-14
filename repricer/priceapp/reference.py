@@ -12,8 +12,9 @@
    (автоакция) или оба. Эталонная пара ВОЗВРАЩАЕТСЯ одним заданием WB на карточку, только
    вверх. Возврат, поднимающий цену больше чем на `ref_max_raise_percent` (50%), не
    отправляется, а уходит во «Внимание»: так выглядит ошибочный эталон, а не занижение.
-2. «Курс». Курс ушёл от курса эталонной больше чем на `ref_rate_percent` (2%) — эталонная
-   цена до скидки пересчитывается по наценке на ТЕКУЩЕМ курсе, затем работает правило 1.
+2. «Курс». Курс ушёл от курса эталонной больше чем на `ref_rate_percent` (2%) — эталон
+   пересчитывается ПО КУРСУ (× новый / прежний, скидка та же), затем работает правило 1.
+   Скачок больше 20% — эталоны не трогаются, запись в журнал (скорее опечатка в курсе).
 
 Только кабинеты WB. Опрос площадки — при запуске программы и раз в 6 часов
 (`workers/jobs.job_wb_poll`), а также сразу, когда курс ушёл за порог.
@@ -31,6 +32,7 @@ from priceapp.timeutils import now_utc
 
 SOURCE = "reference"
 PLATFORMS = ("wb",)
+MAX_RATE_JUMP = Decimal("0.2")
 COMMIT_EVERY = 500
 
 
@@ -230,22 +232,31 @@ def run(db: Session, product_rows=None, actor: str = "программа", clien
             PriceChange.account_id == a.id, PriceChange.is_test.is_(False),
             PriceChange.status == PriceChangeStatus.approved.value)}
         revalued = 0
+        rate_jumps: set[str] = set()
         cards: dict[str, dict] = {}
         big: dict[str, str] = {}                 # по карточке: строка на каждый размер повторяла бы одно и то же
         for r in product_rows(db, a):
             ref = refs.get(r["item_id"])
             if ref is None:
                 continue
-            # 1. Курс ушёл за порог — эталонная пересчитывается по наценке на текущем курсе.
-            if (rate is not None and ref.usd_rub and r.get("price") and r.get("payout") is not None
-                    and abs(rate.usd_rub / _dec(ref.usd_rub) - 1) > rate_thr):
-                ref.ref_price = int(r["price"])
-                ref.ref_payout = _dec(r["payout"]).quantize(Decimal("0.01"))
-                ref.usd_rub = rate.usd_rub
-                ref.source = "rate"
-                ref.set_at = now
-                revalued += 1
-                _mark_dirty()
+            # 1. Курс ушёл за порог — эталон пересчитывается ПО КУРСУ: тот же эталон × новый курс /
+            # курс эталона, скидка прежняя. Раньше он заменялся ценой по наценке на новом курсе, а это
+            # другое число: ручной эталон со страницы «Эталонные цены» стирался, а в акцию цена до
+            # скидки считалась под акционную скидку при прежней скидке эталона — эталон раздувался,
+            # и правило 2 само поднимало WB (проба: +93% без человека; аудит 14.10).
+            if rate is not None and ref.usd_rub and ref.ref_price:
+                ratio = _dec(rate.usd_rub) / _dec(ref.usd_rub)
+                if abs(ratio - 1) > MAX_RATE_JUMP:
+                    rate_jumps.add(f"{ref.usd_rub} -> {rate.usd_rub}")
+                elif abs(ratio - 1) > rate_thr:
+                    ref.ref_price = int((Decimal(ref.ref_price) * ratio).to_integral_value(rounding=ROUND_HALF_UP))
+                    if ref.ref_payout is not None:
+                        ref.ref_payout = (_dec(ref.ref_payout) * ratio).quantize(Decimal("0.01"))
+                    ref.usd_rub = rate.usd_rub
+                    ref.source = "rate"
+                    ref.set_at = now
+                    revalued += 1
+                    _mark_dirty()
             if r["item_id"] in busy:
                 continue
             # 2. Площадка занизила цену после скидки продавца — вернуть эталонную (только вверх).
@@ -261,6 +272,12 @@ def run(db: Session, product_rows=None, actor: str = "программа", clien
                 cards[nm] = {"ref": ref, "cur": r.get("current_sale"), "items": c["items"] if c else set()}
             cards[nm]["items"].add(r["item_id"])
         st["revalued"] += revalued
+        if rate_jumps:
+            # Скачок больше `MAX_RATE_JUMP` — скорее опечатка в ручном курсе, чем рынок: эталоны не
+            # трогаем, пусть решает человек (страница «Курс $»).
+            audit.log(db, actor, "reference_rate_jump", a.name,
+                      f"курс ушёл больше чем на {int(MAX_RATE_JUMP * 100)}% от курса эталона ({'; '.join(sorted(rate_jumps))[:300]}) — "
+                      "эталоны НЕ пересчитаны: проверьте курс")
         st["eaten"] += len(big)
         if big:
             audit.log(db, actor, "reference_big", a.name,
@@ -301,6 +318,12 @@ def _send(db: Session, a: Account, cards: dict, client_factory, st: dict, actor:
             continue
         done += chunk
     from priceapp.dispatch import _record_sent
+    # Строки кабинета — одним запросом, по nmID: `LIKE 'nm:%'` на каждую карточку без индекса
+    # шёл 46 с на 4000 карточек в тяжёлом потоке (аудит 14.10).
+    by_nm: dict[str, list] = {}
+    if done:
+        for it in db.query(PlatformItem).filter(PlatformItem.account_id == a.id):
+            by_nm.setdefault((it.external_id or "").split(":")[0], []).append(it)
     for nm, c in done:
         price, d = int(c["ref"].ref_price), ref_discount_int(c["ref"])
         for item_id in c.get("items", ()):
@@ -308,8 +331,9 @@ def _send(db: Session, a: Account, cards: dict, client_factory, st: dict, actor:
         from priceapp.etalon import journal_sent
         journal_sent(db, a.id, sorted(c.get("items", ())), "", None, price, SOURCE,
                      f"возврат эталона: площадка держала {c['cur']} ₽ после скидки, скидка {d}%", actor)
-        for it in db.query(PlatformItem).filter(PlatformItem.account_id == a.id,
-                                                PlatformItem.external_id.like(f"{nm}:%")):
+        for it in by_nm.get(str(nm), []):
+            if ":" not in (it.external_id or ""):
+                continue
             it.current_price = price
             it.current_sale_price = int((Decimal(price) * (100 - d) / 100).quantize(Decimal(1), ROUND_HALF_UP))
     if done:

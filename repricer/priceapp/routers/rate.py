@@ -53,7 +53,7 @@ def set_mode(request: Request, form=Depends(posted_form), db: Session = Depends(
     audit.log(db, user.username, "rate_mode", mode, f"было {before}, стало {(mode, manual)}")
     db.commit()
     flash(request, ("Считаем по ручному курсу " + manual + " ₽." if mode == "manual"
-                    else "Считаем по курсу ЦБ.") + " Цены не изменились — нужен пересчёт на странице «Цены».", "ok")
+                    else "Считаем по курсу ЦБ.") + " Новые цены видны на «Ценах товаров» сразу; на площадки они уходят кнопкой «Передать».", "ok")
     return RedirectResponse("/rate", status_code=303)
 
 
