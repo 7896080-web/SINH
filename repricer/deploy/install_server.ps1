@@ -96,7 +96,9 @@ if (-not ($lines | Where-Object { $_ -match '^REPRICER_SECRETS_KEY=.+' })) {
     Fail ".env без REPRICER_SECRETS_KEY — без него не прочитать ключи площадок. Возьмите .env с офисного компьютера."
 }
 $lines += @(
-    "DATABASE_URL=sqlite:///" + ($Root -replace "\\", "/") + "/repricer.db",
+    # В скобках обязательно: запятая в PowerShell связывает раньше «+», и без скобок
+    # все следующие строки склеились бы с этой в одну через пробел (так и вышло 14.10).
+    ("DATABASE_URL=sqlite:///" + ($Root -replace "\\", "/") + "/repricer.db"),
     "REPRICER_BACKUP_DIR=$Root\backups",
     "REPRICER_ETALON_DIR=$Root\etalon_history",
     "REPRICER_ONEC_TASKS_DIR=$SyncRoot\tasks",
