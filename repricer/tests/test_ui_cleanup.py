@@ -110,3 +110,67 @@ def test_a_failing_job_does_not_kill_the_background_thread(monkeypatch):
     background._loop()                 # раньше — исключение наружу на первом же круге
     assert len(calls) == 2
     background._stop.clear()
+
+
+def test_keys_page_opens_when_secrets_key_changed(client, db):
+    """Аудит 14.10: ключи, зашифрованные другим REPRICER_SECRETS_KEY, роняли «API-ключи» в 500 —
+    вписать их заново было негде; отправка писала ошибку без текста."""
+    import pytest
+    from cryptography.fernet import Fernet
+
+    from priceapp import accounts
+    from priceapp.models import ApiCredential
+    acc = F.account(db, "wb", "ИП 1")
+    db.add(ApiCredential(account_id=acc.id, field_name="token",
+                         encrypted_value=Fernet(Fernet.generate_key()).encrypt(b"old").decode()))
+    db.commit()
+    page = client.get("/api-keys")
+    assert page.status_code == 200 and accounts.UNREADABLE in page.text
+    with pytest.raises(RuntimeError, match="ИП 1"):
+        accounts.credentials(db, acc)
+
+
+def test_backup_retention_keeps_a_copy_per_day_and_everything_from_today():
+    """Аудит 14.10: «14 последних файлов» — копии наката за два-три дня вытесняли суточные."""
+    from datetime import datetime, timedelta
+    from pathlib import Path
+
+    from priceapp import backup
+    now = datetime(2026, 10, 14, 12, 0)
+    names = []
+    for d in range(20):                                   # по две копии в день за 20 дней
+        for h in (3, 9):
+            t = now - timedelta(days=d, hours=h)
+            names.append(Path(f"repricer-{t:%Y%m%d-%H%M%S}.db"))
+    names.append(Path("repricer-ручная.db"))
+    drop = set(backup.names_to_drop(names, now))
+    kept = [n for n in names if n not in drop]
+    assert Path("repricer-ручная.db") in kept
+    assert all(n in kept for n in names[:2])              # моложе суток — обе
+    days = {n.stem[9:17] for n in kept if n.stem[9:].replace("-", "").isdigit()}
+    assert len(days) == 15                                # сегодня + 14 дней по одной
+
+
+def test_proposal_older_than_a_day_is_not_approved():
+    """Аудит 14.10: предложение недельной давности подтверждалось и уходило с тогдашним шагом."""
+    from datetime import timedelta
+
+    from priceapp.pricing import approve
+    from priceapp.timeutils import now_utc
+    ch = PriceChange(item_id="s", account_id=1, barcode="b", new_price=1000, status="proposed",
+                     created_at=now_utc() - timedelta(days=2))
+    assert "больше суток" in approve(ch, "op") and ch.status == "proposed"
+    ch.created_at = now_utc()
+    assert approve(ch, "op") is None and ch.status == "approved"
+
+
+def test_queued_price_can_be_cancelled_from_the_log(client, db):
+    acc = F.account(db, "wb", "ИП 1")
+    _change(db, acc, "approved")
+    page = client.get("/prices?view=log").text
+    assert 'name="back" value="log"' in page
+    ch = db.query(PriceChange).one()
+    r = client.post("/prices/reject", data={"ids": str(ch.id), "back": "log"})
+    assert "не уйдёт" in r.text
+    db.expire_all()
+    assert db.query(PriceChange).one().status == "rejected"

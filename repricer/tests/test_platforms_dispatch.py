@@ -192,3 +192,35 @@ def test_kit_push_sends_manual_discount_price_with_price():
         {"variant_id": "v2", "price": "3000", "manual_discount_price": "3000"},
         {"variant_id": "v3", "price": "2000"}]}
     assert sorted(res["ok"]) == ["b1", "b2", "b3"]
+
+
+class _WbSession400:
+    def __init__(self, text):
+        self.headers, self.calls, self.text = {}, [], text
+
+    def post(self, url, json=None, timeout=0):
+        self.calls.append((url, json))
+        return _KitResp(400, {"data": None, "error": True, "errorText": self.text})
+
+
+def test_wb_400_already_set_is_accepted_and_other_400_carries_its_reason():
+    """Аудит 14.10: тело ответа WB не читалось — «уже установлены» (цена на месте) уходило в пять
+    повторов и `error` без причины, а любой другой отказ — с текстом «400 Bad Request for url»."""
+    res = platforms.WbClient("t", _WbSession400("The specified prices and discounts are already set")).push_prices(
+        [PriceItem("b1", 1000, "123:1")])
+    assert res["ok"] == ["b1"] and not res["errors"]
+    res = platforms.WbClient("t", _WbSession400("Invalid price")).push_prices([PriceItem("b1", 1000, "123:1")])
+    assert res["ok"] == [] and "Invalid price" in res["errors"][0]["detail"]
+
+
+def test_kit_empty_page_before_total_count_is_truncated():
+    class S:
+        headers = {}
+
+        def get(self, url, params=None, timeout=0):
+            page = params["page"]
+            vs = [{"id": f"v{page}-{i}", "barcode": f"b{page}-{i}"} for i in range(100)] if page == 1 else []
+            return _KitResp(200, {"variants": vs, "total_count": 250})
+    c = platforms.KitClient("t", session=S())
+    rows = c.get_catalog()
+    assert len(rows) == 100 and c.last_truncated is True

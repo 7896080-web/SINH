@@ -153,6 +153,9 @@ def test_server_move_scripts():
     assert "chrome.exe" in inst and "iexplore" not in inst
     upd = (DEPLOY / "update_server.ps1").read_text(encoding="utf-8-sig")
     assert upd.index("nssm stop") < upd.index("make_backup") < upd.index("pytest") < upd.rindex("nssm start $Service")
+    # аудит 14.10: версию сверяют ДО остановки службы, а успех — по фону нового процесса
+    assert upd.index("INSTALLED_TAG") < upd.index("$installed -ne $Tag") < upd.index("nssm stop")
+    assert upd.rindex("nssm start $Service") < upd.index("onec_exchange")
 
 
 def test_ps1_array_items_with_plus_are_parenthesized():

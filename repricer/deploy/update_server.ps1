@@ -8,10 +8,14 @@
     красных тестах НЕ запускается: старый код с новой схемой базы хуже паузы.
 
     PowerShell от администратора:
-        powershell -ExecutionPolicy Bypass -File C:\repricer\deploy\update_server.ps1
+        powershell -ExecutionPolicy Bypass -File C:\repricer\deploy\update_server.ps1 -Tag rpNN
+
+    -Tag — версия, которую СОБИРАЛИСЬ поставить. Патч пишет deploy\INSTALLED_TAG после того,
+    как все файлы записаны и сверены; не совпало — накат останавливается ДО остановки службы:
+    иначе он честно отработал бы на старом коде и кончился зелёным (урок sync_admin 23.09).
 #>
 [CmdletBinding()]
-param([int]$WebPort = 8002, [string]$Service = "repricer")
+param([int]$WebPort = 8002, [string]$Service = "repricer", [string]$Tag = "")
 $ErrorActionPreference = "Stop"
 function Info($m) { Write-Host "[*] $m" -ForegroundColor Cyan }
 function Ok($m)   { Write-Host "[OK] $m" -ForegroundColor Green }
@@ -22,6 +26,15 @@ Set-Location $Root
 $venvPy = Join-Path $Root ".venv\Scripts\python.exe"
 if (-not (Test-Path $venvPy)) { Fail "Нет $venvPy — сначала install_server.ps1" }
 if (-not (Get-Service -Name $Service -ErrorAction SilentlyContinue)) { Fail "Нет службы $Service — сначала install_server.ps1" }
+
+$tagFile = Join-Path $Root "deploy\INSTALLED_TAG"
+$installed = if (Test-Path $tagFile) { (Get-Content $tagFile -TotalCount 1).Trim() } else { "" }
+if ($Tag) {
+    if ($installed -ne $Tag) { Fail "На диске версия '$installed', а ставим '$Tag' — патч $Tag не применён. Служба не тронута." }
+    Ok "Версия на диске: $installed"
+} else {
+    Info "Версия на диске: $(if ($installed) { $installed } else { 'неизвестна' }) (проверка: -Tag rpNN)"
+}
 
 Info "Останавливаю службу $Service"
 & nssm stop $Service | Out-Null
@@ -48,6 +61,7 @@ if ($saved) { $env:DATABASE_URL = $saved }
 if ($rc -ne 0) { Fail "Тесты красные — службу не запускаю" }
 
 Info "Запуск службы $Service"
+$startedUtc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
 & nssm start $Service | Out-Null
 $url = "http://127.0.0.1:$WebPort"
 $up = $false
@@ -55,4 +69,20 @@ for ($i = 0; $i -lt 60 -and -not $up; $i++) {
     try { Invoke-WebRequest "$url/login" -UseBasicParsing -TimeoutSec 2 | Out-Null; $up = $true } catch { Start-Sleep -Seconds 1 }
 }
 if (-not $up) { Fail "Служба не отвечает на $url — журнал: $Root\logs\repricer.err.log (открывать с -Encoding UTF8)" }
-Ok "Обновление завершено, программа отвечает: $url"
+
+# Страница отвечает — ещё не значит, что работает фон: отметки в базе остались от ПРЕЖНЕГО
+# процесса. Ждём отметку обмена с 1С, поставленную новым процессом (быстрый поток, каждые 30 с).
+Info "Жду фоновые задания нового процесса"
+$check = "import sys, priceapp; from datetime import datetime; from priceapp.database import SessionLocal; " +
+         "from priceapp.models import WorkerHeartbeat; db = SessionLocal(); r = db.get(WorkerHeartbeat, 'onec_exchange'); " +
+         "sys.exit(0 if r and r.last_run_at and r.last_run_at >= datetime.fromisoformat(sys.argv[1]) else 1)"
+$alive = $false
+# PowerShell 5.1 при "Stop" превращает любой вывод python в stderr в исключение и рвёт накат.
+$ErrorActionPreference = "Continue"
+for ($i = 0; $i -lt 30 -and -not $alive; $i++) {
+    & $venvPy -c $check $startedUtc 2>$null
+    if ($LASTEXITCODE -eq 0) { $alive = $true } else { Start-Sleep -Seconds 5 }
+}
+$ErrorActionPreference = "Stop"
+if (-not $alive) { Fail "Страница отвечает, но фон нового процесса за 150 с не отметился — журнал: $Root\logs\repricer.err.log" }
+Ok "Обновление завершено ($installed), программа отвечает и фон работает: $url"

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from datetime import timedelta
 from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal
 
 from sqlalchemy.orm import Session
@@ -495,6 +496,7 @@ def recalculate_account(db: Session, account: Account, is_test: bool = False) ->
 
 
 COMMIT_EVERY = 500
+PROPOSAL_TTL = timedelta(hours=24)
 
 
 def approve(change: PriceChange, actor: str, confirm_large: bool = False) -> str | None:
@@ -502,6 +504,10 @@ def approve(change: PriceChange, actor: str, confirm_large: bool = False) -> str
     Пол не обходится никогда; лимит шага — только с confirm_large."""
     if change.status not in OPEN:
         return "уже решено"
+    if change.created_at is not None and now_utc() - change.created_at > PROPOSAL_TTL:
+        # Посчитано давно: цена на площадке, курс и себестоимость с тех пор могли уйти, а лимит
+        # шага считался к тогдашней цене — подтверждение отправило бы её без перепроверки.
+        return "предложение посчитано больше суток назад — пересчитайте (цены и курс могли измениться)"
     if change.block_reason == BLOCK_FLOOR:
         return BLOCK_LABELS[BLOCK_FLOOR]
     if change.block_reason == BLOCK_MAX_CHANGE and not confirm_large:

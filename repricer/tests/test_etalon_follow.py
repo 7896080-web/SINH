@@ -236,3 +236,27 @@ def test_new_etalon_is_recorded_as_our_last_sent_on_wb(db):
     etalon.set_etalon(db, "100", 4000, "оператор", client_factory=lambda p, c: Fake([]))
     pp = db.query(ProductPrice).filter_by(account_id=w.id, item_id="s1").one()
     assert pp.last_sent_price == 8000
+
+
+def test_lamoda_error_without_sku_does_not_fail_the_whole_batch(db):
+    """Аудит 14.10: ошибка Ламоды без `sku` бракует у нас всю пачку, хотя остальные площадка
+    применила. Пачка досылается по одной: виновник отказывает, здоровые встают."""
+    w, kit, lam = _setup(db)
+    F.sku(db, "s2", "100", "L", barcodes=["b2"])
+    F.item(db, lam, "b2", "100", external_id="MP2:s2")
+    db.query(PlatformItem).filter_by(barcode="b2").one().current_price = 9000
+    db.commit()
+
+    class LamFake(Fake):
+        def _post(self, url, body):
+            self.log.append(("post", url, body))
+            keys = [p["parentSku"] for p in body["prices"]]
+            if "MP2" in keys:
+                return {"successCount": len(keys) - 1, "errorCount": 1, "errors": [{"sku": "", "code": "NotFound"}]}
+            return {"successCount": len(keys), "errorCount": 0, "errors": [], "fraudValidationResults": []}
+
+    cards = [c for c in etalon.follower_plan(db) if c.platform == "lamoda"]
+    log = []
+    res = etalon.send_followers(db, cards, client_factory=lambda p, c: LamFake(log))
+    assert "отправлено карточек: 1 из 2" in res["Ламода"] and "MP2" not in res["Ламода"].split(";")[0]
+    assert len([x for x in log if "nomenclatures" in x[1]]) == 3          # пачка + по одной

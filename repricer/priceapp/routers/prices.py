@@ -1041,8 +1041,9 @@ def reject_changes(request: Request, form=Depends(posted_form), db: Session = De
         n += 1
     audit.log(db, user.username, "price_rejected", f"{n} шт", f"id={ids[:50]}")
     db.commit()
-    flash(request, f"Отклонено: {n}.", "ok" if n else "warn")
-    return _back("proposals", account_id=account_id)
+    flash(request, f"Отклонено: {n}." + (" Цена из очереди снята — на площадку не уйдёт." if n and form.get("back") == "log"
+                                          else ""), "ok" if n else "warn")
+    return _back("log" if form.get("back") == "log" else "proposals", account_id=account_id)
 
 
 

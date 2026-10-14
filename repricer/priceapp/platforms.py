@@ -124,6 +124,21 @@ WB_PRICE_PAGE = 1000      # limit у /api/v2/list/goods/filter — до 1000
 WB_PRICE_MAX_PAGES = 500
 
 
+def wb_error_detail(e: Exception) -> str:
+    """Текст отказа WB вместе с ТЕЛОМ ответа: причина (`errorText`) лежит в нём, а в тексте
+    исключения — только «400 Client Error: Bad Request for url…»."""
+    resp = getattr(e, "response", None)
+    body = ""
+    if resp is not None:
+        try:
+            data = resp.json()
+            body = (data.get("errorText") or str(data)) if isinstance(data, dict) else str(data)
+        except ValueError:
+            body = (resp.text or "")
+    code = f"{resp.status_code} " if resp is not None else ""
+    return (f"WB {code}{body}".strip() if body else str(e))[:400]
+
+
 class WbClient:
     platform = "wb"
 
@@ -223,7 +238,16 @@ class WbClient:
             try:
                 data = self._post(f"{WB_PRICES}/api/v2/upload/task", body)
             except requests.RequestException as e:
-                errors.append({"detail": str(e), "items": barcodes})
+                detail = wb_error_detail(e)
+                if "already set" in detail.lower():
+                    # 400 «цены и скидки уже установлены»: WB держит ровно то, что мы шлём, —
+                    # это принято, а не отказ (13.10 на бою такое уходило в 5 повторов и `error`).
+                    for nm in chunk:
+                        for i in by_nm[nm]:
+                            ok.append(i.barcode)
+                            sent[i.barcode] = nm_price[nm]
+                    continue
+                errors.append({"detail": detail, "items": barcodes})
                 continue
             if isinstance(data, dict) and data.get("error"):
                 errors.append({"detail": data.get("errorText") or "WB вернул error=true", "items": barcodes})
@@ -484,12 +508,16 @@ class KitClient:
     def _variants(self):
         """Все страницы `/v1/variants`. Конец — `total_count`, а не короткая
         страница (короткая страница концом не считается — правило sync_admin)."""
-        collected = 0
+        collected, total = 0, None
         self.last_truncated = False
         for page in range(1, KIT_MAX_PAGES + 1):
             data = self._get("/v1/variants", params={"page": page, "per_page": 100})
             variants = data.get("variants", [])
             if not variants:
+                # Пустая страница РАНЬШЕ обещанного `total_count` — выдача неполная: принять её за
+                # полную значило бы удалить из каталога и обнулить цены всего, что не дочитали.
+                if isinstance(total, int) and collected < total:
+                    self.last_truncated = True
                 return
             yield data
             collected += len(variants)

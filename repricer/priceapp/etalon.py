@@ -311,8 +311,9 @@ def send_followers(db: Session, cards: list[FCard], client_factory=None, actor: 
         sent, errors = [], []
         if a.platform == "lamoda":
             days = int(_dec(settings.get(db, settings.ETALON_LAMODA_SALE_DAYS)) or 365)
-            for i in range(0, len(group), LAMODA_PUSH_CHUNK):
-                chunk = group[i:i + LAMODA_PUSH_CHUNK]
+            queue = [group[i:i + LAMODA_PUSH_CHUNK] for i in range(0, len(group), LAMODA_PUSH_CHUNK)]
+            while queue:
+                chunk = queue.pop(0)
                 body, _, _ = _lamoda_body(chunk, days)
                 try:
                     resp = client._post("/v2/nomenclatures-prices", body)
@@ -320,6 +321,15 @@ def send_followers(db: Session, cards: list[FCard], client_factory=None, actor: 
                     errors.append(str(e)[:300])
                     continue
                 failed, unattributed = lamoda_push_failures(resp or {}, [c.key for c in chunk])
+                if unattributed and len(chunk) > 1:
+                    # Ошибка без адресата (у Ламоды пустой `sku` — «не найден по parentSku») бракует
+                    # пачку лишь у нас: остальные 99 площадка применила. Досылаем по одной — виновник
+                    # найдётся, здоровые встанут (цена абсолютная, повтор безвреден). Аудит 14.10.
+                    queue.extend([c] for c in chunk if c.key not in failed)
+                    for c in chunk:
+                        if c.key in failed:
+                            errors.append(f"{c.key}: {failed[c.key]}"[:300])
+                    continue
                 if unattributed:
                     failed.update({c.key: unattributed for c in chunk if c.key not in failed})
                 for c in chunk:
