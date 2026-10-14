@@ -1274,11 +1274,45 @@ def changed(new, cur, step):
     return new is not None and cur is not None and abs(new - cur) >= max(step, cur * 0.03)
 
 
+def overlap_warning(camps):
+    """Товар сразу в нескольких АКТИВНЫХ кампаниях с общим местом показа (поиск / рекомендации): они соревнуются друг с
+    другом за один показ, а единая и ручная ставка вместе у WB не работают — показывается только одна (MPSTATS, вики)."""
+    by_nm = defaultdict(list)
+    for cid, a in camps.items():
+        if a.get("_status") != 9:
+            continue
+        st = a.get("settings") or {}
+        unified = a.get("bid_type") == "unified"
+        pl = st.get("placements") or {}
+        zones = {"поиск", "рекомендации"} if unified or not pl else \
+            {z for z, k in (("поиск", "search"), ("рекомендации", "recommendations")) if pl.get(k)}
+        kind = "единая ставка" if unified else ("за клики" if st.get("payment_type") == "cpc" else "за показы")
+        for s in a.get("nm_settings") or []:
+            by_nm[s.get("nm_id")].append((cid, st.get("name") or str(cid), kind, zones))
+    dup = {}
+    for nm, lst in by_nm.items():
+        pairs = [(x, y) for i, x in enumerate(lst) for y in lst[i + 1:] if x[3] & y[3]]
+        if pairs:
+            dup[nm] = lst
+    if not dup:
+        return
+    mixed = sum(1 for lst in dup.values() if {k for _, _, k, _ in lst} >= {"единая ставка"} and
+                any(k != "единая ставка" for _, _, k, _ in lst))
+    log(f"  ! Товар сразу в нескольких активных кампаниях с общим местом показа: {len(dup)} тов. Кампании соревнуются друг "
+        "с другом за один и тот же показ" + (f"; у {mixed} — единая и ручная ставка вместе, у WB "
+                                                                "работает только одна" if mixed else "") + ":")
+    for nm, lst in sorted(dup.items(), key=lambda x: -len(x[1]))[:15]:
+        log(f"    • {nm}: " + "; ".join(f"«{cut(n, 28)}» {c} ({k}, {'+'.join(sorted(z))})" for c, n, k, z in lst))
+    if len(dup) > 15:
+        log(f"    … и ещё {len(dup) - 15}")
+
+
 def plan_cabinet(cab, token, rules, state):
     _tl.cab = cab                           # для data_problem: в каком кабинете сбой
     log(f"\n══════════ {cab} ══════════")
     plan = {"bids": [], "cluster_bids": [], "minus": [], "limits": [], "trim": [], "untrim": [], "topup": []}
     camps = get_campaigns(token)
+    overlap_warning(camps)
     todo = {}
     explicit = {}
     for k, v in rules.items():
