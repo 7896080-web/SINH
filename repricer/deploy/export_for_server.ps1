@@ -81,17 +81,22 @@ $skipDirs = @(".venv", "logs", "ssh", "backups", "onec_archive", ".pytest_cache"
 $skipFiles = @("repricer.db", "repricer.db-wal", "repricer.db-shm", "MOVED_TO_SERVER.txt")
 $code = Join-Path $stage "repricer"
 New-Item -ItemType Directory -Force -Path $code | Out-Null
-Get-ChildItem $Root -Recurse -File -Force | Where-Object {
-    $rel = $_.FullName.Substring($Root.Length + 1)
-    $parts = $rel -split '\\'
-    -not ($parts | Where-Object { $skipDirs -contains $_ }) -and -not ($skipFiles -contains $rel) -and
-        $_.Name -notlike "*.bak_*"
-} | ForEach-Object {
-    $rel = $_.FullName.Substring($Root.Length + 1)
-    $dst = Join-Path $code $rel
-    New-Item -ItemType Directory -Force -Path (Split-Path $dst) | Out-Null
-    Copy-Item $_.FullName $dst
+# Обход сам, а не Get-ChildItem -Recurse: тот заходит и в пропускаемые папки, а в
+# .pytest_cache у Windows бывает «Отказано в доступе» — и архив не собирался вовсе.
+function Copy-Tree($src, $dst) {
+    foreach ($item in Get-ChildItem -LiteralPath $src -Force) {
+        if ($item.PSIsContainer) {
+            if ($skipDirs -contains $item.Name) { continue }
+            Copy-Tree $item.FullName (Join-Path $dst $item.Name)
+            continue
+        }
+        $rel = $item.FullName.Substring($Root.Length + 1)
+        if (($skipFiles -contains $rel) -or ($item.Name -like "*.bak_*")) { continue }
+        New-Item -ItemType Directory -Force -Path $dst | Out-Null
+        Copy-Item -LiteralPath $item.FullName (Join-Path $dst $item.Name)
+    }
 }
+Copy-Tree $Root $code
 Move-Item $dbCopy (Join-Path $code "repricer.db")
 New-Item -ItemType Directory -Force -Path (Split-Path $Out) | Out-Null
 if (Test-Path $Out) { Remove-Item $Out -Force }
