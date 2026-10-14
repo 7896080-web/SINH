@@ -1047,7 +1047,8 @@ def new_bid(current, rec, cap, mn, step, max_raise, base=None, max_drop=None):
         new = int(math.floor(new / step) * step)
     if mn and new < mn:
         new = mn
-        reason = "окупаемая ставка ниже минимальной WB → минимальная" if cap < mn else reason
+        reason = ("окупаемая ставка ниже минимальной WB → минимальная" if cap < mn else
+                  "рекомендация WB ниже его же минимальной ставки → минимальная")
     return new, reason
 
 
