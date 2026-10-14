@@ -66,3 +66,7 @@ details.guide .guide-body { padding: 4px 14px 10px; max-width: 120ch; }
 details.guide .guide-body li { margin: 3px 0; }
 table.guide-table td, table.guide-table th { white-space: normal; vertical-align: top; }
 table.guide-table td:first-child { min-width: 180px; }
+/* «Кто сейчас ставит цены» — на «Внимании» и над «Ценами товаров». */
+.how-now table { margin-top:6px; }
+.how-now td { padding:3px 10px 3px 0; vertical-align:top; border:0; }
+.how-now.warn { border-color:var(--warn, #c80); }

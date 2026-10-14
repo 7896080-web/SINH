@@ -14,6 +14,7 @@
 .art-table td.last { white-space:normal; min-width:90px; font-size:13px; }
 </style>
 <h1>Цены товаров</h1>
+{% if sc %}{{ guides.how_now_line(sc.platform) }}{% endif %}
 {{ guides.sku_prices() }}
 <p><b>1.</b> Выберите, где (площадка или кабинет) → <b>2.</b> задайте наценку артикулам или категориям → <b>3.</b> проверьте
 новую цену и маржинальность → <b>4.</b> «Передать на площадки».
@@ -80,8 +81,9 @@
       <label>значение<input name="value" inputmode="decimal" style="width:70px" placeholder="{{ '1,8' if by == 'category' else '2,5' }}"></label>
       <button type="submit" onclick="return selConfirm('bulk', 'Установить наценку', '{{ 'категорий' if by == 'category' else 'артикулов' }} (все их размеры)', true)">Установить</button>
       <span style="width:16px"></span>
+      {% if sc.platform == 'lamoda' %}<span class="warn">Передать на Ламоду отсюда нельзя — цены Ламоды ставит <code>lamoda_apply.py</code>.</span>{% else %}
       <label style="flex-direction:row;gap:6px;align-items:center"><input type="checkbox" name="confirm_large" value="1"> включая изменения больше лимита</label>
-      <button type="submit" formaction="/sku-prices/send" data-sel-clear onclick="return selConfirm('bulk', 'ПЕРЕДАТЬ НОВЫЕ ЦЕНЫ на площадку «{{ sc.label }}»', '{{ 'категорий' if by == 'category' else 'артикулов' }} (все их размеры)', true)">2. Передать на площадки</button>
+      <button type="submit" formaction="/sku-prices/send" data-sel-clear onclick="return selConfirm('bulk', 'ПЕРЕДАТЬ НОВЫЕ ЦЕНЫ на площадку «{{ sc.label }}»', '{{ 'категорий' if by == 'category' else 'артикулов' }} (все их размеры)', true)">2. Передать на площадки</button>{% endif %}
     </div>
     <div class="row" style="margin-top:6px"><span class="sel-count muted" data-for="bulk"></span>
       <button type="button" class="secondary sel-clear" data-for="bulk" style="padding:2px 8px;font-size:12px">Снять отметки</button></div>

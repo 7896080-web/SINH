@@ -16,7 +16,7 @@ def test_every_price_page_has_its_guide(client, db):
         "/sku-prices": "«Цены товаров»: основной путь",
         "/prices?view=rules": "«Правила площадок»",
         f"/prices?view=products&account_id={a.id}": "«Текущие и ручные цены»",
-        "/prices?view=proposals": "«Пересчёт всех цен»",
+        "/prices?view=proposals": "«Предложения цен»",
         "/prices?view=log": "«Журнал отправок»",
         "/prices?view=compare": "«Сравнение площадок»",
         "/rate": "«Курс $»",

@@ -47,7 +47,7 @@
   <p class="muted" style="margin-bottom:0">Строк: {{ total }} из {{ all_total }}{% if total > limit %} (показано {{ limit }}){% endif %}.
   Пол репрайсера {{ '{:.2f}'.format(rule.min_markup_coef|float).replace('.', ',') }}; наценка по умолчанию
   {% if rule.base_coef is none %}не задана — без наценки цена не считается{% else %}{{ '{:.2f}'.format(rule.base_coef|float).replace('.', ',') }}{% endif %}.
-  Эталонная цена WB: {% if ref_enabled %}включена — при падении «к получению» больше чем на {{ '{:.0f}'.format(drop) }}% возвращается последняя отправленная цена{% else %}выключена{% endif %}.</p>
+  Эталон WB (цена после скидки продавца): {% if ref_enabled %}включён — если площадка занизит её больше чем на {{ '{:.0f}'.format(drop) }}%, программа вернёт эталон{% else %}выключен{% endif %}.</p>
 </form>
 
 <div class="card">

@@ -634,6 +634,10 @@ def send(request: Request, form=Depends(posted_form), db: Session = Depends(get_
     if rate is None:
         flash(request, "Курса доллара нет — базовую цену не посчитать. Страница «Курс $».", "error")
         return _back(**keep)
+    if sc["platform"] == "lamoda":
+        flash(request, "На Ламоду отсюда цены не передаются: обычная отправка несёт только цену до скидки и сбила бы "
+                       "скидку. Цены Ламоды ставит scripts\\lamoda_apply.py.", "warn")
+        return _back(**keep)
     confirm_large = form.get("confirm_large") == "1"
     chosen = _chosen(form, db, sc, keep)
     if not chosen:

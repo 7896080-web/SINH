@@ -353,10 +353,10 @@ def attention(db: Session, product_rows, background_alive: bool = False) -> Atte
         a.add("bad", "Площадка не приняла цену", "/prices?view=log&status=error", n)
     n = db.query(PriceChange).filter(base, PriceChange.status == "proposed").count()
     if n:
-        a.add("warn", "Пересчёт всех цен: предложения ждут решения", "/prices?view=proposals&status=proposed", n)
+        a.add("warn", "Предложения цен ждут решения (Kit за WB, пересчёт) — подтвердить или отклонить", "/prices?view=proposals&status=proposed", n)
     n = db.query(PriceChange).filter(base, PriceChange.status == "blocked").count()
     if n:
-        a.add("warn", "Пересчёт всех цен: заблокировано (пол или большой шаг)", "/prices?view=proposals&status=blocked", n)
+        a.add("warn", "Предложения цен: заблокировано (ниже пола или большой шаг)", "/prices?view=proposals&status=blocked", n)
     n = db.query(PriceChange).filter(base, PriceChange.status == "approved").count()
     if n:
         a.add("ok", "Подтверждено и ждёт отправки (уходит в течение пары минут)", "/prices?view=log&status=approved", n)

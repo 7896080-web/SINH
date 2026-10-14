@@ -184,7 +184,8 @@ def test_page_filters(client, db):
     page = client.get(f"/approval?account_id={acc.id}&art=A1").text
     assert "A1" in page and ">A2<" not in page.split("<table class=\"ap-table\"", 1)[1]
     assert client.get(f"/approval?account_id={acc.id}&flt=multi").status_code == 200
-    assert "Утверждение цен" in client.get("/attention").text
+    nav = client.get("/attention").text.split("<nav>", 1)[1].split("</nav>", 1)[0]
+    assert "Утверждение цен" not in nav            # из меню убрана 14.10, страница — по ссылке
 
 
 def _table(html):
