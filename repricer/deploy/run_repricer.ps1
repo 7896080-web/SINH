@@ -12,6 +12,15 @@ param([int]$Port = 8002)
 $Root = Split-Path $PSScriptRoot -Parent
 $url = "http://127.0.0.1:$Port"
 
+# Программа переехала на сервер (deploy\export_for_server.ps1): второй экземпляр здесь
+# слал бы на площадки те же цены и задания в 1С параллельно с серверным.
+$moved = Join-Path $Root "MOVED_TO_SERVER.txt"
+if (Test-Path $moved) {
+    Add-Type -AssemblyName PresentationFramework
+    [System.Windows.MessageBox]::Show("Репрайсер перенесён на сервер и здесь не запускается.`n`n$((Get-Content $moved -Encoding UTF8) -join "`n")", "Репрайсер") | Out-Null
+    exit 1
+}
+
 function Test-Up {
     try { Invoke-WebRequest "$url/login" -UseBasicParsing -TimeoutSec 2 | Out-Null; return $true } catch { return $false }
 }

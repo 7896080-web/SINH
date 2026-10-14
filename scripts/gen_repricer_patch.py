@@ -101,7 +101,7 @@ if ($LASTEXITCODE -ne 0) {{ Write-Host "Не удалось распаковат
 if ($Force) {{ & $py $apply $Root --force }} else {{ & $py $apply $Root }}
 if ($LASTEXITCODE -ne 0) {{ Write-Host "Патч НЕ применён — файлы не изменены" -ForegroundColor Red; Remove-Item $b64, $apply -ErrorAction SilentlyContinue; exit 1 }}
 Remove-Item $b64, $apply -ErrorAction SilentlyContinue
-Write-Host "Патч {tag} применён. Теперь: deploy\update_workstation.ps1" -ForegroundColor Green
+Write-Host "Патч {tag} применён. Теперь: на сервере deploy\update_server.ps1 (от администратора), на офисном компьютере deploy\update_workstation.ps1" -ForegroundColor Green
 '''
 
 
