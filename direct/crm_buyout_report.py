@@ -12,8 +12,16 @@ purchased_price — так же, как сама CRM считает выручк
 import csv
 import json
 import sqlite3
+import sys
 from collections import Counter, defaultdict
 from pathlib import Path
+
+# вывод в консоль Windows (cp1251) не должен падать на ₽ ✓: непечатаемое заменяется «?»
+try:
+    if sys.stdout is not None and (sys.stdout.encoding or "").lower().replace("-", "") != "utf8":
+        sys.stdout.reconfigure(errors="replace")
+except (AttributeError, ValueError):
+    pass
 
 DB_FILE = Path.home() / "AWER CRM" / "kitcrm.db"
 DATE_FROM = "2026-07-01"          # заказы, созданные с этой даты

@@ -13,12 +13,18 @@
      регионам и площадкам (отключённые ВК/ОК/погода должны уйти в ноль).
   5. Можно ли уже доверять разнице в покупках.
 
-Суммы без НДС (так же, как бюджеты в Директе). Покупки и выручка — из Метрики
-(оформленные заказы с рекламы, последний значимый переход) — только переходы из кампаний КО и ТО,
-тех же, по которым считается расход. Покупки с другой рекламы показываются отдельной строкой.
-Токен, счётчик и коэффициент соинвеста берутся из настроек AWER CRM (yandex_token.py).
+Суммы без НДС (так же, как бюджеты в Директе); цена покупки и доля рекламы показаны и с НДС (VAT) — если НДС
+на рекламу не возмещается (уточнить у бухгалтера), правильная — с НДС. Реальные деньги = расход ÷ соинвест
+по таблице COINVEST (по датам). Покупки и выручка — из Метрики (оформленные заказы с рекламы, последний значимый
+переход) — только переходы из кампаний КО и ТО (по номеру кампании, иначе по названию), тех же, по которым
+считается расход. Покупки с другой рекламы показываются отдельной строкой. Отчёт Директа или Метрики не
+загрузился — остановка (иначе итоги были бы нулями).
 
-Запуск: python direct_before_after.py   -> вывод + direct_before_after.txt
+Запуск: python direct_before_after.py                        -> «после» с 06.10 по вчера
+        python direct_before_after.py 2026-10-10              -> «после» с 10.10 по вчера
+        python direct_before_after.py 2026-10-10 2026-10-16   -> «после» с 10.10 по 16.10
+Лучше сравнивать целые недели (7, 14 дней): спрос по дням недели разный.
+Результат: вывод + direct_before_after.txt рядом со скриптом.
 """
 import csv
 import datetime as dt
@@ -37,12 +43,22 @@ from yandex_token import crm_config
 BEFORE = ("2026-09-29", "2026-10-05")
 AFTER_FROM = "2026-10-06"
 AFTER_TO = (dt.date.today() - dt.timedelta(days=1)).isoformat()
-# Можно указать другое начало периода «после»: python direct_before_after.py 2026-10-10
+# Другой период «после»: первая дата — начало, вторая (если есть) — конец
+_dates = []
 for _arg in sys.argv[1:]:
     try:
-        AFTER_FROM = dt.date.fromisoformat(_arg).isoformat()
+        _dates.append(dt.date.fromisoformat(_arg).isoformat())
     except ValueError:
-        pass
+        sys.exit(f"Не понял «{_arg}»: даты пишутся так — 2026-10-10.")
+if _dates:
+    AFTER_FROM = _dates[0]
+if len(_dates) > 1:
+    AFTER_TO = _dates[1]
+VAT = 0.22          # НДС на рекламу Директа (ставка 2026 г.); суммы в API — без НДС
+# Соинвест Яндекса по датам: с этой даты — такой множитель (реальные деньги = расход кабинета ÷ множитель).
+# «С конца сентября» ×2, точная дата перехода с ×3 неизвестна — если узнаете, впишите строку ("2026-09-xx", 3.0) выше.
+# До 31.12.2026 — ×2, с 2027 — без соинвеста.
+COINVEST = [("2026-09-01", 2.0), ("2027-01-01", 1.0)]
 
 CAMPAIGNS = {"712220172": "КО", "712219913": "ТО"}
 WEEKLY_OLD = {"712220172": 47500, "712219913": 37500}
@@ -58,7 +74,6 @@ DEVICE_NAMES = {"DESKTOP": "компьютеры", "MOBILE": "смартфоны
 cfg = crm_config()
 TOKEN = os.environ.get("YANDEX_OAUTH_TOKEN") or cfg.get("yandex_oauth_token") or ""
 COUNTER = str(cfg.get("metrika_counter_id") or "110246968")
-MULT = float(cfg.get("coinvest_multiplier") or 2.0)
 CLIENT_LOGIN = cfg.get("direct_client_login") or ""
 
 DH = {"Authorization": f"Bearer {TOKEN}", "Accept-Language": "ru", "processingMode": "auto",
@@ -100,6 +115,17 @@ def pp(b, a):
     return f"{a - b:+.1f} п.п."
 
 
+def mult(date):
+    """Множитель соинвеста на дату (по COINVEST). Даты раньше таблицы — остановка: молча подставлять нельзя."""
+    m = None
+    for since, v in COINVEST:
+        if date >= since:
+            m = v
+    if m is None:
+        sys.exit(f"Нет множителя соинвеста на {date}: допишите строку в COINVEST в начале скрипта.")
+    return m
+
+
 def period_of(date):
     if BEFORE[0] <= date <= BEFORE[1]:
         return "b"
@@ -127,15 +153,24 @@ def direct(fields, name):
         "ReportName": f"ba_{name}_{int(time.time() * 1000)}",
         "ReportType": "CUSTOM_REPORT", "DateRangeType": "CUSTOM_DATE",
         "Format": "TSV", "IncludeVAT": "NO"}}
+    errors = 0
     for _ in range(120):
-        r = requests.post("https://api.direct.yandex.com/json/v5/reports", json=body, headers=DH, timeout=90)
-        if r.status_code == 200:
+        try:
+            r = requests.post("https://api.direct.yandex.com/json/v5/reports", json=body, headers=DH, timeout=90)
+        except requests.RequestException as e:
+            r, err = None, e.__class__.__name__
+        if r is not None and r.status_code == 200:
             text = r.content.decode("utf-8")
             return list(csv.DictReader(io.StringIO(text), delimiter="\t"))
-        if r.status_code in (201, 202):
+        if r is not None and r.status_code in (201, 202):
             time.sleep(int(r.headers.get("retryIn", 5)))
             continue
-        log(f"[Директ, отчёт {name}] ошибка {r.status_code}: {r.content.decode('utf-8', 'replace')[:400]}")
+        if (r is None or r.status_code >= 500) and errors < 3:      # сбой у Яндекса или связи — повторить
+            errors += 1
+            time.sleep(10 * errors)
+            continue
+        log(f"[Директ, отчёт {name}] ошибка " + (f"{r.status_code}: {r.content.decode('utf-8', 'replace')[:400]}"
+                                                 if r is not None else f"связи ({err})"))
         return []
     log(f"[Директ, отчёт {name}] не дождались готовности отчёта")
     return []
@@ -158,7 +193,13 @@ def campaign_names():
 NAMES = {}   # заполняется в main() из Директа
 
 
-def short_campaign(name):
+def short_campaign(dim):
+    """КО / ТО / «другое» по измерению Метрики: сначала номер кампании (id), потом точное название."""
+    for k in ("id", "direct_id"):
+        digits = "".join(ch_ for ch_ in str(dim.get(k) or "") if ch_.isdigit())
+        if digits in CAMPAIGNS:
+            return CAMPAIGNS[digits]
+    name = dim.get("name")
     if not name:
         return "без кампании"
     if NAMES:
@@ -188,7 +229,7 @@ def metrika():
         for row in r.json().get("data", []):
             d = row["dimensions"]
             date = d[0].get("name")
-            camp = short_campaign(d[1].get("name")) if len(d) > 1 else "все"
+            camp = short_campaign(d[1]) if len(d) > 1 else "все"
             v, p, rev = row["metrics"]
             rows.append({"date": date, "camp": camp, "visits": v, "purch": p, "rev": rev})
         return rows
@@ -214,6 +255,11 @@ def build(daily, mrows):
             if p:
                 tot[p][k] += v
                 camp[p][cid][k] += v
+        real = num(r.get("Cost")) / mult(r["Date"])      # реальные деньги — по множителю своего дня
+        day[r["Date"]]["real"] += real
+        if p:
+            tot[p]["real"] += real
+            camp[p][cid]["real"] += real
     ours = set(CAMPAIGNS.values()) | {"все"}   # «все» — только если Метрика не дала разбивку
     for r in mrows:
         p = period_of(r["date"])
@@ -231,7 +277,7 @@ def build(daily, mrows):
 def per_day(t, p):
     n = ND[p]
     cost, clicks, visits, purch, rev = t["cost"], t["clicks"], t["visits"], t["purch"], t["rev"]
-    real = cost / MULT
+    real = t["real"]
     return {
         "cost": cost / n, "imp": t["imp"] / n, "clicks": clicks / n,
         "cpc": cost / clicks if clicks else None,
@@ -240,6 +286,8 @@ def per_day(t, p):
         "aov": rev / purch if purch else None,
         "drr": real / rev * 100 if rev else None,
         "cpa": real / purch if purch else None,
+        "drr_vat": real * (1 + VAT) / rev * 100 if rev else None,
+        "cpa_vat": real * (1 + VAT) / purch if purch else None,
     }
 
 
@@ -279,7 +327,16 @@ def main():
         sys.exit("После изменений ещё не прошло ни одного полного дня.")
 
     log(f"Сравнение «до» {BEFORE[0]} – {BEFORE[1]} ({ND['b']} дн.) и «после» {AFTER_FROM} – {AFTER_TO} ({ND['a']} дн.)")
-    log(f"Суммы без НДС. Реальные деньги = расход кабинета ÷ {MULT:g} (соинвест).")
+    ms = sorted({mult(d) for d in (BEFORE[0], BEFORE[1], AFTER_FROM, AFTER_TO)})
+    log(f"Суммы без НДС. Реальные деньги = расход кабинета ÷ соинвест ×{'/×'.join(f'{m:g}' for m in ms)} "
+        "(по датам, таблица COINVEST в скрипте).")
+    crm_m = cfg.get("coinvest_multiplier")
+    if crm_m and float(crm_m) != mult(AFTER_TO):
+        log(f"ВНИМАНИЕ: в настройках CRM соинвест ×{float(crm_m):g}, а в таблице скрипта на {AFTER_TO} — ×{mult(AFTER_TO):g}. "
+            "Проверьте, какой верный.")
+    if ND["a"] % 7:
+        log(f"Внимание: «после» — {ND['a']} дн., не целое число недель: спрос по дням недели разный, сравнение менее "
+            "точное. Лучше сравнивать 7 или 14 дней.")
     log("Загружаю отчёты Директа (обычно 1–3 минуты)...")
 
     daily = direct(["CampaignId", "Impressions", "Clicks", "Cost"], "daily")
@@ -287,10 +344,18 @@ def main():
     dev = direct(["Device", "Cost"], "device")
     geo = direct(["TargetingLocationName", "Cost"], "geo")
     pl = direct(["Placement", "Cost"], "placement")
+    if not daily:
+        log("\n✗ Отчёт Директа по дням не загрузился (см. ошибку выше) — итоги были бы нулями. Запустите позже ещё раз.")
+        Path(__file__).resolve().with_name("direct_before_after.txt").write_text("\n".join(out), encoding="utf-8")
+        sys.exit(1)
     NAMES.update(campaign_names())
     if not NAMES:
-        log("ВНИМАНИЕ: Директ не отдал названия кампаний — КО и ТО в Метрике определяю по слову в названии.")
+        log("ВНИМАНИЕ: Директ не отдал названия кампаний — КО и ТО в Метрике определяю по номеру или слову в названии.")
     mrows = metrika()
+    if not mrows:
+        log("\n✗ Данные Метрики не загрузились (см. ошибку выше) — покупки и выручка были бы нулями. Запустите позже.")
+        Path(__file__).resolve().with_name("direct_before_after.txt").write_text("\n".join(out), encoding="utf-8")
+        sys.exit(1)
 
     tot, camp, day = build(daily, mrows)
     b, a = per_day(tot["b"], "b"), per_day(tot["a"], "a")
@@ -310,11 +375,19 @@ def main():
         ("Конверсия визита в покупку, %", "cr", 2, "pp"),
         ("Доля рекламы в реальных деньгах, %", "drr", 1, "pp"),
         ("Цена покупки в реальных деньгах, ₽", "cpa", 0, "rel"),
+        (f"  то же с НДС {VAT:.0%}: доля рекламы, %", "drr_vat", 1, "pp"),
+        (f"  то же с НДС {VAT:.0%}: цена покупки, ₽", "cpa_vat", 0, "rel"),
     ]
     for title, k, d, kind in rows:
         diff = ch(b[k], a[k]) if kind == "rel" else pp(b[k], a[k])
         log(f"{title:36}{fm(b[k], d):>12}{fm(a[k], d):>12}{diff:>12}")
     log(f"Всего покупок: до {tot['b']['purch']:.0f} за {ND['b']} дн., после {tot['a']['purch']:.0f} за {ND['a']} дн.")
+    log(f"Допустимая реальная цена покупки ≈2 200 ₽ (docs/business-context.md). Если НДС на рекламу не возмещается "
+        f"(УСН с НДС 5% — уточнить у бухгалтера), сравнивать с ней нужно строку «с НДС».")
+    other = sum(v.get("purch", 0) for p_ in ("b", "a") for nm_, v in camp[p_].items() if nm_ not in CAMPAIGNS.values())
+    if not (tot["b"]["purch"] + tot["a"]["purch"]) and other:
+        log("ВНИМАНИЕ: ни одна покупка не сопоставилась с КО/ТО, а с другой рекламы покупки есть — похоже, Метрика "
+            "называет кампании иначе. Цифры покупок выше неверны; сообщите — поправлю сопоставление.")
 
     # 2. Кампании
     log("\n=== 2. По кампаниям — в среднем за день ===")
@@ -322,8 +395,8 @@ def main():
         f"{'покупки до':>12}{'после':>8}{'доля рекл. до':>15}{'после':>8}")
     for cid, nm in CAMPAIGNS.items():
         cb, ca = camp["b"].get(nm, blank()), camp["a"].get(nm, blank())
-        drr_b = cb["cost"] / MULT / cb["rev"] * 100 if cb["rev"] else None
-        drr_a = ca["cost"] / MULT / ca["rev"] * 100 if ca["rev"] else None
+        drr_b = cb["real"] / cb["rev"] * 100 if cb["rev"] else None
+        drr_a = ca["real"] / ca["rev"] * 100 if ca["rev"] else None
         log(f"{nm:6}{fm(cb['cost'] / ND['b']):>11}{fm(WEEKLY_OLD[cid] / 7):>10}"
             f"{fm(ca['cost'] / ND['a']):>14}{fm(WEEKLY_NEW[cid] / 7):>10}"
             f"{fm(cb['purch'] / ND['b'], 2):>12}{fm(ca['purch'] / ND['a'], 2):>8}"
@@ -342,7 +415,7 @@ def main():
             continue
         v = day[d]
         cpc = v["cost"] / v["clicks"] if v["clicks"] else None
-        drr = v["cost"] / MULT / v["rev"] * 100 if v["rev"] else None
+        drr = v["real"] / v["rev"] * 100 if v["rev"] else None
         mark = "  ← изменения" if d == AFTER_FROM else ""
         log(f"{d:12}{fm(v['cost']):>9}{fm(v['clicks']):>7}{fm(cpc, 1):>12}{fm(v['visits']):>8}"
             f"{fm(v['purch']):>9}{fm(v['rev']):>10}{(fm(drr, 1) + '%') if drr else '—':>12}{mark}")
@@ -363,7 +436,9 @@ def main():
     pb, pa = tot["b"]["purch"], tot["a"]["purch"]
     if tot["b"]["cost"] and pb:
         exp = pb / tot["b"]["cost"] * tot["a"]["cost"]
-        lo, hi = max(0.0, exp - 2 * math.sqrt(exp)), exp + 2 * math.sqrt(exp)
+        # разброс учитывает случайность обоих периодов: «до» тоже не точное (всего pb покупок)
+        sd = math.sqrt(exp + exp ** 2 / pb)
+        lo, hi = max(0.0, exp - 2 * sd), exp + 2 * sd
         log(f"Если бы реклама работала как до изменений, на расход «после» пришлось бы ≈{exp:.0f} покупок")
         log(f"(обычный случайный разброс — примерно от {lo:.0f} до {hi:.0f}). По факту: {pa:.0f}.")
         if pa > hi:
@@ -376,7 +451,7 @@ def main():
     else:
         log("Мало данных для оценки.")
 
-    Path("direct_before_after.txt").write_text("\n".join(out), encoding="utf-8")
+    Path(__file__).resolve().with_name("direct_before_after.txt").write_text("\n".join(out), encoding="utf-8")
     print("\nСохранено в direct_before_after.txt")
 
 
