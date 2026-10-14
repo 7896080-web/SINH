@@ -217,6 +217,17 @@ MINUS_MAX_PER_RUN = 20              # не больше стольких нов�
 # (сверка с MPSTATS, решение пользователя 15.10.2026)
 MINUS_SPEND_ORDERS = 1.5            # потрачено на запрос ≥ 1,5 допустимой цены заказа товара, заказов нет — в минус
 MINUS_MIN_VIEWS = 1000              # низкий CTR судим не раньше стольких показов запроса
+# «Контроль органики» (сверка с MPSTATS, решение пользователя 15.10.2026), только кампании за показы с автоминусом.
+# Органической позиции отдельно от рекламной официальные данные WB не дают, поэтому судим по результату — по заказам
+# из «Джема» (все заказы по запросу, wb_positions.py → wb_history.db) против заказов с рекламы по этому кластеру:
+ORGANIC_CONTROL = True
+ORG_DAYS = 14                       # за столько дней
+ORG_MIN_ORDERS = 10                 # всех заказов по запросу меньше — не судим
+ORG_AD_SHARE = 0.2                  # реклама дала ≤ 20% заказов по запросу и товар в топе — запрос в минус (экономия)
+ORG_TOP_POS = 10                    # …«в топе» — медианная позиция по запросу не хуже этой
+ORG_CHECK_DAYS = 5                  # после минуса столько дней ждём и сравниваем заказы по запросу в день с прежними:
+ORG_RETURN_DROP = 0.7               # меньше 70% прежних (или позиция хуже ORG_TOP_POS × 1,5) — вернуть в рекламу
+HISTORY_DB = Path(__file__).resolve().parent / "wb_history.db"
 MINUS_RETEST_DAYS = 45              # запрос, который автопилот сам отправил в минус, через столько дней возвращается на
                                     # перепроверку (спрос сезонный: то, что не продавало в сентябре, может продавать в
                                     # ноябре); снова не окупился — в минус, следующая перепроверка вдвое позже (до 180 дн.)
@@ -1108,6 +1119,41 @@ def get_minus(token, pairs):
     return res
 
 
+def organic_data(cab, nms):
+    """{(товар, запрос): {день: (все заказы по запросу, медианная позиция, заказы с рекламы)}} из wb_history.db
+    (её пишет wb_positions.py: «Джем» — все заказы по запросу, статистика кластеров — заказы с рекламы). Только чтение;
+    базы нет или она занята — пусто (контроль органики пропускается)."""
+    res = defaultdict(dict)
+    if not ORGANIC_CONTROL or not nms or not HISTORY_DB.exists():
+        return res
+    since = (dt.date.today() - dt.timedelta(days=ORG_DAYS + 60)).isoformat()
+    import sqlite3
+    try:
+        con = sqlite3.connect(f"file:{HISTORY_DB}?mode=ro", uri=True, timeout=30)
+        try:
+            marks = ",".join("?" * len(nms))
+            ad = {}
+            for nm, q, d, o in con.execute(f"SELECT nm, query, date, orders FROM ad_query_day WHERE cab=? AND date>=? "
+                                           f"AND nm IN ({marks})", (cab, since, *nms)):
+                ad[(nm, q, d)] = num(o)
+            for nm, q, d, o, mp in con.execute(f"SELECT nm, query, date, orders, median_pos FROM query_day WHERE cab=? "
+                                               f"AND date>=? AND nm IN ({marks})", (cab, since, *nms)):
+                res[(nm, q)][d] = (num(o), mp, ad.get((nm, q, d), 0.0))
+        finally:
+            con.close()
+    except sqlite3.Error as e:
+        log(f"    ! Контроль органики: база истории не прочиталась ({e}) — пропускаю.")
+        return defaultdict(dict)
+    return res
+
+
+def org_window(days_map, d1, d2):
+    """(все заказы, заказы с рекламы, медианная позиция, дней с данными) за [d1, d2]."""
+    rows = [v for d, v in days_map.items() if d1 <= d <= d2]
+    pos = sorted(v[1] for v in rows if v[1])
+    return (sum(v[0] for v in rows), sum(v[2] for v in rows), pos[len(pos) // 2] if pos else None, len(rows))
+
+
 def get_excluded(token, pairs):
     """{(кампания, товар): исключённые кластеры} из списка кластеров (normquery/list). Нужен как вторая проверка:
     get-minus по новой кампании за показы может не вернуть ничего — если и здесь исключённых нет, список пуст."""
@@ -1647,11 +1693,13 @@ def plan_cabinet(cab, token, rules, state):
                     "в ней пока нет. Писать вслепую нельзя (запись заменяет весь список), поэтому автоминус здесь ждёт: "
                     "чтобы включить его, исключите в кабинете WB любой один кластер у любого товара этой кампании "
                     "(«Кластеры» → «Исключить»). Посмотреть кластеры: python wb_clusters.py --campaign " + str(cid))
+            org = organic_data(cab, nms) if (r["auto_minus"] and r.get("organic_control", True) and camp_known) else {}
+            org_notes = []
             for nm in (nms if camp_known else []):
                 key = pk(cid, nm)
                 current = list(cur_minus.get((cid, nm), []))
                 cur_set = set(current)
-                add_auto, add_route, rem_route, rem_auto = [], [], [], []
+                add_auto, add_route, rem_route, rem_auto, add_org, rem_org = [], [], [], [], [], []
                 # перепроверка: запросы, которые автопилот сам отправил в минус давно, — вернуть (кроме «не наша аудитория»)
                 if r["auto_minus"]:
                     at = (state.get("minus_auto_at") or {}).get(key) or {}
@@ -1719,14 +1767,53 @@ def plan_cabinet(cab, token, rules, state):
                             break
                         add_auto.append(q)
                         added_total += 1
-                if add_auto or add_route or rem_route or rem_auto:
-                    new = [q for q in current if q not in rem_route and q not in rem_auto] + add_route + add_auto
+                # контроль органики: запрос, по которому товар продаётся и без рекламы, — в минус; заказы упали — вернуть
+                if org:
+                    y = dt.date.today() - dt.timedelta(days=1)
+                    d1 = (y - dt.timedelta(days=ORG_DAYS - 1)).isoformat()
+                    om = (state.get("organic_minus") or {}).get(key) or {}
+                    for q, rec in sorted(om.items()):
+                        if q not in cur_set:
+                            continue
+                        since_d = dt.date.fromisoformat(rec["date"])
+                        if (y - since_d).days + 1 < ORG_CHECK_DAYS:
+                            continue
+                        allo, _, mpos, nd = org_window(org.get((nm, q), {}), (since_d + dt.timedelta(days=1)).isoformat(),
+                                                       y.isoformat())
+                        if nd < ORG_CHECK_DAYS:
+                            continue                   # «Джем» за эти дни ещё не собран — ждём
+                        per_day = allo / nd
+                        if per_day < rec["base"] * ORG_RETURN_DROP or (mpos and mpos > ORG_TOP_POS * 1.5):
+                            rem_org.append(q)
+                            org_notes.append(f"      − {nm:>11} {cut(q, 40):40} органика не удержала: заказов в день "
+                                             f"{per_day:.1f} против {rec['base']:.1f} до минуса" +
+                                             (f", позиция {mpos:.0f}" if mpos else "") + " — возвращаю в рекламу")
+                    cs = cl.get((cid, nm), {})
+                    for q, s in sorted(cs.items(), key=lambda x: -x[1]["spend"]):
+                        if q in cur_set or q in add_auto or protected(q) or negative(q) or \
+                                q in planned_cluster.get((cid, nm), set()) or q in route_want.get(nm, set()):
+                            continue
+                        allo, ado, mpos, nd = org_window(org.get((nm, q.strip().lower()), {}), d1, y.isoformat())
+                        if nd < ORG_DAYS // 2 or allo < ORG_MIN_ORDERS or not mpos or mpos > ORG_TOP_POS:
+                            continue
+                        if ado <= allo * ORG_AD_SHARE and added_total < MINUS_MAX_PER_RUN:
+                            add_org.append(q)
+                            added_total += 1
+                            org_notes.append(f"      + {nm:>11} {cut(q, 40):40} в органике: из {allo:.0f} заказов по запросу за "
+                                             f"{nd} дн. реклама дала {ado:.0f} ({ado / allo:.0%}), позиция {mpos:.0f} — "
+                                             f"реклама не нужна, экономия ≈{fm_rub(s['spend'] / CLUSTER_DAYS * 7)} ₽/нед")
+                if add_auto or add_route or rem_route or rem_auto or add_org or rem_org:
+                    new = [q for q in current if q not in rem_route and q not in rem_auto and q not in rem_org] \
+                        + add_route + add_auto + add_org
                     if len(new) > 1000:
                         log(f"    ! У товара {nm} больше 1000 минус-фраз — новые не добавляю.")
                         continue
                     plan["minus"].append({"cabinet": cab, "advert_id": cid, "nm_id": nm, "old": current, "new": new,
                                           "add_auto": add_auto, "add_route": add_route, "rem_route": rem_route,
-                                          "rem_auto": rem_auto,
+                                          "rem_auto": rem_auto, "add_org": add_org, "rem_org": rem_org,
+                                          "org_base": {q: org_window(org.get((nm, q.strip().lower()), {}),
+                                                                     d1, y.isoformat())[0] / ORG_DAYS for q in add_org}
+                                          if add_org else {},
                                           "stats": {q: cl.get((cid, nm), {}).get(q) for q in add_auto},
                                           "why": {q: why_q.get(q) for q in add_auto} if r["auto_minus"] else {}})
             items = [m for m in plan["minus"] if m["advert_id"] == cid]
@@ -1749,6 +1836,10 @@ def plan_cabinet(cab, token, rules, state):
                 log("    Минус-фразы: добавлять нечего.")
             for note in held_notes:
                 log(note)
+            if org_notes:
+                log("    Контроль органики (по «Джему»: все заказы по запросу против заказов с рекламы):")
+                for note in org_notes:
+                    log(note)
 
         # ---- дневной лимит ----
         limit_need = 0     # ₽: WB не ставит дневной лимит больше бюджета кампании («insufficient campaign budget»)
@@ -1985,6 +2076,15 @@ def update_state(state, minus_items, reverse=False):
         at = state.setdefault("minus_auto_at", {}).setdefault(key, {})       # когда запрос ушёл в автоминус
         tries = state.setdefault("minus_retests", {}).setdefault(key, {})   # сколько раз возвращали на перепроверку
         rem_auto = set(m.get("rem_auto") or [])
+        om = state.setdefault("organic_minus", {}).setdefault(key, {})
+        if not reverse:
+            for q in m.get("add_org") or []:
+                om[q] = {"date": dt.date.today().isoformat(), "base": (m.get("org_base") or {}).get(q, 0)}
+            for q in m.get("rem_org") or []:
+                om.pop(q, None)
+        else:
+            for q in m.get("add_org") or []:
+                om.pop(q, None)
         if not reverse:
             auto = (auto | set(m["add_auto"])) - rem_auto
             route = (route | set(m["add_route"])) - set(m["rem_route"])
@@ -2047,6 +2147,11 @@ def prune_state(state, keep_days=35):
     lp = state.get("limit_paused") or {}
     for cid in [c for c, v in lp.items() if (v.get("date") or "") < since]:
         del lp[cid]
+    for k in ("day_budget", "cpm_spent"):              # служебные замеры прошлых дней не нужны
+        d = state.get(k) or {}
+        today = dt.date.today().isoformat()
+        for cid in [c for c, v in d.items() if str(v.get("date") or v.get("at") or "")[:10] < today]:
+            del d[cid]
 
 
 MIN_DEPOSIT = 1000   # WB не принимает пополнение бюджета меньше 1 000 ₽ («minimum deposit amount is 1000», 14.10.2026)

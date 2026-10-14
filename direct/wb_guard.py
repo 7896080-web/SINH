@@ -143,7 +143,7 @@ def plan_topups(cab, token, camps, state):
     return res
 
 
-def spend_snapshot(cab, token, camps):
+def spend_snapshot(cab, token, camps, state=None):
     """Снимок «сколько потрачено к этому часу»: бюджет каждой активной / на паузе кампании и, у кампаний за клики,
     потрачено сегодня и дневной лимит. Только чтение — два запроса на кабинет. Для оценки равномерного расхода."""
     ids = [cid for cid, a in camps.items() if a.get("_status") in (9, 11)]
@@ -163,7 +163,23 @@ def spend_snapshot(cab, token, camps):
             if r and r.get("daily_limit"):
                 cpm_lim[cid] = r["daily_limit"]
     cpm_spent = B.spent_today(token, sorted(cpm_lim)) if cpm_lim else {}
-    CPM[cab] = {"limit": cpm_lim, "spent": cpm_spent}
+    # запасной способ (WB не отдал расход за сегодня): бюджет на первой проверке дня + пополнения после неё − бюджет сейчас.
+    # Ночь до первой проверки (7:40) не видна — это оценка снизу.
+    est = set()
+    if state is not None:
+        dbud = state.setdefault("day_budget", {})
+        today = dt.date.today().isoformat()
+        for cid in cpm_lim:
+            b = buds.get(cid)
+            if b is None:
+                continue
+            rec = dbud.get(str(cid))
+            if not rec or rec.get("date") != today:
+                rec = dbud[str(cid)] = {"date": today, "budget": b, "topups": B.topped_week(state, cid, days=1)}
+            if cid not in cpm_spent:
+                cpm_spent[cid] = max(rec["budget"] + B.topped_week(state, cid, days=1) - rec["topups"] - b, 0.0)
+                est.add(cid)
+    CPM[cab] = {"limit": cpm_lim, "spent": cpm_spent, "est": est}
     now = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
     rows = []
     for cid in ids:
@@ -193,6 +209,8 @@ def plan_cpm_limits(cab, camps, state, topups):
         if a.get("_status") == 9:
             spent = (info.get("spent") or {}).get(cid)
             stop, why = B.cpm_limit_check(cid, spent, limit, state)
+            if stop and cid in (info.get("est") or set()):
+                why += " (расход — оценка по бюджету с первой проверки дня)"
             if stop:
                 pauses.append({"cabinet": cab, "advert_id": cid, "name": name, "spent": spent, "limit": limit, "why": why})
         elif a.get("_status") == 11 and lp == today:
@@ -228,7 +246,7 @@ def plan_cabinet(cab, token, caps, state, budget):
         by_c[int(cid)][int(nm)] = zones
     camps = B.get_campaigns(token)
     try:
-        SNAPSHOTS[cab] = spend_snapshot(cab, token, camps)
+        SNAPSHOTS[cab] = spend_snapshot(cab, token, camps, state)
         if SNAPSHOTS[cab]:
             with B._file_lock:                 # сразу: если проверку остановят позже, снимок этого часа уже записан
                 write_spend_log(SNAPSHOTS[cab])
