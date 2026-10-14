@@ -33,13 +33,16 @@
          python wb_guard.py --apply      (применить)
          python wb_guard.py --rollback   (вернуть ставки последнего запуска)
 По расписанию — каждый час с --apply (см. wb_schedule.ps1). Токен с категорией «Продвижение».
-Время: WB отдаёт рекомендации раз в 12 с на кабинет; кабинеты проверяются одновременно — ≈9–10 минут (по самому
-большому кабинету, REC_MAX = 40).
+Время: WB отдаёт рекомендации раз в 12,5 с на кабинет; кабинеты проверяются одновременно. Обычно ≈9–10 минут (по
+самому большому кабинету, REC_MAX = 40). У кампаний с графиком расхода сверяются все товары — это дольше, поэтому
+сверка с рекомендациями обрывается через REC_DEADLINE_MIN минут (остальным товарам — только проверка минимума WB):
+планировщик останавливает проверку через 22 минуты, и без этого не применилось бы ничего.
 Результат: вывод на экран + wb_guard_log.txt (дописывается).
 """
 import datetime as dt
 import json
 import sys
+import time
 from collections import defaultdict
 
 import wb_bids as B
@@ -48,10 +51,15 @@ import wb_bids as B
 REC_MAX = 40                # сколько товаров за проверку сверять с рекомендацией WB (самые кликабельные) — основной кабинет
 REC_MAX_BY_CAB = {"Яворская": 40}   # по кабинетам; остальным — REC_MAX_OTHER (WB отдаёт рекомендацию раз в 12 с)
 REC_MAX_OTHER = 15
-CAPS_MAX_AGE_HOURS = 48     # потолки из wb_bids.py старше — не доверяю, ничего не меняю
+CAPS_MAX_AGE_HOURS = 48     # потолки из wb_bids.py старше — не доверяю, ничего не меняю (по каждому кабинету)
+REC_DEADLINE_MIN = 13       # сверку с рекомендациями WB — не дольше стольких минут от начала проверки (wb_run
+                            # останавливает её через 22 мин; после сверки ещё остатки, пополнения и запись ставок)
+TOPUP_LATE_MIN = 18         # позже стольких минут от начала пополнения не начинаю: остановка посреди пополнения
+                            # оставила бы его неясным — пополню в следующий час
 # -------------------------------------------
 
 SPEND_LOG = B.HERE / "wb_spend_hourly.csv"   # расход кампаний по часам (только запись наблюдений; см. wb_pacing.py)
+T0 = [time.time()]                            # время начала проверки (от него — REC_DEADLINE_MIN и TOPUP_LATE_MIN)
 SNAPSHOTS = {}                                # {кабинет: [строки]} — заполняется в потоках кабинетов
 PACE = {}                                     # {кабинет: {кампания: {m, why}}} — график расхода (wb_bids.pace_factor)
 BACKUP_DIR = B.HERE / "wb_guard_backups"
@@ -73,8 +81,10 @@ def rec_for(token, cid, nm, pay, target):
 
 
 def plan_topups(cab, token, camps, state):
-    """Пополнения бюджетов по правилам последнего wb_bids.py --apply (те же порог, сумма и потолки в сутки/неделю).
-    Кампания на паузе с бюджетом ниже порога (кончились деньги) — пополнить и запустить, если автопилот ею управлял."""
+    """Пополнения бюджетов по правилам последнего wb_bids.py --apply (те же порог, сумма и потолки в сутки/неделю),
+    сверенным с RULES в wb_bids.py прямо сейчас: из двух значений берётся более строгое, кампания без правила в RULES
+    не пополняется. Кампания на паузе с бюджетом ниже порога (кончились деньги) — пополнить и запустить, если
+    автопилот ею управлял. Пополненная кампания, запуск которой не прошёл, — только запустить."""
     rules = {int(k): v for k, v in (state.get("topup_rules") or {}).items() if v.get("cabinet") == cab}
     ids = [cid for cid, t in rules.items() if cid in camps and (camps[cid].get("_status") == 9 or
                                                                 (camps[cid].get("_status") in (4, 11) and t.get("start")))]
@@ -83,26 +93,43 @@ def plan_topups(cab, token, camps, state):
     buds = B.get_budgets(token, ids)
     res = []
     # общий недельный бюджет пополнений кабинета (как в wb_bids.py: "_week_budget") — по всем кампаниям кабинета
-    cab_cap = next((t.get("cab_cap") for t in rules.values() if t.get("cab_cap")), None)
+    caps_ = [t.get("cab_cap") for t in rules.values()] + [(B.RULES.get(cab) or {}).get("_week_budget")]
+    cab_cap = min((x for x in caps_ if x), default=None)
     cab_left = cab_cap - B.topped_cabinet(state, cab, camps) if cab_cap else None
     for cid in ids:
-        t, bud = rules[cid], buds.get(cid)
-        if bud is None or bud >= t["below"]:
+        t, bud = dict(rules[cid]), buds.get(cid)
+        live = B.live_topup(cab, cid, camps)
+        if live is None:
+            log(f"  «{t['name']}»: в RULES wb_bids.py пополнение этой кампании больше не задано — не пополняю.")
             continue
-        if camps[cid].get("_status") == 11 and bud >= B.PAUSED_MONEY_BELOW:
+        for k in ("below", "amount", "day_cap", "week_cap"):
+            t[k] = min(t[k], live[k])
+        B.note_broken_topups(state, cid, t["name"])
+        if bud is None:
+            continue
+        status = camps[cid].get("_status")
+        if status in (4, 11) and bud >= B.PAUSED_MONEY_BELOW and B.start_retry(state, cid):
+            log(f"  «{t['name']}»: пополнена {B.start_pending(state, cid)}, а запуск не прошёл (в бюджете {B.fm_rub(bud)} ₽) — "
+                "запущу снова, без пополнения.")
+            res.append({"cabinet": cab, "advert_id": cid, "name": t["name"], "amount": 0, "source": t["source"],
+                        "budget_before": bud, "start": True})
+            continue
+        if bud >= t["below"]:
+            continue
+        if status == 11 and bud >= B.PAUSED_MONEY_BELOW:
             log(f"  «{t['name']}» на паузе, в бюджете {B.fm_rub(bud)} ₽ — паузу, видимо, поставили вы: не пополняю и не запускаю.")
             continue
         amount = B.deposit_amount(t["amount"], t["day_cap"], B.topped_week(state, cid, days=1), t["week_cap"],
                                   B.topped_week(state, cid), cab_left if cab_cap else None,
                                   t.get("min_deposit") or B.MIN_DEPOSIT)
-        paused = camps[cid].get("_status") in (4, 11)
+        paused = status in (4, 11)
         if not amount:
             log(f"  ! «{t['name']}»: бюджет {B.fm_rub(bud)} ₽, но до потолка пополнений меньше {t.get('min_deposit') or B.MIN_DEPOSIT:.0f} ₽ "
                 "(меньше WB не принимает) — не пополняю"
                 + (" (кампания стоит на паузе)" if paused else ""))
             continue
         res.append({"cabinet": cab, "advert_id": cid, "name": t["name"], "amount": amount, "source": t["source"],
-                    "budget_before": bud, "start": paused})
+                    "budget_before": bud, "start": paused, "enough": t["below"]})
         if cab_cap:
             cab_left -= amount
     return res
@@ -157,6 +184,9 @@ def plan_cabinet(cab, token, caps, state, budget):
     camps = B.get_campaigns(token)
     try:
         SNAPSHOTS[cab] = spend_snapshot(cab, token, camps)
+        if SNAPSHOTS[cab]:
+            with B._file_lock:                 # сразу: если проверку остановят позже, снимок этого часа уже записан
+                write_spend_log(SNAPSHOTS[cab])
     except B.ApiError as e:
         log(f"  ! {cab}: снимок расхода не получен — {e}")
     topups = plan_topups(cab, token, camps, state)
@@ -193,8 +223,9 @@ def plan_cabinet(cab, token, caps, state, budget):
     rec_ok = {(x[0], x[1], x[2]) for x in sorted((x for x in cand if not x[3].get("fixed")),
                                                   key=lambda x: -(x[3].get("clicks") or 0))[:budget]}
     rec_ok |= {(x[0], x[1], x[2]) for x in cand if x[0] in pace_all and not x[3].get("fixed")}
-    changes, losing, checked = [], [], 0
-    for cid, nm, zone, c, a in sorted(cand, key=lambda x: (x[0], -(x[3].get("clicks") or 0))):
+    changes, losing, checked, late = [], [], 0, 0
+    # по убыванию кликов: если время на сверку кончится, самые важные товары уже сверены
+    for cid, nm, zone, c, a in sorted(cand, key=lambda x: -(x[3].get("clicks") or 0)):
         st = a.get("settings") or {}
         cur_all = {s.get("nm_id"): s.get("bids_kopecks") or {} for s in a.get("nm_settings") or []}
         if nm not in cur_all:
@@ -209,7 +240,9 @@ def plan_cabinet(cab, token, caps, state, budget):
             if cur < mn:
                 losing.append({**base, "new": mn})
             continue
-        if (cid, nm, zone) in rec_ok:
+        if (cid, nm, zone) in rec_ok and time.time() - T0[0] > REC_DEADLINE_MIN * 60:
+            late += 1
+        elif (cid, nm, zone) in rec_ok:
             checked += 1
             try:
                 rec = rec_for(token, cid, nm, c.get("pay") or st.get("payment_type"), c.get("target") or "3-10")
@@ -224,19 +257,27 @@ def plan_cabinet(cab, token, caps, state, budget):
                     nb, why = cur, "не повышаю (мало размеров или много кликов без заказов)"
                 pm = (pace.get(cid) or {}).get("m", 1.0)
                 if pm < 1:
-                    nb2 = B.paced(nb, pm, mn, step)
+                    nb2 = B.paced(nb, pm, mn, step, cur, (prev.get(str(cid)) or {}).get("m", 1.0))
                     if nb2 != nb:
-                        nb, why = nb2, f"{why}; график расхода ×{pm}"
+                        nb, why = nb2, f"{why}; график расхода ×{pm}" + (
+                            " — расход впереди графика, не повышаю" if nb2 == cur else "")
                 if B.changed(nb, cur, step):
                     changes.append({**base, "new": nb, "rec": rec, "why": why})
                 continue
         if mn and cur < mn:                            # рекомендацию не смотрели — только минимум
             changes.append({**base, "new": mn, "rec": None, "why": "ниже минимума WB → минимальная"})
+    if late:
+        log(f"  {cab}: не успел сверить с рекомендацией WB {late} тов. с меньшим числом кликов (на сверку — не больше "
+            f"{REC_DEADLINE_MIN} мин) — у них проверен только минимум WB; сверю в следующий час.")
+    changes.sort(key=lambda c: (c["advert_id"], c["nm_id"]))
     # потолки посчитаны автопилотом до 14 ч назад; товар мог за это время закончиться — повышать ему ставку не нужно
     ups = sorted({c["nm_id"] for c in changes if c["new"] > c["old"] and c.get("rec")})
     if ups:
         stock = B.get_stock(token, ups)
-        if stock is not None:
+        if stock is None:
+            log("  ! Остатки не загрузились — ставки не повышаю (снижения применяю).")
+            changes = [c for c in changes if not (c["new"] > c["old"] and c.get("rec"))]
+        else:
             low_min = B.DEFAULTS.get("min_stock") or 0
             keep = []
             for c in changes:
@@ -312,8 +353,20 @@ def run(cabs, apply):
         log("  Нет окупаемых потолков: автопилот ещё ни разу не применялся (python wb_bids.py --apply). Ничего не меняю.")
         write_log()
         return
-    if age > dt.timedelta(hours=CAPS_MAX_AGE_HOURS):
-        log(f"  Потолки устарели: автопилот применялся {age.days} дн. назад. Ничего не меняю — запустите wb_bids.py.")
+    # возраст потолков — по каждому кабинету: у кабинета, расчёт которого в автопилоте падал, они старше
+    fresh = {}
+    for cab, token in cabs.items():
+        try:
+            a_ = dt.datetime.now() - dt.datetime.fromisoformat((caps.get("cab_at") or {}).get(cab) or caps["at"])
+        except ValueError:
+            a_ = None
+        if a_ is None or a_ > dt.timedelta(hours=CAPS_MAX_AGE_HOURS):
+            log(f"  {cab}: потолки устарели (автопилот удачно считал этот кабинет "
+                + (f"{a_.days} дн. {a_.seconds // 3600} ч назад" if a_ else "давно") + ") — в кабинете ничего не меняю. "
+                "Запустите wb_bids.py и посмотрите, что мешает (✗ в его журнале).")
+        else:
+            fresh[cab] = token
+    if not fresh:
         write_log()
         return
 
@@ -322,11 +375,13 @@ def run(cabs, apply):
     # проверяются только его кампании
     jobs = [(cab, lambda cab=cab, token=token: plan_cabinet(cab, token, caps["items"], state,
                                                            REC_MAX_BY_CAB.get(cab, REC_MAX_OTHER)))
-            for cab, token in cabs.items()]
+            for cab, token in fresh.items()]
     results = B.run_parallel(jobs)
-    snap = [r for cab, _ in jobs for r in SNAPSHOTS.get(cab, [])]
-    if snap:
-        write_spend_log(snap)
+    if apply and not B.lock_mine():
+        log("  ✗ Общую блокировку снял другой процесс, пока шла проверка, — ничего не применяю (иначе два процесса "
+            "меняли бы кабинеты одновременно).")
+        write_log()
+        return
     if apply:
         pst = state.setdefault("pacing", {})
         for cab, _ in jobs:
@@ -361,12 +416,21 @@ def run(cabs, apply):
         log("    Решить: оставить как есть, убрать товар из кампании или поднять допустимую цену заказа в wb_bids.py.")
 
     for t in topups:
+        if not t["amount"]:
+            log(f"  ▶ «{t['name']}»: бюджет {B.fm_rub(t['budget_before'])} ₽ — запустить (пополнили раньше, запуск тогда не прошёл)")
+            continue
         log(f"  ₽ «{t['name']}»: бюджет {B.fm_rub(t['budget_before'])} ₽ → пополнить на {t['amount']} ₽"
             + (" и запустить (стоит на паузе — кончились деньги)" if t["start"] else ""))
+    if apply and topups and time.time() - T0[0] > TOPUP_LATE_MIN * 60:
+        log(f"  ! Проверка идёт дольше {TOPUP_LATE_MIN} мин — пополнения не начинаю (остановка посреди пополнения "
+            "оставила бы его неясным), сделаю в следующий час.")
+        topups = []
     if apply and topups:
         for cab in sorted({t["cabinet"] for t in topups}):
-            n = B.apply_topups(cabs[cab], [t for t in topups if t["cabinet"] == cab], state)
-            log(f"  {cab}: пополнено бюджетов {n} (пополнения не откатываются)")
+            mine = [t for t in topups if t["cabinet"] == cab]
+            n = B.apply_topups(cabs[cab], mine, state)
+            if any(t["amount"] for t in mine):
+                log(f"  {cab}: пополнено бюджетов {n} из {sum(1 for t in mine if t['amount'])} (пополнения не откатываются)")
     if apply and changes:
         BACKUP_DIR.mkdir(exist_ok=True)
         path = BACKUP_DIR / f"guard_{dt.datetime.now():%Y%m%d_%H%M%S}.json"
