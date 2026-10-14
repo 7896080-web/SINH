@@ -141,13 +141,13 @@ RULES = {
         "40769287": {"target": "3-10", "follow_rec": True, "max_bid_cpc": EXP_MAX_CPC, "auto_minus": False, "start_after_topup": True, "daily_limit": 500,
                      "topup_below": 500, "topup_amount": 500, "topup_day_cap": 500, "topup_week_cap": 3500},
         # джемперы 256250 + ZJYM: бюджет ×2 (решение 14.10.2026) — 600 ₽/сутки, как 300 + 300 у Карамана за клики
-        "40863019": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True, "daily_limit": 600,
+        "40863019": {"target": "3-10", "follow_rec": True, "auto_minus": True, "minus_after_restock_days": 0, "start_after_topup": True, "daily_limit": 600,
                      "topup_below": 600, "topup_amount": 600, "topup_day_cap": 600, "topup_week_cap": 4200},
         # «Ребрик 2101 показы» — создана 14.10.2026 через wb_create.py
-        "40955628": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True, "daily_limit": 300,
+        "40955628": {"target": "3-10", "follow_rec": True, "auto_minus": True, "minus_after_restock_days": 0, "start_after_topup": True, "daily_limit": 300,
                                "topup_below": 150, "topup_amount": 150, "topup_day_cap": 150, "topup_week_cap": 2000},
         # «Ребрик TC26 показы» — создана 14.10.2026 через wb_create.py
-        "40955524": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True, "daily_limit": 150,
+        "40955524": {"target": "3-10", "follow_rec": True, "auto_minus": True, "minus_after_restock_days": 0, "start_after_topup": True, "daily_limit": 150,
                                "topup_below": 100, "topup_amount": 100, "topup_day_cap": 100, "topup_week_cap": 1000},
     },
     "Караман": {
@@ -162,7 +162,7 @@ RULES = {
         # новая кампания за показы с теми же товарами; дневного лимита у WB нет — пополнения по 500 ₽ в сутки
         # (как куртки за клики в Ребрике — равные деньги для честного сравнения; было 200 ₽ — мало, решение 14.10.2026)
         # «Караман пуховики показы» — создана 14.10.2026 через wb_create.py
-        "40955797": {"target": "3-10", "follow_rec": True, "auto_minus": False, "start_after_topup": True, "daily_limit": 500,
+        "40955797": {"target": "3-10", "follow_rec": True, "auto_minus": True, "minus_after_restock_days": 0, "start_after_topup": True, "daily_limit": 500,
                                     "topup_below": 500, "topup_amount": 500, "topup_day_cap": 500, "topup_week_cap": 3500},
         "40769357": {"target": "3-10", "follow_rec": True, "max_bid_cpc": EXP_MAX_CPC, "auto_minus": False, "start_after_topup": True, "daily_limit": 300,
                      "topup_below": 300, "topup_amount": 300, "topup_day_cap": 300, "topup_week_cap": 2100},   # 256250
@@ -213,6 +213,12 @@ MINUS_WORDS = ["женск", "детск", "девочк", "мальчик", "д
 MINUS_MIN_CLICKS = 30               # минимум кликов по запросу, чтобы его судить
 MINUS_EXPECTED = 3.0                # сколько заказов «должно было быть» при средней конверсии
 MINUS_MAX_PER_RUN = 20              # не больше стольких новых минус-фраз на кампанию за запуск
+# за показы платят и за показы без кликов: запрос, который съел деньги, а заказа не дал, — в минус и без 30 кликов
+# (сверка с MPSTATS, решение пользователя 15.10.2026)
+MINUS_SPEND_ORDERS = 1.5            # потрачено на запрос ≥ 1,5 допустимой цены заказа товара, заказов нет — в минус
+MINUS_MIN_VIEWS = 1000              # низкий CTR судим не раньше стольких показов запроса
+MINUS_LOW_CTR = 0.5                 # CTR запроса ниже половины среднего CTR товара в кампании, заказов нет, потрачено
+                                    # ≥ половины допустимой цены заказа — в минус
 RETURN_FACTOR = 1.5                 # "top": запрос возвращается в клики, если заказ за показы дороже лимита в 1,5 раза
 RETURN_PAUSE_DAYS = 30              # …и после возврата столько дней не передаётся за показы снова
 STATS_DAYS = 14                     # статистика товаров для конверсии
@@ -1099,6 +1105,21 @@ def get_minus(token, pairs):
     return res
 
 
+def get_excluded(token, pairs):
+    """{(кампания, товар): исключённые кластеры} из списка кластеров (normquery/list). Нужен как вторая проверка:
+    get-minus по новой кампании за показы может не вернуть ничего — если и здесь исключённых нет, список пуст."""
+    res = {}
+    for part in chunks(pairs, 100):
+        pace(token, "nq", 0.25)
+        data = call("POST", ADV + "/adv/v0/normquery/list", token, what="Кластеры товаров",
+                    body={"items": [{"advertId": a, "nmId": n} for a, n in part]}) or {}
+        for it in data.get("items") or []:
+            nq = it.get("normQueries")
+            if isinstance(nq, dict):
+                res[(it.get("advertId"), it.get("nmId"))] = list(nq.get("excluded") or [])
+    return res
+
+
 def get_cluster_bids(token, pairs):
     res = defaultdict(dict)
     for part in chunks(pairs, 100):
@@ -1607,6 +1628,18 @@ def plan_cabinet(cab, token, rules, state):
             # либо фраз нет совсем, либо тип кампании их не поддерживает; писать вслепую нельзя (запись заменяет список).
             camp_known = cur_minus is not None and any((cid, nm) in cur_minus for nm in nms)
             if cur_minus is not None and not camp_known:
+                # вторая проверка: в списке кластеров WB у всех товаров нет исключённых — значит, минус-фраз нет, список пуст
+                try:
+                    excl = get_excluded(token, pairs)
+                except ApiError:
+                    excl = {}
+                if nms and all(excl.get((cid, nm)) == [] for nm in nms):
+                    for nm in nms:
+                        cur_minus[(cid, nm)] = []
+                    camp_known = True
+                    log("    Минус-фразы: WB не вернул списков, но исключённых кластеров у товаров нет — список пуст, "
+                        "автоминус работает.")
+            if cur_minus is not None and not camp_known:
                 log("    Минус-фразы: WB не вернул по этой кампании ни одного списка — скорее всего, исключённых запросов "
                     "в ней пока нет. Писать вслепую нельзя (запись заменяет весь список), поэтому автоминус здесь ждёт: "
                     "чтобы включить его, исключите в кабинете WB любой один кластер у любого товара этой кампании "
@@ -1626,13 +1659,31 @@ def plan_cabinet(cab, token, rules, state):
                 # плохие запросы; пока товар меньше MINUS_AFTER_RESTOCK_DAYS дней в наличии — только MINUS_WORDS
                 if r["auto_minus"]:
                     sd = stock_days(nm)
-                    gated = sd is None or sd < MINUS_AFTER_RESTOCK_DAYS or size_short(nm) is not None
+                    wait_days = r.get("minus_after_restock_days", MINUS_AFTER_RESTOCK_DAYS)
+                    gated = (wait_days and (sd is None or sd < wait_days)) or size_short(nm) is not None
                     cs = cl.get((cid, nm), {})
-                    bad = sorted(((q, s) for q, s in cs.items()
-                                  if s["orders"] == 0 and (s["clicks"] >= MINUS_MIN_CLICKS or negative(q))
-                                  and (s["clicks"] * cr_ref >= MINUS_EXPECTED or negative(q)) and q not in cur_set
-                                  and not protected(q) and q not in planned_cluster.get((cid, nm), set())
-                                  and q not in route_want.get(nm, set())),
+                    allowed_nm = mcpo(cab, r, nm)
+                    tv = sum(s["views"] for s in cs.values())
+                    ctr_nm = sum(s["clicks"] for s in cs.values()) / tv if tv else None
+
+                    def why_bad(q, s):
+                        if s["orders"] or q in cur_set or protected(q) or q in planned_cluster.get((cid, nm), set()) \
+                                or q in route_want.get(nm, set()):
+                            return None
+                        if negative(q):
+                            return "не наша аудитория"
+                        if s["clicks"] >= MINUS_MIN_CLICKS and s["clicks"] * cr_ref >= MINUS_EXPECTED:
+                            return f"{int(s['clicks'])} кл., 0 заказов"
+                        if allowed_nm and s["spend"] >= allowed_nm * MINUS_SPEND_ORDERS:
+                            return (f"потрачено {fm_rub(s['spend'])} ₽ — больше {str(MINUS_SPEND_ORDERS).replace('.', ',')} допустимой цены заказа "
+                                    f"({fm_rub(allowed_nm)} ₽), 0 заказов")
+                        if ctr_nm and s["views"] >= MINUS_MIN_VIEWS and s["clicks"] / s["views"] < ctr_nm * MINUS_LOW_CTR \
+                                and allowed_nm and s["spend"] >= allowed_nm * 0.5:
+                            return (f"CTR {s['clicks'] / s['views']:.1%} при {ctr_nm:.1%} в среднем у товара, "
+                                    f"{int(s['views'])} показов, {fm_rub(s['spend'])} ₽, 0 заказов")
+                        return None
+                    why_q = {q: why_bad(q, s) for q, s in cs.items()}
+                    bad = sorted(((q, s) for q, s in cs.items() if why_q[q]),
                                  key=lambda x: (not negative(x[0]), -x[1]["spend"]))
                     held = {q for q, s in bad if gated and not negative(q)}
                     if held:
@@ -1658,15 +1709,16 @@ def plan_cabinet(cab, token, rules, state):
                         continue
                     plan["minus"].append({"cabinet": cab, "advert_id": cid, "nm_id": nm, "old": current, "new": new,
                                           "add_auto": add_auto, "add_route": add_route, "rem_route": rem_route,
-                                          "stats": {q: cl.get((cid, nm), {}).get(q) for q in add_auto}})
+                                          "stats": {q: cl.get((cid, nm), {}).get(q) for q in add_auto},
+                                          "why": {q: why_q.get(q) for q in add_auto} if r["auto_minus"] else {}})
             items = [m for m in plan["minus"] if m["advert_id"] == cid]
             if items:
                 log("    Минус-фразы:")
                 for m in items:
                     for q in m["add_auto"]:
                         s = m["stats"].get(q) or {}
-                        log(f"      + {m['nm_id']:>11} {cut(q, 40):40} {int(s.get('clicks', 0))} кл., 0 заказов, "
-                            f"{s.get('spend', 0):,.0f} ₽".replace(",", " "))
+                        log(f"      + {m['nm_id']:>11} {cut(q, 40):40} " + ((m.get("why") or {}).get(q) or
+                            f"{int(s.get('clicks', 0))} кл., 0 заказов, {s.get('spend', 0):,.0f} ₽".replace(",", " ")))
                     for q in m["add_route"]:
                         log(f"      + {m['nm_id']:>11} {cut(q, 40):40} передан в «{r['route_from']}»")
                     for q in m["rem_route"]:
