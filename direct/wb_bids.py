@@ -49,6 +49,12 @@ from pathlib import Path
 
 import requests
 
+# Переезд на сервер (deploy/export_for_server.ps1 положил MOVED_TO_SERVER.txt): здесь скрипты больше не запускаются —
+# два компьютера меняли бы ставки и пополняли бюджеты одновременно, а лимиты WB у них общие.
+if (Path(__file__).resolve().parent / "MOVED_TO_SERVER.txt").exists():
+    sys.exit("Скрипты перенесены на сервер — запускайте их там (RDP, C:\\direct). Здесь не запускаю: два компьютера "
+             "меняли бы рекламу одновременно. Подробно — MOVED_TO_SERVER.txt рядом со скриптами.")
+
 # Вывод в консоль Windows (cp1251) или в файл без UTF-8 не должен падать на ₽ ═ ✓: непечатаемое заменяется «?».
 try:
     if sys.stdout is not None and (sys.stdout.encoding or "").lower().replace("-", "") != "utf8":

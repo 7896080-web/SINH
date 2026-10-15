@@ -18,7 +18,10 @@
 # Снять:       powershell -ExecutionPolicy Bypass -File C:\direct\wb_schedule.ps1 -Remove
 # Задания работают, пока компьютер включён и вы вошли в Windows (окно не появляется). Вывод — в C:\direct\wb_sched_out.txt,
 # подробности — в wb_bids_log.txt и wb_guard_log.txt.
-param([switch]$Remove)
+# Сервер (переезд 2026-10, deploy\ПЕРЕЕЗД.md): с ключом -Server задания идут от учётной записи SYSTEM — без входа в
+# Windows, выход из RDP их не останавливает (как службы sync_admin); Python — свой, C:\direct\.venv. Нужны права
+# администратора:  powershell -ExecutionPolicy Bypass -File C:\direct\wb_schedule.ps1 -Server
+param([switch]$Remove, [switch]$Server)
 
 $dir = "C:\direct"
 $names = @("AWER_WB_bids", "AWER_WB_guard", "AWER_WB_positions", "AWER_WB_collector", "AWER_WB_limits")
@@ -29,10 +32,27 @@ if ($Remove) {
     exit
 }
 
-$py = (Get-Command python -ErrorAction SilentlyContinue).Source
-if (-not $py) { Write-Host "Не найден python. Установите Python или проверьте, что команда python работает."; exit 1 }
-$pyw = Join-Path (Split-Path $py) "pythonw.exe"
-if (-not (Test-Path $pyw)) { $pyw = $py }
+if (Test-Path (Join-Path $dir "MOVED_TO_SERVER.txt")) {
+    Write-Host "Скрипты перенесены на сервер (MOVED_TO_SERVER.txt) — расписание здесь не ставлю: два компьютера меняли бы рекламу одновременно."
+    exit 1
+}
+$extra = @{}
+if ($Server) {
+    $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator)
+    if (-not $admin) { Write-Host "С ключом -Server запустите PowerShell от администратора."; exit 1 }
+    $extra.Principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+}
+$venv = Join-Path $dir ".venv\Scripts\pythonw.exe"
+if (Test-Path $venv) {
+    $pyw = $venv
+} else {
+    if ($Server) { Write-Host "Нет $venv — сначала deploy\install_server.ps1"; exit 1 }
+    $py = (Get-Command python -ErrorAction SilentlyContinue).Source
+    if (-not $py) { Write-Host "Не найден python. Установите Python или проверьте, что команда python работает."; exit 1 }
+    $pyw = Join-Path (Split-Path $py) "pythonw.exe"
+    if (-not (Test-Path $pyw)) { $pyw = $py }
+}
 if (-not (Test-Path (Join-Path $dir "wb_run.py"))) { Write-Host "Нет $dir\wb_run.py — сначала скопируйте новые файлы (git pull + Copy-Item)."; exit 1 }
 
 function Make-Action($script, $extra = "--apply", $minutes = 55) {
@@ -50,19 +70,19 @@ $set = Make-Settings (New-TimeSpan -Hours 1)
 
 $bidsTriggers = @("08:00", "13:00", "18:00") | ForEach-Object { New-ScheduledTaskTrigger -Daily -At $_ }
 Register-ScheduledTask -TaskName "AWER_WB_bids" -Action (Make-Action "wb_bids.py" "--apply" 55) -Trigger $bidsTriggers `
-    -Settings $set -Description "Автопилот ставок WB (wb_bids.py --apply), 3 раза в день" -Force | Out-Null
+    -Settings $set -Description "Автопилот ставок WB (wb_bids.py --apply), 3 раза в день" -Force @extra | Out-Null
 
 $guardTrigger = New-ScheduledTaskTrigger -Daily -At "07:40"
 $rep = New-ScheduledTaskTrigger -Once -At "07:40" -RepetitionInterval (New-TimeSpan -Hours 1) -RepetitionDuration (New-TimeSpan -Hours 16)
 $guardTrigger.Repetition = $rep.Repetition
 $guardSet = Make-Settings (New-TimeSpan -Minutes 25)
 Register-ScheduledTask -TaskName "AWER_WB_guard" -Action (Make-Action "wb_guard.py" "--apply" 22) -Trigger $guardTrigger `
-    -Settings $guardSet -Description "Часовая проверка ставок WB (wb_guard.py --apply)" -Force | Out-Null
+    -Settings $guardSet -Description "Часовая проверка ставок WB (wb_guard.py --apply)" -Force @extra | Out-Null
 
 $posSet = Make-Settings (New-TimeSpan -Hours 2)
 Register-ScheduledTask -TaskName "AWER_WB_positions" -Action (Make-Action "wb_positions.py" "" 110) `
     -Trigger (New-ScheduledTaskTrigger -Daily -At "06:00") -Settings $posSet `
-    -Description "Позиции и воронка WB (wb_positions.py, только чтение), каждый день в 6:00" -Force | Out-Null
+    -Description "Позиции и воронка WB (wb_positions.py, только чтение), каждый день в 6:00" -Force @extra | Out-Null
 
 if (Test-Path (Join-Path $dir "wb_collector.py")) {
     $colTrigger = New-ScheduledTaskTrigger -Daily -At "07:00"
@@ -70,7 +90,7 @@ if (Test-Path (Join-Path $dir "wb_collector.py")) {
     $colTrigger.Repetition = $colRep.Repetition
     $colSet = Make-Settings (New-TimeSpan -Minutes 16)
     Register-ScheduledTask -TaskName "AWER_WB_collector" -Action (Make-Action "wb_collector.py" "" 14) -Trigger $colTrigger `
-        -Settings $colSet -Description "Сборщик рекомендаций и размеров WB (wb_collector.py, только чтение), каждые 15 мин" -Force | Out-Null
+        -Settings $colSet -Description "Сборщик рекомендаций и размеров WB (wb_collector.py, только чтение), каждые 15 мин" -Force @extra | Out-Null
 }
 
 $limTrigger = New-ScheduledTaskTrigger -Daily -At "07:02"
@@ -78,9 +98,9 @@ $limRep = New-ScheduledTaskTrigger -Once -At "07:02" -RepetitionInterval (New-Ti
 $limTrigger.Repetition = $limRep.Repetition
 $limSet = Make-Settings (New-TimeSpan -Minutes 5)
 Register-ScheduledTask -TaskName "AWER_WB_limits" -Action (Make-Action "wb_guard.py" "--limits --apply" 4) -Trigger $limTrigger `
-    -Settings $limSet -Description "Дневной лимит кампаний WB каждые 5 мин (wb_guard.py --limits --apply)" -Force | Out-Null
+    -Settings $limSet -Description "Дневной лимит кампаний WB каждые 5 мин (wb_guard.py --limits --apply)" -Force @extra | Out-Null
 
-Write-Host "Готово. Python: $pyw (без окна, через wb_run.py)"
+Write-Host ("Готово. Python: $pyw (без окна, через wb_run.py)" + $(if ($Server) { "; от SYSTEM — без входа в Windows" } else { "" }))
 Get-ScheduledTask -TaskName "AWER_WB_*" | ForEach-Object {
     $i = $_ | Get-ScheduledTaskInfo
     Write-Host ("  {0}: следующий запуск {1}" -f $_.TaskName, $i.NextRunTime)

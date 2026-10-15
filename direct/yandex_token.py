@@ -4,6 +4,7 @@
 
   • OAuth-токен Яндекса (Директ, Метрика, Вебмастер) — из настроек AWER CRM:
     ~/AWER CRM/config.json, ключ yandex_oauth_token (сохраняется в CRM: Маркетинг → Подключение к Яндексу),
+    на сервере — из crm_config.json рядом со скриптами (его собирает deploy/export_for_server.ps1),
     или из переменной окружения YANDEX_OAUTH_TOKEN.
   • Токен Яндекс Доставки — из файла yandex_delivery_token.txt рядом со скриптами
     или из переменной окружения YANDEX_DELIVERY_TOKEN.
@@ -12,6 +13,12 @@ import json
 import os
 import sys
 from pathlib import Path
+
+# Переезд на сервер (deploy/export_for_server.ps1 положил MOVED_TO_SERVER.txt): здесь скрипты больше не запускаются —
+# два компьютера меняли бы ставки и пополняли бюджеты одновременно, а лимиты WB у них общие.
+if (Path(__file__).resolve().parent / "MOVED_TO_SERVER.txt").exists():
+    sys.exit("Скрипты перенесены на сервер — запускайте их там (RDP, C:\\direct). Здесь не запускаю: два компьютера "
+             "меняли бы рекламу одновременно. Подробно — MOVED_TO_SERVER.txt рядом со скриптами.")
 
 # Вывод в консоль Windows (cp1251) или в файл без UTF-8 не должен обрывать скрипт на ✓ ✗ → ₽ −: непечатаемое
 # заменяется «?». Важно для откатов: раньше первый же ✓ после первой записи останавливал откат на середине.
@@ -22,14 +29,19 @@ except (AttributeError, ValueError):
     pass
 
 CRM_CONFIG = Path.home() / "AWER CRM" / "config.json"
+# На сервере AWER CRM нет: при переезде deploy/export_for_server.ps1 кладёт сюда только нужные этим скриптам настройки
+# CRM (токен Яндекса, логин Директа, счётчик Метрики, соинвест) — без остальных ключей CRM.
+LOCAL_CONFIG = Path(__file__).resolve().with_name("crm_config.json")
 DELIVERY_FILE = Path(__file__).resolve().with_name("yandex_delivery_token.txt")
 
 
 def crm_config():
-    try:
-        return json.loads(CRM_CONFIG.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
+    for p in (CRM_CONFIG, LOCAL_CONFIG):
+        try:
+            return json.loads(p.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            continue
+    return {}
 
 
 def yandex_token():

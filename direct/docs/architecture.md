@@ -154,3 +154,4 @@ wb_cost.csv (себестоимость) ───┴─► wb_unit.py ─► wb
 - **Раз в неделю:** `wb_queries.py`, `wb_ads_report.py 7`.
 - **Раз в 1–2 недели:** `wb_unit.py`.
 - Команды Планировщика заданий Windows — в `docs/wb-history.md`.
+- **Где работает:** после переезда (`deploy/ПЕРЕЕЗД.md`) — на сервере с 1С и sync_admin, задания от SYSTEM (`wb_schedule.ps1 -Server`), без входа в Windows; на рабочем компьютере скрипты остановлены меткой `MOVED_TO_SERVER.txt`.
