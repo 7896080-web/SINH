@@ -219,6 +219,32 @@ def test_a_return_is_not_deleted_while_its_history_is_not_purged(db, tiny_cap):
         "про недочищенных детей обязана говорить оговорка, иначе пропуск молчит")
 
 
+def test_a_return_is_deleted_when_its_history_ended_exactly_at_the_cap(db,
+                                                                       tiny_cap):
+    """Граница: детей было РОВНО столько, сколько чистка берёт за прогон.
+
+    Удалено ровно сто тысяч — и это может значить как «осталось ещё», так и
+    «больше не было». Считай мы по числу удалённых, родители ждали бы целые
+    сутки без всякой причины. Вопрос задаётся правильный: остались ли дети."""
+    tiny_cap(chunk=2, chunks=1)
+    item = ReturnItem(barcode="b", platform=Platform.wb,
+                      status=ReturnStatus.back_to_sale,
+                      status_changed_at=_old(400))
+    db.add(item)
+    db.flush()
+    for _ in range(2):                      # ровно потолок
+        db.add(ReturnItemLog(return_id=item.id, at=_old(400),
+                             to_status=ReturnStatus.back_to_sale))
+    db.commit()
+
+    stats = apply_retention(db)
+
+    assert stats["return_item_log"] == 2
+    assert stats["return_items"] == 1, (
+        "детей не осталось, а родителя всё равно отложили на сутки")
+    assert db.query(ReturnItem).count() == 0
+
+
 def test_the_returns_catch_up_on_later_runs(db, tiny_cap):
     """И это не тупик: следующий прогон берёт следующую порцию и доходит сам."""
     tiny_cap(chunk=2, chunks=1)

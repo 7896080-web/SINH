@@ -136,6 +136,30 @@ def test_uncommitted_work_is_never_thrown_away(db, copy, cloud, monkeypatch):
         "выгрузка откатила чужую незакоммиченную работу")
 
 
+def test_work_already_flushed_is_not_thrown_away_either(db, copy, cloud,
+                                                        monkeypatch):
+    """Сторожей ДВА, и второй — про `flush()`.
+
+    После него работа для сессии «уже записана»: `db.new` пуст, `db.dirty`
+    пуст, — а `rollback` выбросил бы её молча, то есть ровно тем способом, от
+    которого сторож и заведён. Спрашиваем у драйвера: у pysqlite
+    `in_transaction` ложно после `SELECT` и истинно после любой записи."""
+    watcher = Watcher(db, listing=[{"Name": copy.name, "Size": 1024}])
+    monkeypatch.setattr(subprocess, "run", watcher)
+
+    db.add(AuditLog(actor="admin", action="уже-сброшена", details="",
+                    created_at=now_utc()))
+    db.flush()
+    assert not db.new and not db.dirty, "flush не сработал — тест проверяет не то"
+
+    backup.upload_to_remote(copy, db=db)
+
+    db.commit()
+    assert db.query(AuditLog).filter(
+        AuditLog.action == "уже-сброшена").count() == 1, (
+        "выгрузка откатила работу, уже отданную flush()")
+
+
 def test_no_session_is_not_an_error(copy, cloud, monkeypatch):
     """`scripts/backup_db.py` зовёт бэкап БЕЗ сессии — ровно тогда, когда с
     базой что-то не так. Отпускать нечего, и падать тут нельзя."""

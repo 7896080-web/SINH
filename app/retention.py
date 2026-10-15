@@ -290,14 +290,14 @@ def apply_retention(db: Session, backlog: dict[str, int] | None = None) -> dict:
     doomed = db.query(ReturnItem.id).filter(
         (ReturnItem.status_changed_at < now - RETURN_KEEP)
         & ReturnItem.status.in_(RETURN_TERMINAL)).scalar_subquery()
-    stats["return_item_log"] = purge(
-        ReturnItemLog, ReturnItemLog.return_id.in_(doomed), "история возвратов")
+    log_doomed = ReturnItemLog.return_id.in_(doomed)
+    batch_doomed = ReturnBatchEntry.return_id.in_(doomed)
+    stats["return_item_log"] = purge(ReturnItemLog, log_doomed, "история возвратов")
     # Строка пачки — такая же таблица-ребёнок, и правило то же. Терминальная
     # вещь в пачке лежать не должна вовсе (передача её оттуда убирает), но
     # чистка на это не рассчитывает: осиротевшая строка показала бы в пачке
     # вещь, которой уже нет.
-    stats["return_batch"] = purge(
-        ReturnBatchEntry, ReturnBatchEntry.return_id.in_(doomed), "пачка возвратов")
+    stats["return_batch"] = purge(ReturnBatchEntry, batch_doomed, "пачка возвратов")
     # Вещь удаляем ТОЛЬКО если её дети вычерпаны до конца. Потолок стоит на
     # КАЖДОЙ таблице отдельно, а история растёт быстрее самих вещей (несколько
     # строк на вещь) — значит упереться в него она может там, где вещи ещё нет.
@@ -307,9 +307,16 @@ def apply_retention(db: Session, backlog: dict[str, int] | None = None) -> dict:
     # первыми. Пропуск не молчит: о недочищенных детях говорит оговорка
     # (`backlog_note`), а следующий прогон возьмёт следующую сотню тысяч и
     # однажды дойдёт до вещей сам.
-    children_capped = (stats["return_item_log"] == PER_RUN_LIMIT
-                       or stats["return_batch"] == PER_RUN_LIMIT)
-    stats["return_items"] = 0 if children_capped else purge(
+    #
+    # Спрашиваем ОСТАЛИСЬ ЛИ дети, а не «уперлась ли чистка в потолок»: ровно
+    # сто тысяч просроченных детей могло быть и всё, что было, — и тогда держать
+    # родителей целые сутки незачем. Условие ТО ЖЕ, что отдано чистке выше, —
+    # буквально то же выражение, а не его повторение.
+    children_left = (
+        db.query(ReturnItemLog.id).filter(log_doomed).limit(1).first() is not None
+        or db.query(ReturnBatchEntry.id).filter(batch_doomed).limit(1).first()
+        is not None)
+    stats["return_items"] = 0 if children_left else purge(
         ReturnItem,
         (ReturnItem.status_changed_at < now - RETURN_KEEP)
         & ReturnItem.status.in_(RETURN_TERMINAL),

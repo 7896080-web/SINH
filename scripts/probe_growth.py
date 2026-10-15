@@ -27,6 +27,7 @@
 Ничего не меняет и не удаляет.
 """
 import os
+import sqlite3
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -198,6 +199,11 @@ def _anomalies(db) -> None:
 def _disk(db) -> None:
     print("")
     print("НА ДИСКЕ")
+    # Версия SQLite — не любопытство. От неё зависит, можно ли писать запросы с
+    # оконными функциями (нужна 3.25) и пользуется ли SQLAlchemy `RETURNING`
+    # (3.35). На машине разработки она своя, и решать по ней за боевую нельзя.
+    print("  SQLite: %s (оконные функции с 3.25, RETURNING с 3.35)"
+          % sqlite3.sqlite_version)
     base = database_path()
     if base is None:
         print("  база не SQLite -- размеров тут не считаем")
