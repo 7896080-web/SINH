@@ -75,6 +75,7 @@ def load_autopilot():
     except (OSError, ValueError):
         state = {}
     ap["caps_at"] = (state.get("caps") or {}).get("at")
+    ap["no_money"] = state.get("no_money") or {}
     for cid, t in (state.get("topup_rules") or {}).items():
         ap["rules"][cid] = {"name": t.get("name"), "week_cap": t.get("week_cap"), "day_cap": t.get("day_cap"),
                             "cabinet": t.get("cabinet")}
@@ -142,17 +143,20 @@ def load_recs():
     медианы 8–14 дней назад, по кампании и товару. Только заметные изменения (±15%)."""
     import csv
     f = HERE / "wb_rec_history.csv"
-    if not f.exists():
+    old_f = HERE / "wb_rec_history.old.csv"       # после переноса (больше 15 МБ) — чтобы не терять 8–14 дней назад
+    if not f.exists() and not old_f.exists():
         return {"rows": [], "since": None}
     today = dt.date.today()
     now_from = (today - dt.timedelta(days=3)).isoformat()
     old_from, old_to = (today - dt.timedelta(days=14)).isoformat(), (today - dt.timedelta(days=8)).isoformat()
     grp, first = {}, None
-    try:
-        raw = f.read_bytes().decode("utf-8-sig", errors="replace").splitlines()
-    except OSError:
-        return {"rows": [], "since": None}
-    for r in csv.DictReader(raw, delimiter=";"):
+    rows_in = []
+    for src in (old_f, f):
+        try:
+            rows_in += list(csv.DictReader(src.read_bytes().decode("utf-8-sig", errors="replace").splitlines(), delimiter=";"))
+        except OSError:
+            continue
+    for r in rows_in:
         d = (r.get("время") or "")[:10]
         try:
             v = float(str(r.get("рекомендация ₽") or "").replace(",", "."))
@@ -196,8 +200,11 @@ def load_collector():
                 fresh = dict(con.execute("SELECT cab, COUNT(*) FROM rec WHERE at >= ? GROUP BY cab", (edge,)).fetchall())
                 for cab, fin, info in con.execute("SELECT cab, finished, info FROM runs ORDER BY cab"):
                     i = json.loads(info or "{}")
-                    res["runs"].append({"cab": cab, "at": fin, "pairs": i.get("pairs", 0), "fresh": fresh.get(cab, 0),
-                                        "err": i.get("err") or ""})
+                    # свежие — по товарам, которые сейчас в кампаниях (сборщик считает их сам в конце прохода);
+                    # в базе ещё до 3 дней лежат товары, которых в кампаниях уже нет
+                    res["runs"].append({"cab": cab, "at": fin, "pairs": i.get("pairs", 0),
+                                        "fresh": min(i.get("fresh", fresh.get(cab, 0)), i.get("pairs", 0)),
+                                        "err": i.get("err") or "", "token_exp": i.get("token_exp")})
             finally:
                 con.close()
         except (sqlite3.Error, ValueError):
@@ -565,6 +572,13 @@ function renderAutopilot() {
   if (A.bids_last) note.push("последний запуск автопилота: " + A.bids_last.at + (A.bids_last.kind === "ПРИМЕНЕНИЕ" ? " (применение)" : " (пробный прогон)"));
   if (A.caps_at) note.push("окупаемые потолки от " + A.caps_at.replace("T", " ").slice(0, 16));
   $("#ap-note").textContent = note.join(" · ") || "Автопилот ещё не применялся.";
+  const nm = Object.entries(A.no_money || {}).filter(([c, at]) => (Date.now() - new Date(at).getTime()) < 3 * 3600000);
+  const prev = document.getElementById("ap-money"); if (prev) prev.remove();
+  if (nm.length) {
+    const el = h("p", {class: "note", id: "ap-money", style: "color:var(--bad);font-weight:600"}, $("#ap-note").parentNode);
+    el.textContent = "На балансе WB не хватает денег: " + nm.map(([c, at]) => c + " (с " + at.slice(11, 16) + ")").join(", ") + " — пополнения не проходят, кампании без бюджета стоят. Пополните баланс в кабинете WB.";
+    $("#ap-note").after(el);
+  }
   const box = $("#ap-runs"); box.textContent = "";
   const runs = A.runs.slice(-12).reverse();
   if (!runs.length) h("div", {class: "empty"}, box, "Запусков с применением пока нет.");
@@ -624,6 +638,11 @@ function renderCollector() {
   const old = runs.some(r => (Date.now() - new Date(r.at).getTime()) > 45 * 60000);
   el.style.color = old ? "var(--bad)" : "";
   if (old) el.textContent += " Сборщик давно не работал — проверьте задание AWER_WB_collector в Планировщике.";
+  const soon = (C.runs || []).filter(r => r.token_exp && (new Date(r.token_exp).getTime() - Date.now()) < 14 * 86400000);
+  if (soon.length) {
+    el.style.color = "var(--bad)";
+    el.textContent += " ТОКЕН WB скоро кончится: " + soon.map(r => r.cab + " — до " + r.token_exp.slice(8, 10) + "." + r.token_exp.slice(5, 7)).join(", ") + ". Перевыпустите в кабинете WB (Настройки → Доступ к API) и замените в wb_tokens.txt.";
+  }
 }
 
 function renderRecs() {

@@ -136,9 +136,11 @@ def plan_topups(cab, token, camps, state):
                                   t.get("min_deposit") or B.MIN_DEPOSIT)
         paused = status in (4, 11)
         if not amount:
-            log(f"  ! «{t['name']}»: бюджет {B.fm_rub(bud)} ₽, но до потолка пополнений меньше {t.get('min_deposit') or B.MIN_DEPOSIT:.0f} ₽ "
+            md = t.get("min_deposit") or B.MIN_DEPOSIT
+            log(f"  ! «{t['name']}»: бюджет {B.fm_rub(bud)} ₽, но до потолка пополнений меньше {md:.0f} ₽ "
                 "(меньше WB не принимает) — не пополняю"
                 + (" (кампания стоит на паузе)" if paused else "")
+                + B.free_note(state, cid, t["week_cap"], B.topped_week(state, cid), md)
                 + (". Потолки в RULES с последнего запуска автопилота с --apply подняли — проверка берёт меньшие, "
                    "пока автопилот их не применит (по расписанию 8:00, 13:00, 18:00)" if raised else ""))
             continue
@@ -239,6 +241,14 @@ def plan_cpm_limits(cab, camps, state, topups):
 
 def write_spend_log(rows):
     import csv
+    try:                                   # больше 15 МБ (≈ год) — начать новый, прежний в .old.csv
+        if SPEND_LOG.exists() and SPEND_LOG.stat().st_size > 15 * 1024 * 1024:
+            old = SPEND_LOG.with_name(SPEND_LOG.stem + ".old.csv")
+            if old.exists():
+                old.unlink()
+            SPEND_LOG.rename(old)
+    except OSError:
+        pass
     new = not SPEND_LOG.exists()
     try:
         with open(SPEND_LOG, "a", encoding="utf-8-sig" if new else "utf-8", newline="") as f:
@@ -533,6 +543,7 @@ def run(cabs, apply):
         path = BACKUP_DIR / f"guard_{dt.datetime.now():%Y%m%d_%H%M%S}.json"
         path.write_text(json.dumps(changes, ensure_ascii=False, indent=1), encoding="utf-8")
         log(f"  Резервная копия: {path.name}")
+        B.prune_backups(BACKUP_DIR, "guard")
         B.record_day_base(state, {"bids": changes, "cluster_bids": []})   # ставка на начало дня (если в правилах вернут ограничения в сутки)
         for cab in sorted({i["cabinet"] for i in changes}):
             n = B.apply_bids(cabs[cab], [i for i in changes if i["cabinet"] == cab], "new")
