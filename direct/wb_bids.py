@@ -131,47 +131,51 @@ RULES = {
     #    Так у каждого кабинета есть оба способа, и разница кабинетов не смешивается с разницей способа оплаты.
     #    Ставки по рекомендации WB (follow_rec, места 3–10), без окупаемого потолка; деньги держит недельный бюджет
     #    пополнений 7 000 ₽ на кабинет ("_week_budget") и дневные лимиты (за клики). Сравнить 27.10: цена заказа, заказы, выкуп.
+    # Недельные потолки пополнений (решение пользователя 15.10.2026, по модели месяца): 7 × дневной лимит, округлённо ВВЕРХ
+    # до 1 000 ₽ — WB не принимает пополнение меньше 1 000, и с потолком 3 500 доступно лишь 3 000: в конце недели
+    # кампания стояла без денег. Расход это не увеличивает — его держит дневной лимит (у показов — пауза стражем).
     "Ребрик": {
-        "_week_budget": 14200,      # 9 200 — эксперимент (джемперы ×2) + 5 000 — новинки 40842596 (решения 14.10.2026)
+        "_week_budget": 16000,      # было 14 200 (решения 14.10.2026); 15.10 — до 7 × сумма дневных лимитов (15 750), кратно 1 000
         # новинки за клики, «Кампания от 10.10.2026», запущена пользователем 14.10.2026: свой бюджет 5 000 ₽/нед
         "40842596": {"target": "3-10", "follow_rec": True, "max_bid_cpc": EXP_MAX_CPC, "auto_minus": False, "start_after_topup": True, "daily_limit": 700,
                      "topup_below": 700, "topup_amount": 700, "topup_day_cap": 700, "topup_week_cap": 5000},
         # за показы дневного лимита у WB нет — держит wb_guard.py паузой (решение 15.10.2026: с 14.10 пополнение не меньше
-        # 1 000 ₽, и тысяча уходила за ≈2 ч вечером); лимит = недельный потолок пополнений ÷ 7
+        # 1 000 ₽, и тысяча уходила за ≈2 ч вечером); недельный потолок — лимит × 7 вверх до 1 000 (решение 15.10.2026)
         # куртки — ЗА КЛИКИ (решение 14.10.2026 по сравнению 40769287 Ребрика ≈606 ₽/заказ и 40769350 Карамана ≈3 505 ₽):
         # 40769287 включена обратно, кампания за показы на эти же куртки 40863039 — на паузе (в правила не входит)
         "40769287": {"target": "3-10", "follow_rec": True, "max_bid_cpc": EXP_MAX_CPC, "auto_minus": False, "start_after_topup": True, "daily_limit": 500,
-                     "topup_below": 500, "topup_amount": 500, "topup_day_cap": 500, "topup_week_cap": 3500},
+                     "topup_below": 500, "topup_amount": 500, "topup_day_cap": 500, "topup_week_cap": 4000},
         # джемперы 256250 + ZJYM: бюджет ×2 (решение 14.10.2026) — 600 ₽/сутки, как 300 + 300 у Карамана за клики
         "40863019": {"target": "3-10", "follow_rec": True, "auto_minus": True, "minus_after_restock_days": 0, "start_after_topup": True, "daily_limit": 600,
-                     "topup_below": 600, "topup_amount": 600, "topup_day_cap": 600, "topup_week_cap": 4200},
+                     "topup_below": 600, "topup_amount": 600, "topup_day_cap": 600, "topup_week_cap": 5000},
         # «Ребрик 2101 показы» — создана 14.10.2026 через wb_create.py
         "40955628": {"target": "3-10", "follow_rec": True, "auto_minus": True, "minus_after_restock_days": 0, "start_after_topup": True, "daily_limit": 300,
-                               "topup_below": 150, "topup_amount": 150, "topup_day_cap": 150, "topup_week_cap": 2000},
+                               "topup_below": 150, "topup_amount": 150, "topup_day_cap": 150, "topup_week_cap": 3000},
         # «Ребрик TC26 показы» — создана 14.10.2026 через wb_create.py
         "40955524": {"target": "3-10", "follow_rec": True, "auto_minus": True, "minus_after_restock_days": 0, "start_after_topup": True, "daily_limit": 150,
-                               "topup_below": 100, "topup_amount": 100, "topup_day_cap": 100, "topup_week_cap": 1000},
+                               "topup_below": 100, "topup_amount": 100, "topup_day_cap": 100, "topup_week_cap": 2000},
     },
     "Караман": {
         "_week_budget": 16200,      # 11 200 — эксперимент (джемперы ×2) + 5 000 — новинки 40842612 (решения 14.10.2026)
         # новинки за клики, «Кампания от 10.10.2026», запущена пользователем 14.10.2026: свой бюджет 5 000 ₽/нед
         "40842612": {"target": "3-10", "follow_rec": True, "max_bid_cpc": EXP_MAX_CPC, "auto_minus": False, "start_after_topup": True, "daily_limit": 700,
                      "topup_below": 700, "topup_amount": 700, "topup_day_cap": 700, "topup_week_cap": 5000},
-        # дневной лимит = порог = сумма пополнения = потолок в сутки; за неделю — лимит × 7 (в сумме 7 000 ₽)
+        # дневной лимит = порог = сумма пополнения = потолок в сутки; за неделю — лимит × 7 вверх до 1 000 ₽
+        # (WB не принимает пополнение меньше 1 000; решение пользователя 15.10.2026)
         "40769334": {"target": "3-10", "follow_rec": True, "max_bid_cpc": EXP_MAX_CPC, "auto_minus": False, "start_after_topup": True, "daily_limit": 300,
-                     "topup_below": 300, "topup_amount": 300, "topup_day_cap": 300, "topup_week_cap": 2100},   # куртки
+                     "topup_below": 300, "topup_amount": 300, "topup_day_cap": 300, "topup_week_cap": 3000},   # куртки
         # пуховики 2651/2717/2718 — ЗА ПОКАЗЫ (решение 14.10.2026): 40769350 за клики (≈3 505 ₽/заказ) — на паузе,
         # новая кампания за показы с теми же товарами; дневного лимита у WB нет — пополнения по 500 ₽ в сутки
         # (как куртки за клики в Ребрике — равные деньги для честного сравнения; было 200 ₽ — мало, решение 14.10.2026)
         # «Караман пуховики показы» — создана 14.10.2026 через wb_create.py
         "40955797": {"target": "3-10", "follow_rec": True, "auto_minus": True, "minus_after_restock_days": 0, "start_after_topup": True, "daily_limit": 500,
-                                    "topup_below": 500, "topup_amount": 500, "topup_day_cap": 500, "topup_week_cap": 3500},
+                                    "topup_below": 500, "topup_amount": 500, "topup_day_cap": 500, "topup_week_cap": 4000},
         "40769357": {"target": "3-10", "follow_rec": True, "max_bid_cpc": EXP_MAX_CPC, "auto_minus": False, "start_after_topup": True, "daily_limit": 300,
-                     "topup_below": 300, "topup_amount": 300, "topup_day_cap": 300, "topup_week_cap": 2100},   # 256250
+                     "topup_below": 300, "topup_amount": 300, "topup_day_cap": 300, "topup_week_cap": 3000},   # 256250
         "40769361": {"target": "3-10", "follow_rec": True, "max_bid_cpc": EXP_MAX_CPC, "auto_minus": False, "start_after_topup": True, "daily_limit": 300,
-                     "topup_below": 300, "topup_amount": 300, "topup_day_cap": 300, "topup_week_cap": 2100},   # ZJYM
+                     "topup_below": 300, "topup_amount": 300, "topup_day_cap": 300, "topup_week_cap": 3000},   # ZJYM
         "40769369": {"target": "3-10", "follow_rec": True, "max_bid_cpc": EXP_MAX_CPC, "auto_minus": False, "start_after_topup": True, "daily_limit": 200,
-                     "topup_below": 200, "topup_amount": 200, "topup_day_cap": 200, "topup_week_cap": 1400},   # 2101
+                     "topup_below": 200, "topup_amount": 200, "topup_day_cap": 200, "topup_week_cap": 2000},   # 2101
     },
 }
 DEFAULTS = {
