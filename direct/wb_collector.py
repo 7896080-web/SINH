@@ -208,6 +208,7 @@ def collect_cabinet(cab, token, db, deadline):
             B.pace_burst(token, "rec", B.REC_INTERVAL, B.REC_BURST)
             if time.time() >= deadline:
                 break
+            B.REC_COUNT[cab] = B.REC_COUNT.get(cab, 0) + 1      # для строки «идёт работа» при ручном запуске
             try:
                 data = B.fetch_rec_raw(token, aid, nm)
             except B.ApiError as e:
