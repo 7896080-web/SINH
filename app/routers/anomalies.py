@@ -12,7 +12,7 @@ from app.dependencies import get_current_user
 from app.models import SyncAnomaly, SyncSetting, Product, PlatformAccount, AnomalyReason, AnomalyStatus, User
 from app.anomalies import close_fixed_anomalies
 from app.transmit import enqueue_full_resend
-from app.excel_utils import build_xlsx_response, read_xlsx_rows, read_upload, parse_bool_ru, format_dt, ExcelReadError
+from app.excel_utils import build_xlsx_response, read_xlsx_rows, read_upload, parse_bool_ru, format_dt, ExcelReadError, MAX_IMPORT_ROWS
 from app.flash import set_flash, pop_flash
 from app.audit import log_action
 
@@ -40,9 +40,14 @@ REASON_PRIORITY = {
 PAGE_LIMIT = 300
 # Сколько уходит в выгрузку. Файл правят руками и загружают обратно, значит он
 # обязан содержать ОТБОР, а не первый экран: «моей строки в файле нет» оператор
-# читает как «её нет в системе». Потолок — защита от попытки собрать всё одним
-# файлом, и страница о нём говорит.
-EXPORT_LIMIT = 50000
+# читает как «её нет в системе».
+#
+# Предел тот же, что у ИМПОРТА, и это не совпадение: файл тут ездит по кругу
+# («выгрузил -> отметил -> залил обратно»). Поставь мы выгрузке потолок выше, и
+# на отборе между двумя числами страница отдавала бы файл, который наша же
+# страница потом не примет, — причём отказ пришёл бы уже после ручной правки
+# нескольких тысяч строк.
+EXPORT_LIMIT = MAX_IMPORT_ROWS
 
 
 def _grouped_query(db: Session, status: str, q: str, account_id: str, reason: str):
@@ -159,6 +164,14 @@ def _render(request: Request, db: Session, user: User, status: str, q: str, acco
     # значит это и есть всё, и лишний `GROUP BY` на каждую загрузку и на каждое
     # автообновление (а оно каждые две минуты) был бы ровно той ценой, от
     # которой страницу тут и спасают.
+    #
+    # Цена названа честно: в ОБРЕЗАННОМ случае агрегация идёт дважды — `GROUP
+    # BY` с сортировкой остановиться раньше не умеет, предел режет разметку и
+    # работу браузера, а не стоимость запроса. Уйти от второго прохода можно
+    # оконным `count(*) over ()` в том же запросе, но он требует SQLite не
+    # старше 3.25, а версию на боевой машине мы не проверяли — её печатает
+    # `scripts/probe_growth.py`. Выдумывать за платформу мы не станем, тем же
+    # правилом, по которому у Ozon нет придуманного лимита запросов.
     total = (len(rows) if len(rows) < PAGE_LIMIT
              else _count_grouped_anomalies(db, status, q, account_id, reason))
     new_count = db.query(SyncAnomaly).filter(

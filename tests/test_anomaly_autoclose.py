@@ -183,6 +183,61 @@ def test_the_queries_do_not_carry_a_parameter_per_anomaly(db):
         "запрос растёт вместе с таблицей и однажды упрётся в предел SQLite")
 
 
+def test_nothing_to_close_means_no_writing_at_all(db):
+    """Закрывать нечего — значит и писать нечего. Проверено на самом SQLite.
+
+    Пустой `UPDATE` — это всё равно письмо: он открывает транзакцию записи и
+    берёт блокировку ещё до того, как выяснится, что подходящих строк нет
+    (второй писатель в этот момент получает `database is locked`). А страница
+    коммитит только когда что-то закрылось, то есть блокировка жила бы до конца
+    запроса — на каждой загрузке и каждом автообновлении раз в две минуты, пока
+    в ту же базу пишут рассылка и приём заказов.
+    """
+    from sqlalchemy import event
+
+    account = make_account(db)
+    _product(db)
+    _anomaly(db, account)                      # есть, но НЕ вылечена
+    db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=False))
+    db.commit()
+
+    written = []
+
+    @event.listens_for(db.get_bind(), "before_cursor_execute")
+    def _record(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith(("UPDATE", "INSERT", "DELETE")):
+            written.append(statement.split()[0].upper())
+
+    assert close_fixed_anomalies(db) == 0
+    assert written == [], (
+        f"на пустой работе ушло письмо в базу ({written}) — блокировка записи "
+        "будет висеть до конца запроса страницы")
+
+
+def test_something_to_close_still_gets_written(db):
+    """Обратная сторона: проба не должна глушить саму работу.
+
+    Без этой проверки правка выше однажды превратилась бы в «ничего не
+    закрываем», и список перестал бы пустеть от работы — молча."""
+    from sqlalchemy import event
+
+    account = make_account(db)
+    _product(db)
+    _anomaly(db, account)
+    db.add(SyncSetting(uid_1c="u1", account_id=account.id, enabled=True))
+    db.commit()
+
+    written = []
+
+    @event.listens_for(db.get_bind(), "before_cursor_execute")
+    def _record(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith("UPDATE"):
+            written.append(statement)
+
+    assert close_fixed_anomalies(db) == 1
+    assert len(written) == 1, "закрывать было что, а записи не произошло"
+
+
 # ----------------------------------------------------------------- страница
 
 def test_the_page_drops_a_fixed_anomaly(logged_in_client, web_db):

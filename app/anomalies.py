@@ -57,27 +57,44 @@ def close_fixed_anomalies(db: Session) -> int:
     base = ((SyncAnomaly.status == AnomalyStatus.new)
             & SyncAnomaly.is_test.is_(False))
 
+    # Пары «причина -> чем она лечится». Условие ОДНО и на вопрос «есть ли что
+    # закрывать», и на само закрытие: спроси мы разным, проба однажды сказала
+    # бы «нечего» там, где закрыть надо, — и строка висела бы вечно.
+    #
     # «Заказ на невключённый товар» — пара товар+кабинет включена. Здесь
     # коррелированный EXISTS уместен: у `sync_settings` есть уникальный индекс
     # по паре (`uq_product_account`), то есть это индексный поиск, а не чтение
     # таблицы на каждую строку.
-    closed = db.query(SyncAnomaly).filter(
-        base,
-        SyncAnomaly.reason == AnomalyReason.order_on_disabled,
-        db.query(SyncSetting).filter(
-            SyncSetting.uid_1c == SyncAnomaly.uid_1c,
-            SyncSetting.account_id == SyncAnomaly.account_id,
-            SyncSetting.enabled.is_(True),
-        ).exists(),
-    ).update({"status": AnomalyStatus.resolved}, synchronize_session="fetch")
-
+    #
     # «Нет баркода» — у товара появился баркод. А здесь, наоборот, `IN
     # (подзапрос)`: он не зависит от строки, и SQLite считает его ОДИН раз, а не
     # на каждую. Тем же правилом лечили поиск на «Товарах».
-    closed += db.query(SyncAnomaly).filter(
-        base,
-        SyncAnomaly.reason == AnomalyReason.missing_barcode,
-        SyncAnomaly.uid_1c.in_(db.query(Barcode.uid_1c).scalar_subquery()),
-    ).update({"status": AnomalyStatus.resolved}, synchronize_session="fetch")
+    cured = (
+        (AnomalyReason.order_on_disabled,
+         db.query(SyncSetting).filter(
+             SyncSetting.uid_1c == SyncAnomaly.uid_1c,
+             SyncSetting.account_id == SyncAnomaly.account_id,
+             SyncSetting.enabled.is_(True),
+         ).exists()),
+        (AnomalyReason.missing_barcode,
+         SyncAnomaly.uid_1c.in_(db.query(Barcode.uid_1c).scalar_subquery())),
+    )
+
+    closed = 0
+    for reason, fixed in cured:
+        criteria = (base, SyncAnomaly.reason == reason, fixed)
+        # СНАЧАЛА спрашиваем чтением, есть ли что закрывать. Пустой `UPDATE` в
+        # SQLite — это всё равно ПИСЬМО: он открывает транзакцию записи и берёт
+        # блокировку ещё до того, как выяснится, что подходящих строк нет
+        # (проверено: второй писатель в этот момент получает `database is
+        # locked`). А `_render` коммитит только когда что-то закрылось, то есть
+        # блокировка жила бы до конца запроса — на КАЖДОЙ загрузке страницы и
+        # каждом её автообновлении раз в две минуты, пока в ту же базу пишут
+        # рассылка (раз в 45 секунд) и приём заказов. Обычный случай здесь —
+        # «закрывать нечего», и он обязан быть чтением.
+        if db.query(SyncAnomaly.id).filter(*criteria).limit(1).first() is None:
+            continue
+        closed += db.query(SyncAnomaly).filter(*criteria).update(
+            {"status": AnomalyStatus.resolved}, synchronize_session="fetch")
 
     return closed

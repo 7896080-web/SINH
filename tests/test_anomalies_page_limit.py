@@ -151,6 +151,17 @@ def test_the_reason_order_survives_the_limit(
     assert "АРТ-свежийбаркод" not in page.text
 
 
+def test_the_export_limit_matches_the_import_limit():
+    """Файл ездит ПО КРУГУ: выгрузил -> отметил -> залил обратно.
+
+    Поставь выгрузке потолок выше импортного, и на отборе между двумя числами
+    страница отдала бы файл, который сама же потом не примет, — причём отказ
+    пришёл бы уже после ручной правки нескольких тысяч строк."""
+    from app.excel_utils import MAX_IMPORT_ROWS
+
+    assert R.EXPORT_LIMIT == MAX_IMPORT_ROWS
+
+
 def test_the_export_takes_the_whole_selection_not_the_page(
         monkeypatch, logged_in_client, web_db, account):
     """Файл правят руками и загружают обратно: «моей строки в файле нет»
