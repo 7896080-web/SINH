@@ -129,6 +129,60 @@ def test_an_empty_list_is_not_an_error(db):
     assert close_fixed_anomalies(db) == 0
 
 
+# ------------------------------------------- и не упираемся в предел параметров
+
+def test_the_queries_do_not_carry_a_parameter_per_anomaly(db):
+    """Число параметров в запросе не зависит от числа аномалий — и это главное.
+
+    Прежний вид грузил ВСЕ открытые аномалии целыми объектами и строил `IN` по
+    всем их товарам. Строки в статусе `new` не чистит никто намеренно
+    (незаконченное дело), а «заказ на невключённый товар» пока идёт переход
+    приходит десятками в сутки и сам не закрывается — то есть на 32 766 разных
+    товарах SQLite ответил бы «too many SQL variables», и страница аномалий
+    перестала бы открываться ВОВСЕ, а она единственное место, где их разбирают.
+
+    Проверяем не скорость и не память, а именно это: столько же параметров на
+    двадцати аномалиях, сколько на шестидесяти. Магического числа тут нет
+    намеренно — с ним тест пришлось бы править от каждой правки условия, а
+    зависимость от объёма он бы не поймал.
+    """
+    from sqlalchemy import event
+
+    account = make_account(db)
+    widest: list[int] = []
+
+    @event.listens_for(db.get_bind(), "before_cursor_execute")
+    def _record(conn, cursor, statement, parameters, context, executemany):
+        widest.append(len(parameters or ()))
+
+    def measure(anomalies: int) -> int:
+        """Сколько параметров в самом широком запросе автозакрытия."""
+        widest.clear()
+        close_fixed_anomalies(db)
+        return max(widest)
+
+    # Аномалии НЕвылеченные: ни одна не закроется, значит оба замера про одно и
+    # то же состояние, и разница может прийти только от объёма.
+    for i in range(20):
+        _product(db, uid=f"u{i}")
+        _anomaly(db, account, uid=f"u{i}", reason=AnomalyReason.missing_barcode)
+    db.commit()
+    on_twenty = measure(20)
+
+    for i in range(20, 60):
+        _product(db, uid=f"u{i}")
+        _anomaly(db, account, uid=f"u{i}", reason=AnomalyReason.missing_barcode)
+    db.commit()
+    on_sixty = measure(60)
+
+    assert db.query(SyncAnomaly).filter(
+        SyncAnomaly.status == AnomalyStatus.new).count() == 60, (
+        "замеры шли по разным состояниям — тест проверяет не то, что думает")
+    assert on_sixty == on_twenty, (
+        f"параметров стало больше от числа аномалий ({on_twenty} -> {on_sixty}): "
+        "запрос растёт вместе с таблицей и однажды упрётся в предел SQLite")
+
+
 # ----------------------------------------------------------------- страница
 
 def test_the_page_drops_a_fixed_anomaly(logged_in_client, web_db):

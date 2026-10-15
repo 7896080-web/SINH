@@ -10,7 +10,7 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 
 from app.database import SessionLocal
 from app.backup import last_backup, make_backup, second_site_configured
-from app.retention import apply_retention
+from app.retention import apply_retention, backlog_note
 from app.report import CRITICAL, collect_findings, summary_line
 from app.workers.verify_stock import verify_all
 from app.models import Platform, PlatformAccount, WorkerHeartbeat
@@ -948,7 +948,19 @@ def job_retention():
                        f"чистка не начата: нет свежей копии базы ({age}) — "
                        f"удалять историю, не имея чем её вернуть, нельзя")
             return
-        stats = apply_retention(db)
+        # Чего не успели — сюда. У чистки есть свой потолок
+        # (`retention.PER_RUN_LIMIT`, 100 000 строк на таблицу за прогон), и
+        # стоит он намеренно: первый запуск на миллионах строк не должен занять
+        # базу надолго. Но потолок, о который упёрлись МОЛЧА, — это та же беда,
+        # которую в этом проекте чинят с весны: своё дело задание сделало ровно
+        # столько, сколько обещало, в журнале «удалено 100 000», heartbeat
+        # зелёный, а приход больше, чем удаление, и отставание копится НАВСЕГДА.
+        # Следствие отложенное: час сверки длиннее с каждым месяцем, копия базы и
+        # выгрузка в облако тяжелеют, а в журнале на миллионы строк разбор
+        # конкретного дня уже не найти — то есть то самое, ради чего сроки
+        # хранения и заводились.
+        backlog: dict[str, int] = {}
+        stats = apply_retention(db, backlog)
         total = sum(stats.values())
         if total:
             logger.info("хранение: удалено %d строк (%s)", total,
@@ -957,7 +969,7 @@ def job_retention():
             # Пишем и когда чистить нечего: молчание обязано означать «задание не
             # отработало», а не «всё в пределах сроков».
             logger.info("хранение: удалять нечего")
-        _heartbeat(db, "retention", True)
+        _heartbeat(db, "retention", True, backlog_note(backlog))
     except Exception as e:
         logger.exception("retention failed")
         _heartbeat(db, "retention", False, str(e))

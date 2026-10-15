@@ -15,8 +15,11 @@ from app.workers import scheduler
 def no_cleanup(monkeypatch):
     """Подменяем саму чистку: нас интересует, зовут её или нет."""
     calls = []
+    # Второй аргумент — словарь, куда чистка складывает то, что не успела
+    # удалить за прогон (`retention.apply_retention`). Подмена обязана его
+    # принимать, иначе тест ловил бы не отказ чистки, а свою же заглушку.
     monkeypatch.setattr(scheduler, "apply_retention",
-                        lambda db: calls.append(1) or {"x": 0})
+                        lambda db, backlog=None: calls.append(1) or {"x": 0})
     return calls
 
 

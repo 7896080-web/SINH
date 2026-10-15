@@ -4,7 +4,7 @@ from app.timeutils import now_utc
 from fastapi import APIRouter, Request, Depends, Query, UploadFile, File
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import func, or_
+from sqlalchemy import case, func, or_
 
 from app.database import get_db
 from app.templating import templates as shared_templates
@@ -29,8 +29,23 @@ REASON_PRIORITY = {
     AnomalyReason.missing_barcode: 1,
 }
 
+# Сколько строк показывает страница. Предел нужен по той же причине, по которой
+# он есть на «Товарах»: строки в статусе `new` не чистит никто намеренно
+# (аномалия в `new` — незаконченное дело), а пока идёт переход со старой системы
+# «заказ на невключённый товар» приходит десятками в сутки и сам не
+# закрывается — пару товар+кабинет никто не включит, потому что этим каталогом
+# мы ещё не управляем. Десять тысяч сгруппированных строк — это мегабайты
+# разметки КАЖДЫЕ ДВЕ МИНУТЫ (страница обновляет себя сама) на веб-службе,
+# которая в это же время принимает заказы с площадок.
+PAGE_LIMIT = 300
+# Сколько уходит в выгрузку. Файл правят руками и загружают обратно, значит он
+# обязан содержать ОТБОР, а не первый экран: «моей строки в файле нет» оператор
+# читает как «её нет в системе». Потолок — защита от попытки собрать всё одним
+# файлом, и страница о нём говорит.
+EXPORT_LIMIT = 50000
 
-def _load_grouped_anomalies(db: Session, status: str, q: str, account_id: str, reason: str):
+
+def _grouped_query(db: Session, status: str, q: str, account_id: str, reason: str):
     query = (
         db.query(
             SyncAnomaly.uid_1c, SyncAnomaly.account_id, SyncAnomaly.reason,
@@ -55,15 +70,47 @@ def _load_grouped_anomalies(db: Session, status: str, q: str, account_id: str, r
     if reason:
         query = query.filter(SyncAnomaly.reason == reason)
 
-    query = query.group_by(
+    return query.group_by(
         SyncAnomaly.uid_1c, SyncAnomaly.account_id, SyncAnomaly.reason,
         Product.article, Product.name, Product.size, Product.color,
         PlatformAccount.name, PlatformAccount.platform,
     )
 
-    rows = query.all()
-    rows = sorted(rows, key=lambda r: (REASON_PRIORITY.get(r.reason, 99), -r.last_detected.timestamp()))
-    return rows
+
+def _load_grouped_anomalies(db: Session, status: str, q: str, account_id: str,
+                            reason: str, limit: int | None = None):
+    """Строки отбора, сгруппированные по паре товар+кабинет+причина.
+
+    Сортировка в SQL, а не в Python, и это не вкусовщина: с пределом показа
+    сортировка после `LIMIT` отобрала бы ПРОИЗВОЛЬНЫЕ триста групп и разложила
+    бы по порядку уже их — то есть страница показывала бы не самые свежие
+    аномалии, а случайные, ничем об этом не сказав. Порядок причин берётся из
+    `REASON_PRIORITY`, чтобы он был ОДИН: по алфавиту значения встают наоборот,
+    и повтори мы его здесь числами, два порядка однажды разошлись бы.
+    """
+    # Предел читается ИЗ МОДУЛЯ, а не из значения по умолчанию у параметра:
+    # умолчание связывается в момент объявления функции, и подмена константы в
+    # тесте на него не действует вовсе — то есть проверка предела проверяла бы
+    # не предел. Ноль значит «без предела».
+    limit = PAGE_LIMIT if limit is None else limit
+    priority = case(*[(SyncAnomaly.reason == kind, rank)
+                      for kind, rank in REASON_PRIORITY.items()], else_=99)
+    query = _grouped_query(db, status, q, account_id, reason).order_by(
+        priority, func.max(SyncAnomaly.detected_at).desc())
+    return query.limit(limit).all() if limit else query.all()
+
+
+def _count_grouped_anomalies(db: Session, status: str, q: str, account_id: str,
+                             reason: str) -> int:
+    """Сколько строк под отбором ВСЕГО — отдельным запросом, а не длиной списка.
+
+    `len(rows)` показывал бы «300» при любом числе аномалий, и «300» без «из
+    2412» читается как «столько их и есть». Тот же тройной дефект уже находили
+    на выгрузке конфликтов сопоставления: предел, врущий счётчик и молчание о
+    том, что список обрезан, — чинить надо все три, иначе оператор всё равно не
+    узнает.
+    """
+    return _grouped_query(db, status, q, account_id, reason).count()
 
 
 def _resolve_sync_and_anomalies(db: Session, uid_1c: str, account_id: int) -> bool:
@@ -108,6 +155,12 @@ def _render(request: Request, db: Session, user: User, status: str, q: str, acco
     if close_fixed_anomalies(db):
         db.commit()
     rows = _load_grouped_anomalies(db, status, q, account_id, reason)
+    # Считаем отбор ТОЛЬКО когда список реально обрезан. Пришло меньше предела —
+    # значит это и есть всё, и лишний `GROUP BY` на каждую загрузку и на каждое
+    # автообновление (а оно каждые две минуты) был бы ровно той ценой, от
+    # которой страницу тут и спасают.
+    total = (len(rows) if len(rows) < PAGE_LIMIT
+             else _count_grouped_anomalies(db, status, q, account_id, reason))
     new_count = db.query(SyncAnomaly).filter(
         SyncAnomaly.status == AnomalyStatus.new.value, SyncAnomaly.is_test.is_(False),
     ).count()
@@ -118,6 +171,7 @@ def _render(request: Request, db: Session, user: User, status: str, q: str, acco
         "rows": rows, "status": status, "q": q, "account_id": account_id, "reason": reason,
         "accounts": accounts, "reasons": list(AnomalyReason), "reason_labels": REASON_LABELS,
         "new_count": new_count,
+        "total": total, "page_limit": PAGE_LIMIT, "export_limit": EXPORT_LIMIT,
         "refresh_seconds": REFRESH_SECONDS,
         "flash": pop_flash(request) if template == "anomalies.html" else None,
     })
@@ -158,7 +212,10 @@ def anomalies_export(
     status: str = Query("new"), q: str = Query(""), account_id: str = Query(""), reason: str = Query(""),
     db: Session = Depends(get_db), user: User = Depends(get_current_user),
 ):
-    rows = _load_grouped_anomalies(db, status, q, account_id, reason)
+    # ВЕСЬ отбор, а не показанную страницу: по этому файлу разбирают пачкой, и
+    # каждая строка здесь — уже случившаяся непроведённая продажа.
+    rows = _load_grouped_anomalies(db, status, q, account_id, reason,
+                                   limit=EXPORT_LIMIT)
 
     headers = ["ID_1С", "Артикул", "Наименование", "Кабинет", "Площадка", "Причина",
                "Заказов поймано", "Последний раз", "Синхронизировать"]

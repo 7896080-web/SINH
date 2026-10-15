@@ -1,4 +1,7 @@
 {% if rows %}
+{% if total and total > rows|length %}
+<p class="help-text">Показаны первые {{ rows|length }} из {{ total }} строк отбора — страница не грузит весь список целиком. Уточните отбор, чтобы увидеть нужную, или выгрузите его в Excel: в файл уходит до {{ export_limit }} строк.</p>
+{% endif %}
 <div class="table-scroll"><table>
     <thead>
         <tr>

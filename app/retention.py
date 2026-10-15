@@ -39,7 +39,7 @@ from sqlalchemy.orm import Session
 from app.models import (AnomalyStatus, AuditLog, DispatchQueueItem, DispatchStatus,
                         FtpTask, FtpTaskStatus, ReconciliationLog, ReturnItem,
                         ReturnBatchEntry, ReturnItemLog, ReturnStatus,
-                        StockDiscrepancyLog,
+                        StockDeltaDocument, StockDiscrepancyLog,
                         SyncAnomaly, TestLogEntry)
 from app.returns import TERMINAL as RETURN_TERMINAL
 from app.timeutils import now_utc
@@ -70,6 +70,25 @@ FTP_TASK_KEEP = timedelta(days=180)
 ANOMALY_KEEP = timedelta(days=90)
 # Журнал страницы «Тестирование» — 30 суток. Это отладочные записи.
 TEST_LOG_KEEP = timedelta(days=30)
+# Применённые дельты остатка ЦС — 30 суток. До этой правки это была ЕДИНСТВЕННАЯ
+# таблица в системе вообще без срока хранения, и росла она сама: строка на каждый
+# документ 1С, изменивший остаток ЦС, то есть розница, перемещения, списания,
+# поставки — сотни и тысячи в сутки, сотни тысяч за год.
+#
+# Авария отсюда не выйдет: строка крошечная, `document_id` уникален и
+# проиндексирован, так что поиск не портится. Беда в другом: смысл строки живёт
+# ЧАСЫ. Она нужна, чтобы узнать повторно приехавший файл (переотправка,
+# повторное проведение, ручной перезапуск обработки), а это происходит в тот же
+# день, не через год.
+#
+# Прикрытие на случай, если древний файл всё-таки приедет снова, есть и второе,
+# и оно сильнее этого: `Product.stock_as_of` отбрасывает строку снимка или
+# дельты СТАРШЕ наших данных по этой позиции. То есть забытый документ, чей
+# идентификатор мы уже удалили, не перепишет остаток назад — его отбросит
+# свежесть данных, а не память о документе. Месяц взят тем же порядком, что у
+# очереди рассылки: это с запасом больше любого реального окна переотправки, и
+# при этом не «вечно».
+DELTA_DOC_KEEP = timedelta(days=30)
 # История расхождений — год, как и журнал действий, и по той же причине: это
 # единственное место, где записано, откуда взялось число, уходящее в порог, а
 # значит и в остаток на площадках. Вопрос «кто и из чего поставил здесь 11»
@@ -103,13 +122,41 @@ CHUNK = 500
 # миллионы: чистить их одним заходом значит занять базу надолго, а спешить некуда —
 # задание ходит каждые сутки и дочистит.
 MAX_CHUNKS = 200
+# Сколько строк ОДНОЙ таблицы чистка способна удалить за прогон. Число, а не
+# рассуждение: суточный приход больше него означает, что чистка отстаёт НАВСЕГДА,
+# каждые сутки на разницу. Сегодня запас есть — журнал сверки пишет строку на
+# каждый товар в снимке, то есть около полутора тысяч в час и сорока тысяч в
+# сутки, — но он весь в числе товаров С НЕНУЛЕВЫМ ОСТАТКОМ: вырастет склад
+# втрое, и запас кончится. Поэтому упёртый потолок обязан выходить наверх, а не
+# оставаться в арифметике двух констант.
+PER_RUN_LIMIT = CHUNK * MAX_CHUNKS
+
+# Метка оговорки «чистка не успевает» — живёт ЗДЕСЬ, а не в отчёте. Текст пишет
+# это задание, а ищет свою часть поля находка `report._check_retention_backlog`:
+# повтори она строку у себя, достаточно было бы поправить формулировку в одном
+# месте, чтобы находка замолчала навсегда, не сказав об этом ни слова.
+BACKLOG_MARK = "чистка не успевает"
 
 
-def _purge(db: Session, model, condition, label: str) -> int:
+def _purge(db: Session, model, condition, label: str,
+           backlog: dict[str, int] | None = None) -> int:
     """Удалить порциями, коммитя каждую. Возвращает сколько удалено.
 
     Выбираем id отдельным запросом, а не `query.delete()` на всю выборку: так
     транзакция ограничена размером порции, а не количеством подходящих строк.
+
+    Упёрлись в `MAX_CHUNKS` — считаем, сколько просроченных строк осталось, и
+    кладём в `backlog`. Считаем ТЕМ ЖЕ `condition`, которым удаляли, и внутри
+    того же вызова: повтори счёт это условие снаружи — и он однажды разошёлся
+    бы с настоящим, то есть показывал бы ноль при полной таблице просрочки.
+    Молчание счётчика и исправная система обязаны быть РАЗНЫМИ состояниями.
+
+    Считаем ТОЛЬКО когда потолок действительно упёрся (`removed` ровно равен
+    ему). Иначе в остаток попала бы строка, перешедшая в терминальный статус
+    ПОСЛЕ того, как чистка прошла её таблицу: запись очереди старше месяца
+    лежала в `pending` и уехала в `sent` в эти же секунды — просрочена, а
+    потолок тут ни при чём. Оговорка «не успеваем» из-за одной такой строки
+    приучила бы её не читать.
     """
     removed = 0
     for _ in range(MAX_CHUNKS):
@@ -122,16 +169,56 @@ def _purge(db: Session, model, condition, label: str) -> int:
         removed += len(ids)
     if removed:
         logger.info("хранение: %s — удалено %d", label, removed)
+    if backlog is not None and removed == PER_RUN_LIMIT:
+        left = db.query(func.count(model.id)).filter(condition).scalar() or 0
+        if left:
+            logger.warning("хранение: %s — не успели, осталось %d", label, left)
+            backlog[label] = left
     return removed
 
 
-def apply_retention(db: Session) -> dict:
-    """Почистить историю по срокам. Возвращает {таблица: сколько удалено}."""
+def backlog_note(backlog: dict[str, int]) -> str:
+    """Оговорка для УСПЕШНОЙ отметки задания. Пусто — всё вычищено.
+
+    Успех, а не ошибка, намеренно и по общему правилу: `/health` про живость
+    (задание отработало и своё дело сделало — ровно столько, сколько обещало), а
+    расхождение разбирает отчёт. Читатель у текста обязан быть, и он есть —
+    `report._check_retention_backlog`.
+
+    Числа в тексте не украшение: «не успевает» без числа не отличить от
+    «осталось три строки», а решают по этому разное — поднять потолок, сократить
+    срок хранения или ничего не делать.
+    """
+    if not backlog:
+        return ""
+    biggest = sorted(backlog.items(), key=lambda kv: -kv[1])
+    listed = ", ".join(f"{name} — {left}" for name, left in biggest[:5])
+    more = f" и ещё {len(biggest) - 5}" if len(biggest) > 5 else ""
+    return (f"{BACKLOG_MARK}: просроченных строк осталось {sum(backlog.values())} "
+            f"({listed}{more}) — за один прогон удаляется не больше "
+            f"{PER_RUN_LIMIT} на таблицу")
+
+
+def apply_retention(db: Session, backlog: dict[str, int] | None = None) -> dict:
+    """Почистить историю по срокам. Возвращает {таблица: сколько удалено}.
+
+    `backlog` — необязательный словарь, в который складывается то, что удалить
+    НЕ УСПЕЛИ: {имя таблицы по-человечески: сколько просроченных строк
+    осталось}. Отдельным параметром, а не вторым возвращаемым значением, и это
+    осознанно. Возврат читают и СКЛАДЫВАЮТ (`sum(...)`) и задание, и тесты:
+    подмешай туда числа другого смысла — и в журнале однажды появилось бы
+    «удалено 300 000» там, где удалено 100 000. А считать остаток вторым
+    проходом снаружи нельзя: условие пришлось бы повторить, а повторённое
+    условие однажды разошлось бы с настоящим.
+    """
     now = now_utc()
     stats: dict[str, int] = {}
 
-    stats["reconciliation_log"] = _purge(
-        db, ReconciliationLog,
+    def purge(model, condition, label: str) -> int:
+        return _purge(db, model, condition, label, backlog)
+
+    stats["reconciliation_log"] = purge(
+        ReconciliationLog,
         ReconciliationLog.checked_at < now - RECONCILIATION_KEEP,
         "журнал сверки")
 
@@ -147,34 +234,38 @@ def apply_retention(db: Session) -> dict:
     # расхождение никуда не девалось. Мёртвые отказы отсеивает сам отчёт
     # (`report._only_live_pairs` и «по паре позже была успешная отправка») — это
     # его работа, а не чистки.
-    stats["dispatch_queue"] = _purge(
-        db, DispatchQueueItem,
+    stats["dispatch_queue"] = purge(
+        DispatchQueueItem,
         (DispatchQueueItem.created_at < now - DISPATCH_KEEP)
         & (DispatchQueueItem.status == DispatchStatus.sent),
         "очередь рассылки")
 
-    stats["audit_log"] = _purge(
-        db, AuditLog, AuditLog.created_at < now - AUDIT_KEEP, "журнал действий")
+    stats["audit_log"] = purge(
+        AuditLog, AuditLog.created_at < now - AUDIT_KEEP, "журнал действий")
 
     # `timeout` не трогаем НИКОГДА, сколько бы ему ни было: по нему неизвестно,
     # создан документ в 1С или нет, и его количество до сих пор считается «в
     # пути», то есть влияет на остаток прямо сейчас. Удалить такую строку значит
     # молча изменить остаток товара.
-    stats["ftp_tasks"] = _purge(
-        db, FtpTask,
+    stats["ftp_tasks"] = purge(
+        FtpTask,
         (FtpTask.created_at < now - FTP_TASK_KEEP)
         & FtpTask.status.in_([FtpTaskStatus.done, FtpTaskStatus.no_document]),
         "задания 1С")
 
-    stats["sync_anomalies"] = _purge(
-        db, SyncAnomaly,
+    stats["sync_anomalies"] = purge(
+        SyncAnomaly,
         (SyncAnomaly.detected_at < now - ANOMALY_KEEP)
         & (SyncAnomaly.status == AnomalyStatus.resolved),
         "разобранные аномалии")
 
-    stats["test_log"] = _purge(
-        db, TestLogEntry, TestLogEntry.created_at < now - TEST_LOG_KEEP,
+    stats["test_log"] = purge(
+        TestLogEntry, TestLogEntry.created_at < now - TEST_LOG_KEEP,
         "журнал тестирования")
+
+    stats["stock_delta_documents"] = purge(
+        StockDeltaDocument, StockDeltaDocument.applied_at < now - DELTA_DOC_KEEP,
+        "применённые дельты 1С")
 
     # ПОСЛЕДНЮЮ запись по товару не удаляем никогда, сколько бы ей ни было лет.
     # Она и есть происхождение числа, которое прямо сейчас сидит в пороге и
@@ -184,8 +275,8 @@ def apply_retention(db: Session) -> dict:
     # ставят один раз и не трогают годами.
     newest_per_product = db.query(func.max(StockDiscrepancyLog.id)).group_by(
         StockDiscrepancyLog.uid_1c).scalar_subquery()
-    stats["stock_discrepancy_log"] = _purge(
-        db, StockDiscrepancyLog,
+    stats["stock_discrepancy_log"] = purge(
+        StockDiscrepancyLog,
         (StockDiscrepancyLog.created_at < now - DISCREPANCY_LOG_KEEP)
         & StockDiscrepancyLog.id.notin_(newest_per_product),
         "история расхождений")
@@ -199,16 +290,27 @@ def apply_retention(db: Session) -> dict:
     doomed = db.query(ReturnItem.id).filter(
         (ReturnItem.status_changed_at < now - RETURN_KEEP)
         & ReturnItem.status.in_(RETURN_TERMINAL)).scalar_subquery()
-    stats["return_item_log"] = _purge(
-        db, ReturnItemLog, ReturnItemLog.return_id.in_(doomed), "история возвратов")
+    stats["return_item_log"] = purge(
+        ReturnItemLog, ReturnItemLog.return_id.in_(doomed), "история возвратов")
     # Строка пачки — такая же таблица-ребёнок, и правило то же. Терминальная
     # вещь в пачке лежать не должна вовсе (передача её оттуда убирает), но
     # чистка на это не рассчитывает: осиротевшая строка показала бы в пачке
     # вещь, которой уже нет.
-    stats["return_batch"] = _purge(
-        db, ReturnBatchEntry, ReturnBatchEntry.return_id.in_(doomed), "пачка возвратов")
-    stats["return_items"] = _purge(
-        db, ReturnItem,
+    stats["return_batch"] = purge(
+        ReturnBatchEntry, ReturnBatchEntry.return_id.in_(doomed), "пачка возвратов")
+    # Вещь удаляем ТОЛЬКО если её дети вычерпаны до конца. Потолок стоит на
+    # КАЖДОЙ таблице отдельно, а история растёт быстрее самих вещей (несколько
+    # строк на вещь) — значит упереться в него она может там, где вещи ещё нет.
+    # Удали мы родителя в этом же прогоне, подзапрос `doomed` в следующем
+    # оставшихся детей уже НЕ НАЙДЁТ: вещи не будет, условие пустое, и строки
+    # истории осиротели бы навсегда — ровно то, против чего они и чистятся
+    # первыми. Пропуск не молчит: о недочищенных детях говорит оговорка
+    # (`backlog_note`), а следующий прогон возьмёт следующую сотню тысяч и
+    # однажды дойдёт до вещей сам.
+    children_capped = (stats["return_item_log"] == PER_RUN_LIMIT
+                       or stats["return_batch"] == PER_RUN_LIMIT)
+    stats["return_items"] = 0 if children_capped else purge(
+        ReturnItem,
         (ReturnItem.status_changed_at < now - RETURN_KEEP)
         & ReturnItem.status.in_(RETURN_TERMINAL),
         "возвраты")

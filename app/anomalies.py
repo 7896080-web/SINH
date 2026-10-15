@@ -31,35 +31,53 @@ def close_fixed_anomalies(db: Session) -> int:
 
     Коммит НЕ делает: вызывающий сам решает, когда фиксировать — страница
     аномалий делает это одной транзакцией со своим ответом.
+
+    Двумя массовыми `UPDATE`, а не перебором строк в Python, и это не про
+    скорость. Прежний вид грузил ВСЕ открытые аномалии целыми объектами и строил
+    `IN` по всем их товарам — то есть на 32 766 разных товарах SQLite ответил бы
+    «too many SQL variables», и страница аномалий перестала бы открываться
+    ВОВСЕ. А она единственное место, где их разбирают. Предел параметров в этом
+    проекте уже знают (`products.UIDS_CHUNK` — про 999 у сборок до 3.32, чего на
+    машине разработки не увидеть), здесь он просто не был применён.
+
+    Срок, за который это наступит, считается по данным, а не по страху: строки
+    в статусе `new` не чистит НИКТО намеренно — аномалия в `new` это
+    незаконченное дело, и `retention` её не трогает, сколько бы ей ни было. Пока
+    идёт переход со старой системы, «заказ на невключённый товар» приходит
+    десятками в сутки и сам не закрывается: пару товар+кабинет никто не включит,
+    потому что этим каталогом мы ещё не управляем. Сотня в сутки — это год,
+    триста — четыре месяца. И страница обновляет себя каждые две минуты, то есть
+    запрос этот не редкий.
+
+    `synchronize_session="fetch"` обязателен. Прежний код менял ORM-объекты, и
+    вызывающие читают состояние СРАЗУ, не коммитя (так же и тесты): с `False`
+    они увидели бы в сессии прежний статус, то есть правка выглядела бы
+    несработавшей ровно там, где её проверяют.
     """
-    rows = db.query(SyncAnomaly).filter(
-        SyncAnomaly.status == AnomalyStatus.new,
-        SyncAnomaly.is_test.is_(False),
-    ).all()
-    if not rows:
-        return 0
+    base = ((SyncAnomaly.status == AnomalyStatus.new)
+            & SyncAnomaly.is_test.is_(False))
 
-    # Два запроса на всю пачку вместо запроса на строку: аномалий бывают сотни,
-    # а страница открывается часто и обновляет себя сама.
-    enabled = {
-        (s.uid_1c, s.account_id)
-        for s in db.query(SyncSetting).filter(SyncSetting.enabled.is_(True)).all()
-    }
-    with_barcode = {
-        b.uid_1c for b in
-        db.query(Barcode.uid_1c).filter(
-            Barcode.uid_1c.in_({r.uid_1c for r in rows})).distinct().all()
-    }
+    # «Заказ на невключённый товар» — пара товар+кабинет включена. Здесь
+    # коррелированный EXISTS уместен: у `sync_settings` есть уникальный индекс
+    # по паре (`uq_product_account`), то есть это индексный поиск, а не чтение
+    # таблицы на каждую строку.
+    closed = db.query(SyncAnomaly).filter(
+        base,
+        SyncAnomaly.reason == AnomalyReason.order_on_disabled,
+        db.query(SyncSetting).filter(
+            SyncSetting.uid_1c == SyncAnomaly.uid_1c,
+            SyncSetting.account_id == SyncAnomaly.account_id,
+            SyncSetting.enabled.is_(True),
+        ).exists(),
+    ).update({"status": AnomalyStatus.resolved}, synchronize_session="fetch")
 
-    closed = 0
-    for row in rows:
-        if row.reason == AnomalyReason.order_on_disabled:
-            fixed = (row.uid_1c, row.account_id) in enabled
-        elif row.reason == AnomalyReason.missing_barcode:
-            fixed = row.uid_1c in with_barcode
-        else:
-            fixed = False
-        if fixed:
-            row.status = AnomalyStatus.resolved
-            closed += 1
+    # «Нет баркода» — у товара появился баркод. А здесь, наоборот, `IN
+    # (подзапрос)`: он не зависит от строки, и SQLite считает его ОДИН раз, а не
+    # на каждую. Тем же правилом лечили поиск на «Товарах».
+    closed += db.query(SyncAnomaly).filter(
+        base,
+        SyncAnomaly.reason == AnomalyReason.missing_barcode,
+        SyncAnomaly.uid_1c.in_(db.query(Barcode.uid_1c).scalar_subquery()),
+    ).update({"status": AnomalyStatus.resolved}, synchronize_session="fetch")
+
     return closed
