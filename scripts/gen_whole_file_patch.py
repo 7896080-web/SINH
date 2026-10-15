@@ -134,8 +134,72 @@ $py = "C:\sync_admin\.venv\Scripts\python.exe"
 '''
 
 
+def subjects_of(root: str, files: list[str]) -> list[str]:
+    """Файлы репозитория, которые ЧИТАЮТ или ЗАПУСКАЮТ тесты из этого патча.
+
+    Патч собирают по `git diff`, то есть по тому, что изменено, — а тесту нужен
+    ещё и его ПРЕДМЕТ. 15.10 на pm162 это остановило накат живого сервера:
+    `tests/test_probe_accounts.py` правился и уехал, а
+    `scripts/probe_accounts.py` не менялся с 05.10 — и на сервере его не было
+    ВОВСЕ. Патчи только пишут и никогда не удаляют, значит файл, который ни один
+    патч не привозил, там просто отсутствует, и никакая сверка sha об этом не
+    скажет: сверяется то, что в патче, а не то, чего в нём нет. Десять тестов
+    упали с «can't open file», причём узнать об этом можно было только после
+    тридцати трёх минут pytest на бою, уже после копии базы и миграций.
+
+    Предмет ищется по ЛИТЕРАЛАМ: тест называет свой скрипт строкой
+    (`ROOT / "scripts" / "probe_accounts.py"`), и ровно этот случай гарантированно
+    падает, если файла нет. Тест, который берёт каталог ГЛОБОМ, сюда не попадает
+    намеренно: неполный каталог он не роняет, он просто проверяет меньше — беда
+    другого рода и другого размера.
+
+    Дотягиваем, а не отказываем: отказ пришлось бы обходить руками на каждом
+    патче, а дотянутый файл при совпадении sha на сервере даже не пишется. Но
+    молча это делать нельзя — список печатается, иначе патч однажды увезёт не то,
+    что человек собирался.
+    """
+    import ast
+
+    known = {f.replace("\\", "/") for f in files}
+    found: set[str] = set()
+    # Транзитивно: тест может читать ДРУГОЙ тест (так делает проверка самого
+    # генератора), а у того свой предмет. Один уровень оставил бы ровно ту же
+    # дыру на шаг глубже, а шагов тут считанные единицы — множество файлов
+    # конечно, и каждый проход либо что-то добавляет, либо заканчивает обход.
+    queue = [f.replace("\\", "/") for f in files]
+    while queue:
+        rel = queue.pop()
+        if not rel.startswith("tests/") or not rel.endswith(".py"):
+            continue
+        try:
+            tree = ast.parse(open(os.path.join(root, rel), encoding="utf-8").read())
+        except (OSError, SyntaxError):
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+                continue
+            name = node.value.replace("\\", "/")
+            # Наружу корня не выходим: литерал в тесте — чужая строка, а патч
+            # пишет на боевой сервер по этим же путям. `os.path.join` с
+            # абсолютным путём корень ПОДМЕНЯЕТ, то есть один такой литерал
+            # увёз бы на сервер файл откуда угодно с диска.
+            if (not name.endswith(".py") or os.path.isabs(name)
+                    or name.startswith("/") or ".." in name.split("/")):
+                continue
+            for candidate in (name, "scripts/" + name):
+                if candidate in known or candidate in found:
+                    continue
+                if os.path.isfile(os.path.join(root, candidate)):
+                    found.add(candidate)
+                    queue.append(candidate)
+                    break
+    return sorted(found)
+
+
 def build(root: str, files: list[str], tag: str, parts: int, width: int,
           delete: list[str] | None = None) -> tuple[str, dict]:
+    pulled = subjects_of(root, files)
+    files = list(files) + pulled
     entries = []
     for rel in files:
         with open(os.path.join(root, rel), "rb") as f:
@@ -163,7 +227,7 @@ def build(root: str, files: list[str], tag: str, parts: int, width: int,
     out.append(PS_APPLY.format(concat=concat, full_sha=full_sha, tag=tag, part_checks=part_checks))
     info = {"files": len(entries), "deleted": len(delete or []),
             "raw_bytes": len(apply_src), "b64_len": len(b64),
-            "parts": len(pieces), "full_sha": full_sha}
+            "parts": len(pieces), "full_sha": full_sha, "pulled_in": pulled}
     return "".join(out), info
 
 
@@ -189,6 +253,8 @@ def main() -> int:
     # там кодировка уже верная, поэтому дефект дожил до первого запуска файлом.
     with open(a.out, "w", encoding="utf-8-sig", newline="\r\n") as f:
         f.write(text)
+    for rel in info["pulled_in"]:
+        print(f"+ дотянут предмет теста: {rel}")
     print(info)
     return 0
 
