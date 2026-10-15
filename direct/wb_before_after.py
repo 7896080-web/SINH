@@ -34,6 +34,7 @@ from wb_common import (ADV, YESTERDAY, ApiError, arg_cabinet, call, campaigns, c
 START = dt.date(2026, 10, 13)  # первый wb_bids.py --apply — 13.10.2026 00:10
 BEFORE_DAYS = 14               # сколько дней «до» (две целые недели — дни недели уравновешены)
 MIN_ORDERS = 20                # меньше заказов в периоде — вывод по кампании предварительный
+MIN_SPEND = 100                # кампании, потратившие меньше (до + после, ₽), — одной строкой в конце
 # Что менялось после START (для пояснений в отчёте)
 CHANGES = [
     ("13.10", "первый запуск автопилота: ставки по рекомендации WB, дневные лимиты, убраны товары < 15 шт"),
@@ -170,6 +171,9 @@ def analyze(cab, token):
                 dst[k] += t[k]
     rb, ra = ratios(tb, nb), ratios(ta, na)
     log(f"До: {B1:%d.%m}–{B2:%d.%m} ({nb} дн.).  После: {A1:%d.%m}–{A2:%d.%m} ({na} дн.).")
+    on_b = len({d for aid in camps for d, v in st_b.get(aid, {}).items() if v["sum"] >= 1})
+    if on_b < nb:
+        log(f"  В «до» реклама кабинета шла {on_b} дн. из {nb} — средние за день «до» занижены, сравнивайте кампании.")
     if na < 7:
         log(f"  «После» всего {na} дн. — меньше недели: вывод предварительный, дни недели не уравновешены.")
     log("\n1. Кабинет целиком, в среднем за день (было → стало):")
@@ -202,11 +206,14 @@ def analyze(cab, token):
 
     # 2. Кампании
     log("\n2. Кампании (в день — по дням, когда кампания тратила; было → стало):")
-    out = []
+    out, small = [], []
     order = sorted(camps, key=lambda i: -(totals(st_a.get(i, {}))["sum"] + totals(st_b.get(i, {}))["sum"]))
     for aid in order:
         t_b, t_a = totals(st_b.get(aid, {})), totals(st_a.get(aid, {}))
         if not t_b["sum"] and not t_a["sum"]:
+            continue
+        if t_b["sum"] + t_a["sum"] < MIN_SPEND:
+            small.append((aid, t_b["sum"] + t_a["sum"]))
             continue
         s = camps[aid].get("settings") or {}
         name, pay = s.get("name") or str(aid), PAY.get(s.get("payment_type"), s.get("payment_type") or "?")
@@ -227,6 +234,9 @@ def analyze(cab, token):
                         "клики": t["clicks"], "заказы": t["orders"], "сумма заказов ₽": round(t["sum_price"], 2),
                         "расход в день ₽": r["day_sum"], "CTR %": r["ctr"], "цена клика ₽": r["cpc"],
                         "цена заказа ₽": r["cpo"], "ДРР %": r["drr"], "итог": vv})
+    if small:
+        log(f"\n  Почти без расхода (меньше {MIN_SPEND} ₽ за оба периода): "
+            + ", ".join(f"«{cut((camps[a].get('settings') or {}).get('name') or a, 30)}» {fm(x)} ₽" for a, x in small))
     return out
 
 
