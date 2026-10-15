@@ -22,6 +22,13 @@
      минимума WB (1 000 ₽): потрачено сегодня ≥ 97% лимита из RULES или по
      темпу последнего часа к следующей проверке ушло бы за лимит больше чем на 15% — пауза до утра; первая проверка
      следующего дня (7:40) запускает снова. Такую паузу автопилот и проверка знают как свою (state["limit_paused"]).
+  5. Расход растягивается по дню (решение 15.10.2026): обогнал график спроса по часам больше чем на 8% лимита — пауза
+     «по графику», спрос догнал (и запас больше, чем кампания тратит за 5 минут) — запуск; с 23:30 до 7:00 такие кампании
+     стоят. После 2 / 4 / 6 / 8 пауз за день ставка ×0,7 / ×0,55 / ×0,4 / ×0,25 (не ниже минимальной WB; крупная «вспышка»
+     считается за несколько пауз). Каждые 5 минут то же делает частая проверка: python wb_guard.py --limits --apply
+     (по расписанию с 7:02; ставки и пополнения она не трогает, журнал — wb_limits_log.txt).
+  6. Стоп-лист wb_hold.txt (номера кампаний по одному в строке): такие кампании скрипты не запускают и не пополняют —
+     чтобы выключить кампанию, которую сами ставят на паузу ночью и по лимиту.
 Лимиты, минус-фразы, ставки по запросам, уборка товаров — только wb_bids.py.
 
 Безопасность:
@@ -69,6 +76,8 @@ CPM = {}                                      # {кабинет: {"limit": {ка
 PACE = {}                                     # {кабинет: {кампания: {m, why}}} — график расхода (wb_bids.pace_factor)
 BACKUP_DIR = B.HERE / "wb_guard_backups"
 LOG_FILE = B.HERE / "wb_guard_log.txt"
+LIMITS_LOG = B.HERE / "wb_limits_log.txt"     # частая проверка лимита (--limits): только паузы, запуски и ошибки
+LIMIT_CHECK_MIN = B.PACE_CHECK_MIN            # частая проверка лимита — раз в столько минут (wb_schedule.ps1)
 log = B.log
 
 
@@ -116,7 +125,10 @@ def plan_topups(cab, token, camps, state):
         if bud is None:
             continue
         status = camps[cid].get("_status")
+        if B.on_hold(cid) and status != 9:
+            continue                       # стоп-лист wb_hold.txt: не пополняю и не запускаю
         lp = B.limit_paused(state, cid)
+        pp = B.pace_paused(state, cid)     # пауза по графику расхода — наша: пополнять можно, запускает plan_cpm_limits
         if status == 11 and lp == dt.date.today().isoformat():
             continue                       # пауза по дневному лимиту — до утра (сообщает plan_cpm_limits)
         if status in (4, 11) and bud >= B.PAUSED_MONEY_BELOW and B.start_retry(state, cid):
@@ -127,7 +139,7 @@ def plan_topups(cab, token, camps, state):
             continue
         if bud >= t["below"]:
             continue
-        if status == 11 and bud >= B.PAUSED_MONEY_BELOW:
+        if status == 11 and bud >= B.PAUSED_MONEY_BELOW and not pp:
             if not lp:                     # пауза по дневному лимиту вчера — запустит plan_cpm_limits
                 log(f"  «{t['name']}» на паузе, в бюджете {B.fm_rub(bud)} ₽ — паузу, видимо, поставили вы: не пополняю и не запускаю.")
             continue
@@ -145,7 +157,7 @@ def plan_topups(cab, token, camps, state):
                    "пока автопилот их не применит (по расписанию 8:00, 13:00, 18:00)" if raised else ""))
             continue
         res.append({"cabinet": cab, "advert_id": cid, "name": t["name"], "amount": amount, "source": t["source"],
-                    "budget_before": bud, "start": paused, "enough": t["below"]})
+                    "budget_before": bud, "start": paused and not pp, "enough": t["below"]})
         if cab_cap:
             cab_left -= amount
     return res
@@ -193,8 +205,12 @@ def spend_snapshot(cab, token, camps, state=None):
             rec = dbud.get(str(cid))
             if not rec or rec.get("date") != today:
                 rec = dbud[str(cid)] = {"date": today, "budget": b, "topups": B.topped_week(state, cid, days=1)}
+            by_budget = max(rec["budget"] + B.topped_week(state, cid, days=1) - rec["topups"] - b, 0.0)
             if cid not in cpm_spent:
-                cpm_spent[cid] = max(rec["budget"] + B.topped_week(state, cid, days=1) - rec["topups"] - b, 0.0)
+                cpm_spent[cid] = by_budget
+                est.add(cid)
+            elif by_budget > cpm_spent[cid] + 1:
+                cpm_spent[cid] = by_budget      # статистика WB отстаёт, а бюджет — нет: берём больший расход
                 est.add(cid)
     CPM[cab] = {"limit": cpm_lim, "spent": cpm_spent, "est": est}
     now = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -213,29 +229,69 @@ def spend_snapshot(cab, token, camps, state=None):
     return rows
 
 
-def plan_cpm_limits(cab, camps, state, topups):
-    """Дневной лимит кампаний за показы: (поставить на паузу, запустить снова)."""
+def plan_cpm_limits(cab, camps, state, topups, quiet=False):
+    """Свой дневной лимит (показы; клики — если лимит ниже минимума WB): (поставить на паузу, запустить снова).
+    Пауза до утра — потрачен лимит; пауза «по графику» — расход обогнал спрос по часам (B.pace_spread), запуск — когда
+    спрос догнал. quiet — без пояснений о том, что и так стоит на паузе (частая проверка, раз в 5 мин)."""
     info = CPM.get(cab) or {}
     today = dt.date.today().isoformat()
     starting = {t["advert_id"] for t in topups if t.get("start")}
     pauses, resumes = [], []
+    say = (lambda *a: None) if quiet else log
     for cid, limit in (info.get("limit") or {}).items():
         a = camps.get(cid) or {}
         name = (a.get("settings") or {}).get("name") or str(cid)
         lp = B.limit_paused(state, cid)
+        pp = B.pace_paused(state, cid)
+        spent = (info.get("spent") or {}).get(cid)
+        B.note_spend(state, cid, spent, a.get("_status") == 9)
+        if B.on_hold(cid) and a.get("_status") != 9 and (lp or pp):
+            for k in ("limit_paused", "pace_paused"):        # стоп-лист: пауза теперь пользователя — не запускаю
+                (state.get(k) or {}).pop(str(cid), None)
+            log(f"  ⏹ «{name}»: в стоп-листе {B.HOLD_FILE.name} — пауза остаётся, запускать не буду.")
+            continue
+        if a.get("_status") == 11 and lp and lp < today and B.PACE_SPREAD and cid not in starting:
+            # вчерашняя пауза по лимиту: утром запускаю не сразу, а по графику и с запасом на «вспышку» (как паузу по графику)
+            (state.get("limit_paused") or {}).pop(str(cid), None)
+            pp = state.setdefault("pace_paused", {})[str(cid)] = {"date": lp, "at": "вчера, по лимиту", "spent": None,
+                                                                  "limit": limit}
+            lp = None
         if a.get("_status") == 9:
-            spent = (info.get("spent") or {}).get(cid)
+            if pp:
+                (state.get("pace_paused") or {}).pop(str(cid), None)    # запустили вручную или WB — пауза уже не наша
             stop, why = B.cpm_limit_check(cid, spent, limit, state)
             if stop and cid in (info.get("est") or set()):
-                why += " (расход — оценка по бюджету с первой проверки дня)"
+                why += " (расход — по бюджету с первой проверки дня)"
             if stop:
-                pauses.append({"cabinet": cab, "advert_id": cid, "name": name, "spent": spent, "limit": limit, "why": why})
+                pauses.append({"cabinet": cab, "advert_id": cid, "name": name, "spent": spent, "limit": limit, "why": why,
+                               "kind": "limit"})
+            elif B.pace_spread(spent, limit) == "pause":
+                pauses.append({"cabinet": cab, "advert_id": cid, "name": name, "spent": spent, "limit": limit, "kind": "pace",
+                               "why": (f"ночь (с {int(B.PACE_NIGHT[0])}:{int(B.PACE_NIGHT[0] % 1 * 60):02d} до "
+                                       f"{int(B.PACE_NIGHT[1])}:00 стоит; потрачено {B.fm_rub(spent)} из {B.fm_rub(limit)} ₽)")
+                               if B.pace_night() else
+                               f"потрачено {B.fm_rub(spent)} из {B.fm_rub(limit)} ₽ при {B.pace_target():.0%} дневного "
+                               "спроса к этому часу"})
         elif a.get("_status") == 11 and lp == today:
-            log(f"  «{name}»: на паузе по дневному лимиту {B.fm_rub(limit)} ₽ (с "
+            say(f"  «{name}»: на паузе по дневному лимиту {B.fm_rub(limit)} ₽ (с "
                 f"{(state.get('limit_paused') or {}).get(str(cid), {}).get('at', '?')}) — запущу утром.")
         elif a.get("_status") == 11 and lp and cid not in starting:
             resumes.append({"cabinet": cab, "advert_id": cid, "name": name, "amount": 0, "source": "balance",
                             "budget_before": None, "start": True})
+        elif a.get("_status") == 11 and pp and cid not in starting:
+            ok = B.pace_spread(spent, limit) == "resume" or ((pp.get("date") or "") < today and not B.pace_night())
+            burst = (B.pace_rate(state, cid) or 0) * LIMIT_CHECK_MIN   # сколько потратит до следующей частой проверки
+            room = limit * min(1.0, B.pace_target() + B.PACE_MARGIN) - (spent or 0)
+            if ok and burst > room:
+                ok = False
+                say(f"  «{name}»: график догнал, но за {LIMIT_CHECK_MIN} мин кампания тратит ≈{B.fm_rub(burst)} ₽, а запас "
+                    f"{B.fm_rub(max(room, 0))} ₽ — подожду.")
+            if ok:
+                resumes.append({"cabinet": cab, "advert_id": cid, "name": name, "amount": 0, "source": "balance",
+                                "budget_before": None, "start": True, "pace": True})
+            else:
+                say(f"  «{name}»: на паузе по графику расхода (с {pp.get('at', '?')}; потрачено {B.fm_rub(spent or 0)} из "
+                    f"{B.fm_rub(limit)} ₽) — запущу, когда спрос по часам догонит.")
     return pauses, resumes
 
 
@@ -299,7 +355,7 @@ def plan_cabinet(cab, token, caps, state, budget):
     pace = {}
     for row in SNAPSHOTS.get(cab, []):
         if row.get("потрачено сегодня ₽") != "" and row.get("дневной лимит ₽") != "":     # за клики и за показы
-            m, why = B.pace_factor(row["кампания"], row["потрачено сегодня ₽"], row["дневной лимит ₽"])
+            m, why = B.pace_factor(row["кампания"], row["потрачено сегодня ₽"], row["дневной лимит ₽"], state=state)
             pace[row["кампания"]] = {"m": m, "why": why}
             if m < 1:
                 log(f"  ⏱ «{row['название']}»: {why}.")
@@ -418,9 +474,13 @@ def main():
         return
 
     apply = "--apply" in sys.argv
+    if "--limits" in sys.argv:
+        run_limits(cabs, apply)
+        return
     log(f"{dt.datetime.now():%d.%m.%Y %H:%M} — часовая проверка ставок WB "
         f"({'ПРИМЕНЕНИЕ' if apply else 'пробный прогон, ничего не меняется'})")
-    if apply and not B.lock_acquire("wb_guard.py"):
+    # частая проверка лимита держит блокировку секунды — подождать её, а не пропускать час
+    if apply and not B.lock_acquire("wb_guard.py", wait_min=3):
         info = B.lock_info()
         log(f"  Сейчас применяет {info[1] if info else 'wb_bids.py'} — проверку пропускаю.")
         write_log()
@@ -428,6 +488,59 @@ def main():
     B.busy_mark("wb_guard.py")          # сборщик рекомендаций пока ждёт: лимит WB общий
     try:
         run(cabs, apply)
+    finally:
+        if apply:
+            B.lock_release()
+
+
+def run_limits(cabs, apply):
+    """Частая проверка своего дневного лимита (python wb_guard.py --limits [--apply]; по расписанию — каждые 5 мин):
+    расход кампаний со своим лимитом (показы; клики — если лимит ниже минимума WB), пауза до утра — лимит потрачен,
+    пауза «по графику» — расход обогнал спрос по часам, запуск — когда спрос догнал. Ставки и пополнения — только в
+    обычной проверке и автопилоте. Пишет в wb_limits_log.txt только паузы, запуски и ошибки."""
+    head = (f"{dt.datetime.now():%d.%m.%Y %H:%M} — проверка дневного лимита "
+            f"({'ПРИМЕНЕНИЕ' if apply else 'пробный прогон, ничего не меняется'})")
+    if apply and not B.lock_acquire("wb_guard.py --limits"):
+        print(head + ": работает автопилот или часовая проверка — пропускаю (лимит проверят они).")
+        return
+    try:
+        state = B.load_state()
+        pauses, resumes, errors = [], [], []
+        for cab, token in cabs.items():
+            B._tl.cab = cab
+            try:
+                camps = B.get_campaigns(token)
+                spend_snapshot(cab, token, camps, state)
+                pz, rs = plan_cpm_limits(cab, camps, state, [], quiet=True)
+            except B.ApiError as e:
+                errors.append(f"  ! {cab}: {e}")
+                continue
+            pauses += pz
+            resumes += rs
+        lines = errors[:]
+        for it in pauses:
+            lines.append(f"  ⏸ «{it['name']}»: {it['why']} — " + ("пауза по графику" if it.get("kind") == "pace" else "пауза до утра"))
+        for t in resumes:
+            lines.append(f"  ▶ «{t['name']}»: " + ("спрос по часам догнал расход — запустить" if t.get("pace")
+                                                   else "новый день — запустить (стояла на паузе по дневному лимиту)"))
+        if lines:
+            B.log(head)
+            for ln in lines:
+                B.log(ln)
+        if apply:
+            for it in pauses:
+                (B.pace_pause_campaign if it.get("kind") == "pace" else B.pause_campaign)(cabs[it["cabinet"]], it, state)
+            for t in resumes:
+                B.start_campaign(cabs[t["cabinet"]], t, state)
+            B.save_state(state)            # замер бюджета на первой проверке дня (для расхода по бюджету)
+        if B.out:                          # паузы, запуски, ошибки, стоп-лист; пустая проверка в журнал не пишется
+            try:
+                with open(LIMITS_LOG, "a", encoding="utf-8") as f:
+                    f.write("\n".join(B.out if lines else [head] + B.out) + "\n\n")
+            except OSError:
+                pass
+        elif not apply:
+            print(head + ": всё в пределах графика, менять нечего.")
     finally:
         if apply:
             B.lock_release()
@@ -514,12 +627,16 @@ def run(cabs, apply):
         log("    Решить: оставить как есть, убрать товар из кампании или поднять допустимую цену заказа в wb_bids.py.")
 
     for it in pauses:
-        log(f"  ⏸ «{it['name']}»: {it['why']} — пауза до утра")
+        log(f"  ⏸ «{it['name']}»: {it['why']} — " + ("пауза по графику, запущу, когда спрос догонит" if it.get("kind") == "pace"
+                                                    else "пауза до утра"))
     if apply and pauses:
         for cab in sorted({i["cabinet"] for i in pauses}):
             for it in (i for i in pauses if i["cabinet"] == cab):
-                B.pause_campaign(cabs[cab], it, state)
+                (B.pace_pause_campaign if it.get("kind") == "pace" else B.pause_campaign)(cabs[cab], it, state)
     for t in topups:
+        if not t["amount"] and t.get("pace"):
+            log(f"  ▶ «{t['name']}»: спрос по часам догнал расход — запустить")
+            continue
         if not t["amount"] and B.limit_paused(state, t["advert_id"]):
             log(f"  ▶ «{t['name']}»: новый день — запустить (вчера стояла на паузе по дневному лимиту)")
             continue

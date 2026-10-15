@@ -70,6 +70,7 @@ ftime.sleep = _sleep
 W = Wm.World(SEED)
 MODE = ["check"]
 COLLECTOR_BROKEN = [False]
+LIMITS_EVERY_5 = os.environ.get("LIMITS", "1") == "1"      # частая проверка лимита (wb_guard.py --limits) каждые 5 мин
 USER_PAUSED = {}                 # кампания → (с, по) — пауза пользователя (автопилот не должен запускать)
 OUT_DIR = os.path.join(RUN, "_out")
 os.makedirs(OUT_DIR, exist_ok=True)
@@ -112,7 +113,7 @@ def mods():
 def run(what, fn_name, argv):
     mods()
     R.rotate()
-    mod = {"bids": B, "guard": G, "collector": C, "budget": BU}[what]
+    mod = {"bids": B, "guard": G, "collector": C, "budget": BU, "limits": G}[what]
     sys.argv = [mod.__file__] + argv
     buf = io.StringIO()
     t0 = _time.time()
@@ -361,6 +362,9 @@ def main():
                 if hm == "08:00" and (last_budget is None or (t - last_budget).total_seconds() > 20 * 3600):
                     run("budget", "main", [])
                     last_budget = t
+            if LIMITS_EVERY_5 and t.hour >= 7 and t.minute % 5 == 2:
+                run("limits", "main", ["--limits", "--apply"])
+                ev_count["limits"] += 1
             if t.hour >= 7 and t.minute == 40:
                 NOW[0] = t + _dt.timedelta(seconds=30)
                 run("guard", "main", ["--apply"])
@@ -369,10 +373,9 @@ def main():
             sizes = {f: os.path.getsize(f) for f in os.listdir(".") if os.path.isfile(f) and not f.endswith(".py")}
             print(f"{t:%d.%m} запусков: {dict(ev_count)}; файлов {len(sizes)}, крупные: "
                   + ", ".join(f"{k} {v // 1024} КБ" for k, v in sorted(sizes.items(), key=lambda x: -x[1])[:4]), flush=True)
-        nxt = t + _dt.timedelta(minutes=5)
-        if NOW[0] >= nxt:                 # запуск затянулся — пропущенные события не догоняем (как IgnoreNew)
-            n = NOW[0] + _dt.timedelta(minutes=5)
-            nxt = n.replace(minute=(n.minute // 5) * 5, second=0, microsecond=0)
+        nxt = t + _dt.timedelta(minutes=1)
+        if NOW[0] >= nxt + _dt.timedelta(minutes=4):     # запуск затянулся — пропущенное не догоняем (как IgnoreNew)
+            nxt = (NOW[0] + _dt.timedelta(minutes=1)).replace(second=0, microsecond=0)
             note("запуск дольше 5 мин", f"{t:%d.%m %H:%M} → часы {NOW[0]:%H:%M}")
         t = nxt
     NOW[0] = end
@@ -425,6 +428,17 @@ def report(ev_count):
     rep.append("\nПРЕДУПРЕЖДЕНИЯ СКРИПТОВ (сколько раз, пример):")
     for k, (n, ex) in sorted(warn.items(), key=lambda x: -x[1][0])[:40]:
         rep.append(f"  {n:5}  {k}\n         пример: {ex}")
+    rep.append("\nКОГДА УХОДЯТ ДЕНЬГИ (свой лимит): доля расхода по времени суток — 0–7 / 7–12 / 12–18 / 18–24 ч")
+    for cid, c in sorted(W.camps.items(), key=lambda x: (x[1]["cab"], x[0])):
+        r = rule_of(c["cab"], cid)
+        if not r or not r.get("daily_limit") or not (c["pay"] == "cpm" or r["daily_limit"] < 1000):
+            continue
+        parts = [0.0, 0.0, 0.0, 0.0]
+        for (d, cc, h), v in W.hour_spend.items():
+            if cc == cid:
+                parts[0 if h < 7 else 1 if h < 12 else 2 if h < 18 else 3] += v
+        tot = sum(parts) or 1
+        rep.append(f"  {c['cab']:9} {cid} {c['name'][:24]:24} " + " / ".join(f"{x / tot:.0%}" for x in parts))
     rep.append("\nФАЙЛЫ в конце:")
     for f in sorted(os.listdir(".")):
         if os.path.isfile(f) and not f.endswith(".py"):
@@ -433,6 +447,13 @@ def report(ev_count):
             rep.append(f"  {f}/: {len(os.listdir(f))} файлов")
     rep.append("\nСОБЫТИЯ МИРА (последние 15): " + "; ".join(f"{t:%d.%m %H:%M} {x}" for t, x in W.events[-15:]))
     rep.append(f"ВЫЗОВЫ WB: {dict(sorted(W.calls.items(), key=lambda x: -x[1])[:8])}")
+    with open(os.path.join(RUN, "_events.txt"), "w", encoding="utf-8") as f:     # всё по номерам кампаний
+        for t, x in W.events:
+            f.write(f"{t:%d.%m %H:%M} {x}\n")
+        for t, cab, cid, s_ in W.deposits:
+            f.write(f"{t:%d.%m %H:%M} пополнение {cid} +{s_}\n")
+        for (d, cid, h), v in sorted(W.hour_spend.items()):
+            f.write(f"{d} {h:02d}ч расход {cid} {v:.0f}\n")
     txt = "\n".join(rep)
     open(os.path.join(RUN, "_report.txt"), "w", encoding="utf-8").write(txt)
     print(txt)

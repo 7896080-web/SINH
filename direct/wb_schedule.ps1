@@ -8,6 +8,8 @@
 #   • после каждого запуска — пересборка дашборда wb_dashboard.html (python wb_dashboard.py --no-open), 13.10.2026;
 #   • wb_collector.py — каждые 15 минут с 07:00 до 24:00: рекомендованные ставки и размеры в базу wb_rec.db
 #     (только чтение WB; решение 15.10.2026). Дашборд после него не пересобирается.
+#   • wb_guard.py --limits --apply — каждые 5 минут с 07:02 до 24:00: свой дневной лимит кампаний (показы; клики с лимитом
+#     ниже 1 000 ₽) — пауза до утра, пауза «по графику» и запуск, когда спрос по часам догнал (решение 15.10.2026).
 # С 14.10.2026 задания запускают pythonw.exe wb_run.py <скрипт> (без окна; своё ограничение по времени, после
 # которого зависший скрипт останавливается и снимается его блокировка; журналы > 5 МБ переносятся в *.old.txt).
 # Работают и от батареи ноутбука. Переустановить после обновления: ту же команду «Установить».
@@ -19,7 +21,7 @@
 param([switch]$Remove)
 
 $dir = "C:\direct"
-$names = @("AWER_WB_bids", "AWER_WB_guard", "AWER_WB_positions", "AWER_WB_collector")
+$names = @("AWER_WB_bids", "AWER_WB_guard", "AWER_WB_positions", "AWER_WB_collector", "AWER_WB_limits")
 
 if ($Remove) {
     foreach ($n in $names) { Unregister-ScheduledTask -TaskName $n -Confirm:$false -ErrorAction SilentlyContinue }
@@ -70,6 +72,13 @@ if (Test-Path (Join-Path $dir "wb_collector.py")) {
     Register-ScheduledTask -TaskName "AWER_WB_collector" -Action (Make-Action "wb_collector.py" "" 14) -Trigger $colTrigger `
         -Settings $colSet -Description "Сборщик рекомендаций и размеров WB (wb_collector.py, только чтение), каждые 15 мин" -Force | Out-Null
 }
+
+$limTrigger = New-ScheduledTaskTrigger -Daily -At "07:02"
+$limRep = New-ScheduledTaskTrigger -Once -At "07:02" -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration (New-TimeSpan -Hours 17)
+$limTrigger.Repetition = $limRep.Repetition
+$limSet = Make-Settings (New-TimeSpan -Minutes 5)
+Register-ScheduledTask -TaskName "AWER_WB_limits" -Action (Make-Action "wb_guard.py" "--limits --apply" 4) -Trigger $limTrigger `
+    -Settings $limSet -Description "Дневной лимит кампаний WB каждые 5 мин (wb_guard.py --limits --apply)" -Force | Out-Null
 
 Write-Host "Готово. Python: $pyw (без окна, через wb_run.py)"
 Get-ScheduledTask -TaskName "AWER_WB_*" | ForEach-Object {
