@@ -31,20 +31,77 @@ from sqlalchemy.orm import sessionmaker
 
 from app.models import (Barcode, Base, FtpTask, FtpTaskStatus, Product,
                         ReconciliationClassification, ReconciliationLog)
+from app.timeutils import now_utc
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "probe_reconcile.py"
 
-BASE = datetime(2026, 10, 5, 6, 33)
+# Якорь рядов — ОТ МОМЕНТА ПРОГОНА, а не датой в тексте. Стояло
+# `datetime(2026, 10, 5, 6, 33)`, и тесты спрашивают скрипт с `--hours 240`:
+# ровно через 240 часов, то есть 15.10 в 06:33 UTC, два самых старых ряда вышли
+# за окно, «строк сверки: 6» стало «4», и два теста покраснели САМИ СОБОЙ. Цена
+# не в путанице: накат гоняет `pytest` ПЕРЕД перезапуском служб, и на боевом
+# сервере он встал на красных тестах — то есть зашитая дата остановила накат
+# через десять суток после того, как её написали. Это тот же класс, что «тест про
+# календарный день обязан переживать полночь», только с десятидневным фитилём.
+#
+# Считается ОДИН раз и при первом обращении, а не на импорте: сбор тестов идёт
+# раньше их выполнения, и значение, посчитанное на импорте, однажды окажется
+# по другую сторону часа. Кэш держит его неизменным на весь прогон — иначе два
+# ряда одного теста разъехались бы на час, случись между ними смена часа.
+_ANCHOR: list = []
+
+# Насколько старым делаем самый ранний ряд. Двенадцать часов — с запасом внутри
+# любого окна, о котором спрашивают тесты (минимум 240 ч), и при этом ряды
+# заведомо в прошлом, как на бою.
+ANCHOR_AGE = timedelta(hours=12)
+
+# Окно, о котором спрашивают тесты ниже. ОДНО число на всех и на сторож: спроси
+# тест про одно окно, а сторож проверь другое — и фитиль вернулся бы молча.
+WINDOW_HOURS = 240
+HOURS = str(WINDOW_HOURS)
+# Сколько часов занимают сами ряды (шесть штук по часу) — запас сторожу.
+SPAN = timedelta(hours=6)
+
+
+def _base():
+    if not _ANCHOR:
+        # Минута 33 — из боевого случая 06.10 (сверка идёт в 33-ю минуту часа),
+        # и она же делает вывод похожим на настоящий.
+        _ANCHOR.append((now_utc() - ANCHOR_AGE).replace(
+            minute=33, second=0, microsecond=0))
+    return _ANCHOR[0]
 
 
 def _log(uid, hour, ours, flight, actual):
     expected = ours + flight
     return ReconciliationLog(
-        uid_1c=uid, checked_at=BASE + timedelta(hours=hour),
+        uid_1c=uid, checked_at=_base() + timedelta(hours=hour),
         python_stock=ours, in_flight=flight, expected_1c=expected,
         actual_1c=actual, delta=actual - expected,
         classification=ReconciliationClassification.normal)
+
+
+def test_the_fixture_never_ages_out_of_the_window():
+    """Сторож против зашитой даты — и он тут не теоретический.
+
+    Зашитая дата опасна ровно тем, что не ломается в день правки:
+    `datetime(2026, 10, 5, 6, 33)` с окном 240 часов прожила ДЕСЯТЬ СУТОК и
+    покраснела сама собой — два самых старых ряда вышли за окно, «строк сверки:
+    6» стало «4». Нашлось это не здесь: накат гоняет `pytest` ПЕРЕД
+    перезапуском служб, и на боевом сервере он встал на красных тестах, уже
+    после копии базы, — то есть дата остановила накат через десять суток после
+    того, как её написали.
+
+    Проверяем САМО свойство: самый старый ряд фикстуры попадает в то окно, о
+    котором тесты спрашивают скрипт, с запасом на длину ряда.
+    """
+    age = now_utc() - _base()
+    assert age + SPAN < timedelta(hours=WINDOW_HOURS), (
+        f"самый старый ряд фикстуры старше окна: ему {age}, окно "
+        f"{WINDOW_HOURS} ч — значит часть рядов скрипт не покажет, а тесты "
+        f"начнут падать сами собой в день, который никто не назначал")
+    assert age > timedelta(0), "ряды обязаны быть в прошлом, как на бою"
 
 
 @pytest.fixture()
@@ -81,7 +138,7 @@ def base(tmp_path):
         s.add(_log("u-50", i, ours, flight, 15))
     s.add(FtpTask(command="CREATE_MOVEMENT", barcode="200222", quantity=3,
                   status=FtpTaskStatus.timeout, order_id="TEST-1",
-                  created_at=BASE, is_test=False))
+                  created_at=_base(), is_test=False))
 
     s.commit()
     s.close()
@@ -101,7 +158,7 @@ def _run(url, *args):
 
 def test_a_swinging_platform_number_is_named(base):
     """1С отдаёт разное — значит мэппинг, и сказать надо именно это."""
-    out = _run(base, "2617", "52", "--hours", "240")
+    out = _run(base, "2617", "52", "--hours", HOURS)
 
     assert "КАЧАЕТСЯ ОСТАТОК 1С: 11 <-> 15" in out, out
     assert "МАКСИМУМ" in out, "следствие обязано быть названо\n" + out
@@ -111,7 +168,7 @@ def test_a_swinging_platform_number_is_named(base):
 
 def test_a_swinging_in_flight_is_named_separately(base):
     """А тут наоборот: 1С стабильна, качаются НАШИ задания."""
-    out = _run(base, "2617", "50", "--hours", "240")
+    out = _run(base, "2617", "50", "--hours", HOURS)
 
     assert "КАЧАЕТСЯ «В ПУТИ»: 0 <-> 3" in out, out
     assert "КАЧАЕТСЯ ОСТАТОК 1С" not in out, (
@@ -125,11 +182,14 @@ def test_the_slagaemye_are_printed_not_just_the_result(base):
     Без столбцов «наш», «в пути», «1С дала» вывод повторял бы страницу и не
     отвечал бы на вопрос, ради которого его запускают.
     """
-    out = _run(base, "2617", "52", "--hours", "240")
+    out = _run(base, "2617", "52", "--hours", HOURS)
 
     for column in ("наш", "в пути", "ждали", "1С дала", "разница"):
         assert column in out, f"нет колонки «{column}»\n{out}"
-    assert "05.10 06:33:00" in out, "строки сверки по часам обязаны быть\n" + out
+    # Время строим ИЗ ТОГО ЖЕ якоря, которым набиты ряды: литерал здесь — это
+    # второй хозяин одной даты, и однажды он разошёлся бы с первым.
+    assert _base().strftime("%d.%m %H:%M:%S") in out, (
+        "строки сверки по часам обязаны быть\n" + out)
 
 
 def test_the_row_with_a_foreign_barcode_stands_out(base):
@@ -139,7 +199,7 @@ def test_the_row_with_a_foreign_barcode_stands_out(base):
     их один, видно лишь в таблице ряда — и это ровно тот перекос, из-за
     которого максимум привозит чужой остаток.
     """
-    out = _run(base, "2617", "--hours", "240")
+    out = _run(base, "2617", "--hours", HOURS)
 
     assert "РЯД ЦЕЛИКОМ" in out, out
     assert "баркодов 2" in out and "баркодов 1" in out, out
@@ -163,7 +223,7 @@ def test_a_quiet_product_is_not_called_swinging(base):
     s.close()
     engine.dispose()
 
-    out = _run(base, "СПОКОЙНЫЙ", "--hours", "240")
+    out = _run(base, "СПОКОЙНЫЙ", "--hours", HOURS)
 
     assert "КАЧАЕТСЯ" not in out, out
     assert "строк сверки: 6" in out, out
@@ -237,7 +297,7 @@ def test_ordinary_stock_movement_is_not_a_swing(base):
     s.close()
     engine.dispose()
 
-    out = _run(base, "ПРОДАЖИ", "--hours", "240")
+    out = _run(base, "ПРОДАЖИ", "--hours", HOURS)
 
     assert "КАЧАЕТСЯ" not in out, (
         "монотонная распродажа объявлена качанием\n" + out)
@@ -260,7 +320,7 @@ def test_a_one_time_step_is_not_a_swing(base):
     s.close()
     engine.dispose()
 
-    out = _run(base, "ПОСТАВКА", "--hours", "240")
+    out = _run(base, "ПОСТАВКА", "--hours", HOURS)
 
     assert "КАЧАЕТСЯ" not in out, "разовая ступенька объявлена качанием\n" + out
 
@@ -288,7 +348,7 @@ def test_a_one_sided_gap_is_not_a_swing(base):
     s.close()
     engine.dispose()
 
-    out = _run(base, "ПЕРЕКОС", "--hours", "240")
+    out = _run(base, "ПЕРЕКОС", "--hours", HOURS)
 
     assert "КАЧАЕТСЯ" not in out, (
         "односторонний перекос объявлен качанием\n" + out)
