@@ -17,7 +17,8 @@ from datetime import timedelta
 
 from app.models import (AnomalyReason, AnomalyStatus, AuditLog, DispatchQueueItem,
                         DispatchStatus, FtpTask, FtpTaskStatus, Platform,
-                        ReconciliationClassification, ReconciliationLog, SyncAnomaly)
+                        ReconciliationClassification, ReconciliationLog,
+                        StockDeltaDocument, SyncAnomaly)
 from app.retention import apply_retention
 from app.timeutils import now_utc
 from tests.factories import make_account
@@ -44,6 +45,31 @@ def _task(db, days: int, status=FtpTaskStatus.done):
 
 
 # ----------------------------------------------------------- старое уходит
+
+def test_old_applied_deltas_are_removed(db):
+    """Единственная таблица, у которой срока хранения не было вовсе.
+
+    Строка на каждый документ 1С, изменивший остаток ЦС: розница, перемещения,
+    списания, поставки — сотни и тысячи в сутки. Смысл строки при этом живёт
+    часы: она нужна, чтобы узнать повторно приехавший файл."""
+    db.add(StockDeltaDocument(document_id="ЦБ000000001", source="retail",
+                              applied_at=_old(60), lines=3))
+    db.commit()
+
+    assert apply_retention(db)["stock_delta_documents"] == 1
+    assert db.query(StockDeltaDocument).count() == 0
+
+
+def test_a_fresh_applied_delta_stays(db):
+    """Повторно приехавший файл обязан узнаваться: 1С кладёт дельту заново при
+    переотправке, повторном проведении и ручном перезапуске обработки, а
+    применить тот же документ второй раз значит списать остаток дважды."""
+    db.add(StockDeltaDocument(document_id="ЦБ000000002", source="retail",
+                              applied_at=_old(1), lines=3))
+    db.commit()
+
+    apply_retention(db)
+    assert db.query(StockDeltaDocument).count() == 1
 
 def test_old_reconciliation_rows_are_removed(db):
     _recon(db, 200)
@@ -195,7 +221,8 @@ def test_every_table_is_reported(db):
 
     assert set(stats) == {"reconciliation_log", "dispatch_queue", "audit_log",
                           "ftp_tasks", "sync_anomalies", "test_log",
-                          "stock_discrepancy_log", "exchange_archive",
+                          "stock_discrepancy_log", "stock_delta_documents",
+                          "exchange_archive",
                           "return_items", "return_item_log", "return_batch"}
 
 
