@@ -2960,7 +2960,8 @@ def start_campaign(token, i, state):
             (state.get(k) or {}).pop(str(i["advert_id"]), None)
         pend.pop(str(i["advert_id"]), None)
         save_state(state)
-        log(f"  ⏹ «{i['name']}»: в стоп-листе {HOLD_FILE.name} — не запускаю (уберите номер из файла, чтобы запускать снова).")
+        log(f"  ⏹ «{i['name']}»: в стоп-листе {HOLD_FILE.name} — не запускаю (вернуть: убрать номер из файла и запустить "
+            "кампанию в кабинете WB).")
         return False
     pace(token, "start", 1.1)
     try:
