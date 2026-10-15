@@ -5,7 +5,9 @@ import math
 import random
 from collections import defaultdict
 
+import os
 NOW = [_dt.datetime(2026, 10, 15, 6, 0)]
+CPM_BOOST = float(os.environ.get("CPM_BOOST", "1"))   # во сколько раз быстрее тратят кампании за показы (15.10: 1 000 ₽ за час)
 
 # час суток → доля дневного спроса (вечерний пик, как у WB одежды)
 PROF = [0.6, 0.4, 0.3, 0.2, 0.2, 0.3, 0.6, 1.2, 2.0, 2.6, 3.0, 3.2, 3.4, 3.4, 3.5, 3.6, 3.8, 4.2, 4.8, 5.4, 5.8, 5.6, 4.2, 2.2]
@@ -51,6 +53,7 @@ class World:
         self.deposits = []    # (datetime, cab, cid, sum)
         self.events = []      # (datetime, что) — пауза/запуск/пополнение/ошибки
         self.spent_day = defaultdict(float)                         # (date, cid) → ₽
+        self.hour_spend = defaultdict(float)                        # (date, cid, час) → ₽
         self.rec = {}         # (cid, nm) → множитель рекомендации
         self.fault = {"read": 0.0, "deposit_unclear": 0.0, "deposit_fail": 0.0, "start_fail": 0.0}
         self.calls = defaultdict(int)
@@ -117,7 +120,7 @@ class World:
                 bid = c["bids"][nm]["search"]
                 rec = self.rec_value(cid, nm, "3-10")
                 pos = min(1.6, max(0.05, (bid / rec) ** 1.2)) if rec else 0.5
-                views = p["views"] * share * pos
+                views = p["views"] * share * pos * (CPM_BOOST if c["pay"] == "cpm" else 1)
                 qs = [q for q in self.queries if q not in c["minus"][nm]]
                 if not qs:
                     continue
@@ -133,6 +136,7 @@ class World:
                 orders = clicks * p["cr"]
                 c["budget"] -= spend
                 self.spent_day[(d, cid)] += spend
+                self.hour_spend[(d, cid, t.hour)] += spend
                 row = self.daily[(d, cid, nm)]
                 for kk, v in (("views", views), ("clicks", clicks), ("sum", spend), ("orders", orders), ("atbs", clicks * 0.15),
                               ("sum_price", orders * p["price"]), ("shks", orders)):
