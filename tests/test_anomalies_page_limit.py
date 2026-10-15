@@ -151,15 +151,23 @@ def test_the_reason_order_survives_the_limit(
     assert "АРТ-свежийбаркод" not in page.text
 
 
-def test_the_export_limit_matches_the_import_limit():
+def test_every_round_trip_export_matches_the_import_limit():
     """Файл ездит ПО КРУГУ: выгрузил -> отметил -> залил обратно.
 
     Поставь выгрузке потолок выше импортного, и на отборе между двумя числами
     страница отдала бы файл, который сама же потом не примет, — причём отказ
-    пришёл бы уже после ручной правки нескольких тысяч строк."""
-    from app.excel_utils import MAX_IMPORT_ROWS
+    пришёл бы уже после ручной правки нескольких тысяч строк, не применив ни
+    одной.
 
-    assert R.EXPORT_LIMIT == MAX_IMPORT_ROWS
+    Проверяются ОБЕ страницы с таким кругом. «Мэппинг» жил с этим расхождением
+    (50 000 против 20 000) с самого начала, и признать дефектом одну страницу,
+    оставив близнеца, — ровно то расхождение двух хозяев одного правила, из-за
+    которого в этом проекте уже не раз выигрывала ветка без теста."""
+    from app.excel_utils import MAX_IMPORT_ROWS
+    from app.routers import mapping
+
+    assert R.EXPORT_LIMIT == MAX_IMPORT_ROWS, "«Аномалии»"
+    assert mapping.EXPORT_LIMIT == MAX_IMPORT_ROWS, "«Мэппинг»"
 
 
 def test_the_export_takes_the_whole_selection_not_the_page(

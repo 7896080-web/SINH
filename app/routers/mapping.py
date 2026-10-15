@@ -8,7 +8,7 @@ from app.database import get_db
 from app.templating import templates as shared_templates
 from app.dependencies import get_current_user
 from app.models import Barcode, Product, MappingConflict, Platform, PlatformAccount, PlatformCatalogItem, User
-from app.excel_utils import build_xlsx_response, read_xlsx_rows, read_upload, format_dt, ExcelReadError
+from app.excel_utils import build_xlsx_response, read_xlsx_rows, read_upload, format_dt, ExcelReadError, MAX_IMPORT_ROWS
 from app.flash import set_flash, pop_flash
 from app.audit import log_action
 from app.workers.client_factory import build_client
@@ -26,9 +26,14 @@ templates = shared_templates
 # как «баркода нет в системе».
 PAGE_LIMIT = 300
 # Сколько уходит в выгрузку. Файл правят руками и загружают обратно, поэтому он
-# обязан содержать то, что оператор отобрал, а не первый экран. Потолок —
-# защита от попытки собрать весь справочник одним файлом.
-EXPORT_LIMIT = 50000
+# обязан содержать то, что оператор отобрал, а не первый экран.
+#
+# Предел тот же, что у ИМПОРТА, и взят ИМЕНЕМ, а не числом: файл тут ездит по
+# кругу. Пока здесь стояло 50 000, а импорт отказывал на 20 000, отбор между
+# двумя числами давал файл, который эта же страница потом не примет, — и отказ
+# приходил уже ПОСЛЕ ручной разметки тысяч строк, не применив ни одной. Текст
+# на странице печатает ту же переменную, поэтому он честен сам собой.
+EXPORT_LIMIT = MAX_IMPORT_ROWS
 
 
 def _mapped_query(db: Session, q: str, source_platform: str):

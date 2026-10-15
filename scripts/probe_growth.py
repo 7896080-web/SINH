@@ -36,6 +36,7 @@ from datetime import timedelta                                # noqa: E402
 from pathlib import Path                                      # noqa: E402
 
 from sqlalchemy import func                                   # noqa: E402
+from sqlalchemy.exc import OperationalError                   # noqa: E402
 
 from app import retention                                     # noqa: E402
 from app.backup import backup_dir, database_path              # noqa: E402
@@ -85,11 +86,33 @@ def _table(db, name: str):
     return None
 
 
+class TableMissing(Exception):
+    """Таблицы нет В БАЗЕ (а не в моделях) — см. `_count`."""
+
+
 def _count(db, model, condition=None) -> int:
-    query = db.query(func.count(model.id))
-    if condition is not None:
-        query = query.filter(condition)
-    return query.scalar() or 0
+    """Сколько строк. Нет таблицы в базе — НАЗВАННЫЙ отказ, а не трассировка.
+
+    Случай не выдуманный и ровно для этого скрипта: его запускают, когда что-то
+    уже не так, а база под ним бывает копией старше схемы или базой, на которую
+    не накатилась миграция. Сырая `OperationalError` из середины отчёта уносит
+    весь остаток — и главное число («самый быстрый приход»), и размеры, и
+    оговорку самого задания, — а читается как поломка скрипта: проверку
+    отложат вовсе. То же правило, по которому `check_1c_module.py` называет
+    выход, когда ему подсунули `.epf`.
+
+    Сессию после этого чиним откатом: без него SQLAlchemy не даст сделать ни
+    одного следующего запроса, и отчёт всё равно оборвался бы — только уже без
+    объяснения.
+    """
+    try:
+        query = db.query(func.count(model.id))
+        if condition is not None:
+            query = query.filter(condition)
+        return query.scalar() or 0
+    except OperationalError as e:
+        db.rollback()
+        raise TableMissing(str(e).split("\n")[0]) from e
 
 
 def _timed(db) -> None:
@@ -107,9 +130,15 @@ def _timed(db) -> None:
             print("  %-26s  ТАБЛИЦЫ НЕТ -- скрипт отстал от схемы" % human)
             continue
         stamp = getattr(model, column)
-        total = _count(db, model)
-        fresh = _count(db, model, stamp >= day)
-        stale = _count(db, model, stamp < now_utc() - keep)
+        try:
+            total = _count(db, model)
+            fresh = _count(db, model, stamp >= day)
+            stale = _count(db, model, stamp < now_utc() - keep)
+        except TableMissing as e:
+            # Называем и идём дальше: остаток отчёта нужнее одной строки.
+            print("  %-26s  ТАБЛИЦЫ НЕТ В БАЗЕ -- база не на head? копия "
+                  "старше схемы? (%s)" % (human, e))
+            continue
         worst = max(worst, fresh)
         print("  %-26s %10d %10d %10d  %d сут."
               % (human, total, fresh, stale, keep.days))
@@ -169,11 +198,14 @@ def _untimed(db) -> None:
             continue
         try:
             rows.append((_count(db, model), name))
-        except Exception:                            # noqa: BLE001
-            continue                                 # таблицы может не быть
+        except TableMissing:
+            # Той же причины, что и выше, и тем же ИМЕНЕМ: прежний `except
+            # Exception` глушил бы заодно и настоящие ошибки.
+            rows.append((-1, name))
     for count, name in sorted(rows, reverse=True)[:12]:
         note = CLEANED_OTHERWISE.get(name)
-        print("  %-30s %10d%s" % (name, count, "   (%s)" % note if note else ""))
+        shown = "ТАБЛИЦЫ НЕТ" if count < 0 else "%10d" % count
+        print("  %-30s %10s%s" % (name, shown, "   (%s)" % note if note else ""))
 
 
 def _anomalies(db) -> None:
