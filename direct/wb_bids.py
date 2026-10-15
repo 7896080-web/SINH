@@ -290,6 +290,9 @@ RULES_BASE = json.loads(json.dumps(RULES))     # RULES без поднятых w
 BUDGET_OV = apply_budget_overrides(RULES)
 TOKENS_FILE = HERE / "wb_tokens.txt"
 BACKUP_DIR = HERE / "wb_bids_backups"
+BACKUP_KEEP_DAYS = 45   # резервные копии старше — удаляются (откат берёт последнюю, уборка товаров смотрит 30 дн.);
+                        # без этого автопилот и страж копили бы ~20 файлов в сутки без конца
+TOKEN_WARN_DAYS = 14    # за сколько дней до окончания токена WB предупреждать (в журнале и на дашборде)
 STATE_FILE = HERE / "wb_bids_state.json"
 LOG_FILE = HERE / "wb_bids_log.txt"
 CPC_LEVEL = {"1-2": "range1To2", "3-10": "range3To10", "11-34": "range11To34"}
@@ -657,6 +660,38 @@ def load_state():
         except (OSError, ValueError):
             sys.exit(f"✗ Файл состояния {STATE_FILE.name} испорчен, а предыдущей версии нет (копия: {bad.name}). "
                      "Ничего не меняю: без учёта пополнений автопилот мог бы потратить недельные потолки заново.")
+
+
+def prune_backups(folder, prefix):
+    """Удалить резервные копии старше BACKUP_KEEP_DAYS (имя: prefix_ГГГГММДД_ЧЧММСС.json или .rolled_back)."""
+    edge = (dt.date.today() - dt.timedelta(days=BACKUP_KEEP_DAYS)).strftime("%Y%m%d")
+    try:
+        for f in folder.glob(prefix + "_*"):
+            stamp = f.name[len(prefix) + 1:len(prefix) + 9]
+            if stamp.isdigit() and stamp < edge:
+                f.unlink()
+    except OSError:
+        pass
+
+
+def token_expires(token):
+    """Когда кончается токен WB (поле exp внутри самого токена) или None. Сам токен никуда не выводится."""
+    try:
+        import base64
+        part = token.split(".")[1]
+        part += "=" * (-len(part) % 4)
+        exp = json.loads(base64.urlsafe_b64decode(part)).get("exp")
+        return dt.datetime.fromtimestamp(int(exp)) if exp else None
+    except Exception:          # noqa: BLE001 — не токен в формате JWT: просто не предупреждаем
+        return None
+
+
+def token_warning(cab, token):
+    e = token_expires(token)
+    if e and (e - dt.datetime.now()).days < TOKEN_WARN_DAYS:
+        return (f"! Токен кабинета «{cab}» действует до {e:%d.%m.%Y} — перевыпустите заранее (кабинет WB → Настройки → "
+                "Доступ к API, тот же набор категорий) и замените в wb_tokens.txt, иначе автопилот остановится.")
+    return None
 
 
 def lock_info():
@@ -2306,7 +2341,7 @@ def plan_cabinet(cab, token, rules, state):
                         f"сегодня пополнено на {fm_rub(today_)} "
                         f"из {r['topup_day_cap']} ₽, за 7 дней на {fm_rub(week)} из {r['topup_week_cap']} ₽"
                         + (f", недельный бюджет кабинета: осталось {max(cab_left[0], 0):.0f} из {cab_cap} ₽" if cab_cap else "")
-                        + " — не пополняю.")
+                        + free_note(state, cid, r["topup_week_cap"], week, min_dep) + " — не пополняю.")
                 else:
                     start = can_start and a.get("_status") in (4, 11)
                     log(f"    Бюджет: {fm_rub(bud)} ₽ < {r['topup_below']} ₽ → пополнить на {amount} ₽ из «{SOURCE_RU[r['topup_source']]}» "
@@ -2570,6 +2605,30 @@ def paced(nb, m, mn, step, cur=None, prev_m=1.0):
     return res
 
 
+def week_free_date(state, cid, week_cap, min_dep=MIN_DEPOSIT):
+    """Когда скользящая неделя освободит под пополнение не меньше min_dep (по уже сделанным пополнениям кампании)."""
+    today = dt.date.today()
+    deps = []
+    for t in (state.get("topups") or {}).get(str(cid), []):
+        try:
+            deps.append((dt.date.fromisoformat(t["date"]), t["sum"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    for k in range(0, 8):
+        d = today + dt.timedelta(days=k)
+        if week_cap - sum(s for x, s in deps if 0 <= (d - x).days < 7) >= min_dep:
+            return d
+    return None
+
+
+def free_note(state, cid, week_cap, week, min_dep):
+    """«; по недельному потолку — с ДД.ММ» — если мешает именно недельный потолок кампании."""
+    if week_cap - week >= min_dep:
+        return ""
+    d = week_free_date(state, cid, week_cap, min_dep)
+    return f"; по недельному потолку кампании можно будет с {d:%d.%m}" if d else ""
+
+
 def topped_week(state, cid, days=7):
     since = (dt.date.today() - dt.timedelta(days=days - 1)).isoformat()
     return sum(t["sum"] for t in state.get("topups", {}).get(str(cid), []) if t["date"] >= since)
@@ -2745,6 +2804,13 @@ def start_campaign(token, i, state):
     return True
 
 
+def no_money(e):
+    """Ответ WB «на балансе не хватает денег» (точный текст WB не задокументирован — смотрим по словам)."""
+    t = str(e).lower()
+    return isinstance(e, ApiError) and e.status in (400, 402, 403, 422) and any(
+        w in t for w in ("недостат", "не хватает", "insufficient", "not enough", "баланс", "balance"))
+
+
 def apply_topups(token, items, state):
     """Пополнить бюджеты. Деньги не возвращаются — отката нет.
       • Перед пополнением бюджет перечитывается: прочитанный при планировании мог устареть на 20–50 мин.
@@ -2754,6 +2820,7 @@ def apply_topups(token, items, state):
       • amount = 0 — кампанию пополнили раньше, а запуск не прошёл: только запустить."""
     ok = 0
     tops = state.setdefault("topups", {})
+    broke = set()                       # источники, на которых в этом запуске WB ответил «не хватает денег»
 
     def drop(cid, rec):
         lst = tops.get(str(cid), [])
@@ -2768,6 +2835,8 @@ def apply_topups(token, items, state):
             if i.get("start"):
                 start_campaign(token, i, state)
             continue
+        if i["source"] in broke:
+            continue                    # денег на этом балансе нет — остальные кампании кабинета не дёргаю
         fresh = get_budgets(token, [cid]).get(cid)
         if fresh is not None and i.get("enough") is not None and fresh >= i["enough"]:
             log(f"  «{i['name']}»: в бюджете уже {fm_rub(fresh)} ₽ (было {fm_rub(i.get('budget_before') or 0)} ₽ при расчёте) — "
@@ -2786,6 +2855,15 @@ def apply_topups(token, items, state):
             if e.status != UNCLEAR and not (isinstance(e.status, int) and e.status >= 500):
                 drop(cid, rec)
                 log(f"  ✗ «{i['name']}»: пополнение не прошло — {e}")
+                if no_money(e):
+                    broke.add(i["source"])
+                    rest = [x for x in items if x is not i and x["amount"] and x["source"] == i["source"]
+                            and items.index(x) > items.index(i)]
+                    log(f"  ✗✗ {i['cabinet']}: на «{SOURCE_RU.get(i['source'], i['source'])}» не хватает денег — пополните "
+                        f"баланс в кабинете WB. Пополнения кабинета в этом запуске остановлены"
+                        + (f" (ждут пополнения ещё кампаний: {len(rest)})" if rest else "") + "; попробую в следующий час.")
+                    state.setdefault("no_money", {})[i["cabinet"]] = dt.datetime.now().isoformat(timespec="minutes")
+                    save_state(state)
                 continue
             # ответ потерялся — повторять нельзя (деньги ушли бы дважды); проверяем бюджет
             time.sleep(5)
@@ -2809,6 +2887,7 @@ def apply_topups(token, items, state):
                 continue
         rec.pop("pending", None)
         ok += 1
+        (state.get("no_money") or {}).pop(i["cabinet"], None)       # деньги на балансе снова есть
         save_state(state)
         total = res.get("total") if isinstance(res, dict) else None
         log(f"  ✓ «{i['name']}»: +{i['amount']} ₽" + (f", бюджет теперь {fm_rub(num(total))} ₽" if total is not None else ""))
@@ -2951,6 +3030,10 @@ def main():
     apply = "--apply" in sys.argv
     log(f"{dt.datetime.now():%d.%m.%Y %H:%M} — {'ПРИМЕНЕНИЕ' if apply else 'пробный прогон, ничего не меняется'}")
     busy_mark("wb_bids.py")             # сборщик рекомендаций пока ждёт: лимит WB общий
+    for cab_, tok_ in cabs.items():
+        w_ = token_warning(cab_, tok_)
+        if w_:
+            log(w_)
     UNIT_LIMITS.update(load_unit_limits())
     if UNIT_LIMITS:
         log(f"Юнит-экономика: лимиты цены заказа для {len(UNIT_LIMITS)} товаров (wb_unit_economics.csv).")
@@ -3009,6 +3092,7 @@ def main():
         path = BACKUP_DIR / f"bids_{dt.datetime.now():%Y%m%d_%H%M%S}.json"
         path.write_text(json.dumps(plan, ensure_ascii=False, indent=1), encoding="utf-8")
         log(f"Резервная копия: {path.name}")
+        prune_backups(BACKUP_DIR, "bids")
         record_day_base(state, plan)
         run_apply(cabs, plan, "new", state)
         log("Откат: python wb_bids.py --rollback")

@@ -17,8 +17,8 @@
   3. Размеры (параллельно — у WB это другой лимит): товары с заказами за 30 дней, раз в SIZES_EVERY_H часа
      (WB обновляет их раз в 2 часа).
   4. Пока автопилот или проверка спрашивают WB сами (файл wb_api.busy), сборщик ждёт — лимит у них общий.
-  5. История рекомендаций (места 1–2, 3–10, 11–34) — таблица rec_hist: строка, когда рекомендация изменилась;
-     хранится HIST_KEEP_DAYS дней.
+  5. История рекомендаций (места 1–2, 3–10, 11–34) — таблица rec_hist: строка, когда рекомендация изменилась, но не
+     чаще раза в час на товар; хранится HIST_KEEP_DAYS дней.
 
 Запуск:  python wb_collector.py            (один проход)
          python wb_collector.py --status   (что в базе: свежесть по кабинетам и сверка с автопилотом)
@@ -40,6 +40,7 @@ RUN_MIN = 13              # один проход — не дольше (зап�
 REC_FRESH_MIN = 12        # рекомендацию моложе — не переспрашиваю
 SIZES_EVERY_H = 2         # размеры обновляю не чаще (WB сам обновляет их раз в 2 часа)
 HIST_KEEP_DAYS = 60       # сколько дней хранить историю рекомендаций
+HIST_EVERY_MIN = 55       # в историю — не чаще раза в час на товар (иначе ~13 тыс. строк в сутки, ~50 МБ за 60 дней)
 FRESH_SHOW_MIN = 30       # в отчёте «свежая» рекомендация — моложе стольких минут
 BUSY_MAX_AGE_MIN = 70     # отметка «спрашиваю WB» старше — процесс, видимо, упал: не жду
 # -------------------------------------------
@@ -63,13 +64,13 @@ class Db:
         at = dt.datetime.now().isoformat(timespec="seconds")
         lv = B.rec_levels(data, pay)
         with self.lock:
-            prev = self.con.execute("SELECT r12, r310, r1134 FROM rec_hist WHERE advert_id=? AND nm=? ORDER BY at DESC "
+            prev = self.con.execute("SELECT r12, r310, r1134, at FROM rec_hist WHERE advert_id=? AND nm=? ORDER BY at DESC "
                                     "LIMIT 1", (aid, nm)).fetchone()
             self.con.execute("INSERT INTO rec (advert_id, nm, cab, pay, at, data) VALUES (?, ?, ?, ?, ?, ?) "
                              "ON CONFLICT (advert_id, nm) DO UPDATE SET cab=excluded.cab, pay=excluded.pay, "
                              "at=excluded.at, data=excluded.data",
                              (aid, nm, cab, pay, at, json.dumps(data, ensure_ascii=False)))
-            if prev is None or tuple(prev) != lv:     # история — только изменения (иначе ~12 тыс. одинаковых строк в сутки)
+            if prev is None or (tuple(prev[:3]) != lv and (B.age_min(prev[3]) or 0) >= HIST_EVERY_MIN):   # изменения, раз в час
                 self.con.execute("INSERT INTO rec_hist (at, cab, advert_id, nm, pay, r12, r310, r1134) "
                                  "VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (at, cab, aid, nm, pay, *lv))
             self.con.commit()
@@ -98,6 +99,12 @@ class Db:
             self.con.execute("DELETE FROM rec WHERE at < ?", (old,))      # товары, которых в кампаниях больше нет
             self.con.execute("DELETE FROM sizes WHERE at < ?", (old,))
             self.con.commit()
+
+
+def age(at):
+    """Минут с момента at; записи нет — бесконечно много (0 — «только что», а не «нет записи»)."""
+    a = B.age_min(at)
+    return float("inf") if a is None else a
 
 
 def busy_other():
@@ -191,11 +198,11 @@ def collect_cabinet(cab, token, db, deadline):
                 pairs.append((cid, nm, pay, a.get("_status")))
     # сначала то, чего нет или что старше всех; при равенстве — активные кампании
     pairs.sort(key=lambda p: (have.get((p[0], p[1])) or "", 0 if p[3] == 9 else 1))
-    todo = [p for p in pairs if (B.age_min(have.get((p[0], p[1]))) or 10 ** 9) >= REC_FRESH_MIN]
+    todo = [p for p in pairs if age(have.get((p[0], p[1]))) >= REC_FRESH_MIN]
 
     size_have = {nm: at for nm, at in db.q("SELECT nm, at FROM sizes WHERE cab=?", (cab,))}
     size_nms = [nm for nm in nms if not no_stock(nm) and ((stock.get(nm) or {}).get("orders") or 0) >= B.SIZE_MIN_ORDERS]
-    size_todo = sorted((nm for nm in size_nms if (B.age_min(size_have.get(nm)) or 10 ** 9) >= SIZES_EVERY_H * 60),
+    size_todo = sorted((nm for nm in size_nms if age(size_have.get(nm)) >= SIZES_EVERY_H * 60),
                        key=lambda nm: size_have.get(nm) or "")
 
     st = {"rec_ok": 0, "rec_err": 0, "size_ok": 0, "size_err": 0, "waited": [0.0], "err": ""}
@@ -245,8 +252,10 @@ def collect_cabinet(cab, token, db, deadline):
         while t.is_alive():
             t.join(1)
     now_have = {(aid, nm): at for aid, nm, at in db.q("SELECT advert_id, nm, at FROM rec WHERE cab=?", (cab,))}
-    fresh = sum(1 for p in pairs if (B.age_min(now_have.get((p[0], p[1]))) or 10 ** 9) < FRESH_SHOW_MIN)
+    fresh = sum(1 for p in pairs if age(now_have.get((p[0], p[1]))) < FRESH_SHOW_MIN)
+    exp = B.token_expires(token)
     info = {"pairs": len(pairs), "fresh": fresh, "rec_ok": st["rec_ok"], "rec_err": st["rec_err"],
+            "token_exp": exp.isoformat(timespec="minutes") if exp else None,
             "sizes_total": len(size_nms), "size_ok": st["size_ok"], "size_err": st["size_err"],
             "waited_min": round(st["waited"][0] / 60, 1), "err": st["err"][:200]}
     db.save_run(cab, started, info)
