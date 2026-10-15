@@ -1139,7 +1139,7 @@ def write_rec_log():
 #   "use"   — берут из базы рекомендации моложе REC_CACHE_MIN мин и размеры моложе SIZE_CACHE_HOURS ч; WB — только
 #             недостающее. Сборщик остановился — данные стареют, и скрипты сами спрашивают WB, как раньше;
 #   "off"   — базу не читают.
-COLLECTOR_MODE = "check"
+COLLECTOR_MODE = "use"           # 15.10.2026: сверка за утро — 356 из 356 совпали; было "check"
 COLLECTOR_DB = HERE / "wb_rec.db"
 CHECK_FILE = HERE / "wb_rec_check.csv"
 CHECK_MAX_AGE_MIN = 60          # сверять с записью сборщика не старше (рекомендации WB меняются в течение дня)

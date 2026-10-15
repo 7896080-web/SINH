@@ -16,7 +16,7 @@
 
 Запуск:  pythonw wb_run.py wb_bids.py --apply --timeout 55
          pythonw wb_run.py wb_positions.py --timeout 110
-Вывод скрипта дописывается в wb_sched_out.txt.
+Вывод скрипта дописывается в wb_sched_out.txt (сборщика wb_collector.py — в wb_collector_out.txt).
 """
 import datetime as dt
 import json
@@ -27,7 +27,9 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 OUT = HERE / "wb_sched_out.txt"
-LOGS = ["wb_sched_out.txt", "wb_bids_log.txt", "wb_guard_log.txt"]
+OUT_COLLECTOR = HERE / "wb_collector_out.txt"     # сборщик идёт каждые 15 мин параллельно с проверкой — свой файл,
+                                                  # чтобы строки двух процессов не перемешивались в wb_sched_out.txt
+LOGS = ["wb_sched_out.txt", "wb_collector_out.txt", "wb_bids_log.txt", "wb_guard_log.txt"]
 MAX_LOG_MB = 5
 LOCK_FILE = HERE / "wb_bids.running"
 BUDGET_FILE = HERE / "wb_budget_proposals.json"
@@ -110,7 +112,7 @@ def main():
         return
     rotate()
     start = dt.datetime.now()
-    with open(OUT, "a", encoding="utf-8") as f:
+    with open(OUT_COLLECTOR if args[0] == "wb_collector.py" else OUT, "a", encoding="utf-8") as f:
         run(args, timeout, f)
         # задаче в планировщике дан 1 час: пересчёт бюджета — только если после него ещё успеет дашборд
         early = (dt.datetime.now() - start).total_seconds() / 60 < 60 - BUDGET_TIMEOUT_MIN - 8
