@@ -38,6 +38,11 @@ BUDGET_FILE = HERE / "wb_budget_proposals.json"
 BUDGET_EVERY_H = 20      # предложения по бюджету пересчитываются не чаще (обычно — после автопилота в 8:00)
 BUDGET_TIMEOUT_MIN = 15
 NO_WINDOW = 0x08000000 if os.name == "nt" else 0      # CREATE_NO_WINDOW: дочерний python без окна
+# Время в скриптах — московское при любом поясе компьютера: у сервера пояс FLE (Киев), с 25.10 его часы на час позади
+# Москвы, а ночная пауза, график спроса по часам и границы суток считаются по Москве. TZ задаёт C-библиотеке Windows
+# (а через неё Python) смещение UTC+3 без перехода на летнее время. Само расписание задано в UTC (wb_schedule.ps1 -Server).
+SCRIPT_TZ = "MSK-3"
+MSK = dt.timezone(dt.timedelta(hours=3))
 
 
 def python_exe():
@@ -62,7 +67,7 @@ def rotate():
 
 
 def note(f, text):
-    f.write(f"\n[{dt.datetime.now():%d.%m.%Y %H:%M:%S}] {text}\n")
+    f.write(f"\n[{dt.datetime.now(MSK):%d.%m.%Y %H:%M:%S}] {text}\n")
     f.flush()
 
 
@@ -80,6 +85,8 @@ def release_lock_of(pid):
 
 def run(args, timeout_min, f):
     env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    if os.name == "nt" and SCRIPT_TZ:
+        env["TZ"] = SCRIPT_TZ
     note(f, "▶ " + " ".join(args))
     p = subprocess.Popen([python_exe()] + args, cwd=str(HERE), stdout=f, stderr=subprocess.STDOUT, env=env,
                          creationflags=NO_WINDOW)
