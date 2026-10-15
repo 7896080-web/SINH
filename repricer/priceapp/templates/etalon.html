@@ -81,7 +81,9 @@
   <label>Артикул или название<input name="q" value="{{ q }}" placeholder="27643"></label>
   <label>Показать<select name="flt" onchange="this.form.submit()">
     <option value="">все</option><option value="diff" {% if flt == 'diff' %}selected{% endif %}>расходятся с эталоном</option>
-    <option value="noetalon" {% if flt == 'noetalon' %}selected{% endif %}>без эталона</option></select></label>
+    <option value="noetalon" {% if flt == 'noetalon' %}selected{% endif %}>без эталона</option>
+    <option value="skip" {% if flt == 'skip' %}selected{% endif %}>площадка не идёт за эталоном (пол, курс, комиссия)</option>
+    <option value="belowfloor" {% if flt == 'belowfloor' %}selected{% endif %}>эталон WB ниже пола</option></select></label>
   <button class="secondary">Найти</button>
 </form>
 

@@ -215,3 +215,22 @@ def test_orphan_markups_can_be_seen_and_deleted(client, db):
     r = client.post("/orphans/delete")
     assert "Удалено наценок без товаров: 1" in r.text
     assert db.query(ArticleCoef).count() == 0
+
+
+def test_retention_drops_only_old_finished_records(db):
+    from datetime import timedelta
+
+    from priceapp import retention
+    from priceapp.models import AuditLog
+    from priceapp.timeutils import now_utc
+    acc = F.account(db, "wb", "ИП 1")
+    old = now_utc() - timedelta(days=200)
+    for status in ("sent", "rejected", "approved", "error", "proposed", "blocked"):
+        db.add(PriceChange(item_id="s", account_id=acc.id, barcode="b", new_price=1, status=status, created_at=old))
+    db.add(PriceChange(item_id="s", account_id=acc.id, barcode="b", new_price=1, status="sent"))   # свежая
+    db.add(AuditLog(username="x", action="a", object="", details="", at=now_utc() - timedelta(days=400)))
+    db.add(AuditLog(username="x", action="b", object="", details=""))
+    db.commit()
+    st = retention.prune(db)
+    assert st == {"price_changes": 2, "audit": 1}
+    assert sorted(c.status for c in db.query(PriceChange)) == ["approved", "blocked", "error", "proposed", "sent"]

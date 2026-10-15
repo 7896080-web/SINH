@@ -292,3 +292,28 @@ def test_excel_import_refuses_a_tenfold_typo(client, db, monkeypatch):
     assert "больше 50%" in r.text and not log
     db.expire_all()
     assert db.query(ReferencePrice).one().ref_price == 10000
+
+
+def test_rate_move_sends_new_etalon_to_all_platforms_without_tolerance(db):
+    """Решение владельца 15.10: эталон следует за курсом и уходит на ВСЕ площадки — и при
+    выключенном автоследовании, и когда изменение меньше допуска 100 ₽."""
+    from priceapp import reference
+    w, kit, lam = _setup(db)
+    log = []
+    fac = lambda p, c: Fake(log)                                    # noqa: E731
+    etalon.set_etalon(db, "100", 5000, "оператор", client_factory=fac)   # всё приведено к эталону
+    log.clear()
+    ref = db.query(ReferencePrice).filter_by(account_id=w.id).one()
+    ref.usd_rub = Decimal("97")                                     # курс эталона 97, сейчас 100: +3,1%
+    from priceapp import accounts as acc_mod
+    for a in (w, kit, lam):
+        acc_mod.set_credential(db, a, "token", "t")
+    db.commit()
+    assert not etalon.auto_enabled(db)
+    st = reference.run(db, client_factory=fac)
+    assert st["revalued"] == 1
+    wb = next(x[2] for x in log if x[0] == "post" and "upload/task" in x[1])
+    assert wb["data"][0]["price"] == 10309                          # 10000 × 100 / 97
+    assert any(x[0] == "push" for x in log)                         # Kit
+    assert any(x[0] == "post" and "nomenclatures-prices" in x[1] for x in log)   # Ламода
+    assert set(st["followers"]) == {"КИТ", "Ламода"}

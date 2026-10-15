@@ -243,8 +243,9 @@ def follower_plan(db: Session, ets: dict[str, Etalon] | None = None, only: set |
         pct = shift(db, platform)
         if pct is None:
             continue
-        rule = get_rule(db, platform)
-        for a in db.query(Account).filter(Account.is_active.is_(True), Account.platform == platform):
+        accs = db.query(Account).filter(Account.is_active.is_(True), Account.platform == platform).all()
+        rule = get_rule(db, platform) if accs else None    # без кабинета правило площадки не заводим
+        for a in accs:
             cards: dict[str, FCard] = {}
             for item_id, rows in mapping.account_items(db, a.id).items():
                 art = article_of(articles, item_id)
@@ -514,21 +515,25 @@ def set_etalon(db: Session, art: str, sale: int, actor: str, client_factory=None
     return report
 
 
-def follow_all(db: Session, client_factory=None) -> dict:
+def follow_all(db: Session, client_factory=None, only: set | None = None, strict: bool = False,
+               force: bool = False) -> dict:
     """Автоследование (опрос WB): только разошедшееся с эталоном и не больше `follow_max_step`
-    за раз; крупнее — ждёт «Привести к эталону» на странице."""
-    st = {"enabled": auto_enabled(db), "sent": {}, "big": 0, "floor": 0}
+    за раз; крупнее — ждёт «Привести к эталону» на странице. `only` — только эти артикулы;
+    `strict` — без допуска (эталон пересчитан по курсу: изменение в 2–5% у недорогого товара
+    меньше допуска, и он за курсом не пошёл бы); `force` — и при выключенном автоследовании
+    (эталон по курсу уходит на все площадки всегда — решение владельца 15.10)."""
+    st = {"enabled": force or auto_enabled(db), "sent": {}, "big": 0, "floor": 0}
     if not st["enabled"]:
         return st
     lim = max_step(db)
     busy = {(a, i) for a, i in db.query(PriceChange.account_id, PriceChange.item_id).filter(
         PriceChange.is_test.is_(False), PriceChange.status == PriceChangeStatus.approved.value)}
     cards = []
-    for c in follower_plan(db):
+    for c in follower_plan(db, only=only):
         if c.skip:
             st["floor"] += 1
             continue
-        if c.follows:
+        if c.same if strict else c.follows:
             continue
         if any((c.account.id, i) in busy for i in c.item_ids):
             continue                      # подтверждённое человеком ещё в очереди — его решение главнее

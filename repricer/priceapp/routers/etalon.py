@@ -59,6 +59,8 @@ def _rows(db: Session, q: str, flt: str):
                 k["big"] += 1
     rows = []
     tol = etalon.tolerance(db)
+    from priceapp.reference import below_floor_articles
+    low = below_floor_articles(db) if flt == "belowfloor" else set()
     ql = q.strip().lower()
     for art in sorted(ets):
         et = ets[art]
@@ -72,6 +74,10 @@ def _rows(db: Session, q: str, flt: str):
         if flt == "diff" and not diff:
             continue
         if flt == "noetalon" and et.sale:
+            continue
+        if flt == "skip" and not any(c.skip for cs in fol.values() for c in cs):
+            continue
+        if flt == "belowfloor" and art not in low:
             continue
         rows.append({"et": et, "fol": fol, "diff": diff})
     return ets, rows, followers, counts
