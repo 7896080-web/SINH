@@ -171,7 +171,11 @@ def analyze(cab, token):
                 dst[k] += t[k]
     rb, ra = ratios(tb, nb), ratios(ta, na)
     log(f"До: {B1:%d.%m}–{B2:%d.%m} ({nb} дн.).  После: {A1:%d.%m}–{A2:%d.%m} ({na} дн.).")
-    on_b = len({d for aid in camps for d, v in st_b.get(aid, {}).items() if v["sum"] >= 1})
+    per_day = defaultdict(float)
+    for aid in camps:
+        for d, v in st_b.get(aid, {}).items():
+            per_day[d] += v["sum"]
+    on_b = sum(1 for x in per_day.values() if x >= MIN_SPEND)     # день с рекламой — от 100 ₽ по кабинету
     if on_b < nb:
         log(f"  В «до» реклама кабинета шла {on_b} дн. из {nb} — средние за день «до» занижены, сравнивайте кампании.")
     if na < 7:
