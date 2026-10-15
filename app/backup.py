@@ -807,8 +807,15 @@ def second_site_configured(db=None) -> bool:
 
 
 def make_backup(database_url: str | None = None,
-                directory: Path | None = None, db=None) -> BackupResult:
+                directory: Path | None = None, db=None,
+                offsite: bool = True) -> BackupResult:
     """Снять копию, проверить её и подчистить старые.
+
+    `offsite=False` — только локальная копия, без второй площадки. Нужно это
+    ровно одному вызывающему, накату: его копия отвечает на вопрос «чем
+    откатить миграцию через десять минут», то есть обязана лежать на диске и
+    появиться СРАЗУ. Вторая площадка отвечает на другой вопрос — «что если
+    откажет диск», — и у неё своё суточное расписание.
 
     Битая копия НЕ удаляется и остаётся на диске: она может пригодиться для
     разбора, а главное — её присутствие вместе с ошибкой в журнале честнее, чем
@@ -860,6 +867,9 @@ def make_backup(database_url: str | None = None,
                             path_kept=_set_aside(target))
 
     removed = prune(directory)
+    if not offsite:
+        return BackupResult(path=str(target), size_bytes=size, checked=True,
+                            removed=removed)
     # Зеркало — ПОСЛЕ проверки: в облако уезжает только копия, которую мы уже
     # прочитали и признали целой. Непроверенная копия на второй площадке — это
     # две надежды вместо одной.
