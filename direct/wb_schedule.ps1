@@ -61,6 +61,24 @@ function Make-Action($script, $extra = "--apply", $minutes = 55) {
     New-ScheduledTaskAction -Execute $pyw -Argument $arg -WorkingDirectory $dir
 }
 
+function Msk-Boundary($hm) {
+    # Время запуска — московское. На сервере пояс FLE (Киев): с 25.10 его часы на час позади Москвы, поэтому с -Server
+    # запуск задаётся в UTC (Москва = UTC+3 круглый год) — Планировщик держит его при любом поясе и переводе часов.
+    # Дата и время собираются из чисел, а не разбором строки «07:40»: так не зависит от языковых настроек Windows.
+    $h, $m = $hm.Split(":") | ForEach-Object { [int]$_ }
+    $d = (Get-Date).Date
+    $at = New-Object DateTime $d.Year, $d.Month, $d.Day, $h, $m, 0
+    $inv = [Globalization.CultureInfo]::InvariantCulture      # «:» в формате .NET — разделитель из языковых настроек
+    if ($Server) { return $at.AddHours(-3).ToString("yyyy-MM-dd'T'HH':'mm':'ss", $inv) + "Z" }
+    return $at.ToString("yyyy-MM-dd'T'HH':'mm':'ss", $inv)
+}
+
+function Daily-At($hm) {
+    $t = New-ScheduledTaskTrigger -Daily -At (Get-Date)
+    $t.StartBoundary = Msk-Boundary $hm
+    return $t
+}
+
 function Make-Settings($limit) {
     New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit $limit `
         -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
@@ -68,12 +86,12 @@ function Make-Settings($limit) {
 
 $set = Make-Settings (New-TimeSpan -Hours 1)
 
-$bidsTriggers = @("08:00", "13:00", "18:00") | ForEach-Object { New-ScheduledTaskTrigger -Daily -At $_ }
+$bidsTriggers = @("08:00", "13:00", "18:00") | ForEach-Object { Daily-At $_ }
 Register-ScheduledTask -TaskName "AWER_WB_bids" -Action (Make-Action "wb_bids.py" "--apply" 55) -Trigger $bidsTriggers `
     -Settings $set -Description "Автопилот ставок WB (wb_bids.py --apply), 3 раза в день" -Force @extra | Out-Null
 
-$guardTrigger = New-ScheduledTaskTrigger -Daily -At "07:40"
-$rep = New-ScheduledTaskTrigger -Once -At "07:40" -RepetitionInterval (New-TimeSpan -Hours 1) -RepetitionDuration (New-TimeSpan -Hours 16)
+$guardTrigger = Daily-At "07:40"
+$rep = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Hours 1) -RepetitionDuration (New-TimeSpan -Hours 16)
 $guardTrigger.Repetition = $rep.Repetition
 $guardSet = Make-Settings (New-TimeSpan -Minutes 25)
 Register-ScheduledTask -TaskName "AWER_WB_guard" -Action (Make-Action "wb_guard.py" "--apply" 22) -Trigger $guardTrigger `
@@ -81,26 +99,29 @@ Register-ScheduledTask -TaskName "AWER_WB_guard" -Action (Make-Action "wb_guard.
 
 $posSet = Make-Settings (New-TimeSpan -Hours 2)
 Register-ScheduledTask -TaskName "AWER_WB_positions" -Action (Make-Action "wb_positions.py" "" 110) `
-    -Trigger (New-ScheduledTaskTrigger -Daily -At "06:00") -Settings $posSet `
+    -Trigger (Daily-At "06:00") -Settings $posSet `
     -Description "Позиции и воронка WB (wb_positions.py, только чтение), каждый день в 6:00" -Force @extra | Out-Null
 
 if (Test-Path (Join-Path $dir "wb_collector.py")) {
-    $colTrigger = New-ScheduledTaskTrigger -Daily -At "07:00"
-    $colRep = New-ScheduledTaskTrigger -Once -At "07:00" -RepetitionInterval (New-TimeSpan -Minutes 15) -RepetitionDuration (New-TimeSpan -Hours 17)
+    $colTrigger = Daily-At "07:00"
+    $colRep = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 15) -RepetitionDuration (New-TimeSpan -Hours 17)
     $colTrigger.Repetition = $colRep.Repetition
     $colSet = Make-Settings (New-TimeSpan -Minutes 16)
     Register-ScheduledTask -TaskName "AWER_WB_collector" -Action (Make-Action "wb_collector.py" "" 14) -Trigger $colTrigger `
         -Settings $colSet -Description "Сборщик рекомендаций и размеров WB (wb_collector.py, только чтение), каждые 15 мин" -Force @extra | Out-Null
 }
 
-$limTrigger = New-ScheduledTaskTrigger -Daily -At "07:02"
-$limRep = New-ScheduledTaskTrigger -Once -At "07:02" -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration (New-TimeSpan -Hours 17)
+$limTrigger = Daily-At "07:02"
+$limRep = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration (New-TimeSpan -Hours 17)
 $limTrigger.Repetition = $limRep.Repetition
 $limSet = Make-Settings (New-TimeSpan -Minutes 5)
 Register-ScheduledTask -TaskName "AWER_WB_limits" -Action (Make-Action "wb_guard.py" "--limits --apply" 4) -Trigger $limTrigger `
     -Settings $limSet -Description "Дневной лимит кампаний WB каждые 5 мин (wb_guard.py --limits --apply)" -Force @extra | Out-Null
 
-Write-Host ("Готово. Python: $pyw (без окна, через wb_run.py)" + $(if ($Server) { "; от SYSTEM — без входа в Windows" } else { "" }))
+Write-Host ("Готово. Python: $pyw (без окна, через wb_run.py)" + $(if ($Server) { "; от SYSTEM — без входа в Windows; время запуска — московское (в UTC)" } else { "" }))
+if ($Server -and (Get-TimeZone).Id -ne "Russian Standard Time") {
+    Write-Host "Пояс сервера не московский — ниже время запуска по часам сервера (с 25.10 на час меньше московского: 8:00 по Москве = 7:00 по серверу)."
+}
 Get-ScheduledTask -TaskName "AWER_WB_*" | ForEach-Object {
     $i = $_ | Get-ScheduledTaskInfo
     Write-Host ("  {0}: следующий запуск {1}" -f $_.TaskName, $i.NextRunTime)
