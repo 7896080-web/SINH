@@ -48,6 +48,44 @@ if ($Tag) {
     }
 }
 
+# Опись: её пишет apply-скрипт патча тем же проходом, что и INSTALLED_TAG, и
+# отвечает она на вопрос, на который сверка sha не отвечает по построению —
+# «а ВСЁ ли, что нужно, на диске?». Сверка смотрит то, что в патче; файл,
+# которого ни один патч не привозил, для неё не существует. 15.10 так и
+# пропал `scripts/probe_accounts.py`, и узналось это из десяти упавших тестов
+# через тридцать три минуты после начала наката.
+#
+# Накат на этом НЕ останавливается: опись новая, и проверка, которая в первый
+# день отказывает исправной системе, кончается тем, что её отключают. Поэтому
+# она называет числа и имена, а решение за человеком.
+# ВЕСЬ блок — под try: выше стоит $ErrorActionPreference = "Stop", то есть
+# любая заминка чтения (файла нет, на его месте каталог, права) оборвала бы
+# НАКАТ. Диагностика не имеет права останавливать то, что она описывает.
+try {
+    $invPath = Join-Path $PSScriptRoot "INVENTORY.txt"
+    $inv = @()
+    if (Test-Path $invPath -PathType Leaf) {
+        $inv = @(Get-Content $invPath -Encoding UTF8)
+    }
+    if ($inv.Count -eq 0) {
+        Write-Host "[*] Описи нет - патч старше pm164. Соберётся следующим." -ForegroundColor DarkGray
+    } else {
+        Write-Host "[*] $($inv[0])" -ForegroundColor Cyan
+        # Строки опознаём ПОИМЁННО. «Двоеточие и ненулевая цифра» цепляло бы и
+        # «ожидается в релизе: 358», то есть кричало бы на каждом исправном накате.
+        $trouble = @($inv | Where-Object { $_ -match "^(нет на диске|разошлись|лишние).*: [1-9]" })
+        if ($trouble.Count -gt 0) {
+            foreach ($line in $trouble) { Write-Host "[!] $line" -ForegroundColor Yellow }
+            Write-Host "[!] Имена — в deploy\INVENTORY.txt. 'Нет на диске' чинится" -ForegroundColor Yellow
+            Write-Host "    следующим патчем, 'лишние' разбираются руками." -ForegroundColor Yellow
+        } else {
+            Write-Host "[*] Опись сошлась: на диске ровно то, что в релизе." -ForegroundColor Green
+        }
+    }
+} catch {
+    Write-Host "[*] Опись прочитать не удалось: $_" -ForegroundColor DarkGray
+}
+
 Write-Host "[*] Зависимости (на случай новых)..." -ForegroundColor Cyan
 & $py -m pip install -r (Join-Path $root "requirements.txt") | Out-Null
 
