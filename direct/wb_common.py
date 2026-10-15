@@ -15,6 +15,12 @@ from pathlib import Path
 
 import requests
 
+# Переезд на сервер (deploy/export_for_server.ps1 положил MOVED_TO_SERVER.txt): здесь скрипты больше не запускаются —
+# два компьютера меняли бы ставки и пополняли бюджеты одновременно, а лимиты WB у них общие.
+if (Path(__file__).resolve().parent / "MOVED_TO_SERVER.txt").exists():
+    sys.exit("Скрипты перенесены на сервер — запускайте их там (RDP, C:\\direct). Здесь не запускаю: два компьютера "
+             "меняли бы рекламу одновременно. Подробно — MOVED_TO_SERVER.txt рядом со скриптами.")
+
 ADV = "https://advert-api.wildberries.ru"
 ANA = "https://seller-analytics-api.wildberries.ru"
 STAT = "https://statistics-api.wildberries.ru"

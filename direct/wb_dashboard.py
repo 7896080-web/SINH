@@ -25,6 +25,7 @@ import datetime as dt
 import json
 import re
 import sqlite3
+import subprocess
 import sys
 import webbrowser
 from pathlib import Path
@@ -235,7 +236,12 @@ def main():
     print(f"Сохранено: {OUT.name}" + ("" if DB.exists() else " (нет wb_history.db — только раздел автопилота; "
                                                              "запустите python wb_positions.py)"))
     if "--no-open" not in sys.argv:
-        webbrowser.open(OUT.as_uri())
+        # --browser путь: на сервере браузер по умолчанию — Internet Explorer, графики в нём не работают
+        br = sys.argv[sys.argv.index("--browser") + 1] if "--browser" in sys.argv[:-1] else None
+        if br and Path(br).exists():
+            subprocess.Popen([br, OUT.as_uri()])
+        else:
+            webbrowser.open(OUT.as_uri())
 
 
 TEMPLATE = r"""<!doctype html>

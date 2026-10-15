@@ -112,6 +112,11 @@ def main():
     if not args:
         print(__doc__)
         return
+    if (HERE / "MOVED_TO_SERVER.txt").exists():      # переехали на сервер — задание здесь забыли снять
+        with open(OUT, "a", encoding="utf-8") as f:
+            note(f, f"✗ {args[0]}: скрипты перенесены на сервер (MOVED_TO_SERVER.txt) — здесь не запускаю. "
+                    "Снимите расписание: powershell -ExecutionPolicy Bypass -File C:\\direct\\wb_schedule.ps1 -Remove")
+        return
     rotate()
     start = dt.datetime.now()
     frequent = args[0] == "wb_collector.py" or (args[0] == "wb_guard.py" and "--limits" in args)

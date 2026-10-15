@@ -6,3 +6,8 @@ yandex_delivery_token.txt
 *tokens*.txt
 config.json
 .env
+crm_config.json
+# переезд на сервер и служебное
+.venv/
+code_backups/
+MOVED_TO_SERVER.txt
