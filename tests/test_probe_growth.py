@@ -57,16 +57,22 @@ def base(tmp_path):
     session.add(SyncAnomaly(uid_1c="u1", account_id=account.id,
                             reason=AnomalyReason.order_on_disabled,
                             status=AnomalyStatus.new, detected_at=now_utc()))
+    # В оговорке ЧУЖОЙ символ, которого в cp1251 нет: турецкая «İ» (а названия
+    # товаров у нас турецкие) или стрелка из чужого ответа. Держать такие
+    # символы в пределах кодировки мы не можем — они приезжают из базы, — и
+    # ровно поэтому скрипт глушит ошибку кодирования. Без этого один символ
+    # уронил бы ВЕСЬ вывод посреди строки.
     session.add(WorkerHeartbeat(
         worker_name="retention", last_run_at=now_utc(), last_success=True,
-        last_error="чистка не успевает: просроченных строк осталось 240000"))
+        last_error="чистка не успевает: просроченных строк осталось 240000 "
+                   "(İSTANBUL →)"))
     session.commit()
     session.close()
     engine.dispose()
     return url
 
 
-def _run(url, tmp_path):
+def _run(url, tmp_path, encoding=None):
     env = dict(os.environ)
     env["DATABASE_URL"] = url
     env["SESSION_SECRET"] = "x" * 32
@@ -74,8 +80,14 @@ def _run(url, tmp_path):
     env["BACKUP_DIR"] = str(tmp_path / "backups")
     env["BACKUP_MIRROR_DIR"] = ""
     env["BACKUP_RCLONE_REMOTE"] = ""
+    if encoding:
+        env["PYTHONIOENCODING"] = encoding
+    # Читаем ТЕМ ЖЕ, чем попросили писать. Прочитай мы вывод cp1251 как UTF-8,
+    # тест упал бы на мозаике — и упал бы на СВОЕЙ ошибке, а не на скриптовой:
+    # ровно тот разбор, который 12.10 стоил часа на `[410 - GoneError]`.
     done = subprocess.run([sys.executable, str(SCRIPT)], capture_output=True,
-                          encoding="utf-8", errors="replace", env=env, cwd=ROOT)
+                          encoding=encoding or "utf-8", errors="replace",
+                          env=env, cwd=ROOT)
     assert done.returncode == 0, done.stdout + done.stderr
     return done.stdout
 
@@ -135,6 +147,47 @@ def test_it_echoes_what_the_job_itself_said(base, tmp_path):
     out = _run(base, tmp_path)
 
     assert "чистка не успевает" in out
+    assert "240000" in out
+
+
+def test_it_survives_the_production_console(base, tmp_path):
+    """Боевая консоль пишет в cp1251, и это надо ПРОГНАТЬ, а не грепнуть.
+
+    `test_console_encoding.py` проверяет исходник на строку `reconfigure` —
+    перенеси её кто-нибудь ниже первого `print`, и защита переживёт то, от чего
+    заведена. Здесь скрипт запускается ровно так, как на сервере, и в вывод
+    попадают ЧУЖИЕ данные: имена таблиц, путь, текст оговорки задания."""
+    out = _run(base, tmp_path, encoding="cp1251")
+
+    assert "ТАБЛИЦЫ СО СРОКОМ ХРАНЕНИЯ" in out
+    assert "чистка не успевает" in out, "оговорка задания до консоли не доехала"
+    # И вывод доехал ДО КОНЦА, несмотря на чужой символ в оговорке.
+    assert "НЕ значат" in out, (
+        "вывод оборвался на символе из чужих данных — на боевой консоли скрипт "
+        "ответил бы трассировкой вместо отчёта")
+
+
+def test_a_table_missing_from_the_database_is_named_not_a_traceback(
+        base, tmp_path):
+    """База под скриптом бывает копией старше схемы или базой без миграции.
+
+    Сырая `OperationalError` из середины отчёта уносит весь остаток — и главное
+    число, и размеры, и оговорку задания, — а читается как поломка скрипта:
+    проверку отложат вовсе. Запускают его ровно тогда, когда уже что-то не
+    так."""
+    from sqlalchemy import create_engine, text
+
+    engine = create_engine(base)
+    with engine.begin() as conn:
+        conn.execute(text("DROP TABLE stock_delta_documents"))
+    engine.dispose()
+
+    out = _run(base, tmp_path)
+
+    assert "ТАБЛИЦЫ НЕТ В БАЗЕ" in out
+    # И, главное, отчёт доехал до конца.
+    assert "самый быстрый приход" in out
+    assert "ЧТО СКАЗАЛА САМА ЧИСТКА" in out
     assert "240000" in out
 
 
