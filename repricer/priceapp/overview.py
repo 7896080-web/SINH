@@ -12,7 +12,7 @@
 """
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import timedelta
 from decimal import Decimal
@@ -282,9 +282,31 @@ def _orphans(db: Session) -> list[Item]:
     return out
 
 
+def _etalon_items(db: Session) -> list[Item]:
+    """Эталон: где он ниже пола (себестоимость или курс выросли — возврат после акции уводит WB
+    в минус) и сколько карточек площадок за ним НЕ идут. Без этой строки они копились молча:
+    симуляция 15.10 — 0 → 29 за 120 дней, видно было только на странице эталонов."""
+    from priceapp import etalon, reference
+    out = []
+    low = reference.below_floor_articles(db)
+    if low:
+        out.append(Item("bad", "Эталон WB ниже пола — себестоимость или курс выросли, а эталон прежний: "
+                               "пересмотрите эталон (возврат после акции отправляет именно его)",
+                        "/etalon?flt=belowfloor", len(low)))
+    skip = Counter()
+    for c in etalon.follower_plan(db):
+        if c.skip and c.skip != "нет эталона WB":
+            skip[platforms.PLATFORMS.get(c.platform, c.platform)] += 1
+    if skip:
+        out.append(Item("warn", "Не идут за эталоном (ниже пола, нет курса или комиссии): "
+                                + ", ".join(f"{k} — {v}" for k, v in skip.items()), "/etalon?flt=skip",
+                        sum(skip.values())))
+    return out
+
+
 def refresh_heavy(db: Session, product_rows) -> None:
     import json
-    items = _heavy(db, product_rows) + _orphans(db)
+    items = _heavy(db, product_rows) + _orphans(db) + _etalon_items(db)
     settings.put(db, HEAVY_KEY, json.dumps({"at": now_utc().isoformat(),
                                             "items": [[i.level, i.text, i.link, i.count] for i in items]},
                                            ensure_ascii=False))

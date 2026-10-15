@@ -159,12 +159,14 @@ def test_rate_move_over_2_percent_recomputes_reference(db):
     assert db.query(ReferencePrice).one().ref_price == 2009
     f.manual_rate(db, "82.4")                                     # +3%
     assert reference.rate_moved(db) is True
-    st = reference.run(db)
+    st, wb = _run(db)
     db.expire_all()
     ref = db.query(ReferencePrice).one()
     assert st["revalued"] == 1 and ref.usd_rub == Decimal("82.4000")
     assert ref.ref_price == 2069 and ref.source == "rate"        # по курсу: 2009 × 82,4 / 80 = 2069,3
-    assert st["restored"] == 0                                    # цена площадки (2500) не ниже новой эталонной
+    # эталон следует за курсом и уходит на WB в любую сторону (решение владельца 15.10):
+    # площадка держала 2500 — теперь держит эталон 2069
+    assert wb.calls == [{"data": [{"nmID": 5, "price": 2069, "discount": 0}]}]
 
 
 def test_rate_move_then_first_rule_applies(db):
@@ -177,14 +179,56 @@ def test_rate_move_then_first_rule_applies(db):
     assert wb.calls[0]["data"][0]["price"] == 2069                # возвращается уже ПЕРЕСЧИТАННАЯ эталонная
 
 
-def test_rate_fall_lowers_reference_but_sends_nothing(db):
-    acc = _setup(db)
+def test_rate_fall_lowers_reference_and_sends_it_down(db):
+    """Решение владельца 15.10: курс упал больше чем на 2% — эталон снижается и уходит на WB."""
+    acc = _setup(db, current=(2009, 2009))
     _ref(db, acc, 2009)
     f.manual_rate(db, "77.6")                                     # −3%
-    st = reference.run(db)
+    st, wb = _run(db)
     db.expire_all()
-    assert st["revalued"] == 1 and db.query(ReferencePrice).one().ref_price < 2009 and st["restored"] == 0
-    assert db.query(PriceChange).count() == 0
+    assert st["revalued"] == 1 and db.query(ReferencePrice).one().ref_price == 1949   # 2009 × 77,6 / 80
+    assert wb.calls == [{"data": [{"nmID": 5, "price": 1949, "discount": 0}]}]
+    assert [c.status for c in db.query(PriceChange)] == ["sent"]  # в «Журнале отправок» — «эталон по курсу»
+    from priceapp.models import AuditLog
+    assert "(курс)" in db.query(AuditLog).filter_by(action="reference_run").first().details
+
+
+def test_rate_fall_far_beyond_wb_drop_limit_is_not_sent(db):
+    acc = _setup(db, current=(2009, 2009))
+    _ref(db, acc, 2009)
+    settings.put(db, settings.WB_MAX_DROP_PERCENT, "10")
+    db.commit()
+    f.manual_rate(db, "66")                                       # −17,5% при пределе снижения 10%
+    st, wb = _run(db)
+    from priceapp.models import AuditLog
+    assert wb.calls == [] and db.query(AuditLog).filter_by(action="reference_rate_far").count() == 1
+
+
+def test_restore_below_floor_is_sent_but_flagged(db):
+    """Симуляция 15.10: себестоимость выросла (или опечатка в 1С), эталон прежний — возврат после
+    акции уводит на WB цену ниже пола. Возврат лучше акционной цены, но человек обязан узнать."""
+    acc = _setup(db)
+    _ref(db, acc, 2009)
+    from priceapp.models import OnecCost
+    db.query(OnecCost).one().cost_usd = Decimal("100")            # пол выше эталона в разы
+    db.commit()
+    _cur(db, 1000)
+    settings.put(db, settings.REF_MAX_RAISE_PERCENT, "200")
+    db.commit()
+    st, wb = _run(db)
+    from priceapp.models import AuditLog
+    assert st["restored"] == 1 and st["below_floor"] == 1
+    assert "НИЖЕ ПОЛА" in db.query(AuditLog).filter_by(action="reference_run").one().details
+
+
+def test_same_big_list_is_logged_once(db):
+    acc = _setup(db)
+    _ref(db, acc, 2009)
+    _cur(db, 1000)                                                # +101% при пределе 50% — «big»
+    for _ in range(3):
+        _run(db)
+    from priceapp.models import AuditLog
+    assert db.query(AuditLog).filter_by(action="reference_big").count() == 1
 
 
 def test_rule_can_be_disabled_and_thresholds_changed(db):
@@ -384,3 +428,25 @@ def test_absurd_raise_is_not_returned_even_in_a_promo(db):
     _cur(db, 1000, sale=150)                                      # скидка 85%, подъём +1239% — выше потолка 500%
     st, wb = _run(db)
     assert st["restored"] == 0 and st["eaten"] == 1 and wb.calls == []
+
+
+def test_below_floor_is_checked_for_every_size_of_the_card(db):
+    """Симуляция 15.10: себестоимость выросла у ОДНОГО размера, а проверялся размер, чей эталон
+    выбран для карточки, — пометка «ниже пола» не появлялась ни разу."""
+    acc = _setup(db)
+    f.sku(db, "u2", "A1", "XL", barcodes=["b2"], cost_usd="100")       # дорогой размер той же карточки
+    f.item(db, acc, "b2", "A1-WB", external_id="5:2", size="XL")
+    db.query(PlatformItem).filter_by(barcode="b2").one().current_price = 2500
+    db.query(PlatformItem).filter_by(barcode="b2").one().current_sale_price = 2500
+    db.commit()
+    _ref(db, acc, 2009)
+    rows = db.query(PlatformItem).filter_by(barcode="b2").all()
+    reference.record(db, acc, "u2", 2009, rows)
+    db.commit()
+    _cur(db, 1000)
+    db.query(PlatformItem).filter_by(barcode="b2").one().current_sale_price = 1000
+    db.query(PlatformItem).filter_by(barcode="b2").one().current_price = 1000
+    settings.put(db, settings.REF_MAX_RAISE_PERCENT, "200")
+    db.commit()
+    st, wb = _run(db)
+    assert st["restored"] == 1 and st["below_floor"] == 1
