@@ -53,8 +53,14 @@ def _run(url, *args):
     env["DATABASE_URL"] = url
     env["SESSION_SECRET"] = "x" * 32
     env["SECRETS_ENCRYPTION_KEY"] = Fernet.generate_key().decode()
+    # Кодировка задаётся с ОБЕИХ сторон и одинаковая: у перенаправленного
+    # вывода питон берёт её из локали дочернего процесса — здесь UTF-8, на
+    # боевом Windows cp1251, — и читай мы его чем-то своим, тест падал бы на
+    # мозаике из наших же русских строк, причём только на сервере.
+    env["PYTHONIOENCODING"] = "utf-8"
     done = subprocess.run([sys.executable, str(SCRIPT), *args],
-                          capture_output=True, text=True, env=env, cwd=str(ROOT))
+                          capture_output=True, encoding="utf-8",
+                          errors="replace", env=env, cwd=str(ROOT))
     return done.stdout + done.stderr
 
 

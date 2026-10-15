@@ -61,24 +61,26 @@ def cabinet(tmp_path):
     return url, tmp_path
 
 
-def _run(url, *args, console=None):
+def _run(url, *args, console="utf-8"):
+    """Запустить скрипт подпроцессом и прочитать вывод ТЕМ ЖЕ, чем попросили
+    писать.
+
+    Кодировка задаётся с ОБЕИХ сторон и ВСЕГДА, а не только в cp1251-прогоне.
+    У перенаправленного вывода питон берёт её из локали дочернего процесса:
+    здесь UTF-8, на боевом Windows cp1251. Не скажи мы дочернему процессу, чем
+    писать, тест читал бы cp1251 как UTF-8 и падал бы на мозаике из НАШИХ ЖЕ
+    русских строк — то есть на своей ошибке, а не на скриптовой, и только на
+    сервере, в накате, уже после копии базы. `console="cp1251"` приносит сюда
+    боевую консоль: без него весь класс дефектов виден только там.
+    """
     env = dict(os.environ)
-    if console:
-        # Боевая консоль Windows, принесённая сюда: без этого весь класс
-        # виден только на сервере и только в накате.
-        env["PYTHONIOENCODING"] = console
+    env["PYTHONIOENCODING"] = console
     env["DATABASE_URL"] = url
     env["SESSION_SECRET"] = "x" * 32
     env["SECRETS_ENCRYPTION_KEY"] = Fernet.generate_key().decode()
-    if console:
-        # Читаем БАЙТАМИ и раскодируем той же кодировкой, что писал скрипт:
-        # с `text=True` их разбирал бы UTF-8, и падал бы уже сам тест — на
-        # выводе, который на сервере читается прекрасно.
-        done = subprocess.run([sys.executable, str(SCRIPT), *args],
-                              capture_output=True, env=env, cwd=str(ROOT))
-        return (done.stdout + done.stderr).decode(console, "replace")
     done = subprocess.run([sys.executable, str(SCRIPT), *args],
-                          capture_output=True, text=True, env=env, cwd=str(ROOT))
+                          capture_output=True, encoding=console,
+                          errors="replace", env=env, cwd=str(ROOT))
     return done.stdout + done.stderr
 
 

@@ -57,8 +57,14 @@ def _run(url):
     env["DATABASE_URL"] = url
     env["SESSION_SECRET"] = "x" * 32
     env["SECRETS_ENCRYPTION_KEY"] = Fernet.generate_key().decode()
+    # Кодировка задаётся с ОБЕИХ сторон и одинаковая: у перенаправленного
+    # вывода питон берёт её из локали дочернего процесса — здесь UTF-8, на
+    # боевом Windows cp1251, — и читай мы его чем-то своим, тест падал бы на
+    # мозаике из наших же русских строк, причём только на сервере.
+    env["PYTHONIOENCODING"] = "utf-8"
     done = subprocess.run([sys.executable, str(SCRIPT)],
-                          capture_output=True, text=True, env=env, cwd=str(ROOT))
+                          capture_output=True, encoding="utf-8",
+                          errors="replace", env=env, cwd=str(ROOT))
     return done.returncode, done.stdout + done.stderr
 
 
@@ -128,8 +134,10 @@ def test_a_formula_that_drifted_apart_is_shouted_about(tmp_path):
         env["DATABASE_URL"] = url
         env["SESSION_SECRET"] = "x" * 32
         env["SECRETS_ENCRYPTION_KEY"] = Fernet.generate_key().decode()
+        env["PYTHONIOENCODING"] = "utf-8"
         done = subprocess.run([sys.executable, str(broken)], capture_output=True,
-                              text=True, env=env, cwd=str(ROOT))
+                              encoding="utf-8", errors="replace", env=env,
+                              cwd=str(ROOT))
     finally:
         broken.unlink(missing_ok=True)
 

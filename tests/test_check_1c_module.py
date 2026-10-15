@@ -14,6 +14,7 @@
 Прогоняем САМ СКРИПТ подпроцессом: предмет правки — то, что увидит человек в
 консоли сервера после того, как ему принесли доработанную `.epf`.
 """
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -47,9 +48,23 @@ repository_only = pytest.mark.skipif(
 )
 
 
+def _child_env() -> dict:
+    """Окружение дочернего процесса с ПРИБИТОЙ кодировкой вывода.
+
+    Кодировка задаётся с ОБЕИХ сторон и одинаковая: у перенаправленного вывода
+    питон берёт её из локали дочернего процесса — здесь UTF-8, на боевом
+    Windows cp1251, — и читай мы его чем-то своим, тест падал бы на мозаике из
+    наших же русских строк, причём только на сервере, в накате.
+    """
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
+
+
 def _run(path) -> tuple[int, str]:
     done = subprocess.run([sys.executable, str(SCRIPT), str(path)],
-                          capture_output=True, text=True, cwd=str(ROOT))
+                          capture_output=True, encoding="utf-8",
+                          errors="replace", env=_child_env(), cwd=str(ROOT))
     return done.returncode, done.stdout + done.stderr
 
 
@@ -160,7 +175,8 @@ def test_without_an_argument_it_says_this_is_not_the_live_epf():
     скрипт.
     """
     done = subprocess.run([sys.executable, str(SCRIPT)],
-                          capture_output=True, text=True, cwd=str(ROOT))
+                          capture_output=True, encoding="utf-8",
+                          errors="replace", env=_child_env(), cwd=str(ROOT))
     out = done.stdout + done.stderr
 
     assert "это копия из репозитория" in out, out

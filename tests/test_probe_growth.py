@@ -72,7 +72,18 @@ def base(tmp_path):
     return url
 
 
-def _run(url, tmp_path, encoding=None):
+def _run(url, tmp_path, encoding="utf-8"):
+    """Запустить скрипт подпроцессом и прочитать вывод ТЕМ ЖЕ, чем попросили
+    писать.
+
+    Кодировка задаётся с ОБЕИХ сторон и ВСЕГДА, а не только в cp1251-прогоне.
+    У перенаправленного вывода питон берёт кодировку из локали дочернего
+    процесса: здесь это UTF-8, а на боевом Windows — cp1251. Не скажи мы
+    дочернему процессу, чем писать, тест читал бы cp1251 как UTF-8 и падал бы
+    на мозаике из НАШИХ ЖЕ русских строк — то есть на своей ошибке, а не на
+    скриптовой, и только на сервере, в накате, уже после копии базы. Ровно так
+    15.10 и вышло: семь падений, накат встал перед перезапуском служб.
+    """
     env = dict(os.environ)
     env["DATABASE_URL"] = url
     env["SESSION_SECRET"] = "x" * 32
@@ -80,13 +91,9 @@ def _run(url, tmp_path, encoding=None):
     env["BACKUP_DIR"] = str(tmp_path / "backups")
     env["BACKUP_MIRROR_DIR"] = ""
     env["BACKUP_RCLONE_REMOTE"] = ""
-    if encoding:
-        env["PYTHONIOENCODING"] = encoding
-    # Читаем ТЕМ ЖЕ, чем попросили писать. Прочитай мы вывод cp1251 как UTF-8,
-    # тест упал бы на мозаике — и упал бы на СВОЕЙ ошибке, а не на скриптовой:
-    # ровно тот разбор, который 12.10 стоил часа на `[410 - GoneError]`.
+    env["PYTHONIOENCODING"] = encoding
     done = subprocess.run([sys.executable, str(SCRIPT)], capture_output=True,
-                          encoding=encoding or "utf-8", errors="replace",
+                          encoding=encoding, errors="replace",
                           env=env, cwd=ROOT)
     assert done.returncode == 0, done.stdout + done.stderr
     return done.stdout
