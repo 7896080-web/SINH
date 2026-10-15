@@ -75,8 +75,14 @@ def _run(url):
     env["DATABASE_URL"] = url
     env["SESSION_SECRET"] = "x" * 32
     env["SECRETS_ENCRYPTION_KEY"] = Fernet.generate_key().decode()
+    # Кодировка задаётся с ОБЕИХ сторон и одинаковая: у перенаправленного
+    # вывода питон берёт её из локали дочернего процесса — здесь UTF-8, на
+    # боевом Windows cp1251, — и читай мы его чем-то своим, тест падал бы на
+    # мозаике из наших же русских строк, причём только на сервере.
+    env["PYTHONIOENCODING"] = "utf-8"
     done = subprocess.run([sys.executable, str(SCRIPT), ORDER],
-                          capture_output=True, text=True, env=env, cwd=str(ROOT))
+                          capture_output=True, encoding="utf-8",
+                          errors="replace", env=env, cwd=str(ROOT))
     return done.stdout + done.stderr
 
 
@@ -182,8 +188,14 @@ def test_without_an_order_number_it_refuses_with_an_example(db_url):
     env["DATABASE_URL"] = url
     env["SESSION_SECRET"] = "x" * 32
     env["SECRETS_ENCRYPTION_KEY"] = Fernet.generate_key().decode()
+    # Кодировка задаётся с ОБЕИХ сторон и одинаковая: у перенаправленного
+    # вывода питон берёт её из локали дочернего процесса — здесь UTF-8, на
+    # боевом Windows cp1251, — и читай мы его чем-то своим, тест падал бы на
+    # мозаике из наших же русских строк, причём только на сервере.
+    env["PYTHONIOENCODING"] = "utf-8"
     done = subprocess.run([sys.executable, str(SCRIPT)],
-                          capture_output=True, text=True, env=env, cwd=str(ROOT))
+                          capture_output=True, encoding="utf-8",
+                          errors="replace", env=env, cwd=str(ROOT))
 
     assert done.returncode != 0
     assert "Укажите номер заказа" in done.stdout

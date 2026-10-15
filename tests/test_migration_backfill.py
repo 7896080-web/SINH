@@ -33,12 +33,18 @@ def _alembic(url, target):
     env = dict(os.environ)
     env["DATABASE_URL"] = url
     env.setdefault("SESSION_SECRET", "x" * 32)
+    # Кодировка задаётся с ОБЕИХ сторон и одинаковая: у перенаправленного
+    # вывода питон берёт её из локали дочернего процесса — здесь UTF-8, на
+    # боевом Windows cp1251, — и читай мы его чем-то своим, тест падал бы на
+    # мозаике из наших же русских строк, причём только на сервере.
+    env["PYTHONIOENCODING"] = "utf-8"
     # Не `-m alembic`: у части установок пакет без `__main__`, и тест падал бы
     # не по делу. Точка входа консольной команды доступна всегда.
     r = subprocess.run([sys.executable, "-c",
                         "from alembic.config import main; main()",
                         "upgrade", target],
-                       cwd=ROOT, env=env, capture_output=True, text=True)
+                       cwd=ROOT, env=env, capture_output=True,
+                       encoding="utf-8", errors="replace")
     assert r.returncode == 0, r.stderr[-2000:]
 
 

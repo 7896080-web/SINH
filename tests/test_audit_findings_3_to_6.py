@@ -294,8 +294,14 @@ def test_the_probe_names_orders_and_cancellations(catalog_with_orders):
     env["DATABASE_URL"] = catalog_with_orders
     env["SESSION_SECRET"] = "x" * 32
     env["SECRETS_ENCRYPTION_KEY"] = Fernet.generate_key().decode()
+    # Кодировка задаётся с ОБЕИХ сторон и одинаковая: у перенаправленного
+    # вывода питон берёт её из локали дочернего процесса — здесь UTF-8, на
+    # боевом Windows cp1251, — и читай мы его чем-то своим, тест падал бы на
+    # мозаике из наших же русских строк, причём только на сервере.
+    env["PYTHONIOENCODING"] = "utf-8"
     done = subprocess.run([sys.executable, str(ROOT / "scripts" / "probe_offset.py"), "u1"],
-                          capture_output=True, text=True, env=env, cwd=str(ROOT))
+                          capture_output=True, encoding="utf-8",
+                          errors="replace", env=env, cwd=str(ROOT))
     out = done.stdout + done.stderr
 
     assert "ЗАКАЗЫ И ОТМЕНЫ" in out, out

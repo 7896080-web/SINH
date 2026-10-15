@@ -11,6 +11,7 @@ Windows PowerShell 5.1 считает, что `.ps1` без BOM написан �
 запуска файлом и проявился на боевом сервере, а не в разработке.
 """
 import io
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -18,12 +19,26 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def _child_env() -> dict:
+    """Окружение дочернего процесса с ПРИБИТОЙ кодировкой вывода.
+
+    Кодировка задаётся с ОБЕИХ сторон и одинаковая: у перенаправленного вывода
+    питон берёт её из локали дочернего процесса — здесь UTF-8, на боевом
+    Windows cp1251, — и читай мы его чем-то своим, тест падал бы на мозаике из
+    наших же русских строк, причём только на сервере, в накате.
+    """
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
+
+
 def _generate(tmp_path, files):
     out = tmp_path / "probe_deploy.ps1"
     r = subprocess.run(
         [sys.executable, str(ROOT / "scripts" / "gen_whole_file_patch.py"),
          "--tag", "probe", "--parts", "1", "--out", str(out), *files],
-        cwd=ROOT, capture_output=True, text=True)
+        cwd=ROOT, capture_output=True, encoding="utf-8", errors="replace",
+        env=_child_env())
     assert r.returncode == 0, r.stderr[-2000:]
     return out
 
@@ -91,7 +106,8 @@ def test_the_patch_records_which_version_it_installed(tmp_path):
     script = tmp_path / "apply.py"
     script.write_text(apply_py, encoding="utf-8")
 
-    r = subprocess.run([sys.executable, str(script)], capture_output=True, text=True)
+    r = subprocess.run([sys.executable, str(script)], capture_output=True,
+                       encoding="utf-8", errors="replace", env=_child_env())
     assert r.returncode == 0, r.stderr[-2000:]
     assert "DONE" in r.stdout
     # И НИ СЛОВА в stderr. Вывод наката человек читает ради двух строк — «DONE N»

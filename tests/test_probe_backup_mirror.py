@@ -57,9 +57,15 @@ def _run(url, tmp_path, **settings):
     # Гасим пустой строкой — см. докстроку модуля.
     env["BACKUP_MIRROR_DIR"] = ""
     env["BACKUP_RCLONE_REMOTE"] = ""
+    # Кодировка задаётся с ОБЕИХ сторон и одинаковая: у перенаправленного
+    # вывода питон берёт её из локали дочернего процесса — здесь UTF-8, на
+    # боевом Windows cp1251, — и читай мы его чем-то своим, тест падал бы на
+    # мозаике из наших же русских строк, причём только на сервере.
+    env["PYTHONIOENCODING"] = "utf-8"
     env.update(settings)
     done = subprocess.run([sys.executable, str(SCRIPT)], capture_output=True,
-                          text=True, env=env, cwd=str(ROOT))
+                          encoding="utf-8", errors="replace", env=env,
+                          cwd=str(ROOT))
     assert done.returncode == 0, done.stdout + done.stderr
     return done.stdout + done.stderr
 
