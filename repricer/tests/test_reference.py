@@ -350,3 +350,37 @@ def test_cbr_rate_jump_waits_when_second_request_fails(db, monkeypatch):
     st, wb = _run(db)
     db.expire_all()
     assert st["revalued"] == 0 and db.query(ReferencePrice).one().ref_price == 2009
+
+
+def test_deep_promo_is_returned_beyond_the_raise_limit(db):
+    """14.10 на бою: акция WB поставила скидку 84–87% (наш коридор 35–50%) и срезала цену после
+    скидки на ~70%; возврат требовал +213…+257% и упирался в предел 200%. Скидка выше коридора
+    ставится не нами — это акция, эталон возвращается при любом подъёме."""
+    acc = _setup(db)
+    _ref(db, acc, 2009)                                           # эталон 2009 без скидки
+    settings.put(db, settings.REF_MAX_RAISE_PERCENT, "200")
+    db.commit()
+    _cur(db, 2500, sale=400)                                      # скидка 84%: подъём +402%
+    st, wb = _run(db)
+    assert st["restored"] == 1 and st["promo"] == 1 and st["eaten"] == 0
+    assert wb.calls == [{"data": [{"nmID": 5, "price": 2009, "discount": 0}]}]
+    from priceapp.models import AuditLog
+    assert "(акция)" in db.query(AuditLog).filter_by(action="reference_run").one().details
+
+
+def test_raise_limit_still_guards_when_discount_is_in_the_corridor(db):
+    acc = _setup(db)
+    _ref(db, acc, 2009)
+    settings.put(db, settings.REF_MAX_RAISE_PERCENT, "200")
+    db.commit()
+    _cur(db, 600, sale=550)                                       # скидка 8% — не акция; подъём +265%
+    st, wb = _run(db)
+    assert st["restored"] == 0 and st["eaten"] == 1 and wb.calls == []
+
+
+def test_absurd_raise_is_not_returned_even_in_a_promo(db):
+    acc = _setup(db)
+    _ref(db, acc, 2009)
+    _cur(db, 1000, sale=150)                                      # скидка 85%, подъём +1239% — выше потолка 500%
+    st, wb = _run(db)
+    assert st["restored"] == 0 and st["eaten"] == 1 and wb.calls == []

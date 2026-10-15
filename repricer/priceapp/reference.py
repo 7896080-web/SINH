@@ -12,6 +12,8 @@
    (автоакция) или оба. Эталонная пара ВОЗВРАЩАЕТСЯ одним заданием WB на карточку, только
    вверх. Возврат, поднимающий цену больше чем на `ref_max_raise_percent` (50%), не
    отправляется, а уходит во «Внимание»: так выглядит ошибочный эталон, а не занижение.
+   Кроме АКЦИИ: скидка продавца на WB выше «до» коридора (её ставим не мы) — эталон
+   возвращается при любом подъёме до 500% (`PROMO_RAISE_CEILING`).
 2. «Курс». Курс ушёл от курса эталонной больше чем на `ref_rate_percent` (2%) — эталон
    пересчитывается ПО КУРСУ (× новый / прежний, скидка та же), затем работает правило 1.
    Скачок больше 20% — повторный запрос к ЦБ: подтвердил — пересчёт, нет — в следующий раз
@@ -33,6 +35,7 @@ from priceapp.timeutils import now_utc
 
 SOURCE = "reference"
 PLATFORMS = ("wb",)
+PROMO_RAISE_CEILING = Decimal(500)         # акция: возврат при любом подъёме, кроме совсем абсурдного
 MAX_RATE_JUMP = Decimal("0.2")             # скачок курса — повторный запрос к ЦБ перед пересчётом
 RATE_CONFIRM_TOLERANCE = Decimal("0.005")   # повторный ответ ЦБ «тот же», если разница не больше 0,5%
 COMMIT_EVERY = 500
@@ -181,16 +184,34 @@ def ref_discount_int(ref: ReferencePrice) -> int:
     return int((_dec(ref.discount or 0) * 100).quantize(Decimal(1), ROUND_HALF_UP))
 
 
-def classify(r: dict, ref: ReferencePrice, drop: Decimal, max_raise: Decimal = Decimal(50)) -> str | None:
+def is_promo(r: dict, promo_disc: Decimal | None) -> bool:
+    """Скидка продавца на WB сейчас ВЫШЕ нашего коридора: такую ставим не мы — её поставила
+    акция площадки (14.10: 84–87% при коридоре 35–50%)."""
+    price, sale = r.get("current"), r.get("current_sale")
+    if promo_disc is None or not price or not sale or sale >= price:
+        return False
+    return (1 - Decimal(sale) / Decimal(price)) * 100 > promo_disc
+
+
+def classify(r: dict, ref: ReferencePrice, drop: Decimal, max_raise: Decimal = Decimal(50),
+             promo_disc: Decimal | None = None) -> str | None:
     """`below` — цена после скидки продавца ниже эталонной больше чем на `drop` %: вернуть;
     `big` — вернуть надо, но возврат поднял бы её больше чем на `max_raise` % — это скорее
-    ошибка эталона, чем занижение площадкой: «Внимание», не отправка; None — в порядке."""
+    ошибка эталона, чем занижение площадкой: «Внимание», не отправка; None — в порядке.
+
+    Исключение — АКЦИЯ (`is_promo`: скидка выше коридора `promo_disc`): там глубина подъёма
+    говорит о глубине акции, а не об ошибке эталона, и эталон возвращается при любом подъёме
+    до `PROMO_RAISE_CEILING` (решение владельца 14.10: «в акциях не участвуем»; при пределе
+    200% не вернулись карточки, где акция срезала цену на 70%). Предел `max_raise` остаётся
+    там, где скидка в коридоре, а разошлась сама цена до скидки — так выглядел ошибочный
+    эталон 13.10."""
     target, cur = ref_sale(ref), r.get("current_sale")
     if not target or not cur:
         return None
     if Decimal(cur) >= Decimal(target) * (1 - drop / 100):
         return None
-    if Decimal(target) > Decimal(cur) * (1 + max_raise / 100):
+    limit = PROMO_RAISE_CEILING if is_promo(r, promo_disc) else max_raise
+    if Decimal(target) > Decimal(cur) * (1 + limit / 100):
         return "big"
     return "below"
 
@@ -254,6 +275,8 @@ def run(db: Session, product_rows=None, actor: str = "программа", clien
                   "эталоны пересчитываются")
     rate_thr = rate_percent(db) / 100
     drop, max_raise = drop_percent(db), max_raise_percent(db)
+    from priceapp.etalon import corridor
+    promo_disc = Decimal(corridor(db)[1])          # скидка выше «до» коридора — акция площадки
     now = now_utc()
     for a in db.query(Account).filter(Account.is_active.is_(True), Account.platform.in_(PLATFORMS)).all():
         refs = {r.item_id: r for r in db.query(ReferencePrice).filter(ReferencePrice.account_id == a.id)}
@@ -264,6 +287,7 @@ def run(db: Session, product_rows=None, actor: str = "программа", clien
             PriceChange.account_id == a.id, PriceChange.is_test.is_(False),
             PriceChange.status == PriceChangeStatus.approved.value)}
         revalued = 0
+        promo: set[str] = set()
         rate_jumps: set[str] = set()
         cards: dict[str, dict] = {}
         big: dict[str, str] = {}                 # по карточке: строка на каждый размер повторяла бы одно и то же
@@ -292,18 +316,22 @@ def run(db: Session, product_rows=None, actor: str = "программа", clien
             if r["item_id"] in busy:
                 continue
             # 2. Площадка занизила цену после скидки продавца — вернуть эталонную (только вверх).
-            kind = classify(r, ref, drop, max_raise)
+            kind = classify(r, ref, drop, max_raise, promo_disc)
             nm = _nm(r.get("platform"))
             if kind is None or not nm:
                 continue
             if kind == "big":
                 big.setdefault(nm, f"{nm}: {r.get('current_sale')} -> {ref_sale(ref)}")
                 continue
+            if is_promo(r, promo_disc):
+                promo.add(nm)
             c = cards.get(nm)
             if c is None or ref.ref_price > c["ref"].ref_price:
                 cards[nm] = {"ref": ref, "cur": r.get("current_sale"), "items": c["items"] if c else set()}
             cards[nm]["items"].add(r["item_id"])
+            cards[nm]["promo"] = nm in promo
         st["revalued"] += revalued
+        st["promo"] = st.get("promo", 0) + len(promo & set(cards))
         if rate_jumps:
             # Скачок больше `MAX_RATE_JUMP` не подтвердился повторным запросом к ЦБ (или курс
             # ручной) — в этот раз эталоны не трогаем; следующий опрос спросит ЦБ снова.
@@ -369,7 +397,8 @@ def _send(db: Session, a: Account, cards: dict, client_factory, st: dict, actor:
             it.current_price = price
             it.current_sale_price = int((Decimal(price) * (100 - d) / 100).quantize(Decimal(1), ROUND_HALF_UP))
     if done:
-        sample = "; ".join(f"{nm}: {c['cur']} -> {ref_sale(c['ref'])}" for nm, c in done[:20])
+        sample = "; ".join(f"{nm}: {c['cur']} -> {ref_sale(c['ref'])}" + (" (акция)" if c.get("promo") else "")
+                           for nm, c in done[:20])
         audit.log(db, actor, "reference_run", a.name,
                   f"возвращена эталонная цена после скидки продавца: {len(done)} карточек — {sample}"
                   + (" …" if len(done) > 20 else ""))
@@ -382,7 +411,8 @@ def summary(st: dict) -> str:
     if not st.get("accounts"):
         return "Эталонных цен WB пока нет: правило начнёт работать после записи эталона."
     parts = [f"Эталонные цены WB ({st['accounts']} каб.): пересчитано по курсу — {st['revalued']}; "
-             f"возвращено цен после скидки продавца — {st['restored']}"]
+             f"возвращено цен после скидки продавца — {st['restored']}"
+             + (f" (из них после акции со скидкой выше коридора — {st['promo']})" if st.get("promo") else "")]
     if st["eaten"]:
         parts.append(f"эталон выше нынешней цены больше допустимого, не возвращено — {st['eaten']} (проверьте эталон)")
     if st.get("errors"):
