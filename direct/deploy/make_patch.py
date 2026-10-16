@@ -50,8 +50,8 @@ def read(path):
 
 mode, root = sys.argv[1], sys.argv[2]
 new = []
-for rel, expect, b64 in FILES:
-    data = base64.b64decode(b64)
+for rel, expect, kind, body in FILES:
+    data = body.encode("utf-8") if kind == "t" else base64.b64decode(body)
     if sha(data) != expect:
         print("  ПАТЧ ПОВРЕЖДЁН:", rel)
         sys.exit(3)
@@ -289,7 +289,14 @@ def build(base, tag, name, also=()):
         with open(os.path.join(HERE, rel), "rb") as f:
             data = f.read()
         if rel in take:
-            files.append((rel, hashlib.sha256(data).hexdigest(), base64.b64encode(data).decode("ascii")))
+            try:                    # текст — как есть (сжимается втрое лучше, чем base64 внутри base64)
+                text = data.decode("utf-8")
+                kind, body = ("t", text) if text.encode("utf-8") == data else ("b", None)
+            except UnicodeDecodeError:
+                kind = "b"
+            if kind == "b":
+                body = base64.b64encode(data).decode("ascii")
+            files.append((rel, hashlib.sha256(data).hexdigest(), kind, body))
         else:
             keep.append((rel, hashlib.sha256(data.replace(b"\r\n", b"\n")).hexdigest()))
     apply_src = APPLY.format(tag=tag, version=version, files=files, keep=keep).encode("utf-8")
