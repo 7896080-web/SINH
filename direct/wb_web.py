@@ -68,6 +68,40 @@ STATUS = {9: "работает", 11: "пауза", 4: "готова к запу�
 NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 _rules_lock = threading.Lock()
 _write_lock = threading.Lock()
+PROGRESS_FILE = HERE / "wb_budget_progress.json"   # этап пересчёта — пишет wb_budget.py
+
+
+class Progress:
+    """Что сейчас делает страница (загрузка из WB, запись) — для шкалы прогресса: done из total и подпись."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.d = {}
+
+    def start(self, op, text, total=None):
+        with self.lock:
+            self.d = {"op": op, "text": text, "done": 0, "total": total, "started": time.time()}
+
+    def step(self, text=None):
+        with self.lock:
+            if self.d:
+                self.d["done"] = self.d.get("done", 0) + 1
+                if text:
+                    self.d["text"] = text
+
+    def end(self):
+        with self.lock:
+            self.d = {}
+
+    def get(self):
+        with self.lock:
+            d = dict(self.d)
+        if d:
+            d["elapsed"] = round(time.time() - d.pop("started"))
+        return d
+
+
+PROG = Progress()
 
 
 def ddmm(iso):
@@ -137,12 +171,14 @@ def collect():
     state = B.load_state()
     cabs = {k: v for k, v in B.load_tokens().items() if k in B.RULES_BASE}
     res, threads = {}, []
+    PROG.start("load", f"Загружаю кампании из WB: 0 из {len(cabs)} кабинетов", total=len(cabs) + 1)
 
     def one(cab, token):
         try:
             res[cab] = ("ok", B.get_campaigns(token))
         except B.ApiError as e:
             res[cab] = ("err", str(e))
+        PROG.step(f"Загружаю кампании из WB: {len(res)} из {len(cabs)} кабинетов (готов «{cab}»)")
 
     for cab, token in cabs.items():
         t = threading.Thread(target=one, args=(cab, token), daemon=True)
@@ -193,6 +229,7 @@ def collect():
                                        x["id"]))
         c["other"].sort(key=lambda x: (not x["active"], x["id"]))
         out.append(c)
+    PROG.step("Собираю таблицу")
     return {"at": dt.datetime.now().strftime("%d.%m.%Y %H:%M"), "cabinets": out,
             "rec_at": props.get("at"), "overrides_at": ov.get("at"), "last_backup": last_backup_name(),
             "recalc": RECALC.status()}
@@ -376,7 +413,7 @@ class Recalc:
     """Пересчёт рекомендаций: пробный прогон wb_budget.py (ничего не меняет) в отдельном процессе."""
 
     def __init__(self):
-        self.proc, self.started, self.finished, self.rc = None, None, None, None
+        self.proc, self.started, self.finished, self.rc, self.t0 = None, None, None, None, 0.0
         self.lock = threading.Lock()
 
     def start(self):
@@ -386,12 +423,17 @@ class Recalc:
             env = dict(os.environ, PYTHONIOENCODING="utf-8")
             if os.name == "nt":
                 env["TZ"] = "MSK-3"           # как у заданий по расписанию (wb_run.py)
+            try:
+                PROGRESS_FILE.unlink()        # этап прошлого расчёта не показывать как этап этого
+            except OSError:
+                pass
             f = open(OUT, "a", encoding="utf-8")
             f.write(f"\n[{dt.datetime.now():%d.%m.%Y %H:%M}] пересчёт рекомендаций: wb_budget.py (пробный прогон)\n")
             f.flush()
             self.proc = subprocess.Popen([python_exe(), str(HERE / "wb_budget.py")], cwd=str(HERE), stdout=f,
                                          stderr=subprocess.STDOUT, env=env, creationflags=NO_WINDOW)
             self.started, self.finished, self.rc = dt.datetime.now(), None, None
+            self.t0 = time.time()
             return True
 
     def status(self):
@@ -401,8 +443,16 @@ class Recalc:
             rc = self.proc.poll()
             if rc is not None and self.finished is None:
                 self.finished, self.rc = dt.datetime.now(), rc
-            return {"running": rc is None, "started": self.started.strftime("%H:%M"),
-                    "finished": self.finished.strftime("%H:%M") if self.finished else None, "rc": self.rc}
+            st = {"running": rc is None, "started": self.started.strftime("%H:%M"),
+                  "finished": self.finished.strftime("%H:%M") if self.finished else None, "rc": self.rc,
+                  "elapsed": round(((self.finished or dt.datetime.now()) - self.started).total_seconds())}
+        try:   # по времени изменения файла: пересчёт идёт по Москве (TZ=MSK-3), страница — по часам сервера
+            fresh = PROGRESS_FILE.stat().st_mtime >= self.t0 - 1
+        except OSError:
+            fresh = False
+        if fresh:
+            st["stage"] = load_json(PROGRESS_FILE, {})
+        return st
 
 
 RECALC = Recalc()
@@ -427,7 +477,13 @@ def nav(active):
     html = ('<nav class="wbnav">'
             f'<a href="/?k={k}"' + (' aria-current="page"' if active == "dash" else "") + '>Дашборд</a>'
             f'<a href="/budgets?k={k}"' + (' aria-current="page"' if active == "budgets" else "") + '>Бюджеты</a>'
-            '</nav>')
+            '</nav>'
+            '<style>.wbload{position:fixed;top:0;left:0;right:0;height:3px;z-index:99;display:none;overflow:hidden}'
+            '.wbload i{position:absolute;top:0;bottom:0;width:30%;background:var(--s1);animation:wbl2 1.1s ease-in-out infinite}'
+            '@keyframes wbl2{0%{left:-30%}100%{left:100%}}</style><div class="wbload" id="wbload"><i></i></div>'
+            '<script>document.querySelectorAll(".wbnav a").forEach(a=>a.addEventListener("click",()=>{'
+            'document.getElementById("wbload").style.display="block"}));'
+            'window.addEventListener("pageshow",()=>{document.getElementById("wbload").style.display="none"});</script>')
     if active == "dash":
         html += (f'<script>setInterval(()=>fetch("/ping?k={k}").catch(()=>{{}}),60000);'
                  f'window.addEventListener("pagehide",()=>navigator.sendBeacon("/bye?k={k}"));</script>')
@@ -471,10 +527,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, PAGE.replace("__TOKEN__", APP.token).replace("<!--NAV-->", nav("budgets")),
                            "text/html; charset=utf-8")
             elif path == "/data":
-                APP.data = collect()
+                try:
+                    APP.data = collect()
+                finally:
+                    PROG.end()
                 self._send(200, APP.data)
             elif path == "/recalc":
                 self._send(200, RECALC.status())
+            elif path == "/progress":
+                self._send(200, {**PROG.get(), "recalc": RECALC.status()})
             elif path == "/ping":
                 self._send(200, {"ok": True})
             else:
@@ -500,7 +561,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path in ("/preview", "/save"):
             if APP.data is None:
-                APP.data = collect()
+                try:
+                    APP.data = collect()
+                finally:
+                    PROG.end()
             lines, warns, errors, norm = plan(APP.data, body.get("changes") or [])
             if path == "/preview" or errors:
                 self._send(200, {"lines": lines, "warnings": warns, "errors": errors, "digest": digest(norm)})
@@ -639,6 +703,12 @@ details.other{padding:8px 14px}summary{cursor:pointer;color:var(--ink2);font-siz
 .box.e{background:var(--bad-wash);color:var(--bad)}.box.w{background:var(--warn-wash);color:var(--warn)}
 .box.o{background:var(--good-wash);color:var(--good)}.box.i{background:var(--surface);border:1px solid var(--ring)}
 .err{color:var(--bad);padding:12px 14px}.muted{color:var(--muted)}
+.prog{display:none;align-items:center;gap:10px;flex:1;min-width:260px}.prog.on{display:flex}.prog.on+.spacer{display:none}
+.prog .track{position:relative;flex:0 0 200px;height:8px;border-radius:4px;background:var(--grid);overflow:hidden}
+.prog .fill{position:absolute;top:0;bottom:0;left:0;width:0;border-radius:4px;background:var(--s1);transition:width .4s ease}
+.prog.ind .fill{width:30%;transition:none;animation:wbl 1.1s ease-in-out infinite}
+@keyframes wbl{0%{left:-30%}100%{left:100%}}
+.prog .pt{flex:1;min-width:0;font-size:12.5px;line-height:1.35;color:var(--ink2)}
 </style></head><body><div class="wrap">
 <!--NAV-->
 <header><h1>Бюджеты кампаний</h1><span class="sub" id="sub">Загружаю кампании из WB…</span><span class="spacer"></span>
@@ -648,10 +718,12 @@ details.other{padding:8px 14px}summary{cursor:pointer;color:var(--ink2);font-siz
 <label class="sub"><input type="checkbox" id="act"> только работающие</label><span class="sub" id="cnt"></span></div>
 <div id="cabs"></div><div id="plan"></div>
 <div class="bar"><button class="b p" id="chk" disabled>Проверить изменения</button><button class="b" id="save" disabled>Сохранить</button>
-<button class="b" id="reset" disabled>Сбросить правки</button><span class="spacer"></span><button class="b" id="undo">Отменить последнее сохранение</button></div>
+<button class="b" id="reset" disabled>Сбросить правки</button>
+<div class="prog" id="prog" role="progressbar" aria-live="polite"><div class="track"><div class="fill"></div></div><span class="pt"></span></div>
+<span class="spacer"></span><button class="b" id="undo">Отменить последнее сохранение</button></div>
 </div>
 <script>
-const K="__TOKEN__";let DATA=null,lastDigest=null,polling=null;
+const K="__TOKEN__";let DATA=null,lastDigest=null;
 const fmt=v=>v==null?"—":Math.round(v).toLocaleString("ru-RU");
 const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const dm=s=>s?s.slice(0,10).split("-").reverse().slice(0,2).join("."):"";
@@ -705,36 +777,55 @@ function render(){const el=document.getElementById("cabs");el.innerHTML="";
  filter()}
 function changes(){return [...document.querySelectorAll("input.v")].filter(i=>i.value.trim()!==i.dataset.orig).map(i=>({cab:i.dataset.cab,id:i.dataset.id,field:i.dataset.f,value:i.value.trim()}))}
 function onEdit(e){if(e.target.dataset)e.target.classList.toggle("changed",e.target.value.trim()!==e.target.dataset.orig);
- const n=changes().length;document.getElementById("chk").disabled=!n;document.getElementById("reset").disabled=!n;
- document.getElementById("save").disabled=true;document.getElementById("save").classList.remove("p");lastDigest=null;
+ const n=changes().length;lastDigest=null;document.getElementById("save").classList.remove("p");if(typeof syncButtons==="function")syncButtons();
  document.getElementById("plan").innerHTML=n?'<div class="box i">Несохранённых правок: '+n+'. Нажмите «Проверить изменения».</div>':""}
 function filter(){const q=document.getElementById("q").value.trim().toLowerCase(),act=document.getElementById("act").checked;let n=0;
  document.querySelectorAll("tr[data-hay]").forEach(tr=>{const v=(!q||tr.dataset.hay.includes(q))&&(!act||tr.dataset.act==="1");tr.style.display=v?"":"none";if(v)n++});
  document.getElementById("cnt").textContent=q||act?("показано кампаний: "+n):""}
 function box(cls,title,items){return items&&items.length?`<div class="box ${cls}"><b>${title}</b><ul>${items.map(x=>"<li>"+esc(x)+"</li>").join("")}</ul></div>`:""}
-function recInfo(d){const r=d.recalc||{},el=document.getElementById("recinfo");
- let t=d.rec_at?`Рекомендации посчитаны ${d.rec_at.replace("T"," ").slice(8,10)}.${d.rec_at.slice(5,7)} ${d.rec_at.slice(11,16)} (wb_budget.py, раз в сутки после утреннего автопилота). `:"Рекомендаций ещё нет. ";
- if(r.running){el.innerHTML=esc(t)+`<b>Пересчитываю с ${r.started}…</b> (≈1–3 минуты на кабинет, страницу можно не закрывать)`;if(!polling)polling=setInterval(poll,5000);return}
+// ---------- шкала прогресса: каждое действие идёт через busy(); долгие — с этапами с сервера (/progress) ----------
+const $id=id=>document.getElementById(id);let STACK=[],LOCKS=0,PT=null,RECALC_ON=false;
+const fmtSec=s=>s<60?s+" с":Math.floor(s/60)+" мин "+(s%60)+" с";
+function syncButtons(){const n=changes().length,lk=LOCKS>0;$id("chk").disabled=lk||!n;$id("reset").disabled=lk||!n;
+ $id("save").disabled=lk||!lastDigest;$id("undo").disabled=lk;const r=$id("recalc");if(r)r.disabled=lk||RECALC_ON}
+function showProg(pct,text){const p=$id("prog");p.classList.add("on");p.classList.toggle("ind",pct==null);
+ p.querySelector(".fill").style.width=pct==null?"":Math.max(3,Math.round(pct*100))+"%";p.querySelector(".pt").textContent=text;
+ if(pct==null)p.removeAttribute("aria-valuenow");else p.setAttribute("aria-valuenow",Math.round(pct*100))}
+async function tickProg(){if(!STACK.length)return;let s={};try{s=await fetch("/progress?k="+K).then(r=>r.json())}catch(e){}
+ if(!STACK.length)return;const top=STACK[STACK.length-1],el=Math.round((Date.now()-top.t0)/1000);let pct=null,text=top.label;
+ if(s.op&&s.total){pct=s.done/s.total;text=s.text}
+ else if(top.recalc&&s.recalc&&s.recalc.running){const f=s.recalc.stage;text="Пересчёт рекомендаций: "+(f?f.text:"запускаю…");
+  pct=f?(f.done?1:(f.i*f.stages+f.stage+.5)/(f.n*f.stages)):null}
+ else if(top.recalc&&s.recalc&&s.recalc.finished){pct=1;text=s.recalc.rc?"Пересчёт рекомендаций не удался":"Пересчёт рекомендаций готов — обновляю страницу"}
+ showProg(pct,text+" · "+fmtSec(el))}
+async function busy(label,lock,fn,recalc){const it={label,t0:Date.now(),recalc:!!recalc};STACK.push(it);if(lock)LOCKS++;syncButtons();
+ showProg(null,label);if(!PT)PT=setInterval(tickProg,500);
+ try{return await fn()}finally{STACK.splice(STACK.indexOf(it),1);if(lock)LOCKS--;
+  if(!STACK.length){clearInterval(PT);PT=null;$id("prog").classList.remove("on")}else tickProg();syncButtons()}}
+function recInfo(d){const r=d.recalc||{},el=$id("recinfo");
+ let t=d.rec_at?`Рекомендации посчитаны ${d.rec_at.slice(8,10)}.${d.rec_at.slice(5,7)} ${d.rec_at.slice(11,16)} (wb_budget.py, раз в сутки после утреннего автопилота). `:"Рекомендаций ещё нет. ";
+ if(r.running){el.innerHTML=esc(t)+`<b>Пересчитываю с ${r.started}…</b> Ход — на шкале внизу; править можно, страница обновится сама.`;if(!RECALC_ON)waitRecalc();return}
  el.innerHTML=esc(t)+(r.finished&&r.rc?`<span class="down">Пересчёт в ${r.finished} не удался (код ${r.rc}) — журнал wb_web_out.txt. </span>`:"")+`<button class="b sm" id="recalc">Пересчитать сейчас</button>`;
- document.getElementById("recalc").onclick=async()=>{await api("/recalc",{});const s=await api("/recalc");d.recalc=s;recInfo(d)}}
-async function poll(){const s=await api("/recalc");if(!s.running){clearInterval(polling);polling=null;if(changes().length){DATA.recalc=s;recInfo(DATA);
- document.getElementById("plan").innerHTML='<div class="box i">Рекомендации пересчитаны. Чтобы увидеть их, сохраните или сбросьте правки и обновите страницу.</div>'}else load()}}
-async function load(){document.getElementById("sub").textContent="Загружаю кампании из WB…";
- const d=await api("/data");if(d.error){document.getElementById("sub").innerHTML='<span class="err">'+esc(d.error)+'</span>';return}
- DATA=d;document.getElementById("sub").textContent=`Кампании и артикулы — из WB на ${d.at}. Снижение потолков действует сразу, повышение — с ближайшего автопилота (8:00, 13:00, 18:00); свой дневной лимит — за 5 минут. Деньги здесь не переводятся.`;
- recInfo(d);render();["chk","save","reset"].forEach(x=>document.getElementById(x).disabled=true);
- document.getElementById("undo").title=d.last_backup?("вернёт файл поправок как до "+d.last_backup):"копий ещё нет"}
-document.getElementById("q").addEventListener("input",filter);document.getElementById("act").addEventListener("change",filter);
-document.getElementById("chk").onclick=async()=>{const r=await api("/preview",{changes:changes()});
- document.getElementById("plan").innerHTML=box("e","Не принято:",r.errors)+(r.lines&&r.lines.length?box("i","Будет записано:",r.lines):'<div class="box i">Менять нечего — значения те же.</div>')+box("w","Обратите внимание:",r.warnings);
- lastDigest=(!r.errors||!r.errors.length)&&r.lines&&r.lines.length?r.digest:null;const sv=document.getElementById("save");sv.disabled=!lastDigest;sv.classList.toggle("p",!!lastDigest);
- document.getElementById("plan").scrollIntoView({behavior:"smooth"})};
-document.getElementById("save").onclick=async()=>{const r=await api("/save",{changes:changes(),digest:lastDigest});
- if(r.errors&&r.errors.length){document.getElementById("plan").innerHTML=box("e","Не записано:",r.errors);return}
- await load();document.getElementById("plan").innerHTML=`<div class="box o">Записано правок: ${r.saved} (резервная копия ${esc(r.backup)}). Отменить — «Отменить последнее сохранение».</div>`};
-document.getElementById("reset").onclick=()=>{render();onEdit({target:{}});document.getElementById("plan").innerHTML=""};
-document.getElementById("undo").onclick=async()=>{if(!confirm("Вернуть поправки как до последнего сохранения (вашего или wb_budget.py)? Применяется сразу."))return;
- const r=await api("/undo",{});await load();document.getElementById("plan").innerHTML=r.undone?`<div class="box o">Отменено: поправки как до ${esc(r.undone)}.</div>`:'<div class="box w">Отменять нечего — копий нет.</div>'};
+ $id("recalc").onclick=async()=>{$id("recalc").disabled=true;const s=await api("/recalc",{});d.recalc=s;recInfo(d)};syncButtons()}
+async function waitRecalc(){RECALC_ON=true;syncButtons();
+ await busy("Пересчёт рекомендаций…",false,async()=>{for(;;){await new Promise(r=>setTimeout(r,2000));const s=await api("/recalc");if(!s.running){DATA.recalc=s;return}}},true);
+ RECALC_ON=false;if(changes().length){recInfo(DATA);$id("plan").innerHTML='<div class="box i">Рекомендации пересчитаны. Чтобы увидеть их, сохраните или сбросьте правки — страница обновится.</div>'}else await load()}
+async function load(){return busy("Загружаю кампании из WB…",true,async()=>{$id("sub").textContent="Загружаю кампании из WB…";
+ const d=await api("/data");if(d.error){$id("sub").innerHTML='<span class="err">'+esc(d.error)+'</span>';return}
+ DATA=d;lastDigest=null;$id("save").classList.remove("p");$id("sub").textContent=`Кампании и артикулы — из WB на ${d.at}. Снижение потолков действует сразу, повышение — с ближайшего автопилота (8:00, 13:00, 18:00); свой дневной лимит — за 5 минут. Деньги здесь не переводятся.`;
+ render();recInfo(d);$id("undo").title=d.last_backup?("вернёт файл поправок как до "+d.last_backup):"копий ещё нет"})}
+$id("q").addEventListener("input",filter);$id("act").addEventListener("change",filter);
+$id("chk").onclick=()=>busy("Проверяю правки…",true,async()=>{const r=await api("/preview",{changes:changes()});
+ $id("plan").innerHTML=box("e","Не принято:",r.errors)+(r.lines&&r.lines.length?box("i","Будет записано:",r.lines):'<div class="box i">Менять нечего — значения те же.</div>')+box("w","Обратите внимание:",r.warnings);
+ lastDigest=(!r.errors||!r.errors.length)&&r.lines&&r.lines.length?r.digest:null;$id("save").classList.toggle("p",!!lastDigest);
+ $id("plan").scrollIntoView({behavior:"smooth"})});
+$id("save").onclick=()=>busy("Сохраняю…",true,async()=>{const r=await api("/save",{changes:changes(),digest:lastDigest});
+ if(r.errors&&r.errors.length){$id("plan").innerHTML=box("e","Не записано:",r.errors);return}
+ await load();$id("plan").innerHTML=`<div class="box o">Записано правок: ${r.saved} (резервная копия ${esc(r.backup)}). Отменить — «Отменить последнее сохранение».</div>`});
+$id("reset").onclick=()=>{render();onEdit({target:{}});$id("plan").innerHTML=""};
+$id("undo").onclick=()=>{if(!confirm("Вернуть поправки как до последнего сохранения (вашего или wb_budget.py)? Применяется сразу."))return;
+ busy("Отменяю последнее сохранение…",true,async()=>{const r=await api("/undo",{});await load();
+  $id("plan").innerHTML=r.undone?`<div class="box o">Отменено: поправки как до ${esc(r.undone)}.</div>`:'<div class="box w">Отменять нечего — копий нет.</div>'})};
 setInterval(()=>fetch("/ping?k="+K).catch(()=>{}),60000);
 window.addEventListener("pagehide",()=>navigator.sendBeacon("/bye?k="+K));
 load();

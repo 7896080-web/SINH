@@ -70,6 +70,22 @@ OVERRIDES = B.BUDGET_OVERRIDES
 BACKUPS = HERE / "wb_budget_backups"
 REPORT = HERE / "wb_budget_report.txt"
 PROPOSALS = HERE / "wb_budget_proposals.json"   # последние предложения — для дашборда
+PROGRESS = HERE / "wb_budget_progress.json"     # этап расчёта — для шкалы прогресса на странице «Бюджеты»
+STAGES = ["список кампаний", "статистика кампаний (до минуты)", "остатки товаров", "выкуп товаров", "расчёт"]
+_cur = {"i": 0, "n": 1, "cab": ""}
+
+
+def progress(stage, done=False):
+    """Записать этап: кабинет i из n и этап stage (индекс в STAGES); done — расчёт закончен. Ошибки записи не мешают."""
+    d = {"at": dt.datetime.now().isoformat(timespec="seconds"), "done": done, "cab": _cur["cab"], "i": _cur["i"],
+         "n": _cur["n"], "stage": stage, "stages": len(STAGES),
+         "text": "готово" if done else f"{_cur['cab']} ({_cur['i'] + 1} из {_cur['n']}) — {STAGES[stage]}"}
+    try:
+        tmp = PROGRESS.with_suffix(".tmp")
+        tmp.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, PROGRESS)
+    except OSError:
+        pass
 log = B.log
 rub = B.fm_rub
 
@@ -256,7 +272,9 @@ def total(days, d1, d2=None):
 
 def plan_cabinet(cab, token, state, ov):
     log(f"\n══════════ {cab} ══════════")
+    progress(0)
     camps = B.get_campaigns(token)
+    progress(1)
     rules_now = {}
     for cid, a in camps.items():
         if a.get("_status") not in (9, 11):
@@ -270,10 +288,13 @@ def plan_cabinet(cab, token, state, ov):
     y = dt.date.today() - dt.timedelta(days=1)
     d1 = y - dt.timedelta(days=STATS_DAYS - 1)
     stats = camp_days(token, sorted(rules_now), d1, y)
+    progress(2)
     nms = {cid: [s.get("nm_id") for s in camps[cid].get("nm_settings") or []] for cid in rules_now}
     all_nms = sorted({n for v in nms.values() for n in v})
     stock = B.get_stock(token, all_nms) or {}
+    progress(3)
     B.load_buyout(cab, token, all_nms, {n: (stock.get(n) or {}).get("vendor") for n in all_nms})
+    progress(4)
     snaps = snapshots()
     exp_until = EXPERIMENT.get(cab)
     exp_on = bool(exp_until and dt.date.today().isoformat() <= exp_until)
@@ -508,9 +529,9 @@ def main():
     state = B.load_state()
     ov = load_overrides()
     props = []
-    for cab, token in B.load_tokens().items():
-        if cab not in B.RULES:
-            continue
+    cabs = [(c, t) for c, t in B.load_tokens().items() if c in B.RULES]
+    for i, (cab, token) in enumerate(cabs):
+        _cur.update(i=i, n=len(cabs), cab=cab)
         try:
             props += plan_cabinet(cab, token, state, ov)
         except B.ApiError as e:
@@ -518,6 +539,7 @@ def main():
             FAILED_CABS.add(cab)
     has = show(props)
     save_proposals(props)
+    progress(len(STAGES) - 1, done=True)
     if not SPEND_LOG.exists():
         log("\n  Часовых снимков расхода (wb_spend_hourly.csv) ещё нет — их пишет wb_guard.py с 14.10.2026.")
     if not has:
