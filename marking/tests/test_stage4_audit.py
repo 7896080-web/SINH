@@ -111,11 +111,13 @@ def test_claim_stamps_time_so_old_order_is_not_expired_mid_request(db, supply, f
 def test_resolve_needs_a_real_uuid_not_used_by_another_order(db, supply, fake, monkeypatch):
     monkeypatch.setattr(chz_api, "create_order",
                         lambda *a: (_ for _ in ()).throw(chz_api.ChzApiError("таймаут", None)))
-    orders = C.prepare_orders(db, supply, "op")
-    for o in orders:
+    C.prepare_orders(db, supply, "op")
+    a, b = db.query(CodeOrder).order_by(CodeOrder.id).all()
+    b.batch_key = "второй-заказ"         # два разных заказа СУЗ, у каждого свой номер
+    db.flush()
+    for o in (a, b):
         with pytest.raises(C.CodesError):
             C.send_order(db, o, "S")
-    a, b = orders
     with pytest.raises(C.CodesError, match="UUID"):
         C.resolve_unknown_order(db, a, "SUZ-1")
     C.resolve_unknown_order(db, a, UUID)

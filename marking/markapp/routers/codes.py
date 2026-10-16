@@ -69,8 +69,12 @@ def order_prepare(supply_id: int, db: Session = Depends(get_db), user: User = De
         db.rollback()
         return _err(str(e))
     db.commit()
-    return {"orders": [{"id": o.id, "sku": o.supplier_sku, "quantity": o.quantity, "body": o.body}
-                       for o in orders]}
+    out = []
+    for o in orders:                     # по строке на заказ СУЗ (до 10 GTIN)
+        rows = C.batch_of(db, o)
+        out.append({"id": o.id, "sku": C.batch_label(rows), "quantity": sum(r.quantity for r in rows),
+                    "body": o.body})
+    return {"orders": out}
 
 
 @router.post("/supplies/{supply_id}/codes/order-send")
@@ -79,16 +83,20 @@ def order_send(supply_id: int, db: Session = Depends(get_db), user: User = Depen
     order = db.get(CodeOrder, order_id)
     if order is None or order.supply_id != supply_id:
         return _err("заказ не найден", 404)
+    rows = C.batch_of(db, order)
+    label = C.batch_label(rows)
     try:
         C.send_order(db, order, signature)
     except C.CodesError as e:
         if order.status in ("unknown", "error"):
-            audit.log(db, user.username, "codes_order_failed", order.supplier_sku,
-                      f"поставка {supply_id}, {order.quantity} шт.: {order.status} — {e}")
+            for r in rows:
+                audit.log(db, user.username, "codes_order_failed", r.supplier_sku,
+                          f"поставка {supply_id}, {r.quantity} шт.: {r.status} — {e}")
         db.commit()                      # итог (unknown / error / new) остаётся у заказа
-        return _err(f"{order.supplier_sku}: {e}", 502)
-    audit.log(db, user.username, "codes_order", order.supplier_sku,
-              f"поставка {order.supply_id}, GTIN {order.gtin}, {order.quantity} шт., СУЗ {order.suz_order_id}")
+        return _err(f"{label}: {e}", 502)
+    for r in rows:
+        audit.log(db, user.username, "codes_order", r.supplier_sku,
+                  f"поставка {r.supply_id}, GTIN {r.gtin}, {r.quantity} шт., СУЗ {r.suz_order_id}")
     db.commit()
     return {"ok": True, "suz_order_id": order.suz_order_id}
 

@@ -23,12 +23,13 @@ import logging
 import os
 import re
 import threading
+import uuid
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, object_session
 
 from markapp import chz_api, chz_auth, config, settings
 from markapp.crypto import decrypt_value, encrypt_value
@@ -217,6 +218,10 @@ def suz_token(supply: Supply) -> str:
 def prepare_orders(db: Session, supply: Supply, username: str) -> list[CodeOrder]:
     """Заказы на недостающее по каждому артикулу — в базу ДО отправки.
 
+    Строка заказа — по артикулу (GTIN), а в СУЗ они уходят пачками до 10 GTIN
+    одним заказом (`batch_key`, общее тело): лимит СУЗ — 100 активных заказов.
+    Возвращает по одной строке на пачку — её и подписывают.
+
     Неотправленные заказы прошлого раза возвращаются снова, а не дублируются.
     Заказ с неизвестным исходом занимает своё количество: пока человек не
     решит, был ли он, нового на это количество нет.
@@ -233,45 +238,98 @@ def prepare_orders(db: Session, supply: Supply, username: str) -> list[CodeOrder
         if line.gtin and line.deficit > 0:
             db.add(CodeOrder(supply_id=supply.id, organization_id=supply.organization_id,
                              supplier_sku=line.supplier_sku, gtin=line.gtin, quantity=line.deficit,
-                             oms_id=supply.organization.oms_id,
-                             body=chz_api.order_body(line.gtin, line.deficit), created_by=username))
+                             oms_id=supply.organization.oms_id, body="", created_by=username))
     db.flush()
-    return (db.query(CodeOrder).filter(CodeOrder.supply_id == supply.id, CodeOrder.status == "new")
+    pending = (db.query(CodeOrder).filter(CodeOrder.supply_id == supply.id, CodeOrder.status == "new")
+               .order_by(CodeOrder.id).all())
+    # Пачка, уже собранная прошлым разом (401/429 — не принят), остаётся как
+    # была; без ключа — собираем. Тело неотправленного заказа ещё никто не
+    # подписал, и пересобрать его можно.
+    loose = [o for o in pending if not o.batch_key]
+    chunk: list[CodeOrder] = []
+    for o in loose + [None]:
+        if o is None or len(chunk) == chz_api.MAX_GTINS_PER_ORDER or any(c.gtin == o.gtin for c in chunk):
+            if chunk:
+                key = str(uuid.uuid4())
+                body = chz_api.order_body([(c.gtin, c.quantity) for c in chunk])
+                for c in chunk:
+                    c.batch_key, c.body = key, body
+            chunk = []
+        if o is not None:
+            chunk.append(o)
+    db.flush()
+    heads, seen = [], set()
+    for o in pending:
+        if o.batch_key not in seen:
+            seen.add(o.batch_key)
+            heads.append(o)
+    return heads
+
+
+def batch_of(db: Session, order: CodeOrder) -> list[CodeOrder]:
+    """Все строки одного заказа СУЗ (одной пачки), начиная с первой."""
+    if not order.batch_key:
+        return [order]
+    return (db.query(CodeOrder).filter(CodeOrder.batch_key == order.batch_key)
             .order_by(CodeOrder.id).all())
 
 
+def batch_label(rows: list[CodeOrder]) -> str:
+    skus = [r.supplier_sku for r in rows]
+    return skus[0] if len(skus) == 1 else f"{skus[0]} и ещё {len(skus) - 1} арт."
+
+
+def _claim_batch(db: Session, rows: list[CodeOrder]) -> bool:
+    """Как `_claim`, но на весь заказ: либо все его строки уходят в отправку,
+    либо ни одна (вторая вкладка уже взяла)."""
+    ids = [r.id for r in rows]
+    n = (db.query(CodeOrder).filter(CodeOrder.id.in_(ids), CodeOrder.status == "new")
+         .update({CodeOrder.status: "sending", CodeOrder.updated_at: now_utc()},
+                 synchronize_session=False))
+    if n != len(ids):
+        db.rollback()
+        return False
+    db.commit()
+    return True
+
+
 def send_order(db: Session, order: CodeOrder, signature: str) -> None:
-    """Захват → запрос → итог. Вызывающий коммитит итог."""
+    """Захват → запрос → итог, на весь заказ (все строки пачки). Вызывающий
+    коммитит итог."""
     supply = db.get(Supply, order.supply_id)
     _check_can_order(supply)
     token = suz_token(supply)
-    if not _claim(db, CodeOrder, order.id, "new", "sending"):
+    rows = batch_of(db, order)
+    if not _claim_batch(db, rows):
         raise CodesError("заказ уже отправляется или отправлен (другая вкладка?)")
-    db.refresh(order)
+    for r in rows:
+        db.refresh(r)
     try:
-        order.suz_order_id = chz_api.create_order(order.oms_id or supply.organization.oms_id,
-                                                  order.body, token, signature)
+        suz_id = chz_api.create_order(order.oms_id or supply.organization.oms_id,
+                                      order.body, token, signature)
         # Номер — в журнал СРАЗУ, до коммита: упади запись в базу, заказ стал бы
         # `unknown`, и номер пришлось бы искать в ЛК СУЗ по времени и GTIN.
-        logger.info("заказ %s (%s, %s шт.): СУЗ создал заказ %s", order.id, order.gtin,
-                    order.quantity, order.suz_order_id)
-        order.status, order.error = "sent", ""
+        logger.info("заказ %s (%s): СУЗ создал заказ %s", [r.id for r in rows],
+                    ", ".join(f"{r.gtin}×{r.quantity}" for r in rows), suz_id)
+        for r in rows:
+            r.suz_order_id, r.status, r.error = suz_id, "sent", ""
     except chz_api.ChzApiError as e:
-        order.error = str(e)
         # 408 и 409 — не «заказа нет»: таймаут на стороне сервера или повтор уже
         # принятого запроса. Объяви мы их ошибкой, недостающее заказалось бы снова.
         if e.outcome_unknown or e.status in (408, 409) or "не вернул номер" in str(e):
-            order.status = "unknown"
+            status = "unknown"
         elif e.status in (401, 429):
-            # Не принят: можно повторить после входа / паузы.
-            order.status = "new"
+            status = "new"              # не принят: можно повторить после входа / паузы
             if e.status == 401:
                 chz_auth.forget(supply.organization, "suz", token)
         else:
-            order.status = "error"     # 4xx: СУЗ заказ не создал
+            status = "error"            # 4xx: СУЗ заказ не создал
+        for r in rows:
+            r.status, r.error = status, str(e)
         raise CodesError(str(e))
     finally:
-        order.updated_at = now_utc()
+        for r in rows:
+            r.updated_at = now_utc()
 
 
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
@@ -291,21 +349,27 @@ def resolve_unknown_order(db: Session, order: CodeOrder, suz_order_id: str) -> N
                        "остальные коды не придут — недостающее можно заказать заново")
         order.updated_at = now_utc()
         return
+    # Исход неизвестен у всего заказа СУЗ сразу: строки пачки ушли одним
+    # запросом, и решение человека относится ко всем.
+    rows = [r for r in batch_of(db, order) if r.status == "unknown"]
     if suz_order_id:
         if not UUID_RE.match(suz_order_id):
             raise CodesError("номер заказа СУЗ — это UUID вида 1b2c3d4e-…, проверьте, что скопирован целиком")
         db.flush()            # autoflush=False: иначе запрос не увидит несохранённые решения
         taken = (db.query(CodeOrder.id).filter(CodeOrder.suz_order_id == suz_order_id,
-                                               CodeOrder.id != order.id).first())
+                                               CodeOrder.id.notin_([r.id for r in rows])).first())
         if taken:
             # Два заказа программы на один буфер СУЗ: план посчитал бы его дважды,
             # один из них упёрся бы в исчерпание и попросил дозаказ.
             raise CodesError(f"этот номер уже записан за заказом №{taken[0]} — у каждого заказа свой номер")
-        order.suz_order_id, order.status = suz_order_id, "sent"
-        order.error = "номер заказа указан человеком по ЛК СУЗ"
+        for r in rows:
+            r.suz_order_id, r.status = suz_order_id, "sent"
+            r.error = "номер заказа указан человеком по ЛК СУЗ"
     else:
-        order.status, order.error = "error", "человек подтвердил: в СУЗ заказа нет"
-    order.updated_at = now_utc()
+        for r in rows:
+            r.status, r.error = "error", "человек подтвердил: в СУЗ заказа нет"
+    for r in rows:
+        r.updated_at = now_utc()
 
 
 # --- Получение кодов ----------------------------------------------------------------
@@ -344,19 +408,34 @@ CLOSE_WINDOW = timedelta(hours=48)
 
 
 def _to_close(db: Session, supply: Supply) -> list[CodeOrder]:
-    """Заказы, по которым получены ВСЕ коды и которые ещё не закрыты в СУЗ.
+    """По строке на заказ СУЗ, который пора закрыть: по каждому его подзаказу
+    получены ВСЕ коды или буфер уже закрыт самим СУЗ, и хотя бы по одному всё
+    получено.
 
-    Только `done`: закрытие с невыданными кодами СУЗ оформляет как их отказ
-    (4.3, прим. 1), а у `incomplete` буфер уже закрыт самим СУЗ.
+    Закрытие с невыданными кодами СУЗ оформляет как отказ от них (4.3, прим. 1),
+    поэтому заказ, где хоть один подзаказ ещё идёт (`sent`, `ready`) или
+    неясен, не закрываем. У `incomplete`, `rejected` и `error` буфер уже закрыт
+    или кодов нет — закрытие их не задевает.
     """
     if supply.is_test:
         return []           # тренировочная поставка в ЧЗ изменяющими запросами не ходит
-    return (db.query(CodeOrder).filter(CodeOrder.supply_id == supply.id,
+    done = (db.query(CodeOrder).filter(CodeOrder.supply_id == supply.id,
                                        CodeOrder.status == "done",
                                        CodeOrder.suz_order_id != "",
                                        CodeOrder.suz_closed_at.is_(None),
                                        CodeOrder.created_at > now_utc() - CLOSE_WINDOW)
             .order_by(CodeOrder.id).all())
+    out, seen = [], set()
+    for o in done:
+        if o.suz_order_id in seen:
+            continue
+        seen.add(o.suz_order_id)
+        busy = (db.query(CodeOrder.id).filter(CodeOrder.suz_order_id == o.suz_order_id,
+                                              CodeOrder.status.in_(OPEN_ORDER),
+                                              CodeOrder.status != "incomplete").first())
+        if not busy:
+            out.append(o)
+    return out
 
 
 def run_step(db: Session, order: CodeOrder, action: str, path: str, signature: str) -> None:
@@ -394,6 +473,13 @@ def run_step(db: Session, order: CodeOrder, action: str, path: str, signature: s
     order.updated_at = now_utc()
 
 
+def db_rows_of_suz_order(order: CodeOrder) -> list[CodeOrder]:
+    """Строки программы с тем же номером заказа СУЗ (подзаказы одного заказа)."""
+    db = object_session(order)
+    return (db.query(CodeOrder).filter(CodeOrder.supply_id == order.supply_id,
+                                       CodeOrder.suz_order_id == order.suz_order_id).all())
+
+
 def _close(order: CodeOrder, supply: Supply, token: str, signature: str) -> None:
     """Закрыть заказ в СУЗ. Отказ статуса заказа не меняет: коды получены, а
     не закрытый нами заказ СУЗ закроет сам через 48 часов."""
@@ -405,8 +491,11 @@ def _close(order: CodeOrder, supply: Supply, token: str, signature: str) -> None
         if e.status == 401:
             chz_auth.forget(supply.organization, "suz", token)
         raise CodesError(order.error)
-    order.suz_closed_at = order.updated_at = now_utc()
-    order.error = ""
+    at = now_utc()
+    for r in db_rows_of_suz_order(order):
+        r.suz_closed_at = r.updated_at = at
+        if r.status == "done":
+            r.error = ""
     logger.info("заказ %s (%s): закрыт в СУЗ", order.id, order.suz_order_id)
 
 

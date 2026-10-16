@@ -79,10 +79,15 @@ def test_short_cis_is_parsed_not_cut():
 
 def test_orders_are_written_before_sending_and_not_duplicated(db, supply, fake):
     orders = C.prepare_orders(db, supply, "op")
-    assert [(o.supplier_sku, o.quantity, o.status) for o in orders] == [("A 1", 2, "new"), ("B 1", 1, "new")]
+    # Два артикула — один заказ СУЗ (до 10 GTIN): строка на артикул, тело общее.
+    assert [(o.supplier_sku, o.quantity, o.status) for o in orders] == [("A 1", 2, "new")]
+    rows = C.batch_of(db, orders[0])
+    assert [(r.supplier_sku, r.quantity, r.status) for r in rows] == [("A 1", 2, "new"), ("B 1", 1, "new")]
+    assert rows[0].body == rows[1].body and rows[0].batch_key == rows[1].batch_key
     body = json.loads(orders[0].body)
-    assert body["products"][0] == {"gtin": GTIN_A, "quantity": 2, "serialNumberType": "OPERATOR",
-                                   "templateId": 10, "cisType": "UNIT"}
+    assert body["products"] == [
+        {"gtin": GTIN_A, "quantity": 2, "serialNumberType": "OPERATOR", "templateId": 10, "cisType": "UNIT"},
+        {"gtin": GTIN_B, "quantity": 1, "serialNumberType": "OPERATOR", "templateId": 10, "cisType": "UNIT"}]
     assert body["attributes"] == {"releaseMethodType": "PRODUCTION"}
     # Повтор до отправки — те же заказы, не новые.
     assert [o.id for o in C.prepare_orders(db, supply, "op")] == [o.id for o in orders]
@@ -117,7 +122,7 @@ def test_full_cycle_order_codes_statuses_introduce(db, supply, fake):
     # Все коды получены — заказы закрываются в СУЗ (лимит 100 активных заказов);
     # подписывается тело, как при создании заказа.
     closes = C.steps(db, supply)
-    assert [s["action"] for s in closes] == ["close", "close"]
+    assert [s["action"] for s in closes] == ["close"]           # один заказ СУЗ — одно закрытие
     assert closes[0]["sign"] == '{"orderId":"SUZ-1"}'
     for st in closes:
         C.run_step(db, db.get(CodeOrder, st["order_id"]), st["action"], st["path"], "SIG-CLOSE")
@@ -200,7 +205,8 @@ def test_codes_page_renders(client, db, supply, fake):
     assert r.status_code == 200
     assert "Итог ввода в оборот" in r.text and "A 1" in r.text and "коды не заказаны" in r.text
     r = client.post(f"/supplies/{supply.id}/codes/order-prepare")
-    assert r.status_code == 200 and len(r.json()["orders"]) == 2
+    assert r.status_code == 200
+    assert [(o["sku"], o["quantity"]) for o in r.json()["orders"]] == [("A 1 и ещё 1 арт.", 3)]
 
 
 def test_order_is_closed_only_with_every_code_received(db, supply, fake):
@@ -215,8 +221,27 @@ def test_order_is_closed_only_with_every_code_received(db, supply, fake):
         for st in C.steps(db, supply):
             if st["action"] != "close":
                 C.run_step(db, db.get(CodeOrder, st["order_id"]), st["action"], st["path"], "S")
-    closes = [s for s in C.steps(db, supply) if s["action"] == "close"]
-    assert [s["sku"] for s in closes] == ["B 1"]
+    # B получен целиком, но он подзаказ того же заказа, что и A: закрыть заказ
+    # сейчас значило бы отказаться от невыданного кода A.
+    assert [s for s in C.steps(db, supply) if s["action"] == "close"] == []
+    state["codes"][GTIN_A] = [full(GTIN_A, 2)]                  # следующий блок СУЗ
+    for _ in range(3):                                         # статус -> готовы -> коды
+        for st in C.steps(db, supply):
+            if st["action"] != "close":
+                C.run_step(db, db.get(CodeOrder, st["order_id"]), st["action"], st["path"], "S")
+    assert [s["action"] for s in C.steps(db, supply)] == ["close"]
+
+
+def test_suborder_closed_by_suz_does_not_block_closing_the_order(db, supply, fake):
+    """`incomplete` — буфер уже закрыт СУЗ: закрытие заказа его не задевает."""
+    calls, state = fake
+    for o in C.prepare_orders(db, supply, "op"):
+        C.send_order(db, o, "S")
+    a, b = db.query(CodeOrder).order_by(CodeOrder.id).all()
+    a.status, a.received = "incomplete", 1
+    b.status, b.received = "done", 1
+    db.flush()
+    assert [s["action"] for s in C.steps(db, supply)] == ["close"]
 
 
 def test_failed_close_keeps_codes_and_is_retried(db, supply, fake, monkeypatch):
@@ -238,7 +263,7 @@ def test_failed_close_keeps_codes_and_is_retried(db, supply, fake, monkeypatch):
     with pytest.raises(C.CodesError, match="не закрыт"):
         C.run_step(db, order, st["action"], st["path"], "S")
     assert order.status == "done" and order.suz_closed_at is None     # коды остаются за поставкой
-    assert [s["action"] for s in C.steps(db, supply)] == ["close", "close"]
+    assert [s["action"] for s in C.steps(db, supply)] == ["close"]
 
 
 def test_old_orders_are_not_closed_suz_did_it_itself(db, supply, fake):
@@ -258,3 +283,36 @@ def test_test_supply_orders_are_never_closed(db, supply, fake):
                      received=1))
     db.flush()
     assert C.steps(db, supply) == []
+
+
+def test_more_than_ten_gtins_go_in_several_orders(db, supply, fake):
+    """Не больше 10 GTIN в заказе СУЗ (спецификация 3.0, 4.4.1, прим. 2)."""
+    calls, _ = fake
+    gtins = [f"046{n:010d}" for n in range(12)]
+    gtins = [g + str((10 - sum(int(c) * (3 if i % 2 == 0 else 1) for i, c in enumerate(g))) % 10)
+             for g in gtins]
+    for n, g in enumerate(gtins):
+        supply.rows.append(SupplyRow(position=10 + n, supplier_sku=f"X {n}", qty=1, extras=[""]))
+        db.add(GtinPair(supplier_sku=f"X {n}", gtin=g, source="manual"))
+    db.flush()
+    heads = C.prepare_orders(db, supply, "op")
+    sizes = [len(json.loads(h.body)["products"]) for h in heads]
+    assert sizes == [10, 4]                                   # 14 артикулов: 10 + 4
+    for h in heads:
+        C.send_order(db, h, "S")
+    assert len(calls["orders"]) == 2
+    assert {o.suz_order_id for o in db.query(CodeOrder)} == {"SUZ-1", "SUZ-2"}
+    assert all(o.status == "sent" for o in db.query(CodeOrder))
+
+
+def test_failed_order_marks_every_row_of_it(db, supply, fake, monkeypatch):
+    def refuse(*a):
+        raise chz_api.ChzApiError("заказ в СУЗ: HTTP 400: 3350", 400)
+    monkeypatch.setattr(chz_api, "create_order", refuse)
+    head = C.prepare_orders(db, supply, "op")[0]
+    with pytest.raises(C.CodesError):
+        C.send_order(db, head, "S")
+    assert [o.status for o in db.query(CodeOrder)] == ["error", "error"]
+    # Отказ СУЗ — заказа нет, недостающее заказывается снова, одним заказом.
+    again = C.prepare_orders(db, supply, "op")
+    assert len(again) == 1 and len(C.batch_of(db, again[0])) == 2

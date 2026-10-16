@@ -65,12 +65,25 @@ def _check(resp: requests.Response, what: str):
 
 # --- СУЗ ----------------------------------------------------------------------
 
-def order_body(gtin: str, quantity: int) -> str:
-    """Тело заказа как в kiz-tool (ТЗ, 7.1): lp, OPERATOR, шаблон 10, UNIT, произведено в РФ."""
+# Не больше 10 товаров (GTIN) в одном заказе, без повторов (спецификация СУЗ
+# 3.0, 4.4.1, прим. 2).
+MAX_GTINS_PER_ORDER = 10
+
+
+def order_body(items: list[tuple[str, int]]) -> str:
+    """Тело заказа как в kiz-tool (ТЗ, 7.1): lp, OPERATOR, шаблон 10, UNIT, произведено в РФ.
+
+    Несколько GTIN в одном заказе — каждый своим подзаказом. Лимит СУЗ — 100
+    активных заказов (4.4.1, прим. 3); заказ на каждый размер упирался в него
+    на одной поставке (ошибка 3350, 16.10.2026).
+    """
+    gtins = [g for g, _ in items]
+    if not items or len(items) > MAX_GTINS_PER_ORDER or len(set(gtins)) != len(gtins):
+        raise ValueError(f"в заказе СУЗ от 1 до {MAX_GTINS_PER_ORDER} разных GTIN, а не {gtins}")
     return json.dumps({
         "productGroup": PRODUCT_GROUP,
         "products": [{"gtin": gtin, "quantity": int(quantity), "serialNumberType": "OPERATOR",
-                      "templateId": TEMPLATE_ID, "cisType": "UNIT"}],
+                      "templateId": TEMPLATE_ID, "cisType": "UNIT"} for gtin, quantity in items],
         "attributes": {"releaseMethodType": "PRODUCTION"},
     }, ensure_ascii=False, separators=(",", ":"))
 
@@ -114,7 +127,8 @@ def close_path(oms_id: str) -> str:
 
 def close_body(order_id: str) -> str:
     """Тело закрытия заказа (спецификация СУЗ 3.0, 4.4.8). Без `gtin` СУЗ
-    закрывает все подзаказы — у нас в заказе один GTIN, это и есть заказ."""
+    закрывает все подзаказы заказа разом; закрываем, только когда по каждому
+    подзаказу всё получено или буфер уже закрыт (`codes._to_close`)."""
     return json.dumps({"orderId": order_id}, ensure_ascii=False, separators=(",", ":"))
 
 
