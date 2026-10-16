@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, File, Request, UploadFile
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 
+from priceapp import progress
 from priceapp import audit, etalon, settings
 from priceapp.database import get_db
 from priceapp.deps import get_current_user, posted_form
@@ -164,6 +165,7 @@ def _last_poll(db: Session) -> str:
 
 
 @router.post("/etalon/poll-now")
+@progress.tracked
 def poll_now(request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Опросить WB вне расписания: свежие цены, возврат эталона, следование площадок."""
     settings.put(db, settings.REF_POLL_NOW, "1")
@@ -175,6 +177,7 @@ def poll_now(request: Request, db: Session = Depends(get_db), user: User = Depen
 
 
 @router.post("/etalon/set")
+@progress.tracked
 def set_one(request: Request, form=Depends(posted_form), db: Session = Depends(get_db),
             user: User = Depends(get_current_user)):
     art, sale = str(form.get("art") or ""), _int(form.get("sale"))
@@ -189,6 +192,7 @@ def set_one(request: Request, form=Depends(posted_form), db: Session = Depends(g
 
 
 @router.post("/etalon/follow-now")
+@progress.tracked
 def follow_now(request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Привести все площадки к эталону — включая большой шаг (решение человека)."""
     cards = [c for c in etalon.follower_plan(db) if not c.skip and not c.follows]
@@ -208,6 +212,7 @@ def export(db: Session = Depends(get_db), user: User = Depends(get_current_user)
 
 
 @router.post("/etalon/import")
+@progress.tracked
 def import_file(request: Request, file: UploadFile = File(...), db: Session = Depends(get_db),
                 user: User = Depends(get_current_user)):
     # обычный def: синхронная работа с базой в async-обработчике заморозила бы интерфейс
@@ -246,8 +251,11 @@ def import_file(request: Request, file: UploadFile = File(...), db: Session = De
         flash(request, f"В файле {len(todo)} новых эталонов — больше {IMPORT_LIMIT} за раз. Разбейте файл.", "warn")
         return _back()
     done, refused = 0, []
+    progress.pin("Ставлю новые эталоны", total=len(todo))
     for art, sale in todo:
+        progress.stage(f"артикул {art}")
         rep = etalon.set_etalon(db, art, sale, user.username, snapshot=False)
+        progress.advance()
         if any("не записан" in r.lower() for r in rep):
             refused.append(next(r for r in rep if "не записан" in r.lower()))
         else:

@@ -450,7 +450,8 @@ def recalculate_account(db: Session, account: Account, is_test: bool = False) ->
     items = mapping.account_items(db, account.id)
     costs = {c.item_id: c for c in db.query(OnecCost).filter(OnecCost.item_id.in_(list(items)))}
     prices = {p.item_id: p for p in db.query(ProductPrice).filter(ProductPrice.account_id == account.id)}
-    for item_id, rows in items.items():
+    from priceapp import progress
+    for item_id, rows in progress.each(list(items.items()), f"Рассчитываю «{account.name}»"):
         pp = prices.get(item_id)
         last = pp.last_sent_price if pp else None
         cost = costs.get(item_id)

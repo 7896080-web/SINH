@@ -232,6 +232,8 @@ def floor_problem(rule, commission, rate, costs: dict, item_ids, new_list: int, 
 
 def follower_plan(db: Session, ets: dict[str, Etalon] | None = None, only: set | None = None) -> list[FCard]:
     """Карточки площадок-последователей, их цель и что уйдёт. `only` — только эти артикулы."""
+    from priceapp import progress
+    progress.stage("Считаю цели площадок по эталону")
     ets = ets if ets is not None else etalons(db)
     articles = article_map(db)
     lo, hi = corridor(db)
@@ -311,10 +313,12 @@ def send_followers(db: Session, cards: list[FCard], client_factory=None, actor: 
     from priceapp import accounts
     from priceapp.dispatch import _record_sent
     from priceapp.platforms import LAMODA_PUSH_CHUNK, PriceItem, lamoda_push_failures
+    from priceapp import progress
     out: dict[str, str] = {}
     by_acc: dict[int, list[FCard]] = {}
     for c in cards:
         by_acc.setdefault(c.account.id, []).append(c)
+    progress.stage("Отправляю цены на площадки", total=len(cards))
     for group in by_acc.values():
         a = group[0].account
         try:
@@ -334,6 +338,7 @@ def send_followers(db: Session, cards: list[FCard], client_factory=None, actor: 
                 except Exception as e:
                     errors.append(str(e)[:300])
                     continue
+                progress.step(len(chunk))
                 failed, unattributed = lamoda_push_failures(resp or {}, [c.key for c in chunk])
                 if unattributed and len(chunk) > 1:
                     # Ошибка без адресата (у Ламоды пустой `sku` — «не найден по parentSku») бракует
@@ -359,6 +364,7 @@ def send_followers(db: Session, cards: list[FCard], client_factory=None, actor: 
                     items.append(PriceItem(r.barcode, c.new_list, r.external_id, r.article, sale))
                     owner[r.barcode] = c
             res = client.push_prices(items) if items else {"ok": [], "errors": []}
+            progress.step(len(group))
             ok = set(res.get("ok", []))
             sent = [c for c in group if any(r.barcode in ok for r in c.rows)]
             errors = [str(e.get("detail", e))[:300] for e in res.get("errors", [])]

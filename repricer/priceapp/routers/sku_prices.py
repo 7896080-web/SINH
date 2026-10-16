@@ -29,6 +29,7 @@ from fastapi import APIRouter, Depends, File, Query, Request, UploadFile
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 
+from priceapp import progress
 from priceapp import audit, mapping, rates
 from priceapp.database import data_version, get_db, wrote_prices
 from priceapp.deps import get_current_user, posted_form
@@ -382,6 +383,7 @@ def build(db: Session, sc: dict, art: str = "", barcode: str = "", color: str = 
     """Группы в порядке ключа: артикулы (с размерами внутри) или категории. Отборы
     по тексту — по SKU, по состоянию — по группе целиком: наценка одна на группу,
     и отбор, разрезающий её, ставил бы её строкам разные решения в одной правке."""
+    progress.stage(f"Считаю цены «{sc['label']}»")
     a_l, b_l, c_l, s_l = art.strip().lower(), barcode.strip(), color.strip().lower(), size.strip().lower()
     lo, hi = _dec_or_none(mmin), _dec_or_none(mmax)
     plo, phi = _dec_or_none(pmin), _dec_or_none(pmax)          # цена на площадке сейчас (наибольшая по размерам)
@@ -527,6 +529,7 @@ def _value(raw, kind: str) -> Decimal:
 
 
 @router.post("/sku-prices/coef")
+@progress.tracked
 def save_coef(request: Request, form=Depends(posted_form), db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Наценка отмеченным артикулам или категориям (или всему отбору) в выбранном
     «где». Строка страницы — тот же путь с одной группой; пустое поле в строке —
@@ -564,7 +567,7 @@ def save_coef(request: Request, form=Depends(posted_form), db: Session = Depends
     level_category = keep["by"] == "category"
     own_level = SRC_CABINET if sc["account_id"] else SRC_ARTICLE
     changed, skipped, detached = 0, 0, 0
-    for g in chosen:
+    for g in progress.each(chosen, "Ставлю наценку"):
         if level_category and g["key"] == NO_CATEGORY:
             skipped += 1
             continue
@@ -625,6 +628,7 @@ def manual_clear(request: Request, form=Depends(posted_form), db: Session = Depe
 # --- передача на площадки ------------------------------------------------------------
 
 @router.post("/sku-prices/send")
+@progress.tracked
 def send(request: Request, form=Depends(posted_form), db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Передать новые цены отмеченных строк (или всего отбора) во все кабинеты
     «где». Это и есть подтверждение: цена встаёт в очередь отправки, как
@@ -662,7 +666,7 @@ def send(request: Request, form=Depends(posted_form), db: Session = Depends(get_
             PriceChange.account_id.in_(acc_ids), PriceChange.is_test.is_(False),
             PriceChange.status.in_(OPEN + (PriceChangeStatus.approved.value,))):
         earlier.setdefault((old.item_id, old.account_id), []).append(old)
-    for g in chosen:
+    for g in progress.each(chosen, "Ставлю цены в очередь отправки"):
         for r in g["rows"]:
             for c in r["cells"]:
                 d, acc = c["decision"], c["account"]
@@ -798,6 +802,7 @@ def export(scope: str = Query(""), art: str = Query(""), barcode: str = Query(""
 
 
 @router.post("/sku-prices/import")
+@progress.tracked
 def import_file(request: Request, file: UploadFile = File(...), form=Depends(posted_form),
                 db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     # Назад — на ту же страницу с теми же «где» и отборами: без них человек
@@ -815,7 +820,7 @@ def import_file(request: Request, file: UploadFile = File(...), form=Depends(pos
     by_key = {s["key"]: s for s in scopes(db)}
     known: dict[str, set[str]] = {}
     changed, errors = 0, []
-    for i, row in enumerate(rows, start=2):
+    for i, row in progress.each(enumerate(rows, start=2), "Применяю строки файла", total=len(rows)):
         key, scope_key, raw = _cell(row.get(key_col)), _cell(row.get(SCOPE_COL)), _cell(row.get(VALUE_COL))
         if not key or raw == "" or (not level_category and _cell(row.get("Размер"))):
             continue            # пустая наценка ничего не меняет; строки размеров — справочные

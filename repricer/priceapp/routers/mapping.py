@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, File, Query, Request, UploadFile
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 
+from priceapp import progress
 from priceapp import article_matching as am, audit, mapping, settings
 from priceapp.database import get_db
 from priceapp.deps import get_current_user, posted_form
@@ -70,6 +71,7 @@ def save_rule(account_id: int, request: Request, form=Depends(posted_form), db: 
 
 
 @router.post("/mapping/confirm/{account_id}")
+@progress.tracked
 def confirm(account_id: int, request: Request, form=Depends(posted_form), db: Session = Depends(get_db),
                   user: User = Depends(get_current_user)):
     a = db.get(Account, account_id)
@@ -80,6 +82,7 @@ def confirm(account_id: int, request: Request, form=Depends(posted_form), db: Se
     if not pairs:
         flash(request, "Ничего не выбрано.", "warn")
         return back
+    progress.stage(f"Сопоставляю баркоды: {len(pairs)}")
     created, refused = am.confirm(db, a.id, pairs, user.username)
     audit.log(db, user.username, "article_match_confirmed", label(a),
               f"создано {created}, отказано {sum(refused.values())}; {pairs[:50]}")
@@ -114,6 +117,7 @@ def _num_text(v) -> str:
 
 
 @router.post("/mapping/import/{account_id}")
+@progress.tracked
 def import_links(account_id: int, request: Request, file: UploadFile = File(...),
                  db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Ручные связи файлом вкладки «Статус»: у строк «нет в 1С» вписать ID_1С.
@@ -127,7 +131,7 @@ def import_links(account_id: int, request: Request, file: UploadFile = File(...)
         return back
     current = {r.item.barcode: r for r in mapping.build(db, a.id)}
     pairs = []
-    for row in rows:
+    for row in progress.each(rows, "Применяю строки файла"):
         barcode, item_id = _num_text(row.get("Баркод")), _cell(row.get("ID_1С"))
         r = current.get(barcode)
         if not barcode or not item_id or (r is not None and r.item_id == item_id):
@@ -165,6 +169,7 @@ def export_candidates(account_id: int, status: str = Query(""), db: Session = De
 
 
 @router.post("/mapping/candidates-import/{account_id}")
+@progress.tracked
 def import_candidates(account_id: int, request: Request, file: UploadFile = File(...),
                       db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """«Да» в «Подтвердить» — то же, что галочка и «Сопоставить выбранные»:
@@ -177,7 +182,7 @@ def import_candidates(account_id: int, request: Request, file: UploadFile = File
     if rows is None:
         return back
     pairs, errors = [], []
-    for i, row in enumerate(rows, start=2):
+    for i, row in progress.each(enumerate(rows, start=2), "Применяю строки файла", total=len(rows)):
         decision = _cell(row.get("Подтвердить (Да)")).lower()
         if decision == "":
             continue
