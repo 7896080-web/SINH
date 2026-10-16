@@ -28,9 +28,8 @@ WIDTH = 80
 CODE_EXT = (".py", ".ps1", ".ico")
 
 APPLY = r'''# {tag}: запись файлов патча в C:\direct. check — только проверка; write — запись. Запускает БЛОК APPLY.
-import base64, datetime, hashlib, io, os, py_compile, sys, tempfile
+import base64, hashlib, io, os, py_compile, sys, tempfile
 TAG = {tag!r}
-VERSION = {version!r}
 FILES = {files!r}
 KEEP = {keep!r}
 
@@ -103,9 +102,6 @@ if mode == "write":
             sys.exit(4)
         print("  записан", rel)
         n += 1
-    stamp = datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
-    with io.open(os.path.join(root, "VERSION.txt"), "w", encoding="utf-8-sig") as f:
-        f.write("%s (патч %s, поставлен %s)\n" % (VERSION, TAG, stamp))
     print("  записано файлов: %d" % n)
     sys.exit(0)
 sys.exit(1)
@@ -250,6 +246,8 @@ function Invoke-{Tag} {{
     if (-not (Start-Schedule)) {{ Fail "Файлы стоят, но расписание не поставилось — поставьте: powershell -ExecutionPolicy Bypass -File C:\direct\wb_schedule.ps1 -Server" }}
     $sc = Join-Path $Root "deploy\shortcuts.ps1"
     if (Test-Path $sc) {{ Run "powershell" @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $sc, "-Root", $Root) | Out-Null }}
+    # версия — только после успеха (при откате осталась бы чужая)
+    Set-Content -Path (Join-Path $Root "VERSION.txt") -Encoding UTF8 -Value "{version} (патч {tag}, поставлен $(Get-Date -Format 'dd.MM.yyyy HH:mm'))"
     Get-ChildItem -LiteralPath (Join-Path $Root "code_backups") -Directory | Sort-Object Name | Select-Object -SkipLast 10 | Remove-Item -Recurse -Force
     Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
     Ok "Патч {tag} поставлен: версия {version}, расписание включено"
@@ -299,7 +297,7 @@ def build(base, tag, name, also=()):
             files.append((rel, hashlib.sha256(data).hexdigest(), kind, body))
         else:
             keep.append((rel, hashlib.sha256(data.replace(b"\r\n", b"\n")).hexdigest()))
-    apply_src = APPLY.format(tag=tag, version=version, files=files, keep=keep).encode("utf-8")
+    apply_src = APPLY.format(tag=tag, files=files, keep=keep).encode("utf-8")
     c = zlib.compressobj(9, zlib.DEFLATED, -15)            # «сырой» deflate — его распаковывает .NET DeflateStream
     b64 = base64.b64encode(c.compress(apply_src) + c.flush()).decode("ascii")
     pieces = [b64[i:i + BLOCK] for i in range(0, len(b64), BLOCK)]
