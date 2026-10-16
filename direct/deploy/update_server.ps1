@@ -83,7 +83,7 @@ function Start-Schedule {
 function Test-Load {
     & $venvPy -m compileall -q -l $Root | Out-Null
     if ($LASTEXITCODE -ne 0) { return $false }
-    & $venvPy -c "import wb_bids, wb_guard, wb_common, wb_collector, yandex_token" | Out-Host
+    & $venvPy -c "import wb_bids, wb_guard, wb_common, wb_collector, wb_budget, wb_dashboard, wb_web, yandex_token" | Out-Host
     return ($LASTEXITCODE -eq 0)
 }
 
@@ -135,7 +135,7 @@ if (-not (Test-Load)) {
     Fail "Обновление отменено, работает прежняя версия ($old)"
 }
 if (-not (Start-Schedule)) { Fail "Расписание не поставилось — поставьте: powershell -ExecutionPolicy Bypass -File C:\direct\wb_schedule.ps1 -Server" }
-# ярлыки: новые страницы (например, «Бюджеты WB») появляются на рабочем столе сами
+# ярлык «Реклама WB» — на wb_web.py (дашборд и «Бюджеты»), если обновление его привезло
 $sc = Join-Path $Root "deploy\shortcuts.ps1"
 if (Test-Path $sc) { & powershell -NoProfile -ExecutionPolicy Bypass -File $sc -Root $Root | Out-Host }
 # старые копии кода — оставить последние 10
