@@ -328,7 +328,35 @@ def steps(db: Session, supply: Supply) -> list[dict]:
             action = "status"
         out.append({"order_id": o.id, "action": action, "path": path, "sign": chz_api.signed_text(path),
                     "sku": o.supplier_sku})
+    for o in _to_close(db, supply):
+        oms = o.oms_id or supply.organization.oms_id or ""
+        body = chz_api.close_body(o.suz_order_id)
+        # Подписывается тело, как при создании заказа; путь — для сверки шага.
+        out.append({"order_id": o.id, "action": "close", "path": chz_api.close_path(oms) + "#" + body,
+                    "sign": body, "sku": o.supplier_sku})
     return out
+
+
+# Незакрытый заказ СУЗ закрывает сам через 48 часов после выдачи всех кодов
+# (спецификация 3.0, 4.3, прим. 2) — закрывать старше незачем: он уже закрыт, и
+# повторное закрытие только потратило бы подпись и шаг на ошибку.
+CLOSE_WINDOW = timedelta(hours=48)
+
+
+def _to_close(db: Session, supply: Supply) -> list[CodeOrder]:
+    """Заказы, по которым получены ВСЕ коды и которые ещё не закрыты в СУЗ.
+
+    Только `done`: закрытие с невыданными кодами СУЗ оформляет как их отказ
+    (4.3, прим. 1), а у `incomplete` буфер уже закрыт самим СУЗ.
+    """
+    if supply.is_test:
+        return []           # тренировочная поставка в ЧЗ изменяющими запросами не ходит
+    return (db.query(CodeOrder).filter(CodeOrder.supply_id == supply.id,
+                                       CodeOrder.status == "done",
+                                       CodeOrder.suz_order_id != "",
+                                       CodeOrder.suz_closed_at.is_(None),
+                                       CodeOrder.created_at > now_utc() - CLOSE_WINDOW)
+            .order_by(CodeOrder.id).all())
 
 
 def run_step(db: Session, order: CodeOrder, action: str, path: str, signature: str) -> None:
@@ -338,6 +366,9 @@ def run_step(db: Session, order: CodeOrder, action: str, path: str, signature: s
     if expected is None or expected["action"] != action or expected["path"] != path:
         raise CodesError("шаг устарел — обновите страницу")
     token = suz_token(supply)
+    if action == "close":
+        _close(order, supply, token, signature)
+        return
     try:
         data = chz_api.suz_get(path, token, signature)
     except chz_api.ChzApiError as e:
@@ -361,6 +392,22 @@ def run_step(db: Session, order: CodeOrder, action: str, path: str, signature: s
     else:
         _apply_codes(db, supply, order, data)
     order.updated_at = now_utc()
+
+
+def _close(order: CodeOrder, supply: Supply, token: str, signature: str) -> None:
+    """Закрыть заказ в СУЗ. Отказ статуса заказа не меняет: коды получены, а
+    не закрытый нами заказ СУЗ закроет сам через 48 часов."""
+    try:
+        chz_api.close_order(order.oms_id or supply.organization.oms_id or "",
+                            chz_api.close_body(order.suz_order_id), token, signature)
+    except chz_api.ChzApiError as e:
+        order.error, order.updated_at = f"заказ не закрыт в СУЗ: {e}", now_utc()
+        if e.status == 401:
+            chz_auth.forget(supply.organization, "suz", token)
+        raise CodesError(order.error)
+    order.suz_closed_at = order.updated_at = now_utc()
+    order.error = ""
+    logger.info("заказ %s (%s): закрыт в СУЗ", order.id, order.suz_order_id)
 
 
 def _apply_status(order: CodeOrder, data) -> None:

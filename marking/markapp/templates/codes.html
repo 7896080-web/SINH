@@ -238,6 +238,7 @@
           errors = 0;
           if (s.action === 'codes') log(s.sku + ': получено ' + res.received + ' из ' + res.quantity
                                         + (res.error ? ' — ' + res.error : ''), res.error ? 'bad' : 'ok');
+          else if (s.action === 'close') log(s.sku + ': заказ закрыт в СУЗ', 'ok');
           else if (res.status === 'ready') log(s.sku + ': коды готовы, забираю…');
           else if (res.status === 'rejected' || res.status === 'error') log(s.sku + ': ' + res.error, 'bad');
           else waiting++;
