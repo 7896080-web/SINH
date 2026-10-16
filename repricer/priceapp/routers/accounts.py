@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 
+from priceapp import progress
 from priceapp import accounts as acc_mod, audit, platforms
 from priceapp.crypto import mask_value
 from priceapp.database import get_db
@@ -118,11 +119,13 @@ def check(account_id: int, request: Request, db: Session = Depends(get_db),
 
 
 @router.post("/api-keys/{account_id}/catalog")
+@progress.tracked
 def load_catalog(account_id: int, request: Request, db: Session = Depends(get_db),
                  user: User = Depends(get_current_user)):
     a = db.get(Account, account_id)
     if a is None:
         return _back()
+    progress.stage(f"Загружаю каталог «{a.name}» с площадки")
     try:
         st = acc_mod.load_catalog(db, a, acc_mod.client_for(db, a, CLIENT_FACTORY))
     except Exception as e:

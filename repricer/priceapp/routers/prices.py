@@ -24,6 +24,7 @@ from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 
+from priceapp import progress
 from priceapp import accounts as acc_mod, audit, mapping, overview, platforms, rates, settings
 from priceapp.database import get_db
 from priceapp.deps import get_current_user, posted_form
@@ -296,6 +297,7 @@ def export_rules(db: Session = Depends(get_db), user: User = Depends(get_current
 
 
 @router.post("/prices/rules-import")
+@progress.tracked
 def import_rules(request: Request, file: UploadFile = File(...), db: Session = Depends(get_db),
                  user: User = Depends(get_current_user)):
     rows = _read_upload(request, file, "Площадка (код)")
@@ -384,6 +386,7 @@ def export_guard(db: Session = Depends(get_db), user: User = Depends(get_current
 
 
 @router.post("/prices/guard-import")
+@progress.tracked
 def import_guard(request: Request, file: UploadFile = File(...), db: Session = Depends(get_db),
                  user: User = Depends(get_current_user)):
     """Пустая ячейка ничего не меняет, «-» снимает границу."""
@@ -425,6 +428,7 @@ def preview_guard(request: Request, db: Session = Depends(get_db), user: User = 
 
 
 @router.post("/prices/guard-run")
+@progress.tracked
 def run_guard(request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Вернуть цены по диапазонам: по уже загруженным текущим ценам ставит наши
     цены в ОТПРАВКУ (только вверх и только там, где они вернут маржинальность)."""
@@ -442,6 +446,7 @@ def product_rows(db: Session, account: Account, q: str = "", flt: str = "",
                  coef_min: str = "", coef_max: str = "") -> list[dict]:
     """Экономика по каждому SKU 1С, сопоставленному с каталогом кабинета:
     по ТЕКУЩЕЙ цене площадки и по расчётной."""
+    progress.stage(f"Считаю цены кабинета «{account.name}»")
     items = mapping.account_items(db, account.id)
     info = _sku_info(db, items)
     costs = {c.item_id: c for c in db.query(OnecCost).filter(OnecCost.item_id.in_(list(items)))}
@@ -583,6 +588,7 @@ def set_manual(account_id: int, request: Request, form=Depends(posted_form), db:
 
 
 @router.post("/prices/bulk/{account_id}")
+@progress.tracked
 def bulk_edit(account_id: int, request: Request, form=Depends(posted_form), db: Session = Depends(get_db),
                     user: User = Depends(get_current_user)):
     """Массовая правка ручных цен: по отмеченным строкам или по ВСЕМУ отбору.
@@ -626,7 +632,7 @@ def bulk_edit(account_id: int, request: Request, form=Depends(posted_form), db: 
              get_rule(db, acc.platform)) for acc in targets]
     for acc, rows, rule in plan:
         skipped += len(wanted - set(rows))
-        for item_id, r in rows.items():
+        for item_id, r in progress.each(list(rows.items()), f"Ручные цены «{acc.name}»"):
             if action == "set_manual":
                 new = value
             elif action == "clear_manual":
@@ -654,6 +660,7 @@ def bulk_edit(account_id: int, request: Request, form=Depends(posted_form), db: 
 
 
 @router.post("/prices/load-current")
+@progress.tracked
 def load_current(request: Request, account_id: str = Form(""), back: str = Form("products"),
                  form=Depends(posted_form), db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Текущие цены со всех активных кабинетов — для наценки по текущим. Только
@@ -661,7 +668,8 @@ def load_current(request: Request, account_id: str = Form(""), back: str = Form(
     from priceapp.routers import accounts as acc_router
     accs = _accounts(db)
     done, problems = [], []
-    for a in accs:
+    for n, a in enumerate(accs, 1):
+        progress.stage(f"Загружаю текущие цены: «{a.name}» ({n} из {len(accs)})")
         if a.platform not in platforms.READS_PRICES:
             problems.append(f"{a.name}: {PLATFORMS[a.platform]} — чтение цен не подключено")
             continue
@@ -724,6 +732,7 @@ def export(account_id: int, q: str = Query(""), flt: str = Query(""), coef_min: 
 
 
 @router.post("/prices/import/{account_id}")
+@progress.tracked
 def import_manual(account_id: int, request: Request, file: UploadFile = File(...), form=Depends(posted_form),
                   db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Импорт ручных цен из файла вкладки «Товары». Читается ТОЛЬКО колонка
@@ -751,7 +760,7 @@ def import_manual(account_id: int, request: Request, file: UploadFile = File(...
         return _back("products", account_id=account_id, **_keep(form))
     known = set(mapping.account_items(db, a.id))
     changed, errors = 0, []
-    for i, row in enumerate(rows, start=2):
+    for i, row in progress.each(enumerate(rows, start=2), "Применяю строки файла", total=len(rows)):
         item_id = _cell(row.get("ID_1С"))
         if not item_id:
             continue
@@ -829,6 +838,7 @@ def export_changes(view: str = Query("proposals"), account_id: str = Query(""), 
 
 
 @router.post("/prices/changes-import")
+@progress.tracked
 def import_changes(request: Request, file: UploadFile = File(...), db: Session = Depends(get_db),
                    user: User = Depends(get_current_user)):
     """Решения по предложениям файлом: «Да» — подтвердить через тот же
@@ -839,7 +849,7 @@ def import_changes(request: Request, file: UploadFile = File(...), db: Session =
         return _back("proposals")
     approved = rejected = 0
     errors = []
-    for i, row in enumerate(rows, start=2):
+    for i, row in progress.each(enumerate(rows, start=2), "Применяю решения из файла", total=len(rows)):
         decision = _cell(row.get(DECISION_COL)).lower()
         if decision == "":
             continue
@@ -945,6 +955,7 @@ def _tariff_counts(db: Session, accs) -> dict:
 
 
 @router.post("/prices/recalculate")
+@progress.tracked
 def recalculate(request: Request, account_id: str = Form(""), db: Session = Depends(get_db),
                 user: User = Depends(get_current_user)):
     accs = _accounts(db)
@@ -955,7 +966,8 @@ def recalculate(request: Request, account_id: str = Form(""), db: Session = Depe
         return _back("proposals", account_id=account_id)
     total = {"proposed": 0, "blocked": 0, "unchanged": 0, "skipped": 0}
     reasons: dict[str, int] = {}
-    for a in accs:
+    for n, a in enumerate(accs, 1):
+        progress.stage(f"Рассчитываю: «{a.name}» ({n} из {len(accs)})")
         st = recalculate_account(db, a)
         for k in total:
             total[k] += getattr(st, k)
@@ -977,6 +989,7 @@ def _ids(form) -> list[int]:
 
 
 @router.post("/prices/approve")
+@progress.tracked
 def approve_changes(request: Request, form=Depends(posted_form), db: Session = Depends(get_db),
                           user: User = Depends(get_current_user)):
     ids, account_id = _ids(form), str(form.get("account_id") or "")
@@ -992,7 +1005,8 @@ def approve_changes(request: Request, form=Depends(posted_form), db: Session = D
         flash(request, "Ничего не выбрано.", "warn")
         return _back("proposals", account_id=account_id)
     approved, refused = 0, {}
-    for ch in db.query(PriceChange).filter(PriceChange.id.in_(ids), PriceChange.is_test.is_(False)):
+    for ch in progress.each(db.query(PriceChange).filter(PriceChange.id.in_(ids), PriceChange.is_test.is_(False)).all(),
+                            "Подтверждаю предложения"):
         if ch.account and ch.account.platform == "lamoda":
             # Обычная отправка несёт только цену до скидки — скидку и её даты Ламоде ставит
             # scripts/lamoda_apply.py, и цена без них сбила бы её.
@@ -1031,6 +1045,7 @@ def reject_all(request: Request, db: Session = Depends(get_db), user: User = Dep
 
 
 @router.post("/prices/reject")
+@progress.tracked
 def reject_changes(request: Request, form=Depends(posted_form), db: Session = Depends(get_db),
                          user: User = Depends(get_current_user)):
     ids, account_id = _ids(form), str(form.get("account_id") or "")
@@ -1042,8 +1057,9 @@ def reject_changes(request: Request, form=Depends(posted_form), db: Session = De
             return _back("proposals", account_id=account_id)
         ids = [c.id for c in q]
     n = 0
-    for ch in db.query(PriceChange).filter(PriceChange.id.in_(ids), PriceChange.is_test.is_(False),
-                                           PriceChange.status.in_(OPEN + ("approved",))):
+    for ch in progress.each(db.query(PriceChange).filter(PriceChange.id.in_(ids), PriceChange.is_test.is_(False),
+                                                         PriceChange.status.in_(OPEN + ("approved",))).all(),
+                            "Отклоняю предложения"):
         ch.status = PriceChangeStatus.rejected.value
         ch.decided_by, ch.decided_at = user.username, now_utc()
         n += 1

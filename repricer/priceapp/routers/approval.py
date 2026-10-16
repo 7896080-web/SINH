@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, File, Query, Request, UploadFile
 from fastapi.responses import RedirectResponse, Response
 from sqlalchemy.orm import Session
 
+from priceapp import progress
 from priceapp import approval, audit, reference, settings
 from priceapp.database import data_version, get_db
 from priceapp.deps import get_current_user, posted_form
@@ -163,10 +164,12 @@ def page(request: Request, account_id: str = Query(""), cat: str = Query(""), ar
 
 
 @router.post("/approval/save")
+@progress.tracked
 def save(request: Request, form=Depends(posted_form), db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     acc = _account_from(db, form)
     if acc is None:
         return RedirectResponse("/approval", status_code=303)
+    progress.stage(f"Считаю цены «{acc.name}»")
     current = {r["art"]: r["margin"] for r in computed(db, acc)["rows"]}
     values, errors = {}, []
     for k in form.keys():
@@ -230,6 +233,7 @@ def export(account_id: str = Query(""), platform_all: str = Query(""), db: Sessi
 
 
 @router.post("/approval/import")
+@progress.tracked
 def import_file(request: Request, account_id: str = Query(""), file: UploadFile = File(...), db: Session = Depends(get_db),
                 user: User = Depends(get_current_user)):
     accs = _accounts(db)
@@ -240,6 +244,7 @@ def import_file(request: Request, account_id: str = Query(""), file: UploadFile 
         return _back(acc.id if acc else "")
     # Только кабинеты площадки открытого кабинета: лист сопоставляется по имени, а у WB и Ozon
     # бывают одноимённые ИП — книга Ozon ложилась в WB (аудит 14.10).
+    progress.stage("Загружаю книгу «Утверждения цен»")
     res = approval.import_workbook(db, user, data, [a for a in accs if acc is None or a.platform == acc.platform])
     audit.log(db, user.username, "approval_import", acc.name if acc else "",
               f"листов {res['sheets']}, маржинальностей {res['changed']}, экономики строк {res['econ']}, ошибок {len(res['errors'])}")
@@ -254,6 +259,7 @@ def import_file(request: Request, account_id: str = Query(""), file: UploadFile 
 
 
 @router.post("/approval/align")
+@progress.tracked
 def align(request: Request, form=Depends(posted_form), db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Общие товары кабинетов одной площадки — одна цена продавца: по эталонному кабинету (с «Яворская» в
     названии, иначе первому), а если артикула в нём нет — по наибольшей цене из кабинетов."""
@@ -263,7 +269,7 @@ def align(request: Request, form=Depends(posted_form), db: Session = Depends(get
     accs = [a for a in _accounts(db) if a.platform == acc.platform]
     master = next((a for a in accs if "Яворская" in a.name), accs[0])
     price: dict[str, dict] = {}
-    for a in accs:
+    for a in progress.each(accs, "Считаю цены кабинетов"):
         for r in computed(db, a)["rows"]:
             if r["apa"] is None or r["margin"] is None:
                 continue
