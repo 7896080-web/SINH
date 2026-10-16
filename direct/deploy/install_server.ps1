@@ -92,7 +92,7 @@ foreach ($db in @(Get-ChildItem -LiteralPath $Root -Filter "*.db" -File)) {
 $dirs = @($Root) + @(@("tools\sim", "deploy") | ForEach-Object { Join-Path $Root $_ } | Where-Object { Test-Path $_ })
 & $venvPy -m compileall -q -l @dirs | Out-Null
 if ($LASTEXITCODE -ne 0) { Fail "Скрипты не собираются (compileall) — архив неполный или испорчен" }
-& $venvPy -c "import wb_bids, wb_guard, wb_common, wb_collector, yandex_token"
+& $venvPy -c "import wb_bids, wb_guard, wb_common, wb_collector, wb_budget, wb_dashboard, wb_web, yandex_token"
 if ($LASTEXITCODE -ne 0) { Fail "Скрипты не загружаются — смотрите сообщение выше" }
 Ok "Базы целы, скрипты собираются"
 if (-not (Test-Path (Join-Path $Root "crm_config.json"))) { Warn "Нет crm_config.json — скрипты Директа и Метрики попросят токен Яндекса; WB это не мешает." }
@@ -140,7 +140,7 @@ if (-not $NoSchedule) {
     }
 }
 
-# --- 7. Ярлыки «Реклама WB» и «Бюджеты WB» ---
+# --- 7. Ярлык «Реклама WB» (дашборд и «Бюджеты») ---
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Root "deploy\shortcuts.ps1") -Root $Root
 
 Write-Host ""

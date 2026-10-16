@@ -225,14 +225,20 @@ def load_collector():
     return res
 
 
-def main():
-    if sys.stdout is None:          # запуск ярлыком через pythonw.exe — консоли нет, print некуда писать
-        sys.stdout = sys.stderr = open(HERE / "wb_dashboard_log.txt", "a", encoding="utf-8")
+def build_html(nav=""):
+    """Страница дашборда целиком. nav — переключатель «Дашборд | Бюджеты» (его вставляет wb_web.py; в файле
+    wb_dashboard.html его нет — у файла нет сервера, который показал бы страницу бюджетов)."""
     data = {"generated": dt.datetime.now().strftime("%d.%m.%Y %H:%M"), **load_db(), "autopilot": load_autopilot(),
             "recs": load_recs(), "seo": load_seo(), "collector": load_collector(),
             "has_db": DB.exists()}
     payload = json.dumps(data, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
-    OUT.write_text(TEMPLATE.replace("__DATA__", payload), encoding="utf-8")
+    return TEMPLATE.replace("__DATA__", payload).replace("<!--NAV-->", nav)
+
+
+def main():
+    if sys.stdout is None:          # запуск ярлыком через pythonw.exe — консоли нет, print некуда писать
+        sys.stdout = sys.stderr = open(HERE / "wb_dashboard_log.txt", "a", encoding="utf-8")
+    OUT.write_text(build_html(), encoding="utf-8")
     print(f"Сохранено: {OUT.name}" + ("" if DB.exists() else " (нет wb_history.db — только раздел автопилота; "
                                                              "запустите python wb_positions.py)"))
     if "--no-open" not in sys.argv:
@@ -336,10 +342,16 @@ pre { white-space: pre-wrap; font: 12px/1.45 ui-monospace, Consolas, monospace; 
   border: 1px solid var(--grid); border-radius: 6px; padding: 2px 6px; user-select: all; overflow-wrap: anywhere; }
 .bud .done { color: var(--good); font-size: 12px; }
 .hold { font-size: 12.5px; color: var(--ink2); padding: 3px 0; }
+/* переключатель страниц «Дашборд | Бюджеты» (вставляет wb_web.py) */
+.wbnav { display: flex; gap: 4px; margin: 0 0 14px; border-bottom: 1px solid var(--grid); }
+.wbnav a { padding: 8px 14px; color: var(--ink2); text-decoration: none; border-bottom: 2px solid transparent; margin-bottom: -1px; font-weight: 500; }
+.wbnav a[aria-current="page"] { color: var(--ink); border-bottom-color: var(--s1); }
+.wbnav a:hover { color: var(--ink); }
 </style>
 </head>
 <body>
 <div class="wrap">
+  <!--NAV-->
   <header>
     <h1>Реклама Wildberries</h1>
     <span class="sub" id="sub"></span>

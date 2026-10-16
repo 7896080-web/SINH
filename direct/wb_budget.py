@@ -17,7 +17,9 @@
 заказ дороже среднего, поэтому нужен запас). Одну кампанию — не чаще раза в RAISE_EVERY_DAYS дней; через столько
 дней после повышения — проверка: если цена заказа после повышения выше допустимой — предложение вернуть как было.
 Не выше MAX_FACTOR × значения в RULES без правки кода. Кабинеты эксперимента — не раньше его конца (EXPERIMENT).
-Кампании и недельный бюджет кабинета, поправленные вручную на странице «Бюджеты WB» (wb_budget_page.py), не трогает.
+Кампании и недельный бюджет кабинета, поправленные вручную на странице «Бюджеты» (wb_web.py), не трогает.
+Рекомендуемый недельный бюджет — для КАЖДОЙ кампании (и в эксперименте, для справки), см. recommend(): по фактическому
+расходу в неделю и сглаженной цене заказа против допустимой; 0 — заказов нет при расходе ≥ 2 допустимых цен заказа.
 
 Запуск:
   python wb_budget.py                     — пробный прогон: таблица и предложения, ничего не меняет
@@ -54,6 +56,12 @@ MAX_FACTOR = 3.0           # не выше ×3 от значения в RULES б
 RAISE_EVERY_DAYS = 7       # одной кампании — не чаще; через столько дней после повышения — проверка
 EXPERIMENT = {"Ребрик": "2026-10-27", "Караман": "2026-10-27"}   # до этой даты бюджеты кабинета не трогаю
 EMPTY_BUDGET = 50          # ₽: бюджет кампании за показы меньше — «пусто»
+# Рекомендуемый недельный бюджет (запрос пользователя 16.10.2026 — показывать на странице «Бюджеты» рядом с текущим):
+REC_PRIOR = 3              # цена заказа сглаживается так, будто было ещё 3 заказа по допустимой цене: при 1–2 заказах
+                           # оценка не скачет, при 30+ — почти фактическая
+REC_HEADROOM = 0.2         # окупается и денег хватает — бюджет с запасом 20% к фактическому расходу
+REC_FAIR = 1.15            # заказ дороже допустимого не больше чем на 15% — «впритык»: бюджет по фактическому расходу
+REC_STOP_SPEND = 2         # потрачено ≥ 2 допустимых цен заказа и ни одного заказа — рекомендовать 0 (остановить)
 # -------------------------------------------
 
 HERE = B.HERE
@@ -161,6 +169,68 @@ def camp_days(token, ids, d1, d2):
     return res
 
 
+def up1000(x):
+    return int(math.ceil(x / 1000.0) * 1000)
+
+
+def recommend(spend, orders, days, allowed, starving, cover, base_week, has_daily, starve_note="", cur_week=None,
+              cur_daily=None):
+    """Рекомендуемый бюджет кампании: ({"week": ₽ в неделю, "daily": ₽ в сутки или None}, пояснение) или (None, почему нет).
+      spend, orders — расход и заказы с рекламы за окно (до STATS_DAYS дней), days — дней в окне с первого расхода;
+      allowed — допустимая цена заказа (как у автопилота, с поправкой на выкуп); starving — деньги кончались до вечера
+      или исчерпан недельный потолок; cover — на сколько дней хватит товара; base_week — недельный потолок по RULES
+      (выше base_week × MAX_FACTOR не рекомендую); cur_week / cur_daily — сейчас: окупаемой кампании меньше нынешнего не
+      рекомендую (урезанный дневной лимит срезал бы сильные дни), уменьшать — только то, что не окупается."""
+    if not spend or spend < 1 or not days:
+        return None, "расхода за 14 дней не было — рекомендовать не из чего"
+    if not allowed:
+        return None, "не знаю допустимую цену заказа — рекомендовать не из чего"
+    use = spend / days * 7                                    # сколько кампания тратит в неделю на самом деле
+    cpo_s = (spend + REC_PRIOR * allowed) / (orders + REC_PRIOR)
+    q = cpo_s / allowed
+    few = " Заказов мало — вывод предварительный." if orders < MIN_ORDERS else ""
+    fact = f"За {days} дн. {rub(spend)} ₽, заказов {orders:.0f}" + (f", заказ {rub(spend / orders)} ₽" if orders else "")
+    per_week = f"{orders / days * 7:.1f}".replace(".", ",")
+    keep = cut = False                                        # окупается — не меньше нынешнего; дорого — не больше
+    if orders < 1 and spend >= REC_STOP_SPEND * allowed:
+        raw, why = 0, f"{fact} при допустимых {rub(allowed)} ₽ — ни одного заказа: остановить (0 ₽)"
+    elif orders < 1:
+        daily = (cur_daily or up100(use / 7)) if has_daily else None
+        return {"week": cur_week or up1000(use), "daily": daily}, (
+            f"{fact} — потрачено меньше {REC_STOP_SPEND} допустимых цен заказа ({rub(allowed)} ₽): рано судить, "
+            "оставить как есть." + few)
+    elif q > REC_FAIR:
+        raw, cut = orders / days * 7 * allowed, True
+        why = (f"{fact}, допустимо {rub(allowed)} ₽ — дорого: бюджет, который окупают нынешние заказы "
+               f"({per_week} в неделю × {rub(allowed)} ₽)")
+    elif q > STEPS[-1][0]:
+        raw, keep = use, True
+        why = f"{fact}, допустимо {rub(allowed)} ₽ — окупается впритык: денег не добавлять"
+    else:
+        step = next(x for lim_, x in STEPS if q <= lim_)
+        keep = True
+        if starving and cover is not None and cover / (1 + step) < MIN_COVER_DAYS:
+            raw, why = use, (f"{fact}, допустимо {rub(allowed)} ₽ — окупается, денег не хватает, но товара на "
+                             f"{cover:.0f} дн.: прибавка его быстро распродаст — денег не добавлять")
+        elif starving:
+            raw, why = use * (1 + step), (f"{fact}, допустимо {rub(allowed)} ₽ — окупается, а деньги кончаются"
+                                          f"{starve_note}: +{step:.0%} к расходу")
+        else:
+            raw, why = use * (1 + REC_HEADROOM), f"{fact}, допустимо {rub(allowed)} ₽ — окупается, денег хватает"
+    if base_week and raw > base_week * MAX_FACTOR:
+        raw = base_week * MAX_FACTOR
+        why += f"; не больше ×{MAX_FACTOR:g} от правил"
+    week = up1000(raw) if raw else 0                          # WB пополняет не меньше чем на 1 000 ₽
+    daily = (max(100, up100(raw / 7)) if raw else None) if has_daily else None   # от неокруглённой суммы
+    if keep:
+        week = max(week, cur_week or 0)
+        daily = max(daily, cur_daily) if daily and cur_daily else daily
+    if cut:
+        week = min(week, cur_week) if cur_week else week
+        daily = min(daily, cur_daily) if daily and cur_daily else daily
+    return {"week": week, "daily": daily}, why + "." + few
+
+
 def base_rule(cab, cid, camps):
     """Правило кампании по RULES без поднятых wb_budget.py лимитов."""
     now, B.RULES = B.RULES, B.RULES_BASE
@@ -229,12 +299,23 @@ def plan_cabinet(cab, token, state, ov):
         cur = {k: r.get(k) for k in B.BUDGET_KEYS}
         base = base_rule(cab, cid, camps)
         prop = {"cabinet": cab, "advert_id": cid, "name": name, "cur": cur, "cpo": cpo, "allowed": allowed}
+        spent_days = sorted(d for d, v in (stats.get(cid) or {}).items() if v.get("sum", 0) > 0)
+        n_days = (y - dt.date.fromisoformat(spent_days[0])).days + 1 if spent_days else 0
+        starve_note = (f" (в {len(short)} из {seen} дн. до {STARVE_HOUR}:00)" if len(short) >= STARVE_MIN else
+                       "; недельный потолок исчерпан" if caps_hit else "")
+        rec, rec_why = recommend(spend, orders, n_days, allowed, len(short) >= STARVE_MIN or caps_hit, cover,
+                                 base.get("topup_week_cap") if r.get("topup_below") else (base.get("daily_limit") or 0) * 7,
+                                 bool(r.get("daily_limit")), starve_note,
+                                 cur.get("topup_week_cap") if r.get("topup_below") else None, cur.get("daily_limit"))
+        if exp_on:
+            rec_why = f"Эксперимент до {exp_until[8:10]}.{exp_until[5:7]} — для справки. " + rec_why
+        prop.update(rec=rec, rec_text=rec_why, spend=spend, orders=orders, days=n_days)
         why = []
         last = raised.get(str(cid))
         man = (ov.get("manual") or {}).get(str(cid))
-        if man:                        # поправлено вручную на странице «Бюджеты WB» — ручное решение важнее автоматики
+        if man:                        # поправлено вручную на странице «Бюджеты» — ручное решение важнее автоматики
             prop.update(action="hold", text=f"поправлено вручную {man.get('date', '')[8:10]}.{man.get('date', '')[5:7]} на странице "
-                                                  "«Бюджеты WB» — не трогаю")
+                                                  "«Бюджеты» — не трогаю")
             out.append(prop)
             continue
         # проверка поднятого раньше: окупается ли после повышения
@@ -311,6 +392,15 @@ LABEL = {"daily_limit": "дневной лимит", "topup_day_cap": "попо�
 
 
 def show(props):
+    log("\n  Рекомендуемый недельный бюджет (показывается на странице «Бюджеты» в «Реклама WB»):")
+    for p in props:
+        if p.get("advert_id") == "_week_budget":
+            continue
+        r = p.get("rec")
+        cw = (p.get("cur") or {}).get("topup_week_cap")
+        log(f"    {p['cabinet']}: «{B.cut(p['name'], 30)}» ({p['advert_id']}) — "
+            + (f"{rub(r['week'])} ₽/нед" + (f", {rub(r['daily'])} ₽/сут" if r.get("daily") else "")
+               + (f" (сейчас потолок {rub(cw)})" if cw else "") if r else "—") + f": {p.get('rec_text', '')}")
     log("\n  Предложения:")
     any_ = False
     for p in props:
@@ -359,12 +449,24 @@ def apply(props, ov, only):
         "потолкам. Откат: python wb_budget.py --rollback")
 
 
+FAILED_CABS = set()        # кабинеты, по которым WB не ответил в этом запуске — их прежние предложения сохраняются
+
+
 def save_proposals(props, applied_ids=()):
-    """Предложения последнего расчёта — для дашборда (только данные, без токенов)."""
+    """Предложения последнего расчёта — для дашборда и страницы «Бюджеты» (только данные, без токенов). Кабинет, по
+    которому WB в этом запуске не ответил, остаётся с прежним расчётом (с пометкой stale), а не пропадает."""
     items = []
+    if FAILED_CABS:
+        try:
+            old = json.loads(PROPOSALS.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            old = {}
+        for it in old.get("items") or []:
+            if it.get("cabinet") in FAILED_CABS:
+                items.append(dict(it, stale=it.get("stale") or old.get("at")))
     for p in props:
         it = {k: p.get(k) for k in ("cabinet", "advert_id", "name", "action", "text", "cpo", "allowed", "cur", "new",
-                                    "add_week", "step")}
+                                    "add_week", "step", "rec", "rec_text", "spend", "orders", "days")}
         it["applied"] = str(p.get("advert_id")) in applied_ids
         items.append(it)
     try:
@@ -408,6 +510,7 @@ def main():
             props += plan_cabinet(cab, token, state, ov)
         except B.ApiError as e:
             log(f"  ✗ {cab}: {e}")
+            FAILED_CABS.add(cab)
     has = show(props)
     save_proposals(props)
     if not SPEND_LOG.exists():

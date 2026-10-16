@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-    Сервер: ярлыки «Реклама WB» (дашборд) и «Бюджеты WB» (недельные потолки и лимиты кампаний) на рабочем столе.
+    Сервер: ярлык «Реклама WB» на рабочем столе — дашборд и страница «Бюджеты» (wb_web.py).
 
 .DESCRIPTION
     Браузер указывается ЯВНО (Chrome, Edge, Яндекс, Firefox): на Windows Server браузер по умолчанию — Internet
@@ -52,7 +52,14 @@ function Make-Link($title, $script, $iconName, $desc) {
     Ok "Ярлык «$title» ($desk)"
 }
 
-Make-Link "Реклама WB" "wb_dashboard.py" "wb_dashboard.ico" "Дашборд рекламы Wildberries: пересобрать и открыть"
-Make-Link "Бюджеты WB" "wb_budget_page.py" "wb_budget_page.ico" "Недельные потолки пополнений и дневные лимиты кампаний WB: проверить и поправить"
+# «Реклама WB» — дашборд и страница «Бюджеты» (wb_web.py); без wb_web.py — как раньше, файл дашборда
+if (Test-Path (Join-Path $Root "wb_web.py")) {
+    Make-Link "Реклама WB" "wb_web.py" "wb_dashboard.ico" "Реклама Wildberries: дашборд и бюджеты кампаний"
+} else {
+    Make-Link "Реклама WB" "wb_dashboard.py" "wb_dashboard.ico" "Дашборд рекламы Wildberries: пересобрать и открыть"
+}
+# отдельного ярлыка «Бюджеты WB» нет (решение пользователя 16.10.2026: страница внутри «Реклама WB»)
+$old = Join-Path $desk "Бюджеты WB.lnk"
+if (Test-Path $old) { Remove-Item $old -Force }
 if ($browser) { Ok "Браузер ярлыков: $browser" }
 else { Warn "Chrome/Edge/Яндекс не найден — ярлыки откроют браузер по умолчанию (Internet Explorer: страницы могут не работать)." }
