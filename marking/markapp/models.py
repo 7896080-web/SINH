@@ -332,6 +332,10 @@ class CodeOrder(Base):
     # Сколько кодов СУЗ сообщил готовыми (availableCodes) — больше не просим.
     available = Column(Integer, nullable=True)
     received = Column(Integer, nullable=False, default=0)
+    # Когда заказ закрыт в СУЗ после получения всех кодов (codes.steps,
+    # действие close). Пусто — не закрывали: либо коды ещё идут, либо заказ
+    # старше окна и СУЗ закрыл его сам.
+    suz_closed_at = Column(DateTime, nullable=True)
     error = Column(Text, nullable=False, default="")
     created_by = Column(String(64), nullable=False, default="")
     created_at = Column(DateTime, nullable=False, default=now_utc)

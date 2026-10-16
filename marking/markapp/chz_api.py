@@ -108,6 +108,34 @@ def create_order(oms_id: str, body: str, client_token: str, signature: str) -> s
     return order_id
 
 
+def close_path(oms_id: str) -> str:
+    return f"/order/close?omsId={quote(oms_id)}"
+
+
+def close_body(order_id: str) -> str:
+    """Тело закрытия заказа (спецификация СУЗ 3.0, 4.4.8). Без `gtin` СУЗ
+    закрывает все подзаказы — у нас в заказе один GTIN, это и есть заказ."""
+    return json.dumps({"orderId": order_id}, ensure_ascii=False, separators=(",", ":"))
+
+
+def close_order(oms_id: str, body: str, client_token: str, signature: str) -> None:
+    """Закрыть заказ в СУЗ. Подписывается тело — как при создании заказа.
+
+    Зачем: у участника не больше 100 активных заказов (4.4.1, прим. 3), а
+    незакрытый заказ СУЗ закрывает сам лишь через 48 часов после выдачи всех
+    кодов (4.3, прим. 2). Заказ на каждый размер, поставка на полсотни размеров
+    — и через день новые заказы встают с ошибкой 3350 (16.10.2026).
+    """
+    headers = _suz_headers(client_token, signature) | {"Content-Type": "application/json"}
+    try:
+        resp = requests.post(f"{SUZ_URL}{close_path(oms_id)}", data=body.encode("utf-8"),
+                             headers=headers, proxies=_proxies(),
+                             allow_redirects=False, timeout=60)
+    except requests.RequestException as e:
+        raise ChzApiError(f"СУЗ недоступен: {type(e).__name__}")
+    _check(resp, "закрытие заказа в СУЗ")
+
+
 def suz_get(path: str, client_token: str, signature: str):
     try:
         resp = requests.get(f"{SUZ_URL}{path}", headers=_suz_headers(client_token, signature),

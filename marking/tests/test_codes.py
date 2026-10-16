@@ -1,13 +1,14 @@
 """Коды поставки: заказ в СУЗ, получение, статусы, ввод в оборот. ЧЗ подменён."""
 import base64
 import json
-from datetime import date
+from datetime import date, timedelta
 
 import pytest
 
 from markapp import chz_api, chz_auth, codes as C, settings
 from markapp.crypto import decrypt_value
 from markapp.models import CodeOrder, GtinPair, IntroduceDoc, MarkCode, Supply, SupplyRow
+from markapp.timeutils import now_utc
 
 GTIN_A, GTIN_B = "04620180403734", "04630688318072"
 GS = "\x1d"
@@ -19,7 +20,7 @@ def full(gtin, n):
 
 @pytest.fixture
 def fake(monkeypatch):
-    calls = {"orders": [], "gets": [], "cises": [], "docs": []}
+    calls = {"orders": [], "gets": [], "cises": [], "docs": [], "closes": []}
     state = {"buffer": "PENDING", "codes": {}, "cises": {}, "doc_status": "CHECKED_OK"}
 
     def create_order(oms, body, token, sig):
@@ -43,6 +44,8 @@ def fake(monkeypatch):
         return "DOC-1"
 
     monkeypatch.setattr(chz_api, "create_order", create_order)
+    monkeypatch.setattr(chz_api, "close_order",
+                        lambda oms, body, token, sig: calls["closes"].append((oms, body, token, sig)))
     monkeypatch.setattr(chz_api, "suz_get", suz_get)
     monkeypatch.setattr(chz_api, "cises_info", cises_info)
     monkeypatch.setattr(chz_api, "create_document", create_document)
@@ -111,6 +114,15 @@ def test_full_cycle_order_codes_statuses_introduce(db, supply, fake):
     assert code.cis == f"01{GTIN_A}21{1:013d}" and GS not in code.cis
     assert decrypt_value(code.full_enc) == full(GTIN_A, 1) and "EE10" not in code.full_enc
     # Внеочередная копия запускается маршрутом ПОСЛЕ коммита — test_audit_fixes.
+    # Все коды получены — заказы закрываются в СУЗ (лимит 100 активных заказов);
+    # подписывается тело, как при создании заказа.
+    closes = C.steps(db, supply)
+    assert [s["action"] for s in closes] == ["close", "close"]
+    assert closes[0]["sign"] == '{"orderId":"SUZ-1"}'
+    for st in closes:
+        C.run_step(db, db.get(CodeOrder, st["order_id"]), st["action"], st["path"], "SIG-CLOSE")
+    assert calls["closes"][0] == ("OMS-1", '{"orderId":"SUZ-1"}', "S-TOKEN", "SIG-CLOSE")
+    assert all(o.suz_closed_at for o in db.query(CodeOrder))
     assert C.steps(db, supply) == []
 
     # Нанесение ещё не пришло — ввести нечего.
@@ -189,3 +201,60 @@ def test_codes_page_renders(client, db, supply, fake):
     assert "Итог ввода в оборот" in r.text and "A 1" in r.text and "коды не заказаны" in r.text
     r = client.post(f"/supplies/{supply.id}/codes/order-prepare")
     assert r.status_code == 200 and len(r.json()["orders"]) == 2
+
+
+def test_order_is_closed_only_with_every_code_received(db, supply, fake):
+    """Закрытие с невыданными кодами СУЗ оформляет как отказ от них (спецификация
+    3.0, 4.3, прим. 1) — закрываем только заказ, где получено всё."""
+    calls, state = fake
+    for o in C.prepare_orders(db, supply, "op"):
+        C.send_order(db, o, "S")
+    state["buffer"] = "ACTIVE"
+    state["codes"] = {GTIN_A: [full(GTIN_A, 1)], GTIN_B: [full(GTIN_B, 3)]}   # у A 1 из 2
+    for _ in range(2):
+        for st in C.steps(db, supply):
+            if st["action"] != "close":
+                C.run_step(db, db.get(CodeOrder, st["order_id"]), st["action"], st["path"], "S")
+    closes = [s for s in C.steps(db, supply) if s["action"] == "close"]
+    assert [s["sku"] for s in closes] == ["B 1"]
+
+
+def test_failed_close_keeps_codes_and_is_retried(db, supply, fake, monkeypatch):
+    calls, state = fake
+    for o in C.prepare_orders(db, supply, "op"):
+        C.send_order(db, o, "S")
+    state["buffer"] = "ACTIVE"
+    state["codes"] = {GTIN_A: [full(GTIN_A, 1), full(GTIN_A, 2)], GTIN_B: [full(GTIN_B, 3)]}
+    for _ in range(2):
+        for st in C.steps(db, supply):
+            if st["action"] != "close":
+                C.run_step(db, db.get(CodeOrder, st["order_id"]), st["action"], st["path"], "S")
+
+    def refuse(*a):
+        raise chz_api.ChzApiError("закрытие заказа в СУЗ: HTTP 400: ...", 400)
+    monkeypatch.setattr(chz_api, "close_order", refuse)
+    st = C.steps(db, supply)[0]
+    order = db.get(CodeOrder, st["order_id"])
+    with pytest.raises(C.CodesError, match="не закрыт"):
+        C.run_step(db, order, st["action"], st["path"], "S")
+    assert order.status == "done" and order.suz_closed_at is None     # коды остаются за поставкой
+    assert [s["action"] for s in C.steps(db, supply)] == ["close", "close"]
+
+
+def test_old_orders_are_not_closed_suz_did_it_itself(db, supply, fake):
+    calls, state = fake
+    for o in C.prepare_orders(db, supply, "op"):
+        C.send_order(db, o, "S")
+    for o in db.query(CodeOrder):
+        o.status, o.received = "done", o.quantity
+        o.created_at = now_utc() - timedelta(hours=49)
+    assert C.steps(db, supply) == []
+
+
+def test_test_supply_orders_are_never_closed(db, supply, fake):
+    supply.is_test = True
+    db.add(CodeOrder(supply_id=supply.id, organization_id=supply.organization_id, supplier_sku="A 1",
+                     gtin=GTIN_A, quantity=1, body="{}", status="done", suz_order_id="SUZ-X",
+                     received=1))
+    db.flush()
+    assert C.steps(db, supply) == []
