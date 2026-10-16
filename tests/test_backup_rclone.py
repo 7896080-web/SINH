@@ -230,3 +230,39 @@ def test_the_cloud_failure_reaches_the_reader(tmp_path, configured, monkeypatch)
     # Сам бэкап НЕ считается неудачным: локальная копия снята и прочитана.
     assert result.ok
     assert "облако" in result.mirror_error
+
+
+def test_the_neighbours_in_a_shared_bucket_are_invisible_to_the_prune(
+        copy, configured, monkeypatch):
+    """Бакет ОБЩИЙ на все программы сервера, и уборка их не видит.
+
+    Свойство «имя, которое не разбирается, не удаляем никогда» было и раньше —
+    ради копии, положенной человеком руками. С переездом в Selectel S3 ценой
+    его потери стали ЧУЖИЕ БЭКАПЫ: в `awer-backups` рядом с нашей папкой лежат
+    репрайсер, финпомощник, CRM, direct и маркировка (`BACKUPS.md`), и ошибка
+    тут не «удалили лишний файл», а «у соседней программы копий больше нет».
+    Поэтому проверка идёт настоящими именами соседей, и по СЛЕДСТВИЮ — какие
+    команды ушли в облако.
+
+    Видит их уборка только при пути в корень бакета (опечатка в «Пути в
+    облаке»), и это ровно тот случай, когда свойство обязано держать.
+    """
+    fake = FakeRun(listing=[
+        _entry(copy.name, 1024),
+        _entry("repricer", 0), _entry("financebot", 0), _entry("awer_crm", 0),
+        _entry("direct", 0), _entry("marking", 0), _entry("sync_admin", 0),
+        _entry("repricer-20260101-120000.db", 10),
+        _entry("finance-20260101-120000.db", 10),
+        _entry("marking.db", 10),
+    ])
+    monkeypatch.setattr(subprocess, "run", fake)
+    monkeypatch.setenv("BACKUP_MIRROR_KEEP_DAILY", "1")
+    monkeypatch.setenv("BACKUP_MIRROR_KEEP_WEEKLY", "0")
+
+    assert backup.upload_to_remote(copy) == ""
+
+    deleted = [c[-1] for c in fake.calls
+               if c[c.index("--log-level") + 2] == "deletefile"]
+    assert deleted == [], (
+        "уборка Sync Admin потянулась за чужими копиями в общем бакете: "
+        + str(deleted))

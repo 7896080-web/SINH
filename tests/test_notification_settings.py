@@ -424,3 +424,28 @@ def test_the_page_shows_where_copies_land_and_does_not_let_it_be_changed(
     from app.models import AppSetting
     assert web_db.query(AppSetting).filter(
         AppSetting.key == "BACKUP_DIR").count() == 0
+
+
+def test_the_setup_hint_and_the_field_name_the_same_remote(logged_in_client):
+    """Подсказка «как настроить» и пример в поле обязаны называть ОДНО имя.
+
+    Разойдись они — человек заведёт в `rclone config` одно имя, а в «Путь в
+    облаке» впишет другое, и выгрузка откажет с «rclone не найден такой
+    remote» в суточном задании, то есть там, куда не смотрят. Страница тут
+    единственная инструкция: сервер человек видит по RDP, бумажки рядом нет.
+
+    Имя берётся ИЗ ПОЛЯ, а не повторяется строкой: повтори проверка имя у
+    себя, она однажды согласилась бы ровно в тот день, когда площадку сменили,
+    — а площадка уже менялась дважды за неделю (Яндекс.Диск → WebDAV →
+    Selectel S3).
+    """
+    field = next(f for f in settings_store.RCLONE_FIELDS
+                 if f.name == "BACKUP_RCLONE_REMOTE")
+    remote = field.placeholder.split(":")[0]
+
+    page = logged_in_client.get("/notifications").text
+
+    assert field.placeholder in page, "пример пути со страницы исчез"
+    assert f">{remote}<" in page, (
+        f"поле предлагает «{field.placeholder}», а подсказка «как настроить» "
+        f"называет другое имя remote — человек заведёт одно, впишет другое")

@@ -141,3 +141,79 @@ def test_the_missing_mark_is_not_guessed(base, tmp_path, monkeypatch):
     out = _run(base, tmp_path)
 
     assert "не было ни разу" in out
+
+
+# ---------------------------------------------------------- тип облака
+
+def _probe_module():
+    """Импортировать сам скрипт как модуль.
+
+    Здесь — В ОТЛИЧИЕ от остальных тестов файла — проверка идёт в процессе, а
+    не подпроцессом, и причина платформенная: чтобы пройти по этой ветке,
+    подпроцессу нужен подставной `rclone.exe`. Исполняемая заглушка — это либо
+    `#!/bin/sh` (не запустится на боевом Windows), либо `.bat` (не запустится
+    здесь), то есть тест был бы зелёным на одной машине и красным на другой —
+    ровно то, чем останавливается накат. Предмет при этом сохраняется: мы
+    проверяем НАПЕЧАТАННУЮ строку, а не то, что вернула функция.
+    """
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("probe_mirror", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_s3_does_not_answer_about_and_that_is_not_a_refusal(db, monkeypatch,
+                                                            capsys, tmp_path):
+    """`about` умеет Яндекс.Диск, а S3 — нет, и это НЕ отказ доступа.
+
+    Отдельный вопрос про корень оставлен не зря: 12.10 разбор развело именно
+    то, что корень отвечал, а папка нет. Но с переездом на Selectel S3 тот же
+    вызов отказывает ВСЕГДА — и строка «доступ к облаку: ОТКАЗ» висела бы на
+    полностью исправной системе, в скрипте, который открывают, когда уже беда.
+    Проверка, кричащая на исправном, кончается тем, что её перестают читать.
+    """
+    probe = _probe_module()
+    monkeypatch.setenv("BACKUP_RCLONE_REMOTE", "selectel:awer-backups/sync_admin")
+    monkeypatch.setenv("BACKUP_RCLONE_EXE", str(tmp_path / "rclone.exe"))
+    monkeypatch.setenv("BACKUP_RCLONE_CONFIG", str(tmp_path / "rclone.conf"))
+
+    def answer(exe, config, args, timeout=None):
+        if args[0] == "about":
+            return False, ("rclone вернул 1: Error: S3 bucket awer-backups "
+                           "path sync_admin doesn't support about")
+        return True, '[{"Name": "sync_admin-20261016-030000.db", "Size": 10}]'
+
+    monkeypatch.setattr(probe, "_run_rclone", answer)
+
+    probe._cloud(db)
+    out = capsys.readouterr().out
+
+    assert "доступ к облаку: ОТКАЗ" not in out, (
+        "S3 про свободное место не отвечает вовсе — назвав это отказом, скрипт "
+        "ругался бы на исправную площадку:\n" + out)
+    assert "не спросить" in out, "и умолчать об этом тоже нельзя"
+    assert "копий 1" in out, "а про папку скрипт обязан ответить как обычно"
+
+
+def test_a_real_refusal_of_the_root_is_still_a_refusal(db, monkeypatch, capsys,
+                                                       tmp_path):
+    """Обратная сторона: послабление не должно глушить настоящий отказ.
+
+    Без этой половины «не спросить» однажды накрыло бы и отозванный ключ — то
+    есть ровно тот случай, ради которого вопрос про корень и задаётся.
+    """
+    probe = _probe_module()
+    monkeypatch.setenv("BACKUP_RCLONE_REMOTE", "selectel:awer-backups/sync_admin")
+    monkeypatch.setenv("BACKUP_RCLONE_EXE", str(tmp_path / "rclone.exe"))
+    monkeypatch.setenv("BACKUP_RCLONE_CONFIG", str(tmp_path / "rclone.conf"))
+
+    monkeypatch.setattr(probe, "_run_rclone", lambda *a, **kw: (
+        False, "rclone вернул 1: https response error StatusCode: 403, "
+               "api error SignatureDoesNotMatch"))
+
+    probe._cloud(db)
+    out = capsys.readouterr().out
+
+    assert "доступ к облаку: ОТКАЗ" in out
+    assert "БАЛАНС" in out, "причина обязана быть названа, а не только код"

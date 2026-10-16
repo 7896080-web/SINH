@@ -89,9 +89,10 @@
         «Диагностике», и появится находка отчёта.
         <br><br>
         Настраивается один раз в консоли: <span class="mono">rclone config</span> →
-        <span class="mono">n</span> → имя (например <span class="mono">yandex</span>) →
-        выбрать Yandex Disk → браузерная авторизация. <b>Токен остаётся у rclone</b>, в
-        нашу базу он не попадает: rclone сам его выдаёт и сам обновляет.
+        <span class="mono">n</span> → имя (сейчас <span class="mono">selectel</span>) →
+        тип <span class="mono">s3</span> → провайдер <b>Selectel</b> → ключ доступа и
+        секрет сервисного пользователя. <b>Ключ остаётся у rclone</b>, в нашу базу он
+        не попадает — и класть его туда не нужно.
         <br><br>
         Файл <span class="mono">rclone.conf</span> хранит доступ к вашему облаку —
         в само облако его класть нельзя, как и <span class="mono">.env</span>.

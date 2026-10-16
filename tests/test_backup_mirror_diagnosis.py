@@ -149,6 +149,74 @@ def test_a_known_refusal_is_named(said, expected):
     assert expected in backup.cloud_gist(said, "yandex:backups")
 
 
+# Дословные формы, которыми код печатает aws-sdk внутри rclone, — то есть то,
+# что мы увидим от Selectel S3. Их ДВЕ, потому что rclone сменил поколение
+# sdk: старые сборки пишут «status code: 403», новые — «StatusCode: 403».
+# Обе мимо прежнего выражения (двоеточие, слипшееся слово), и обе читались как
+# «код не разобран».
+S3_REFUSALS = [
+    ("ERROR : sync_admin-20261016-030000.db: Failed to copy: "
+     "SignatureDoesNotMatch: The request signature we calculated does not "
+     "match the signature you provided.\n\tstatus code: 403, request id: "
+     "4442587FB7D0A2F9, host id: xyz", 403, "не пускает"),
+    ("ERROR : Failed to copy: operation error S3: PutObject, https response "
+     "error StatusCode: 403, RequestID: 4442587F, HostID: xyz, api error "
+     "SignatureDoesNotMatch: ...", 403, "не пускает"),
+    ("ERROR : operation error S3: ListObjectsV2, https response error "
+     "StatusCode: 404, RequestID: 1, api error NoSuchBucket: The specified "
+     "bucket does not exist", 404, "там нет"),
+    ("ERROR : operation error S3: PutObject, https response error "
+     "StatusCode: 507, api error InsufficientStorage", 507, "кончилось место"),
+    ("ERROR : operation error S3: PutObject, https response error "
+     "StatusCode: 503, api error SlowDown: Please reduce your request rate.",
+     503, "проходит само"),
+]
+
+
+@pytest.mark.parametrize("said, code, expected", S3_REFUSALS)
+def test_the_new_site_speaks_a_different_dialect(said, code, expected):
+    """Разбор кодов писался под WebDAV Яндекса, а площадка сменилась на S3.
+
+    И это главное про всю эту правку: форма кода зависит от БЭКЕНДА rclone, а
+    не от того, что мы вызываем. Пока формы S3 не разбирались, `cloud_gist`
+    отдавал пустую строку на КАЖДЫЙ отказ новой площадки — то есть наверх шёл
+    сырой текст, а он читается как поломка настройки, и человек идёт чинить
+    то, что не ломалось. Ровно тот час разбора, который 12.10 стоил мозаики.
+
+    Молчание разбора при этом неотличимо от честного «незнакомый код не
+    выдумываем», поэтому проверка нужна на каждую форму отдельно.
+    """
+    assert backup.cloud_code(said) == code, said
+    assert expected in backup.cloud_gist(said, "selectel:awer-backups/sync_admin")
+
+
+def test_a_closed_account_is_named_next_to_a_revoked_key():
+    """У 403 на Selectel второе прочтение, и оно дороже первого.
+
+    При нулевом балансе доступ закрывают, а через тридцать суток УДАЛЯЮТ
+    данные (`BACKUPS.md`). `rclone config` этого не лечит, и человек, читающий
+    подсказку буквально, потратил бы на перенастройку ключа те дни, которые
+    есть у копий. Тот же приём, что у 410: у отказа два прочтения, и умолчать
+    о втором нельзя.
+    """
+    gist = backup.cloud_gist("https response error StatusCode: 403", "selectel:b")
+
+    assert "БАЛАНС" in gist
+    assert "rclone config" in gist, "первое прочтение тоже никуда не делось"
+
+
+def test_a_wrong_bucket_name_is_among_the_readings_of_404():
+    """У S3 папок нет, а 404 отвечает НЕВЕРНОЕ ИМЯ БАКЕТА.
+
+    Прежний текст предлагал только `rclone mkdir` — то есть создать бакет
+    поверх опечатки в «Пути в облаке», вместо того чтобы опечатку найти.
+    """
+    gist = backup.cloud_gist("api error NoSuchBucket, StatusCode: 404",
+                             "selectel:awer-bakcups/sync_admin")
+
+    assert "бакета" in gist
+
+
 def test_a_transient_refusal_says_it_passes_by_itself():
     """410 — отказ платформы, и человеку надо сказать именно это.
 

@@ -32,8 +32,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pathlib import Path                                      # noqa: E402
 
-from app.backup import (_parse_moment, _run_rclone, backup_dir,  # noqa: E402
-                        cloud_gist, last_backup, mirror_dir,
+from app.backup import (_parse_moment, _run_rclone, about_unsupported,  # noqa: E402
+                        backup_dir, cloud_gist, last_backup, mirror_dir,
                         rclone_settings)
 from app.database import SessionLocal                         # noqa: E402
 from app.models import WorkerHeartbeat                        # noqa: E402
@@ -114,6 +114,13 @@ def _cloud(db) -> bool:
     ok, said = _run_rclone(exe, config, ["about", root])
     if ok:
         print("  доступ к облаку: есть")
+    elif about_unsupported(said):
+        # Третий исход, и он НЕ отказ: S3 про свободное место не отвечает
+        # вовсе. Назови мы это отказом, строка висела бы на исправной системе
+        # — а скрипт читают, когда уже беда, и ложная строка в нём съедает
+        # доверие ко всем остальным.
+        print("  доступ к облаку: не спросить -- этот тип облака (S3) про")
+        print("    свободное место не отвечает; смотрите строку про папку ниже")
     else:
         # Корень и папка — РАЗНЫЕ вопросы, и 12.10 именно это и развело разбор:
         # `about` отвечал, а папка — нет. Печатаем оба, иначе «облако не
