@@ -161,6 +161,32 @@ def flags(state, cid):
     return out
 
 
+def managed(rules, cab, cid, camps, state):
+    """(под управлением автопилота?, почему нет) — так же, как кампании выбирает wb_bids.plan_cabinet: по своему правилу
+    (номер или название) — в любом статусе; по общему «*» — только работающая или стоящая на паузе программы (лимит,
+    график расхода). Остальное на паузе автопилот не трогает (кроме паузы из-за пустого бюджета — тогда пополнит)."""
+    r = rules.get(cab) or {}
+    today = dt.date.today().isoformat()
+    for k, v in r.items():
+        if k == "*" or k.startswith("_") or (v.get("until") and today > v["until"]):
+            continue
+        ids = B.find(camps, k)
+        if cid in ids:
+            if len(ids) > 1:
+                return False, f"правило «{k}» подходит к нескольким кампаниям — автопилот их пропускает"
+            return True, ""
+    if "*" not in r:
+        return False, "нет в правилах автопилота"
+    if cid in {c for k in r.get("_except") or [] for c in B.find(camps, k)}:
+        return False, "в исключениях «_except»"
+    st = (camps.get(cid) or {}).get("_status")
+    if st == 9 or (st == 11 and (B.limit_paused(state, cid) or B.pace_paused(state, cid))):
+        return True, ""
+    if st == 11 and str(cid) in (state.get("managed") or {}):
+        return False, "на паузе — автопилот запустит её, только если кончились деньги (в бюджете меньше 100 ₽)"
+    return False, ("на паузе" if st == 11 else STATUS.get(st, "не работает")) + " — общее правило «*» ведёт только работающие"
+
+
 def collect():
     """Всё для страницы «Бюджеты»: кабинеты, кампании с артикулами, текущие и «по правилам» значения, пополнения
     за 7 дней, рекомендации wb_budget.py."""
@@ -211,7 +237,9 @@ def collect():
                    "nms": [{"nm": n, "vendor": (prod.get(n) or ("", ""))[0], "title": (prod.get(n) or ("", ""))[1]}
                            for n in nms]}
             r = rule_of(rules, cab, cid, camps)
-            if r is None:
+            ok, why = managed(rules, cab, cid, camps, state)
+            if r is None or not ok:
+                row["why"] = why or "нет в правилах автопилота"
                 c["other"].append(row)
                 continue
             base = rule_of(B.RULES_BASE, cab, cid, camps) or {}
@@ -697,7 +725,7 @@ input.v.changed{background:var(--chg);border-color:var(--warn)}.hint{font-size:1
 button.b{padding:6px 12px;border-radius:8px;border:1px solid var(--ring);background:var(--surface);color:var(--ink);font:inherit;cursor:pointer}
 button.b.p{background:var(--ink);border-color:var(--ink);color:var(--surface)}button.b.sm{padding:2px 8px;font-size:12px;margin-top:4px}
 button.b:disabled{opacity:.45;cursor:default}
-details.other{padding:8px 14px}summary{cursor:pointer;color:var(--ink2);font-size:13px}
+details.other{padding:8px 14px}details.other .why{font-size:12px;color:var(--ink2);margin-top:2px}summary{cursor:pointer;color:var(--ink2);font-size:13px}
 .bar{position:sticky;bottom:0;background:var(--surface);border-top:1px solid var(--ring);padding:10px 16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:0 -16px}
 #plan .box{border-radius:10px;padding:10px 14px;margin:0 0 10px}.box ul{margin:4px 0;padding-left:18px}
 .box.e{background:var(--bad-wash);color:var(--bad)}.box.w{background:var(--warn-wash);color:var(--warn)}
@@ -715,7 +743,7 @@ details.other{padding:8px 14px}summary{cursor:pointer;color:var(--ink2);font-siz
 <div class="seg" role="group" aria-label="Тема"><button data-theme-btn="auto" aria-pressed="true">Авто</button><button data-theme-btn="light" aria-pressed="false">Светлая</button><button data-theme-btn="dark" aria-pressed="false">Тёмная</button></div></header>
 <div class="sub" id="recinfo"></div>
 <div class="tools"><input type="search" id="q" placeholder="Найти: номер кампании, артикул, название…">
-<label class="sub"><input type="checkbox" id="act"> только работающие</label><span class="sub" id="cnt"></span></div>
+<label class="sub"><input type="checkbox" id="mine" checked> только под управлением</label><label class="sub"><input type="checkbox" id="act"> только работающие</label><span class="sub" id="cnt"></span></div>
 <div id="cabs"></div><div id="plan"></div>
 <div class="bar"><button class="b p" id="chk" disabled>Проверить изменения</button><button class="b" id="save" disabled>Сохранить</button>
 <button class="b" id="reset" disabled>Сбросить правки</button>
@@ -758,6 +786,7 @@ function render(){const el=document.getElementById("cabs");el.innerHTML="";
    rsum=act.reduce((a,r)=>a+(r.rec?r.rec.week:(r.cur.topup_week_cap||0)),0);
   let h=`<div class="cabhead"><h2>${esc(c.cab)}</h2>`+(c.experiment?`<span class="pill w">эксперимент до ${dm(c.experiment)}</span>`:"")+
    (wb.cur!=null?`<span>Недельный бюджет кабинета ${inp(c.cab,"_week_budget","_week_budget",wb.cur,wb.base)}</span><span class="sub">пополнено за 7 дн.: ${fmt(wb.topped)} ₽</span>`:`<span class="sub">недельного бюджета кабинета нет</span>`)+
+   `<span class="sub">под управлением ${c.camps.length} из ${c.camps.length+c.other.length}</span>`+
    `<span class="sub">недельные потолки работающих: ${fmt(sum)} ₽ · рекомендуется ${fmt(rsum)} ₽</span><span class="spacer"></span>`+
    `<button class="b sm" data-takeall="${esc(c.cab)}">Взять все рекомендации кабинета</button></div>`;
   h+=`<div class="scroll"><table><thead><tr><th>Кампания</th><th>Артикулы в кампании</th><th class="num">Дневной лимит, ₽</th><th class="num">Пополнений в сутки, ₽</th><th class="num wk">Недельный потолок, ₽</th><th>Рекомендуется</th><th class="num">Пополнено за 7 дн.</th></tr></thead><tbody>`;
@@ -769,7 +798,7 @@ function render(){const el=document.getElementById("cabs");el.innerHTML="";
    `<td>${recCell(c.cab,r)}</td><td class="num">${r.topup?fmt(r.topped)+" из "+fmt(r.cur.topup_week_cap):'<span class="muted">без пополнений</span>'}</td></tr>`});
   h+=`</tbody></table></div>`;
   if(c.other.length)h+=`<details class="other"><summary>Не под управлением автопилота — только для справки (${c.other.length})</summary><div class="scroll"><table><tbody>`+
-   c.other.map(r=>`<tr data-hay="${esc((r.id+" "+r.name+" "+r.nms.map(x=>x.vendor+" "+x.nm).join(" ")).toLowerCase())}" data-act="${r.active?1:0}"><td><div class="cid">${r.id}</div><div class="name">${esc(r.name)}</div><div class="badges"><span class="pill">${r.pay}</span><span class="pill">${r.status}</span></div></td><td>${arts(r.nms)}</td></tr>`).join("")+`</tbody></table></div></details>`;
+   c.other.map(r=>`<tr data-hay="${esc((r.id+" "+r.name+" "+r.nms.map(x=>x.vendor+" "+x.nm).join(" ")).toLowerCase())}" data-act="${r.active?1:0}"><td><div class="cid">${r.id}</div><div class="name">${esc(r.name)}</div><div class="badges"><span class="pill">${r.pay}</span><span class="pill">${r.status}</span></div><div class="why">${esc(r.why||"")}</div></td><td>${arts(r.nms)}</td></tr>`).join("")+`</tbody></table></div></details>`;
   s.innerHTML=h;el.appendChild(s)});
  document.querySelectorAll("input.v").forEach(i=>i.addEventListener("input",onEdit));
  document.querySelectorAll("[data-take]").forEach(b=>b.onclick=()=>{const [c,i]=b.dataset.take.split("|");take(c,i)});
@@ -779,9 +808,13 @@ function changes(){return [...document.querySelectorAll("input.v")].filter(i=>i.
 function onEdit(e){if(e.target.dataset)e.target.classList.toggle("changed",e.target.value.trim()!==e.target.dataset.orig);
  const n=changes().length;lastDigest=null;document.getElementById("save").classList.remove("p");if(typeof syncButtons==="function")syncButtons();
  document.getElementById("plan").innerHTML=n?'<div class="box i">Несохранённых правок: '+n+'. Нажмите «Проверить изменения».</div>':""}
-function filter(){const q=document.getElementById("q").value.trim().toLowerCase(),act=document.getElementById("act").checked;let n=0;
- document.querySelectorAll("tr[data-hay]").forEach(tr=>{const v=(!q||tr.dataset.hay.includes(q))&&(!act||tr.dataset.act==="1");tr.style.display=v?"":"none";if(v)n++});
- document.getElementById("cnt").textContent=q||act?("показано кампаний: "+n):""}
+function filter(){const q=document.getElementById("q").value.trim().toLowerCase(),act=document.getElementById("act").checked,
+  mine=document.getElementById("mine").checked;let n=0;
+ try{localStorage.setItem("wbBudgetsMine",mine?"1":"0")}catch(e){}
+ document.querySelectorAll("details.other").forEach(d=>{d.style.display=mine?"none":"";if(!mine&&(q||act))d.open=true});
+ document.querySelectorAll("tr[data-hay]").forEach(tr=>{const v=(!q||tr.dataset.hay.includes(q))&&(!act||tr.dataset.act==="1");tr.style.display=v?"":"none";
+  if(v&&!(mine&&tr.closest("details.other")))n++});
+ document.getElementById("cnt").textContent=q||act||mine?("показано кампаний: "+n):""}
 function box(cls,title,items){return items&&items.length?`<div class="box ${cls}"><b>${title}</b><ul>${items.map(x=>"<li>"+esc(x)+"</li>").join("")}</ul></div>`:""}
 // ---------- шкала прогресса: каждое действие идёт через busy(); долгие — с этапами с сервера (/progress) ----------
 const $id=id=>document.getElementById(id);let STACK=[],LOCKS=0,PT=null,RECALC_ON=false;
@@ -814,7 +847,8 @@ async function load(){return busy("Загружаю кампании из WB…"
  const d=await api("/data");if(d.error){$id("sub").innerHTML='<span class="err">'+esc(d.error)+'</span>';return}
  DATA=d;lastDigest=null;$id("save").classList.remove("p");$id("sub").textContent=`Кампании и артикулы — из WB на ${d.at}. Снижение потолков действует сразу, повышение — с ближайшего автопилота (8:00, 13:00, 18:00); свой дневной лимит — за 5 минут. Деньги здесь не переводятся.`;
  render();recInfo(d);$id("undo").title=d.last_backup?("вернёт файл поправок как до "+d.last_backup):"копий ещё нет"})}
-$id("q").addEventListener("input",filter);$id("act").addEventListener("change",filter);
+try{if(localStorage.getItem("wbBudgetsMine")==="0")$id("mine").checked=false}catch(e){}
+$id("q").addEventListener("input",filter);$id("act").addEventListener("change",filter);$id("mine").addEventListener("change",filter);
 $id("chk").onclick=()=>busy("Проверяю правки…",true,async()=>{const r=await api("/preview",{changes:changes()});
  $id("plan").innerHTML=box("e","Не принято:",r.errors)+(r.lines&&r.lines.length?box("i","Будет записано:",r.lines):'<div class="box i">Менять нечего — значения те же.</div>')+box("w","Обратите внимание:",r.warnings);
  lastDigest=(!r.errors||!r.errors.length)&&r.lines&&r.lines.length?r.digest:null;$id("save").classList.toggle("p",!!lastDigest);
