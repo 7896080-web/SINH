@@ -140,32 +140,8 @@ if (-not $NoSchedule) {
     }
 }
 
-# --- 7. Ярлык дашборда ---
-$browser = @(
-    "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
-    "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe",
-    "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe",
-    "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
-    "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe",
-    "$env:LOCALAPPDATA\Yandex\YandexBrowser\Application\browser.exe",
-    "$env:ProgramFiles\Mozilla Firefox\firefox.exe"
-) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
-$desk = Join-Path $env:PUBLIC "Desktop"
-if (-not (Test-Path $desk)) { $desk = [Environment]::GetFolderPath("Desktop") }
-$pyw = Join-Path $Root ".venv\Scripts\pythonw.exe"
-$shell = New-Object -ComObject WScript.Shell
-$lnk = Join-Path $desk "Реклама WB.lnk"
-if (Test-Path $lnk) { Remove-Item $lnk -Force }
-$s = $shell.CreateShortcut($lnk)
-$s.TargetPath = $pyw
-$s.Arguments = '"' + (Join-Path $Root "wb_dashboard.py") + '"' + $(if ($browser) { ' --browser "' + $browser + '"' } else { "" })
-$s.WorkingDirectory = $Root
-$icon = Join-Path $Root "wb_dashboard.ico"
-if (Test-Path $icon) { $s.IconLocation = "$icon,0" }
-$s.Description = "Дашборд рекламы Wildberries: пересобрать и открыть"
-$s.Save()
-if ($browser) { Ok "Ярлык «Реклама WB» на рабочем столе ($desk), браузер $browser" }
-else { Warn "Chrome/Edge не найден — ярлык откроет дашборд браузером по умолчанию (Internet Explorer: графики могут не работать)." }
+# --- 7. Ярлыки «Реклама WB» и «Бюджеты WB» ---
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Root "deploy\shortcuts.ps1") -Root $Root
 
 Write-Host ""
 Ok "Готово. Скрипты — в C:\direct, команды те же: cd C:\direct; python <скрипт>.py"
