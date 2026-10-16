@@ -306,7 +306,10 @@ def build(base, tag, name, also=()):
     for i, (piece, s) in enumerate(zip(pieces, shas), 1):
         body = "\n".join(piece[j:j + WIDTH] for j in range(0, len(piece), WIDTH))
         out.append(PS_PART.format(tag=tag, i=i, n=len(pieces), body=body, sha=s))
-    out.append(PS_APPLY.format(
+    # без пустых строк внутри функции: при вставке в консоль без PSReadLine пустая строка обрывает ввод на середине;
+    # пустая строка в конце — наоборот, запускает вставленное
+    apply_ps = "\n".join(line for line in PS_APPLY.strip("\n").split("\n") if line.strip()) + "\n\n"
+    out.append("\n" + apply_ps.format(
         tag=tag, Tag=tag.capitalize(), version=version,
         parts=", ".join(f"${tag}_{i}" for i in range(1, len(pieces) + 1)),
         want=", ".join(f'"{s}"' for s in shas),
