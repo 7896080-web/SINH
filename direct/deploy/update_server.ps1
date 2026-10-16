@@ -135,6 +135,9 @@ if (-not (Test-Load)) {
     Fail "Обновление отменено, работает прежняя версия ($old)"
 }
 if (-not (Start-Schedule)) { Fail "Расписание не поставилось — поставьте: powershell -ExecutionPolicy Bypass -File C:\direct\wb_schedule.ps1 -Server" }
+# ярлыки: новые страницы (например, «Бюджеты WB») появляются на рабочем столе сами
+$sc = Join-Path $Root "deploy\shortcuts.ps1"
+if (Test-Path $sc) { & powershell -NoProfile -ExecutionPolicy Bypass -File $sc -Root $Root | Out-Host }
 # старые копии кода — оставить последние 10
 Get-ChildItem -LiteralPath $backups -Directory | Sort-Object Name | Select-Object -SkipLast 10 | Remove-Item -Recurse -Force
 Ok "Обновлено до $new, расписание включено"

@@ -17,6 +17,7 @@
 заказ дороже среднего, поэтому нужен запас). Одну кампанию — не чаще раза в RAISE_EVERY_DAYS дней; через столько
 дней после повышения — проверка: если цена заказа после повышения выше допустимой — предложение вернуть как было.
 Не выше MAX_FACTOR × значения в RULES без правки кода. Кабинеты эксперимента — не раньше его конца (EXPERIMENT).
+Кампании и недельный бюджет кабинета, поправленные вручную на странице «Бюджеты WB» (wb_budget_page.py), не трогает.
 
 Запуск:
   python wb_budget.py                     — пробный прогон: таблица и предложения, ничего не меняет
@@ -230,6 +231,12 @@ def plan_cabinet(cab, token, state, ov):
         prop = {"cabinet": cab, "advert_id": cid, "name": name, "cur": cur, "cpo": cpo, "allowed": allowed}
         why = []
         last = raised.get(str(cid))
+        man = (ov.get("manual") or {}).get(str(cid))
+        if man:                        # поправлено вручную на странице «Бюджеты WB» — ручное решение важнее автоматики
+            prop.update(action="hold", text=f"поправлено вручную {man.get('date', '')[8:10]}.{man.get('date', '')[5:7]} на странице "
+                                                  "«Бюджеты WB» — не трогаю")
+            out.append(prop)
+            continue
         # проверка поднятого раньше: окупается ли после повышения
         if last and (dt.date.today() - dt.date.fromisoformat(last["date"])).days >= RAISE_EVERY_DAYS:
             ta = total(stats.get(cid, {}), last["date"])
@@ -289,7 +296,7 @@ def plan_cabinet(cab, token, state, ov):
                          + f". Это до +{rub(add_week)} ₽ в неделю ≈ +{more:.0f} заказов (каждый доп. заказ считаю дороже "
                            f"среднего в {str(MARGINAL).replace('.', ',')} раза)")
         out.append(prop)
-    if cab_cap and not exp_on:
+    if cab_cap and not exp_on and not (ov.get("manual") or {}).get("_week_budget:" + cab):
         add = sum(p.get("add_week") or 0 for p in out if p.get("action") == "raise" and "topup_week_cap" in p["new"])
         if add:
             out.append({"cabinet": cab, "advert_id": "_week_budget", "name": "недельный бюджет кабинета",
