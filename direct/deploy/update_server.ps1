@@ -65,8 +65,9 @@ function Stop-Schedule {
     $pattern = '(wb_|direct_|metrika_|webmaster_|yandex_|crm_)\w*\.py'
     $deadline = (Get-Date).AddMinutes($WaitMin)
     while ($true) {
+        # страница «Реклама WB» (wb_web.py) открыта сколько угодно — её не ждём: новый код она возьмёт при следующем открытии
         $busy = @(Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'" |
-            Where-Object { $_.CommandLine -match $pattern })
+            Where-Object { $_.CommandLine -match $pattern -and $_.CommandLine -notmatch 'wb_web\.py' })
         if (-not $busy.Count -and -not (Test-Path (Join-Path $Root "wb_bids.running"))) { return $true }
         if ((Get-Date) -gt $deadline) { return $false }
         Info "Дорабатывает: $(@($busy | ForEach-Object { ([regex]::Match($_.CommandLine, $pattern)).Value }) -join ', ') — жду…"
