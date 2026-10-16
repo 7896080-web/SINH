@@ -154,7 +154,7 @@ function Invoke-{Tag} {{
         # прямо в консоль (не через конвейер): кириллица не портится, а вывод не становится результатом функции.
         # Start-Process склеивает аргументы через пробел без кавычек — с пробелами берём в кавычки сами
         $a = @($a | ForEach-Object {{ if ($_ -match '\s') {{ '"' + $_ + '"' }} else {{ $_ }} }})
-        $p = Start-Process -FilePath $exe -ArgumentList $a -NoNewWindow -PassThru
+        $p = Start-Process -FilePath $exe -ArgumentList $a -WorkingDirectory $Root -NoNewWindow -PassThru   # import wb_* — из C:\direct
         $null = $p.Handle                    # иначе в PowerShell 5.1 ExitCode бывает пустым
         $p.WaitForExit()
         return $p.ExitCode
