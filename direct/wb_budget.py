@@ -216,7 +216,12 @@ def recommend(spend, orders, days, allowed, starving, cover, base_week, has_dail
             raw, why = use * (1 + step), (f"{fact}, допустимо {rub(allowed)} ₽ — окупается, а деньги кончаются"
                                           f"{starve_note}: +{step:.0%} к расходу")
         else:
-            raw, why = use * (1 + REC_HEADROOM), f"{fact}, допустимо {rub(allowed)} ₽ — окупается, денег хватает"
+            cap = cur_week or ((cur_daily or 0) * 7) or None
+            if cap and use >= cap * 0.9:      # тратит у самого потолка — деньги, скорее всего, держат расход
+                raw, why = use * (1 + REC_HEADROOM), (f"{fact}, допустимо {rub(allowed)} ₽ — окупается, расход у потолка "
+                                                       f"({rub(use)} из {rub(cap)} ₽ в неделю): +{REC_HEADROOM:.0%} запаса")
+            else:
+                raw, why = use, f"{fact}, допустимо {rub(allowed)} ₽ — окупается, денег хватает: как есть"
     if base_week and raw > base_week * MAX_FACTOR:
         raw = base_week * MAX_FACTOR
         why += f"; не больше ×{MAX_FACTOR:g} от правил"
