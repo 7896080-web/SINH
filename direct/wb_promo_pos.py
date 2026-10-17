@@ -14,6 +14,8 @@
 Запуск:  python wb_promo_pos.py                              (все кабинеты; ≈5–10 минут — лимит «Джема» 3 запроса в минуту)
          python wb_promo_pos.py --cabinet "Яворская"
          python wb_promo_pos.py --nm 253631693,253633739      (только эти товары)
+         python wb_promo_pos.py --promo 253631693,253633739   (это товары акции — сравнить их с остальными;
+                                                               нужно, если акционную цену поставили заранее)
          python wb_promo_pos.py --day 2026-10-16              (с каким днём сравнивать; по умолчанию вчера)
          python wb_promo_pos.py --day 2026-10-16 --to 2026-10-17   (два полных дня — назавтра, окончательно)
 Товары — те, что отслеживает wb_positions.py (лучшие по заказам, рекламируемые, wb_watch.csv), или --nm.
@@ -42,6 +44,7 @@ TOP_QUERIES = 3       # главных запросов на товар в та�
 
 WEEKDAYS = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
 CUR = [TODAY]         # с каким днём сравнивать базовый: сегодня (неполный) или --to (полный день)
+PROMO = set()         # --promo: товары акции (если цену для акции поставили заранее, по цене «вчера → сегодня» их не узнать)
 
 
 def arg(name):
@@ -194,7 +197,7 @@ def analyze(cab, con, nms, base, problems):
                 t.get(k) is None for k in ("avg_pos", "opens", "price")):
             continue
         pa, pt = a.get("price") or a.get("avg_price"), t.get("price") or t.get("avg_price")
-        promo = None if not (pa and pt) else (pt <= pa * (1 - PRICE_DROP))
+        promo = (nm in PROMO) if PROMO else (None if not (pa and pt) else (pt <= pa * (1 - PRICE_DROP)))
         qs = queries(con, cab, nm, base)
         up = sum(1 for q in qs if q[3] < q[2] - POS_MOVE + 1e-9)
         down = sum(1 for q in qs if q[3] > q[2] + POS_MOVE - 1e-9)
@@ -240,33 +243,58 @@ def analyze(cab, con, nms, base, problems):
         d = [r["d_avg"] for r in g if r["d_avg"] is not None]
         better = sum(1 for x in d if x <= -POS_MOVE)
         worse = sum(1 for x in d if x >= POS_MOVE)
-        ts = [r["tempo_search"] for r in g if r["tempo_search"] is not None]
-        to = [r["tempo_orders"] for r in g if r["tempo_orders"] is not None]
         qu, qd = sum(r["up"] for r in g), sum(r["down"] for r in g)
         drops = [r["pt"] / r["pa"] - 1 for r in g if r["pa"] and r["pt"]]
+        # темп — по сумме группы: у товаров с 1–3 заказами в день медиана по товарам даёт «−100%» из-за одного заказа
+        tot = {k: sum((r[w].get(f) or 0) for r in g) for k, w, f in
+               (("s_a", "a", "search_opens"), ("s_t", "t", "search_opens"), ("o_a", "a", "orders"), ("o_t", "t", "orders"))}
+        both = [r for r in g if r["d_avg"] is not None and (r["a"].get("search_opens") or 0) > 0]
+        wsum = sum(r["a"]["search_opens"] for r in both)
+        mids = [r["t"]["median_pos"] - r["a"]["median_pos"] for r in g if r["a"].get("median_pos") and r["t"].get("median_pos")]
         return {"n": len(g), "nd": len(d), "med": statistics.median(d) if d else None, "better": better, "worse": worse,
-                "same": len(d) - better - worse, "ts": statistics.median(ts) if ts else None,
-                "to": statistics.median(to) if to else None, "qu": qu, "qd": qd,
+                "same": len(d) - better - worse, "qu": qu, "qd": qd, **tot,
+                "ts": tempo(tot["s_t"], tot["s_a"], share_t), "to": tempo(tot["o_t"], tot["o_a"], share_t),
+                "wpa": sum(r["a"]["avg_pos"] * r["a"]["search_opens"] for r in both) / wsum if wsum else None,
+                "wpt": sum(r["t"]["avg_pos"] * r["a"]["search_opens"] for r in both) / wsum if wsum else None,
+                "mid_n": len(mids), "mid": statistics.median(mids) if mids else None,
+                "mid_b": sum(1 for x in mids if x <= -POS_MOVE), "mid_w": sum(1 for x in mids if x >= POS_MOVE),
                 "drop": statistics.median(drops) if drops else None}
 
     gp, gn, gu = group(lambda r: r["promo"] is True), group(lambda r: r["promo"] is False), group(lambda r: r["promo"] is None)
     log("")
-    log(f"  Цена: ниже вчерашней на {PRICE_DROP:.0%}+ у {gp['n']} из {len(rows)} товаров"
-        + (f" (в среднем {gp['drop'] * 100:+.0f}%)" if gp["n"] and gp["drop"] is not None else "")
-        + f"; без изменений — {gn['n']}" + (f"; цену не узнать (нет показов и заказов) — {gu['n']}" if gu["n"] else "") + ".")
-    for title, g in (("В акции (цена ниже)", gp), ("Без акции", gn)):
+    if PROMO:
+        log(f"  Товары акции — по списку --promo: {gp['n']} из {len(rows)}"
+            + (f" (цена к базовому дню {gp['drop'] * 100:+.0f}%)" if gp["n"] and gp["drop"] is not None else "") + ".")
+    else:
+        log(f"  Цена: ниже, чем {base:%d.%m}, на {PRICE_DROP:.0%}+ у {gp['n']} из {len(rows)} товаров"
+            + (f" (в среднем {gp['drop'] * 100:+.0f}%)" if gp["n"] and gp["drop"] is not None else "")
+            + f"; без изменений — {gn['n']}" + (f"; цену не узнать (нет показов и заказов) — {gu['n']}" if gu["n"] else "") + ".")
+    ga = group(lambda r: True)
+    for title, g in ((("В акции" + ("" if PROMO else " (цена ниже)")), gp),
+                     ("Без акции" if gp["n"] else "Все товары", gn if gp["n"] else ga)):
         if not g["n"]:
             continue
         log(f"  {title}: {g['n']} тов.")
+        if g["wpa"] is not None:
+            log(f"      средняя позиция с учётом трафика: {g['wpa']:.1f} → {g['wpt']:.1f}"
+                f" ({'лучше' if g['wpt'] < g['wpa'] - POS_MOVE else 'хуже' if g['wpt'] > g['wpa'] + POS_MOVE else 'так же'})")
         if g["nd"]:
-            log(f"      средняя позиция: лучше у {g['better']}, хуже у {g['worse']}, так же у {g['same']}; "
-                f"медиана изменения {g['med']:+.1f} места" + (" (меньше — лучше)" if g["med"] else ""))
+            log(f"      по товарам: лучше у {g['better']}, хуже у {g['worse']}, так же у {g['same']}; "
+                f"медиана изменения {g['med']:+.1f} места")
+        if g["mid_n"]:
+            log(f"      медианная позиция главных товаров ({g['mid_n']}): лучше у {g['mid_b']}, хуже у {g['mid_w']}, "
+                f"медиана изменения {g['mid']:+.1f}")
         if g["qu"] or g["qd"]:
             log(f"      запросы: поднялись {g['qu']}, опустились {g['qd']}")
-        log(f"      переходы из поиска — темп к вчера: {pct(g['ts'])}; заказы — темп: {pct(g['to'])}")
+        exp = "" if share_t >= 1 else " к этому часу"
+        log(f"      переходы из поиска: {fp(g['s_a'])} → {fp(g['s_t'])}"
+            + (f" (ожидалось {g['s_a'] * share_t:.0f}{exp}, {pct(g['ts'])})" if g["ts"] is not None else ""))
+        log(f"      заказы: {fp(g['o_a'])} → {fp(g['o_t'])}"
+            + (f" (ожидалось {g['o_a'] * share_t:.0f}{exp}, {pct(g['to'])})" if g["to"] is not None else "")
+            + (" — заказов мало, вывод предварительный" if g["o_a"] < 20 else ""))
     log("")
     log("  Выводы:")
-    for line in conclusions(gp, gn, share_t, base):
+    for line in conclusions(gp, gn, share_t, base, ga):
         log("   • " + line)
 
     log("")
@@ -298,31 +326,45 @@ def analyze(cab, con, nms, base, problems):
     return rows, csv
 
 
-def conclusions(gp, gn, share, base):
+def conclusions(gp, gn, share, base, ga):
     out = []
     if not gp["n"]:
-        out.append("Ни у одного отслеживаемого товара цена не стала ниже вчерашней — либо акция ещё не применилась "
-                   "(WB обновляет цены в поиске с задержкой), либо товары акции не в отслеживаемых: укажите их через --nm.")
+        out.append("Товаров акции по цене не видно: цена в поиске та же, что " + f"{base:%d.%m}" + ". Так бывает, если акционную "
+                   "цену поставили заранее (тогда и вчера она уже действовала) или акция идёт за счёт скидки WB. Укажите товары "
+                   "акции списком: --promo 111,222 — сравню их с остальными.")
+        if ga["wpa"] is not None:
+            move = ga["wpt"] - ga["wpa"]
+            out.append(f"В целом по товарам позиция с учётом трафика {ga['wpa']:.1f} → {ga['wpt']:.1f} — "
+                       + ("заметно лучше" if move <= -5 else "заметно хуже" if move >= 5 else "в пределах обычных колебаний дня")
+                       + f"; по товарам лучше у {ga['better']}, хуже у {ga['worse']}.")
+        if ga["ts"] is not None:
+            out.append(f"Переходы из поиска {pct(ga['ts'])} к темпу {base:%d.%m}, заказы {pct(ga['to'])}"
+                       + (" (заказов мало — это в пределах случайности)." if ga["o_a"] < 50 else "."))
+        if share < 1:
+            out.append(f"Окончательно — по полному дню, завтра: python wb_promo_pos.py --day {base} --to {CUR[0]}")
         return out
-    if gp["med"] is not None and gn["med"] is not None:
-        diff = gp["med"] - gn["med"]
+    # сдвиг позиции группы: с учётом трафика (главные товары весят больше), иначе — медиана по товарам
+    mv = lambda g: (g["wpt"] - g["wpa"]) if g["wpa"] is not None else g["med"]
+    if mv(gp) is not None and mv(gn) is not None:
+        diff = mv(gp) - mv(gn)
         if diff <= -POS_MOVE:
-            out.append(f"Акция подняла товары в поиске: у товаров в акции позиция изменилась на {gp['med']:+.1f}, у товаров "
-                       f"без акции — на {gn['med']:+.1f}; разница ≈{-diff:.1f} места в пользу акции.")
+            out.append(f"Акция подняла товары в поиске: у товаров в акции позиция изменилась на {mv(gp):+.1f}, у товаров "
+                       f"без акции — на {mv(gn):+.1f}; разница ≈{-diff:.1f} места в пользу акции.")
         elif diff >= POS_MOVE:
-            out.append(f"Товары в акции просели относительно остальных ({gp['med']:+.1f} против {gn['med']:+.1f}) — "
+            out.append(f"Товары в акции просели относительно остальных ({mv(gp):+.1f} против {mv(gn):+.1f}) — "
                        "проверьте остатки и рекламу этих товаров: сама по себе скидка позицию не ухудшает.")
         else:
-            out.append(f"Заметного сдвига позиций от акции пока нет: в акции {gp['med']:+.1f}, без акции {gn['med']:+.1f} места.")
-    elif gp["med"] is not None:
-        out.append(f"Позиция товаров в акции изменилась на {gp['med']:+.1f} места (меньше — лучше); сравнить не с чем — "
+            out.append(f"Заметного сдвига позиций от акции пока нет: в акции {mv(gp):+.1f}, без акции {mv(gn):+.1f} места.")
+    elif mv(gp) is not None:
+        out.append(f"Позиция товаров в акции изменилась на {mv(gp):+.1f} места (меньше — лучше); сравнить не с чем — "
                    "товаров без акции с позициями нет.")
     if gp["ts"] is not None:
         rel = f" (без акции — {pct(gn['ts'])})" if gn["ts"] is not None else ""
         out.append(f"Переходы из поиска у товаров в акции — {pct(gp['ts'])} к вчерашнему темпу{rel}.")
     if gp["to"] is not None:
         rel = f" (без акции — {pct(gn['to'])})" if gn["to"] is not None else ""
-        out.append(f"Заказы у товаров в акции — {pct(gp['to'])} к вчерашнему темпу{rel}.")
+        out.append(f"Заказы у товаров в акции — {pct(gp['to'])} к вчерашнему темпу{rel}"
+                   + (" — заказов мало, вывод предварительный." if gp["o_a"] < 20 else "."))
     if share < 0.35:
         out.append(f"Прошло лишь ≈{share:.0%} дневного спроса — цифры переходов и заказов ещё шумные; позиции надёжнее. "
                    "Повторите проверку вечером.")
@@ -348,6 +390,7 @@ def main():
         if not base < CUR[0] <= TODAY:
             sys.exit("--to — день после --day и не позже сегодняшнего")
     only = [int(x) for x in (arg("--nm") or "").replace(" ", "").split(",") if x.strip().isdigit()]
+    PROMO.update(int(x) for x in (arg("--promo") or "").replace(" ", "").split(",") if x.strip().isdigit())
     cabs = load_tokens(arg_cabinet())
     log(f"Акция: позиции в поиске {dname(base)} → {dname(CUR[0])}"
         + (f" до {dt.datetime.now():%H:%M}" if CUR[0] == TODAY else "") + " (только чтение). "
@@ -356,7 +399,7 @@ def main():
 
     def run(cab, token):
         log(f"\n{'═' * 20} {cab} {'═' * 20}")
-        nms = (only or tracked(cab))[:MAX_NMS]
+        nms = list(dict.fromkeys(sorted(PROMO) + (only or tracked(cab))))[:MAX_NMS]   # товары акции — всегда
         con, nms, problems = collect(cab, token, nms, base)
         _, csv = analyze(cab, con, nms, base, problems)
         con.close()
