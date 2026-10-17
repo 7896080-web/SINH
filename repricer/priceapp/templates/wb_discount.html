@@ -122,6 +122,7 @@
   <td>{% for h in r.held|sort %}<span class="badge">− {{ fmt(h) }}%</span> {% else %}<span class="muted">—</span>{% endfor %}
     {% if r.rule and r.rule.now_at %}<div class="sub">отправлено − {{ fmt(r.rule.now_pct) }}% {{ r.rule.now_at|local }} {{ r.rule.now_by }}</div>{% endif %}</td>
   <td><b>{{ fmt(r.eff) }}%</b><div class="sub">{{ r.eff_src }}</div>
+    {% if r.rule and r.rule.until %}<div class="sub warn" title="Порог для акции: после её конца вернётся {{ fmt(r.rule.prev_max_disc) or 'общий' }}">до {{ r.rule.until|local }} — акция «{{ r.rule.until_note }}»</div>{% endif %}
     {% if r.others %}<div class="sub" title="Свой порог у отдельных кабинетов — там действует он">кабинеты: {{ r.others|join(', ') }}</div>{% endif %}</td>
   <td><input class="pct" name="thr" form="{{ fid }}" value="{{ fmt(r.own) }}" inputmode="decimal" placeholder="—" title="Пусто — своего порога нет, действует общий ({{ fmt(r.eff) }}%){% if r.kind == 'category' %}. Новое значение встанет и на все артикулы категории{% endif %}"></td>
   <td><input class="pct" name="now" form="{{ fid }}" inputmode="decimal" placeholder="N" title="«Отправить сейчас» поставит цену «эталон − N%»; 0 — полный эталон"></td>

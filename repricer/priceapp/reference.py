@@ -302,6 +302,10 @@ def run(db: Session, product_rows=None, actor: str = "программа", clien
     if not enabled(db):
         st["disabled"] = True
         return st
+    # Пороги «для акции», чья акция закончилась, — обратно к прежним ДО решений о возврате: опрос в
+    # 00:05 после конца акции и должен вернуть эталон там, где WB сам прежнюю цену не поставил.
+    from priceapp import wb_discount as _wd
+    _wd.expire_temp(db)
     rate = rates.current(db)
     rate, jump_confirmed, jump_note = confirm_rate_jump(db, rate, cbr_session)
     if jump_confirmed:
