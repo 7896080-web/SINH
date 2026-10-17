@@ -8,15 +8,18 @@
 сейчас, и `adopt_sent` для цен, ушедших до появления правила.
 
 1. «Площадка занизила цену». Цена после скидки продавца по ТЕКУЩИМ ценам WB ниже эталонной
-   больше чем на `ref_drop_percent` (10%) — неважно, что сменилось: цена до скидки, скидка
-   (автоакция) или оба. Эталонная пара ВОЗВРАЩАЕТСЯ одним заданием WB на карточку, только
-   вверх. Возврат, поднимающий цену больше чем на `ref_max_raise_percent` (50%), не
+   больше чем на ПОРОГ — неважно, что сменилось: цена до скидки, скидка (автоакция) или оба.
+   Порог — `ref_drop_percent` (10%) на все товары или свой у категории WB / артикула 1С, на все
+   кабинеты или на один (`wb_discount.Thresholds`, страница «Порог скидки WB»). Эталонная пара
+   ВОЗВРАЩАЕТСЯ одним заданием WB на карточку, только вверх, и ПОЛНОЙ — сдвиг «эталон − N%»,
+   отправленный со страницы порога, при этом снимается. Возврат, поднимающий цену больше чем на `ref_max_raise_percent` (50%), не
    отправляется, а уходит во «Внимание»: так выглядит ошибочный эталон, а не занижение.
    Кроме АКЦИИ: скидка продавца на WB выше «до» коридора (её ставим не мы) — эталон
    возвращается при любом подъёме до 500% (`PROMO_RAISE_CEILING`).
 2. «Курс». Курс ушёл от курса эталонной больше чем на `ref_rate_percent` (2%) — эталон
-   пересчитывается ПО КУРСУ (× новый / прежний, скидка та же) и уходит на WB в ЛЮБУЮ сторону,
-   а затем на все площадки-последователи без допуска (решение владельца 15.10). Вниз — не ниже
+   пересчитывается ПО КУРСУ (× новый / прежний, скидка та же) и уходит на WB в ЛЮБУЮ сторону
+   (стоит «эталон − N%» — то эталон по курсу − тот же N%), а затем на все площадки-последователи
+   без допуска (решение владельца 15.10). Вниз — не ниже
    пола и не больше `wb_max_drop_percent` за раз (крупнее — со страницы, шагами).
    Скачок больше 20% — повторный запрос к ЦБ: подтвердил — пересчёт, нет — в следующий раз
    (ручной курс повторно не запросить — у него скачок не применяется, запись в журнал).
@@ -92,6 +95,7 @@ def record(db: Session, account: Account, item_id: str, price: int, rows, rule=N
     row.usd_rub = usd
     row.source = source
     row.set_at = now_utc()
+    row.held_pct = None          # новый эталон — цена, что ушла; сдвиг «эталон − N%» к нему не относится
     db.flush()
     _mark_dirty()
     return True
@@ -227,18 +231,20 @@ def _nm(item) -> str:
     return nm if nm.isdigit() else ""
 
 
-def ref_below_floor(ref, costs: dict, rate, rule, item_id: str | None = None) -> bool:
+def ref_below_floor(ref, costs: dict, rate, rule, item_id: str | None = None, price: int | None = None) -> bool:
     """Эталонная пара `ref` ниже пола размера `item_id` (по умолчанию — своего) по ТЕКУЩИМ
     себестоимости и курсу: себестоимость или курс выросли, а эталон прежний (или опечатка в 1С).
     Цена у WB одна на карточку — проверять надо КАЖДЫЙ размер по паре, которая уйдёт (симуляция
     15.10: выросла себестоимость одного размера, а проверялся другой). Одно правило для
-    возврата, «Внимания» и страницы эталонов."""
+    возврата, «Внимания» и страницы эталонов. `price` — цена до скидки, которая уйдёт, если это не
+    эталонная (стоит «эталон − N%»)."""
     from priceapp.pricing import base_price, floor_price
     base = base_price(costs.get(item_id or ref.item_id), rate.usd_rub if rate else None)
     com = ref.commission_percent if ref.commission_percent is not None else rule.commission_percent
     if base is None or com is None or not Decimal(0) <= _dec(com) < Decimal(100):
         return False
-    return int(ref.ref_price) < floor_price(base, rule, _dec(com), _dec(ref.discount or 0))
+    return int(price if price is not None else ref.ref_price) < floor_price(base, rule, _dec(com),
+                                                                            _dec(ref.discount or 0))
 
 
 def below_floor_articles(db: Session) -> set[str]:
@@ -303,18 +309,20 @@ def run(db: Session, product_rows=None, actor: str = "программа", clien
                   f"курс ушёл больше чем на {int(MAX_RATE_JUMP * 100)}% от курса эталонов; {jump_note} — "
                   "эталоны пересчитываются")
     rate_thr = rate_percent(db) / 100
-    drop, max_raise = drop_percent(db), max_raise_percent(db)
+    max_raise = max_raise_percent(db)
     from priceapp.etalon import corridor
     from priceapp.models import OnecCost
     promo_disc = Decimal(corridor(db)[1])          # скидка выше «до» коридора — акция площадки
     max_drop = _pct(db, settings.WB_MAX_DROP_PERCENT, "33")
     rule = get_rule(db, "wb")
     costs = {c.item_id: c.cost_usd for c in db.query(OnecCost)}
+    from priceapp import wb_discount
+    limits = wb_discount.Thresholds(db)
     revalued_items: set[str] = set()
     now = now_utc()
 
-    def below_floor(ref, items=()) -> bool:
-        return any(ref_below_floor(ref, costs, rate, rule, i) for i in (items or (ref.item_id,)))
+    def below_floor(ref, items=(), price=None) -> bool:
+        return any(ref_below_floor(ref, costs, rate, rule, i, price) for i in (items or (ref.item_id,)))
 
     for a in db.query(Account).filter(Account.is_active.is_(True), Account.platform.in_(PLATFORMS)).all():
         refs = {r.item_id: r for r in db.query(ReferencePrice).filter(ReferencePrice.account_id == a.id)}
@@ -359,8 +367,10 @@ def run(db: Session, product_rows=None, actor: str = "программа", clien
                     _mark_dirty()
             if r["item_id"] in busy:
                 continue
-            # 2. Площадка занизила цену после скидки продавца — вернуть эталонную (только вверх).
-            kind = classify(r, ref, drop, max_raise, promo_disc)
+            # 2. Площадка занизила цену после скидки продавца ниже порога — вернуть эталонную (только
+            # вверх). Порог — свой у артикула или категории в этом кабинете, иначе общий.
+            kind = classify(r, ref, limits.for_item(r["item_id"], r.get("category") or "", a.id)[0],
+                            max_raise, promo_disc)
             nm = _nm(r.get("platform"))
             if not nm:
                 continue
@@ -370,13 +380,16 @@ def run(db: Session, product_rows=None, actor: str = "программа", clien
                 # 15.10: «эталон следует за курсом и отправляется на все площадки при изменении
                 # больше чем на 2%»). Снижение больше `wb_max_drop_percent` одним заданием WB не
                 # применяет (а от 50% — не берёт) — такое со страницы, шагами.
+                # Стоит «эталон − N%» (страница «Порог скидки WB») — уходит эталон по курсу − тот же N%.
                 cur_sale = r.get("current_sale")
-                if r.get("current") == int(ref.ref_price) and r.get("current_sale") == ref_sale(ref):
+                hp, hd = wb_discount.held_pair(ref)
+                hs = wb_discount.sale_of(hp, hd)
+                if r.get("current") == hp and r.get("current_sale") == hs:
                     continue
-                if cur_sale and ref_sale(ref) < Decimal(cur_sale) * (1 - max_drop / 100):
-                    rate_far.setdefault(nm, f"{nm}: {cur_sale} -> {ref_sale(ref)}")
+                if cur_sale and hs < Decimal(cur_sale) * (1 - max_drop / 100):
+                    rate_far.setdefault(nm, f"{nm}: {cur_sale} -> {hs}")
                     continue
-                if cur_sale and ref_sale(ref) < cur_sale and below_floor(ref, items_of_nm.get(nm, ())):
+                if cur_sale and hs < cur_sale and below_floor(ref, items_of_nm.get(nm, ()), hp):
                     continue                  # вниз — никогда ниже пола (ни одного размера карточки)
                 why = "rate"
             elif kind is None:
@@ -386,14 +399,19 @@ def run(db: Session, product_rows=None, actor: str = "программа", clien
                 continue
             if is_promo(r, promo_disc):
                 promo.add(nm)
+            # возврат — ПОЛНЫЙ эталон; по курсу — с тем сдвигом, что стоит. Возврат главнее курса:
+            # карточка, где хоть один размер ушёл ниже порога, получает полный эталон.
+            price, d = (wb_discount.held_pair(ref) if why == "rate"
+                        else (int(ref.ref_price), ref_discount_int(ref)))
             c = cards.get(nm)
-            if c is None or ref.ref_price > c["ref"].ref_price:
-                cards[nm] = {"ref": ref, "cur": r.get("current_sale"), "items": c["items"] if c else set(),
-                             "why": c["why"] if c else set()}
+            if (c is None or (why == "restore" and "restore" not in c["why"])
+                    or ((why == "restore") == ("restore" in c["why"]) and price > c["price"])):
+                cards[nm] = {"ref": ref, "price": price, "disc": d, "cur": r.get("current_sale"),
+                             "items": c["items"] if c else set(), "why": c["why"] if c else set()}
             cards[nm]["items"].add(r["item_id"])
             cards[nm]["why"].add(why)
             cards[nm]["promo"] = nm in promo
-            cards[nm]["below_floor"] = below_floor(cards[nm]["ref"], cards[nm]["items"])
+            cards[nm]["below_floor"] = below_floor(cards[nm]["ref"], cards[nm]["items"], cards[nm]["price"])
         st["revalued"] += revalued
         st["promo"] = st.get("promo", 0) + len(promo & set(cards))
         if rate_jumps:
@@ -419,7 +437,7 @@ def run(db: Session, product_rows=None, actor: str = "программа", clien
                       f"эталон по курсу ниже нынешней цены больше чем на {format(max_drop.normalize(), 'f')}% — на WB "
                       f"не отправлено, снижайте со страницы «Эталонные цены» ({len(rate_far)}): "
                       + "; ".join(list(rate_far.values())[:20]))
-        restored = _send(db, a, cards, client_factory, st, actor) if cards else 0
+        restored = _send(db, a, cards, client_factory, st, actor, refs) if cards else 0
         st["restored"] += restored
         st["below_floor"] = st.get("below_floor", 0) + sum(1 for c in cards.values() if c.get("below_floor"))
         if revalued:
@@ -438,8 +456,9 @@ def run(db: Session, product_rows=None, actor: str = "программа", clien
     return st
 
 
-def _send(db: Session, a: Account, cards: dict, client_factory, st: dict, actor: str) -> int:
-    """Эталонная пара (цена до скидки + скидка) на карточки WB одним заданием на пачку."""
+def _send(db: Session, a: Account, cards: dict, client_factory, st: dict, actor: str, refs: dict | None = None) -> int:
+    """Эталонная пара (цена до скидки + скидка) на карточки WB одним заданием на пачку. Возврат
+    эталона снимает сдвиг «эталон − N%» у SKU карточки: дальше там стоит полный эталон."""
     from priceapp import accounts
     from priceapp.models import PlatformItem
     from priceapp.platforms import WB_PRICES
@@ -452,8 +471,7 @@ def _send(db: Session, a: Account, cards: dict, client_factory, st: dict, actor:
     done = []
     for start in range(0, len(items), 1000):
         chunk = items[start:start + 1000]
-        body = {"data": [{"nmID": int(nm), "price": int(c["ref"].ref_price), "discount": ref_discount_int(c["ref"])}
-                         for nm, c in chunk]}
+        body = {"data": [{"nmID": int(nm), "price": _price(c), "discount": _disc(c)} for nm, c in chunk]}
         try:
             data = client._post(f"{WB_PRICES}/api/v2/upload/task", body)
         except Exception as e:
@@ -471,12 +489,17 @@ def _send(db: Session, a: Account, cards: dict, client_factory, st: dict, actor:
         for it in db.query(PlatformItem).filter(PlatformItem.account_id == a.id):
             by_nm.setdefault((it.external_id or "").split(":")[0], []).append(it)
     for nm, c in done:
-        price, d = int(c["ref"].ref_price), ref_discount_int(c["ref"])
+        price, d = _price(c), _disc(c)
+        restore = "restore" in c.get("why", ())
         for item_id in c.get("items", ()):
             _record_sent(db, item_id, a.id, price)   # цена наша — диапазон безопасности не должен её «возвращать»
+            ref = (refs or {}).get(item_id)
+            if restore and ref is not None:
+                ref.held_pct = None
         from priceapp.etalon import journal_sent
-        what = ("эталон по курсу" if "rate" in c.get("why", ()) and "restore" not in c.get("why", ())
-                else "возврат эталона")
+        held = c["ref"].held_pct if not restore else None
+        what = ("эталон по курсу" + (f" − {format(_dec(held).normalize(), 'f')}%" if held else "")
+                if not restore else "возврат эталона")
         journal_sent(db, a.id, sorted(c.get("items", ())), "", None, price, SOURCE,
                      f"{what}: площадка держала {c['cur']} ₽ после скидки, скидка {d}%"
                      + ("; эталон НИЖЕ ПОЛА" if c.get("below_floor") else ""), actor)
@@ -489,17 +512,27 @@ def _send(db: Session, a: Account, cards: dict, client_factory, st: dict, actor:
         def mark(c):
             tags = []
             if "rate" in c.get("why", ()) and "restore" not in c.get("why", ()):
-                tags.append("курс")
+                tags.append("курс" + (f", эталон − {format(_dec(c['ref'].held_pct).normalize(), 'f')}%"
+                                      if c["ref"].held_pct else ""))
             if c.get("promo"):
                 tags.append("акция")
             if c.get("below_floor"):
                 tags.append("НИЖЕ ПОЛА — пересмотрите эталон")
             return f" ({', '.join(tags)})" if tags else ""
-        sample = "; ".join(f"{nm}: {c['cur']} -> {ref_sale(c['ref'])}{mark(c)}" for nm, c in done[:20])
+        from priceapp.wb_discount import sale_of
+        sample = "; ".join(f"{nm}: {c['cur']} -> {sale_of(_price(c), _disc(c))}{mark(c)}" for nm, c in done[:20])
         audit.log(db, actor, "reference_run", a.name,
                   f"эталонная цена после скидки продавца отправлена на WB: {len(done)} карточек — {sample}"
                   + (" …" if len(done) > 20 else ""))
     return len(done)
+
+
+def _price(c: dict) -> int:
+    return int(c.get("price") or c["ref"].ref_price)
+
+
+def _disc(c: dict) -> int:
+    return int(c["disc"]) if c.get("disc") is not None else ref_discount_int(c["ref"])
 
 
 def summary(st: dict) -> str:

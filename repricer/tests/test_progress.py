@@ -81,7 +81,8 @@ def test_every_mass_action_is_tracked():
             "prices.py": ["/prices/bulk/{account_id}", "/prices/load-current", "/prices/import/{account_id}",
                           "/prices/changes-import", "/prices/recalculate", "/prices/approve", "/prices/reject",
                           "/prices/guard-run"],
-            "etalon.py": ["/etalon/follow-now", "/etalon/import", "/etalon/set"]}
+            "etalon.py": ["/etalon/follow-now", "/etalon/import", "/etalon/set"],
+            "wb_discount.py": ["/wb-discount/save", "/wb-discount/bulk", "/wb-discount/import"]}
     for name, routes in must.items():
         text = (root / name).read_text(encoding="utf-8")
         for r in routes:

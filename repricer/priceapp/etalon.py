@@ -111,12 +111,21 @@ class WbCard:
     ref_disc: int | None
     cur_list: int | None
     cur_sale: int | None
+    held: Decimal | None = None                  # стоит «эталон − N%» (страница «Порог скидки WB»)
 
     @property
     def ref_sale(self) -> int | None:
         if not self.ref_list or self.ref_disc is None:
             return None
         return int((Decimal(self.ref_list) * (100 - self.ref_disc) / 100).quantize(Decimal(1), ROUND_HALF_UP))
+
+    @property
+    def target_sale(self) -> int | None:
+        """Что должно стоять на карточке: эталон или «эталон − N%», отправленный со страницы порога."""
+        if not self.held or not self.ref_list or self.ref_disc is None:
+            return self.ref_sale
+        from priceapp.wb_discount import held_list, sale_of
+        return sale_of(held_list(self.ref_list, self.held), self.ref_disc)
 
 
 @dataclass
@@ -160,6 +169,8 @@ def etalons(db: Session) -> dict[str, Etalon]:
                     c.cur_list, c.cur_sale = r.current_price, r.current_sale_price or r.current_price
                 if ref is not None and (c.ref_list is None or ref.ref_price > c.ref_list):
                     c.ref_list, c.ref_disc = ref.ref_price, ref_discount_int(ref)
+                if ref is not None and ref.held_pct is not None:
+                    c.held = Decimal(ref.held_pct)
     for art, v in sales.items():
         out[art].sale = int((Decimal(sum(v)) / len(v)).quantize(Decimal(1), ROUND_HALF_UP))
     return out
@@ -450,6 +461,7 @@ def set_etalon(db: Session, art: str, sale: int, actor: str, client_factory=None
                 ref.usd_rub = rate.usd_rub if rate else None
                 ref.source = "manual"
                 ref.set_at = now
+                ref.held_pct = None      # эталон сменили руками — на WB уходит он сам, без сдвига
             # прежние нерешённые и подтверждённые решения по этим товарам — сняты: уйдёт эталон
             for ch in db.query(PriceChange).filter(PriceChange.account_id == a.id, PriceChange.item_id.in_(c.item_ids),
                                                    PriceChange.is_test.is_(False),

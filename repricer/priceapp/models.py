@@ -416,6 +416,32 @@ class ReferencePrice(Base):
     usd_rub = Column(Numeric(12, 4), nullable=True)
     source = Column(String(16), nullable=False, default="sent")   # sent / rate / adopt
     set_at = Column(DateTime, nullable=False, default=now_utc)
+    # На WB сейчас стоит не эталон, а эталон − столько % — отправлено кнопкой «Отправить сейчас»
+    # (`wb_discount.send_now`). Пересчёт эталона по курсу держит этот сдвиг; возврат полного
+    # эталона (цена ушла ниже порога) и любая новая запись эталона его снимают.
+    held_pct = Column(Numeric(5, 2), nullable=True)
+
+
+class WbDiscountRule(Base):
+    """ПОРОГ скидки от эталона на WB — по категории WB (`kind` = category, ключ — предмет) или по
+    артикулу 1С (`kind` = article). Цена после скидки продавца может быть ниже эталона не больше
+    чем на `max_disc` %; ниже — правило возврата (`reference.run`) возвращает ПОЛНЫЙ эталон.
+    Артикул главнее категории, категория — порога по умолчанию (`ref_drop_percent`). Действует,
+    пока его не изменят руками. `account_id` = 0 — на все кабинеты WB, иначе только для этого
+    кабинета, и он главнее (ноль, а не NULL: уникальность с NULL SQLite не проверяет). `now_*` —
+    последняя отправка «эталон − N%» (`wb_discount.send_now`), для показа на странице."""
+    __tablename__ = "wb_discount_rules"
+    __table_args__ = (UniqueConstraint("kind", "key", "account_id", name="uq_wb_discount_rule"),)
+    id = Column(Integer, primary_key=True)
+    kind = Column(String(8), nullable=False)               # category / article
+    key = Column(String(200), nullable=False)
+    account_id = Column(Integer, nullable=False, default=0)
+    max_disc = Column(Numeric(5, 2), nullable=True)
+    now_pct = Column(Numeric(5, 2), nullable=True)
+    now_at = Column(DateTime, nullable=True)
+    now_by = Column(String(64), nullable=False, default="")
+    updated_at = Column(DateTime, nullable=False, default=now_utc, onupdate=now_utc)
+    updated_by = Column(String(64), nullable=False, default="")
 
 
 class ReferenceDiscount(Base):

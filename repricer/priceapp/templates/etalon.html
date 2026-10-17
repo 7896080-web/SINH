@@ -95,7 +95,8 @@
   <td><b>{{ et.article }}</b><div class="sub" style="white-space:normal;max-width:220px">{{ et.name }}</div></td>
   <td class="num"><b>{{ rub(et.sale) }}</b></td>
   <td>{% for c in et.cards %}<div class="sub">{{ c.account.name }} {{ c.nm }}: {% if c.ref_sale %}{{ rub(c.ref_list) }} −{{ c.ref_disc }}% = {{ rub(c.ref_sale) }}{% else %}эталона нет{% endif %}
-    {% if c.cur_sale and c.ref_sale and (c.cur_sale - c.ref_sale)|abs > tol %} · <span class="warn">сейчас {{ rub(c.cur_sale) }}</span>{% endif %}</div>{% endfor %}</td>
+    {% if c.held %} · <a href="/wb-discount" title="Отправлено со страницы «Порог скидки WB»; уйдёт ниже порога — вернётся полный эталон">эталон − {{ c.held|plain }}% = {{ rub(c.target_sale) }}</a>{% endif %}
+    {% if c.cur_sale and c.target_sale and (c.cur_sale - c.target_sale)|abs > tol %} · <span class="warn">сейчас {{ rub(c.cur_sale) }}</span>{% endif %}</div>{% endfor %}</td>
   {% for p in followers %}<td>{% for c in r.fol.get(p, []) %}<div class="sub">
     {% if c.skip %}<span class="bad">{{ c.skip }}</span>{% elif c.follows %}<span class="ok" title="сейчас {{ rub(c.cur_sale) }}, цель {{ rub(c.target) }} — в пределах допуска">{{ rub(c.cur_sale) }} ✓</span>{% else %}
     сейчас {{ rub(c.cur_sale) }} → <b>{{ rub(c.target) }}</b>{% endif %}</div>{% else %}<span class="muted">—</span>{% endfor %}</td>{% endfor %}
