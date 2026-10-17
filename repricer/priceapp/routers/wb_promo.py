@@ -1,7 +1,10 @@
 """Страница «Акции WB»: календарь акций по кабинетам, наши карточки в обычных акциях — плановая
 цена, «% от эталона для вхождения», порог, пометка «уложится в порог» / «вернётся эталон»; порог
 «для акции» (до её конца) и «Добавить в акцию»; массовая правка, Excel, история
-(`priceapp/wb_promo.py`)."""
+(`priceapp/wb_promo.py`).
+
+Устроена как «Порог скидки WB»: отбор и Excel видны сразу, без выбора акции. Акция не выбрана —
+в таблице и в файле все идущие и будущие обычные акции, каждая своим разделом."""
 from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation
@@ -64,26 +67,23 @@ def _promos(db: Session, acc: int, promo_id: int | None = None) -> list[WbPromot
     return q.order_by(WbPromotion.start_at, WbPromotion.name).all()
 
 
-def _view(db: Session, p: dict, all_cards=None):
-    """(кабинет, акции, выбранная акция, строки Entry, категории, артикулы по ключу, вне каталога, карточки)."""
+def _view(db: Session, p: dict):
+    """(кабинет, акции под отбором, строки Entry, категории для отбора, вне каталога, карточки)."""
+    from priceapp import etalon
     acc = _acc(db, p["acc"])
-    chosen = _promos(db, acc, int(p["promo"])) if p["promo"] else []
-    pcards = wp.classify(db, chosen, all_cards) if chosen else []
-    cats, arts, unknown = wp.rows(db, pcards, acc)
-    if p["by"] == GROUP:
-        entries = wp.grouped(cats, arts, p["q"], p["cat"], p["flt"])
-    else:
-        src = cats if p["by"] == wd.CATEGORY else arts
-        entries = [wd.Entry("row", row=r, section=r.key if r.kind == wd.CATEGORY else (r.category or ""))
-                   for r in src if wp.keep(r, p["q"], p["cat"], p["flt"])]
-    return acc, chosen, entries, cats, {a.key: a for a in arts}, unknown, pcards
+    chosen = _promos(db, acc, int(p["promo"]) if p["promo"] else None)
+    ets = etalon.etalons(db)
+    pcards = wp.classify(db, chosen, wd.cards(db, ets))
+    entries, cats, unknown = wp.sections(db, pcards, acc, p["by"], p["q"], p["cat"], p["flt"],
+                                         {a: e.name for a, e in ets.items()})
+    return acc, chosen, entries, cats, unknown, pcards
 
 
-def _calendar(db: Session, promos: list[WbPromotion]) -> list[dict]:
+def _calendar(db: Session, promos: list[WbPromotion], pcards=None) -> list[dict]:
     """Список акций для страницы: одна строка на акцию (ID у WB общий), кабинеты и наши счётчики."""
     now = now_utc()
     counts: dict[int, dict] = {}
-    for pc in wp.classify(db, promos):
+    for pc in (pcards if pcards is not None else wp.classify(db, promos)):
         k = counts.setdefault(pc.promo.promo_id, {"ours": 0, "in": 0, wp.FITS: 0, wp.RETURNS: 0, wp.FLOOR: 0})
         if pc.card is None:
             continue
@@ -115,26 +115,28 @@ def page(request: Request, db: Session = Depends(get_db), user: User = Depends(g
     from priceapp.models import AuditLog, WorkerHeartbeat
     from priceapp.routers.prices import saved_filters
     p = _params(request.query_params)
-    all_cards = wd.cards(db)
-    acc, chosen, entries, cats, _, unknown, pcards = _view(db, p, all_cards)
-    calendar = _calendar(db, _promos(db, acc))
+    acc, chosen, entries, cats, unknown, pcards = _view(db, p)
+    in_scope = _promos(db, acc)
+    calendar = _calendar(db, in_scope, pcards if not p["promo"] else None)
     rows = [e for e in entries if e.kind == "row"]
     shown, n = [], 0
-    for e in entries:
+    for e in entries:                       # предел — по строкам, заголовки разделов не в счёт
         n += e.kind == "row"
         if n > ROWS_LIMIT:
             break
         shown.append(e)
     fetched = max((x.fetched_at for x in db.query(WbPromotion)), default=None)
-    hb = db.get(WorkerHeartbeat, "wb_promo")
     qs = urlencode({k: v for k, v in p.items() if v})
     history = (db.query(AuditLog).filter(AuditLog.action.in_(HISTORY)).order_by(AuditLog.id.desc()).limit(50).all())
-    return render(request, "wb_promo.html", user, "wb_promo", p=p, acc=acc, promo=chosen[0] if chosen else None,
-                  promo_accounts=sorted({x.account_id for x in chosen}), calendar=calendar, entries=shown,
+    promo = chosen[0] if p["promo"] and chosen else None
+    return render(request, "wb_promo.html", user, "wb_promo", p=p, acc=acc, promo=promo, calendar=calendar,
+                  promo_choices=[(c["id"], c["name"], c["type"]) for c in calendar], entries=shown,
                   total=len(rows), shown=min(len(rows), ROWS_LIMIT), unknown=unknown, views=VIEWS,
                   filters=wp.FILTERS, accounts=wd.wb_accounts(db), where=wd.account_name(db, acc),
-                  categories=[c.key for c in cats], fmt=wd.fmt, labels=wd.KIND_LABELS, types=wp.TYPE_LABELS,
-                  fetched=fetched, beat=hb, pending=settings.get(db, settings.WB_PROMO_REFRESH_NOW) == "1",
+                  categories=cats, fmt=wd.fmt, labels=wd.KIND_LABELS, types=wp.TYPE_LABELS,
+                  has_regular=any(x.type == wp.REGULAR for x in in_scope),
+                  fetched=fetched, beat=db.get(WorkerHeartbeat, "wb_promo"),
+                  pending=settings.get(db, settings.WB_PROMO_REFRESH_NOW) == "1",
                   history=history, export_qs=qs, current_url="/wb-promo" + (f"?{qs}" if qs else ""),
                   saved_filters=saved_filters(db, "/wb-promo"), statuses=wp.STATUS_LABELS,
                   n_cards=len([pc for pc in pcards if pc.card is not None]))
@@ -152,14 +154,15 @@ def refresh_now(request: Request, form=Depends(posted_form), db: Session = Depen
 
 
 def _targets(entries, form) -> list:
-    """Строки правки: весь отбор или отмеченные. Артикул, чья категория тоже в правке, отдельно не
-    берём — его карточки уже в строке категории."""
+    """Строки правки: весь отбор или отмеченные. Артикул, чья категория в той же акции тоже в
+    правке, отдельно не берём — его карточки уже в строке категории."""
     rows = [e.row for e in entries if e.kind == "row"]
     if form.get("all_filtered") != "1":
         sel = set(form.getlist("sel"))
         rows = [r for r in rows if r.sel in sel]
-    cats = {wd.norm(r.key) for r in rows if r.kind == wd.CATEGORY}
-    return [r for r in rows if not (r.kind == wd.ARTICLE and not r.shared and r.category and wd.norm(r.category) in cats)]
+    cats = {(r.promo.promo_id, wd.norm(r.key)) for r in rows if r.kind == wd.CATEGORY}
+    return [r for r in rows if not (r.kind == wd.ARTICLE and not r.shared and r.category
+                                    and (r.promo.promo_id, wd.norm(r.category)) in cats)]
 
 
 def _cards_of(rows) -> list:
@@ -173,7 +176,7 @@ def _cards_of(rows) -> list:
 
 
 def _apply(request: Request, db: Session, p: dict, rows, action: str, raw_value, actor: str) -> RedirectResponse:
-    """Общее для строки и массовой правки: порог «для акции» (если вписан) и/или «Добавить в акцию»."""
+    """Общее для строки, массовой правки: порог «для акции» (если вписан) и/или «Добавить в акцию»."""
     value = None
     if str(raw_value or "").strip():
         try:
@@ -191,13 +194,13 @@ def _apply(request: Request, db: Session, p: dict, rows, action: str, raw_value,
         flash(request, "Ничего не отмечено — отметьте строки или «весь отбор».", "warn")
         return _back(p)
     msg, level = [], "ok"
+    names = sorted({pc.promo.name for pc in cards})
+    what = f"акция «{names[0]}»" if len(names) == 1 else f"акций {len(names)}"
     if value is not None:
         n = wp.set_threshold(db, cards, value, actor)
         db.commit()
-        promo = cards[0].promo
-        from priceapp.templating import local
-        msg.append(f"Порог для акции {wd.fmt(value)}% — у артикулов изменено: {n}; действует до "
-                   f"{local(promo.end_at)}, потом вернётся прежний.")
+        msg.append(f"Порог для акции {wd.fmt(value)}% ({what}) — у артикулов изменено: {n}; действует до конца "
+                   "акции, потом вернётся прежний.")
     if action == "add":
         # Пересчёт после нового порога — по самим карточкам, а не по отбору страницы: при отборе
         # «вернётся эталон» карточки, только что уложившиеся в новый порог, из отбора выпали бы, и
@@ -207,7 +210,7 @@ def _apply(request: Request, db: Session, p: dict, rows, action: str, raw_value,
         fresh = [pc for pc in wp.classify(db, promos)
                  if (pc.promo.account_id, pc.promo.promo_id, pc.item.nm_id) in keys]
         st = wp.add(db, fresh, actor)
-        text, level = wp.add_report(f"Акция «{cards[0].promo.name}»", st)
+        text, level = wp.add_report(what[0].upper() + what[1:], st)
         msg.append(text)
     flash(request, " ".join(msg), level)
     return _back(p)
@@ -220,10 +223,10 @@ def save_one(request: Request, form=Depends(posted_form), db: Session = Depends(
     """Строка: «Сохранить порог» — порог для акции; «Добавить в акцию» — порог (если вписан) и
     добавление карточек строки, что укладываются в порог."""
     p = _params(form)
-    _, chosen, entries, _, _, _, _ = _view(db, p)
+    _, _, entries, _, _, _ = _view(db, p)
     sel = str(form.get("sel") or "")
     rows = [e.row for e in entries if e.kind == "row" and e.row.sel == sel][:1]
-    if not chosen or not rows:
+    if not rows:
         flash(request, "Строка не найдена — обновите страницу.", "warn")
         return _back(p)
     return _apply(request, db, p, rows, "add" if form.get("action") == "add" else "set", form.get("thr"),
@@ -235,24 +238,20 @@ def save_one(request: Request, form=Depends(posted_form), db: Session = Depends(
 def bulk(request: Request, form=Depends(posted_form), db: Session = Depends(get_db),
          user: User = Depends(get_current_user)):
     p = _params(form)
-    _, chosen, entries, _, _, _, _ = _view(db, p)
-    if not chosen:
-        flash(request, "Сначала выберите акцию.", "warn")
-        return _back(p)
-    rows = _targets(entries, form)
-    return _apply(request, db, p, rows, "add" if form.get("action") == "add" else "set", form.get("value"),
-                  user.username)
+    _, _, entries, _, _, _ = _view(db, p)
+    return _apply(request, db, p, _targets(entries, form), "add" if form.get("action") == "add" else "set",
+                  form.get("value"), user.username)
 
 
 @router.get("/wb-promo/export")
 def export(request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Файл для правки — всегда разделами, как на странице; отбор страницы учитывается. Акция не
+    выбрана — все идущие и будущие обычные акции, каждая своим разделом."""
     p = _params(request.query_params)
     p["by"] = GROUP
-    _, chosen, entries, _, _, _, _ = _view(db, p)
-    if not chosen:
-        flash(request, "Сначала выберите акцию.", "warn")
-        return _back(p)
-    return bytes_response(wp.export_xlsx(entries, chosen[0]), f"акция_WB_{chosen[0].promo_id}.xlsx")
+    _, chosen, entries, _, _, _ = _view(db, p)
+    name = f"акция_WB_{p['promo']}.xlsx" if p["promo"] else "акции_WB.xlsx"
+    return bytes_response(wp.export_xlsx(entries), name)
 
 
 @router.get("/wb-promo/history")
@@ -269,7 +268,8 @@ def history_export(db: Session = Depends(get_db), user: User = Depends(get_curre
 def import_file(request: Request, file: UploadFile = File(...), db: Session = Depends(get_db),
                 user: User = Depends(get_current_user)):
     """Файл из «Экспорт в Excel»: «Новый порог для акции, %» (пусто — без изменений) и «Добавить в
-    акцию» («да»). Строки — той акции, что в колонке «ID акции»; отбор кабинета — как на странице."""
+    акцию» («да»). Каждая строка — в акции из своей колонки «ID акции»; в одном файле может быть
+    несколько акций. Кабинет — из отбора страницы, как при выгрузке."""
     p = _params(request.query_params)
     try:
         data = read_xlsx_rows(file.file.read())
@@ -281,7 +281,7 @@ def import_file(request: Request, file: UploadFile = File(...), db: Session = De
         return _back(p)
     todo: dict[str, list] = {}
     bad = []
-    for n, r in enumerate(data, start=2):
+    for n, r in enumerate(progress.each(data, "Читаю файл", total=len(data)), start=2):
         t_raw, add_raw = r.get(wp.COL_NEW), str(r.get(wp.COL_ADD) or "").strip().casefold()
         if str(t_raw if t_raw is not None else "").strip() == "" and not add_raw:
             continue
@@ -295,9 +295,11 @@ def import_file(request: Request, file: UploadFile = File(...), db: Session = De
             continue
         todo.setdefault(pid, []).append((n, kind, key, t_raw, bool(add_raw)))
     msgs, level = [], "ok"
+    progress.pin("Применяю файл по акциям", total=len(todo))
     for pid, lines in todo.items():
         q = dict(p, promo=pid, by=GROUP, q="", cat="", flt="")
-        _, chosen, entries, _, _, _, _ = _view(db, q)
+        _, chosen, entries, _, _, _ = _view(db, q)
+        progress.advance()
         if not chosen:
             bad.append(f"акция {pid}: нет среди идущих и будущих — обновите календарь")
             continue
@@ -305,7 +307,7 @@ def import_file(request: Request, file: UploadFile = File(...), db: Session = De
         thr: dict[Decimal, list] = {}
         adds = []
         for n, kind, key, t_raw, want in lines:
-            row = by_sel.get(f"{kind[0]}:{key}")
+            row = by_sel.get(f"{pid}:{kind[0]}:{key}")
             if row is None:
                 bad.append(f"строка {n}: {key} — в акции {pid} таких карточек нет")
                 continue
@@ -326,7 +328,7 @@ def import_file(request: Request, file: UploadFile = File(...), db: Session = De
         db.commit()
         msgs.append(f"Акция «{chosen[0].name}»: порог для акции изменён у артикулов — {changed}")
         if adds:
-            _, _, entries, _, _, _, _ = _view(db, q)
+            _, _, entries, _, _, _ = _view(db, q)
             by_sel = {e.row.sel: e.row for e in entries if e.kind == "row"}
             st = wp.add(db, _cards_of([by_sel[r.sel] for r in adds if r.sel in by_sel]), user.username)
             text, lv = wp.add_report("добавление", st)

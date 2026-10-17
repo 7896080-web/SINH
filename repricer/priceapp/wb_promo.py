@@ -198,6 +198,7 @@ class PCard:
     entry: int | None = None
     need: Decimal | None = None      # % от эталона для вхождения
     thr: Decimal | None = None
+    thr_src: str = ""                # откуда порог: артикул, категория, по умолчанию, «для акции до …»
     status: str = UNKNOWN
     note: str = ""
 
@@ -225,6 +226,10 @@ def classify(db: Session, promos: list[WbPromotion], all_cards=None) -> list[PCa
     rule = get_rule(db, "wb")
     rate = rates.current(db)
     costs = {c.item_id: c.cost_usd for c in db.query(OnecCost)}
+    temp = {(r.key, r.account_id): r.until for r in db.query(WbDiscountRule).filter(
+        WbDiscountRule.kind == wd.ARTICLE, WbDiscountRule.until.isnot(None))}
+    after = wd.Thresholds(db, after_temp=True) if temp else limits
+    from priceapp.templating import local
     out = []
     for p in regular:
         for it in db.query(WbPromotionItem).filter(WbPromotionItem.account_id == p.account_id,
@@ -239,7 +244,18 @@ def classify(db: Session, promos: list[WbPromotion], all_cards=None) -> list[PCa
                 pc.status = NOETALON
                 continue
             pc.need = ((1 - Decimal(pc.entry) / Decimal(c.ref_sale)) * 100).quantize(Decimal("0.1"), ROUND_HALF_UP)
-            pc.thr = min(limits.for_item(i, c.category, p.account_id)[0] for i in c.item_ids)
+            pc.thr, pc.thr_src = min((limits.for_item(i, c.category, p.account_id) for i in c.item_ids),
+                                     key=lambda t: t[0])
+            until = next((temp[(a, p.account_id)] for a in c.articles if (a, p.account_id) in temp), None)
+            if until is not None and pc.thr_src.startswith("артикул"):
+                if p.end_at is None or until < p.end_at:
+                    # Временный порог другой акции кончится раньше этой: дальше вернётся прежний, и
+                    # опрос выкинул бы карточку из ещё идущей акции. Судим по тому, что будет ПОСЛЕ.
+                    pc.thr, src = min((after.for_item(i, c.category, p.account_id) for i in c.item_ids),
+                                      key=lambda t: t[0])
+                    pc.thr_src = f"{src}: порог для акции до {local(until)} кончится раньше этой"
+                else:
+                    pc.thr_src = f"для акции до {local(until)}"
             pc.note = etalon.floor_problem(rule, item_facts(rule, c.rows).commission, rate, costs, c.item_ids,
                                            it.price or c.cur_list or 0, it.plan_discount or 0)
             pc.status = FLOOR if pc.note else (FITS if pc.need < pc.thr else RETURNS)
@@ -260,10 +276,12 @@ class PRow:
     category: str = ""
     shared: bool = False
     cards: list = field(default_factory=list)
+    promo: WbPromotion | None = None
 
     @property
     def sel(self) -> str:
-        return f"{self.kind[0]}:{self.key}"
+        """Строка — в своей акции: одна и та же категория в двух акциях — две строки."""
+        return f"{self.promo.promo_id if self.promo else 0}:{self.kind[0]}:{self.key}"
 
     @property
     def accounts(self) -> list[str]:
@@ -321,6 +339,21 @@ class PRow:
         return self._range(self._vals("thr"))
 
     @property
+    def thr_src_text(self) -> str:
+        return ", ".join(sorted({pc.thr_src for pc in self.cards if pc.thr_src}))
+
+    @property
+    def below_text(self) -> str:
+        """На сколько % цена на WB сейчас ниже эталона — как на «Пороге скидки WB»."""
+        return self._range([pc.card.below_pct for pc in self.cards
+                            if pc.card is not None and pc.card.below_pct is not None])
+
+    @property
+    def held_text(self) -> str:
+        return ", ".join(f"− {_fmt(h)}%" for h in sorted({pc.card.held for pc in self.cards
+                                                          if pc.card is not None and pc.card.held is not None}))
+
+    @property
     def suggest(self) -> int | None:
         """Наименьший целый порог, при котором уложатся все карточки строки."""
         n = self.need_max
@@ -357,12 +390,13 @@ def keep(row: PRow, q: str = "", cat: str = "", flt: str = "") -> bool:
     return True
 
 
-def rows(db: Session, pcards: list[PCard], account_id: int = 0) -> tuple[list[PRow], list[PRow], int]:
-    """(категории, артикулы, карточек вне каталога) по карточкам акции в кабинете (0 — во всех)."""
-    from priceapp import etalon
-    names = {}
-    for art, et in etalon.etalons(db).items():
-        names[art] = et.name
+def rows(db: Session, pcards: list[PCard], account_id: int = 0, promo: WbPromotion | None = None,
+         names: dict | None = None) -> tuple[list[PRow], list[PRow], int]:
+    """(категории, артикулы, карточек вне каталога) по карточкам ОДНОЙ акции в кабинете (0 — во
+    всех). `names` — артикул -> название (эталоны считаются один раз на страницу)."""
+    if names is None:
+        from priceapp import etalon
+        names = {art: et.name for art, et in etalon.etalons(db).items()}
     pcs = [pc for pc in pcards if not account_id or pc.promo.account_id == account_id]
     unknown = sum(1 for pc in pcs if pc.card is None)
     cats: dict[str, PRow] = {}
@@ -372,9 +406,11 @@ def rows(db: Session, pcards: list[PCard], account_id: int = 0) -> tuple[list[PR
         if pc.card is None:
             continue
         if pc.card.category:
-            cats.setdefault(wd.norm(pc.card.category), PRow(wd.CATEGORY, pc.card.category, category=pc.card.category))
+            cats.setdefault(wd.norm(pc.card.category), PRow(wd.CATEGORY, pc.card.category, category=pc.card.category,
+                                                            promo=promo or pc.promo))
         for a in pc.articles:
-            arts.setdefault(a, PRow(wd.ARTICLE, a, name=names.get(a, ""), category=pc.card.category)).cards.append(pc)
+            arts.setdefault(a, PRow(wd.ARTICLE, a, name=names.get(a, ""), category=pc.card.category,
+                                    promo=promo or pc.promo)).cards.append(pc)
             art_accs.setdefault(a, set()).add(pc.promo.account_id)
     for a, row in arts.items():
         row.shared = len(art_accs.get(a, ())) > 1
@@ -412,6 +448,33 @@ def grouped(cats: list[PRow], arts: list[PRow], q: str = "", cat: str = "", flt:
         out.append(wd.Entry("head", f"{wd.NO_CATEGORY} ({len(orphans)})", section=wd.NO_CATEGORY))
         out += [wd.Entry("row", row=a, section=wd.NO_CATEGORY) for a in orphans]
     return out
+
+
+def sections(db: Session, pcards: list[PCard], account_id: int, by: str, q: str = "", cat: str = "", flt: str = "",
+             names: dict | None = None) -> tuple[list[wd.Entry], list[str], int]:
+    """Строки страницы и файла по всем акциям из `pcards`: каждая акция своим разделом (если их
+    несколько), внутри — как на «Пороге скидки WB». -> (строки, категории для отбора, вне каталога)."""
+    from priceapp.templating import local
+    groups: dict[int, list[PCard]] = {}
+    for pc in pcards:
+        groups.setdefault(pc.promo.promo_id, []).append(pc)
+    out, cats_all, unknown = [], set(), 0
+    for pid, pcs in groups.items():
+        promo = pcs[0].promo
+        cats, arts, unk = rows(db, pcs, account_id, promo, names)
+        unknown += unk
+        cats_all |= {c.key for c in cats}
+        if by == "group":
+            part = grouped(cats, arts, q, cat, flt)
+        else:
+            src = cats if by == wd.CATEGORY else arts
+            part = [wd.Entry("row", row=r, section=r.key if r.kind == wd.CATEGORY else (r.category or ""))
+                    for r in src if keep(r, q, cat, flt)]
+        if part and len(groups) > 1:
+            out.append(wd.Entry("promo", f"Акция «{promo.name}» · {local(promo.start_at)} — {local(promo.end_at)} · "
+                                         f"ID {pid}", section=promo.name))
+        out += part
+    return out, sorted(cats_all, key=str.casefold), unknown
 
 
 # --- действия ------------------------------------------------------------------------------------
@@ -523,13 +586,17 @@ def attention_items(db: Session, now: datetime | None = None) -> list[tuple[str,
 
 HEAD = ["Раздел", "Тип", "Категория WB / артикул 1С", "Название", "Категория WB", "Кабинеты", "ID акции", "Акция",
         "Начало", "Конец", "Карточек в акции", "Карточек всего", "Эталон, ₽", "Сейчас на WB, ₽",
-        "Цена при входе, ₽", "Рекомендуемая скидка, %", "% от эталона для вхождения", "Порог действует, %",
-        "Пометка", "Новый порог для акции, %", "Добавить в акцию (да)"]
-COL_KIND, COL_KEY, COL_PROMO, COL_NEW, COL_ADD = HEAD[1], HEAD[2], HEAD[6], HEAD[19], HEAD[20]
+        "Сейчас ниже эталона, %", "Стоит «эталон − N%»", "Цена при входе, ₽", "Рекомендуемая скидка, %",
+        "% от эталона для вхождения", "Порог сейчас, %", "Откуда порог", "Пометка", "Новый порог для акции, %",
+        "Добавить в акцию (да)"]
+COL_KIND, COL_KEY, COL_PROMO, COL_NEW, COL_ADD = "Тип", "Категория WB / артикул 1С", "ID акции", \
+    "Новый порог для акции, %", "Добавить в акцию (да)"
 YES = {"да", "yes", "1", "+", "true", "истина"}
 
 
-def export_xlsx(entries: list[wd.Entry], promo: WbPromotion) -> bytes:
+def export_xlsx(entries: list[wd.Entry]) -> bytes:
+    """Файл для правки — те же разделы, что на странице (по акциям, если их несколько). Правятся две
+    колонки (выделены цветом) и выгружаются ПУСТЫМИ — что вписали, то и меняется."""
     import io
 
     from openpyxl import Workbook
@@ -540,12 +607,13 @@ def export_xlsx(entries: list[wd.Entry], promo: WbPromotion) -> bytes:
     from priceapp.templating import local
     wb = Workbook(write_only=True)
     ws = wb.create_sheet("Акция WB")
-    widths = [22, 11, 24, 36, 18, 26, 10, 30, 14, 14, 9, 9, 10, 10, 11, 11, 12, 12, 30, 12, 12]
+    widths = [22, 11, 24, 36, 18, 26, 10, 30, 14, 14, 9, 9, 10, 10, 11, 12, 11, 11, 12, 10, 20, 30, 12, 12]
     for i, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
     ws.freeze_panes = "D2"
     edit = PatternFill("solid", fgColor="FFF4C2")
     head_fill = PatternFill("solid", fgColor="DCE6F2")
+    promo_fill = PatternFill("solid", fgColor="B8CCE4")
     cat_fill = PatternFill("solid", fgColor="EEF2F7")
     edit_cols = {HEAD.index(COL_NEW), HEAD.index(COL_ADD)}
 
@@ -566,14 +634,15 @@ def export_xlsx(entries: list[wd.Entry], promo: WbPromotion) -> bytes:
 
     ws.append(row_of(HEAD, bold=True))
     for e in entries:
-        if e.kind == "head":
-            ws.append(row_of([e.text.upper()] + [None] * (len(HEAD) - 1), bold=True, fill=head_fill, editable=False))
+        if e.kind in ("head", "promo"):
+            ws.append(row_of([e.text.upper()] + [None] * (len(HEAD) - 1), bold=True,
+                             fill=promo_fill if e.kind == "promo" else head_fill, editable=False))
             continue
-        r = e.row
+        r, promo = e.row, e.row.promo
         ws.append(row_of([e.section, wd.KIND_LABELS[r.kind], r.key, r.name, r.category if r.kind == wd.ARTICLE else "",
                           ", ".join(r.accounts), promo.promo_id, promo.name, local(promo.start_at), local(promo.end_at),
-                          r.n_in, len(r.cards), r.etalon, r.current, r.entry_text, r.plan_disc_text, r.need_text,
-                          r.thr_text, r.mark, None, None],
+                          r.n_in, len(r.cards), r.etalon, r.current, r.below_text, r.held_text, r.entry_text,
+                          r.plan_disc_text, r.need_text, r.thr_text, r.thr_src_text, r.mark, None, None],
                          bold=r.kind == wd.CATEGORY, fill=cat_fill if r.kind == wd.CATEGORY else None,
                          indent=2 * e.level))
     buf = io.BytesIO()
