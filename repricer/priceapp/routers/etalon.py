@@ -71,7 +71,7 @@ def _rows(db: Session, q: str, flt: str):
             continue
         fol = by_art.get(art, {})
         diff = any(not c.skip and not c.follows for cs in fol.values() for c in cs) or any(
-            c.ref_sale and c.cur_sale and abs(c.cur_sale - c.ref_sale) > tol for c in et.cards)
+            c.target_sale and c.cur_sale and abs(c.cur_sale - c.target_sale) > tol for c in et.cards)
         if flt == "diff" and not diff:
             continue
         if flt == "noetalon" and et.sale:

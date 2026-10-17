@@ -56,6 +56,7 @@ SOURCE_LABELS = {**pricing.SOURCE_LABELS, "rollback": "возврат прежн
                  "guard": "возврат по диапазону безопасности",
                  "etalon": "новый эталон", "etalon_follow": "за эталоном",
                  "reference": "возврат эталона WB", "follow": "Kit за WB",
+                 "wb_now": "эталон − N% (порог скидки WB)",
                  # прежние схемы — для старых строк журнала
                  "platform": "цена площадки", "base": "от базовой"}
 PRICE_STATUS_LABELS = {"QUARANTINE": "на карантине у площадки", "ERROR": "площадка: ошибка цены",
@@ -1300,7 +1301,7 @@ def preview(platform: str, request: Request, form=Depends(posted_form), db: Sess
 # Страницы, чей отбор можно запомнить. «Цены товаров» — основной рабочий экран, а
 # отбор на нём сохранить было нельзя: сервер принимал только /prices и /mapping, а
 # переход по меню сбрасывает фильтры (аудит 08.10).
-SAVED_FILTER_PAGES = ("/prices", "/mapping", "/sku-prices")
+SAVED_FILTER_PAGES = ("/prices", "/mapping", "/sku-prices", "/wb-discount")
 
 
 def saved_filters(db: Session, *pages: str) -> list:

@@ -1,0 +1,128 @@
+{% extends "base.html" %}
+{% block title %}Порог скидки WB{% endblock %}
+{% block content %}
+{% macro rub(v) %}{% if v is none %}—{% else %}{{ '{:,}'.format(v).replace(',', ' ') }}{% endif %}{% endmacro %}
+{% set unit = 'категорий' if p.by == 'category' else 'артикулов' %}
+<style>
+.wd-table td { vertical-align:top; font-size:13px; }
+.wd-table .sub { color:var(--muted); font-size:12px; }
+.wd-table input.pct { width:56px; }
+.wd-table tr.over td:first-child { border-left:3px solid var(--warn, #c80); }
+.wd-hist td { font-size:12px; vertical-align:top; padding:2px 10px 2px 0; }
+</style>
+<h1>Порог скидки WB</h1>
+<p class="muted">Эталон — цена WB <b>после скидки продавца</b> (страница <a href="/etalon">«Эталонные цены»</a>). <b>Порог</b> —
+на сколько % цена на WB может быть ниже эталона: акция WB в пределах порога не трогается, ниже порога программа при
+ближайшем опросе WB возвращает <b>полный эталон</b>. <b>«Эталон −, %»</b> с кнопкой «Отправить сейчас» — разово ставит на
+карточки WB цену «эталон − N%» (N меньше порога); дальше — как обычно: держится, пока не уйдёт ниже порога, пересчёт по курсу
+сохраняет тот же N%. Эталон и площадки-последователи (Kit, Ламода) при этом не меняются.
+Главнее всех — артикул в кабинете, затем артикул на все кабинеты, категория в кабинете, категория на все кабинеты, порог
+на все товары. Действует, пока не изменят руками.</p>
+
+<div class="card">
+  <form method="post" action="/wb-discount/default" class="row">
+    {% for k in ('acc', 'by', 'q', 'cat', 'flt') %}<input type="hidden" name="{{ k }}" value="{{ p[k] }}">{% endfor %}
+    <label>Порог на все товары, %<input name="value" value="{{ fmt(default) }}" inputmode="decimal" style="width:60px"></label>
+    <button class="secondary">Сохранить</button>
+    <span class="muted">Действует там, где у категории и артикула нет своего.</span>
+  </form>
+</div>
+
+<div class="row saved-filters" style="margin-bottom:10px">
+  {% for sf in saved_filters %}<span class="chip"><a href="{{ sf.url }}">{{ sf.name }}</a>
+    <form method="post" action="/filters/{{ sf.id }}/delete" style="display:inline"><button class="chip-x" title="Удалить отбор" onclick="return confirm('Удалить отбор «{{ sf.name|js }}»?')">×</button></form></span>{% endfor %}
+  <form method="post" action="/filters/save" class="row" style="gap:6px">
+    <input type="hidden" name="url" value="{{ current_url }}">
+    <input name="name" placeholder="имя отбора" style="width:160px" required>
+    <button class="secondary" title="Запомнить кабинет, вид и отбор этой страницы">Сохранить отбор</button></form>
+</div>
+
+<form method="get" action="/wb-discount" class="card">
+  <div class="row">
+    <label>Кабинет<select name="acc" onchange="this.form.submit()" style="font-weight:600">
+      <option value="">Все кабинеты WB</option>
+      {% for a in accounts %}<option value="{{ a.id }}" {% if acc == a.id %}selected{% endif %}>{{ a.name }}</option>{% endfor %}</select></label>
+    <label>Вид<select name="by" onchange="this.form.submit()">{% for k, v in views.items() %}<option value="{{ k }}" {% if p.by == k %}selected{% endif %}>{{ v }}</option>{% endfor %}</select></label>
+    {% if p.by == 'article' %}<label>Категория<select name="cat"><option value="">все</option>{% for c in categories %}<option value="{{ c }}" {% if p.cat == c %}selected{% endif %}>{{ c }}</option>{% endfor %}</select></label>{% endif %}
+    <label>{{ 'Категория' if p.by == 'category' else 'Артикул или название' }}<input name="q" value="{{ p.q }}" style="width:140px"></label>
+    <label>Отбор<select name="flt">{% for k, v in filters.items() %}<option value="{{ k }}" {% if p.flt == k %}selected{% endif %}>{{ v }}</option>{% endfor %}</select></label>
+    <button class="secondary">Показать</button>
+    <a class="btn secondary" href="/wb-discount{% if p.by != 'category' %}?by={{ p.by }}{% endif %}">Сбросить</a>
+  </div>
+  <p class="muted" style="margin-bottom:0">{% if acc %}Порог и «Отправить сейчас» здесь — только для кабинета <b>{{ where }}</b>; его порог главнее порога на все кабинеты.
+  {% else %}Порог здесь — на все кабинеты WB ({{ accounts|length }}); у кабинета со своим порогом действует свой. «Отправить сейчас» — на карточки всех кабинетов.{% endif %}</p>
+</form>
+
+<details style="margin-bottom:10px"><summary><b>Excel</b> — выгрузить отобранное или задать пороги файлом</summary>
+<div class="row" style="margin-top:8px">
+  <a class="btn secondary" href="/wb-discount/export?{{ export_qs }}" title="Ровно то, что отобрано на странице">Экспорт отбора в Excel</a>
+  <a class="btn secondary" href="/wb-discount/export?acc={{ p.acc }}&amp;by=all" title="Все категории и все артикулы кабинета (или всех кабинетов)">Экспорт: все категории и артикулы</a>
+  <form method="post" action="/wb-discount/import?{{ export_qs }}" enctype="multipart/form-data" class="row"
+    onsubmit="return confirm('Загрузить пороги из файла? Строки с заполненной колонкой «Отправить сейчас» СРАЗУ уйдут на WB.')">
+    <label>Колонки «Порог…» и «Отправить сейчас…» (пусто — без изменений, «-» в пороге — снять свой)<input type="file" name="file" accept=".xlsx" required></label>
+    <button class="secondary">Импорт из Excel</button>
+  </form>
+</div>
+<p class="muted" style="margin-bottom:0">Колонка «Кабинет» решает, где действует порог: «{{ 'Все кабинеты WB' }}» или имя кабинета. Остальные колонки — справочные.</p></details>
+
+<form method="post" action="/wb-discount/bulk" id="bulk" data-sel-key="wbd:{{ acc }}:{{ p.by }}" data-sel-name="sel" data-sel-total="{{ total }}" data-sel-unit="{{ unit }}">
+  {% for k in ('acc', 'by', 'q', 'cat', 'flt') %}<input type="hidden" name="{{ k }}" value="{{ p[k] }}">{% endfor %}
+  <div class="card">
+    <div class="row">
+      <label style="flex-direction:row;gap:6px;align-items:center"><input type="checkbox" name="all_filtered" value="1"> весь отбор — {{ total }} {{ 'кат.' if p.by == 'category' else 'арт.' }}</label>
+      <label>Порог, %<input name="value" inputmode="decimal" style="width:60px" placeholder="20"></label>
+      <button type="submit" name="action" value="set" onclick="return selConfirm('bulk', 'Установить порог ({{ where|js }})', '{{ unit }}', true)">Установить порог</button>
+      <button type="submit" name="action" value="clear" class="secondary" onclick="return selConfirm('bulk', 'Снять свой порог ({{ where|js }}) — будет действовать общий', '{{ unit }}', true)">Снять свой порог</button>
+      <span style="width:16px"></span>
+      <label>Эталон −, %<input name="now" inputmode="decimal" style="width:60px" placeholder="15"></label>
+      <button type="submit" name="action" value="send" data-sel-clear onclick="return selConfirm('bulk', 'ОТПРАВИТЬ НА WB «эталон − ' + this.form.elements['now'].value + '%» ({{ where|js }})', '{{ unit }} (все их карточки)', true)">Отправить сейчас</button>
+    </div>
+    <div class="row" style="margin-top:6px"><span class="sel-count muted" data-for="bulk"></span>
+      <button type="button" class="secondary sel-clear" data-for="bulk" style="padding:2px 8px;font-size:12px">Снять отметки</button></div>
+    <p class="muted" style="margin-bottom:0">«Установить порог» и «Снять свой порог» на WB ничего не отправляют — порог начнёт действовать при ближайшем
+    опросе WB. «Отправить сейчас» ставит цену «эталон − N%» сразу; 0 — вернуть полный эталон. Не уходит ниже пола, больше
+    чем на 33% за раз и там, где N не меньше порога.
+    Найдено: {{ total }} {{ unit }}{% if total > rows|length %}, показаны первые {{ rows|length }} — галочка «весь отбор» берёт все, полный список — в Excel{% endif %}.</p>
+  </div>
+</form>
+
+<div class="scroll"><table class="wd-table">
+<tr><th><input type="checkbox" class="sel-all" data-for="bulk" title="Отметить строки на экране"></th>
+<th>{{ 'Категория WB' if p.by == 'category' else 'Артикул' }}</th><th class="num">Карточек WB</th>
+{% if p.by == 'article' %}<th class="num">Эталон, ₽</th><th class="num">Сейчас на WB, ₽</th>{% endif %}
+<th class="num" title="На сколько % цена после скидки на WB сейчас ниже эталона (у категории — от и до по карточкам)">Сейчас ниже эталона, %</th>
+<th>Стоит «эталон − N%»</th><th>Порог действует</th><th>Свой порог, %</th><th>Эталон −, %</th><th></th></tr>
+{% for r in rows %}{% set fid = 'r' ~ loop.index %}
+<tr class="{{ 'over' if r.below_max is not none and r.eff is not none and r.below_max > r.eff else '' }}">
+  <td><input type="checkbox" name="sel" value="{{ r.sel }}" form="bulk"></td>
+  <td><b>{{ r.key }}</b>{% if r.name %}<div class="sub" style="max-width:240px">{{ r.name }}</div>{% endif %}
+    {% if p.by == 'article' and r.category %}<div class="sub">{{ r.category }}</div>{% endif %}
+    {% if not r.cards %}<div class="sub warn">на WB нет карточек с эталоном</div>{% endif %}</td>
+  <td class="num">{{ r.cards or '—' }}</td>
+  {% if p.by == 'article' %}<td class="num">{{ rub(r.etalon) }}</td><td class="num">{{ rub(r.current) }}</td>{% endif %}
+  <td class="num">{{ r.below_text or '—' }}</td>
+  <td>{% for h in r.held|sort %}<span class="badge">− {{ fmt(h) }}%</span> {% else %}<span class="muted">—</span>{% endfor %}
+    {% if r.rule and r.rule.now_at %}<div class="sub">отправлено − {{ fmt(r.rule.now_pct) }}% {{ r.rule.now_at|local }} {{ r.rule.now_by }}</div>{% endif %}</td>
+  <td><b>{{ fmt(r.eff) }}%</b><div class="sub">{{ r.eff_src }}</div>
+    {% if r.others %}<div class="sub" title="Свой порог у отдельных кабинетов — там действует он">кабинеты: {{ r.others|join(', ') }}</div>{% endif %}</td>
+  <td><input class="pct" name="thr" form="{{ fid }}" value="{{ fmt(r.own) }}" inputmode="decimal" placeholder="—" title="Пусто — своего порога нет, действует общий ({{ fmt(r.eff) }}%)"></td>
+  <td><input class="pct" name="now" form="{{ fid }}" inputmode="decimal" placeholder="N" title="«Отправить сейчас» поставит цену «эталон − N%»; 0 — полный эталон"></td>
+  <td><form id="{{ fid }}" method="post" action="/wb-discount/save" class="row" style="gap:4px;flex-wrap:nowrap">
+    {% for k in ('acc', 'by', 'q', 'cat', 'flt') %}<input type="hidden" name="{{ k }}" value="{{ p[k] }}">{% endfor %}
+    <input type="hidden" name="kind" value="{{ r.kind }}"><input type="hidden" name="key" value="{{ r.key }}">
+    <button name="action" value="save" class="secondary" style="padding:4px 8px">Сохранить</button>
+    {% if r.cards %}<button name="action" value="send" style="padding:4px 8px"
+      onclick="var v=this.form.elements['now'].value; if(!v){alert('Впишите «Эталон −, %».');return false;} return confirm('{{ r.key|js }} ({{ where|js }}): отправить на WB «эталон − ' + v + '%» по {{ r.cards }} карточкам?')">Отправить сейчас</button>{% endif %}
+  </form></td>
+</tr>
+{% else %}<tr><td colspan="11" class="muted">Нет строк под этот отбор.</td></tr>{% endfor %}
+</table></div>
+<p class="muted">Строка с полосой слева — цена на WB сейчас ниже порога: ближайший опрос WB вернёт полный эталон.</p>
+
+<details class="card"><summary><b>История изменений</b> — пороги и отправки «эталон − N%», последние {{ history|length }}</summary>
+<p><a class="btn secondary" href="/wb-discount/history">Выгрузить всю историю в Excel</a></p>
+<table class="wd-hist">
+{% for h in history %}<tr><td style="white-space:nowrap">{{ h.at|local }}</td><td>{{ h.username }}</td><td>{{ h.object }}</td><td>{{ h.details }}</td></tr>
+{% else %}<tr><td class="muted">Пока ничего не меняли.</td></tr>{% endfor %}
+</table></details>
+{% endblock %}
