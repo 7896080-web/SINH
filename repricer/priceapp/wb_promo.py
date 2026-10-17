@@ -22,6 +22,10 @@ API не отдаёт — только число исключённых до с
 «Добавить в акцию» (`add`) — запись на WB: только «уложится в порог», не ниже пола, ещё не в акции.
 Со старта акции, если она не началась, иначе сразу. WB применяет не мгновенно — до следующего
 обновления календаря строка помечена «отправлено, ждём WB».
+
+«Участвовать до» (`set_leave`, решение владельца 17.10) — срок участия карточки, раньше конца
+акции. По его истечении (`leave_due`, фоном раз в 5 минут) программа ставит ПОЛНЫЙ эталон: цена
+поднимается, и карточка выходит из акции. Порог «для акции» этой акции кончается в тот же срок.
 """
 from __future__ import annotations
 
@@ -210,9 +214,19 @@ class PCard:
     def added(self) -> bool:
         return bool(self.item.added_at) and not self.item.in_action and now_utc() - self.item.added_at < ADDED_WAIT
 
+    @property
+    def leaving(self) -> bool:
+        """Есть срок участия, и он ещё не прошёл."""
+        return self.item.leave_at is not None and self.item.left_at is None
 
-def classify(db: Session, promos: list[WbPromotion], all_cards=None) -> list[PCard]:
-    """Каждая карточка обычных акций `promos`: цена при входе, «% от эталона», порог, пометка."""
+    @property
+    def left(self) -> bool:
+        return self.item.left_at is not None
+
+
+def classify(db: Session, promos: list[WbPromotion], all_cards=None, leave_at=None) -> list[PCard]:
+    """Каждая карточка обычных акций `promos`: цена при входе, «% от эталона», порог, пометка.
+    `leave_at` — срок участия, с которым карточки собираются добавить (у уже стоящих — свой)."""
     from priceapp import etalon, rates
     from priceapp.models import OnecCost
     from priceapp.pricing import get_rule, item_facts
@@ -247,8 +261,13 @@ def classify(db: Session, promos: list[WbPromotion], all_cards=None) -> list[PCa
             pc.thr, pc.thr_src = min((limits.for_item(i, c.category, p.account_id) for i in c.item_ids),
                                      key=lambda t: t[0])
             until = next((temp[(a, p.account_id)] for a in c.articles if (a, p.account_id) in temp), None)
+            # до какого момента карточка в акции: конец акции или срок участия, если он раньше
+            horizon = p.end_at
+            lv = leave_at or (it.leave_at if it.left_at is None else None)
+            if lv is not None and (horizon is None or lv < horizon):
+                horizon = lv
             if until is not None and pc.thr_src.startswith("артикул"):
-                if p.end_at is None or until < p.end_at:
+                if horizon is None or until < horizon:
                     # Временный порог другой акции кончится раньше этой: дальше вернётся прежний, и
                     # опрос выкинул бы карточку из ещё идущей акции. Судим по тому, что будет ПОСЛЕ.
                     pc.thr, src = min((after.for_item(i, c.category, p.account_id) for i in c.item_ids),
@@ -365,12 +384,24 @@ class PRow:
         return "; ".join(parts)
 
     @property
+    def leave_text(self) -> str:
+        """«участвует до 25.10» по срокам карточек строки."""
+        from priceapp.templating import local
+        dates = sorted({pc.item.leave_at for pc in self.cards if pc.leaving})
+        return ", ".join(local(d, "%d.%m %H:%M") for d in dates)
+
+    @property
+    def n_left(self) -> int:
+        return sum(1 for pc in self.cards if pc.left)
+
+    @property
     def can_add(self) -> int:
         return sum(1 for pc in self.cards if pc.status == FITS and not pc.item.in_action and not pc.added)
 
 
 FILTERS = {"": "все", FITS: "уложится в порог", RETURNS: "вернётся эталон", FLOOR: "ниже пола",
-           "in": "уже в акции", "out": "не в акции", "added": "отправлено, ждём WB", NOETALON: "нет эталона"}
+           "in": "уже в акции", "out": "не в акции", "added": "отправлено, ждём WB", NOETALON: "нет эталона",
+           "leave": "со сроком участия", "left": "вышли по сроку"}
 
 
 def keep(row: PRow, q: str = "", cat: str = "", flt: str = "") -> bool:
@@ -386,6 +417,10 @@ def keep(row: PRow, q: str = "", cat: str = "", flt: str = "") -> bool:
     if flt == "out" and row.n_in == len(row.cards):
         return False
     if flt == "added" and not row.n_added:
+        return False
+    if flt == "leave" and not row.leave_text:
+        return False
+    if flt == "left" and not row.n_left:
         return False
     return True
 
@@ -479,8 +514,9 @@ def sections(db: Session, pcards: list[PCard], account_id: int, by: str, q: str 
 
 # --- действия ------------------------------------------------------------------------------------
 
-def set_threshold(db: Session, pcards: list[PCard], value: Decimal, actor: str) -> int:
-    """Порог «для акции» артикулам этих карточек, в их кабинетах, до конца их акции. Не коммитит."""
+def set_threshold(db: Session, pcards: list[PCard], value: Decimal, actor: str, leave_at=None) -> int:
+    """Порог «для акции» артикулам этих карточек, в их кабинетах, до конца их акции (или до срока
+    участия `leave_at`, если он раньше). Не коммитит."""
     n, done = 0, set()
     for pc in pcards:
         if pc.card is None or pc.promo.end_at is None:
@@ -490,12 +526,158 @@ def set_threshold(db: Session, pcards: list[PCard], value: Decimal, actor: str) 
             if k in done:
                 continue
             done.add(k)
-            n += wd.set_temp_threshold(db, art, value, pc.promo.end_at, actor, pc.promo.account_id,
+            until = min(pc.promo.end_at, leave_at) if leave_at else pc.promo.end_at
+            n += wd.set_temp_threshold(db, art, value, until, actor, pc.promo.account_id,
                                        pc.promo.promo_id, pc.promo.name)
     return n
 
 
-def add(db: Session, pcards: list[PCard], actor: str, client_factory=None) -> dict:
+def parse_leave(raw):
+    """«Участвовать до»: дата (поле страницы — ГГГГ-ММ-ДД, Excel — дата или дд.мм.гггг) -> конец
+    этого МЕСТНОГО дня как наивное UTC. Пусто — None; не дата — ValueError."""
+    from datetime import date, datetime as dt
+    from priceapp.timeutils import local_day_start_utc
+    if raw is None or str(raw).strip() == "":
+        return None
+    if isinstance(raw, dt):
+        d = raw.date()
+    elif isinstance(raw, date):
+        d = raw
+    else:
+        text = str(raw).strip()
+        for fmt_ in ("%Y-%m-%d", "%d.%m.%Y", "%d.%m.%y"):
+            try:
+                d = dt.strptime(text, fmt_).date()
+                break
+            except ValueError:
+                continue
+        else:
+            raise ValueError(text)
+    return local_day_start_utc(d + timedelta(days=1)) - timedelta(seconds=1)
+
+
+def leave_error(promo: WbPromotion, leave_at, now=None) -> str:
+    now = now or now_utc()
+    if leave_at <= now:
+        return "срок уже прошёл"
+    if promo.start_at and leave_at <= promo.start_at:
+        return "срок раньше старта акции"
+    if promo.end_at and leave_at >= promo.end_at:
+        return "срок не раньше конца акции — она кончится сама"
+    return ""
+
+
+def set_leave(db: Session, pcards: list[PCard], leave_at, actor: str) -> tuple[int, list[str]]:
+    """Срок участия карточкам, что в акции или отправлены в неё; None — снять срок (участвует до
+    конца акции). Порог «для акции» этой акции укорачивается до срока. Не коммитит.
+    -> (сколько карточек, отказы)."""
+    from priceapp.templating import local
+    n, bad, done = 0, [], set()
+    for pc in pcards:
+        name = f"{pc.account.name if pc.account else ''} {pc.item.nm_id}"
+        if not (pc.item.in_action or pc.item.added_at):
+            continue
+        if leave_at is not None:
+            err = leave_error(pc.promo, leave_at)
+            if err:
+                bad.append(f"{name}: {err}")
+                continue
+        if pc.item.leave_at == leave_at and pc.item.left_at is None:
+            continue
+        pc.item.leave_at, pc.item.leave_by, pc.item.left_at = leave_at, actor, None
+        n += 1
+        if leave_at is None:
+            continue
+        for art in pc.articles:
+            k = (art, pc.promo.account_id)
+            if k in done:
+                continue
+            done.add(k)
+            r = wd.get_rule(db, wd.ARTICLE, art, pc.promo.account_id)
+            if r is not None and r.until is not None and r.until_promo_id == pc.promo.promo_id and r.until > leave_at:
+                r.until = leave_at
+    if n:
+        what = f"до {local(leave_at)}" if leave_at else "снят — до конца акции"
+        names = sorted({pc.promo.name for pc in pcards})
+        audit.log(db, actor, "wb_promo_leave_set", "", f"срок участия {what}: карточек {n}; акции: "
+                  + ", ".join(f"«{x}»" for x in names)[:800])
+    return n, bad
+
+
+def leave_due(db: Session, client_factory=None, now: datetime | None = None) -> dict:
+    """Срок участия прошёл — на карточку ставится ПОЛНЫЙ эталон (цена до скидки и скидка эталона):
+    цена поднимается, и карточка выходит из акции. Карточка без эталона поднять нечем — она
+    помечается вышедшей с записью в журнал «уберите в кабинете WB», иначе её пытались бы каждые
+    5 минут. Не принял WB — повтор при следующем проходе. Коммитит."""
+    from priceapp import accounts, etalon
+    from priceapp.dispatch import _record_sent
+    from priceapp.platforms import WB_PRICES
+    now = now or now_utc()
+    due = db.query(WbPromotionItem).filter(WbPromotionItem.leave_at.isnot(None), WbPromotionItem.leave_at <= now,
+                                           WbPromotionItem.left_at.is_(None)).all()
+    st = {"due": len(due), "raised": 0, "same": 0, "errors": []}
+    if not due:
+        return st
+    cards = {(c.account.id, c.nm): c for c in wd.cards(db)}
+    names = {(p.account_id, p.promo_id): p.name for p in db.query(WbPromotion)}
+    plan: dict[int, dict[str, tuple]] = {}
+    for it in due:
+        c = cards.get((it.account_id, it.nm_id))
+        promo = names.get((it.account_id, it.promo_id), it.promo_id)
+        if c is None or not c.ref_list:
+            it.left_at = now
+            audit.log(db, "программа", "wb_promo_leave", str(it.account_id),
+                      f"акция «{promo}», карточка {it.nm_id}: срок участия прошёл, но эталона нет — цену поднять "
+                      "нечем, уберите карточку из акции в кабинете WB")
+            st["errors"].append(f"{it.nm_id}: нет эталона")
+            continue
+        if c.cur_list == c.ref_list and c.cur_sale == c.ref_sale:
+            it.left_at = now                  # уже на эталоне — подниматься некуда
+            st["same"] += 1
+            continue
+        plan.setdefault(it.account_id, {}).setdefault(c.nm, (c, []))[1].append((it, promo))
+    for acc_id, by_nm in plan.items():
+        acc = db.get(Account, acc_id)
+        try:
+            client = accounts.client_for(db, acc, client_factory)
+        except Exception as e:
+            st["errors"].append(f"{acc.name}: {e}"[:300])
+            continue
+        items = list(by_nm.items())
+        for start in range(0, len(items), 1000):
+            chunk = items[start:start + 1000]
+            body = {"data": [{"nmID": int(nm), "price": int(c.ref_list), "discount": int(c.ref_disc or 0)}
+                             for nm, (c, _) in chunk]}
+            try:
+                data = client._post(f"{WB_PRICES}/api/v2/upload/task", body)
+                if isinstance(data, dict) and data.get("error"):
+                    raise RuntimeError(data.get("errorText") or "WB вернул error=true")
+            except Exception as e:
+                st["errors"].append(f"{acc.name}: {e}"[:300])
+                continue
+            for nm, (c, its) in chunk:
+                wd._mark_held(db, acc_id, c.item_ids, None)      # полный эталон — сдвига «эталон − N%» больше нет
+                for i in c.item_ids:
+                    _record_sent(db, i, acc_id, int(c.ref_list))
+                promos = ", ".join(sorted({f"«{p}»" for _, p in its}))
+                etalon.journal_sent(db, acc_id, c.item_ids, c.rows[0].barcode if c.rows else "", c.cur_list,
+                                    int(c.ref_list), "wb_promo_leave",
+                                    f"выход из акции {promos} по сроку: полный эталон {c.ref_sale} ₽", "программа")
+                for r in c.rows:
+                    r.current_price, r.current_sale_price = int(c.ref_list), c.ref_sale
+                for it, _ in its:
+                    it.left_at = now
+                st["raised"] += 1
+            audit.log(db, "программа", "wb_promo_leave", acc.name,
+                      f"срок участия прошёл — поставлен полный эталон, карточки выходят из акций: {len(chunk)} — "
+                      + "; ".join(f"{nm}: -> {c.ref_sale}" for nm, (c, _) in chunk[:20])[:900])
+        db.commit()
+    db.commit()
+    wd.expire_temp(db, now)
+    return st
+
+
+def add(db: Session, pcards: list[PCard], actor: str, client_factory=None, leave_at=None) -> dict:
     """«Добавить в акцию» — только «уложится в порог», не ниже пола, ещё не в акции и не отправленные
     недавно. По кабинету и акции одним запросом на 1000 карточек. Коммитит."""
     from priceapp import accounts, progress
@@ -534,10 +716,14 @@ def add(db: Session, pcards: list[PCard], actor: str, client_factory=None) -> di
             progress.step(len(chunk))
             done += chunk
             for pc in chunk:
-                pc.item.added_at, pc.item.added_by = now, actor
+                pc.item.added_at, pc.item.added_by, pc.item.left_at = now, actor, None
+                if leave_at is not None and not leave_error(pc.promo, leave_at):
+                    pc.item.leave_at, pc.item.leave_by = leave_at, actor
+            from priceapp.templating import local
             audit.log(db, actor, "wb_promo_add", acc.name,
                       f"акция «{promo.name}» ({pid}): добавлено карточек {len(chunk)}, "
-                      f"{'сразу' if upload_now else 'со старта акции'}; ответ WB: {res}"[:1000])
+                      f"{'сразу' if upload_now else 'со старта акции'}"
+                      + (f", участвуют до {local(leave_at)}" if leave_at else "") + f"; ответ WB: {res}"[:1000])
         st["sent"] += len(done)
         db.commit()
     return st
@@ -587,15 +773,16 @@ def attention_items(db: Session, now: datetime | None = None) -> list[tuple[str,
 HEAD = ["Раздел", "Тип", "Категория WB / артикул 1С", "Название", "Категория WB", "Кабинеты", "ID акции", "Акция",
         "Начало", "Конец", "Карточек в акции", "Карточек всего", "Эталон, ₽", "Сейчас на WB, ₽",
         "Сейчас ниже эталона, %", "Стоит «эталон − N%»", "Цена при входе, ₽", "Рекомендуемая скидка, %",
-        "% от эталона для вхождения", "Порог сейчас, %", "Откуда порог", "Пометка", "Новый порог для акции, %",
-        "Добавить в акцию (да)"]
+        "% от эталона для вхождения", "Порог сейчас, %", "Откуда порог", "Пометка", "Участвует до",
+        "Новый порог для акции, %", "Участвовать до (дата)", "Добавить в акцию (да)"]
 COL_KIND, COL_KEY, COL_PROMO, COL_NEW, COL_ADD = "Тип", "Категория WB / артикул 1С", "ID акции", \
     "Новый порог для акции, %", "Добавить в акцию (да)"
+COL_LEAVE = "Участвовать до (дата)"
 YES = {"да", "yes", "1", "+", "true", "истина"}
 
 
 def export_xlsx(entries: list[wd.Entry]) -> bytes:
-    """Файл для правки — те же разделы, что на странице (по акциям, если их несколько). Правятся две
+    """Файл для правки — те же разделы, что на странице (по акциям, если их несколько). Правятся три
     колонки (выделены цветом) и выгружаются ПУСТЫМИ — что вписали, то и меняется."""
     import io
 
@@ -607,7 +794,7 @@ def export_xlsx(entries: list[wd.Entry]) -> bytes:
     from priceapp.templating import local
     wb = Workbook(write_only=True)
     ws = wb.create_sheet("Акция WB")
-    widths = [22, 11, 24, 36, 18, 26, 10, 30, 14, 14, 9, 9, 10, 10, 11, 12, 11, 11, 12, 10, 20, 30, 12, 12]
+    widths = [22, 11, 24, 36, 18, 26, 10, 30, 14, 14, 9, 9, 10, 10, 11, 12, 11, 11, 12, 10, 20, 30, 14, 12, 14, 12]
     for i, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
     ws.freeze_panes = "D2"
@@ -615,7 +802,7 @@ def export_xlsx(entries: list[wd.Entry]) -> bytes:
     head_fill = PatternFill("solid", fgColor="DCE6F2")
     promo_fill = PatternFill("solid", fgColor="B8CCE4")
     cat_fill = PatternFill("solid", fgColor="EEF2F7")
-    edit_cols = {HEAD.index(COL_NEW), HEAD.index(COL_ADD)}
+    edit_cols = {HEAD.index(COL_NEW), HEAD.index(COL_LEAVE), HEAD.index(COL_ADD)}
 
     def row_of(values, bold=False, fill=None, indent=0, editable=True):
         out = []
@@ -642,7 +829,8 @@ def export_xlsx(entries: list[wd.Entry]) -> bytes:
         ws.append(row_of([e.section, wd.KIND_LABELS[r.kind], r.key, r.name, r.category if r.kind == wd.ARTICLE else "",
                           ", ".join(r.accounts), promo.promo_id, promo.name, local(promo.start_at), local(promo.end_at),
                           r.n_in, len(r.cards), r.etalon, r.current, r.below_text, r.held_text, r.entry_text,
-                          r.plan_disc_text, r.need_text, r.thr_text, r.thr_src_text, r.mark, None, None],
+                          r.plan_disc_text, r.need_text, r.thr_text, r.thr_src_text, r.mark, r.leave_text,
+                          None, None, None],
                          bold=r.kind == wd.CATEGORY, fill=cat_fill if r.kind == wd.CATEGORY else None,
                          indent=2 * e.level))
     buf = io.BytesIO()

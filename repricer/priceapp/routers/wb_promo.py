@@ -29,7 +29,7 @@ GROUP = "group"
 VIEWS = {GROUP: "Общие артикулы и категории с артикулами", wd.CATEGORY: "Только категории",
          wd.ARTICLE: "Только артикулы"}
 FILTER_KEYS = ("acc", "promo", "by", "q", "cat", "flt")
-HISTORY = ("wb_promo_threshold", "wb_promo_threshold_back", "wb_promo_add")
+HISTORY = ("wb_promo_threshold", "wb_promo_threshold_back", "wb_promo_add", "wb_promo_leave_set", "wb_promo_leave")
 
 
 def _params(src) -> dict:
@@ -175,8 +175,25 @@ def _cards_of(rows) -> list:
     return out
 
 
-def _apply(request: Request, db: Session, p: dict, rows, action: str, raw_value, actor: str) -> RedirectResponse:
-    """Общее для строки, массовой правки: порог «для акции» (если вписан) и/или «Добавить в акцию»."""
+def _fresh(db: Session, cards: list, leave_at=None) -> list:
+    """Те же карточки, пересчитанные заново (после нового порога или со сроком участия) — по самим
+    карточкам, а не по отбору страницы: при отборе «вернётся эталон» карточки, только что
+    уложившиеся в новый порог, из отбора выпали бы, и добавлять стало бы нечего."""
+    keys = {(pc.promo.account_id, pc.promo.promo_id, pc.item.nm_id) for pc in cards}
+    promos = list({(pc.promo.account_id, pc.promo.promo_id): pc.promo for pc in cards}.values())
+    return [pc for pc in wp.classify(db, promos, leave_at=leave_at)
+            if (pc.promo.account_id, pc.promo.promo_id, pc.item.nm_id) in keys]
+
+
+def _apply(request: Request, db: Session, p: dict, rows, action: str, raw_value, actor: str,
+           raw_leave=None) -> RedirectResponse:
+    """Общее для строки и массовой правки: порог «для акции» и срок участия (если вписаны) и/или
+    «Добавить в акцию». Срок кончает и порог «для акции» этой акции."""
+    try:
+        leave_at = wp.parse_leave(raw_leave)
+    except ValueError:
+        flash(request, f"«Участвовать до» — дата: «{raw_leave}» не дата.", "warn")
+        return _back(p)
     value = None
     if str(raw_value or "").strip():
         try:
@@ -186,8 +203,8 @@ def _apply(request: Request, db: Session, p: dict, rows, action: str, raw_value,
         if value is None or wd.threshold_error(value):
             flash(request, "Новый порог для акции — число больше 0 и не больше 90 (%).", "warn")
             return _back(p)
-    elif action == "set":
-        flash(request, "Впишите новый порог для акции.", "warn")
+    elif action == "set" and leave_at is None:
+        flash(request, "Впишите новый порог для акции или срок участия.", "warn")
         return _back(p)
     cards = _cards_of(rows)
     if not cards:
@@ -196,22 +213,29 @@ def _apply(request: Request, db: Session, p: dict, rows, action: str, raw_value,
     msg, level = [], "ok"
     names = sorted({pc.promo.name for pc in cards})
     what = f"акция «{names[0]}»" if len(names) == 1 else f"акций {len(names)}"
+    from priceapp.templating import local
     if value is not None:
-        n = wp.set_threshold(db, cards, value, actor)
+        n = wp.set_threshold(db, cards, value, actor, leave_at)
         db.commit()
-        msg.append(f"Порог для акции {wd.fmt(value)}% ({what}) — у артикулов изменено: {n}; действует до конца "
-                   "акции, потом вернётся прежний.")
+        msg.append(f"Порог для акции {wd.fmt(value)}% ({what}) — у артикулов изменено: {n}; действует до "
+                   + (f"{local(leave_at)} (срок участия)" if leave_at else "конца акции") + ", потом вернётся прежний.")
+    if leave_at is not None and action == "set":
+        n, bad = wp.set_leave(db, cards, leave_at, actor)
+        db.commit()
+        msg.append(f"Срок участия до {local(leave_at)}: карточек {n} — потом полный эталон, и они выйдут из акции"
+                   + (f"; не поставлено ({len(bad)}): " + "; ".join(bad[:5]) if bad else "") + ".")
+        if bad or not n:
+            level = "warn"
+        if not n and not bad:
+            msg.append("Срок ставится карточкам, что в акции или отправлены в неё, — таких в строках нет.")
     if action == "add":
-        # Пересчёт после нового порога — по самим карточкам, а не по отбору страницы: при отборе
-        # «вернётся эталон» карточки, только что уложившиеся в новый порог, из отбора выпали бы, и
-        # добавлять стало бы нечего.
-        keys = {(pc.promo.account_id, pc.promo.promo_id, pc.item.nm_id) for pc in cards}
-        promos = list({(pc.promo.account_id, pc.promo.promo_id): pc.promo for pc in cards}.values())
-        fresh = [pc for pc in wp.classify(db, promos)
-                 if (pc.promo.account_id, pc.promo.promo_id, pc.item.nm_id) in keys]
-        st = wp.add(db, fresh, actor)
+        st = wp.add(db, _fresh(db, cards, leave_at), actor, leave_at=leave_at)
         text, level = wp.add_report(what[0].upper() + what[1:], st)
         msg.append(text)
+        if leave_at is not None:
+            n, bad = wp.set_leave(db, _fresh(db, cards), leave_at, actor)       # и тем, что уже были в акции
+            db.commit()
+            msg.append(f"Срок участия до {local(leave_at)}" + (f"; не поставлено: " + "; ".join(bad[:3]) if bad else "") + ".")
     flash(request, " ".join(msg), level)
     return _back(p)
 
@@ -230,7 +254,7 @@ def save_one(request: Request, form=Depends(posted_form), db: Session = Depends(
         flash(request, "Строка не найдена — обновите страницу.", "warn")
         return _back(p)
     return _apply(request, db, p, rows, "add" if form.get("action") == "add" else "set", form.get("thr"),
-                  user.username)
+                  user.username, form.get("leave"))
 
 
 @router.post("/wb-promo/bulk")
@@ -240,7 +264,7 @@ def bulk(request: Request, form=Depends(posted_form), db: Session = Depends(get_
     p = _params(form)
     _, _, entries, _, _, _ = _view(db, p)
     return _apply(request, db, p, _targets(entries, form), "add" if form.get("action") == "add" else "set",
-                  form.get("value"), user.username)
+                  form.get("value"), user.username, form.get("leave"))
 
 
 @router.get("/wb-promo/export")
@@ -267,23 +291,26 @@ def history_export(db: Session = Depends(get_db), user: User = Depends(get_curre
 @progress.tracked
 def import_file(request: Request, file: UploadFile = File(...), db: Session = Depends(get_db),
                 user: User = Depends(get_current_user)):
-    """Файл из «Экспорт в Excel»: «Новый порог для акции, %» (пусто — без изменений) и «Добавить в
-    акцию» («да»). Каждая строка — в акции из своей колонки «ID акции»; в одном файле может быть
-    несколько акций. Кабинет — из отбора страницы, как при выгрузке."""
+    """Файл из «Экспорт в Excel»: «Новый порог для акции, %», «Участвовать до (дата)» («-» — снять
+    срок) и «Добавить в акцию» («да»); пусто — без изменений. Каждая строка — в акции из своей
+    колонки «ID акции»; в одном файле может быть несколько акций. Кабинет — из отбора страницы."""
     p = _params(request.query_params)
     try:
         data = read_xlsx_rows(file.file.read())
     except ExcelReadError as e:
         flash(request, str(e), "error")
         return _back(p)
-    if data and any(c not in data[0] for c in (wp.COL_KIND, wp.COL_KEY, wp.COL_PROMO, wp.COL_NEW, wp.COL_ADD)):
+    if data and any(c not in data[0] for c in (wp.COL_KIND, wp.COL_KEY, wp.COL_PROMO, wp.COL_NEW, wp.COL_ADD,
+                                                wp.COL_LEAVE)):
         flash(request, "В файле нет нужных колонок — выгрузите файл этой страницей («Экспорт в Excel»).", "error")
         return _back(p)
     todo: dict[str, list] = {}
     bad = []
     for n, r in enumerate(progress.each(data, "Читаю файл", total=len(data)), start=2):
         t_raw, add_raw = r.get(wp.COL_NEW), str(r.get(wp.COL_ADD) or "").strip().casefold()
-        if str(t_raw if t_raw is not None else "").strip() == "" and not add_raw:
+        l_raw = r.get(wp.COL_LEAVE)
+        if str(t_raw if t_raw is not None else "").strip() == "" and not add_raw and \
+                str(l_raw if l_raw is not None else "").strip() == "":
             continue
         kind, key = wd.parse_kind(r.get(wp.COL_KIND)), wd.parse_key(r.get(wp.COL_KEY))
         pid = wd.parse_key(r.get(wp.COL_PROMO))
@@ -293,7 +320,16 @@ def import_file(request: Request, file: UploadFile = File(...), db: Session = De
         if add_raw and add_raw not in wp.YES:
             bad.append(f"строка {n}: {key} — «Добавить в акцию»: «да» или пусто")
             continue
-        todo.setdefault(pid, []).append((n, kind, key, t_raw, bool(add_raw)))
+        leave = "keep"
+        if str(l_raw if l_raw is not None else "").strip() == wd.CLEAR_CELL:
+            leave = None
+        elif str(l_raw if l_raw is not None else "").strip():
+            try:
+                leave = wp.parse_leave(l_raw)
+            except ValueError:
+                bad.append(f"строка {n}: {key} — «Участвовать до»: «{l_raw}» не дата")
+                continue
+        todo.setdefault(pid, []).append((n, kind, key, t_raw, bool(add_raw), leave))
     msgs, level = [], "ok"
     progress.pin("Применяю файл по акциям", total=len(todo))
     for pid, lines in todo.items():
@@ -304,9 +340,9 @@ def import_file(request: Request, file: UploadFile = File(...), db: Session = De
             bad.append(f"акция {pid}: нет среди идущих и будущих — обновите календарь")
             continue
         by_sel = {e.row.sel: e.row for e in entries if e.kind == "row"}
-        thr: dict[Decimal, list] = {}
-        adds = []
-        for n, kind, key, t_raw, want in lines:
+        thr: dict[tuple, list] = {}
+        adds, leaves = [], {}
+        for n, kind, key, t_raw, want, leave in lines:
             row = by_sel.get(f"{pid}:{kind[0]}:{key}")
             if row is None:
                 bad.append(f"строка {n}: {key} — в акции {pid} таких карточек нет")
@@ -319,21 +355,39 @@ def import_file(request: Request, file: UploadFile = File(...), db: Session = De
                 if v is None or wd.threshold_error(v):
                     bad.append(f"строка {n}: {key} — порог «{t_raw}»: больше 0 и не больше 90")
                     continue
-                thr.setdefault(v, []).append(row)
+                thr.setdefault((v, leave if leave != "keep" else None), []).append(row)
             if want:
-                adds.append(row)
+                adds.append((row, leave if leave != "keep" else None))
+            if leave != "keep":
+                leaves.setdefault(leave, []).append(row)
         changed = 0
-        for v, rows in thr.items():
-            changed += wp.set_threshold(db, _cards_of(rows), v, user.username)
+        for (v, lv_at), rows in thr.items():
+            changed += wp.set_threshold(db, _cards_of(rows), v, user.username, lv_at)
         db.commit()
         msgs.append(f"Акция «{chosen[0].name}»: порог для акции изменён у артикулов — {changed}")
         if adds:
             _, _, entries, _, _, _ = _view(db, q)
             by_sel = {e.row.sel: e.row for e in entries if e.kind == "row"}
-            st = wp.add(db, _cards_of([by_sel[r.sel] for r in adds if r.sel in by_sel]), user.username)
-            text, lv = wp.add_report("добавление", st)
-            msgs.append(text)
-            level = "warn" if lv == "warn" else level
+            groups: dict = {}
+            for row, lv_at in adds:
+                if row.sel in by_sel:
+                    groups.setdefault(lv_at, []).append(by_sel[row.sel])
+            for lv_at, rows in groups.items():
+                st = wp.add(db, _fresh(db, _cards_of(rows), lv_at), user.username, leave_at=lv_at)
+                text, lv = wp.add_report("добавление", st)
+                msgs.append(text)
+                level = "warn" if lv == "warn" else level
+        if leaves:
+            _, _, entries, _, _, _ = _view(db, q)
+            by_sel = {e.row.sel: e.row for e in entries if e.kind == "row"}
+            n_leave, bad_leave = 0, []
+            for lv_at, rows in leaves.items():
+                k, b = wp.set_leave(db, _cards_of([by_sel[r.sel] for r in rows if r.sel in by_sel]), lv_at,
+                                    user.username)
+                n_leave, bad_leave = n_leave + k, bad_leave + b
+            db.commit()
+            msgs.append(f"срок участия изменён у карточек — {n_leave}")
+            bad += bad_leave
     if bad:
         level = "warn"
         msgs.append("Не применено: " + "; ".join(bad[:5]) + (" …" if len(bad) > 5 else ""))

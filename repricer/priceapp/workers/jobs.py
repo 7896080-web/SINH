@@ -339,6 +339,24 @@ def job_wb_promo(client_factory=None) -> None:
         db.close()
 
 
+def job_wb_promo_leave(client_factory=None) -> None:
+    """Срок участия в акции прошёл — полный эталон, карточка выходит из акции (`wb_promo.leave_due`)."""
+    db = SessionLocal()
+    try:
+        from priceapp import overview, wb_promo
+        st = wb_promo.leave_due(db, client_factory)
+        if st["raised"]:
+            overview.mark_dirty(db)
+            db.commit()
+        beat(db, "wb_promo_leave", True, "; ".join(st["errors"])[:1000])
+    except Exception as e:
+        db.rollback()
+        logger.exception("выход из акций по сроку упал")
+        beat(db, "wb_promo_leave", False, f"{type(e).__name__}: {e}")
+    finally:
+        db.close()
+
+
 def attention_dirty() -> bool:
     db = SessionLocal()
     try:

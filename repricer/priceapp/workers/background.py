@@ -14,7 +14,8 @@
   `wb_poll_at` (по умолчанию 00:05 — акции WB стартуют в полночь),
   а также сразу, если курс ушёл от курса эталонных цен больше чем на 2% (`reference.py`);
 - копия базы — через 10 минут после запуска, не чаще раза в сутки;
-- календарь акций WB (`wb_promo.py`) — при запуске, раз в 3 часа и по кнопке «Обновить календарь».
+- календарь акций WB (`wb_promo.py`) — при запуске, раз в 3 часа и по кнопке «Обновить календарь»;
+  выход из акций по сроку участия — раз в 5 минут.
 
 Потоков ДВА. Быстрый — обмен с 1С, курс, отправка, копия: их нельзя задерживать.
 Тяжёлый — суточное обновление (каталоги, цены, диапазоны безопасности) и счётчики
@@ -37,6 +38,7 @@ REFRESH_FIRST_AFTER = 60
 REFRESH_EVERY = 3600          # задание само решит, пора ли (раз в сутки)
 WB_POLL_EVERY = 6 * 3600      # опрос WB: 4 раза в сутки
 PROMO_EVERY = 3 * 3600        # календарь акций WB: раз в 3 часа и по кнопке
+LEAVE_EVERY = 300             # выход из акций по сроку участия — раз в 5 минут
 BACKUP_FIRST_AFTER = 600
 
 HEAVY_TICK = 30
@@ -94,7 +96,7 @@ def _loop() -> None:
 
 def _heavy_loop() -> None:
     started = time.monotonic()
-    last = {"refresh": None, "attention": None, "wb": None, "promo": None}
+    last = {"refresh": None, "attention": None, "wb": None, "promo": None, "leave": None}
     while not _stop.is_set():
         now = time.monotonic()
         if now - started >= REFRESH_FIRST_AFTER and (
@@ -110,6 +112,9 @@ def _heavy_loop() -> None:
                 last["promo"] is None or now - last["promo"] >= PROMO_EVERY or _safe(jobs.wb_promo_requested)):
             _safe(jobs.job_wb_promo)
             last["promo"] = time.monotonic()
+        if now - started >= REFRESH_FIRST_AFTER and (last["leave"] is None or now - last["leave"] >= LEAVE_EVERY):
+            _safe(jobs.job_wb_promo_leave)
+            last["leave"] = time.monotonic()
         if last["attention"] is None or now - last["attention"] >= ATTENTION_EVERY or _safe(jobs.attention_dirty):
             _safe(jobs.job_attention)
             last["attention"] = time.monotonic()

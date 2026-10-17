@@ -2,13 +2,16 @@
 {% block title %}Акции WB{% endblock %}
 {% block content %}
 {% macro rub(v) %}{% if v is none %}—{% else %}{{ '{:,}'.format(v).replace(',', ' ') }}{% endif %}{% endmacro %}
-{% set cols = 11 if p.by == 'category' else 13 %}
+{% set cols = 10 if p.by == 'category' else 11 %}
 <style>
 .wp-table td { vertical-align:top; font-size:13px; }
 .wp-table .sub { color:var(--muted); font-size:12px; }
 .wp-table input.pct { width:56px; }
-.wp-table td.key { min-width:220px; }
+.wp-table td.key { min-width:170px; }
 .wp-table td.mark div { white-space:nowrap; }
+.wp-table th, .wp-table th.num { white-space:normal; max-width:120px; }
+.wp-table td.key { max-width:230px; }
+.wp-table td.num .sub { white-space:normal; }
 .wp-table tr.wp-promo td { background:var(--accent, #36c); color:#fff; font-weight:700; font-size:13px; }
 .wp-table tr.wp-head td { background:var(--accent-soft, #dce6f2); font-weight:700; text-transform:uppercase; font-size:12px; letter-spacing:.03em; }
 .wp-table tr.wp-cat td { background:var(--soft, #eef2f7); }
@@ -28,7 +31,9 @@
 <p class="muted"><b>Новый порог для акции</b> действует <b>до конца акции</b>, потом возвращается прежний — и ставится только
 артикулам, чьи карточки есть в этой акции. Постоянный порог — на странице <a href="/wb-discount">«Порог скидки WB»</a>.
 <b>«Добавить в акцию»</b> отправляет на WB только карточки «уложится в порог»: со старта акции, если она ещё не началась, иначе
-сразу. Акция не выбрана — в таблице и в файле <b>все идущие и будущие обычные акции</b>, каждая своим разделом.</p>
+сразу. <b>«Участвовать до»</b> — срок участия раньше конца акции: когда он пройдёт, программа поставит полный эталон, цена
+поднимется, и карточка выйдет из акции; порог для акции кончится в тот же срок. Акция не выбрана — в таблице и в файле <b>все
+идущие и будущие обычные акции</b>, каждая своим разделом.</p>
 
 <div class="row" style="gap:12px;align-items:stretch;margin-bottom:10px">
 <div class="card" style="flex:1 1 320px;margin:0">
@@ -44,8 +49,9 @@
   <ol class="wp-steps muted">
     <li><a class="btn secondary" href="/wb-promo/export?{{ export_qs }}" title="Разделами, как на странице; отбор страницы учитывается">Экспорт в Excel</a>
       <a class="btn secondary" href="/wb-promo/export{% if p.acc %}?acc={{ p.acc }}{% endif %}" title="Все идущие и будущие обычные акции{% if acc %} кабинета {{ where }}{% endif %}, без отбора">все акции</a></li>
-    <li>Впишите <b>«Новый порог для акции, %»</b> и/или <b>«да»</b> в «Добавить в акцию» — эти колонки выделены цветом и выгружаются
-      пустыми: что вписали, то и меняется. В файле может быть несколько акций — каждая строка в своей.</li>
+    <li>Впишите <b>«Новый порог для акции, %»</b>, <b>«Участвовать до (дата)»</b> («-» — снять срок) и/или <b>«да»</b> в «Добавить
+      в акцию» — эти колонки выделены цветом и выгружаются пустыми: что вписали, то и меняется. В файле может быть несколько
+      акций — каждая строка в своей.</li>
     <li><form method="post" action="/wb-promo/import?{{ export_qs }}" enctype="multipart/form-data" class="row" style="display:inline-flex"
       onsubmit="return confirm('Загрузить файл? Порог для акции встанет до её конца; строки с «да» СРАЗУ уйдут в акцию на WB.')">
       <input type="file" name="file" accept=".xlsx" required><button class="secondary">Импорт из Excel</button></form></li>
@@ -114,13 +120,15 @@
     <div class="row">
       <label style="flex-direction:row;gap:6px;align-items:center"><input type="checkbox" name="all_filtered" value="1"> весь отбор — {{ total }} стр.</label>
       <label>Новый порог для акции, %<input name="value" inputmode="decimal" style="width:60px" placeholder="25"></label>
-      <button type="submit" name="action" value="set" onclick="return selConfirm('bulk', 'Поставить порог ' + this.form.elements['value'].value + '% до конца акции', 'строк', true)">Установить порог для акции</button>
-      <button type="submit" name="action" value="add" data-sel-clear onclick="return selConfirm('bulk', 'ДОБАВИТЬ В АКЦИЮ на WB карточки, что укладываются в порог' + (this.form.elements['value'].value ? ' (сначала порог ' + this.form.elements['value'].value + '%)' : ''), 'строк', true)">Добавить в акцию</button>
+      <label title="Срок участия: по его истечении — полный эталон, и карточка выходит из акции">Участвовать до<input type="date" name="leave"></label>
+      <button type="submit" name="action" value="set" onclick="var f=this.form.elements; if(!f['value'].value && !f['leave'].value){alert('Впишите порог для акции или срок участия.');return false;} return selConfirm('bulk', 'Сохранить ' + (f['value'].value ? 'порог ' + f['value'].value + '% ' : '') + (f['leave'].value ? 'срок участия до ' + f['leave'].value : '(до конца акции)'), 'строк', true)">Сохранить порог и срок</button>
+      <button type="submit" name="action" value="add" data-sel-clear onclick="var f=this.form.elements; return selConfirm('bulk', 'ДОБАВИТЬ В АКЦИЮ на WB карточки, что укладываются в порог' + (f['value'].value ? ' (сначала порог ' + f['value'].value + '%)' : '') + (f['leave'].value ? ', участвуют до ' + f['leave'].value : ''), 'строк', true)">Добавить в акцию</button>
     </div>
     <div class="row" style="margin-top:6px"><span class="sel-count muted" data-for="bulk"></span>
       <button type="button" class="secondary sel-clear" data-for="bulk" style="padding:2px 8px;font-size:12px">Снять отметки</button></div>
-    <p class="muted" style="margin-bottom:0">«Установить порог для акции» на WB ничего не отправляет. «Добавить в акцию» с вписанным порогом —
-    сначала порог, потом добавление тех, что в него уложились. Отмечены категория и её артикулы — артикулы не берутся дважды.
+    <p class="muted" style="margin-bottom:0">«Сохранить порог и срок» на WB ничего не отправляет: срок ставится карточкам, что уже в акции или
+    отправлены в неё. «Добавить в акцию» с вписанным порогом — сначала порог, потом добавление тех, что в него уложились, со
+    сроком, если он вписан. Отмечены категория и её артикулы — артикулы не берутся дважды.
     Наших карточек под отбором кабинета и акции: {{ n_cards }}{% if unknown %}; ещё {{ unknown }} карточек акций нет в нашем каталоге или они без сопоставления с 1С — обновите каталог кабинета{% endif %}.
     Найдено: {{ total }} строк{% if total > shown %}, показаны первые {{ shown }} — «весь отбор» берёт все, полный список — в Excel{% endif %}.</p>
   </div>
@@ -129,12 +137,11 @@
 <div class="scroll"><table class="wp-table">
 <tr><th><input type="checkbox" class="sel-all" data-for="bulk" title="Отметить строки на экране"></th>
 <th>Категория / артикул</th><th class="num" title="в акции / всего">Карточек</th>
-{% if p.by != 'category' %}<th class="num">Эталон, ₽</th><th class="num">Сейчас на WB, ₽</th>{% endif %}
-<th class="num" title="На сколько % цена после скидки на WB сейчас ниже эталона">Сейчас ниже эталона, %</th>
-<th>Стоит «эталон − N%»</th>
+{% if p.by != 'category' %}<th class="num">Эталон, ₽<div class="muted">сейчас на WB</div></th>{% endif %}
+<th class="num" title="На сколько % цена после скидки на WB сейчас ниже эталона; ниже — стоит ли «эталон − N%» со страницы порога">Сейчас ниже эталона, %<div class="muted">стоит «эталон − N%»</div></th>
 <th class="num" title="Цена сейчас × (100 − рекомендуемая скидка WB)">Цена при входе, ₽<div class="muted">скидка WB, %</div></th>
 <th class="num">% от эталона для вхождения</th><th class="num">Порог сейчас, %</th><th>Пометка</th>
-<th title="Действует до конца акции, потом вернётся прежний">Порог для акции, %</th><th></th></tr>
+<th title="Действует до конца акции (или до срока участия), потом вернётся прежний">Порог для акции, %<div class="muted">участвовать до</div></th><th></th></tr>
 {% for e in entries %}
 {% if e.kind == 'promo' %}<tr class="wp-promo"><td colspan="{{ cols }}">{{ e.text }}</td></tr>
 {% elif e.kind == 'head' %}<tr class="wp-head"><td colspan="{{ cols }}">{{ e.text }}</td></tr>
@@ -146,10 +153,11 @@
     {% if r.category and (p.by != 'group' or r.shared) %}<div class="sub">{{ r.category }}</div>{% endif %}{% endif %}
     {% if r.shared or not acc %}<div class="sub">кабинеты: {{ r.accounts|join(', ') }}</div>{% endif %}
     {% if not p.promo %}<div class="sub">акция «{{ r.promo.name }}»</div>{% endif %}</td>
-  <td class="num">{{ r.n_in }} / {{ r.cards|length }}{% if r.n_added %}<div class="sub warn">отправлено, ждём WB: {{ r.n_added }}</div>{% endif %}</td>
-  {% if p.by != 'category' %}<td class="num">{{ rub(r.etalon) if r.kind == 'article' else '' }}</td><td class="num">{{ rub(r.current) if r.kind == 'article' else '' }}</td>{% endif %}
-  <td class="num">{{ r.below_text or '—' }}</td>
-  <td>{{ r.held_text or '—' }}</td>
+  <td class="num">{{ r.n_in }} / {{ r.cards|length }}{% if r.n_added %}<div class="sub warn">отправлено, ждём WB: {{ r.n_added }}</div>{% endif %}
+    {% if r.leave_text %}<div class="sub" title="По сроку — полный эталон, и карточка выходит из акции">участвует до {{ r.leave_text }}</div>{% endif %}
+    {% if r.n_left %}<div class="sub">вышли по сроку: {{ r.n_left }}</div>{% endif %}</td>
+  {% if p.by != 'category' %}<td class="num">{% if r.kind == 'article' %}{{ rub(r.etalon) }}<div class="sub">{{ rub(r.current) }}</div>{% endif %}</td>{% endif %}
+  <td class="num">{{ r.below_text or '—' }}{% if r.held_text %}<div class="sub">{{ r.held_text }}</div>{% endif %}</td>
   <td class="num">{{ r.entry_text or '—' }}<div class="sub">{{ r.plan_disc_text }}</div></td>
   <td class="num"><b>{{ r.need_text or '—' }}</b></td>
   <td class="num">{{ r.thr_text or '—' }}<div class="sub">{{ r.thr_src_text }}</div></td>
@@ -158,14 +166,15 @@
     {% if r.count('floor') %}<div class="bad">{{ statuses.floor }} — {{ r.count('floor') }}</div>{% endif %}
     {% if r.count('noetalon') %}<div class="muted">{{ statuses.noetalon }} — {{ r.count('noetalon') }}</div>{% endif %}</td>
   <td><input class="pct" name="thr" form="{{ fid }}" inputmode="decimal" placeholder="{{ r.suggest or '' }}"
-       title="{% if r.suggest %}Чтобы уложились все карточки строки — не меньше {{ r.suggest }}%. {% endif %}Действует до конца акции"></td>
-  <td><form id="{{ fid }}" method="post" action="/wb-promo/save" class="row" style="gap:4px;flex-wrap:nowrap">
+       title="{% if r.suggest %}Чтобы уложились все карточки строки — не меньше {{ r.suggest }}%. {% endif %}Действует до конца акции">
+    <input type="date" name="leave" form="{{ fid }}" style="margin-top:4px;width:130px" title="Срок участия: по его истечении — полный эталон, и карточка выходит из акции"></td>
+  <td><form id="{{ fid }}" method="post" action="/wb-promo/save" style="display:flex;flex-direction:column;gap:4px;min-width:118px">
     {% for k in ('acc', 'promo', 'by', 'q', 'cat', 'flt') %}<input type="hidden" name="{{ k }}" value="{{ p[k] }}">{% endfor %}
     <input type="hidden" name="sel" value="{{ r.sel }}">
     <button name="action" value="set" class="secondary" style="padding:4px 8px"
-      onclick="if(!this.form.elements['thr'].value){alert('Впишите новый порог для акции.');return false;} return true">Сохранить порог</button>
+      onclick="var f=this.form.elements; if(!f['thr'].value && !f['leave'].value){alert('Впишите порог для акции или срок участия.');return false;} return true">Сохранить</button>
     {% if r.n_in < r.cards|length %}<button name="action" value="add" style="padding:4px 8px"
-      onclick="var v=this.form.elements['thr'].value; return confirm('{{ r.key|js }} — акция «{{ r.promo.name|js }}»: добавить в акцию на WB карточки, что укладываются в порог' + (v ? ' (сначала порог ' + v + '% до конца акции)' : '') + '?')">Добавить в акцию</button>{% endif %}
+      onclick="var f=this.form.elements, v=f['thr'].value, d=f['leave'].value; return confirm('{{ r.key|js }} — акция «{{ r.promo.name|js }}»: добавить в акцию на WB карточки, что укладываются в порог' + (v ? ' (сначала порог ' + v + '%)' : '') + (d ? ', участвуют до ' + d : '') + '?')">Добавить в акцию</button>{% endif %}
   </form></td>
 </tr>{% endif %}
 {% else %}<tr><td colspan="{{ cols }}" class="muted">Нет строк под этот отбор{% if promo and promo.type == 'auto' %} — у автоакции товары по API не видны{% endif %}.</td></tr>{% endfor %}

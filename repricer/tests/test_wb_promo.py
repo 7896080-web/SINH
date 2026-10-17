@@ -310,3 +310,164 @@ def test_all_promos_mode_page_bulk_and_one_file_for_two_promos(client, db):
     finally:
         acc_mod.client_for = accs
     assert cal.uploads[-1] == (1, [6], False)
+
+
+# --- срок участия ---------------------------------------------------------------------------------
+
+def test_parse_leave_is_end_of_local_day_and_checks():
+    from datetime import date, datetime
+    from priceapp.timeutils import local_date_of
+    at = wp.parse_leave("2026-10-25")
+    assert local_date_of(at) == date(2026, 10, 25) and local_date_of(at + timedelta(seconds=2)) == date(2026, 10, 26)
+    assert wp.parse_leave("25.10.2026") == at == wp.parse_leave(datetime(2026, 10, 25))
+    assert wp.parse_leave("") is None
+    try:
+        wp.parse_leave("завтра")
+        assert False
+    except ValueError:
+        pass
+    promo = WbPromotion(start_at=now_utc() + timedelta(days=1), end_at=now_utc() + timedelta(days=10))
+    assert wp.leave_error(promo, now_utc() - timedelta(hours=1)) == "срок уже прошёл"
+    assert "раньше старта" in wp.leave_error(promo, now_utc() + timedelta(hours=5))
+    assert "кончится сама" in wp.leave_error(promo, now_utc() + timedelta(days=11))
+    assert wp.leave_error(promo, now_utc() + timedelta(days=4)) == ""
+
+
+def test_add_with_term_and_promo_threshold_ends_with_the_term(db):
+    a = _setup(db)
+    cal = _Cal([_promo(1)], {(1, False): [_item(5, 25)]})
+    _load(db, cal)
+    promo = db.query(WbPromotion).one()
+    leave = now_utc() + timedelta(days=4)
+    wp.set_threshold(db, wp.classify(db, [promo]), Decimal(26), "op", leave)
+    db.commit()
+    # без срока порог «до 4-го дня» для акции «до 11-го» не в счёт — карточка вылетела бы раньше
+    assert wp.classify(db, [promo])[0].status == wp.RETURNS
+    st = wp.add(db, wp.classify(db, [promo], leave_at=leave), "op", client_factory=lambda p, c: cal, leave_at=leave)
+    assert st["sent"] == 1
+    it = db.query(WbPromotionItem).one()
+    assert it.leave_at == leave and it.left_at is None
+    assert db.query(WbDiscountRule).filter_by(key="A1").one().until == leave and a.id
+
+
+def test_set_leave_for_cards_in_promo_shortens_the_promo_threshold(db):
+    a = _setup(db)
+    _setup(db, acc=a, nm="6", art="A2", item="u2", barcode="b2")
+    _load(db, _Cal([_promo(1)], {(1, True): [_item(5, 25, True)], (1, False): [_item(6, 5)]}))
+    promo = db.query(WbPromotion).one()
+    pcs = wp.classify(db, [promo])
+    wp.set_threshold(db, pcs, Decimal(26), "op")
+    db.commit()
+    leave = now_utc() + timedelta(days=3)
+    n, bad = wp.set_leave(db, pcs, leave, "op")
+    db.commit()
+    assert n == 1 and not bad                                         # A2 не в акции — срок не нужен
+    assert db.query(WbPromotionItem).filter_by(nm_id="5").one().leave_at == leave
+    assert db.query(WbPromotionItem).filter_by(nm_id="6").one().leave_at is None
+    assert db.query(WbDiscountRule).filter_by(key="A1").one().until == leave
+    n, bad = wp.set_leave(db, pcs, promo.end_at + timedelta(days=1), "op")
+    assert n == 0 and "кончится сама" in bad[0]
+
+
+def test_leave_due_raises_price_to_full_etalon_and_marks_left(db):
+    a = _setup(db)
+    _setup(db, acc=a, nm="6", art="A2", item="u2", barcode="b2")
+    cal = _Cal([_promo(1, start_in=-timedelta(days=1))], {(1, True): [_item(5, 25, True), _item(6, 25, True)]})
+    _load(db, cal)
+    for nm in ("b1", "b2"):                                           # в акции: 2009 при скидке 25% = 1507
+        row = db.query(PlatformItem).filter_by(barcode=nm).one()
+        row.current_sale_price = 1507
+    row.current_sale_price = 2009                                     # A2 уже вернулся к эталону
+    for it in db.query(WbPromotionItem):
+        it.leave_at = now_utc() - timedelta(minutes=1)
+    db.commit()
+    st = wp.leave_due(db, client_factory=lambda p, c: cal)
+    assert st["raised"] == 1 and st["same"] == 1
+    assert cal.posts == [{"data": [{"nmID": 5, "price": 2009, "discount": 0}]}]
+    assert all(i.left_at is not None for i in db.query(WbPromotionItem))
+    from priceapp.models import PriceChange
+    ch = db.query(PriceChange).filter_by(source="wb_promo_leave").one()
+    assert ch.status == "sent" and "по сроку" in ch.note
+    assert wp.leave_due(db, client_factory=lambda p, c: cal)["due"] == 0       # второй раз не шлём
+    assert db.query(AuditLog).filter_by(action="wb_promo_leave").count() == 1
+
+
+def test_leave_due_retries_when_wb_refuses_and_names_cards_without_etalon(db):
+    _setup(db)
+    _load(db, _Cal([_promo(1, start_in=-timedelta(days=1))], {(1, True): [_item(5, 25, True), _item(42, 20, True)]}))
+    row = db.query(PlatformItem).filter_by(barcode="b1").one()
+    row.current_sale_price = 1507
+    for it in db.query(WbPromotionItem):
+        it.leave_at = now_utc() - timedelta(minutes=1)
+    db.commit()
+
+    class Down(_Cal):
+        def _post(self, url, body):
+            raise RuntimeError("WB недоступен")
+    st = wp.leave_due(db, client_factory=lambda p, c: Down([]))
+    assert "WB недоступен" in st["errors"][-1]
+    assert db.query(WbPromotionItem).filter_by(nm_id="5").one().left_at is None    # повтор в следующий раз
+    assert db.query(WbPromotionItem).filter_by(nm_id="42").one().left_at is not None
+    assert "эталона нет" in db.query(AuditLog).filter_by(action="wb_promo_leave").one().details
+    cal = _Cal([])
+    assert wp.leave_due(db, client_factory=lambda p, c: cal)["raised"] == 1
+
+
+def test_page_row_term_and_excel_term(client, db):
+    a = _setup(db)
+    _setup(db, acc=a, nm="6", art="A2", item="u2", barcode="b2")
+    _load(db, _Cal([_promo(1)], {(1, True): [_item(5, 25, True)], (1, False): [_item(6, 5)]}))
+    day = (now_utc() + timedelta(days=3)).strftime("%Y-%m-%d")
+    r = client.post("/wb-promo/save", data={"acc": str(a.id), "promo": "1", "by": "article", "sel": "1:a:A1",
+                                            "leave": day, "action": "set"})
+    assert "Срок участия до" in r.text and "карточек 1" in r.text
+    assert db.query(WbPromotionItem).filter_by(nm_id="5").one().leave_at == wp.parse_leave(day)
+    html = client.get(f"/wb-promo?promo=1&acc={a.id}&by=article&flt=leave").text
+    assert "участвует до" in html and "A1" in html
+    # Excel: «-» снимает срок
+    wb = Workbook()
+    wb.active.append(wp.HEAD)
+    row = [None] * len(wp.HEAD)
+    row[1], row[2], row[6], row[wp.HEAD.index(wp.COL_LEAVE)] = "Артикул", "A1", 1, "-"
+    wb.active.append(row)
+    buf = io.BytesIO()
+    wb.save(buf)
+    r = client.post(f"/wb-promo/import?acc={a.id}", files={"file": ("p.xlsx", buf.getvalue())})
+    assert "срок участия изменён у карточек — 1" in r.text
+    db.expire_all()
+    assert db.query(WbPromotionItem).filter_by(nm_id="5").one().leave_at is None
+
+
+def test_job_runs_leave_due(db):
+    from priceapp.models import WorkerHeartbeat
+    from priceapp.workers import jobs
+    jobs.job_wb_promo_leave(client_factory=lambda p, c: _Cal([]))
+    assert db.get(WorkerHeartbeat, "wb_promo_leave").last_success
+
+
+def test_import_threshold_term_and_add_in_one_row(client, db):
+    """Строка файла: порог 26, «участвовать до» через 4 дня и «да» — порог до срока, карточка
+    добавлена со сроком (порог «до срока» для неё в счёт: дальше она в акции не стоит)."""
+    a = _setup(db)
+    cal = _Cal([_promo(1)], {(1, False): [_item(5, 25)]})
+    _load(db, cal)
+    day = (now_utc() + timedelta(days=4)).strftime("%d.%m.%Y")
+    wb = Workbook()
+    wb.active.append(wp.HEAD)
+    row = [None] * len(wp.HEAD)
+    row[1], row[2], row[6] = "Артикул", "A1", 1
+    row[wp.HEAD.index(wp.COL_NEW)], row[wp.HEAD.index(wp.COL_LEAVE)], row[wp.HEAD.index(wp.COL_ADD)] = 26, day, "да"
+    wb.active.append(row)
+    buf = io.BytesIO()
+    wb.save(buf)
+    accs = acc_mod.client_for
+    try:
+        acc_mod.client_for = lambda db_, acc_, cf=None: cal
+        r = client.post(f"/wb-promo/import?acc={a.id}", files={"file": ("p.xlsx", buf.getvalue())})
+    finally:
+        acc_mod.client_for = accs
+    assert cal.uploads == [(1, [5], False)] and "отправлено в акцию карточек 1 из 1" in r.text
+    db.expire_all()
+    leave = wp.parse_leave(day)
+    assert db.query(WbPromotionItem).one().leave_at == leave
+    assert db.query(WbDiscountRule).filter_by(key="A1").one().until == leave

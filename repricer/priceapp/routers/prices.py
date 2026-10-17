@@ -57,6 +57,7 @@ SOURCE_LABELS = {**pricing.SOURCE_LABELS, "rollback": "возврат прежн
                  "etalon": "новый эталон", "etalon_follow": "за эталоном",
                  "reference": "возврат эталона WB", "follow": "Kit за WB",
                  "wb_now": "эталон − N% (порог скидки WB)",
+                 "wb_promo_leave": "выход из акции WB по сроку",
                  # прежние схемы — для старых строк журнала
                  "platform": "цена площадки", "base": "от базовой"}
 PRICE_STATUS_LABELS = {"QUARANTINE": "на карантине у площадки", "ERROR": "площадка: ошибка цены",

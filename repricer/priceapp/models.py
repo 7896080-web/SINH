@@ -492,6 +492,11 @@ class WbPromotionItem(Base):
     fetched_at = Column(DateTime, nullable=False, default=now_utc)
     added_at = Column(DateTime, nullable=True)
     added_by = Column(String(64), nullable=False, default="")
+    # Срок участия («Участвовать до»): по его истечении программа ставит полный эталон — цена
+    # поднимается, и карточка выходит из акции (`wb_promo.leave_due`). `left_at` — когда вышла.
+    leave_at = Column(DateTime, nullable=True)
+    leave_by = Column(String(64), nullable=False, default="")
+    left_at = Column(DateTime, nullable=True)
 
 
 class ReferenceDiscount(Base):

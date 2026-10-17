@@ -337,6 +337,7 @@ def heavy_cached(db: Session) -> tuple[list[Item] | None, str, bool]:
 JOB_NAMES = {"onec_exchange": "обмен с 1С", "price_dispatch": "отправка цен", "rate": "курс ЦБ",
              "daily_refresh": "суточное обновление (каталоги, цены, диапазоны)", "backup": "копия базы",
              "attention": "счётчики «Внимания»", "wb_promo": "календарь акций WB",
+             "wb_promo_leave": "выход из акций по сроку",
              "wb_poll": "опрос WB"}
 
 
