@@ -44,7 +44,8 @@ SOURCE = "wb_now"
 MAX_THRESHOLD = Decimal(90)
 CLEAR_CELL = "-"
 ALL_ACCOUNTS = "Все кабинеты WB"
-HISTORY_ACTIONS = ("wb_threshold", "wb_send_now", "wb_threshold_default")
+HISTORY_ACTIONS = ("wb_threshold", "wb_send_now", "wb_threshold_default", "wb_promo_threshold",
+                   "wb_promo_threshold_back", "wb_promo_add")
 
 
 def norm(category: str) -> str:
@@ -269,18 +270,70 @@ def set_threshold(db: Session, kind: str, key: str, value: Decimal | None, actor
     действует следующий по старшинству. Пишет историю. Возвращает, изменилось ли. Не коммитит."""
     rule = get_rule(db, kind, key, account_id)
     old = Decimal(rule.max_disc) if rule is not None and rule.max_disc is not None else None
-    if old == value:
+    temp = rule is not None and rule.until is not None
+    if old == value and not temp:
         return False
     if rule is None:
         rule = WbDiscountRule(kind=kind, key=key, account_id=account_id or 0, updated_by=actor)
         db.add(rule)
     rule.max_disc = value
+    # правка руками делает порог постоянным: «до конца акции» снимается
+    rule.until, rule.prev_max_disc, rule.until_promo_id, rule.until_note = None, None, None, ""
     rule.updated_by = actor
     rule.updated_at = now_utc()
     db.flush()
     audit.log(db, actor, "wb_threshold", (where or account_name(db, account_id))[:100],
-              f"{KIND_LABELS[kind].lower()} {key}: порог {fmt(old) or 'общий'} -> {fmt(value) or 'общий'}")
+              f"{KIND_LABELS[kind].lower()} {key}: порог {fmt(old) or 'общий'} -> {fmt(value) or 'общий'}"
+              + (" (был «до конца акции» — теперь постоянный)" if temp else ""))
     return True
+
+
+def set_temp_threshold(db: Session, article: str, value: Decimal, until, actor: str, account_id: int,
+                       promo_id: int, note: str) -> bool:
+    """Порог артикула в кабинете «для акции»: действует до `until` (конец акции), потом возвращается
+    прежний (`expire_temp`). Уже стоит такой же временный (другая акция) — остаётся больший порог и
+    более поздний срок, а «прежний» — тот, что был ДО первой акции. Не коммитит. -> изменилось ли."""
+    rule = get_rule(db, ARTICLE, article, account_id)
+    if rule is None:
+        rule = WbDiscountRule(kind=ARTICLE, key=article, account_id=account_id, updated_by=actor)
+        db.add(rule)
+    old = Decimal(rule.max_disc) if rule.max_disc is not None else None
+    if rule.until is None:
+        rule.prev_max_disc = old
+        new_until = until
+    else:
+        value = max(value, old) if old is not None else value
+        new_until = max(rule.until, until)
+    if old == value and rule.until == new_until:
+        return False
+    rule.max_disc, rule.until = value, new_until
+    rule.until_promo_id, rule.until_note = promo_id, note[:300]
+    rule.updated_by, rule.updated_at = actor, now_utc()
+    db.flush()
+    from priceapp.templating import local
+    audit.log(db, actor, "wb_promo_threshold", account_name(db, account_id)[:100],
+              f"артикул {article}: порог {fmt(old) or 'общий'} -> {fmt(value)} до {local(new_until)} "
+              f"(для акции «{note}»), потом вернётся {fmt(rule.prev_max_disc) or 'общий'}"[:1000])
+    return True
+
+
+def expire_temp(db: Session, now=None) -> int:
+    """Пороги «для акции», чей срок прошёл, — обратно к прежнему. Зовёт правило возврата перед
+    решениями (опрос в 00:05 после конца акции) и обновление календаря. Коммитит."""
+    now = now or now_utc()
+    n = 0
+    for r in db.query(WbDiscountRule).filter(WbDiscountRule.until.isnot(None), WbDiscountRule.until <= now).all():
+        was = r.max_disc
+        r.max_disc, r.until, r.until_promo_id = r.prev_max_disc, None, None
+        note, r.until_note, r.prev_max_disc = r.until_note, "", None
+        r.updated_by, r.updated_at = "программа", now
+        audit.log(db, "программа", "wb_promo_threshold_back", account_name(db, r.account_id)[:100],
+                  f"{KIND_LABELS.get(r.kind, r.kind).lower()} {r.key}: акция «{note}» закончилась — порог "
+                  f"{fmt(was)} -> {fmt(r.max_disc) or 'общий'}"[:1000])
+        n += 1
+    if n:
+        db.commit()
+    return n
 
 
 def set_category(db: Session, key: str, value: Decimal | None, actor: str, account_id: int = 0, where: str = "",

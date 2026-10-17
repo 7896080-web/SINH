@@ -21,6 +21,7 @@ EXPECTED = {
     "daily_refresh": (2 * 26 * 3600, False),
     "wb_poll": (2 * 6 * 3600 + 1800, False),   # опрос WB: при запуске и раз в 6 часов
     "backup": (2 * 26 * 3600, False),
+    "wb_promo": (2 * 3 * 3600 + 1800, False),   # календарь акций WB: раз в 3 часа
     # Раз в 10 минут, при правках — сразу; но в тяжёлом потоке за суточным обновлением и опросом
     # WB, которые на боевом каталоге идут десятки минут.
     "attention": (2 * 3600, False),
@@ -72,6 +73,6 @@ def failed_or_noted(db: Session) -> list[tuple[str, str, bool]]:
     for row in db.query(WorkerHeartbeat):
         if not row.last_success:
             out.append((row.name, row.last_error[:200], True))
-        elif row.last_error and row.name in ("daily_refresh", "onec_exchange", "price_dispatch", "backup"):
+        elif row.last_error and row.name in ("daily_refresh", "onec_exchange", "price_dispatch", "backup", "wb_promo"):
             out.append((row.name, row.last_error[:200], False))
     return out

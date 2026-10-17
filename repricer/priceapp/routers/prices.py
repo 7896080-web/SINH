@@ -1301,7 +1301,7 @@ def preview(platform: str, request: Request, form=Depends(posted_form), db: Sess
 # Страницы, чей отбор можно запомнить. «Цены товаров» — основной рабочий экран, а
 # отбор на нём сохранить было нельзя: сервер принимал только /prices и /mapping, а
 # переход по меню сбрасывает фильтры (аудит 08.10).
-SAVED_FILTER_PAGES = ("/prices", "/mapping", "/sku-prices", "/wb-discount")
+SAVED_FILTER_PAGES = ("/prices", "/mapping", "/sku-prices", "/wb-discount", "/wb-promo")
 
 
 def saved_filters(db: Session, *pages: str) -> list:

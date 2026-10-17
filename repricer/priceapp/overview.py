@@ -304,9 +304,16 @@ def _etalon_items(db: Session) -> list[Item]:
     return out
 
 
+def _promo_items(db: Session) -> list[Item]:
+    """Акция WB стартует в ближайшие полтора дня, а у заметного числа её карточек плановая цена ниже
+    порога — после старта программа вернёт эталон, и они выйдут из акции (`wb_promo.attention_items`)."""
+    from priceapp import wb_promo
+    return [Item(*x) for x in wb_promo.attention_items(db)]
+
+
 def refresh_heavy(db: Session, product_rows) -> None:
     import json
-    items = _heavy(db, product_rows) + _orphans(db) + _etalon_items(db)
+    items = _heavy(db, product_rows) + _orphans(db) + _etalon_items(db) + _promo_items(db)
     settings.put(db, HEAVY_KEY, json.dumps({"at": now_utc().isoformat(),
                                             "items": [[i.level, i.text, i.link, i.count] for i in items]},
                                            ensure_ascii=False))
@@ -329,7 +336,8 @@ def heavy_cached(db: Session) -> tuple[list[Item] | None, str, bool]:
 
 JOB_NAMES = {"onec_exchange": "обмен с 1С", "price_dispatch": "отправка цен", "rate": "курс ЦБ",
              "daily_refresh": "суточное обновление (каталоги, цены, диапазоны)", "backup": "копия базы",
-             "attention": "счётчики «Внимания»"}
+             "attention": "счётчики «Внимания»", "wb_promo": "календарь акций WB",
+             "wb_poll": "опрос WB"}
 
 
 def _health(db: Session, a: Attention) -> None:

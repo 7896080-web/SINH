@@ -118,6 +118,12 @@ def _int_price(v) -> int | None:
 WB_CONTENT = "https://content-api.wildberries.ru"
 WB_PRICES = "https://discounts-prices-api.wildberries.ru"
 WB_COMMON = "https://common-api.wildberries.ru"
+# Календарь акций (`wb_promo.py`): по спеке (снимок github.com/ZloyDeDD/wb-api-skill, 08-promotion.yaml)
+# категория токена — «Цены и скидки», лимит — 10 запросов за 6 с, интервал 600 мс. Вживую НЕ проверялось.
+WB_CALENDAR = "https://dp-calendar-api.wildberries.ru"
+WB_CALENDAR_PAGE = 1000
+WB_CALENDAR_MAX_PAGES = 50
+WB_CALENDAR_PAUSE = 0.65
 WB_PAGE = 100            # по спеке WB у cursor.limit maximum: 100
 WB_MAX_PAGES = 2000
 WB_PRICE_PAGE = 1000      # limit у /api/v2/list/goods/filter — до 1000
@@ -197,6 +203,61 @@ class WbClient:
             r.raise_for_status()
             return r.json()
         return parse_wb_tariffs(with_retry(call))
+
+    # --- календарь акций ---------------------------------------------------------------------
+
+    def _calendar(self, method: str, path: str, params=None, body=None):
+        import time
+        time.sleep(WB_CALENDAR_PAUSE)          # 10 запросов за 6 с на кабинет — с запасом
+
+        def call():
+            r = self.session.request(method, f"{WB_CALENDAR}{path}", params=params, json=body, timeout=60)
+            r.raise_for_status()
+            return r.json() if r.content else {}
+        return with_retry(call)
+
+    def promotions(self, start, end, all_promo: bool = True) -> list[dict]:
+        """Акции в периоде: `allPromo` true — все, false — только доступные для участия."""
+        out = []
+        fmt = "%Y-%m-%dT%H:%M:%SZ"
+        for page in range(WB_CALENDAR_MAX_PAGES):
+            data = self._calendar("GET", "/api/v1/calendar/promotions", params={
+                "startDateTime": start.strftime(fmt), "endDateTime": end.strftime(fmt),
+                "allPromo": "true" if all_promo else "false", "limit": WB_CALENDAR_PAGE,
+                "offset": page * WB_CALENDAR_PAGE})
+            got = ((data or {}).get("data") or {}).get("promotions") or []
+            out += got
+            if len(got) < WB_CALENDAR_PAGE:
+                break
+        return out
+
+    def promotion_details(self, ids: list[int]) -> list[dict]:
+        out = []
+        for start in range(0, len(ids), 100):
+            data = self._calendar("GET", "/api/v1/calendar/promotions/details",
+                                  params=[("promotionIDs", i) for i in ids[start:start + 100]])
+            out += ((data or {}).get("data") or {}).get("promotions") or []
+        return out
+
+    def promotion_nomenclatures(self, promo_id: int, in_action: bool) -> tuple[list[dict], bool]:
+        """Товары кабинета для обычной акции (у автоакции метода нет). -> (товары, обрезано ли)."""
+        out = []
+        for page in range(WB_CALENDAR_MAX_PAGES):
+            data = self._calendar("GET", "/api/v1/calendar/promotions/nomenclatures", params={
+                "promotionID": promo_id, "inAction": "true" if in_action else "false",
+                "limit": WB_CALENDAR_PAGE, "offset": page * WB_CALENDAR_PAGE})
+            got = ((data or {}).get("data") or {}).get("nomenclatures") or []
+            out += got
+            if len(got) < WB_CALENDAR_PAGE:
+                return out, False
+        return out, True
+
+    def promotion_upload(self, promo_id: int, nm_ids: list[int], upload_now: bool) -> dict:
+        """Добавить товары в обычную акцию: `uploadNow` true — сейчас, false — со старта акции."""
+        data = self._calendar("POST", "/api/v1/calendar/promotions/upload", body={
+            "data": {"promotionID": int(promo_id), "uploadNow": bool(upload_now),
+                     "nomenclatures": [int(n) for n in nm_ids]}})
+        return (data or {}).get("data") or {}
 
     def price_key(self, item) -> str:
         """Чем адресуется цена строки каталога: у WB — nmID (цена на карточку)."""

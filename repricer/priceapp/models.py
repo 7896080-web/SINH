@@ -440,8 +440,58 @@ class WbDiscountRule(Base):
     now_pct = Column(Numeric(5, 2), nullable=True)
     now_at = Column(DateTime, nullable=True)
     now_by = Column(String(64), nullable=False, default="")
+    # Порог «для акции» (страница «Акции WB»): действует до `until` (конец акции), потом
+    # возвращается `prev_max_disc` (None — своего порога не было). Правка руками делает его
+    # постоянным: `until` снимается.
+    until = Column(DateTime, nullable=True)
+    prev_max_disc = Column(Numeric(5, 2), nullable=True)
+    until_promo_id = Column(Integer, nullable=True)
+    until_note = Column(String(300), nullable=False, default="")
     updated_at = Column(DateTime, nullable=False, default=now_utc, onupdate=now_utc)
     updated_by = Column(String(64), nullable=False, default="")
+
+
+class WbPromotion(Base):
+    """Акция из календаря акций WB (`wb_promo.refresh`) — по кабинету: ID акции у WB общий, а
+    товары для участия у каждого кабинета свои. `type`: regular — акция, auto — автоакция (её
+    товары API не отдаёт)."""
+    __tablename__ = "wb_promotions"
+    __table_args__ = (UniqueConstraint("account_id", "promo_id", name="uq_wb_promotion"),)
+    id = Column(Integer, primary_key=True)
+    account_id = Column(Integer, ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False)
+    promo_id = Column(Integer, nullable=False)
+    name = Column(String(300), nullable=False, default="")
+    type = Column(String(16), nullable=False, default="regular")
+    start_at = Column(DateTime, nullable=True)
+    end_at = Column(DateTime, nullable=True)
+    description = Column(Text, nullable=False, default="")
+    advantages = Column(Text, nullable=False, default="")
+    participation = Column(Integer, nullable=True)
+    in_action_total = Column(Integer, nullable=True)
+    exceptions = Column(Integer, nullable=True)
+    fetched_at = Column(DateTime, nullable=False, default=now_utc)
+    items_fetched_at = Column(DateTime, nullable=True)
+    items_note = Column(Text, nullable=False, default="")
+
+
+class WbPromotionItem(Base):
+    """Карточка (nmID) из списка товаров обычной акции: участвует ли, цена и скидка сейчас,
+    плановая цена (наибольшая цена со скидкой для участия) и рекомендуемая скидка. `added_at` —
+    мы отправили её в акцию и ждём, что WB это покажет."""
+    __tablename__ = "wb_promotion_items"
+    __table_args__ = (UniqueConstraint("account_id", "promo_id", "nm_id", name="uq_wb_promotion_item"),)
+    id = Column(Integer, primary_key=True)
+    account_id = Column(Integer, ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False)
+    promo_id = Column(Integer, nullable=False, index=True)
+    nm_id = Column(String(32), nullable=False)
+    in_action = Column(Boolean, nullable=False, default=False)
+    price = Column(Integer, nullable=True)
+    plan_price = Column(Integer, nullable=True)
+    discount = Column(Integer, nullable=True)
+    plan_discount = Column(Integer, nullable=True)
+    fetched_at = Column(DateTime, nullable=False, default=now_utc)
+    added_at = Column(DateTime, nullable=True)
+    added_by = Column(String(64), nullable=False, default="")
 
 
 class ReferenceDiscount(Base):

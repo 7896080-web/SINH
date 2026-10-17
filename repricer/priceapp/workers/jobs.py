@@ -304,6 +304,41 @@ def job_backup() -> None:
         db.close()
 
 
+def wb_promo_requested() -> bool:
+    """Кнопка «Обновить календарь сейчас» на странице «Акции WB»."""
+    db = SessionLocal()
+    try:
+        if settings.get(db, settings.WB_PROMO_REFRESH_NOW) == "1":
+            settings.put(db, settings.WB_PROMO_REFRESH_NOW, "0")
+            db.commit()
+            return True
+        return False
+    finally:
+        db.close()
+
+
+def job_wb_promo(client_factory=None) -> None:
+    """Календарь акций WB (`wb_promo.refresh`): акции кабинетов, их товары, плановые цены. Сбой
+    отдельного кабинета — оговоркой в отметке (её показывает «Внимание»), а не падением."""
+    db = SessionLocal()
+    try:
+        from priceapp import overview, wb_promo
+        if not db.query(ApiCredential.id).join(Account, Account.id == ApiCredential.account_id).filter(
+                Account.platform == "wb", Account.is_active.is_(True)).first():
+            beat(db, "wb_promo", True, "")
+            return
+        st = wb_promo.refresh(db, client_factory)
+        logger.info("%s", wb_promo.summary(st))
+        overview.mark_dirty(db)
+        beat(db, "wb_promo", True, "; ".join(st["errors"])[:1000])
+    except Exception as e:
+        db.rollback()
+        logger.exception("календарь акций WB упал")
+        beat(db, "wb_promo", False, f"{type(e).__name__}: {e}")
+    finally:
+        db.close()
+
+
 def attention_dirty() -> bool:
     db = SessionLocal()
     try:

@@ -54,6 +54,8 @@ ETALON_TOLERANCE_RUB = "etalon_tolerance_rub"
 # Акции WB стартуют в полночь: без опроса в 00:05 их цены жили бы до ближайшего опроса раз в 6 часов.
 WB_POLL_AT = "wb_poll_at"
 WB_POLL_SLOT_DONE = "wb_poll_slot_done"
+# Календарь акций WB (`wb_promo.py`): «обновить сейчас» по кнопке страницы «Акции WB».
+WB_PROMO_REFRESH_NOW = "wb_promo_refresh_now"
 
 # Эталон WB (`pricing.etalon_prices`): цена продавца со скидкой на WB минус этот %;
 # допустимая скидка продавца на площадке (вне — цена до скидки не считается); «от
@@ -101,6 +103,7 @@ DEFAULTS = {
     ETALON_TOLERANCE_RUB: "100",
     WB_POLL_AT: "00:05",
     WB_POLL_SLOT_DONE: "",
+    WB_PROMO_REFRESH_NOW: "0",
     COST_NORMALIZE: "1",
 }
 
