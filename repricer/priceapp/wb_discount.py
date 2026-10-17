@@ -122,17 +122,22 @@ class Thresholds:
     """Порог по товару: артикул (кабинет → все) → категория (кабинет → все) → умолчание.
     Строится один раз на проход: правил мало, а спрашивают по каждому SKU."""
 
-    def __init__(self, db: Session):
+    def __init__(self, db: Session, after_temp: bool = False):
+        """`after_temp` — пороги, что будут ПОСЛЕ окончания временных «для акции» (вместо них —
+        прежние): по ним судят акцию, которая идёт дольше, чем держится временный порог."""
         from priceapp.pricing import article_map
         from priceapp.reference import drop_percent
         self.default = drop_percent(db)
         self.by_art: dict[tuple[str, int], Decimal] = {}
         self.by_cat: dict[tuple[str, int], Decimal] = {}
-        for r in db.query(WbDiscountRule).filter(WbDiscountRule.max_disc.isnot(None)):
+        for r in db.query(WbDiscountRule).filter((WbDiscountRule.max_disc.isnot(None)) | (WbDiscountRule.until.isnot(None))):
+            value = r.prev_max_disc if after_temp and r.until is not None else r.max_disc
+            if value is None:
+                continue
             if r.kind == ARTICLE:
-                self.by_art[(r.key, r.account_id or 0)] = Decimal(r.max_disc)
+                self.by_art[(r.key, r.account_id or 0)] = Decimal(value)
             else:
-                self.by_cat[(norm(r.key), r.account_id or 0)] = Decimal(r.max_disc)
+                self.by_cat[(norm(r.key), r.account_id or 0)] = Decimal(value)
         self._articles = article_map(db) if self.by_art else {}
 
     def for_category(self, category: str, account_id: int = 0) -> tuple[Decimal, str]:

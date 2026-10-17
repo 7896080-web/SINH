@@ -216,7 +216,7 @@ def test_page_bulk_add_export_and_import(client, db):
     accs = acc_mod.client_for
     try:
         acc_mod.client_for = lambda db_, acc_, cf=None: cal
-        r = client.post("/wb-promo/bulk", data={"acc": str(a.id), "promo": "1", "sel": ["c:Шорты"],
+        r = client.post("/wb-promo/bulk", data={"acc": str(a.id), "promo": "1", "sel": ["1:c:Шорты"],
                                                 "action": "add", "value": "26"})
     finally:
         acc_mod.client_for = accs
@@ -259,7 +259,54 @@ def test_add_with_new_threshold_under_returns_filter_still_adds(client, db):
     try:
         acc_mod.client_for = lambda db_, acc_, cf=None: cal
         r = client.post("/wb-promo/save", data={"acc": str(a.id), "promo": "1", "flt": "returns", "by": "article",
-                                                "sel": "a:A1", "thr": "26", "action": "add"})
+                                                "sel": "1:a:A1", "thr": "26", "action": "add"})
     finally:
         acc_mod.client_for = accs
     assert cal.uploads == [(1, [5], False)] and "отправлено в акцию карточек 1 из 1" in r.text
+
+
+def test_all_promos_mode_page_bulk_and_one_file_for_two_promos(client, db):
+    """Акция не выбрана — все обычные акции разделами; в одном файле правка двух акций сразу."""
+    a = _setup(db)
+    _setup(db, acc=a, nm="6", art="A2", item="u2", barcode="b2", category="Джемперы")
+    cal = _Cal([_promo(1), _promo(3, name="Чёрная пятница", start_in=timedelta(days=5))],
+               {(1, False): [_item(5, 25), _item(6, 5)], (3, False): [_item(5, 15)]})
+    _load(db, cal)
+    html = client.get("/wb-promo").text
+    assert "Акция «Осенняя распродажа»" in html and "Акция «Чёрная пятница»" in html
+    assert "Правка через Excel" in html and "Сейчас ниже эталона" in html and "по умолчанию" in html
+    # выгрузка без выбора акции — обе акции своими разделами, «ID акции» у каждой строки
+    rows = [list(x) for x in load_workbook(io.BytesIO(client.get("/wb-promo/export").content)).active.iter_rows(values_only=True)]
+    assert rows[0] == wp.HEAD
+    heads = [r[0] for r in rows[1:] if r[1] is None]
+    assert any("ОСЕННЯЯ РАСПРОДАЖА" in h for h in heads) and any("ЧЁРНАЯ ПЯТНИЦА" in h for h in heads)
+    assert {r[6] for r in rows[1:] if r[1]} == {1, 3}
+    # один файл: A1 в акции 1 — порог 26 и «да»; A1 в акции 3 — «да». Порог 26 «для акции» 1 кончится
+    # раньше акции 3 — для неё действует прежний 10%, и −15% в него не укладывается: не добавляем
+    wb = Workbook()
+    wb.active.append(wp.HEAD)
+    for pid, thr, add in ((1, 26, "да"), (3, None, "да")):
+        row = [None] * len(wp.HEAD)
+        row[1], row[2], row[6] = "Артикул", "A1", pid
+        row[wp.HEAD.index(wp.COL_NEW)], row[wp.HEAD.index(wp.COL_ADD)] = thr, add
+        wb.active.append(row)
+    buf = io.BytesIO()
+    wb.save(buf)
+    accs = acc_mod.client_for
+    try:
+        acc_mod.client_for = lambda db_, acc_, cf=None: cal
+        r = client.post("/wb-promo/import", files={"file": ("p.xlsx", buf.getvalue())})
+    finally:
+        acc_mod.client_for = accs
+    assert cal.uploads == [(1, [5], False)]
+    assert "Чёрная пятница" in r.text and "вернётся эталон" in r.text      # во второй — не уложилась, сказано
+    # порог «для акции» виден у строки другой акции как источник
+    html = client.get(f"/wb-promo?acc={a.id}").text
+    assert "для акции до" in html and "кончится раньше этой" in html
+    # массовая правка по всему отбору — по всем акциям
+    try:
+        acc_mod.client_for = lambda db_, acc_, cf=None: cal
+        client.post("/wb-promo/bulk", data={"acc": str(a.id), "q": "A2", "all_filtered": "1", "action": "add"})
+    finally:
+        acc_mod.client_for = accs
+    assert cal.uploads[-1] == (1, [6], False)
