@@ -19,6 +19,13 @@
 
 Каждая правка порога и каждая отправка пишутся в журнал (`HISTORY_ACTIONS`): страница показывает
 историю и выгружает её в Excel.
+
+Список (страница и Excel, решение владельца 17.10): сначала ОБЩИЕ артикулы — те, что есть в
+нескольких кабинетах WB, — затем каждая категория со списком своих артикулов. Новое значение у
+КАТЕГОРИИ ставится на все её артикулы (`set_category`): их собственные пороги снимаются, действует
+порог категории. Не трогали категорию — меняются только изменённые артикулы. Общие артикулы
+правятся своим списком: каскад категории их своих порогов не лишает (без своего порога на них и
+так действует порог категории).
 """
 from __future__ import annotations
 
@@ -230,6 +237,23 @@ def select(all_cards: list[Card], kind: str, key: str, account_id: int = 0) -> l
     return [c for c in all_cards if norm(c.category) == k]
 
 
+def shared_articles(all_cards: list[Card]) -> set[str]:
+    """Артикулы, которые есть в нескольких кабинетах WB, — общий список."""
+    accs: dict[str, set] = {}
+    for c in all_cards:
+        for a in c.articles:
+            accs.setdefault(a, set()).add(c.account.id)
+    return {a for a, s in accs.items() if len(s) > 1}
+
+
+def category_articles(all_cards: list[Card], category: str, account_id: int = 0) -> set[str]:
+    """Артикулы из списка категории (без общих) — на них каскадом ставится порог категории."""
+    shared = shared_articles(all_cards)
+    k = norm(category)
+    return {a for c in all_cards if norm(c.category) == k and (not account_id or c.account.id == account_id)
+            for a in c.articles if a not in shared}
+
+
 # --- правила -----------------------------------------------------------------------------------
 
 def get_rule(db: Session, kind: str, key: str, account_id: int = 0) -> WbDiscountRule | None:
@@ -257,6 +281,32 @@ def set_threshold(db: Session, kind: str, key: str, value: Decimal | None, actor
     audit.log(db, actor, "wb_threshold", (where or account_name(db, account_id))[:100],
               f"{KIND_LABELS[kind].lower()} {key}: порог {fmt(old) or 'общий'} -> {fmt(value) or 'общий'}")
     return True
+
+
+def set_category(db: Session, key: str, value: Decimal | None, actor: str, account_id: int = 0, where: str = "",
+                 all_cards: list[Card] | None = None) -> tuple[bool, int]:
+    """Порог категории. НОВОЕ значение (не None) ставится на все артикулы её списка: их свои пороги
+    в этом же разделе снимаются, и на них действует порог категории. Раздел «все кабинеты» снимает
+    ещё и свои пороги этой категории и её артикулов в отдельных кабинетах — иначе «на все артикулы
+    категории» было бы неправдой. «-» (None) — только снять порог самой категории: исключения
+    артикулов остаются. Возвращает (изменился ли порог категории, сколько своих порогов снято).
+    Не коммитит."""
+    changed = set_threshold(db, CATEGORY, key, value, actor, account_id, where)
+    if value is None:
+        return changed, 0
+    arts = category_articles(all_cards if all_cards is not None else cards(db), key, account_id)
+    cleared = 0
+    q = db.query(WbDiscountRule).filter(WbDiscountRule.max_disc.isnot(None))
+    for r in q.filter(WbDiscountRule.kind == ARTICLE).all():
+        if r.key in arts and (not account_id or r.account_id == account_id):
+            cleared += set_threshold(db, ARTICLE, r.key, None, actor, r.account_id,
+                                     f"{account_name(db, r.account_id)} — каскад категории {key}")
+    if not account_id:
+        for r in q.filter(WbDiscountRule.kind == CATEGORY, WbDiscountRule.account_id != 0).all():
+            if norm(r.key) == norm(key):
+                cleared += set_threshold(db, CATEGORY, r.key, None, actor, r.account_id,
+                                         f"{account_name(db, r.account_id)} — каскад категории {key}")
+    return changed, cleared
 
 
 def set_default(db: Session, value: Decimal, actor: str) -> bool:
@@ -287,10 +337,18 @@ def send_now(db: Session, kind: str, key: str, pct: Decimal, actor: str, client_
     from priceapp.pricing import item_facts
     all_cards = all_cards if all_cards is not None else cards(db)
     chosen = select(all_cards, kind, key, account_id)
-    st = {"cards": len(chosen), "sent": 0, "same": 0, "skipped": [], "errors": []}
+    limits = Thresholds(db)
+    own = 0
+    if kind == CATEGORY:
+        # категория правит артикулы без своего порога; со своим — правятся своей строкой
+        def governed(c: Card) -> bool:
+            return any(not limits.for_article(a, c.category, c.account.id)[1].startswith("артикул")
+                       for a in c.articles)
+        own = sum(1 for c in chosen if not governed(c))
+        chosen = [c for c in chosen if governed(c)]
+    st = {"cards": len(chosen), "sent": 0, "same": 0, "skipped": [], "errors": [], "own": own}
     if not chosen:
         return st
-    limits = Thresholds(db)
     rule = platform_rule(db, "wb")
     rate = rates.current(db)
     ids = [i for c in chosen for i in c.item_ids]
@@ -393,10 +451,10 @@ def _mark_held(db: Session, account_id: int, item_ids, pct) -> None:
 
 
 def merge_reports(sts: list[dict]) -> dict:
-    out = {"cards": 0, "sent": 0, "same": 0, "skipped": [], "errors": []}
+    out = {"cards": 0, "sent": 0, "same": 0, "skipped": [], "errors": [], "own": 0}
     for st in sts:
-        for k in ("cards", "sent", "same"):
-            out[k] += st[k]
+        for k in ("cards", "sent", "same", "own"):
+            out[k] += st.get(k, 0)
         out["skipped"] += st["skipped"]
         out["errors"] += st["errors"]
     return out
@@ -406,11 +464,17 @@ def report(what: str, pct: Decimal | None, st: dict) -> tuple[str, str]:
     """Текст и уровень флеша по итогам `send_now`; pct None — проценты разные (файл)."""
     if pct is not None:
         what = f"{what}: " + (f"эталон − {fmt(pct)}%" if pct else "полный эталон")
+    own = st.get("own", 0)
     if not st["cards"]:
+        if own:
+            return (f"{what} — не отправлено: у всех {own} карточек свой порог артикула, их правят строкой "
+                    "артикула.", "warn")
         return f"{what} — на WB нет карточек с эталоном.", "warn"
     parts = [f"отправлено карточек {st['sent']} из {st['cards']}"]
     if st["same"]:
         parts.append(f"уже стояло так — {st['same']}")
+    if own:
+        parts.append(f"не трогали {own} — у их артикулов свой порог, правьте строкой артикула")
     bad = st["skipped"] + st["errors"]
     if bad:
         parts.append(f"не отправлено ({len(bad)}): " + "; ".join(bad[:5]) + (" …" if len(bad) > 5 else ""))
@@ -432,6 +496,10 @@ class Row:
     below_max: Decimal | None = None
     held: list = field(default_factory=list)      # сдвиги «эталон − N%», что стоят сейчас
     sales: list = field(default_factory=list)     # цены после скидки на WB сейчас, по карточкам
+    accounts: list = field(default_factory=list)  # кабинеты, где есть этот артикул (категория)
+    shared: bool = False                          # артикул есть в нескольких кабинетах — общий список
+    articles: int = 0                             # категория: артикулов в её списке (без общих)
+    own_articles: int = 0                         # категория: из них со своим порогом здесь
     rule: WbDiscountRule | None = None            # свой порог там, где смотрим (кабинет или все)
     others: list = field(default_factory=list)    # «все кабинеты»: свои пороги отдельных кабинетов
     eff: Decimal | None = None
@@ -460,6 +528,11 @@ def table(db: Session, account_id: int = 0, all_cards: list[Card] | None = None)
     from priceapp import etalon
     ets = etalon.etalons(db)
     all_cards = all_cards if all_cards is not None else cards(db, ets)
+    shared = shared_articles(all_cards)
+    art_accs: dict[str, set] = {}
+    for c in all_cards:
+        for a in c.articles:
+            art_accs.setdefault(a, set()).add(c.account.name)
     if account_id:
         all_cards = [c for c in all_cards if c.account.id == account_id]
     limits = Thresholds(db)
@@ -502,6 +575,11 @@ def table(db: Session, account_id: int = 0, all_cards: list[Card] | None = None)
         row.rule, row.others = rules.get((ARTICLE, art)), others.get((ARTICLE, art), [])
         row.eff, row.eff_src = limits.for_article(art, row.category, account_id)
         row.current = int(sum(row.sales) / len(row.sales)) if row.sales else None
+        row.accounts, row.shared = sorted(art_accs.get(art, ())), art in shared
+        if not row.shared and row.category and norm(row.category) in cats:
+            c = cats[norm(row.category)]
+            c.articles += 1
+            c.own_articles += row.own is not None
     return (sorted(cats.values(), key=lambda r: r.key.casefold()),
             sorted(arts.values(), key=lambda r: r.key))
 
@@ -539,17 +617,120 @@ def keep(row: Row, q: str = "", cat: str = "", flt: str = "") -> bool:
     return True
 
 
-HEAD = ["Тип", "Категория WB / артикул 1С", "Кабинет", "Название", "Категория WB", "Карточек WB", "Эталон, ₽",
-        "Сейчас на WB, ₽", "Сейчас ниже эталона, %", "Стоит «эталон − N%»", "Порог действует, %",
-        "Порог: макс. скидка от эталона, %", "Отправить сейчас: эталон −, %"]
-COL_KIND, COL_KEY, COL_ACC, COL_THR, COL_NOW = HEAD[0], HEAD[1], HEAD[2], HEAD[11], HEAD[12]
+@dataclass
+class Entry:
+    """Строка списка: заголовок раздела или строка категории / артикула (level 1 — артикул под категорией)."""
+    kind: str                      # head / row
+    text: str = ""
+    row: Row | None = None
+    level: int = 0
+    section: str = ""
 
 
-def export_rows(rows: list[Row], where: str) -> list[list]:
-    return [[KIND_LABELS[r.kind], r.key, where, r.name, r.category, r.cards or None, r.etalon, r.current,
-             r.below_text, ", ".join(fmt(h) for h in sorted(r.held)),
-             f"{fmt(r.eff)} ({r.eff_src})" if r.eff is not None else "",
-             float(r.own) if r.own is not None else None, None] for r in rows]
+NO_CATEGORY = "Без категории"
+SHARED_TITLE = "Общие артикулы — есть в нескольких кабинетах"
+
+
+def grouped(cats: list[Row], arts: list[Row], q: str = "", cat: str = "", flt: str = "") -> list[Entry]:
+    """Общие артикулы, затем каждая категория и её артикулы. Категория показывается, если подходит
+    под отбор сама или хоть один её артикул; совпала по названию с поиском — со всеми артикулами."""
+    out: list[Entry] = []
+    shared = [a for a in arts if a.shared and keep(a, q, cat, flt)]
+    if shared:
+        out.append(Entry("head", f"{SHARED_TITLE} ({len(shared)})", section=SHARED_TITLE))
+        out += [Entry("row", row=a, section=SHARED_TITLE) for a in shared]
+    kids: dict[str, list[Row]] = {}
+    for a in arts:
+        if not a.shared:
+            kids.setdefault(norm(a.category) if a.category else "", []).append(a)
+    ql = q.strip().casefold()
+    for c in cats:
+        if cat and norm(c.key) != norm(cat):
+            continue
+        name_hit = bool(ql) and ql in c.key.casefold()
+        mine = [a for a in kids.get(norm(c.key), []) if keep(a, "" if name_hit else q, "", flt)]
+        if not (keep(c, q, "", flt) or mine):
+            continue
+        out.append(Entry("row", row=c, section=c.key))
+        out += [Entry("row", row=a, level=1, section=c.key) for a in mine]
+    orphans = [a for a in kids.get("", []) if not cat and keep(a, q, "", flt)]
+    if orphans:
+        out.append(Entry("head", f"{NO_CATEGORY} ({len(orphans)})", section=NO_CATEGORY))
+        out += [Entry("row", row=a, section=NO_CATEGORY) for a in orphans]
+    return out
+
+
+def covered(targets: list[tuple[str, str]], arts: dict[str, Row]) -> list[tuple[str, str]]:
+    """Массовая правка: строку артикула, чья категория тоже в правке, отдельно не правим — её
+    покрывает каскад категории (иначе каждый артикул получил бы свой порог, равный порогу категории,
+    — лишние строки, которые разорвали бы связь с категорией). Общие артикулы правятся всегда сами."""
+    cats = {norm(k) for kind, k in targets if kind == CATEGORY}
+    out = []
+    for kind, k in targets:
+        row = arts.get(k) if kind == ARTICLE else None
+        if row is not None and not row.shared and row.category and norm(row.category) in cats:
+            continue
+        out.append((kind, k))
+    return out
+
+
+HEAD = ["Раздел", "Тип", "Категория WB / артикул 1С", "Название", "Категория WB", "Кабинеты", "Где действует",
+        "Карточек WB", "Эталон, ₽", "Сейчас на WB, ₽", "Сейчас ниже эталона, %", "Стоит «эталон − N%»",
+        "Порог сейчас, %", "Свой порог, %", "Новый порог, %", "Отправить сейчас: эталон −, %"]
+COL_KIND, COL_KEY, COL_WHERE, COL_NEW, COL_NOW = HEAD[1], HEAD[2], HEAD[6], HEAD[14], HEAD[15]
+OLD_FORMAT_COL = "Порог: макс. скидка от эталона, %"      # выгрузка rp42: там порог стоял заполненным
+
+
+def export_xlsx(entries: list[Entry], where: str) -> bytes:
+    """Файл для правки: те же разделы, что на странице. Правятся две колонки (выделены цветом) и
+    выгружаются ПУСТЫМИ — что вписали, то и меняется; остальное справочное."""
+    import io
+
+    from openpyxl import Workbook
+    from openpyxl.cell import WriteOnlyCell
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+    wb = Workbook(write_only=True)
+    ws = wb.create_sheet("Порог скидки WB")
+    widths = [22, 11, 26, 40, 20, 30, 18, 9, 10, 10, 12, 12, 20, 10, 12, 14]
+    for i, w in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    ws.freeze_panes = "D2"
+    edit = PatternFill("solid", fgColor="FFF4C2")
+    head_fill = PatternFill("solid", fgColor="DCE6F2")
+    cat_fill = PatternFill("solid", fgColor="EEF2F7")
+    edit_cols = {HEAD.index(COL_NEW), HEAD.index(COL_NOW)}
+
+    def row_of(values, bold=False, fill=None, indent=0, editable=True):
+        out = []
+        for i, v in enumerate(values):
+            c = WriteOnlyCell(ws, value=v)
+            if bold:
+                c.font = Font(bold=True)
+            if i in edit_cols and editable:
+                c.fill = edit
+            elif fill:
+                c.fill = fill
+            if indent and i == 2:
+                c.alignment = Alignment(indent=indent)
+            out.append(c)
+        return out
+
+    ws.append(row_of(HEAD, bold=True))
+    for e in entries:
+        if e.kind == "head":
+            ws.append(row_of([e.text.upper()] + [None] * (len(HEAD) - 1), bold=True, fill=head_fill, editable=False))
+            continue
+        r = e.row
+        ws.append(row_of([e.section, KIND_LABELS[r.kind], r.key, r.name, r.category if r.kind == ARTICLE else "",
+                          ", ".join(r.accounts), where, r.cards or None, r.etalon, r.current, r.below_text,
+                          ", ".join(fmt(h) for h in sorted(r.held)),
+                          f"{fmt(r.eff)} ({r.eff_src})" if r.eff is not None else "",
+                          float(r.own) if r.own is not None else None, None, None],
+                         bold=r.kind == CATEGORY, fill=cat_fill if r.kind == CATEGORY else None, indent=2 * e.level))
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
 
 
 HISTORY_HEAD = ["Когда", "Кто", "Где", "Что"]

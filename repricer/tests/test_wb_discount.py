@@ -28,7 +28,8 @@ def _setup(db, category="Шорты", name="ИП 1", nm="5", art="A1", item="u1"
         acc = f.account(db, "wb", name, commission=25)
         f.rule(db, acc, base_coef="2.5", min_markup_coef="1.3", max_change_percent=1000)
         acc_mod.set_credential(db, acc, "token", "t")
-    f.sku(db, item, art, "S", barcodes=[barcode], cost_usd=cost)
+    from priceapp.models import OnecCost
+    f.sku(db, item, art, "S", barcodes=[barcode], cost_usd=None if db.get(OnecCost, item) else cost)
     f.item(db, acc, barcode, art, external_id=f"{nm}:1", size="S")
     row = db.query(PlatformItem).filter_by(barcode=barcode).one()
     row.current_price = row.current_sale_price = 2009
@@ -210,55 +211,148 @@ def test_page_bulk_and_history(client, db):
     assert rows[0][:4] == tuple(wd.HISTORY_HEAD) and len(rows) >= 5
 
 
-def test_excel_roundtrip(client, db):
-    a = _setup(db)
-    r = client.get("/wb-discount/export?by=all")
-    ws = load_workbook(io.BytesIO(r.content)).active
-    head = [c.value for c in ws[1]]
-    assert head == wd.HEAD
-    data = [list(row) for row in ws.iter_rows(min_row=2, values_only=True)]
-    kinds = {(row[0], row[1]) for row in data}
-    assert ("Категория", "Шорты") in kinds and ("Артикул", "A1") in kinds
-    # файл: «Шорты» 20 на все кабинеты и «эталон − 15» сейчас; A1 в кабинете — 18; мусор — ошибкой
+def _three(db):
+    """ИП 1: A1 и A2 — «Шорты», A3 — «Джемперы»; ИП 2: A1 — общий артикул двух кабинетов."""
+    a1 = _setup(db, nm="5", art="A1", item="u1", barcode="b1")
+    _setup(db, acc=a1, nm="6", art="A2", item="u2", barcode="b2")
+    _setup(db, acc=a1, nm="7", art="A3", item="u3", barcode="b3", category="Джемперы")
+    a2 = f.account(db, "wb", "ИП 2", commission=25)
+    acc_mod.set_credential(db, a2, "token", "t")
+    _setup(db, acc=a2, nm="8", art="A1", item="u1", barcode="b8")
+    return a1, a2
+
+
+def _sheet(content):
+    ws = load_workbook(io.BytesIO(content)).active
+    return [list(r) for r in ws.iter_rows(values_only=True)]
+
+
+def _file(rows):
+    """Файл для импорта: [(тип, ключ, где, новый порог, эталон −)] в колонках выгрузки."""
     wb = Workbook()
     out = wb.active
     out.append(wd.HEAD)
-    blank = [None] * len(wd.HEAD)
-    rows = [("Категория", "шорты", "Все кабинеты WB", 20, 15), ("Артикул", "A1", a.name, 18, None),
-            ("Артикул", "НЕТ", "", 10, None), ("Категория", "Шорты", "Все кабинеты WB", 25, None)]
-    for kind, key, acc, thr, now in rows:
-        row = list(blank)
-        row[0], row[1], row[2], row[11], row[12] = kind, key, acc, thr, now
+    for kind, key, where, thr, now in rows:
+        row = [None] * len(wd.HEAD)
+        row[wd.HEAD.index(wd.COL_KIND)], row[wd.HEAD.index(wd.COL_KEY)] = kind, key
+        row[wd.HEAD.index(wd.COL_WHERE)] = where
+        row[wd.HEAD.index(wd.COL_NEW)], row[wd.HEAD.index(wd.COL_NOW)] = thr, now
         out.append(row)
     buf = io.BytesIO()
     wb.save(buf)
+    return buf.getvalue()
+
+
+def test_export_lists_shared_articles_then_categories_with_their_articles(client, db):
+    _three(db)
+    rows = _sheet(client.get("/wb-discount/export").content)
+    assert rows[0] == wd.HEAD
+    kinds = [(r[1], r[2]) for r in rows[1:]]
+    assert rows[1][0].startswith("ОБЩИЕ АРТИКУЛЫ") and rows[1][1] is None          # заголовок раздела
+    assert kinds[1:] == [("Артикул", "A1"), ("Категория", "Джемперы"), ("Артикул", "A3"),
+                         ("Категория", "Шорты"), ("Артикул", "A2")]
+    shared = rows[2]
+    assert shared[wd.HEAD.index("Кабинеты")] == "ИП 1, ИП 2" and shared[0] == wd.SHARED_TITLE
+    # править — в выделенных колонках, и выгружаются они ПУСТЫМИ: что вписали, то и меняется
+    assert all(r[wd.HEAD.index(wd.COL_NEW)] is None and r[wd.HEAD.index(wd.COL_NOW)] is None for r in rows[1:])
+    html = client.get("/wb-discount").text
+    assert "Общие артикулы — есть в нескольких кабинетах" in html and "кабинеты: ИП 1, ИП 2" in html
+
+
+def test_new_category_value_goes_to_all_its_articles_but_not_to_shared(db):
+    a1, a2 = _three(db)
+    wd.set_threshold(db, wd.ARTICLE, "A2", Decimal(30), "op")
+    wd.set_threshold(db, wd.ARTICLE, "A2", Decimal(12), "op", account_id=a1.id)
+    wd.set_threshold(db, wd.CATEGORY, "Шорты", Decimal(15), "op", account_id=a1.id)
+    wd.set_threshold(db, wd.ARTICLE, "A1", Decimal(25), "op")                  # общий — свой
+    db.commit()
+    changed, cleared = wd.set_category(db, "Шорты", Decimal(20), "op")
+    db.commit()
+    assert changed and cleared == 3
+    t = wd.Thresholds(db)
+    assert t.for_article("A2", "Шорты", a1.id) == (Decimal(20), "категория")
+    assert t.for_article("A1", "Шорты", a1.id) == (Decimal(25), "артикул")       # общий список — свой
+    assert any("каскад категории Шорты" in h.object for h in db.query(AuditLog).filter_by(action="wb_threshold"))
+    # «-» у категории снимает только её порог — исключения артикулов остаются
+    wd.set_threshold(db, wd.ARTICLE, "A2", Decimal(11), "op")
+    db.commit()
+    assert wd.set_category(db, "Шорты", None, "op") == (True, 0)
+    assert wd.Thresholds(db).for_article("A2", "Шорты", a1.id) == (Decimal(11), "артикул")
+    # раздел кабинета снимает свои пороги артикулов только в этом кабинете
+    wd.set_threshold(db, wd.ARTICLE, "A2", Decimal(13), "op", account_id=a1.id)
+    db.commit()
+    assert wd.set_category(db, "Шорты", Decimal(18), "op", account_id=a1.id) == (True, 1)
+    assert wd.Thresholds(db).for_article("A2", "Шорты", a1.id) == (Decimal(11), "артикул")   # на все кабинеты — главнее
+    assert a2.id
+
+
+def test_import_category_first_then_article_exception_and_only_changed_rows(client, db):
+    a1, _ = _three(db)
+    wd.set_threshold(db, wd.ARTICLE, "A3", Decimal(33), "op")                  # не трогаем в файле — останется
+    wd.set_threshold(db, wd.ARTICLE, "A2", Decimal(30), "op")
+    db.commit()
+    content = _file([("Артикул", "A2", "Все кабинеты WB", 12, None),          # исключение — строкой НИЖЕ категории
+                     ("Категория", "Шорты", "Все кабинеты WB", 20, None),
+                     ("Категория", "Джемперы", "Все кабинеты WB", None, None)])
+    r = client.post("/wb-discount/import", files={"file": ("p.xlsx", content)})
+    assert r.status_code == 200 and "у категорий — 1, у артикулов — 1" in r.text
+    db.expire_all()
+    t = wd.Thresholds(db)
+    assert t.for_category("Шорты")[0] == Decimal(20)
+    assert t.for_article("A2", "Шорты", a1.id) == (Decimal(12), "артикул")      # каскад, затем исключение
+    assert t.for_article("A3", "Джемперы", a1.id) == (Decimal(33), "артикул")   # не меняли
+    # файл старого образца (rp42: порог в нём стоял заполненным) — отказ, а не каскад по всему каталогу
+    wb = Workbook()
+    wb.active.append(["Тип", "Категория WB / артикул 1С", "Кабинет", wd.OLD_FORMAT_COL])
+    wb.active.append(["Категория", "Шорты", "Все кабинеты WB", 25])
+    buf = io.BytesIO()
+    wb.save(buf)
+    r = client.post("/wb-discount/import", files={"file": ("old.xlsx", buf.getvalue())})
+    assert "старого образца" in r.text
+    db.expire_all()
+    assert wd.Thresholds(db).for_category("Шорты")[0] == Decimal(20)
+
+
+def test_import_send_now_and_errors(client, db):
+    a = _setup(db)
+    content = _file([("категория", "шорты", "Все кабинеты WB", 20, 15), ("Артикул", "A1", a.name, 18, None),
+                     ("Артикул", "НЕТ", "", 10, None), ("Категория", "Шорты", "Все кабинеты WB", 25, None),
+                     ("Артикул", "A1", "ИП Неизвестный", 10, None)])
     fake = _Wb()
     accs = acc_mod.client_for
     try:
         acc_mod.client_for = lambda db_, acc_, cf=None: fake
-        r = client.post("/wb-discount/import", files={"file": ("p.xlsx", buf.getvalue())})
+        r = client.post("/wb-discount/import", files={"file": ("p.xlsx", content)})
     finally:
         acc_mod.client_for = accs
-    assert r.status_code == 200
     db.expire_all()
     t = wd.Thresholds(db)
-    assert t.for_category("Шорты")[0] == Decimal(20)                       # повтор строки не применён
-    assert t.for_article("A1", "Шорты", a.id)[0] == Decimal(18)
-    # «эталон − 15» при пороге артикула 18% — уходит (артикул главнее категории)
-    assert fake.calls == [{"data": [{"nmID": 5, "price": 1708, "discount": 0}]}]
-    assert "НЕТ" in r.text and "повторяется" in r.text
-    # «-» снимает свой порог
-    wb = Workbook()
-    out = wb.active
-    out.append(wd.HEAD)
-    row = list(blank)
-    row[0], row[1], row[2], row[11] = "Артикул", "A1", a.name, "-"
-    out.append(row)
-    buf = io.BytesIO()
-    wb.save(buf)
-    client.post("/wb-discount/import", files={"file": ("p.xlsx", buf.getvalue())})
+    assert t.for_category("Шорты")[0] == Decimal(20)                           # повтор строки не применён
+    assert t.for_article("A1", "Шорты", a.id) == (Decimal(18), "артикул, кабинет")
+    # у A1 в кабинете свой порог — «отправить сейчас» категории его не трогает
+    assert fake.calls == [] and "свой порог артикула" in r.text
+    assert "НЕТ" in r.text and "повторяется" in r.text and "ИП Неизвестный" in r.text
+    content = _file([("Артикул", "A1", a.name, "-", None), ("Категория", "Шорты", "Все кабинеты WB", None, 15)])
+    try:
+        acc_mod.client_for = lambda db_, acc_, cf=None: fake
+        client.post("/wb-discount/import", files={"file": ("p.xlsx", content)})
+    finally:
+        acc_mod.client_for = accs
     db.expire_all()
     assert wd.Thresholds(db).for_article("A1", "Шорты", a.id) == (Decimal(20), "категория")
+    assert fake.calls == [{"data": [{"nmID": 5, "price": 1708, "discount": 0}]}]
+
+
+def test_bulk_does_not_set_articles_covered_by_their_category(client, db):
+    a1, _ = _three(db)
+    wd.set_threshold(db, wd.ARTICLE, "A2", Decimal(30), "op")
+    db.commit()
+    client.post("/wb-discount/bulk", data={"sel": ["c:Шорты", "a:A2", "a:A1"], "action": "set", "value": "22"})
+    db.expire_all()
+    t = wd.Thresholds(db)
+    assert t.for_article("A2", "Шорты", a1.id) == (Decimal(22), "категория")    # покрыт категорией, не свой
+    assert t.for_article("A1", "Шорты", a1.id) == (Decimal(22), "артикул")      # общий — правится сам
+    assert db.query(WbDiscountRule).filter_by(kind="article", key="A2").one().max_disc is None
 
 
 def test_default_threshold_on_the_page(client, db):
