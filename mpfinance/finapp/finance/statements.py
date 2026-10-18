@@ -228,9 +228,25 @@ def _ours(db: Session, report_ids: list[int]) -> dict[int, dict[str, int]]:
     return out
 
 
+# Отбор по кабинету: у двух ИП свои кабинеты WB и свои своды, а номера отчётов
+# у WB сквозные — смешанный список показывал бы отчёты одного ИП «не
+# загруженными» в своде другого. NO_ACCOUNT — свод, загруженный без кабинета.
+NO_ACCOUNT = "none"
+
+
+def _by_account(query, column, account):
+    if account is None:
+        return query
+    if account == NO_ACCOUNT:
+        return query.filter(column.is_(None))
+    return query.filter(column == account)
+
+
 def compare(db: Session, platform: str = "wb", date_from: date | None = None,
-            date_to: date | None = None) -> list[Row]:
-    query = db.query(PlatformStatement).filter(PlatformStatement.platform == platform)
+            date_to: date | None = None, account: int | str | None = None) -> list[Row]:
+    """`account`: None — все кабинеты, id кабинета или NO_ACCOUNT."""
+    query = _by_account(db.query(PlatformStatement).filter(PlatformStatement.platform == platform),
+                        PlatformStatement.account_id, account)
     if date_from:
         query = query.filter(PlatformStatement.period_to >= date_from)
     if date_to:
@@ -250,3 +266,44 @@ def compare(db: Session, platform: str = "wb", date_from: date | None = None,
         report = reports.get(statement.report_number)
         rows.append(Row(statement, report, ours.get(report.id, {}) if report else {}))
     return rows
+
+
+def not_in_summary(db: Session, platform: str, rows: list[Row],
+                   account: int | str | None = None) -> list[tuple[SalesReport, int]]:
+    """Загруженные отчёты, которых нет НИ В ОДНОМ своде площадки, — в пределах
+    периода, который показанный свод покрывает (за его пределами отсутствие
+    ничего не значит: свод просто туда не доходит). Обычно это отчёт другого
+    кабинета, чей свод не загружен, либо свод устарел."""
+    if not rows:
+        return []
+    start = min(r.statement.period_from for r in rows)
+    end = max(r.statement.period_to for r in rows)
+    known = {n for (n,) in db.query(PlatformStatement.report_number).filter(
+        PlatformStatement.platform == platform)}
+    query = _by_account(db.query(SalesReport).filter(
+        SalesReport.platform == platform, SalesReport.period_from <= end,
+        SalesReport.period_to >= start), SalesReport.account_id, account)
+    extra = [r for r in query.order_by(SalesReport.period_from.desc())
+             if r.report_number not in known]
+    ours = _ours(db, [r.id for r in extra])
+    return [(r, ours.get(r.id, {}).get("total_kop", 0)) for r in extra]
+
+
+def entity_warnings(db: Session, platform: str, account_id: int | None, rows: list[dict]) -> list[str]:
+    """Предупреждения при загрузке свода: в файле несколько юрлиц, или в кабинете
+    уже лежит свод ДРУГОГО юрлица (выбран не тот кабинет). Свод при этом
+    загружается: повторная загрузка с верным кабинетом его переназначит."""
+    out = []
+    in_file = sorted({r["legal_entity"] for r in rows if r.get("legal_entity")})
+    if len(in_file) > 1:
+        out.append("В файле несколько юрлиц: " + ", ".join(in_file)
+                   + ". Свод одного кабинета — одно юрлицо; разнесите по кабинетам.")
+    if account_id is not None and in_file:
+        numbers = {r["report_number"] for r in rows}
+        before = {e for n, e in db.query(PlatformStatement.report_number, PlatformStatement.legal_entity)
+                  .filter(PlatformStatement.platform == platform,
+                          PlatformStatement.account_id == account_id) if n not in numbers and e}
+        if before and not before & set(in_file):
+            out.append(f"В этом кабинете уже лежит свод юрлица {', '.join(sorted(before))}, а в файле — "
+                       f"{', '.join(in_file)}. Если кабинет выбран не тот, загрузите файл ещё раз с верным.")
+    return out

@@ -544,6 +544,54 @@ KIT_FORMAT = ReportFormat(
 )
 
 
+# AWER CRM (своя CRM заказов сайта на KIT, база kitcrm.db) — «Продажи»,
+# файл sales-items-<с>_<по>-<когда выгружен>.xlsx: Дата, Номер заказа,
+# Артикул, Баркод, Сумма; строка «Итого:» под таблицей. Сверено с выгрузкой за
+# 01–30.09.2026 (49 позиций, 309 950 ₽). Строка — одна штука (колонки
+# количества нет, две штуки одного товара идут двумя строками). «Номер заказа»
+# — номер для покупателя (`order_number` KIT, 100608), а не внутренний id
+# заказа, по которому принимает заказы Sync Admin, поэтому он кладётся в
+# `srid`, как и у загрузки KIT по API, — сверки по номеру с Sync Admin нет.
+# Комиссии у KIT нет, «Сумма» — деньги продавца; эквайринг приходит отдельно
+# детализацией Яндекс Пэй.
+AWER_CRM_ALIASES = {
+    "operation_date": ("Дата",),
+    "srid": ("Номер заказа",),
+    "article": ("Артикул",),
+    "barcode": ("Баркод",),
+    "payout": ("Сумма",),
+}
+
+
+def build_awer_crm(row: Row) -> dict:
+    line = v.empty_line()
+    amount = row.money("payout")
+    # Минус в сумме — возврат (в выгрузке продаж его не было, но молча считать
+    # его продажей с отрицательной выручкой было бы хуже).
+    line["operation"] = v.RETURN if amount < 0 else v.SALE
+    line["source_operation"] = "Возврат (AWER CRM)" if amount < 0 else "Продажа (AWER CRM)"
+    line["quantity"] = 1
+    line["revenue"] = line["payout"] = amount
+    line["operation_date"] = row.date("operation_date")
+    line["srid"] = row.text("srid")
+    line["barcode"] = row.text("barcode")
+    line["article"] = row.text("article")
+    return line
+
+
+AWER_CRM_FORMAT = ReportFormat(
+    code="kit_awer_crm",
+    label="AWER CRM — продажи сайта на KIT",
+    platforms=("kit",),
+    aliases=AWER_CRM_ALIASES,
+    build=build_awer_crm,
+    required=("operation_date", "srid", "barcode", "payout"),
+    min_fields=5,
+    note="Выгрузка «Продажи» из AWER CRM (sales-items-…xlsx). Строка — одна штука, «Сумма» — "
+         "деньги продавца; итог сверяется со строкой «Итого:». Период — из имени файла.",
+)
+
+
 # Яндекс Пэй — «Детализация к платёжному поручению» (и «к акту»): комиссии
 # эквайринга по заказам сайта на KIT. Выручки в этом отчёте нет — она уже
 # пришла из выгрузки заказов, — поэтому строка несёт только комиссию.
@@ -639,7 +687,7 @@ UNIFIED_FORMAT = ReportFormat(
     note="Наш собственный шаблон: подходит для любой площадки.",
 )
 
-FORMATS = (WB_FORMAT, LAMODA_FORMAT, KIT_FORMAT, KIT_PAY_FORMAT, UNIFIED_FORMAT)
+FORMATS = (WB_FORMAT, LAMODA_FORMAT, KIT_FORMAT, AWER_CRM_FORMAT, KIT_PAY_FORMAT, UNIFIED_FORMAT)
 
 
 def formats_for(platform: str) -> list[ReportFormat]:

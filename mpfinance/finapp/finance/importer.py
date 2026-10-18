@@ -61,6 +61,23 @@ def number_from_filename(filename: str) -> str:
     return match.group(1) if match else ""
 
 
+_FILENAME_PERIOD_RE = re.compile(r"(\d{4}-\d{2}-\d{2})_(\d{4}-\d{2}-\d{2})")
+
+
+def period_from_filename(filename: str) -> tuple[date, date] | None:
+    """Период из имени файла «…-2026-09-01_2026-09-30-…» (AWER CRM). По датам
+    строк месяц, в последний день которого не продали ничего, кончился бы
+    раньше, — а имя файла называет тот период, за который выгружали."""
+    match = _FILENAME_PERIOD_RE.search(filename or "")
+    if not match:
+        return None
+    try:
+        start, end = (date.fromisoformat(g) for g in match.groups())
+    except ValueError:
+        return None
+    return (start, end) if start <= end else None
+
+
 def resolve_uids(db: Session, report: SalesReport, notes: list[str] | None = None) -> int:
     """Проставляет строкам uid_1c (`mapping.resolve`: «Мэппинг» sync_admin, затем
     справочник 1С) и пересчитывает, сколько строк продаж/возвратов осталось без
@@ -160,6 +177,8 @@ def import_report(db: Session, *, platform: str, file_bytes: bytes, filename: st
     if period_from is None:
         if parsed.period:
             period_from, period_to = parsed.period
+        elif period_from_filename(filename):
+            period_from, period_to = period_from_filename(filename)
         elif dates:
             period_from, period_to = min(dates), max(dates)
         else:

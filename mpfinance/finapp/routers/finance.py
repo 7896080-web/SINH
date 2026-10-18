@@ -697,13 +697,20 @@ STATEMENT_STATUSES = {"": "все", "missing": "не загружены", "diff"
 
 @router.get("/finance/statements", response_class=HTMLResponse)
 def statements_page(
-    request: Request, status: str = Query(""), year: str = Query(""),
+    request: Request, status: str = Query(""), year: str = Query(""), account: str = Query(""),
     db: Session = Depends(get_db), user: User = Depends(get_current_user),
 ):
     d_from = d_to = None
     if year.isdigit():
         d_from, d_to = date(int(year), 1, 1), date(int(year), 12, 31)
-    rows = statements.compare(db, "wb", d_from, d_to)
+    wb_accounts = [a for a in _accounts(db) if a.platform == "wb"]
+    if account == statements.NO_ACCOUNT:
+        scope = statements.NO_ACCOUNT
+    elif account.isdigit() and any(a.id == int(account) for a in wb_accounts):
+        scope = int(account)
+    else:
+        account, scope = "", None
+    rows = statements.compare(db, "wb", d_from, d_to, scope)
     counts = {key: sum(1 for r in rows if r.status == key) for key in ("missing", "diff", "ok")}
     loaded = [r for r in rows if r.report is not None]
     totals = {"wb": sum(r.statement.total_kop for r in rows),
@@ -711,12 +718,20 @@ def statements_page(
               "ours": sum(r.ours.get("total_kop", 0) for r in loaded)}
     years = sorted({s.period_from.year for s in db.query(PlatformStatement.period_from)
                     .filter(PlatformStatement.platform == "wb")}, reverse=True)
+    # Пусто под отбором кабинета — не «свода нет»: он есть, но у другого кабинета.
+    any_summary = bool(years)
+    # Кабинеты и юрлица в показанном своде: два ИП в одном списке — повод
+    # выбрать кабинет, иначе итоги складывают чужие деньги.
+    entities = sorted({(r.statement.account.name if r.statement.account else "кабинет не указан",
+                        r.statement.legal_entity or "—") for r in rows})
     shown = [r for r in rows if not status or r.status == status]
     return templates.TemplateResponse(request, "finance_statements.html", _ctx(
         request, user, "finance-statements",
         rows=shown, total_rows=len(rows), counts=counts, totals=totals, status=status,
-        statuses=STATEMENT_STATUSES, year=year, years=years,
-        wb_accounts=[a for a in _accounts(db) if a.platform == "wb"],
+        statuses=STATEMENT_STATUSES, year=year, years=years, account=account,
+        no_account=statements.NO_ACCOUNT, wb_accounts=wb_accounts, entities=entities,
+        any_summary=any_summary,
+        extra=statements.not_in_summary(db, "wb", rows, scope),
     ))
 
 
@@ -730,12 +745,22 @@ def statements_upload(
     except (ReportReadError, statements.StatementError) as e:
         set_flash(request, f"Свод не загружен: {e}", "warn")
         return RedirectResponse("/finance/statements", status_code=303)
-    stats = statements.store(db, "wb", _int_or_none(account_id), rows, "file")
+    target = _int_or_none(account_id)
+    warnings = statements.entity_warnings(db, "wb", target, rows)
+    stats = statements.store(db, "wb", target, rows, "file")
+    entities = sorted({r["legal_entity"] for r in rows if r.get("legal_entity")})
     log_action(db, user.username, "statements_uploaded",
-               f"{file.filename}: строк {stats['rows']}, новых {stats['new']}")
+               f"{file.filename}: строк {stats['rows']}, новых {stats['new']}, кабинет {target or '—'}, "
+               f"юрлицо {', '.join(entities) or '—'}")
     db.commit()
-    message = f"Свод загружен: отчётов {stats['rows']} (новых {stats['new']}, обновлено {stats['updated']})."
+    message = f"Свод загружен: отчётов {stats['rows']} (новых {stats['new']}, обновлено {stats['updated']})"
+    message += f", юрлицо: {', '.join(entities)}." if entities else "."
     if stats["declared_set"]:
         message += f" «Итого к оплате» подставлено в загруженные отчёты: {stats['declared_set']}."
-    set_flash(request, message, "good")
-    return RedirectResponse("/finance/statements", status_code=303)
+    if warnings:
+        # Первыми: сообщение режется по MAX_FLASH_CHARS, а предупреждение о
+        # чужом юрлице важнее счётчиков.
+        message = " ".join(warnings) + " " + message
+    set_flash(request, message, "warn" if warnings else "good")
+    return RedirectResponse(f"/finance/statements?account={target}" if target else "/finance/statements",
+                            status_code=303)

@@ -24,8 +24,9 @@ SUMMARY_HEADERS = [
     "Разовое изменение срока перечисления денежных средств", "Итого к оплате", "Валюта"]
 
 
-def _summary_row(number, start, end, kind, for_pay, delivery, storage, acceptance, other, penalty, total):
-    return [number, "ИП Яворская Т. Н.", f"{start}T00:00:00+03:00", f"{end}T00:00:00+03:00",
+def _summary_row(number, start, end, kind, for_pay, delivery, storage, acceptance, other, penalty, total,
+                 entity="ИП Яворская Т. Н."):
+    return [number, entity, f"{start}T00:00:00+03:00", f"{end}T00:00:00+03:00",
             "2026-09-20T21:48:03+00:00", kind, 0, 0, for_pay, 0, delivery, storage, acceptance, other,
             penalty, 0, 0, 0, 0, total, "руб."]
 
@@ -100,6 +101,73 @@ def test_compare_finds_missing_matching_and_diverging_reports(db):
     assert diverging.status == "diff"
     assert diverging.diff == 12154961 - 12000000
     assert diverging.bucket_diffs() == [("Доставка", 12154961, 12000000)]
+
+
+# Два ИП — два кабинета WB со своими сводами. Номера отчётов у WB сквозные, и
+# 848966494 (ИП Яворский) в своде ИП Яворской отсутствует по праву.
+OTHER = "ИП Яворский"
+OTHER_ROWS = [_summary_row("848966494", "2026-09-14", "2026-09-20", "Основной", 60000, 12000, 500, 0, 264.02,
+                           0, 47235.98, entity=OTHER)]
+
+
+def _two_cabinets(db):
+    her = make_account(db, name="WB Яворская")
+    his = make_account(db, name="WB Яворский")
+    statements.store(db, "wb", her.id, _parse(_summary_file()), "file")
+    db.commit()
+    return her, his
+
+
+def test_compare_is_filtered_by_cabinet(db):
+    her, his = _two_cabinets(db)
+    statements.store(db, "wb", his.id, _parse(_summary_file(OTHER_ROWS)), "file")
+    db.commit()
+    numbers = lambda account: {r.statement.report_number for r in statements.compare(db, account=account)}
+    assert numbers(her.id) == {"848253942", "852719850", "250613472"}
+    assert numbers(his.id) == {"848966494"}
+    assert numbers(None) == numbers(her.id) | numbers(his.id)
+    assert numbers(statements.NO_ACCOUNT) == set()
+    row = statements.compare(db, account=his.id)[0]
+    assert row.statement.legal_entity == OTHER and row.statement.total_kop == 4723598
+
+
+def test_loaded_report_absent_from_every_summary_is_listed(db):
+    her, his = _two_cabinets(db)
+    report = _wb_report(db, "848966494", [{"operation": v.SALE, "quantity": 1, "payout": 4723598}])
+    report.account_id = his.id
+    db.commit()
+    extra = lambda account: [r.report_number for r, _ in
+                             statements.not_in_summary(db, "wb", statements.compare(db, account=account),
+                                                       account)]
+    assert extra(None) == ["848966494"]
+    assert statements.not_in_summary(db, "wb", statements.compare(db))[0][1] == 4723598
+    assert extra(her.id) == []                       # отчёт чужого кабинета её своду не в упрёк
+    # Свод самого кабинета ещё не загружен — показать не по чему (за пределами
+    # свода отсутствие ничего не значит).
+    assert extra(his.id) == []
+    statements.store(db, "wb", his.id, _parse(_summary_file(OTHER_ROWS)), "file")
+    db.commit()
+    assert extra(None) == [] and extra(his.id) == []
+    assert statements.compare(db, account=his.id)[0].status == "ok"
+
+
+def test_report_outside_the_summary_period_is_not_listed(db):
+    _two_cabinets(db)
+    report = make_report(db, platform="wb", period=(date(2026, 10, 12), date(2026, 10, 18)), key="SR-new")
+    report.report_number = "900000001"
+    db.commit()
+    assert statements.not_in_summary(db, "wb", statements.compare(db)) == []
+
+
+def test_upload_warns_about_other_legal_entity_and_mixed_file(db):
+    her, his = _two_cabinets(db)
+    other = _parse(_summary_file(OTHER_ROWS))
+    warnings = statements.entity_warnings(db, "wb", her.id, other)
+    assert len(warnings) == 1 and OTHER in warnings[0] and "ИП Яворская Т. Н." in warnings[0]
+    assert statements.entity_warnings(db, "wb", his.id, other) == []
+    assert statements.entity_warnings(db, "wb", her.id, _parse(_summary_file())) == []   # тот же свод ещё раз
+    mixed = _parse(_summary_file(REAL_ROWS + OTHER_ROWS))
+    assert "несколько юрлиц" in statements.entity_warnings(db, "wb", None, mixed)[0]
 
 
 def test_summary_fills_wb_total_into_reports_loaded_without_it(db):
@@ -180,6 +248,24 @@ def test_statements_page_and_upload(client, db):
     assert "Свод загружен: отчётов 3" in response.text
     assert "848253942" in response.text and "не загружен" in response.text
     assert db.query(PlatformStatement).count() == 3
+
+
+def test_statements_page_by_cabinet(client, db):
+    her, his = _two_cabinets(db)
+    response = client.post("/finance/statements/upload", data={"account_id": str(her.id)},
+                           files={"file": ("svod.xlsx", _summary_file(OTHER_ROWS))}, follow_redirects=True)
+    # Свод Яворского по ошибке загружен в кабинет Яворской — предупреждение.
+    assert "уже лежит свод юрлица" in response.text
+    response = client.post("/finance/statements/upload", data={"account_id": str(his.id)},
+                           files={"file": ("svod.xlsx", _summary_file(OTHER_ROWS))}, follow_redirects=True)
+    assert "юрлицо: ИП Яворский" in response.text and "уже лежит" not in response.text
+    page = client.get(f"/finance/statements?account={his.id}").text
+    assert "848966494" in page and "848253942" not in page and OTHER in page
+    page = client.get("/finance/statements").text
+    assert "848966494" in page and "848253942" in page and "своды нескольких кабинетов" in page
+    page = client.get(f"/finance/statements?account={statements.NO_ACCOUNT}").text
+    assert "848253942" not in page and "У этого кабинета свода нет" in page
+    assert client.get("/finance/statements?account=999").status_code == 200   # чужой id — как «все»
 
 
 def test_check_button_on_accounts_page(client, db, monkeypatch):

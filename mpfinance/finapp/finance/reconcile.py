@@ -121,6 +121,13 @@ def order_check(db: Session, report: SalesReport) -> OrderCheck:
         else:
             check.without_order_id += 1
     check.report_orders = len(by_order)
+    if goods and not by_order:
+        # Без номеров заказов, по которым принимает Sync Admin, сравнивать не по
+        # чему, а «принятые заказы, которых нет в отчётах» назвали бы ВСЕ заказы
+        # периода — при том что они в этом отчёте есть, только под другими номерами.
+        shown = "номера заказов для покупателя" if any(line.srid for line in goods) else "номеров заказов нет"
+        return OrderCheck(False, f"В отчёте {shown}, а Sync Admin хранит заказы по внутренним "
+                                 f"номерам площадки — сверить по заказам нельзя.")
 
     # Границы периода — МЕСТНЫЕ сутки (отчёт площадки по московским датам), а
     # sync_admin хранит момент приёма в UTC.

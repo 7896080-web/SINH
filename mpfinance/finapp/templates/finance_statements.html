@@ -30,6 +30,16 @@
     </form>
 </div>
 
+{% if not account and entities|length > 1 %}
+<div class="card">
+    <p class="help-text" style="margin:0;">
+        В списке своды нескольких кабинетов:
+        {% for name, entity in entities %}<b>{{ name }}</b> ({{ entity }}){% if not loop.last %}, {% endif %}{% endfor %}.
+        Итоги ниже складывают их вместе — для сверки выберите кабинет.
+    </p>
+</div>
+{% endif %}
+
 {% if total_rows %}
 <div class="kpi-row">
     <div class="kpi"><div class="kpi__label">Отчётов в своде</div><div class="kpi__value">{{ total_rows }}</div></div>
@@ -51,6 +61,14 @@
 
 <form method="get" action="/finance/statements" class="filters">
     <div class="field">
+        <label>Кабинет WB</label>
+        <select name="account">
+            <option value="">все</option>
+            {% for a in wb_accounts %}<option value="{{ a.id }}" {% if account == a.id|string %}selected{% endif %}>{{ a.name }}</option>{% endfor %}
+            <option value="{{ no_account }}" {% if account == no_account %}selected{% endif %}>кабинет не указан</option>
+        </select>
+    </div>
+    <div class="field">
         <label>Показать</label>
         <select name="status">{% for key, label in statuses.items() %}<option value="{{ key }}" {% if status == key %}selected{% endif %}>{{ label }}</option>{% endfor %}</select>
     </div>
@@ -69,7 +87,7 @@
         <tbody>
         {% for r in rows %}{% set s = r.statement %}
         <tr>
-            <td class="mono">{{ s.report_number }}<div class="help-text">{{ 'API' if s.source == 'api' else 'файл' }}{% if s.account %} · {{ s.account.name }}{% endif %}</div></td>
+            <td class="mono">{{ s.report_number }}<div class="help-text">{{ 'API' if s.source == 'api' else 'файл' }} · {{ s.account.name if s.account else 'кабинет не указан' }}</div>{% if s.legal_entity %}<div class="help-text">{{ s.legal_entity }}</div>{% endif %}</td>
             <td class="mono">{{ s.period_from.strftime('%d.%m.%Y') }} — {{ s.period_to.strftime('%d.%m.%Y') }}</td>
             <td>{{ s.report_kind or '—' }}</td>
             <td class="num">{{ money(s.total_kop) }}</td>
@@ -88,7 +106,36 @@
     </table>
     </div>
     {% else %}
-    <div class="empty-state">{% if total_rows %}Под фильтр ничего не попало.{% else %}Свода ещё нет — загрузите его файлом или запустите загрузку отчётов WB по API.{% endif %}</div>
+    <div class="empty-state">{% if total_rows %}Под фильтр ничего не попало.{% elif account and any_summary %}У этого кабинета свода нет{% if year %} за {{ year }} год{% endif %} — загрузите его файлом, выбрав кабинет в форме выше, или загрузите отчёты кабинета по API.{% else %}Свода ещё нет — загрузите его файлом или запустите загрузку отчётов WB по API.{% endif %}</div>
     {% endif %}
 </div>
+
+{% if extra %}
+<div class="card" style="padding:0;" id="not-in-summary">
+    <div style="padding:16px 16px 0;">
+        <h2 style="margin:0;">Загружены, но в своде их нет: {{ extra|length }}</h2>
+        <p class="help-text">
+            Отчёт загружен, а ни в одном своде WB такого номера нет. Обычно это отчёт другого кабинета
+            (другого ИП), чей свод не загружен: загрузите свод того кабинета, выбрав его в форме выше.
+            Либо свод устарел — загрузите свежий.
+        </p>
+    </div>
+    <div class="table-scroll">
+    <table>
+        <thead><tr><th>№ отчёта</th><th>Период</th><th>Кабинет</th><th class="num">Итог строк</th><th class="num">Итого к оплате WB</th></tr></thead>
+        <tbody>
+        {% for rep, lines_total in extra %}
+        <tr>
+            <td class="mono"><a href="/finance/reports/{{ rep.id }}">{{ rep.report_number or '—' }}</a></td>
+            <td class="mono">{{ rep.period_from.strftime('%d.%m.%Y') }} — {{ rep.period_to.strftime('%d.%m.%Y') }}</td>
+            <td>{{ rep.account.name if rep.account else 'не указан' }}</td>
+            <td class="num">{{ money(lines_total) }}</td>
+            <td class="num">{{ money(rep.declared_payout_kop) if rep.declared_payout_kop is not none else '—' }}</td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    </div>
+</div>
+{% endif %}
 {% endblock %}
