@@ -44,7 +44,8 @@ READS_PRICES = {"wb", "ozon", "lamoda", "kit"}
 
 # Какие ключи у кабинета: (имя поля, подпись).
 CREDENTIAL_FIELDS = {
-    "wb": [("token", "Токен (категории «Контент» и «Цены и скидки»)")],
+    "wb": [("token", "Токен (категории «Контент» и «Цены и скидки»; для сбора данных — ещё «Статистика», "
+                     "«Аналитика», «Финансы»)")],
     "ozon": [("client_id", "Client-Id"), ("api_key", "Api-Key")],
     "kit": [("token", "Токен")],
     "lamoda": [("client_id", "Client ID"), ("client_secret", "Client Secret"),
@@ -128,6 +129,14 @@ WB_PAGE = 100            # по спеке WB у cursor.limit maximum: 100
 WB_MAX_PAGES = 2000
 WB_PRICE_PAGE = 1000      # limit у /api/v2/list/goods/filter — до 1000
 WB_PRICE_MAX_PAGES = 500
+# Сбор данных (`wb_data.py`) — по официальной спеке dev.wildberries.ru/api/swagger/yaml/ru/{11-analytics,
+# 12-reports,13-finances}.yaml, скачанной 18.10.2026; вживую НЕ проверялось. Категории токена: «Статистика»
+# (заказы, продажи), «Аналитика» (воронка, остатки), «Финансы» (детализация реализации).
+WB_STATISTICS = "https://statistics-api.wildberries.ru"
+WB_ANALYTICS = "https://seller-analytics-api.wildberries.ru"
+WB_FINANCE = "https://finance-api.wildberries.ru"
+WB_FUNNEL_CHUNK = 1000    # nmIds у sales-funnel/products — до 1000, limit — до 1000
+WB_STOCKS_PAGE = 250000   # limit у stocks-report/wb-warehouses — до 250000
 
 
 def wb_error_detail(e: Exception) -> str:
@@ -174,7 +183,17 @@ class WbClient:
                 problems.append(f"«{what}»: нет связи ({e})")
         if problems:
             return False, "; ".join(problems)
-        return True, "Токен действителен для «Контент» и «Цены и скидки»."
+        # Категории для сбора данных (`wb_data.py`) цены не нужны — их нехватка не делает ключ негодным,
+        # но называется сразу: иначе узнали бы о ней только на странице «Данные WB».
+        lacking = []
+        for host, what in ((WB_STATISTICS, "Статистика"), (WB_ANALYTICS, "Аналитика"), (WB_FINANCE, "Финансы")):
+            try:
+                self.session.get(f"{host}/ping", timeout=15).raise_for_status()
+            except requests.RequestException:
+                lacking.append(f"«{what}»")
+        tail = (" Для сбора данных WB у токена нет категорий: " + ", ".join(lacking) + "." if lacking
+                else " Сбор данных WB: «Статистика», «Аналитика», «Финансы» — есть.")
+        return True, "Токен действителен для «Контент» и «Цены и скидки»." + tail
 
     def get_catalog(self) -> list[CatalogRow]:
         result, cursor, prev = [], {"limit": WB_PAGE}, None
@@ -258,6 +277,54 @@ class WbClient:
             "data": {"promotionID": int(promo_id), "uploadNow": bool(upload_now),
                      "nomenclatures": [int(n) for n in nm_ids]}})
         return (data or {}).get("data") or {}
+
+    # --- сбор данных (`wb_data.py`) -----------------------------------------------------------------
+
+    def _data(self, method: str, url: str, params=None, body=None):
+        """Один запрос сбора данных — БЕЗ повторов внутри: лимиты у этих методов — запрос в 20–60 с, и
+        повтор с ожиданием держал бы тяжёлый поток минутами. 429 и любой отказ уходят наверх, следующую
+        попытку назначает сборщик. 204 и пустое тело — None."""
+        r = self.session.request(method, url, params=params, json=body, timeout=180)
+        r.raise_for_status()
+        if r.status_code == 204 or not r.content:
+            return None
+        return r.json()
+
+    def stat_orders(self, date_from: str) -> list[dict]:
+        """Заказы, изменившиеся после `date_from` (`lastChangeDate`, время московское): до ~80 000 строк за
+        ответ, хранятся у WB 90 дней. `GET statistics-api /api/v1/supplier/orders`, лимит — запрос в минуту."""
+        return self._data("GET", f"{WB_STATISTICS}/api/v1/supplier/orders",
+                          params={"dateFrom": date_from, "flag": 0}) or []
+
+    def stat_sales(self, date_from: str) -> list[dict]:
+        """Продажи (`saleID` S…) и возвраты (R…) — как `stat_orders`."""
+        return self._data("GET", f"{WB_STATISTICS}/api/v1/supplier/sales",
+                          params={"dateFrom": date_from, "flag": 0}) or []
+
+    def funnel_day(self, day, nm_ids: list[int]) -> list[dict]:
+        """Воронка карточек за ОДИН день (переходы, корзины, заказы, выкупы, отмены): `POST seller-analytics-api
+        /api/analytics/v3/sales-funnel/products`, период — до 365 дней назад, до 1000 карточек за запрос, лимит —
+        3 запроса в минуту. Карточки перечисляем сами (из каталога): постраничная выдача по `offset` при
+        равных значениях сортировки могла бы терять строки на стыке страниц."""
+        d = day.isoformat()
+        data = self._data("POST", f"{WB_ANALYTICS}/api/analytics/v3/sales-funnel/products", body={
+            "selectedPeriod": {"start": d, "end": d}, "nmIds": [int(n) for n in nm_ids],
+            "skipDeletedNm": False, "limit": len(nm_ids), "offset": 0})
+        return ((data or {}).get("data") or {}).get("products") or []
+
+    def stocks_wb(self, offset: int = 0) -> list[dict]:
+        """Остатки на складах WB сейчас — строка на размер и склад: `POST seller-analytics-api
+        /api/analytics/v1/stocks-report/wb-warehouses`, лимит — 3 запроса в минуту."""
+        data = self._data("POST", f"{WB_ANALYTICS}/api/analytics/v1/stocks-report/wb-warehouses",
+                          body={"limit": WB_STOCKS_PAGE, "offset": int(offset)})
+        return ((data or {}).get("data") or {}).get("items") or []
+
+    def finance_detailed(self, date_from: str, date_to: str, rrd_id: int, limit: int, fields: list[str]):
+        """Детализация к еженедельным отчётам реализации: `POST finance-api /api/finance/v1/sales-reports/detailed`
+        (данные с 29.01.2024, лимит — запрос в минуту). Части — по `rrdId` последней строки, конец — 204 (None)."""
+        return self._data("POST", f"{WB_FINANCE}/api/finance/v1/sales-reports/detailed", body={
+            "dateFrom": date_from, "dateTo": date_to, "limit": int(limit), "rrdId": int(rrd_id),
+            "period": "weekly", "fields": list(fields)})
 
     def price_key(self, item) -> str:
         """Чем адресуется цена строки каталога: у WB — nmID (цена на карточку)."""

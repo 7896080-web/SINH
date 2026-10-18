@@ -337,8 +337,8 @@ def heavy_cached(db: Session) -> tuple[list[Item] | None, str, bool]:
 JOB_NAMES = {"onec_exchange": "обмен с 1С", "price_dispatch": "отправка цен", "rate": "курс ЦБ",
              "daily_refresh": "суточное обновление (каталоги, цены, диапазоны)", "backup": "копия базы",
              "attention": "счётчики «Внимания»", "wb_promo": "календарь акций WB",
-             "wb_promo_leave": "выход из акций по сроку",
-             "wb_poll": "опрос WB"}
+             "wb_promo_leave": "выход из акций по сроку и эталон после конца акции",
+             "wb_poll": "опрос WB", "wb_data": "сбор данных WB (заказы, воронка, остатки, детализация)"}
 
 
 def _health(db: Session, a: Attention) -> None:
@@ -355,7 +355,8 @@ def _health(db: Session, a: Attention) -> None:
         if name in stale:
             continue
         a.add("bad" if is_error else "warn",
-              f"«{JOB_NAMES.get(name, name)}»: {'ошибка' if is_error else 'оговорка'} — {text}", "/diagnostics")
+              f"«{JOB_NAMES.get(name, name)}»: {'ошибка' if is_error else 'оговорка'} — {text}",
+              "/wb-data" if name == "wb_data" else "/diagnostics")
     bad = db.query(OnecTask).filter(OnecTask.status.in_((OnecTaskStatus.failed.value,
                                                          OnecTaskStatus.timeout.value)),
                                     OnecTask.created_at > now_utc() - timedelta(days=2)).count()

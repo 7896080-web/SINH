@@ -29,7 +29,8 @@ GROUP = "group"
 VIEWS = {GROUP: "Общие артикулы и категории с артикулами", wd.CATEGORY: "Только категории",
          wd.ARTICLE: "Только артикулы"}
 FILTER_KEYS = ("acc", "promo", "by", "q", "cat", "flt")
-HISTORY = ("wb_promo_threshold", "wb_promo_threshold_back", "wb_promo_add", "wb_promo_leave_set", "wb_promo_leave")
+HISTORY = ("wb_promo_threshold", "wb_promo_threshold_back", "wb_promo_add", "wb_promo_leave_set", "wb_promo_leave",
+           "wb_promo_end")
 
 
 def _params(src) -> dict:
@@ -138,6 +139,7 @@ def page(request: Request, db: Session = Depends(get_db), user: User = Depends(g
                   fetched=fetched, beat=db.get(WorkerHeartbeat, "wb_promo"),
                   pending=settings.get(db, settings.WB_PROMO_REFRESH_NOW) == "1",
                   history=history, export_qs=qs, current_url="/wb-promo" + (f"?{qs}" if qs else ""),
+                  ended=wp.ended_summary(db, acc), keep_days=wp.KEEP_ENDED_DAYS,
                   saved_filters=saved_filters(db, "/wb-promo"), statuses=wp.STATUS_LABELS,
                   n_cards=len([pc for pc in pcards if pc.card is not None]))
 

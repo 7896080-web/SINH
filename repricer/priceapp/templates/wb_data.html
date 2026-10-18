@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block title %}Данные WB{% endblock %}
+{% block content %}
+<style>
+.wd-table td, .wd-table th { vertical-align: top; }
+.wd-table td.num { white-space: nowrap; }
+.wd-table .sub { font-size: 12px; color: var(--muted, #667); }
+</style>
+<h1>Данные WB</h1>
+<p class="muted">Программа копит у себя то, по чему потом считается, окупилась ли акция и какая скидка выгодна: заказы со
+скидкой WB и ценой для покупателя, продажи и возвраты, воронку по дням (переходы, корзины, заказы, выкупы), остатки на складах
+WB, детализацию реализации (фактические комиссия, логистика, эквайринг, снижение комиссии в акции) и цены карточек по дням.
+У WB эти данные живут недолго — воронка по дням в API за неделю, заказы 90 дней, остатки только «сейчас», истории цен нет
+вовсе, — поэтому сбор идёт сам, фоном, с первого дня. Ничего на WB не меняет: только читает. Храним {{ keep_days }} дней.</p>
+<p class="muted">Токену кабинета нужны категории <b>«Статистика»</b> (заказы, продажи), <b>«Аналитика»</b> (воронка, остатки) и
+<b>«Финансы»</b> (детализация) — вдобавок к «Контенту» и «Ценам и скидкам». Токен с нужными категориями создаётся в личном кабинете
+WB, в разделе доступа к API; затем его вставляют на странице <a href="/api-keys">«API-ключи»</a> вместо прежнего (кнопка «Проверить»
+там же назовёт, каких категорий не хватает). После смены ключа сбор пробует снова сам.</p>
+
+<div class="card">
+  Сбор: {% if beat %}последний проход <b>{{ beat.last_run_at|local('%d.%m %H:%M:%S') }}</b>{% if not beat.last_success %} — <span class="bad">ошибка: {{ beat.last_error }}</span>{% elif beat.last_error %} — <span class="warn">{{ beat.last_error }}</span>{% else %} — <span class="ok">без отказов</span>{% endif %}{% else %}<span class="muted">ещё не запускался (стартует через минуту после запуска программы)</span>{% endif %}.
+  <form method="post" action="/wb-data/retry" style="display:inline;margin-left:8px"><button class="secondary" title="Снять паузу после отказа, например сразу после того, как токену добавили категорию">Повторить сейчас</button></form>
+</div>
+
+{% for r in rows %}
+<div class="card">
+<h2 style="margin-top:0">{{ r.account.name }}</h2>
+<div class="scroll"><table class="wd-table">
+<tr><th>Что</th><th>Категория токена</th><th class="num">Собрано</th><th>За дни</th><th>Последний раз</th><th>Состояние</th></tr>
+{% for s in r.sets %}
+<tr>
+  <td><b>{{ s.label }}</b>
+    {% if s.dataset == 'orders' %}<div class="sub">каждые 30 минут; при первом запуске — 89 дней назад</div>
+    {% elif s.dataset == 'sales' %}<div class="sub">каждые 30 минут; выкупы (S…) и возвраты (R…)</div>
+    {% elif s.dataset == 'funnel' %}<div class="sub">вчера — каждый день; свежие дни перечитываются ~35 суток; назад — до года</div>
+    {% elif s.dataset == 'stocks' %}<div class="sub">снимок раз в сутки, по размерам</div>
+    {% elif s.dataset == 'finance' %}<div class="sub">раз в сутки; при первом запуске — 120 дней назад</div>
+    {% else %}<div class="sub">снимок раз в сутки из загруженных текущих цен, без запросов к WB</div>{% endif %}</td>
+  <td>{{ s.category or '—' }}</td>
+  <td class="num">{{ s.rows }} строк{% if s.days is defined %}<div class="sub">дней: {{ s.days }}{% if s.target_days %} из {{ funnel_days }}{% endif %}</div>{% endif %}</td>
+  <td style="white-space:nowrap">{% if s.first %}{{ s.first|ru }} — {{ s.last|ru }}{% else %}<span class="muted">пока нет</span>{% endif %}</td>
+  <td style="white-space:nowrap">{{ s.done_at|local if s.done_at else '—' }}</td>
+  <td>{% if s.error %}<span class="{{ 'warn' if 'лимит запросов' in s.error else 'bad' }}">{{ s.error }}</span>{% elif s.done_at %}<span class="ok">идёт</span>{% else %}<span class="muted">ждёт очереди</span>{% endif %}
+    {% if s.next_at %}<div class="sub">следующая попытка {{ s.next_at|local }}</div>{% endif %}</td>
+</tr>
+{% endfor %}
+</table></div>
+</div>
+{% else %}
+<div class="card muted">Нет активных кабинетов WB с ключом — добавьте их на странице <a href="/api-keys">«API-ключи»</a>.</div>
+{% endfor %}
+{% endblock %}

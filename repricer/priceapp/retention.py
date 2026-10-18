@@ -40,4 +40,19 @@ def prune(db: Session) -> dict:
                      PriceChange.status.in_((PriceChangeStatus.sent.value, PriceChangeStatus.rejected.value)),
                      PriceChange.created_at < now - timedelta(days=CHANGES_DAYS))
     audit = _purge(db, AuditLog, AuditLog.at < now - timedelta(days=AUDIT_DAYS))
-    return {"price_changes": changes, "audit": audit}
+    return {"price_changes": changes, "audit": audit, "wb_data": prune_wb_data(db)}
+
+
+def prune_wb_data(db: Session) -> int:
+    """Собранные данные WB (`wb_data.py`) — `wb_data.KEEP_DAYS`, по их календарному дню: для оценки акций нужен
+    год с запасом на сравнение «год к году». Отметки собранных дней — заодно: дальше окна воронки они не нужны."""
+    from priceapp import wb_data
+    from priceapp.models import WbDataState, WbFinanceRow, WbFunnelDay, WbOrder, WbPriceDay, WbSale, WbStockDay
+    today = wb_data.msk_date(now_utc())
+    edge = today - timedelta(days=wb_data.KEEP_DAYS)
+    n = 0
+    for model in (WbOrder, WbSale, WbFunnelDay, WbStockDay, WbPriceDay, WbFinanceRow):
+        n += _purge(db, model, model.day < edge)
+    old_key = (today - timedelta(days=wb_data.FUNNEL_BACK_DAYS + 30)).isoformat()
+    n += _purge(db, WbDataState, WbDataState.key != "", WbDataState.key < old_key)
+    return n

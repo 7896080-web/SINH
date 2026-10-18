@@ -497,6 +497,10 @@ class WbPromotionItem(Base):
     leave_at = Column(DateTime, nullable=True)
     leave_by = Column(String(64), nullable=False, default="")
     left_at = Column(DateTime, nullable=True)
+    # Акция закончилась — карточке вернули эталон (`wb_promo.end_due`; WB сам цену после акции не
+    # возвращает). `end_done_at` — когда обработали, `end_note` — чем кончилось.
+    end_done_at = Column(DateTime, nullable=True)
+    end_note = Column(String(200), nullable=False, default="")
 
 
 class ReferenceDiscount(Base):
@@ -532,3 +536,179 @@ class CardEcon(Base):
     how = Column(String(200), nullable=False, default="")
     updated_at = Column(DateTime, nullable=False, default=now_utc, onupdate=now_utc)
 
+
+
+# --- Данные WB для оценки цен и акций (`wb_data.py`) ----------------------------------------------
+# У WB они живут недолго (воронка по дням — неделю, заказы — 90 дней), поэтому копим у себя с первого
+# дня. Время — UTC, `day` — московский календарный день (так WB считает сутки в отчётах).
+
+class WbDataState(Base):
+    """Где остановился сбор набора данных кабинета: `dataset` — orders / sales / funnel / stocks / finance /
+    prices, `key` — день (для воронки, остатков, цен) или пусто. `cursor` — продолжение (у заказов —
+    `lastChangeDate`, у воронки — номер пачки карточек), `done_at` — последний завершённый проход,
+    `next_at` — не раньше этого времени следующий, `error` — последний отказ (пусто — всё в порядке)."""
+    __tablename__ = "wb_data_state"
+    __table_args__ = (UniqueConstraint("account_id", "dataset", "key", name="uq_wb_data_state"),)
+    id = Column(Integer, primary_key=True)
+    account_id = Column(Integer, ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False)
+    dataset = Column(String(16), nullable=False)
+    key = Column(String(16), nullable=False, default="")
+    cursor = Column(Text, nullable=False, default="")
+    done_at = Column(DateTime, nullable=True)
+    next_at = Column(DateTime, nullable=True)
+    rows = Column(Integer, nullable=False, default=0)
+    error = Column(Text, nullable=False, default="")
+    updated_at = Column(DateTime, nullable=False, default=now_utc)
+
+
+class WbOrder(Base):
+    """Заказ WB (одна единица товара) — `statistics-api /supplier/orders`. Единственное место, где у каждого
+    заказа есть скидка WB (`spp`) и цена для покупателя (`finished_price`); метод WB объявил к отключению."""
+    __tablename__ = "wb_orders"
+    __table_args__ = (UniqueConstraint("account_id", "srid", name="uq_wb_order"),)
+    id = Column(Integer, primary_key=True)
+    account_id = Column(Integer, ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False)
+    srid = Column(String(100), nullable=False)
+    day = Column(Date, nullable=False, index=True)
+    ordered_at = Column(DateTime, nullable=True)
+    changed_at = Column(DateTime, nullable=True)
+    nm_id = Column(String(32), nullable=False, default="", index=True)
+    barcode = Column(String(64), nullable=False, default="")
+    article = Column(String(200), nullable=False, default="")
+    size = Column(String(64), nullable=False, default="")
+    total_price = Column(Numeric(12, 2), nullable=True)          # цена до скидки продавца
+    discount_pct = Column(Integer, nullable=True)                # скидка продавца
+    spp = Column(Numeric(6, 2), nullable=True)                   # скидка WB
+    price_with_disc = Column(Numeric(12, 2), nullable=True)      # со скидкой продавца
+    finished_price = Column(Numeric(12, 2), nullable=True)       # для покупателя (без Кошелька)
+    is_cancel = Column(Boolean, nullable=False, default=False)
+    cancel_at = Column(DateTime, nullable=True)
+    warehouse = Column(String(100), nullable=False, default="")
+    region = Column(String(200), nullable=False, default="")
+    fetched_at = Column(DateTime, nullable=False, default=now_utc)
+
+
+class WbSale(Base):
+    """Продажа (`sale_id` S…) или возврат (R…) — `statistics-api /supplier/sales`. `for_pay` — к перечислению."""
+    __tablename__ = "wb_sales"
+    __table_args__ = (UniqueConstraint("account_id", "sale_id", name="uq_wb_sale"),)
+    id = Column(Integer, primary_key=True)
+    account_id = Column(Integer, ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False)
+    sale_id = Column(String(64), nullable=False)
+    srid = Column(String(100), nullable=False, default="")
+    day = Column(Date, nullable=False, index=True)
+    sold_at = Column(DateTime, nullable=True)
+    changed_at = Column(DateTime, nullable=True)
+    nm_id = Column(String(32), nullable=False, default="", index=True)
+    barcode = Column(String(64), nullable=False, default="")
+    article = Column(String(200), nullable=False, default="")
+    size = Column(String(64), nullable=False, default="")
+    total_price = Column(Numeric(12, 2), nullable=True)
+    discount_pct = Column(Integer, nullable=True)
+    spp = Column(Numeric(6, 2), nullable=True)
+    price_with_disc = Column(Numeric(12, 2), nullable=True)
+    finished_price = Column(Numeric(12, 2), nullable=True)
+    for_pay = Column(Numeric(12, 2), nullable=True)
+    fetched_at = Column(DateTime, nullable=False, default=now_utc)
+
+
+class WbFunnelDay(Base):
+    """Воронка карточки (nmID) за день — `sales-funnel/products`. Строки только с движением: нет строки за
+    собранный день — значит, по карточке ничего не было (собран ли день — `WbDataState`). Выкупы, отмены и
+    возвраты WB относит к дню ЗАКАЗА и дописывает неделями — поэтому дни перечитываются ~35 суток."""
+    __tablename__ = "wb_funnel_days"
+    __table_args__ = (UniqueConstraint("account_id", "day", "nm_id", name="uq_wb_funnel_day"),)
+    id = Column(Integer, primary_key=True)
+    account_id = Column(Integer, ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False)
+    day = Column(Date, nullable=False, index=True)
+    nm_id = Column(String(32), nullable=False, index=True)
+    open_count = Column(Integer, nullable=False, default=0)
+    cart_count = Column(Integer, nullable=False, default=0)
+    order_count = Column(Integer, nullable=False, default=0)
+    order_sum = Column(Integer, nullable=False, default=0)
+    buyout_count = Column(Integer, nullable=False, default=0)
+    buyout_sum = Column(Integer, nullable=False, default=0)
+    cancel_count = Column(Integer, nullable=False, default=0)
+    cancel_sum = Column(Integer, nullable=False, default=0)
+    avg_price = Column(Integer, nullable=True)
+    wishlist = Column(Integer, nullable=False, default=0)
+    fetched_at = Column(DateTime, nullable=False, default=now_utc)
+
+
+class WbStockDay(Base):
+    """Остаток размера (nmID + chrtID) на складах WB — снимок раз в сутки (`stocks-report/wb-warehouses`)."""
+    __tablename__ = "wb_stock_days"
+    __table_args__ = (UniqueConstraint("account_id", "day", "nm_id", "chrt_id", name="uq_wb_stock_day"),)
+    id = Column(Integer, primary_key=True)
+    account_id = Column(Integer, ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False)
+    day = Column(Date, nullable=False, index=True)
+    nm_id = Column(String(32), nullable=False, index=True)
+    chrt_id = Column(String(32), nullable=False, default="")
+    quantity = Column(Integer, nullable=False, default=0)
+    to_client = Column(Integer, nullable=False, default=0)
+    from_client = Column(Integer, nullable=False, default=0)
+    fetched_at = Column(DateTime, nullable=False, default=now_utc)
+
+
+class WbPriceDay(Base):
+    """Цена карточки на WB за день — снимок текущих цен кабинета (без запросов к WB: из `platform_items`). Истории
+    цен API WB не отдаёт, а без неё не с чем сравнить продажи до и после акции."""
+    __tablename__ = "wb_price_days"
+    __table_args__ = (UniqueConstraint("account_id", "day", "nm_id", name="uq_wb_price_day"),)
+    id = Column(Integer, primary_key=True)
+    account_id = Column(Integer, ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False)
+    day = Column(Date, nullable=False, index=True)
+    nm_id = Column(String(32), nullable=False, index=True)
+    price = Column(Integer, nullable=True)            # до скидки продавца
+    sale_price = Column(Integer, nullable=True)       # со скидкой продавца
+    fetched_at = Column(DateTime, nullable=False, default=now_utc)
+
+
+class WbFinanceRow(Base):
+    """Строка детализации к отчёту реализации (`finance-api sales-reports/detailed`): продажа, возврат, логистика,
+    хранение, штраф. Отсюда фактические комиссия, эквайринг, логистика и снижение комиссии в акции (`kgvp_v2`).
+    `oper` — «обоснование для оплаты» (sellerOperName)."""
+    __tablename__ = "wb_finance_rows"
+    __table_args__ = (UniqueConstraint("account_id", "rrd_id", name="uq_wb_finance_row"),)
+    id = Column(Integer, primary_key=True)
+    account_id = Column(Integer, ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False)
+    rrd_id = Column(String(32), nullable=False)
+    report_id = Column(String(32), nullable=False, default="")
+    period_from = Column(Date, nullable=True)
+    period_to = Column(Date, nullable=True)
+    day = Column(Date, nullable=True, index=True)          # дата операции (rrDate)
+    nm_id = Column(String(32), nullable=False, default="", index=True)
+    barcode = Column(String(64), nullable=False, default="")
+    article = Column(String(200), nullable=False, default="")
+    size = Column(String(64), nullable=False, default="")
+    doc_type = Column(String(64), nullable=False, default="")
+    oper = Column(String(100), nullable=False, default="")
+    srid = Column(String(100), nullable=False, default="")
+    ordered_at = Column(DateTime, nullable=True)
+    sold_at = Column(DateTime, nullable=True)
+    quantity = Column(Integer, nullable=True)
+    retail_price = Column(Numeric(12, 2), nullable=True)
+    retail_amount = Column(Numeric(12, 2), nullable=True)
+    retail_price_with_disc = Column(Numeric(12, 2), nullable=True)
+    sale_pct = Column(Integer, nullable=True)
+    commission_pct = Column(Numeric(8, 4), nullable=True)
+    kvw_base = Column(Numeric(8, 4), nullable=True)
+    kvw = Column(Numeric(8, 4), nullable=True)
+    kgvp_v2 = Column(Numeric(8, 4), nullable=True)         # снижение кВВ из-за акции, %
+    spp = Column(Numeric(6, 2), nullable=True)
+    for_pay = Column(Numeric(12, 2), nullable=True)
+    sales_commission = Column(Numeric(12, 2), nullable=True)
+    acquiring_fee = Column(Numeric(12, 2), nullable=True)
+    acquiring_pct = Column(Numeric(8, 4), nullable=True)
+    delivery_count = Column(Integer, nullable=True)
+    return_count = Column(Integer, nullable=True)
+    logistics = Column(Numeric(12, 2), nullable=True)      # deliveryService
+    penalty = Column(Numeric(12, 2), nullable=True)
+    additional_payment = Column(Numeric(12, 2), nullable=True)
+    storage = Column(Numeric(12, 2), nullable=True)
+    deduction = Column(Numeric(12, 2), nullable=True)
+    acceptance = Column(Numeric(12, 2), nullable=True)
+    rebill_logistics = Column(Numeric(12, 2), nullable=True)
+    seller_promo_id = Column(String(32), nullable=False, default="")
+    seller_promo_discount = Column(Numeric(8, 4), nullable=True)
+    fetched_at = Column(DateTime, nullable=False, default=now_utc)

@@ -26,6 +26,12 @@ API не отдаёт — только число исключённых до с
 «Участвовать до» (`set_leave`, решение владельца 17.10) — срок участия карточки, раньше конца
 акции. По его истечении (`leave_due`, фоном раз в 5 минут) программа ставит ПОЛНЫЙ эталон: цена
 поднимается, и карточка выходит из акции. Порог «для акции» этой акции кончается в тот же срок.
+
+Конец акции (`end_due`, решение владельца 18.10, тот же проход раз в 5 минут) — карточкам, которые в
+ней стояли, возвращается эталон: WB сам прежнюю цену не возвращает, а «уложившуюся в порог» карточку
+правило возврата не трогает, и она так и стояла бы по акционной цене. Карточку, записанную ещё в одну
+незакончившуюся акцию, не трогаем — эталон ей вернёт конец той акции. Автоакций этот шаг не видит: их
+товаров API не отдаёт.
 """
 from __future__ import annotations
 
@@ -609,9 +615,6 @@ def leave_due(db: Session, client_factory=None, now: datetime | None = None) -> 
     цена поднимается, и карточка выходит из акции. Карточка без эталона поднять нечем — она
     помечается вышедшей с записью в журнал «уберите в кабинете WB», иначе её пытались бы каждые
     5 минут. Не принял WB — повтор при следующем проходе. Коммитит."""
-    from priceapp import accounts, etalon
-    from priceapp.dispatch import _record_sent
-    from priceapp.platforms import WB_PRICES
     now = now or now_utc()
     due = db.query(WbPromotionItem).filter(WbPromotionItem.leave_at.isnot(None), WbPromotionItem.leave_at <= now,
                                            WbPromotionItem.left_at.is_(None)).all()
@@ -635,7 +638,31 @@ def leave_due(db: Session, client_factory=None, now: datetime | None = None) -> 
             it.left_at = now                  # уже на эталоне — подниматься некуда
             st["same"] += 1
             continue
-        plan.setdefault(it.account_id, {}).setdefault(c.nm, (c, []))[1].append((it, promo))
+        plan.setdefault(it.account_id, {}).setdefault(c.nm, (c, [], (int(c.ref_list), int(c.ref_disc or 0)), None))[1] \
+            .append((it, promo))
+
+    def done(it):
+        it.left_at = now
+
+    def note(c, promos, pair):
+        return f"выход из акции {promos} по сроку: полный эталон {c.ref_sale} ₽"
+
+    _raise_cards(db, plan, client_factory, st, "wb_promo_leave", note, done,
+                 "срок участия прошёл — поставлен полный эталон, карточки выходят из акций")
+    db.commit()
+    wd.expire_temp(db, now)
+    return st
+
+
+def _raise_cards(db: Session, plan: dict, client_factory, st: dict, source: str, note, done, what: str) -> None:
+    """Поставить на WB пары «цена до скидки, скидка» карточкам `plan` = {кабинет: {nmID: (карточка, [(товар
+    акции, название акции)], (цена, скидка), сдвиг «эталон − N%» после отправки)}}. Принятое — сразу у нас
+    как текущее и как отправленное, строкой журнала цен с источником `source`; `done(товар акции)`
+    помечает обработанное. Не принял WB — пометки нет, повтор при следующем проходе. Коммитит по кабинету.
+    «Уже установлены» (400 already set) — принято: WB держит ровно то, что мы шлём (так же в `push_prices`)."""
+    from priceapp import accounts, etalon
+    from priceapp.dispatch import _record_sent
+    from priceapp.platforms import WB_PRICES, wb_error_detail
     for acc_id, by_nm in plan.items():
         acc = db.get(Account, acc_id)
         try:
@@ -646,35 +673,137 @@ def leave_due(db: Session, client_factory=None, now: datetime | None = None) -> 
         items = list(by_nm.items())
         for start in range(0, len(items), 1000):
             chunk = items[start:start + 1000]
-            body = {"data": [{"nmID": int(nm), "price": int(c.ref_list), "discount": int(c.ref_disc or 0)}
-                             for nm, (c, _) in chunk]}
+            body = {"data": [{"nmID": int(nm), "price": int(pair[0]), "discount": int(pair[1])}
+                             for nm, (c, _, pair, _) in chunk]}
             try:
                 data = client._post(f"{WB_PRICES}/api/v2/upload/task", body)
                 if isinstance(data, dict) and data.get("error"):
                     raise RuntimeError(data.get("errorText") or "WB вернул error=true")
             except Exception as e:
-                st["errors"].append(f"{acc.name}: {e}"[:300])
-                continue
-            for nm, (c, its) in chunk:
-                wd._mark_held(db, acc_id, c.item_ids, None)      # полный эталон — сдвига «эталон − N%» больше нет
+                detail = wb_error_detail(e)
+                if "already set" not in detail.lower():
+                    st["errors"].append(f"{acc.name}: {detail}"[:300])
+                    continue
+            for nm, (c, its, pair, held) in chunk:
+                sale = wd.sale_of(pair[0], pair[1])
+                wd._mark_held(db, acc_id, c.item_ids, held)
                 for i in c.item_ids:
-                    _record_sent(db, i, acc_id, int(c.ref_list))
+                    _record_sent(db, i, acc_id, int(pair[0]))
                 promos = ", ".join(sorted({f"«{p}»" for _, p in its}))
                 etalon.journal_sent(db, acc_id, c.item_ids, c.rows[0].barcode if c.rows else "", c.cur_list,
-                                    int(c.ref_list), "wb_promo_leave",
-                                    f"выход из акции {promos} по сроку: полный эталон {c.ref_sale} ₽", "программа")
+                                    int(pair[0]), source, note(c, promos, pair), "программа")
                 for r in c.rows:
-                    r.current_price, r.current_sale_price = int(c.ref_list), c.ref_sale
+                    r.current_price, r.current_sale_price = int(pair[0]), sale
                 for it, _ in its:
-                    it.left_at = now
+                    done(it)
                 st["raised"] += 1
-            audit.log(db, "программа", "wb_promo_leave", acc.name,
-                      f"срок участия прошёл — поставлен полный эталон, карточки выходят из акций: {len(chunk)} — "
-                      + "; ".join(f"{nm}: -> {c.ref_sale}" for nm, (c, _) in chunk[:20])[:900])
+            audit.log(db, "программа", source, acc.name,
+                      f"{what}: {len(chunk)} — "
+                      + "; ".join(f"{nm}: -> {wd.sale_of(pair[0], pair[1])}" for nm, (c, _, pair, _) in chunk[:20])[:900])
         db.commit()
+
+
+END_SOURCE = "wb_promo_end"
+
+
+def end_due(db: Session, client_factory=None, now: datetime | None = None) -> dict:
+    """Акция закончилась — карточкам, которые в ней стояли, вернуть эталон (решение владельца 18.10).
+
+    WB сам прежнюю цену после акции не возвращает. Карточка, которая «уложилась в порог», в нём же и
+    остаётся, и правило возврата (`reference.run`) её не трогает: без этого шага она так и стояла бы по
+    акционной цене. Берём карточки обычных акций, у которых WB показывал участие или мы сами их туда
+    отправили; вышедшие по сроку уже на эталоне. Цель — эталон с учётом «эталон − N%» (`held_pct`):
+    сдвиг — решение человека с «Порога скидки WB», и конец акции его не отменяет. Поднимаем, только если
+    цена со скидкой сейчас НИЖЕ цели.
+
+    Карточку, которая записана ещё в одну незакончившуюся акцию (идёт или впереди), не трогаем: подъём
+    цены выкинул бы её оттуда. Эталон ей вернёт конец ТОЙ акции. У автоакций список товаров API не
+    отдаёт — их этот шаг не видит. Каждая карточка акции обрабатывается один раз (`end_done_at`), итог —
+    в `end_note`. Не принял WB — повтор при следующем проходе. Коммитит."""
+    now = now or now_utc()
+    rows = (db.query(WbPromotionItem, WbPromotion)
+            .join(WbPromotion, (WbPromotion.account_id == WbPromotionItem.account_id)
+                  & (WbPromotion.promo_id == WbPromotionItem.promo_id))
+            .filter(WbPromotion.end_at.isnot(None), WbPromotion.end_at <= now,
+                    WbPromotionItem.end_done_at.is_(None), WbPromotionItem.left_at.is_(None))
+            .all())
+    rows = [(it, p) for it, p in rows if it.in_action or it.added_at is not None]
+    st = {"due": len(rows), "raised": 0, "same": 0, "busy": 0, "errors": []}
+    if not rows:
+        return st
+    from priceapp.templating import local
+    busy = {}
+    for it, p in (db.query(WbPromotionItem, WbPromotion)
+                  .join(WbPromotion, (WbPromotion.account_id == WbPromotionItem.account_id)
+                        & (WbPromotion.promo_id == WbPromotionItem.promo_id))
+                  .filter((WbPromotion.end_at.is_(None)) | (WbPromotion.end_at > now),
+                          WbPromotionItem.left_at.is_(None))):
+        if it.in_action or it.added_at is not None:
+            busy.setdefault((it.account_id, it.nm_id), p)
+    cards = {(c.account.id, c.nm): c for c in wd.cards(db)}
+    plan: dict[int, dict[str, tuple]] = {}
+    for it, p in rows:
+        other = busy.get((it.account_id, it.nm_id))
+        if other is not None:
+            it.end_done_at = now
+            it.end_note = (f"ещё в акции «{other.name}»"
+                           + (f" до {local(other.end_at, '%d.%m %H:%M')}" if other.end_at else "")
+                           + " — эталон вернёт её конец")[:200]
+            st["busy"] += 1
+            continue
+        c = cards.get((it.account_id, it.nm_id))
+        if c is None or not c.ref_list:
+            it.end_done_at, it.end_note = now, "эталона нет — вернуть нечего"
+            audit.log(db, "программа", END_SOURCE, str(it.account_id),
+                      f"акция «{p.name}» закончилась, карточка {it.nm_id}: эталона нет — цену после акции "
+                      "проверьте в кабинете WB")
+            st["errors"].append(f"{it.nm_id}: нет эталона")
+            continue
+        disc = int(c.ref_disc or 0)
+        price = wd.held_list(int(c.ref_list), c.held)
+        target = wd.sale_of(price, disc)
+        if c.cur_sale is not None and c.cur_sale >= target:
+            it.end_done_at, it.end_note = now, "цена уже не ниже эталона"
+            st["same"] += 1
+            continue
+        plan.setdefault(it.account_id, {}).setdefault(c.nm, (c, [], (price, disc), c.held))[1].append((it, p.name))
+
+    def done(it):
+        it.end_done_at, it.end_note = now, "эталон возвращён"
+
+    def note(c, promos, pair):
+        what = (f"эталон − {wd.fmt(c.held)}%" if c.held else "полный эталон")
+        return f"акция {promos} закончилась: {what} {wd.sale_of(pair[0], pair[1])} ₽"
+
+    _raise_cards(db, plan, client_factory, st, END_SOURCE, note, done,
+                 "акция закончилась — карточкам возвращён эталон")
     db.commit()
-    wd.expire_temp(db, now)
     return st
+
+
+def ended_summary(db: Session, account_id: int = 0, now: datetime | None = None) -> list[dict]:
+    """Закончившиеся акции (их хранят `KEEP_ENDED_DAYS`) и что было с их карточками после конца — для
+    страницы: без этого возврат эталона виден только в журнале цен."""
+    now = now or now_utc()
+    q = db.query(WbPromotion).filter(WbPromotion.end_at.isnot(None), WbPromotion.end_at <= now,
+                                     WbPromotion.type == REGULAR)
+    if account_id:
+        q = q.filter(WbPromotion.account_id == account_id)
+    names = {a.id: a.name for a in db.query(Account)}
+    out = []
+    for p in q.order_by(WbPromotion.end_at.desc()):
+        its = [i for i in db.query(WbPromotionItem).filter(WbPromotionItem.account_id == p.account_id,
+                                                          WbPromotionItem.promo_id == p.promo_id)
+               if i.in_action or i.added_at is not None or i.left_at is not None]
+        if not its:
+            continue
+        notes: dict[str, int] = {}
+        for i in its:
+            key = ("вышли по сроку" if i.left_at is not None else i.end_note or "ждёт возврата эталона")
+            notes[key] = notes.get(key, 0) + 1
+        out.append({"promo": p, "account": names.get(p.account_id, ""), "cards": len(its),
+                    "notes": sorted(notes.items(), key=lambda kv: -kv[1])})
+    return out
 
 
 def add(db: Session, pcards: list[PCard], actor: str, client_factory=None, leave_at=None) -> dict:

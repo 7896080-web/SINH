@@ -24,6 +24,8 @@ EXPECTED = {
     "wb_promo": (2 * 3 * 3600 + 1800, False),   # календарь акций WB: раз в 3 часа
     # Выход из акций по сроку: раз в 5 минут, но в тяжёлом потоке за суточным обновлением и опросом WB.
     "wb_promo_leave": (2 * 3600, False),
+    # Сбор данных WB: каждые 30 с, но в тяжёлом потоке за суточным обновлением и опросом WB.
+    "wb_data": (2 * 3600, False),
     # Раз в 10 минут, при правках — сразу; но в тяжёлом потоке за суточным обновлением и опросом
     # WB, которые на боевом каталоге идут десятки минут.
     "attention": (2 * 3600, False),
@@ -75,6 +77,7 @@ def failed_or_noted(db: Session) -> list[tuple[str, str, bool]]:
     for row in db.query(WorkerHeartbeat):
         if not row.last_success:
             out.append((row.name, row.last_error[:200], True))
-        elif row.last_error and row.name in ("daily_refresh", "onec_exchange", "price_dispatch", "backup", "wb_promo", "wb_promo_leave"):
+        elif row.last_error and row.name in ("daily_refresh", "onec_exchange", "price_dispatch", "backup", "wb_promo", "wb_promo_leave",
+                                                    "wb_data"):
             out.append((row.name, row.last_error[:200], False))
     return out

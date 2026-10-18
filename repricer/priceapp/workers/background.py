@@ -15,7 +15,9 @@
   а также сразу, если курс ушёл от курса эталонных цен больше чем на 2% (`reference.py`);
 - копия базы — через 10 минут после запуска, не чаще раза в сутки;
 - календарь акций WB (`wb_promo.py`) — при запуске, раз в 3 часа и по кнопке «Обновить календарь»;
-  выход из акций по сроку участия — раз в 5 минут.
+  выход из акций по сроку участия и возврат эталона после конца акции — раз в 5 минут;
+- сбор данных WB (`wb_data.py`: заказы, воронка, остатки, детализация) — шагом на каждом такте тяжёлого
+  потока, не больше запроса на домен WB по кабинету: свои паузы под лимиты WB он держит сам.
 
 Потоков ДВА. Быстрый — обмен с 1С, курс, отправка, копия: их нельзя задерживать.
 Тяжёлый — суточное обновление (каталоги, цены, диапазоны безопасности) и счётчики
@@ -115,6 +117,8 @@ def _heavy_loop() -> None:
         if now - started >= REFRESH_FIRST_AFTER and (last["leave"] is None or now - last["leave"] >= LEAVE_EVERY):
             _safe(jobs.job_wb_promo_leave)
             last["leave"] = time.monotonic()
+        if now - started >= REFRESH_FIRST_AFTER:
+            _safe(jobs.job_wb_data)
         if last["attention"] is None or now - last["attention"] >= ATTENTION_EVERY or _safe(jobs.attention_dirty):
             _safe(jobs.job_attention)
             last["attention"] = time.monotonic()

@@ -471,3 +471,91 @@ def test_import_threshold_term_and_add_in_one_row(client, db):
     leave = wp.parse_leave(day)
     assert db.query(WbPromotionItem).one().leave_at == leave
     assert db.query(WbDiscountRule).filter_by(key="A1").one().until == leave
+
+
+def _ended(db, pid=1):
+    """Акция `pid` закончилась минуту назад (товары загружены, пока она шла)."""
+    p = db.query(WbPromotion).filter_by(promo_id=pid).one()
+    p.end_at = now_utc() - timedelta(minutes=1)
+    db.commit()
+
+
+def test_promo_end_returns_etalon_to_cards_that_stayed_in_promo(db):
+    """Решение 18.10: WB после акции цену не возвращает, а «уложившуюся в порог» карточку правило возврата
+    не трогает — эталон ей возвращает конец акции. Уже стоящую по эталону и не участвовавшую не трогаем."""
+    a = _setup(db)
+    _setup(db, acc=a, nm="6", art="A2", item="u2", barcode="b2")
+    _setup(db, acc=a, nm="7", art="A3", item="u3", barcode="b3")
+    cal = _Cal([_promo(1, start_in=-timedelta(days=3))],
+               {(1, True): [_item(5, 8, True), _item(6, 8, True)], (1, False): [_item(7, 8)]})
+    _load(db, cal)
+    for bc, sale in (("b1", 1848), ("b2", 2009), ("b3", 1848)):    # 5 — по акционной, 6 — уже эталон, 7 — не в акции
+        db.query(PlatformItem).filter_by(barcode=bc).one().current_sale_price = sale
+    db.commit()
+    assert wp.end_due(db, client_factory=lambda p, c: cal)["due"] == 0      # акция ещё идёт
+    _ended(db)
+    st = wp.end_due(db, client_factory=lambda p, c: cal)
+    assert st["raised"] == 1 and st["same"] == 1
+    assert cal.posts == [{"data": [{"nmID": 5, "price": 2009, "discount": 0}]}]
+    from priceapp.models import PriceChange
+    ch = db.query(PriceChange).filter_by(source="wb_promo_end").one()
+    assert ch.status == "sent" and "закончилась" in ch.note and "полный эталон" in ch.note
+    its = {i.nm_id: i for i in db.query(WbPromotionItem)}
+    assert its["5"].end_note == "эталон возвращён" and its["6"].end_note == "цена уже не ниже эталона"
+    assert its["7"].end_done_at is None
+    assert db.query(PlatformItem).filter_by(barcode="b1").one().current_sale_price == 2009
+    assert wp.end_due(db, client_factory=lambda p, c: cal)["due"] == 0      # второй раз не шлём
+    assert db.query(AuditLog).filter_by(action="wb_promo_end").count() == 1
+
+
+def test_promo_end_waits_for_other_promo_and_keeps_minus_n(db):
+    """Карточку, записанную ещё в идущую акцию, конец первой не трогает: подъём выкинул бы её оттуда.
+    «Эталон − N%» (решение человека с «Порога скидки WB») конец акции не отменяет."""
+    from priceapp.models import ReferencePrice
+    a = _setup(db)
+    _setup(db, acc=a, nm="6", art="A2", item="u2", barcode="b2")
+    cal = _Cal([_promo(1, start_in=-timedelta(days=3)), _promo(2, start_in=-timedelta(days=1), name="Вторая")],
+               {(1, True): [_item(5, 20, True), _item(6, 20, True)], (2, True): [_item(5, 20, True)]})
+    _load(db, cal)
+    for bc in ("b1", "b2"):
+        db.query(PlatformItem).filter_by(barcode=bc).one().current_sale_price = 1607
+    db.query(ReferencePrice).filter_by(item_id="u2").one().held_pct = Decimal(15)
+    db.commit()
+    _ended(db, 1)
+    st = wp.end_due(db, client_factory=lambda p, c: cal)
+    assert st["busy"] == 1 and st["raised"] == 1
+    assert cal.posts == [{"data": [{"nmID": 6, "price": 1708, "discount": 0}]}]      # 2009 − 15%
+    first = {i.nm_id: i for i in db.query(WbPromotionItem).filter_by(promo_id=1)}
+    assert "ещё в акции «Вторая»" in first["5"].end_note
+    assert db.query(ReferencePrice).filter_by(item_id="u2").one().held_pct == Decimal(15)
+    from priceapp.models import PriceChange
+    assert "эталон − 15%" in db.query(PriceChange).filter_by(source="wb_promo_end").one().note
+    _ended(db, 2)                                                    # кончилась и вторая — теперь эталон
+    st = wp.end_due(db, client_factory=lambda p, c: cal)
+    assert st["raised"] == 1 and cal.posts[-1] == {"data": [{"nmID": 5, "price": 2009, "discount": 0}]}
+
+
+def test_promo_end_retries_when_wb_refuses_and_page_shows_result(client, db):
+    _setup(db)
+    _load(db, _Cal([_promo(1, start_in=-timedelta(days=3))], {(1, True): [_item(5, 8, True)]}))
+    db.query(PlatformItem).filter_by(barcode="b1").one().current_sale_price = 1848
+    db.commit()
+    _ended(db)
+
+    class Down(_Cal):
+        def _post(self, url, body):
+            raise RuntimeError("WB недоступен")
+    st = wp.end_due(db, client_factory=lambda p, c: Down([]))
+    assert "WB недоступен" in st["errors"][-1]
+    assert db.query(WbPromotionItem).one().end_done_at is None                # повтор в следующий раз
+    html = client.get("/wb-promo").text
+    assert "Закончившиеся акции" in html and "ждёт возврата эталона — 1" in html
+    from priceapp.models import WorkerHeartbeat
+    from priceapp.workers import jobs
+    jobs.job_wb_promo_leave(client_factory=lambda p, c: _Cal([]))
+    hb = db.get(WorkerHeartbeat, "wb_promo_leave")
+    db.refresh(hb)
+    assert hb.last_success
+    db.expire_all()
+    assert db.query(WbPromotionItem).one().end_note == "эталон возвращён"
+    assert "эталон возвращён — 1" in client.get("/wb-promo").text

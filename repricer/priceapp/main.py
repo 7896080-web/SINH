@@ -10,7 +10,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from priceapp.database import Base, SessionLocal, engine
 from priceapp.deps import NotAuthenticated
 from priceapp.routers import (accounts, approval, attention, auth, diagnostics, etalon, health, help, mapping,
-                              prices, progress, rate, sku_prices, wb_discount, wb_promo)
+                              prices, progress, rate, sku_prices, wb_data, wb_discount, wb_promo)
 from priceapp.settings import ensure_defaults
 
 
@@ -85,8 +85,8 @@ def _mark_dirty() -> None:
 app.mount("/static", StaticFiles(directory=str(Path(__file__).resolve().parent / "static")),
           name="static")
 
-for r in (auth, attention, prices, sku_prices, etalon, wb_discount, wb_promo, approval, mapping, rate, accounts,
-          diagnostics, health, help, progress):
+for r in (auth, attention, prices, sku_prices, etalon, wb_discount, wb_promo, wb_data, approval, mapping, rate,
+          accounts, diagnostics, health, help, progress):
     app.include_router(r.router)
 
 

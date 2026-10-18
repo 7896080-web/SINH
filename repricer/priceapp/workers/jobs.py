@@ -340,19 +340,45 @@ def job_wb_promo(client_factory=None) -> None:
 
 
 def job_wb_promo_leave(client_factory=None) -> None:
-    """Срок участия в акции прошёл — полный эталон, карточка выходит из акции (`wb_promo.leave_due`)."""
+    """Срок участия в акции прошёл — полный эталон, карточка выходит из акции (`wb_promo.leave_due`);
+    акция закончилась — карточкам, которые в ней стояли, эталон (`wb_promo.end_due`)."""
     db = SessionLocal()
     try:
         from priceapp import overview, wb_promo
         st = wb_promo.leave_due(db, client_factory)
-        if st["raised"]:
+        try:
+            est = wb_promo.end_due(db, client_factory)
+        except Exception as e:
+            db.rollback()
+            logger.exception("возврат эталона после конца акции упал")
+            est = {"raised": 0, "errors": [f"после конца акции: {type(e).__name__}: {e}"[:300]]}
+        if st["raised"] or est["raised"]:
             overview.mark_dirty(db)
             db.commit()
-        beat(db, "wb_promo_leave", True, "; ".join(st["errors"])[:1000])
+        beat(db, "wb_promo_leave", True, "; ".join(st["errors"] + est["errors"])[:1000])
     except Exception as e:
         db.rollback()
         logger.exception("выход из акций по сроку упал")
         beat(db, "wb_promo_leave", False, f"{type(e).__name__}: {e}")
+    finally:
+        db.close()
+
+
+def job_wb_data(client_factory=None) -> None:
+    """Сбор данных WB (`wb_data.run`): заказы, продажи, воронка по дням, остатки, детализация реализации, цены по
+    дням — шагом, не больше запроса на домен WB по кабинету за проход. Отказы, которые требуют человека (у токена
+    нет категории), — оговоркой в отметке: её показывают «Внимание» и «Данные WB»."""
+    db = SessionLocal()
+    try:
+        from priceapp import wb_data
+        st = wb_data.run(db, client_factory)
+        if st["requests"]:
+            logger.info("данные WB: запросов %s, строк %s", st["requests"], st["rows"])
+        beat(db, "wb_data", True, "; ".join(wb_data.problems(db))[:1000])
+    except Exception as e:
+        db.rollback()
+        logger.exception("сбор данных WB упал")
+        beat(db, "wb_data", False, f"{type(e).__name__}: {e}")
     finally:
         db.close()
 

@@ -232,5 +232,5 @@ def test_retention_drops_only_old_finished_records(db):
     db.add(AuditLog(username="x", action="b", object="", details=""))
     db.commit()
     st = retention.prune(db)
-    assert st == {"price_changes": 2, "audit": 1}
+    assert st == {"price_changes": 2, "audit": 1, "wb_data": 0}
     assert sorted(c.status for c in db.query(PriceChange)) == ["approved", "blocked", "error", "proposed", "sent"]
