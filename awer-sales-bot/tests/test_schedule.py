@@ -58,10 +58,10 @@ def test_schedule_page(env):  # noqa: F811
     web = TestClient(create_app(cfg, db))
     sid = db.seller_id("Продавец04", create=False)
     page = web.get("/schedule/2026-10", auth=AUTH).text
-    assert "График работы 2026-10" in page and "Норма — 18 рабочих дней" in page and f'name="s{sid}_31"' in page
-    r = web.post("/schedule/2026-10", data={f"s{sid}_1": "on", f"s{sid}_2": "on", f"s{sid}_5": "on"}, auth=AUTH)
+    assert "График работы 2026-10" in page and "Норма — 18 рабочих дней" in page and f'name="w{sid}_31_0"' in page and "<h2>МСЛ</h2>" in page
+    r = web.post("/schedule/2026-10", data={f"w{sid}_1_0": "on", f"w{sid}_2_0": "on", f"w{sid}_5_1": "on"}, auth=AUTH)
     assert "График сохранён" in r.text
     assert set(db.schedule_days("2026-10")[sid]) == {1, 2, 5}
-    web.post("/schedule/2026-10", data={f"s{sid}_3": "on"}, auth=AUTH)  # пересохранение заменяет месяц
+    web.post("/schedule/2026-10", data={f"w{sid}_3_0": "on"}, auth=AUTH)  # пересохранение заменяет месяц
     assert set(db.schedule_days("2026-10")[sid]) == {3}
     assert db.planned_shifts(sid, "2026-10") == 1 and db.planned_shifts(sid, "2026-11") is None

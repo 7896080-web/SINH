@@ -77,13 +77,17 @@ def test_crews_and_schedule_pages(env):  # noqa: F811
     assert crews.store_on(db, cfg, sid, today) == "МСЛ"
 
     month = today.strftime("%Y-%m")
-    web.post(f"/schedule/{month}", data={f"s{sid}_1": "МСЛ", f"s{sid}_2": "Город"}, auth=AUTH)
+    gi, mi = cfg.stores.index("Город"), cfg.stores.index("МСЛ")
+    # 1-го — в МСЛ, 2-го — галочки в обоих магазинах: берётся магазин его смены
+    web.post(f"/schedule/{month}", data={f"w{sid}_1_{mi}": "on", f"w{sid}_2_{gi}": "on", f"w{sid}_2_{mi}": "on"},
+             auth=AUTH)
     saved = db.schedule_days(month)[sid]
     d1, d2 = today.replace(day=1), today.replace(day=2)
     assert saved[1] == (None if crews.default_store(db, cfg, sid, d1) == "МСЛ" else "МСЛ")  # магазин смены не храним
-    assert saved[2] == (None if crews.default_store(db, cfg, sid, d2) == "Город" else "Город")
+    assert saved[2] is None  # в обоих магазинах сразу нельзя — остаётся магазин его смены
     sched = web.get(f"/schedule/{month}", auth=AUTH).text
-    assert "Смена Эли · сильный" in sched and "Город</b>: продавцов" in sched
+    assert "<h2>Город</h2>" in sched and "<h2>МСЛ</h2>" in sched and "Смена Эли" in sched
+    assert "Продавец04 <span class=note>С1 · сильный</span>" in sched
 
 
 def test_owner_warned_about_staffing(env):  # noqa: F811
