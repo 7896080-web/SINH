@@ -41,7 +41,7 @@ def test_records_and_streak(env, tmp_path):  # noqa: F811
     rows += [(oct_day(12), "Продавец04", 40_000, 4), (oct_day(13), "Продавец04", 45_000, 5),
              (oct_day(14), "Продавец04", 50_000, 6)]
     import_file(write_sales(tmp_path / "s.csv", rows), db, cfg)
-    plan = service.frozen_plan(db, "2026-10", sid)  # 561 764 / 18 → дневная норма ≈ 31 209
+    plan = service.frozen_plan(db, "2026-10", sid)  # 547 706 / 18 → дневная норма ≈ 30 428
     got = {a.kind: a for a in achievements.for_day(db, cfg, sid, oct_day(14), plan)}
     assert "Личный рекорд: 50 000 ₽" in got["record_sales"].text and "45 000 ₽" in got["record_sales"].text
     assert got["record_items"].notable
@@ -383,7 +383,7 @@ def test_max_step_tip_does_not_promise_next_step(env, tmp_path):  # noqa: F811
     cfg, db = env
     service.freeze(db, cfg, "2026-10")
     sid = db.seller_id("Продавец04", create=False)
-    # 10 смен × 80 000 = 800 000 ₽ = 142 % плана 561 764 ₽ — выше 140 %, это максимальная ступень
+    # 10 смен × 80 000 = 800 000 ₽ = 146 % плана 547 706 ₽ — выше 140 %, это максимальная ступень
     import_file(write_sales(tmp_path / "s.csv", [(oct_day(i), "Продавец04", 80_000, 8) for i in range(1, 11)]), db, cfg)
     text = daily(db, cfg, sid, oct_day(10))
     assert "Максимальная ступень достигнута" in text and "следующая ступень уже близко" not in text

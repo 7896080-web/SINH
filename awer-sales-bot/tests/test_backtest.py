@@ -28,7 +28,7 @@ def test_october_plan_matches_reference_and_uses_only_past(env):  # noqa: F811
     assert r.store.plan == pytest.approx(before.store.plan)  # продажи октября не меняют план октября
     assert r.source == "1С" and r.coverage == pytest.approx(17 / 31)
     x = next(x for x in r.rows if x.name == "Продавец04")
-    assert x.plan == pytest.approx(561_764, abs=1) and x.method == "personal"
+    assert x.plan == pytest.approx(547_706, abs=1) and x.method == "personal"
     assert x.days == 17 and x.fte == pytest.approx(17 / cfg.norm_shifts)
     assert x.performance == pytest.approx((x.sales / x.fte) / x.plan)
     assert x.plan_worked == pytest.approx(x.plan * x.fte)

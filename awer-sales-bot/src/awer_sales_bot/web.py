@@ -27,7 +27,7 @@ from .planning import backtest, service
 from .planning.engine import METHOD_NAMES, month_add, rate_for, threshold_amounts
 
 def _how_note(method: str) -> str:
-    """Пометка у имени в «Личных планах»: план не по последним 3 месяцам."""
+    """Пометка у имени в «Личных планах»: «после перерыва» или «новичок»."""
     return f' <span class=note>{METHOD_NAMES[method]}</span>' if method in ("returning", "newcomer") else ""
 
 
@@ -135,7 +135,7 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
              f'<tr><td>План новичка (средний рядовой прошлого года × коэффициент)</td><td class=n>{_rub(sp.newcomer_plan)}</td></tr>',
              '</table>',
              f'<form method=post action="/month/{month}/plans"><h2>Личные планы (на полный месяц)</h2><table>',
-             '<tr><th>Продавец</th><th>Роль</th><th>Уровень 3 мес.</th><th>План расчёт</th><th>План вручную</th>'
+             '<tr><th>Продавец</th><th>Роль</th><th>Обычный месяц (доля за год)</th><th>План расчёт</th><th>План вручную</th>'
              f'<th>План итог</th><th>+{p.step:.0%} → ставка</th><th>Факт с 1-го</th><th>Выполн. (за рабочий день)</th><th>Ставка сейчас</th></tr>']
         for r in mp.rows:
             st = service.status(db, cfg, r.seller_id, today) if today.strftime("%Y-%m") == month else None

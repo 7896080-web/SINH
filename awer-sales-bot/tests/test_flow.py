@@ -80,7 +80,7 @@ def test_flow(env, tmp_path):
     cfg, db = env
     mp = service.freeze(db, cfg, "2026-10")
     plan04 = next(r for r in mp.rows if r.name == "Продавец04").plan_final
-    assert plan04 == pytest.approx(561_764, abs=1)
+    assert plan04 == pytest.approx(547_706, abs=1)
 
     days = [date(2026, 10, 1) + timedelta(days=i) for i in range(17)]
     lines_f, docs_f = make_export(cfg.onec.inbox, days, ["Продавец04", "Админ2"])

@@ -38,12 +38,15 @@ def test_store_plan_october(hist):
     assert sp.newcomer_plan == pytest.approx(449_146.09, abs=1)
 
 
+# личный план = доля в магазине за 12 мес. × план магазина (решение владельца 19.10.2026; до этого — уровень за 3 мес.:
+# Эльвина 1 107 673, Юлия 941 654, Продавец04 561 764, Добряк 706 013, Продавец17 663 213); сверено пересчётом
+# прямо по ведомостям, без кода бота
 @pytest.mark.parametrize("seller,expected", [
-    ("Админ2", 1_107_673),  # Эльвина
-    ("Админ1", 941_654),  # Юлия
-    ("Продавец04", 561_764),
-    ("Продавец08", 706_013),
-    ("Продавец17", 663_213),
+    ("Админ2", 1_205_174),  # Эльвина
+    ("Админ1", 916_125),  # Юлия
+    ("Продавец04", 547_706),
+    ("Продавец08", 612_393),  # Добряк: 5 мес. за год — «после перерыва»
+    ("Продавец17", 659_531),
 ])
 def test_personal_plans_october(hist, seller, expected):
     assert seller_plan(hist, "2026-10", seller).plan_full == pytest.approx(expected, abs=1)
@@ -57,16 +60,16 @@ def test_newcomer_plan(hist):
 
 def test_backtest_august_admin(hist):
     plan = seller_plan(hist, "2026-08", "Админ2").plan_full
-    assert plan == pytest.approx(960_791, abs=1)
+    assert plan == pytest.approx(996_528, abs=1)
     x = hist.get("2026-08", "Админ2")
     r = evaluate(x.sales, x.fte, plan, "admin")
-    assert r.performance == pytest.approx(1.37, abs=0.01)
+    assert r.performance == pytest.approx(1.324, abs=0.001)
     assert r.rate == 53_000  # 25 000 + 3 шага, + 13 000 доплата
 
 
 def test_backtest_september_no_bonus(hist):
     plan = seller_plan(hist, "2026-09", "Админ2").plan_full
-    assert plan == pytest.approx(1_275_323, abs=1)
+    assert plan == pytest.approx(1_403_717, abs=1)
     x = hist.get("2026-09", "Админ2")
     r = evaluate(x.sales, x.fte, plan, "admin")
     assert r.steps == 0 and r.rate == 38_000
@@ -113,13 +116,13 @@ def _store_with(seller_months: dict[str, tuple[float, float]]) -> History:
 
 
 def test_returning_after_break_uses_own_months_within_year():
-    # март–июнь работала, июль–август перерыв, сентябрь — полмесяца: за 3 мес < 1 полного месяца
+    # март и июнь работала, июль–август перерыв, сентябрь — полмесяца: за 3 мес < 1 полного месяца
     h = _store_with({"2026-03": (300_000, 1.0), "2026-06": (240_000, 1.0), "2026-09": (100_000, 0.5)})
     sp = store_plan(h, "2026-10")
     x = seller_plan(h, "2026-10", "Вернулась", sp)
     assert x.method == "returning"
-    # от сентября назад до 1 полного месяца: сентябрь (0,5) + июнь (1,0); март уже не нужен
-    share = (100_000 + 240_000) / (0.5 * 1_100_000 + 1.0 * 1_240_000)
+    # доля за 12 мес., как у всех: каждый её месяц — к выторгу магазина в этом месяце
+    share = (300_000 + 240_000 + 100_000) / (1.0 * 1_300_000 + 1.0 * 1_240_000 + 0.5 * 1_100_000)
     assert x.plan_full == pytest.approx(share * sp.plan)
     assert x.level * sp.coef == pytest.approx(x.plan_full)
     assert x.plan_full != pytest.approx(sp.newcomer_plan)
@@ -136,4 +139,4 @@ def test_returning_season_correction_and_year_limit():
     h2 = _store_with({"2025-01": (400_000, 1.0)})
     assert seller_plan(h2, "2026-02", "Вернулась").method == "newcomer"
     assert seller_plan(h2, "2026-01", "Вернулась").method == "returning"  # ровно 12 мес. назад — ещё считается
-    assert seller_plan(h2, "2026-02", "Вернулась", p=Params(lookback=13)).method == "returning"
+    assert seller_plan(h2, "2026-02", "Вернулась", p=Params(personal_window=13)).method == "returning"

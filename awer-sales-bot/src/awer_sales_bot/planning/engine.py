@@ -1,17 +1,17 @@
 """Расчёт планов и ставок — чистые функции без БД.
 
-Логика 1-в-1 повторяет согласованную Excel-модель «План_и_ставка_продавцов.xlsx»:
+Магазинная часть 1-в-1 повторяет согласованную Excel-модель «План_и_ставка_продавцов.xlsx»; личный план —
+доля в магазине за 12 мес. (решение владельца 19.10.2026, docs/SPEC.md п. 6):
 
 1. Тренд магазина = Σ общего выторга за 3 месяца перед расчётным
    / Σ за те же месяцы прошлого года (только пары месяцев, где есть оба значения).
 2. План магазина = выторг расчётного месяца прошлого года × тренд.
 3. Коэффициент месяца = план магазина / средний месяц магазина за 3 последних.
-4. Личный план (на полный отработанный месяц) =
-   Σ личных продаж за 3 мес / Σ отработанного за 3 мес × коэффициент месяца.
-5. Вернулся после перерыва (за 3 мес < min_fte, но раньше, до lookback мес. назад, работал) =
-   Σ личных продаж / Σ (отработанное × выторг магазина) по своим последним месяцам, пока отработанное не наберёт
-   min_fte, × план магазина (решение владельца 19.10.2026, сверх Excel-модели).
-5а. Новичок (за lookback мес. < min_fte) =
+4. Личный план (на полный отработанный месяц) = доля × план магазина, где
+   доля = Σ личных продаж за personal_window мес. / Σ (отработанное в месяце × выторг магазина за месяц).
+   Нужно отработанного за это время не меньше min_fte. Если за 3 мес. меньше min_fte, а за год набралось —
+   «после перерыва»: расчёт тот же, отличается только пометка.
+5. Новичок (за personal_window мес. < min_fte) =
    средний рядовой продавец (без админов) в этом месяце прошлого года × тренд.
 6. Выполнение = (продажи за месяц / отработано) / личный план.
    Ставка = база + надбавка × полные шаги перевыполнения (шаг 10 %), не выше максимума;
@@ -96,9 +96,9 @@ class Params:
     step: float = 0.10  # шаг перевыполнения
     step_bonus: float = 5_000  # надбавка за шаг, ₽
     max_rate: float = 45_000  # максимальная ставка без доплаты админа
-    min_fte: float = 1.0  # минимум отработанного за 3 мес. для личного плана
-    window: int = 3  # окно тренда и личного уровня, мес.
-    lookback: int = 12  # вернувшийся после перерыва: своя история не дальше стольких месяцев назад
+    min_fte: float = 1.0  # минимум отработанного (в полных месяцах) для личного плана
+    window: int = 3  # окно тренда и среднего месяца магазина, мес.
+    personal_window: int = 12  # окно доли продавца в магазине, мес.
     sales_percent: float = 0.04  # процент от продаж (для ведомости)
     stabilizer: Literal["none", "one_step"] = "none"  # см. docs/SPEC.md
 
@@ -156,7 +156,7 @@ class SellerPlan:
     seller: str
     plan_full: float | None  # личный план на полный месяц, ₽
     method: Literal["personal", "returning", "newcomer", "manual", "none"]
-    level: float | None  # личный средний уровень за окно (на полный месяц)
+    level: float | None  # его обычный месяц: доля за год × средний месяц магазина за 3 мес. (× коэф. = план)
 
 
 def seller_plan(h: History, month: str, seller: str, sp: StorePlan | None = None, p: Params = Params(),
@@ -165,37 +165,27 @@ def seller_plan(h: History, month: str, seller: str, sp: StorePlan | None = None
     sp = sp or store_plan(h, month, p)
     if manual is not None:
         return SellerPlan(month, seller, manual, "manual", None)
-    if sp.coef is None:
+    if sp.plan is None:
         return SellerPlan(month, seller, None, "none", None)
-    s = f = 0.0
-    for k in range(1, p.window + 1):
-        x = h.get(month_add(month, -k), seller)
-        if x:
-            s += x.sales
-            f += x.fte
-    if f >= p.min_fte and f > 0:
-        level = s / f
-        return SellerPlan(month, seller, level * sp.coef, "personal", level)
-    share = returning_share(h, month, seller, p)
-    if share is not None:
-        plan = share * sp.plan
-        return SellerPlan(month, seller, plan, "returning", plan / sp.coef if sp.coef else None)  # уровень × коэф. = план
-    return SellerPlan(month, seller, sp.newcomer_plan, "newcomer", None)
+    share, worked = personal_share(h, month, seller, p.personal_window)
+    if share is None or worked < p.min_fte:
+        return SellerPlan(month, seller, sp.newcomer_plan, "newcomer", None)
+    recent = sum(x.fte for k in range(1, p.window + 1) if (x := h.get(month_add(month, -k), seller)))
+    plan = share * sp.plan
+    return SellerPlan(month, seller, plan, "personal" if recent >= p.min_fte else "returning",
+                      plan / sp.coef if sp.coef else None)  # уровень: его обычный месяц; × коэф. месяца = план
 
 
-def returning_share(h: History, month: str, seller: str, p: Params = Params()) -> float | None:
-    """Доля продавца в выторге магазина по его последним месяцам (от прошлого назад, пока отработанное не наберёт
-    min_fte, не дальше lookback): Σ продаж / Σ (отработанное × выторг магазина на полный месяц). None — не набралось."""
+def personal_share(h: History, month: str, seller: str, months: int = 12) -> tuple[float | None, float]:
+    """(доля продавца в выторге магазина, отработано) за `months` месяцев перед `month`:
+    Σ продаж / Σ (отработанное × выторг магазина на полный месяц) — с поправкой на сезон каждого месяца."""
     s = f = base = 0.0
-    for k in range(1, p.lookback + 1):
+    for k in range(1, months + 1):
         m = month_add(month, -k)
         x, store = h.get(m, seller), h.store_full(m)
-        if not x or store <= 0:
-            continue
-        s, f, base = s + x.sales, f + x.fte, base + x.fte * store
-        if f >= p.min_fte and base > 0:
-            return s / base
-    return None
+        if x and store > 0:
+            s, f, base = s + x.sales, f + x.fte, base + x.fte * store
+    return (s / base if base > 0 else None), f
 
 
 # ----------------------------------------------------------------------------- evaluation
