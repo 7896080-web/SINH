@@ -20,23 +20,27 @@ FIX = Path(__file__).parent / "fixtures" / "history_anon.json"
 CATS = [("Джинсы", 5600), ("Рубашка Д/р", 3600), ("Ремень", 1900), ("Футболка-O", 2100), ("Куртка демисезон", 9500)]
 
 
-def make_export(path: Path, days: list[date], sellers: list[str]) -> None:
+def make_export(folder: Path, days: list[date], sellers: list[str]) -> tuple[Path, Path]:
+    """Две выгрузки как из обработки 1С: строки ОРП и шапки ОРП."""
     rnd = random.Random(1)
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.append(["Продажи по чекам"])
-    ws.append(["Дата", "Магазин", "Продавец", "Чек", "Номенклатура", "Номенклатурная группа", "Количество", "Сумма"])
-    n = 0
+    lines = ["Дата;Склад;Документ;Продавец;Номенклатура;Номенклатурная группа;Количество;Сумма;Скидка"]
+    docs = ["Дата;Магазин;Касса;Документ;Чеков;Чеков возврата;Выручка"]
     for d in days:
-        for s in sellers:
-            for _ in range(rnd.randint(4, 8)):
-                n += 1
-                store = rnd.choice(["Город", "МСЛ"])
-                for _ in range(rnd.randint(1, 3)):
+        for store, sklad in (("ГОРОД", "ГОРОД_склад"), ("МСЛ", "МСЛ_склад")):
+            rev, items, doc = 0.0, 0, f"КР{d:%m%d}{store[:1]}"
+            for s in sellers:
+                for _ in range(rnd.randint(2, 6)):
                     cat, price = rnd.choice(CATS)
-                    ws.append([d.strftime("%d.%m.%Y 12:00:00"), store, s, f"Ч-{n}", f"Арт {cat}", cat, 1, price])
-        ws.append([d.strftime("%d.%m.%Y"), "Город", "Wildberries", "WB", "x", "x", 1, 9999])  # исключается
-    wb.save(path)
+                    disc = price * 0.1 if rnd.random() < 0.2 else 0
+                    lines.append(f"{d:%d.%m.%Y};{sklad};{doc};{s};Арт {cat};{cat};1;{price - disc:.2f};{disc:.2f}")
+                    rev += price - disc
+                    items += 1
+            lines.append(f"{d:%d.%m.%Y};{sklad};{doc};Wildberries;x;x;1;9999;0")  # исключается
+            docs.append(f"{d:%d.%m.%Y};{store};P1 {store}_Касса_Основная;{doc};{max(1, items // 2)};0;{rev:.2f}")
+    a, b = folder / "orp_lines_test.csv", folder / "orp_docs_test.csv"
+    a.write_text("\n".join(lines), encoding="utf-8")
+    b.write_text("\n".join(docs), encoding="utf-8")
+    return a, b
 
 
 @pytest.fixture()
@@ -68,10 +72,12 @@ def test_flow(env, tmp_path):
     assert plan04 == pytest.approx(561_764, abs=1)
 
     days = [date(2026, 10, 1) + timedelta(days=i) for i in range(17)]
-    f = cfg.onec.inbox / "sales.xlsx"
-    make_export(f, days, ["Продавец04", "Админ2"])
-    rep = import_file(f, db, cfg)
-    assert rep.skipped == 17 and len(rep.days) == 34
+    lines_f, docs_f = make_export(cfg.onec.inbox, days, ["Продавец04", "Админ2"])
+    rep = import_file(docs_f, db, cfg)
+    assert rep.kind == "docs" and len(rep.days) == 34
+    rep = import_file(lines_f, db, cfg)
+    assert rep.kind == "lines" and rep.skipped == 34 and len(rep.days) == 34
+    assert {d[1] for d in rep.days} == {"Город", "МСЛ"}
     assert db.day_closed(date(2026, 10, 17), cfg.stores) == []
 
     sid = db.seller_id("Продавец04", create=False)
@@ -79,7 +85,7 @@ def test_flow(env, tmp_path):
     assert st.worked == 17 and st.planned_shifts == 15
     assert st.plan_month == pytest.approx(plan04, abs=1)
     text = daily(db, cfg, sid, date(2026, 10, 17))
-    assert "Базовый план" in text and "Средний чек" in text and "Вещей в чеке" in text
+    assert "Базовый план" in text and "средний чек" in text and "Вещей за смену" in text
 
     # ручные правки меняют план
     service.save_month_settings(db, "2026-11", trend_manual=1.0, step=0.05, step_bonus=3000)
@@ -106,10 +112,10 @@ def test_flow(env, tmp_path):
 def test_upload_csv(env, monkeypatch):
     cfg, db = env
     monkeypatch.setenv("UPLOAD_TOKEN", "tok")
-    csv_text = ("Дата;Магазин;Продавец;Чек;Номенклатура;Номенклатурная группа;Количество;Сумма\n"
-                "17.10.2026;Город;Продавец04;101;Джинсы X;Джинсы;1;5600\n"
-                "17.10.2026;Город;Продавец04;101;Ремень Y;Ремень;1;1900\n"
-                "17.10.2026;МСЛ;Админ2;В-7;Рубашка;Рубашка Д/р;-1;-3600\n")
+    csv_text = ("Дата;Склад;Документ;Продавец;Номенклатура;Номенклатурная группа;Количество;Сумма;Скидка\n"
+                "17.10.2026;ГОРОД_склад;КР1;Продавец04;Джинсы X;Джинсы;1;5600;400\n"
+                "17.10.2026;ГОРОД_склад;КР1;Продавец04;Ремень Y;Ремень;1;1900;0\n"
+                "17.10.2026;МСЛ_склад;КР2;Админ2;Рубашка;Рубашка Д/р;-1;-3600;0\n")
     client = TestClient(create_app(cfg, db))
     assert client.post("/api/upload", content=csv_text.encode(), headers={"X-Token": "bad"}).status_code == 401
     r = client.post("/api/upload", content=csv_text.encode("utf-8"), headers={"X-Token": "tok", "X-Filename": "s.csv"})

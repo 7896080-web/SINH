@@ -25,17 +25,29 @@ CREATE TABLE IF NOT EXISTS seller_aliases (     -- другие написани
     alias TEXT PRIMARY KEY,
     seller_id INTEGER NOT NULL REFERENCES sellers(id)
 );
-CREATE TABLE IF NOT EXISTS sales_lines (        -- строки чеков из 1С
+CREATE TABLE IF NOT EXISTS sales_lines (        -- строки «Отчета о розничных продажах» (ТЧ Товары / Возвращенные)
     id INTEGER PRIMARY KEY,
     day TEXT NOT NULL,                    -- YYYY-MM-DD
     store TEXT NOT NULL,
     seller_id INTEGER NOT NULL REFERENCES sellers(id),
-    receipt TEXT NOT NULL,
+    doc TEXT,                             -- номер ОРП
     item TEXT,
     category TEXT,
     qty REAL NOT NULL,
     amount REAL NOT NULL,                 -- со скидкой; возврат — отрицательный
+    discount REAL NOT NULL DEFAULT 0,     -- сумма скидки по строке
     source TEXT
+);
+CREATE TABLE IF NOT EXISTS store_days (         -- шапка ОРП: чеков и выручка по кассе за день
+    day TEXT NOT NULL,
+    store TEXT NOT NULL,
+    kassa TEXT NOT NULL,
+    doc TEXT,
+    checks INTEGER NOT NULL DEFAULT 0,
+    return_checks INTEGER NOT NULL DEFAULT 0,
+    revenue REAL NOT NULL DEFAULT 0,
+    source TEXT,
+    PRIMARY KEY (day, store, kassa)
 );
 CREATE INDEX IF NOT EXISTS ix_sales_day ON sales_lines(day);
 CREATE INDEX IF NOT EXISTS ix_sales_seller_day ON sales_lines(seller_id, day);

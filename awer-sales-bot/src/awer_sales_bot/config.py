@@ -11,22 +11,38 @@ from .planning.engine import Params
 
 
 class Columns(BaseModel):
-    """Названия колонок в выгрузке 1С (Excel/CSV). Сравнение без учёта регистра."""
+    """Строки ОРП (ТЧ «Товары» и «Возвращенные товары»). Сравнение без учёта регистра."""
 
     date: str = "Дата"
-    store: str = "Магазин"
+    store: str = "Склад"  # склад строки («ГОРОД_склад») → магазин через onec.store_map
     seller: str = "Продавец"
-    receipt: str = "Чек"
+    doc: str = "Документ"
     item: str = "Номенклатура"
     category: str = "Номенклатурная группа"
     qty: str = "Количество"
-    amount: str = "Сумма"
+    amount: str = "Сумма"  # со скидкой
+    discount: str = "Скидка"
+
+
+class DocColumns(BaseModel):
+    """Шапки ОРП: чеков и выручка по кассе за день (средний чек и вещей в чеке — по магазину)."""
+
+    date: str = "Дата"
+    store: str = "Магазин"
+    kassa: str = "Касса"
+    doc: str = "Документ"
+    checks: str = "Чеков"
+    return_checks: str = "Чеков возврата"
+    revenue: str = "Выручка"
 
 
 class OneC(BaseModel):
     inbox: Path = Path("data/inbox")
     archive: Path = Path("data/archive")
     columns: Columns = Columns()
+    doc_columns: DocColumns = DocColumns()
+    # склад / магазин / касса из 1С → короткое имя магазина (без учёта регистра; частичное совпадение)
+    store_map: dict[str, str] = {"ГОРОД": "Город", "МСЛ": "МСЛ"}
     exclude_sellers: list[str] = ["", "Wildberries", "Ozon", "Lamoda"]
     # «Букалова Юлия МСЛ» -> продавец «Букалова Юлия», магазин «МСЛ» (как в ведомостях ЗП)
     seller_store_suffixes: dict[str, str] = {" МСЛ": "МСЛ"}

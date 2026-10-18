@@ -34,11 +34,13 @@ def daily(db: DB, cfg: Settings, sid: int, day: date) -> str:
     st = status(db, cfg, sid, day)
     y = M.seller(db, sid, day, day)
     mtd = M.seller(db, sid, day.replace(day=1), day)
-    tm = M.team(db, day.replace(day=1), day, exclude_admins=True)
+    tm = M.team(db, day.replace(day=1), day)
+    shop = M.store(db, day, day)
     L = [f"Доброе утро, {s['first_name'] or s['name']}! Итоги {day.day} {MONTHS_GEN[day.month]}.", ""]
-    if y.receipts or y.sales:
-        L.append(f"**Вчера:** {rub(y.sales)} · чеков {y.receipts} · средний чек {rub(y.avg_check)} · "
-                 f"вещей в чеке {d1(y.upt)}" if y.upt else f"**Вчера:** {rub(y.sales)}")
+    if y.sales or y.items:
+        L.append(f"**Вчера:** {rub(y.sales)} · вещей {y.items:.0f} · средняя цена вещи {rub(y.avg_price)}")
+        if shop.checks:
+            L.append(f"Магазины вчера: средний чек {rub(shop.avg_check)} · вещей в чеке {d1(shop.upt)}")
     else:
         L.append("**Вчера:** продаж нет (выходной?)")
     L.append("")
@@ -61,8 +63,13 @@ def daily(db: DB, cfg: Settings, sid: int, day: date) -> str:
                      f"ставка по итогам месяца при таком темпе {rub(st.projected_rate)}")
     else:
         L.append("План на месяц ещё не рассчитан — уточните у администратора.")
-    L += ["", f"**Средний чек** за месяц: {rub(mtd.avg_check)} (команда {rub(tm.avg_check)})",
-          f"**Вещей в чеке**: {d1(mtd.upt)} (команда {d1(tm.upt)})"]
+    shop_m = M.store(db, day.replace(day=1), day)
+    L += ["", "**С начала месяца, вы / команда:**",
+          f"Продажи за смену: {rub(mtd.per_shift)} / {rub(tm.per_shift)}",
+          f"Вещей за смену: {d1(mtd.items_per_shift)} / {d1(tm.items_per_shift)}",
+          f"Средняя цена вещи: {rub(mtd.avg_price)} / {rub(tm.avg_price)}"]
+    if shop_m.checks:
+        L.append(f"Магазины: средний чек {rub(shop_m.avg_check)} · вещей в чеке {d1(shop_m.upt)}")
     tips = advise(db, cfg, sid, st, day)
     if tips:
         L += ["", "💡 " + "\n💡 ".join(tips)]
@@ -100,12 +107,13 @@ def owner_summary(db: DB, cfg: Settings, day: date) -> str:
             continue
         m = M.seller(db, s["id"], day.replace(day=1), day)
         rows.append((s["name"], st, m))
-    tot = M.team(db, day.replace(day=1), day)
-    L = [f"**Сводка на {day:%d.%m.%Y}**", f"Магазины с начала месяца: {rub(tot.sales)} · средний чек "
-         f"{rub(tot.avg_check)} · вещей в чеке {d1(tot.upt)}", ""]
+    tot = M.store(db, day.replace(day=1), day)
+    allm = M.team(db, day.replace(day=1), day, exclude_admins=False)
+    L = [f"**Сводка на {day:%d.%m.%Y}**",
+         f"С начала месяца: {rub(allm.sales)} · средний чек {rub(tot.avg_check)} · вещей в чеке {d1(tot.upt)}", ""]
     for name, st, m in sorted(rows, key=lambda x: -(x[1].performance or 0)):
         L.append(f"{name}: {rub(st.sales)} · выполнение {pct(st.performance)} · ставка {rub(st.projected_rate or st.current_rate)}"
-                 f" · чек {rub(m.avg_check)} · {d1(m.upt)} вещ.")
+                 f" · за смену {rub(m.per_shift)} · {d1(m.items_per_shift)} вещ. · цена вещи {rub(m.avg_price)}")
     return "\n".join(x for x in L if x is not None)
 
 

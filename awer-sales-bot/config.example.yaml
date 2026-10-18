@@ -16,17 +16,29 @@ params:                          # значения по умолчанию; п�
   stabilizer: none               # none | one_step (ставка меняется не больше чем на 1 ступень за месяц)
 
 onec:
-  inbox: data/inbox              # сюда внешняя обработка 1С кладёт CSV
+  inbox: data/inbox              # сюда внешняя обработка 1С кладёт orp_lines_*.csv и orp_docs_*.csv
   archive: data/archive
-  columns:                       # заголовки колонок выгрузки
+  columns:                       # строки «Отчета о розничных продажах»
     date: "Дата"
-    store: "Магазин"
+    store: "Склад"
     seller: "Продавец"
-    receipt: "Чек"
+    doc: "Документ"
     item: "Номенклатура"
     category: "Номенклатурная группа"
     qty: "Количество"
     amount: "Сумма"
+    discount: "Скидка"
+  doc_columns:                   # шапки ОРП
+    date: "Дата"
+    store: "Магазин"
+    kassa: "Касса"
+    doc: "Документ"
+    checks: "Чеков"
+    return_checks: "Чеков возврата"
+    revenue: "Выручка"
+  store_map:                     # склад / касса из 1С → магазин (по части названия, без учёта регистра)
+    "ГОРОД": "Город"
+    "МСЛ": "МСЛ"
   exclude_sellers: ["", "Wildberries", "Ozon", "Lamoda"]
   seller_store_suffixes: {" МСЛ": "МСЛ"}
   default_store: "Город"

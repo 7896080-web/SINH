@@ -1,4 +1,4 @@
-"""Рекомендации по увеличению продаж — правила на данных продавца и команды.
+"""Рекомендации по увеличению продаж — правила на данных продавца и команды (без админов).
 
 Каждое правило возвращает (приоритет, текст). В сообщение идут 1–2 самых важных.
 Опционально (recommendations.llm: true) текст переформулирует Claude API — без новых цифр.
@@ -12,57 +12,60 @@ from .config import Settings
 from .db import DB
 from .planning.service import Status
 
-
-def _d1(x: float) -> str:
-    return f"{x:.1f}".replace(".", ",")
+# категории-«дополнения»: их стоит предлагать ко второму товару (поправьте под свой ассортимент)
+ADD_ONS = ("Ремень", "Футболка", "Рубашка", "Носки", "Галстук", "Свитшот", "Джемпер")
 
 
 def _rub(x: float) -> str:
     return f"{x:,.0f}".replace(",", " ") + " ₽"
 
 
+def _d1(x: float) -> str:
+    return f"{x:.1f}".replace(".", ",")
+
+
 def rules(db: DB, cfg: Settings, sid: int, st: Status, day: date) -> list[tuple[int, str]]:
     m_start = day.replace(day=1)
     lb_start = day - timedelta(days=cfg.recommendations.lookback_days)
     me = M.seller(db, sid, m_start, day)
-    tm = M.team(db, m_start, day, exclude_admins=True)
+    tm = M.team(db, m_start, day)
     out: list[tuple[int, str]] = []
 
     # 1. Темп отстаёт от плана
     if st.plan_month and st.pace_per_shift is not None and st.per_shift_needed_base and st.remaining_shifts:
         if st.pace_per_shift < st.per_shift_needed_base:
             out.append((90, f"Чтобы выйти на план, нужно в среднем {_rub(st.per_shift_needed_base)} за смену "
-                            f"(сейчас {_rub(st.pace_per_shift)}). Каждый лишний товар в чеке приближает к цели."))
+                            f"(сейчас {_rub(st.pace_per_shift)})."))
 
-    # 2. Комплектность ниже команды
-    if me.upt and tm.upt and me.upt < tm.upt * 0.9:
-        share = M.single_item_share(db, sid, m_start, day)
-        cat = M.top_single_category(db, sid, lb_start, day)
-        pairs = M.cross_sell(db, lb_start, day).get(cat or "", [])
+    # 2. Мало вещей за смену → дополнительные товары; какую категорию продавец «недопредлагает»
+    if me.items_per_shift and tm.items_per_shift and me.items_per_shift < tm.items_per_shift * 0.9:
+        mine, team_mix = M.category_mix(db, sid, lb_start, day), M.category_mix(db, None, lb_start, day)
+        gaps = sorted(((c, team_mix[c] - mine.get(c, 0.0)) for c in team_mix
+                       if any(c.startswith(a) for a in ADD_ONS)), key=lambda x: -x[1])
         tip = ""
-        if cat and pairs:
-            tip = f" К категории «{cat}» чаще всего докупают: " + ", ".join(f"«{b}»" for b, _ in pairs[:2]) + "."
-        share_txt = f" {share:.0%} ваших чеков — одна вещь." if share else ""
-        out.append((80, f"Вещей в чеке {_d1(me.upt)} против {_d1(tm.upt)} у команды.{share_txt} "
+        if gaps and gaps[0][1] > 0.02:
+            c = gaps[0][0]
+            tip = f" У команды «{c}» — {team_mix[c]:.0%} проданных вещей, у вас {mine.get(c, 0):.0%}: предлагайте к основной покупке."
+        out.append((80, f"Вещей за смену {_d1(me.items_per_shift)} против {_d1(tm.items_per_shift)} у команды. "
                         f"Предлагайте второй товар к образу.{tip}"))
 
-    # 3. Средний чек ниже команды
-    if me.avg_check and tm.avg_check and me.avg_check < tm.avg_check * 0.9:
-        my_p = M.avg_item_price(db, m_start, day, sid)
-        tm_p = M.avg_item_price(db, m_start, day)
-        extra = ""
-        if my_p and tm_p and my_p < tm_p * 0.9:
-            extra = f" Средняя цена вещи у вас {_rub(my_p)}, у команды {_rub(tm_p)} — начинайте показ с моделей подороже."
-        out.append((70, f"Средний чек {_rub(me.avg_check)} против {_rub(tm.avg_check)} у команды.{extra}"))
+    # 3. Дешёвая корзина → начинать показ с моделей подороже
+    if me.avg_price and tm.avg_price and me.avg_price < tm.avg_price * 0.9:
+        out.append((70, f"Средняя цена проданной вещи у вас {_rub(me.avg_price)}, у команды {_rub(tm.avg_price)} — "
+                        "начинайте показ с моделей среднего и верхнего ценового сегмента."))
 
-    # 4. Возвраты
-    if me.sales > 0 and me.returns / (me.sales + me.returns) > 0.08:
-        out.append((50, f"Возвраты {me.returns / (me.sales + me.returns):.0%} от продаж — проверяйте размер "
-                        "и посадку на примерке, это сохранит выручку."))
+    # 4. Скидки выше команды
+    if me.discount_share and tm.discount_share is not None and me.discount_share > max(0.05, tm.discount_share * 1.3):
+        out.append((60, f"Скидки — {me.discount_share:.0%} от суммы продаж (у команды {tm.discount_share:.0%}). "
+                        "Сначала рассказывайте о ценности вещи, скидку — в конце и только когда она решает покупку."))
 
-    # 5. Всё хорошо
+    # 5. Возвраты
+    if me.returns_share and me.returns_share > 0.08:
+        out.append((50, f"Возвраты {me.returns_share:.0%} от продаж — проверяйте размер и посадку на примерке."))
+
+    # 6. Всё хорошо
     if not out and st.performance and st.performance >= 1:
-        out.append((10, "Отличный темп! Держите его — до следующей ступени совсем немного."))
+        out.append((10, "Отличный темп! Держите его — следующая ступень уже близко."))
     return sorted(out, key=lambda x: -x[0])
 
 
