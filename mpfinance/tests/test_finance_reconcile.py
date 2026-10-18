@@ -94,3 +94,14 @@ def test_unmatched_barcodes_are_rolled_up(db):
     assert len(rows) == 1
     assert rows[0]["barcode"] == "999"
     assert (rows[0]["lines"], rows[0]["quantity"], rows[0]["revenue"]) == (3, 1, 100000)
+
+
+def test_sync_admin_database_cannot_be_written(sync_db):
+    """База Sync Admin открывается в mode=ro: запись невозможна на уровне
+    самого соединения, а не по договорённости."""
+    import pytest
+
+    from finapp import syncdb
+    with pytest.raises(syncdb.SyncDbError, match="readonly"):
+        with syncdb._connect() as conn:
+            conn.execute("INSERT INTO platform_accounts (id, platform, name) VALUES (1, 'wb', 'x')")

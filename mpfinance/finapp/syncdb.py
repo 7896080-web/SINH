@@ -76,7 +76,8 @@ def _connect():
         raise SyncDbError("база sync_admin не задана (MPFIN_SYNC_DB в .env)")
     if not p.exists():
         raise SyncDbError(f"нет файла базы sync_admin {p}")
-    uri = "file:" + p.resolve().as_posix() + "?mode=ro"
+    # file:///C:/… — так SQLite понимает и диск Windows, и кириллицу/пробелы в пути.
+    uri = p.resolve().as_uri() + "?mode=ro"
     try:
         conn = sqlite3.connect(uri, uri=True, timeout=10)
     except sqlite3.Error as e:
