@@ -1,0 +1,199 @@
+{% extends "base.html" %}
+{% from "finance_macros.html" import money, platform_badge %}
+{% block title %}Отчёты площадок{% endblock %}
+{% block content %}
+
+<div class="page-header">
+    <div>
+        <h1>Отчёты площадок</h1>
+        <p>Отчёты о продажах WB, Lamoda и Яндекс KIT в единой форме: юнит-экономика, сверка, загрузка продаж в 1С</p>
+    </div>
+    <div class="toolbar">
+        <a class="btn" href="/finance/reports/template">Шаблон единой формы</a>
+    </div>
+</div>
+
+<div class="card" id="api">
+    <h2 style="margin-top:0; font-size:15px;">Официальные отчёты по API</h2>
+    <p class="help-text" style="margin-top:0;">
+        <b>Wildberries</b> — еженедельные отчёты реализации из finance-api (тот же отчёт, что в ЛК
+        «Финансовые отчёты»), вместе с «Итого к оплате» WB для сверки. Нужен токен с категорией
+        «Финансы» (поле на «API-ключах»). WB отдаёт один запрос в минуту, поэтому загрузка за
+        несколько недель идёт десятки минут — в фоне.
+        <b>Яндекс KIT</b> — финансового отчёта у KIT нет; отчёт за период собирается из официальных
+        данных заказов: доставленное за вычетом отказов, стоимость доставки для магазина.
+        <b>Lamoda</b> — финансовых отчётов в API Lamoda нет (только кабинет и ЭДО): официальный отчёт
+        агента загружайте файлом ниже.
+    </p>
+    {% if api_accounts %}
+    <form method="post" action="/finance/fetch" class="filters" style="border:none; padding:0;">
+        <div class="field">
+            <label for="api_account">Кабинет</label>
+            <select id="api_account" name="account_id" onchange="this.form.kind.value = this.selectedOptions[0].dataset.kind">
+                {% for a in api_accounts %}
+                <option value="{{ a.id }}" data-kind="{{ 'wb_api' if a.platform == 'wb' else 'kit_api' }}">{{ platform_labels[a.platform] }} · {{ a.name }}</option>
+                {% endfor %}
+            </select>
+            <input type="hidden" name="kind" value="{{ 'wb_api' if api_accounts[0].platform == 'wb' else 'kit_api' }}">
+        </div>
+        <div class="field">
+            <label for="api_from">Период с</label>
+            <input type="date" id="api_from" name="date_from" value="{{ default_from }}" max="{{ today }}" required>
+        </div>
+        <div class="field">
+            <label for="api_to">по</label>
+            <input type="date" id="api_to" name="date_to" value="{{ today }}" max="{{ today }}" required>
+        </div>
+        <div class="field">
+            <label>&nbsp;</label>
+            <button type="submit" class="btn btn-primary">Загрузить по API</button>
+        </div>
+    </form>
+    {% else %}
+    <p class="muted">Нет кабинетов WB или KIT — заведите их на странице «API-ключи».</p>
+    {% endif %}
+    <p class="help-text">Автозагрузка: {% if auto_fetch %}<span class="badge badge--good">включена</span> — раз в сутки WB за
+        последние 4 недели и KIT за две полные недели (пока отчёт не отправлен в 1С, он обновляется: отказы при получении
+        доезжают позже){% else %}<span class="badge badge--muted">выключена</span> — только по кнопке{% endif %}.
+        Переключается на странице «Себестоимость».</p>
+
+    {% if fetches %}
+    <details class="table-view" {% if fetches and fetches[0].status in ('pending', 'running', 'sent') %}open{% endif %}>
+        <summary>Журнал загрузок</summary>
+        <table>
+            <thead><tr><th>#</th><th>Что</th><th>Кабинет</th><th>Период</th><th>Состояние</th><th class="num">Найдено / загружено</th><th>Подробности</th></tr></thead>
+            <tbody>
+            {% for f in fetches %}
+            <tr>
+                <td class="mono">{{ f.id }}</td>
+                <td>{{ fetch_kinds.get(f.kind, f.kind) }}<div class="help-text">{{ f.requested_by or '' }} · {{ f.created_at|local }}</div></td>
+                <td>{{ f.account.name if f.account else '—' }}</td>
+                <td class="mono">{% if f.date_from %}{{ f.date_from.strftime('%d.%m.%Y') }} — {{ f.date_to.strftime('%d.%m.%Y') }}{% else %}—{% endif %}</td>
+                <td><span class="badge {% if f.status == 'done' %}badge--good{% elif f.status == 'failed' %}badge--bad{% else %}badge--warn{% endif %}">{{ {'pending': 'в очереди', 'running': 'идёт', 'sent': 'ждём 1С', 'done': 'готово', 'failed': 'ошибка'}.get(f.status, f.status) }}</span></td>
+                <td class="num">{{ f.found }} / {{ f.imported }}</td>
+                <td class="help-text" style="max-width:420px;">{{ f.message or '' }}</td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </details>
+    {% endif %}
+</div>
+
+<div class="card">
+    <h2 style="margin-top:0; font-size:15px;">Загрузить отчёт файлом</h2>
+    <form method="post" action="/finance/reports/upload" enctype="multipart/form-data" class="filters" style="border:none; padding:0;">
+        <div class="field">
+            <label for="platform">Площадка</label>
+            <select id="platform" name="platform" required>
+                {% for p in platforms %}<option value="{{ p }}">{{ platform_labels[p] }}</option>{% endfor %}
+            </select>
+        </div>
+        <div class="field">
+            <label for="account_id">Кабинет (для сверки с заказами)</label>
+            <select id="account_id" name="account_id">
+                <option value="">— не указан —</option>
+                {% for a in accounts %}<option value="{{ a.id }}">{{ platform_labels[a.platform] }} · {{ a.name }}</option>{% endfor %}
+            </select>
+        </div>
+        <div class="field">
+            <label for="report_number">Номер отчёта (если есть)</label>
+            <input type="text" id="report_number" name="report_number" placeholder="например 123456789">
+        </div>
+        <div class="field">
+            <label for="period_from">Период с</label>
+            <input type="date" id="period_from" name="period_from">
+        </div>
+        <div class="field">
+            <label for="period_to">по</label>
+            <input type="date" id="period_to" name="period_to">
+        </div>
+        <div class="field">
+            <label for="file">Файл (.xlsx, .csv или .zip)</label>
+            <input type="file" id="file" name="file" accept=".xlsx,.csv,.zip" required>
+        </div>
+        <div class="field">
+            <label>&nbsp;</label>
+            <button type="submit" class="btn btn-primary">Загрузить</button>
+        </div>
+    </form>
+    <p class="help-text">
+        Период можно не указывать — он возьмётся из дат операций в отчёте. Отчёт загружается целиком
+        или не загружается совсем: если хоть одна строка не разобралась, вы увидите её номер.
+        Загрузка в 1С — отдельной кнопкой на странице отчёта, сама по себе ничего в 1С не уходит.
+    </p>
+    <details class="table-view">
+        <summary>Какие отчёты понимает программа</summary>
+        <ul class="check-list" style="margin-top:8px;">
+            {% for f in formats %}
+            <li><b>{{ f.label }}</b> — {{ f.note }}</li>
+            {% endfor %}
+            <li>Ozon и любые другие отчёты — через шаблон единой формы: колонки «Тип операции»
+                ({{ operation_labels.values() | join(', ') }}), «Дата операции», «К перечислению за товар» обязательны.</li>
+        </ul>
+    </details>
+</div>
+
+<div class="filters">
+    <div class="field">
+        <label>Площадка</label>
+        <div class="presets">
+            <a href="/finance/reports" class="{% if not platform %}active{% endif %}">Все</a>
+            {% for p in platforms %}
+            <a href="/finance/reports?platform={{ p }}" class="{% if platform == p %}active{% endif %}">{{ platform_labels[p] }}</a>
+            {% endfor %}
+        </div>
+    </div>
+</div>
+
+<div class="card" style="padding:0;">
+    {% if reports %}
+    <div class="table-scroll">
+    <table>
+        <thead>
+            <tr>
+                <th>Площадка / кабинет</th>
+                <th>Период</th>
+                <th>Номер</th>
+                <th class="num">Строк</th>
+                <th class="num">Выручка</th>
+                <th class="num">К перечислению</th>
+                <th>Сверка</th>
+                <th>1С</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for r in reports %}{% set t = totals.get(r.id, (0, 0)) %}
+        <tr>
+            <td>{{ platform_badge(r.platform, platform_labels, platform_colors) }}
+                <div class="help-text">{{ r.account.name if r.account else 'кабинет не указан' }}</div></td>
+            <td class="mono">{{ r.period_from.strftime('%d.%m.%Y') }} — {{ r.period_to.strftime('%d.%m.%Y') }}</td>
+            <td class="mono">{{ r.report_number or '—' }}
+                <div class="help-text">{{ 'API' if r.source == 'api' else 'файл' }}{% if r.report_kind %} · {{ r.report_kind }}{% endif %}</div></td>
+            <td class="num">{{ r.lines_count }}</td>
+            <td class="num">{{ money(t[0]) }}</td>
+            <td class="num">{{ money(t[1]) }}</td>
+            <td>
+                {% if r.unmatched_lines %}<span class="badge badge--warn">без товара 1С: {{ r.unmatched_lines }}</span>
+                {% elif r.bank_payout_kop is not none and r.bank_payout_kop != (r.declared_payout_kop if r.declared_payout_kop is not none else t[1]) %}<span class="badge badge--bad">расхождение с банком</span>
+                {% elif r.declared_payout_kop is not none and r.declared_payout_kop != t[1] %}<span class="badge badge--bad">расхождение с площадкой</span>
+                {% elif r.bank_payout_kop is not none %}<span class="badge badge--good">сходится</span>
+                {% else %}<span class="muted help-text">нет суммы из банка</span>{% endif %}
+            </td>
+            <td>
+                {% set s = r.onec_status.value %}
+                <span class="badge {% if s == 'done' %}badge--good{% elif s in ('failed', 'timeout') %}badge--bad{% elif s in ('pending', 'sent') %}badge--warn{% else %}badge--muted{% endif %}">{{ onec_labels[r.onec_status] }}</span>
+            </td>
+            <td><a class="btn" href="/finance/reports/{{ r.id }}">Открыть</a></td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    </div>
+    {% else %}
+    <div class="empty-state">Отчётов пока нет — загрузите первый формой выше.</div>
+    {% endif %}
+</div>
+
+{% endblock %}

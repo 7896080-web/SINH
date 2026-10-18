@@ -1,0 +1,37 @@
+{# Общие куски раздела «Финансы». #}
+
+{# Фильтр периода: пресеты + свои даты. Дополнительные поля формы — через {% call %}. #}
+{% macro period_filter(base_url, preset, presets, d_from, d_to, extra_query='') %}
+<form method="get" action="{{ base_url }}" class="filters">
+    <div class="field">
+        <label>Период</label>
+        <div class="presets">
+            {% for code, label in presets %}
+            <a href="{{ base_url }}?preset={{ code }}{{ extra_query }}" class="{% if preset == code %}active{% endif %}">{{ label }}</a>
+            {% endfor %}
+        </div>
+    </div>
+    <div class="field">
+        <label for="date_from">с</label>
+        <input type="date" id="date_from" name="date_from" value="{{ d_from.isoformat() }}">
+    </div>
+    <div class="field">
+        <label for="date_to">по</label>
+        <input type="date" id="date_to" name="date_to" value="{{ d_to.isoformat() }}">
+    </div>
+    {% if caller %}{{ caller() }}{% endif %}
+    <div class="field">
+        <label>&nbsp;</label>
+        <button type="submit" class="btn btn-primary">Показать</button>
+    </div>
+</form>
+{% endmacro %}
+
+{# Сумма с красным минусом. #}
+{% macro money(kop, short=false) -%}
+<span class="{% if kop is not none and kop < 0 %}neg{% endif %}">{{ (kop | rub_short) if short else (kop | rub) }}</span>
+{%- endmacro %}
+
+{% macro platform_badge(code, labels, colors) -%}
+<span class="status-line" style="gap:6px;"><span class="swatch" style="background: {{ colors.get(code, '#898781') }};"></span>{{ labels.get(code, code) }}</span>
+{%- endmacro %}

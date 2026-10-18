@@ -1,0 +1,235 @@
+{% extends "base.html" %}
+{% from "finance_macros.html" import money, platform_badge %}
+{% block title %}Отчёт #{{ report.id }}{% endblock %}
+{% block content %}
+
+<div class="page-header">
+    <div>
+        <h1>{{ platform_labels[report.platform] }}: отчёт за {{ report.period_from.strftime('%d.%m.%Y') }} — {{ report.period_to.strftime('%d.%m.%Y') }}</h1>
+        <p>#{{ report.id }}{% if report.report_number %} · номер площадки {{ report.report_number }}{% endif %}
+           · {{ report.account.name if report.account else 'кабинет не указан' }}
+           · {{ report.lines_count }} строк · {{ 'по API' if report.source == 'api' else 'файл' }} «{{ report.file_name }}»{% if report.report_kind %} · {{ report.report_kind }}{% endif %}
+           · загрузил {{ report.uploaded_by or '—' }} {{ report.uploaded_at|local('%d.%m.%Y %H:%M') }}</p>
+    </div>
+    <div class="toolbar">
+        <a class="btn" href="/finance/reports/{{ report.id }}/export">Единая форма (Excel)</a>
+        <a class="btn" href="/finance/unit-economics?date_from={{ report.period_from.isoformat() }}&date_to={{ report.period_to.isoformat() }}&platform={{ report.platform }}{% if report.account_id %}&account_id={{ report.account_id }}{% endif %}">Юнит-экономика</a>
+    </div>
+</div>
+
+<div class="card">
+    <h2 style="margin-top:0; font-size:15px;">Итоги по операциям</h2>
+    <div class="table-scroll">
+    <table>
+        <thead>
+            <tr>
+                <th>Операция</th><th class="num">Строк</th><th class="num">Кол-во</th><th class="num">Выручка</th>
+                <th class="num">Комиссия</th><th class="num">За товар</th><th class="num">Логистика</th>
+                <th class="num">Хранение</th><th class="num">Штрафы и удержания</th>
+                <th class="num">Компенсации</th><th class="num">Итого</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for row in operations %}{% set t = row.totals %}
+        <tr>
+            <td>{{ row.label }}</td>
+            <td class="num">{{ row.lines }}</td>
+            <td class="num">{{ row.quantity }}</td>
+            <td class="num">{{ money(t.revenue) }}</td>
+            <td class="num">{{ money(t.commission) }}</td>
+            <td class="num">{{ money(t.payout) }}</td>
+            <td class="num">{{ money(t.logistics) }}</td>
+            <td class="num">{{ money(t.storage) }}</td>
+            <td class="num">{{ money(t.penalty + t.acceptance + t.deduction) }}</td>
+            <td class="num">{{ money(t.compensation) }}</td>
+            <td class="num">{{ money(t.total_payout) }}</td>
+        </tr>
+        {% endfor %}
+        <tr class="row--total">
+            <td>Итого</td><td></td>
+            <td class="num">{{ total.sold_qty }} / −{{ total.returned_qty }}</td>
+            <td class="num">{{ money(total.revenue) }}</td>
+            <td class="num">{{ money(total.commission) }}</td>
+            <td class="num">{{ money(total.payout) }}</td>
+            <td class="num">{{ money(total.logistics) }}</td>
+            <td class="num">{{ money(total.storage) }}</td>
+            <td class="num">{{ money(total.penalty + total.acceptance + total.deduction) }}</td>
+            <td class="num">{{ money(total.compensation) }}</td>
+            <td class="num">{{ money(total.total_payout) }}</td>
+        </tr>
+        </tbody>
+    </table>
+    </div>
+    <p class="help-text">Знаки: возвраты уменьшают выручку и выплату; расходы — положительные числа, вычитаются из «за товар».
+       «Комиссия» — всё, что площадка удержала с продажи (вознаграждение, эквайринг): выручка − выплата за товар.</p>
+</div>
+
+<div class="card" id="money">
+    <h2 style="margin-top:0; font-size:15px;">1. Сверка денег</h2>
+    <table style="max-width:720px;">
+        <tbody>
+            <tr><td>Итог строк отчёта (посчитано программой)</td><td class="num">{{ money(money_chk.computed) }}</td><td></td></tr>
+            <tr><td>«Итого к оплате» по данным площадки{% if report.source == 'api' and report.declared_payout_kop is not none %} <span class="help-text">(из официального отчёта, API)</span>{% endif %}</td><td class="num">{{ money(money_chk.declared) }}</td>
+                <td>{% if money_chk.declared_diff is not none %}
+                    {% if money_chk.declared_diff == 0 %}<span class="badge badge--good">сходится</span>
+                    {% else %}<span class="badge badge--bad">разница {{ money_chk.declared_diff | rub(true) }}</span>{% endif %}
+                {% endif %}</td></tr>
+            <tr><td>Поступило на расчётный счёт</td><td class="num">{{ money(money_chk.bank) }}</td>
+                <td>{% if money_chk.bank_diff is not none %}
+                    {% if money_chk.bank_diff == 0 %}<span class="badge badge--good">сходится</span>
+                    {% else %}<span class="badge badge--bad">разница {{ money_chk.bank_diff | rub(true) }}</span>{% endif %}
+                {% endif %}</td></tr>
+        </tbody>
+    </table>
+    <form method="post" action="/finance/reports/{{ report.id }}/payouts" class="filters" style="border:none; padding:12px 0 0;">
+        <div class="field">
+            <label for="declared">«Итого к оплате» площадки, ₽</label>
+            <input type="text" id="declared" name="declared" value="{{ (report.declared_payout_kop | rub) if report.declared_payout_kop is not none else '' }}" placeholder="из шапки отчёта">
+        </div>
+        <div class="field">
+            <label for="bank">Поступило на счёт, ₽</label>
+            <input type="text" id="bank" name="bank" value="{{ (report.bank_payout_kop | rub) if report.bank_payout_kop is not none else '' }}" placeholder="из выписки банка">
+        </div>
+        <div class="field" style="flex:1; min-width:220px;">
+            <label for="note">Комментарий</label>
+            <input type="text" id="note" name="note" value="{{ report.note or '' }}" style="width:100%;">
+        </div>
+        <div class="field">
+            <label>&nbsp;</label>
+            <button type="submit" class="btn">Сохранить</button>
+        </div>
+    </form>
+    <p class="help-text">Расхождение банка считается от суммы площадки, а если её нет — от итога строк.
+       Площадка может удержать из выплаты долги прошлых недель — тогда разница с банком нормальна, но её стоит знать.</p>
+</div>
+
+<div class="card" id="orders">
+    <h2 style="margin-top:0; font-size:15px;">2. Сверка с заказами Sync Admin</h2>
+    {% if not orders.applicable %}
+        <p class="muted">{{ orders.reason }}</p>
+    {% else %}
+        <ul class="check-list">
+            <li>Заказов в отчёте: {{ orders.report_orders }}, из них найдено среди принятых Sync Admin: {{ orders.matched }}.</li>
+            {% if orders.without_order_id %}<li>Строк продаж/возвратов без номера заказа: {{ orders.without_order_id }}
+                (для WB это продажи со склада площадки — FBO, Sync Admin их не принимает).</li>{% endif %}
+            <li>{% if orders.cancelled_in_system %}<span class="badge badge--bad">{{ orders.cancelled_in_system | length }}</span>{% else %}<span class="badge badge--good">0</span>{% endif %}
+                продано по отчёту, но в Sync Admin заказ отменён (товар вернулся на ЦС — расхождение остатка).</li>
+            <li>{% if orders.not_in_system_total %}<span class="badge badge--warn">{{ orders.not_in_system_total }}</span>{% else %}<span class="badge badge--good">0</span>{% endif %}
+                заказов из отчёта нет среди принятых Sync Admin.</li>
+            <li>{% if orders.missing_in_reports_total %}<span class="badge badge--warn">{{ orders.missing_in_reports_total }}</span>{% else %}<span class="badge badge--good">0</span>{% endif %}
+                заказов, принятых Sync Admin за период, нет ни в одном загруженном отчёте этого кабинета
+                (заказы последних дней обычно попадают в отчёт следующего периода).</li>
+        </ul>
+        {% if orders.cancelled_in_system %}
+        <h3 style="font-size:14px;">Продано, но отменено в Sync Admin</h3>
+        <table><thead><tr><th>Заказ</th><th>Баркод</th><th>Артикул</th><th>Отменён в Sync Admin</th></tr></thead><tbody>
+        {% for order, line in orders.cancelled_in_system %}
+        <tr><td class="mono">{{ order.order_id }}</td><td class="mono">{{ line.barcode or '—' }}</td><td>{{ line.article or '—' }}</td>
+            <td>{{ order.cancelled_at|local('%d.%m.%Y %H:%M') or '—' }}</td></tr>
+        {% endfor %}</tbody></table>
+        {% endif %}
+        {% if orders.not_in_system %}
+        <details class="table-view"><summary>Заказы отчёта, которых нет в Sync Admin ({{ orders.not_in_system_total }})</summary>
+        <table><thead><tr><th>Заказ</th><th>Операция</th><th>Дата</th><th>Баркод</th><th>Артикул</th></tr></thead><tbody>
+        {% for line in orders.not_in_system %}
+        <tr><td class="mono">{{ line.order_id }}</td><td>{{ operation_labels[line.operation] }}</td>
+            <td class="mono">{{ line.operation_date.strftime('%d.%m.%Y') }}</td><td class="mono">{{ line.barcode or '—' }}</td><td>{{ line.article or '—' }}</td></tr>
+        {% endfor %}</tbody></table></details>
+        {% endif %}
+        {% if orders.missing_in_reports %}
+        <details class="table-view"><summary>Заказы Sync Admin, которых нет в отчётах ({{ orders.missing_in_reports_total }})</summary>
+        <table><thead><tr><th>Заказ</th><th>Принят</th><th>Статус</th><th class="num">Кол-во</th></tr></thead><tbody>
+        {% for order in orders.missing_in_reports %}
+        <tr><td class="mono">{{ order.order_id }}</td><td class="mono">{{ order.processed_at|local('%d.%m.%Y %H:%M') }}</td>
+            <td>{{ 'подтверждён' if order.status == 'confirmed' else 'принят' }}</td><td class="num">{{ order.quantity }}</td></tr>
+        {% endfor %}</tbody></table></details>
+        {% endif %}
+    {% endif %}
+</div>
+
+<div class="card" id="barcodes">
+    <h2 style="margin-top:0; font-size:15px;">3. Товары без сопоставления с 1С</h2>
+    {% if unmatched %}
+        <p>Строк продаж/возвратов без товара 1С: <b>{{ report.unmatched_lines }}</b>. Товар ищется по
+           «Мэппингу» Sync Admin, затем по справочнику баркодов 1С. Привяжите баркоды в Sync Admin
+           (страница «Мэппинг») и нажмите «Пересопоставить» — до этого отчёт в 1С не отправится,
+           а себестоимость к этим продажам не подставится.</p>
+        <table>
+            <thead><tr><th>Баркод</th><th>Артикул</th><th>Наименование</th><th>Размер</th><th class="num">Строк</th><th class="num">Шт (нетто)</th><th class="num">Выручка</th></tr></thead>
+            <tbody>
+            {% for row in unmatched %}
+            <tr><td class="mono">{{ row.barcode or '— нет баркода —' }}</td><td>{{ row.article or '—' }}</td><td>{{ row.name or '—' }}</td>
+                <td>{{ row.size or '' }}</td><td class="num">{{ row.lines }}</td><td class="num">{{ row.quantity }}</td><td class="num">{{ money(row.revenue) }}</td></tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    {% else %}
+        <p><span class="badge badge--good">все сопоставлены</span> У каждой продажи и возврата есть товар 1С.</p>
+    {% endif %}
+    <form method="post" action="/finance/reports/{{ report.id }}/remap" class="inline-form">
+        <button type="submit" class="btn">Пересопоставить баркоды</button>
+    </form>
+</div>
+
+<div class="card" id="onec">
+    <h2 style="margin-top:0; font-size:15px;">4. Загрузка продаж в 1С</h2>
+    <div class="status-line">
+        {% set s = report.onec_status.value %}
+        <span class="badge {% if s == 'done' %}badge--good{% elif s in ('failed', 'timeout') %}badge--bad{% elif s in ('pending', 'sent') %}badge--warn{% else %}badge--muted{% endif %}">{{ onec_labels[report.onec_status] }}</span>
+        {% if report.onec_detail %}<span>{{ report.onec_detail }}</span>{% endif %}
+    </div>
+    <table style="max-width:720px; margin-top:12px;">
+        <tbody>
+            <tr><td>Склад продаж в 1С</td><td>{{ warehouse or '— не задан —' }}</td></tr>
+            <tr><td>Дата документов</td><td class="mono">{{ report.period_to.strftime('%d.%m.%Y') }} (конец периода отчёта)</td></tr>
+            <tr><td>Продажи</td><td class="num">{{ plan_sale[0] }} шт, к перечислению {{ plan_sale[1] | rub }}</td></tr>
+            <tr><td>Возвраты</td><td class="num">{{ plan_return[0] }} шт, к перечислению {{ plan_return[1] | rub }}</td></tr>
+            <tr><td>Строк в файле для 1С</td><td class="num">{{ plan.lines | length }}</td></tr>
+            {% if plan.skipped_lines %}
+            <tr><td>Корректировки без количества (в документ не попадут)</td>
+                <td class="num">{{ plan.skipped_lines }} стр. на {{ plan.skipped_amount_kop | rub }}</td></tr>
+            {% endif %}
+            {% if report.onec_requested_at %}<tr><td>Отправить попросил</td><td>{{ report.onec_requested_by }} · {{ report.onec_requested_at|local('%d.%m.%Y %H:%M') }}</td></tr>{% endif %}
+            {% if report.onec_sent_at %}<tr><td>Ушёл в 1С</td><td>{{ report.onec_sent_at|local('%d.%m.%Y %H:%M') }}, файл {{ report.onec_batch_filename }}</td></tr>{% endif %}
+            {% if report.onec_completed_at %}<tr><td>Ответ 1С</td><td>{{ report.onec_completed_at|local('%d.%m.%Y %H:%M') }}</td></tr>{% endif %}
+        </tbody>
+    </table>
+
+    {% if problems and not in_flight %}
+    <ul class="check-list" style="margin-top:12px;">
+        {% for p in problems %}<li><span class="badge badge--warn">нельзя отправить</span> {{ p }}</li>{% endfor %}
+    </ul>
+    {% endif %}
+
+    <div class="toolbar" style="margin-top:12px;">
+        {% if not in_flight %}
+        <form method="post" action="/finance/reports/{{ report.id }}/send-1c" class="inline-form"
+              onsubmit="return confirm('Создать в 1С документы продаж и возвратов по этому отчёту? Документы создаются непроведёнными; повторная отправка перезаполнит их.');">
+            <button type="submit" class="btn btn-primary" {% if problems %}disabled{% endif %}>
+                {{ 'Отправить в 1С повторно' if report.onec_status.value in ('done', 'failed', 'timeout') else 'Отправить в 1С' }}
+            </button>
+        </form>
+        {% endif %}
+        <form method="post" action="/finance/reports/{{ report.id }}/delete" class="inline-form"
+              onsubmit="return confirm('Удалить отчёт из программы? Документы, уже созданные в 1С, останутся.');">
+            <button type="submit" class="btn btn-danger" {% if in_flight %}disabled{% endif %}>Удалить отчёт</button>
+        </form>
+    </div>
+    {% set renamed = plan.lines | selectattr('report_barcodes') | list %}
+    {% if plan.lines %}
+    <details class="table-view" style="margin-top:12px;"><summary>Строки для 1С ({{ plan.lines | length }})</summary>
+    <table><thead><tr><th>Вид</th><th>Баркод в 1С</th><th>Баркод в отчёте</th><th class="num">Кол-во</th><th class="num">К перечислению</th></tr></thead><tbody>
+    {% for line in plan.lines %}
+    <tr><td>{{ 'продажа' if line.kind == 'SALE' else 'возврат' }}</td><td class="mono">{{ line.barcode or '— нет —' }}</td>
+        <td class="mono">{% if line.report_barcodes != [line.barcode] %}{{ line.report_barcodes | join(', ') }}{% endif %}</td>
+        <td class="num">{{ line.quantity }}</td><td class="num">{{ line.amount_kop | rub }}</td></tr>
+    {% endfor %}</tbody></table></details>
+    {% endif %}
+    <p class="help-text">В 1С уходят продажи и возвраты, свёрнутые по баркоду: баркод, количество и сумма к
+       перечислению продавцу. Баркод — тот, что прописан у товара в 1С: если баркод из отчёта в 1С
+       не заведён, уходит баркод того же товара из 1С (колонка «Баркод в отчёте» показывает замену).
+       Ключ документа: <span class="mono">{{ report.onec_key }}</span> — повторная отправка того же отчёта
+       перезаполняет непроведённый документ, а не создаёт второй.</p>
+</div>
+
+{% endblock %}

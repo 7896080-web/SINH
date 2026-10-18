@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Финансы площадок{% endblock %}</title>
+    <link rel="stylesheet" href="{{ static_url('style.css') }}">
+    <script>
+        // Состояние меню восстанавливается ДО первой отрисовки: иначе на каждом
+        // переходе был бы виден скачок ширины.
+        try {
+            if (localStorage.getItem("mpfin-nav-collapsed") === "1") {
+                document.documentElement.classList.add("nav-collapsed");
+            }
+        } catch (e) { /* меню останется развёрнутым */ }
+    </script>
+</head>
+<body>
+    <div class="shell">
+        {# Иконки — своим спрайтом: сервер живёт без внешних библиотек. #}
+        <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+            <symbol id="i-fin-dashboard" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                    stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M2.5 13.5h11"/>
+                <path d="M4 13.5V8.5M8 13.5V4.5M12 13.5V7"/>
+            </symbol>
+            <symbol id="i-fin-reports" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                    stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M3 2.5h10v11H3z"/>
+                <path d="M5.5 5.5h5M5.5 8h5M5.5 10.5h2.5"/>
+            </symbol>
+            <symbol id="i-fin-ue" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                    stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="5" cy="5" r="1.8"/>
+                <circle cx="11" cy="11" r="1.8"/>
+                <path d="M12.5 3.5 3.5 12.5"/>
+            </symbol>
+            <symbol id="i-fin-costs" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                    stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M2.5 8.2 8.2 2.5h5.3v5.3L7.8 13.5z"/>
+                <circle cx="10.8" cy="5.2" r="1"/>
+            </symbol>
+            <symbol id="i-api-keys" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                    stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="5" cy="8" r="3"/>
+                <path d="M8 8h6M11.5 8v2.5M13.5 8v2"/>
+            </symbol>
+            <symbol id="i-diagnostics" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                    stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M1.5 8.5h3L6 5l2.5 7L10.5 8.5h4"/>
+            </symbol>
+            <symbol id="i-logout" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                    stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M6.5 2.5H3.5v11h3"/>
+                <path d="M9.5 5.5 12.5 8l-3 2.5M12.5 8H6"/>
+            </symbol>
+            <symbol id="i-collapse" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                    stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M9.5 4 5.5 8l4 4"/>
+            </symbol>
+            <symbol id="i-statements" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                    stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M3 2.5h10v11H3z"/>
+                <path d="M5.5 6l1.5 1.5L10.5 4.5M5.5 10.5h5"/>
+            </symbol>
+        </svg>
+        {% set nav_icons = {'finance': 'i-fin-dashboard', 'finance-reports': 'i-fin-reports', 'finance-statements': 'i-statements',
+                            'finance-ue': 'i-fin-ue', 'finance-costs': 'i-fin-costs',
+                            'accounts': 'i-api-keys', 'diagnostics': 'i-diagnostics'} %}
+        <nav class="nav">
+            <div class="nav__brand">
+                <span class="nav__brand-text">Финансы площадок</span>
+                <button type="button" class="nav__toggle" id="nav-toggle"
+                        title="Свернуть меню" aria-label="Свернуть меню">
+                    <svg class="nav__icon" aria-hidden="true"><use href="#i-collapse"/></svg>
+                </button>
+            </div>
+            {% if current_user %}
+            {% for key, href, label in nav_items %}
+            <a class="nav__item {% if active_page == key %}active{% endif %}" href="{{ href }}" title="{{ label }}">
+                <svg class="nav__icon" aria-hidden="true"><use href="#{{ nav_icons[key] }}"/></svg>
+                <span class="nav__label">{{ label }}</span>
+            </a>
+            {% endfor %}
+            <div class="nav__footer">
+                <span class="nav__label nav__user">{{ current_user.username }}</span>
+                <a class="nav__logout" href="/logout" title="Выйти">
+                    <svg class="nav__icon" aria-hidden="true"><use href="#i-logout"/></svg>
+                    <span class="nav__label">Выйти</span>
+                </a>
+            </div>
+            {% endif %}
+        </nav>
+        <main class="main">
+            {% if flash %}
+            <div class="flash flash--{{ flash.kind }}">{{ flash.message }}</div>
+            {% endif %}
+            {% block content %}{% endblock %}
+        </main>
+    </div>
+    <script>
+        (function () {
+            var button = document.getElementById("nav-toggle");
+            if (!button) return;
+            var root = document.documentElement;
+            function describe() {
+                var text = root.classList.contains("nav-collapsed") ? "Развернуть меню" : "Свернуть меню";
+                button.title = text;
+                button.setAttribute("aria-label", text);
+            }
+            describe();
+            button.addEventListener("click", function () {
+                var collapsed = root.classList.toggle("nav-collapsed");
+                try { localStorage.setItem("mpfin-nav-collapsed", collapsed ? "1" : "0"); } catch (e) { }
+                describe();
+            });
+        })();
+    </script>
+</body>
+</html>

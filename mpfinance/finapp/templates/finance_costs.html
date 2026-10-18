@@ -1,0 +1,140 @@
+{% extends "base.html" %}
+{% block title %}Себестоимость{% endblock %}
+{% block content %}
+
+<div class="page-header">
+    <div>
+        <h1>Себестоимость и настройки расчёта</h1>
+        <p>Себестоимость задана у {{ with_cost }} из {{ products_total }} товаров</p>
+    </div>
+    <div class="toolbar">
+        <a class="btn" href="/finance/costs/export">Выгрузить в Excel</a>
+        <form method="post" action="/finance/costs/import" enctype="multipart/form-data" class="inline-form">
+            <label class="btn file-upload-btn">Загрузить из Excel
+                <input type="file" name="file" accept=".xlsx" onchange="this.form.submit()">
+            </label>
+        </form>
+    </div>
+</div>
+
+<div class="card">
+    <h2 style="margin-top:0; font-size:15px;">Себестоимость из 1С</h2>
+    <p class="help-text" style="margin-top:0;">
+        Берётся из регистра «Себестоимость номенклатуры» той же командой, что у «Репрайсера»
+        (<span class="mono">EXPORT_COST_PRICES</span>) — в долларах; в рубли переводится курсом ЦБ на дату
+        продажи. Обновляется сама раз в сутки (если включена автозагрузка) или по кнопке.
+        Цена, заданная вручную через Excel, приоритетнее: выгрузка из 1С её не перебивает.
+    </p>
+    <div class="toolbar">
+        <form method="post" action="/finance/costs/request-1c" class="inline-form">
+            <button type="submit" class="btn btn-primary">Загрузить себестоимость из 1С</button>
+        </form>
+        <span class="help-text">Курс ЦБ: {% if latest_rate %}{{ '%.4f'|format(latest_rate[1]) }} ₽ за $ на {{ latest_rate[0].strftime('%d.%m.%Y') }}{% else %}ещё не получен{% if raw['FIN_USD_RATE_MANUAL'] %} — считается по ручному {{ raw['FIN_USD_RATE_MANUAL'] }}{% endif %}{% endif %}</span>
+    </div>
+    {% if cost_jobs %}
+    <table style="margin-top:10px;">
+        <thead><tr><th>Задание</th><th>Поставлено</th><th>Состояние</th><th>Подробности</th></tr></thead>
+        <tbody>
+        {% for j in cost_jobs %}
+        <tr><td class="mono">{{ j.key }}</td><td class="mono">{{ j.created_at|local }}</td>
+            <td><span class="badge {% if j.status == 'done' %}badge--good{% elif j.status in ('failed', 'timeout') %}badge--bad{% else %}badge--warn{% endif %}">{{ onec_task_labels.get(j.status, j.status) }}</span></td>
+            <td class="help-text">{{ j.result_detail or '' }}</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% endif %}
+</div>
+
+<div class="card">
+    <p class="help-text" style="margin-top:0;">
+        Выгрузите список, заполните колонку «Себестоимость» (₽ за штуку) и загрузите файл обратно.
+        Товар ищется по ID_1С, если его нет — по баркоду, если нет и его — по артикулу (тогда цена
+        ставится всем размерам артикула). «Действует с» — дата, с которой цена применяется к продажам;
+        пусто — «всегда». Новая цена с новой датой не переписывает прошлые месяцы.
+    </p>
+</div>
+
+<form method="get" action="/finance/costs" class="filters">
+    <div class="field">
+        <label for="q">Поиск</label>
+        <input type="search" id="q" name="q" value="{{ q }}" placeholder="артикул, наименование">
+    </div>
+    <div class="field">
+        <label>&nbsp;</label>
+        <label class="checkbox-inline"><input type="checkbox" name="missing" value="true" {% if missing %}checked{% endif %}> Только без себестоимости</label>
+    </div>
+    <div class="field">
+        <label>&nbsp;</label>
+        <button type="submit" class="btn">Показать</button>
+    </div>
+</form>
+
+<div class="card" style="padding:0;">
+    {% if products %}
+    <table>
+        <thead><tr><th>Товар</th><th>Размер / цвет</th><th class="num">Себестоимость</th><th>Действует с</th><th>Источник</th></tr></thead>
+        <tbody>
+        {% for p in products %}{% set c = costs.get(p.uid_1c) %}
+        <tr>
+            <td>{{ p.name or '—' }}<div class="help-text mono">{{ p.article or '—' }}</div></td>
+            <td>{{ p.size or '' }}{% if p.color %} · {{ p.color }}{% endif %}</td>
+            <td class="num">{% if c %}{{ c.cost_minor | rub }} {{ '₽' if c.currency == 'RUB' else '$' }}{% else %}<span class="badge badge--warn">не задана</span>{% endif %}</td>
+            <td class="mono">{% if c %}{{ 'всегда' if c.valid_from.year == 2000 else c.valid_from.strftime('%d.%m.%Y') }}{% endif %}</td>
+            <td>{% if c %}{{ '1С' if c.source == '1c' else (c.updated_by or 'Excel') }}{% endif %}</td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% if total > products | length %}<div class="help-text" style="padding:10px 14px;">Показаны первые {{ products | length }} из {{ total }} — полный список в Excel.</div>{% endif %}
+    {% else %}
+    <div class="empty-state">Товаров по отбору нет.</div>
+    {% endif %}
+</div>
+
+<div class="card" id="settings">
+    <h2 style="margin-top:0; font-size:15px;">Настройки расчёта</h2>
+    <form method="post" action="/finance/settings">
+        <div class="filters" style="border:none; padding:0;">
+            <div class="field">
+                <label for="tax_mode">Налог</label>
+                <select id="tax_mode" name="FIN_TAX_MODE">
+                    {% for code, label in tax_modes.items() %}<option value="{{ code }}" {% if raw['FIN_TAX_MODE'] == code %}selected{% endif %}>{{ label }}</option>{% endfor %}
+                </select>
+            </div>
+            <div class="field">
+                <label for="tax_rate">Ставка, %</label>
+                <input type="text" id="tax_rate" name="FIN_TAX_RATE" value="{{ raw['FIN_TAX_RATE'] }}" style="width:80px;">
+            </div>
+            <div class="field">
+                <label for="extra_cost_per_unit">Доп. расходы на проданную единицу, ₽</label>
+                <input type="text" id="extra_cost_per_unit" name="FIN_EXTRA_COST_PER_UNIT" value="{{ raw['FIN_EXTRA_COST_PER_UNIT'] }}" style="width:120px;">
+            </div>
+            <div class="field">
+                <label for="auto_fetch">Автозагрузка по API и из 1С</label>
+                <select id="auto_fetch" name="FIN_AUTO_FETCH">
+                    <option value="1" {% if raw['FIN_AUTO_FETCH'] != '0' %}selected{% endif %}>раз в сутки</option>
+                    <option value="0" {% if raw['FIN_AUTO_FETCH'] == '0' %}selected{% endif %}>только по кнопке</option>
+                </select>
+            </div>
+            <div class="field">
+                <label for="usd_rate">Курс доллара вручную, ₽</label>
+                <input type="text" id="usd_rate" name="FIN_USD_RATE_MANUAL" value="{{ raw['FIN_USD_RATE_MANUAL'] }}" placeholder="если курса ЦБ нет" style="width:140px;">
+            </div>
+        </div>
+        <h3 style="font-size:14px; margin:16px 0 4px;">Склады продаж в 1С (для загрузки отчётов)</h3>
+        <p class="help-text" style="margin-top:0;">Точное наименование склада в справочнике «Склады» 1С, с которого списываются
+            продажи площадки. Для WB, Ozon и KIT по умолчанию — те же склады, куда приём заказа перемещает товар.
+            Склад Lamoda задайте сами: пока он пустой, отчёты Lamoda в 1С не отправляются.</p>
+        <div class="filters" style="border:none; padding:0;">
+            {% for p, key in warehouse_keys.items() %}
+            <div class="field">
+                <label for="{{ key }}">{{ platform_labels[p] }}</label>
+                <input type="text" id="{{ key }}" name="{{ key }}" value="{{ raw[key] }}"{% if p == 'lamoda' %} placeholder="в боевой базе — «Lamaoda_Склад»"{% endif %}>
+            </div>
+            {% endfor %}
+        </div>
+        <button type="submit" class="btn btn-primary" style="margin-top:12px;">Сохранить настройки</button>
+    </form>
+</div>
+
+{% endblock %}

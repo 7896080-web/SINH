@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+{% block title %}API-ключи{% endblock %}
+{% block content %}
+<div class="page-header">
+    <div>
+        <h1>Кабинеты площадок и ключи</h1>
+        <p>Отчёты WB и Яндекс KIT забираются по API, Lamoda и Ozon — загрузкой файла.</p>
+    </div>
+</div>
+
+<div class="card">
+    <p class="help-text" style="margin-top:0;">
+        <b>WB:</b> нужен токен с категорией <b>«Финансы»</b> (кабинет WB → Настройки → Доступ к API;
+        достаточно «Только на чтение»). <b>Яндекс KIT:</b> токен магазина. Ключи хранятся зашифрованными
+        ключом этой программы и здесь не показываются — только маска; пустое поле при сохранении ключ
+        не стирает.<br>
+        <b>Кабинет в Sync Admin</b> — тот же кабинет в программе синхронизации: по нему отчёт
+        сверяется с заказами, которые принял Sync Admin.
+        {% if sync_error %}<br><span class="badge badge--warn">Sync Admin</span> {{ sync_error }}{% endif %}
+    </p>
+</div>
+
+{% for row in rows %}{% set a = row.account %}
+<div class="card">
+    <form method="post" action="/api-keys/{{ a.id }}" autocomplete="off">
+        <h2 style="margin-top:0; font-size:15px;">{{ platforms[a.platform] }} · {{ a.name }}
+            {% if not a.is_active %}<span class="badge badge--muted">выключен</span>{% endif %}</h2>
+        <div class="filters" style="margin:0;">
+            <div class="field">
+                <label>Название</label>
+                <input type="text" name="name" value="{{ a.name }}">
+            </div>
+            {% for field, label, masked in row.fields %}
+            <div class="field">
+                <label>{{ label }}</label>
+                <input type="password" name="{{ field }}" placeholder="{{ masked or 'не задан' }}" autocomplete="new-password">
+            </div>
+            {% endfor %}
+            <div class="field">
+                <label>Кабинет в Sync Admin</label>
+                <select name="sync_account_id">
+                    <option value="">— не связан —</option>
+                    {% for s in row.sync_choices %}<option value="{{ s.id }}" {% if a.sync_account_id == s.id %}selected{% endif %}>{{ s.name }}</option>{% endfor %}
+                    {% if a.sync_account_id and a.sync_account_id not in sync_names %}<option value="{{ a.sync_account_id }}" selected>#{{ a.sync_account_id }} (нет в Sync Admin)</option>{% endif %}
+                </select>
+            </div>
+            <div class="field">
+                <label>&nbsp;</label>
+                <label class="checkbox-inline"><input type="checkbox" name="is_active" value="1" {% if a.is_active %}checked{% endif %}> Активен</label>
+            </div>
+            <div class="field">
+                <label>&nbsp;</label>
+                <button type="submit" class="btn btn-primary">Сохранить</button>
+            </div>
+        </div>
+    </form>
+    {% if a.platform in ('wb', 'kit') %}
+    <form method="post" action="/api-keys/{{ a.id }}/check" class="inline-form" style="margin-top:8px;">
+        <button type="submit" class="btn">Проверить доступ</button>
+        <span class="help-text">один запрос к {{ 'WB finance-api (список отчётов за две недели)' if a.platform == 'wb' else 'KIT (первая страница заказов)' }} с сохранённым ключом</span>
+    </form>
+    {% endif %}
+</div>
+{% endfor %}
+
+<div class="card">
+    <h2 style="margin-top:0; font-size:15px;">Новый кабинет</h2>
+    <form method="post" action="/api-keys/new" class="filters" style="margin:0;">
+        <div class="field">
+            <label>Площадка</label>
+            <select name="platform">{% for key, label in platforms.items() %}<option value="{{ key }}">{{ label }}</option>{% endfor %}</select>
+        </div>
+        <div class="field">
+            <label>Название</label>
+            <input type="text" name="name" placeholder="например, ИП Яворская">
+        </div>
+        <div class="field">
+            <label>&nbsp;</label>
+            <button type="submit" class="btn">Добавить</button>
+        </div>
+    </form>
+</div>
+{% endblock %}

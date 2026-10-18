@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% block title %}Диагностика{% endblock %}
+{% block content %}
+<div class="page-header">
+    <div>
+        <h1>Диагностика</h1>
+        <p>Обмен с 1С, база Sync Admin, фоновые задания</p>
+    </div>
+</div>
+
+<div class="card">
+    <h2 style="margin-top:0; font-size:15px;">Обработка 1С «ОбменССайтом»</h2>
+    <p>
+        {% if epf_ready %}<span class="badge badge--good">{{ epf_version }}</span> подтверждена {{ epf_checked_at|local('%d.%m.%Y %H:%M') }}
+        {% elif epf_version %}<span class="badge badge--bad">{{ epf_version }}</span> — нужна mark-4 или новее: обновите модуль обработки в Конфигураторе
+        {% else %}<span class="badge badge--warn">не проверена</span> — нажмите «Проверить обработку 1С». Пока обработка не ответила версией mark-4, программа не шлёт в 1С ничего, кроме этой проверки.
+        {% endif %}
+    </p>
+    <div class="toolbar">
+        <form method="post" action="/diagnostics/request/FIN_PING" class="inline-form">
+            <button type="submit" class="btn">Проверить обработку 1С</button>
+        </form>
+        <form method="post" action="/diagnostics/request/BARCODE_DICT" class="inline-form">
+            <button type="submit" class="btn" {% if not epf_ready %}disabled{% endif %}>Обновить справочник баркодов</button>
+        </form>
+        <form method="post" action="/diagnostics/request/EXPORT_COST_PRICES" class="inline-form">
+            <button type="submit" class="btn" {% if not epf_ready %}disabled{% endif %}>Запросить себестоимость</button>
+        </form>
+    </div>
+    <table style="max-width:760px; margin-top:12px;">
+        <tbody>
+            <tr><td>Справочник баркодов 1С</td><td>{% if catalog_at %}{{ barcodes }} баркодов, {{ products }} товаров · {{ catalog_at|local('%d.%m.%Y %H:%M') }}{% else %}ещё не загружен{% endif %}</td></tr>
+            <tr><td>Себестоимость из 1С</td><td>{{ costs_at|local('%d.%m.%Y %H:%M') if costs_at else 'ещё не загружалась' }}</td></tr>
+            <tr><td>База Sync Admin (мэппинг, заказы)</td><td>{{ sync_status }}</td></tr>
+            {% for name, path in dirs.items() %}<tr><td>{{ name }}</td><td class="mono">{{ path }}</td></tr>{% endfor %}
+        </tbody>
+    </table>
+</div>
+
+<div class="card">
+    <h2 style="margin-top:0; font-size:15px;">Задания 1С</h2>
+    {% if tasks %}
+    <table>
+        <thead><tr><th>Ключ</th><th>Команда</th><th>Поставлено</th><th>Состояние</th><th>Ответ</th></tr></thead>
+        <tbody>
+        {% for t in tasks %}
+        <tr><td class="mono">{{ t.key }}</td><td>{{ commands.get(t.command, t.command) }}</td><td class="mono">{{ t.created_at|local }}</td>
+            <td><span class="badge {% if t.status == 'done' %}badge--good{% elif t.status in ('failed', 'timeout') %}badge--bad{% else %}badge--warn{% endif %}">{{ task_labels.get(t.status, t.status) }}</span></td>
+            <td class="help-text">{{ t.result_detail or '' }}</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% else %}<p class="muted">Заданий ещё не было.</p>{% endif %}
+</div>
+
+<div class="card">
+    <h2 style="margin-top:0; font-size:15px;">Файл из 1С вручную</h2>
+    <p class="help-text" style="margin-top:0;">Пока обмен не настроен: справочник баркодов
+        (<span class="mono">uid|артикул|наименование|баркод|размер|цвет</span>) или себестоимость
+        (<span class="mono">uid|цена в $</span>) — те же файлы, что кладёт обработка.</p>
+    <form method="post" action="/diagnostics/upload" enctype="multipart/form-data" class="filters" style="margin:0;">
+        <div class="field">
+            <label>Что за файл</label>
+            <select name="kind"><option value="dict">справочник баркодов</option><option value="cost">себестоимость</option></select>
+        </div>
+        <div class="field"><label>Файл</label><input type="file" name="file" accept=".txt,.csv" required></div>
+        <div class="field"><label>&nbsp;</label><button type="submit" class="btn">Загрузить</button></div>
+    </form>
+</div>
+
+<div class="card">
+    <h2 style="margin-top:0; font-size:15px;">Фоновые задания</h2>
+    {% if stale %}<ul class="check-list">{% for s in stale %}<li><span class="badge badge--bad">внимание</span> {{ s }}</li>{% endfor %}</ul>{% endif %}
+    <table>
+        <thead><tr><th>Задание</th><th>Последний прогон</th><th>Итог</th></tr></thead>
+        <tbody>
+        {% for b in beats %}
+        <tr><td class="mono">{{ b.name }}</td><td class="mono">{{ b.last_run_at|local('%d.%m.%Y %H:%M') }}</td>
+            <td>{% if b.last_success %}<span class="badge badge--good">ок</span>{% else %}<span class="badge badge--bad">ошибка</span>{% endif %} <span class="help-text">{{ b.last_error }}</span></td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    <p class="help-text">Последняя копия базы: {{ last_backup|local('%d.%m.%Y %H:%M') if last_backup else 'ещё не снималась' }}.</p>
+</div>
+
+<div class="card">
+    <h2 style="margin-top:0; font-size:15px;">Журнал действий</h2>
+    <table>
+        <thead><tr><th>Когда</th><th>Кто</th><th>Что</th><th>Подробности</th></tr></thead>
+        <tbody>
+        {% for r in log %}
+        <tr><td class="mono">{{ r.at|local('%d.%m.%Y %H:%M') }}</td><td>{{ r.actor }}</td><td class="mono">{{ r.action }}</td><td class="help-text">{{ r.details or '' }}</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endblock %}

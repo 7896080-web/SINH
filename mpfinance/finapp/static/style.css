@@ -1,0 +1,648 @@
+:root {
+    --ink: #1c2126;
+    --ink-soft: #4a5158;
+    --line: #d8dce0;
+    --line-soft: #eceef0;
+    --bg: #f7f8f9;
+    --surface: #ffffff;
+    --accent: #2f5d9f;
+    --accent-soft: #e8eef7;
+    --good: #2f7d4f;
+    --good-soft: #e7f3ec;
+    --warn: #b5750f;
+    --warn-soft: #fbf1de;
+    --bad: #a83636;
+    --bad-soft: #f8e9e9;
+    --radius: 6px;
+    font-size: 15px;
+}
+
+* { box-sizing: border-box; }
+
+body {
+    margin: 0;
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: var(--ink);
+    background: var(--bg);
+    line-height: 1.5;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+.shell {
+    display: flex;
+    min-height: 100vh;
+}
+
+.nav {
+    width: 220px;
+    flex-shrink: 0;
+    background: var(--surface);
+    border-right: 1px solid var(--line);
+    padding: 20px 0;
+}
+
+.nav {
+    /* Ширину меняет только эта переменная — остальное считается от неё, и
+       свёрнутое состояние не приходится описывать второй раскладкой. */
+    display: flex;
+    flex-direction: column;
+    transition: width .12s ease;
+}
+
+.nav__brand {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 0 12px 20px 20px;
+    font-weight: 600;
+    font-size: 16px;
+    border-bottom: 1px solid var(--line-soft);
+    margin-bottom: 12px;
+}
+
+.nav__brand-text { flex: 1; min-width: 0; }
+
+.nav__toggle {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--surface);
+    color: var(--ink-soft);
+    cursor: pointer;
+}
+
+.nav__toggle:hover { background: var(--bg); color: var(--ink); }
+
+.nav__icon {
+    width: 16px;
+    height: 16px;
+    flex-shrink: 0;
+}
+
+.nav__item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 20px;
+    color: var(--ink-soft);
+    font-size: 14px;
+    border-left: 3px solid transparent;
+}
+
+.nav__label { min-width: 0; }
+
+/* --------------------------------------------------------------------------
+   Свёрнутое меню: узкая полоса с иконками, основная область забирает ширину
+   сама (у .main стоит flex: 1). Класс висит на <html>, а не на <body>, потому
+   что выставляется скриптом в <head> — до первой отрисовки, иначе на каждом
+   переходе между страницами меню видимо прыгало бы шириной.
+   -------------------------------------------------------------------------- */
+.nav-collapsed .nav { width: 60px; }
+
+.nav-collapsed .nav__brand {
+    padding: 0 0 16px;
+    justify-content: center;
+    gap: 0;
+}
+
+.nav-collapsed .nav__brand-text { display: none; }
+
+.nav-collapsed .nav__item {
+    justify-content: center;
+    padding: 10px 0;
+    /* Полоска активного пункта уезжает вниз: слева места под неё не осталось,
+       а без метки активной страницы свёрнутое меню теряет ориентир. */
+    border-left-width: 0;
+    border-bottom: 2px solid transparent;
+}
+
+.nav-collapsed .nav__item.active {
+    border-left-color: transparent;
+    border-bottom-color: var(--accent);
+}
+
+.nav-collapsed .nav__label { display: none; }
+
+.nav__user { display: block; margin-bottom: 4px; }
+
+.nav__logout {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.nav-collapsed .nav__footer {
+    padding: 16px 0 0;
+}
+
+.nav-collapsed .nav__logout { justify-content: center; }
+
+/* Кнопка разворачивает стрелку обратно. */
+.nav-collapsed .nav__toggle .nav__icon { transform: rotate(180deg); }
+
+.nav__item:hover { background: var(--bg); text-decoration: none; }
+
+.nav__item.active {
+    color: var(--ink);
+    border-left-color: var(--accent);
+    background: var(--accent-soft);
+    font-weight: 500;
+}
+
+.nav__footer {
+    margin-top: auto;
+    padding: 16px 20px 0;
+    border-top: 1px solid var(--line-soft);
+    font-size: 13px;
+    color: var(--ink-soft);
+}
+
+.main {
+    flex: 1;
+    padding: 28px 36px;
+    /* min-width: 0 — ключевое. По умолчанию у flex-элемента min-width: auto, то
+       есть он НЕ МОЖЕТ стать уже своего содержимого: широкая таблица распирала
+       .main, следом .shell, и горизонтально ехала вся страница вместе с меню —
+       оно уползало за левый край и «терялось». С нулевым минимумом .main
+       остаётся в пределах экрана, а прокручивается сама таблица внутри карточки
+       (.table-scroll ниже). */
+    min-width: 0;
+    /* Потолок был 1180px — на широком мониторе таблица товаров (13 колонок плюс
+       кабинеты) сжималась в эту рамку и пряталась под прокрутку, хотя место на
+       экране было. Ограничение оставлено, но шире: текст на сверхшироком
+       мониторе всё ещё не растягивается в нечитаемую строку. */
+    max-width: 1600px;
+}
+
+/* Прокрутка живёт ВНУТРИ карточки, а не у страницы: шапка, меню и остальные
+   карточки остаются на месте, уезжает только таблица. */
+.table-scroll {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+}
+
+/* Шапка таблицы не уезжает при вертикальной прокрутке: на 300 строках без неё
+   непонятно, какая колонка какая. */
+.table-scroll thead th {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    background: var(--surface);
+}
+
+.page-header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    margin-bottom: 20px;
+}
+
+.page-header h1 {
+    font-size: 20px;
+    font-weight: 600;
+    margin: 0;
+}
+
+.page-header p {
+    color: var(--ink-soft);
+    font-size: 13px;
+    margin: 4px 0 0;
+}
+
+.card {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 20px;
+    margin-bottom: 20px;
+}
+
+/* Карточка, на которую привела ссылка «Разобрать →» из находки отчёта.
+   Без подсветки переход выглядел как «страница просто обновилась»: находки и
+   сами живут на «Диагностике», страница длинная, и куда именно прокрутило —
+   не видно. Рамка держится, пока адрес указывает сюда, и снимается следующим
+   переходом: это не уведомление, а указание пальцем. */
+.card:target,
+h3:target {
+    outline: 2px solid var(--accent, #2f6feb);
+    outline-offset: 4px;
+    scroll-margin-top: 16px;
+}
+
+.filters {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    align-items: flex-end;
+    padding: 16px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    margin-bottom: 16px;
+}
+
+.field { display: flex; flex-direction: column; gap: 4px; }
+.field label { font-size: 12px; color: var(--ink-soft); }
+
+input[type="text"], input[type="search"], input[type="password"], select {
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 7px 10px;
+    font-size: 14px;
+    font-family: inherit;
+    background: var(--surface);
+    color: var(--ink);
+    min-width: 160px;
+}
+
+input:focus, select:focus, button:focus {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+}
+
+.checkbox-inline { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+
+button, .btn {
+    border: 1px solid var(--line);
+    background: var(--surface);
+    border-radius: var(--radius);
+    padding: 7px 14px;
+    font-size: 14px;
+    cursor: pointer;
+    color: var(--ink);
+}
+
+button:hover, .btn:hover { background: var(--bg); }
+
+.btn-primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+}
+
+.btn-primary:hover { background: #274d84; }
+
+/* Мелкая кнопка для действий внутри строки таблицы: рядом с текстом строки
+   обычная выглядит непропорционально и ломает высоту ряда. */
+.btn--small { padding: 4px 9px; font-size: 13px; }
+
+/* Действие с необратимым последствием — например «документа нет» в разборе
+   зависших заданий 1С: оно возвращает единицу в остаток, и если товар на самом
+   деле отгружен, площадки начнут продавать проданное. Цвет тут не украшение, а
+   предупреждение: рядом стоит безобидная кнопка, и перепутать их нельзя. */
+.btn--danger { border-color: var(--bad); color: var(--bad); }
+.btn--danger:hover { background: var(--bad-soft); }
+
+table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+
+th {
+    text-align: left;
+    font-weight: 500;
+    color: var(--ink-soft);
+    font-size: 12px;
+    text-transform: none;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--line);
+    white-space: nowrap;
+}
+
+td {
+    padding: 9px 12px;
+    border-bottom: 1px solid var(--line-soft);
+    vertical-align: middle;
+}
+
+tr:hover td { background: var(--bg); }
+
+.mono { font-variant-numeric: tabular-nums; }
+
+.badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 12px;
+}
+
+.badge--good { background: var(--good-soft); color: var(--good); }
+.badge--warn { background: var(--warn-soft); color: var(--warn); }
+.badge--bad { background: var(--bad-soft); color: var(--bad); }
+
+.platform-check { display: flex; align-items: center; justify-content: center; gap: 4px; }
+.platform-check input[type="checkbox"] { width: 16px; height: 16px; cursor: pointer; }
+
+.proposal-flag {
+    color: var(--warn);
+    cursor: pointer;
+    font-weight: 600;
+    border: none;
+    background: none;
+    font-size: 15px;
+    padding: 0 2px;
+}
+.proposal-flag:hover { transform: scale(1.15); }
+
+.login-shell {
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--bg);
+}
+
+.login-card {
+    width: 340px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 32px;
+}
+
+.login-card h1 {
+    font-size: 18px;
+    margin: 0 0 4px;
+}
+
+.login-card p { color: var(--ink-soft); font-size: 13px; margin: 0 0 20px; }
+
+.login-card .field { margin-bottom: 14px; }
+.login-card input { width: 100%; }
+.login-card button { width: 100%; margin-top: 6px; }
+
+.error-text {
+    color: var(--bad);
+    font-size: 13px;
+    margin: -6px 0 14px;
+}
+
+.empty-state {
+    padding: 40px;
+    text-align: center;
+    color: var(--ink-soft);
+    font-size: 14px;
+}
+
+.help-text { color: var(--ink-soft); font-size: 12px; margin-top: 4px; }
+
+.flash {
+    padding: 10px 14px;
+    border-radius: var(--radius);
+    font-size: 13.5px;
+    margin-bottom: 16px;
+    border: 1px solid transparent;
+}
+.flash--good { background: var(--good-soft); color: var(--good); border-color: var(--good); }
+.flash--warn { background: var(--warn-soft); color: var(--warn); border-color: var(--warn); }
+.flash--info { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
+
+.toolbar {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}
+
+.file-upload-btn {
+    position: relative;
+    overflow: hidden;
+    display: inline-block;
+}
+.file-upload-btn input[type="file"] {
+    position: absolute;
+    inset: 0;
+    opacity: 0;
+    cursor: pointer;
+}
+
+/* Выбранная выгрузка в списке запросов на странице «Остатки на дату» */
+.row--active {
+    background: var(--accent-soft);
+}
+
+
+/* --------------------------------------------------------------------------
+   Узкий экран. Меню в 220px и боковая раскладка на ноутбуке 13" съедали треть
+   ширины у таблиц; на планшете страница просто не помещалась.
+   -------------------------------------------------------------------------- */
+@media (max-width: 1100px) {
+    .shell { flex-direction: column; }
+    .nav {
+        width: 100%;
+        border-right: none;
+        border-bottom: 1px solid var(--line);
+        padding: 12px 0;
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 4px;
+    }
+    .nav__brand { border: none; margin: 0; padding: 0 16px; }
+    .nav__item { border-left: none; border-bottom: 3px solid transparent; padding: 8px 14px; }
+    .nav__item.active { border-left: none; border-bottom-color: var(--accent); }
+    .nav__footer { margin: 0 0 0 auto; border: none; padding: 0 16px; }
+    /* Горизонтальное меню сворачивать нечему: ширину оно не занимает, а
+       узкая полоса с иконками поверх страницы только мешала бы. */
+    .nav__toggle { display: none; }
+    .nav-collapsed .nav { width: 100%; }
+    .nav-collapsed .nav__brand-text,
+    .nav-collapsed .nav__label { display: inline; }
+    .nav-collapsed .nav__item { justify-content: flex-start; padding: 8px 14px; }
+    .main { padding: 20px 16px; max-width: none; }
+    .page-header { flex-direction: column; align-items: flex-start; gap: 10px; }
+    .filters { gap: 10px; }
+}
+
+@media (max-width: 640px) {
+    .main { padding: 16px 12px; }
+    input[type="text"], input[type="search"], input[type="password"], select { min-width: 0; }
+    .field { flex: 1 1 140px; }
+}
+
+/* Отрицательное расхождение на «Расхождениях со складом»: по таким строкам
+   наружу уходит БОЛЬШЕ, чем числится в 1С, и устаревшее измерение здесь уже
+   оверселл. Раскрашена ячейка, а не число: поле ввода перекрасить нельзя, не
+   мешая читать его содержимое. */
+.dsc-negative { background: rgba(200, 40, 40, .08); }
+.dsc-negative .pr-input { color: #b02020; font-weight: 600; }
+
+/* ---------------------------------------------------------------
+   Живая строка статуса отправки в 1С («Коробка возвратов»).
+
+   Полоса стоит над пачкой и обновляет себя сама. Три состояния, и цвет у них
+   не украшение, а разная цена: спокойное (ждать нечего), «идёт» (вещи в пути,
+   пройдёт само) и тревожное (застряло или отказ 1С — само НЕ пройдёт, нужен
+   человек). Смешай мы второе с третьим, строка весь день выглядела бы
+   одинаково, и единственное, что требует действия, потерялось бы в ней.
+   --------------------------------------------------------------- */
+.transfer-status {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    padding: 10px 14px;
+    margin-bottom: 14px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--surface);
+    line-height: 1.5;
+}
+
+.transfer-status--live {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+}
+
+.transfer-status--bad {
+    border-color: var(--bad);
+    background: var(--bad-soft);
+}
+
+/* Точка «дышит», только пока что-то в пути: на странице, открытой весь день,
+   неподвижная строка неотличима от зависшей, а мигание на спокойном экране
+   отвлекает кладовщика от коробки. */
+.transfer-dot {
+    flex: 0 0 auto;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: var(--line);
+    transform: translateY(-1px);
+}
+
+.transfer-status--live .transfer-dot { background: var(--accent); }
+.transfer-status--bad  .transfer-dot { background: var(--bad); }
+
+.transfer-status--live .transfer-dot,
+.transfer-status--bad  .transfer-dot {
+    animation: transfer-pulse 1.6s ease-in-out infinite;
+}
+
+/* Человеку, которому анимация мешает (системная настройка), её не показываем:
+   строка остаётся читаемой, а это всё, что от неё требуется. */
+@media (prefers-reduced-motion: reduce) {
+    .transfer-dot { animation: none !important; }
+}
+
+@keyframes transfer-pulse {
+    0%, 100% { opacity: 1; }
+    50%      { opacity: 0.25; }
+}
+
+.transfer-alarm {
+    display: block;
+    margin-top: 4px;
+    color: var(--bad);
+    font-weight: 600;
+}
+
+.transfer-done {
+    display: block;
+    margin-top: 4px;
+    color: var(--good);
+}
+
+.transfer-note {
+    display: block;
+    margin-top: 4px;
+    color: var(--ink-soft);
+}
+
+/* ---------- Страницы финансов ---------- */
+
+.badge--muted { background: var(--line-soft); color: var(--ink-soft); }
+.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.neg { color: var(--bad); }
+.muted { color: var(--ink-soft); }
+tr.row--total td { font-weight: 600; border-top: 1px solid var(--line); }
+tr.row--sub td { color: var(--ink-soft); }
+
+.presets { display: flex; gap: 4px; flex-wrap: wrap; }
+.presets a {
+    padding: 6px 10px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    font-size: 13px;
+    color: var(--ink-soft);
+    background: var(--surface);
+}
+.presets a.active { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+input[type="date"], input[type="number"] {
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 6px 8px;
+    font-size: 14px;
+    font-family: inherit;
+}
+
+.kpi-row {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 12px;
+    margin-bottom: 20px;
+}
+.kpi {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+}
+.kpi__label { font-size: 12px; color: var(--ink-soft); }
+.kpi__value { font-size: 22px; font-weight: 600; margin-top: 2px; white-space: nowrap; }
+.kpi__note { font-size: 12px; color: var(--ink-soft); margin-top: 2px; }
+
+.platform-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+    gap: 12px;
+    margin-bottom: 20px;
+}
+.platform-card h3 { margin: 0 0 10px; font-size: 15px; display: flex; align-items: center; gap: 8px; }
+.platform-card dl { display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; margin: 0; font-size: 13.5px; }
+.platform-card dt { color: var(--ink-soft); }
+.platform-card dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; }
+
+.meter { height: 6px; background: var(--accent-soft); border-radius: 3px; overflow: hidden; margin-top: 6px; }
+.meter__fill { height: 100%; background: var(--accent); border-radius: 3px; }
+
+.chart-wrap { position: relative; }
+.chart-wrap svg { width: 100%; height: auto; display: block; }
+.chart-grid { stroke: var(--line-soft); stroke-width: 1; }
+.chart-axis { stroke: var(--line); stroke-width: 1; }
+.chart-label { fill: var(--ink-soft); font-size: 11px; font-family: inherit; }
+.chart-hit { fill: transparent; cursor: default; }
+.chart-hit:hover, .chart-hit:focus { fill: rgba(47, 93, 159, 0.06); outline: none; }
+.legend { display: flex; gap: 16px; flex-wrap: wrap; font-size: 13px; color: var(--ink-soft); margin: 4px 0 10px; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.chart-tip {
+    position: absolute;
+    pointer-events: none;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    padding: 8px 10px;
+    font-size: 12.5px;
+    min-width: 170px;
+    display: none;
+    z-index: 5;
+}
+.chart-tip__title { color: var(--ink-soft); margin-bottom: 4px; }
+.chart-tip__row { display: flex; align-items: center; gap: 6px; }
+.chart-tip__row b { margin-left: auto; font-variant-numeric: tabular-nums; }
+.chart-tip__key { width: 12px; height: 2px; display: inline-block; }
+
+.two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+@media (max-width: 900px) { .two-col { grid-template-columns: 1fr; } }
+
+.check-list { margin: 0; padding-left: 18px; font-size: 13.5px; }
+.check-list li { margin-bottom: 4px; }
+details.table-view summary { cursor: pointer; font-size: 13px; color: var(--accent); margin-top: 8px; }
+.inline-form { display: inline; }
+.btn-danger { color: var(--bad); border-color: var(--bad); }
+.status-line { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }

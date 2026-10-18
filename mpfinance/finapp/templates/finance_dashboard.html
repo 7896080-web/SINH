@@ -1,0 +1,261 @@
+{% extends "base.html" %}
+{% from "finance_macros.html" import period_filter, money, platform_badge %}
+{% block title %}Дашборд площадок{% endblock %}
+{% block content %}
+
+<div class="page-header">
+    <div>
+        <h1>Дашборд площадок</h1>
+        <p>По загруженным отчётам площадок за {{ d_from.strftime('%d.%m.%Y') }} — {{ d_to.strftime('%d.%m.%Y') }}
+           (по дате операции в отчёте)</p>
+    </div>
+    <div class="toolbar">
+        <a class="btn" href="/finance/reports">Загрузить отчёт</a>
+    </div>
+</div>
+
+{{ period_filter('/finance', preset, presets, d_from, d_to) }}
+
+{% if not total %}
+<div class="card empty-state">
+    За этот период нет ни одного загруженного отчёта площадки.
+    <div class="help-text">Отчёты загружаются на странице <a href="/finance/reports">«Отчёты площадок»</a>:
+        детализация WB, отчёт Lamoda, отчёт Яндекс KIT или заполненная единая форма.</div>
+</div>
+{% else %}
+
+<div class="kpi-row">
+    <div class="kpi">
+        <div class="kpi__label">Выручка</div>
+        <div class="kpi__value">{{ money(total.revenue, true) }}</div>
+        <div class="kpi__note">продано {{ total.sold_qty }} шт, возвратов {{ total.returned_qty }}</div>
+    </div>
+    <div class="kpi">
+        <div class="kpi__label">К перечислению от площадок</div>
+        <div class="kpi__value">{{ money(total.total_payout, true) }}</div>
+        <div class="kpi__note">расходы площадок {{ total.platform_cost_share | pct }} выручки</div>
+    </div>
+    <div class="kpi">
+        <div class="kpi__label">Прибыль</div>
+        <div class="kpi__value">{{ money(total.profit, true) }}</div>
+        <div class="kpi__note">после себестоимости, налога и доп. расходов</div>
+    </div>
+    <div class="kpi">
+        <div class="kpi__label">Маржинальность</div>
+        <div class="kpi__value">{{ total.margin | pct }}</div>
+        <div class="kpi__note">ROI {{ total.roi | pct }}</div>
+    </div>
+    <div class="kpi">
+        <div class="kpi__label">Доля возвратов</div>
+        <div class="kpi__value">{{ total.return_rate | pct }}</div>
+        <div class="kpi__note">чистые продажи {{ total.net_qty }} шт</div>
+    </div>
+</div>
+
+{% if total.cost_missing_qty or total.unmatched_lines or not_in_1c %}
+<div class="card">
+    <h2 style="margin-top:0; font-size:15px;">Что искажает цифры</h2>
+    <ul class="check-list">
+        {% if total.cost_missing_qty %}
+        <li><span class="badge badge--warn">себестоимость</span>
+            Продано {{ total.cost_missing_qty }} шт без себестоимости — прибыль по ним завышена.
+            <a href="/finance/costs?missing=true">Заполнить себестоимость</a></li>
+        {% endif %}
+        {% if total.unmatched_lines %}
+        <li><span class="badge badge--warn">мэппинг</span>
+            Строк продаж/возвратов без товара 1С: {{ total.unmatched_lines }} — себестоимость к ним не
+            подставится, в 1С такие отчёты не отправляются. Привяжите баркоды в «Мэппинге» Sync Admin.</li>
+        {% endif %}
+        {% if not_in_1c %}
+        <li><span class="badge badge--warn">1С</span>
+            Отчётов за период, не загруженных в 1С: {{ not_in_1c }} из {{ reports_in_period }}.
+            <a href="/finance/reports">Отчёты площадок</a></li>
+        {% endif %}
+    </ul>
+</div>
+{% endif %}
+
+<div class="platform-grid">
+    {% for p in platforms %}{% set t = summary[p] %}
+    <div class="card platform-card" style="margin-bottom:0;">
+        <h3><span class="swatch" style="background: {{ platform_colors[p] }};"></span>{{ platform_labels[p] }}</h3>
+        <dl>
+            <dt>Выручка</dt><dd>{{ money(t.revenue, true) }}</dd>
+            <dt>К перечислению</dt><dd>{{ money(t.total_payout, true) }}</dd>
+            <dt>Прибыль</dt><dd>{{ money(t.profit, true) }}</dd>
+            <dt>Маржинальность</dt><dd>{{ t.margin | pct }}</dd>
+            <dt>Продано / возвраты</dt><dd>{{ t.sold_qty }} / {{ t.returned_qty }} шт</dd>
+            <dt>Прибыль на единицу</dt><dd>{{ money(t.profit_per_unit, true) }}</dd>
+        </dl>
+        <div class="help-text" style="margin-top:10px;">Расходы площадки — {{ t.platform_cost_share | pct }} выручки</div>
+        <div class="meter" role="img" aria-label="Расходы площадки {{ t.platform_cost_share | pct }} выручки">
+            <div class="meter__fill" style="width: {{ meter_width(t.platform_cost_share) }}%;"></div>
+        </div>
+    </div>
+    {% endfor %}
+</div>
+
+{% if chart %}
+<div class="card">
+    <h2 style="margin-top:0; font-size:15px;">Выручка по {{ 'неделям' if bucket == 'week' else 'месяцам' }}</h2>
+    <div class="legend">
+        {% for p in platforms %}<span><span class="swatch" style="background: {{ platform_colors[p] }};"></span>{{ platform_labels[p] }}</span>{% endfor %}
+    </div>
+    <div class="chart-wrap" id="revenue-chart">
+        <svg viewBox="0 0 {{ chart.width }} {{ chart.height }}" role="img"
+             aria-label="Выручка по {{ 'неделям' if bucket == 'week' else 'месяцам' }}, столбики с накоплением по площадкам">
+            {% for tick in chart.ticks %}
+            <line class="{{ 'chart-axis' if loop.first else 'chart-grid' }}" x1="{{ chart.pad_left }}" x2="{{ chart.width - chart.pad_right }}" y1="{{ tick.y }}" y2="{{ tick.y }}"></line>
+            <text class="chart-label" x="{{ chart.pad_left - 8 }}" y="{{ tick.y + 4 }}" text-anchor="end">{{ tick.label }}</text>
+            {% endfor %}
+            {% for col in chart.columns %}
+                {% for seg in col.segments %}<path d="{{ seg.path }}" fill="{{ seg.color }}"></path>{% endfor %}
+                {% if loop.index0 % chart.label_every == 0 %}
+                <text class="chart-label" x="{{ col.cx }}" y="{{ chart.label_y }}" text-anchor="middle">{{ col.label }}</text>
+                {% endif %}
+                <rect class="chart-hit" tabindex="0" x="{{ col.hit_x }}" y="0" width="{{ col.hit_w }}" height="{{ chart.baseline }}"
+                      data-title="{{ ('Неделя с ' ~ col.start.strftime('%d.%m.%Y')) if bucket == 'week' else ('Месяц ' ~ col.start.strftime('%m.%Y')) }}"
+                      data-rows="{% for p in platforms %}{% if p in col.values %}{{ p }}={{ col.values[p] | rub_short }};{% endif %}{% endfor %}"
+                      data-total="{{ col.total | rub_short }}"></rect>
+            {% endfor %}
+        </svg>
+        <div class="chart-tip" id="revenue-tip"></div>
+    </div>
+    <details class="table-view">
+        <summary>Таблица с теми же числами</summary>
+        <table>
+            <thead><tr><th>Период</th><th>Площадка</th><th class="num">Выручка</th><th class="num">К перечислению</th><th class="num">Прибыль</th></tr></thead>
+            <tbody>
+            {% for start, p, t in trend_rows %}
+            <tr><td class="mono">{{ start.strftime('%d.%m.%Y') }}</td><td>{{ platform_labels.get(p, p) }}</td>
+                <td class="num">{{ money(t.revenue) }}</td><td class="num">{{ money(t.total_payout) }}</td><td class="num">{{ money(t.profit) }}</td></tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </details>
+</div>
+{% endif %}
+
+<div class="card">
+    <h2 style="margin-top:0; font-size:15px;">Куда уходит выручка</h2>
+    <div class="table-scroll">
+    <table>
+        <thead>
+            <tr>
+                <th>Площадка</th><th class="num">Выручка</th><th class="num">Комиссия</th><th class="num">Логистика</th>
+                <th class="num">Хранение</th><th class="num">Штрафы и удержания</th><th class="num">Себестоимость</th>
+                <th class="num">Налог и доп. расходы</th><th class="num">Прибыль</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for p in platforms %}{% set t = summary[p] %}
+        <tr>
+            <td>{{ platform_badge(p, platform_labels, platform_colors) }}</td>
+            <td class="num">{{ money(t.revenue, true) }}</td>
+            {% for part in [t.commission, t.logistics, t.storage, t.other_costs, t.cogs, t.tax + t.extra, t.profit] %}
+            <td class="num">{{ money(part, true) }}<div class="help-text">{{ ((part / t.revenue) if t.revenue > 0 else none) | pct }}</div></td>
+            {% endfor %}
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    </div>
+    <p class="help-text">Налог: {{ tax_modes[settings.tax_mode] }}{% if settings.tax_mode != 'none' %}, {{ settings.tax_rate }} %{% endif %}.
+       Настраивается на странице <a href="/finance/costs#settings">«Себестоимость»</a>.</p>
+</div>
+
+<div class="two-col">
+    <div class="card">
+        <h2 style="margin-top:0; font-size:15px;">Самые прибыльные артикулы</h2>
+        {% if top %}
+        <table>
+            <thead><tr><th>Артикул</th><th class="num">Шт</th><th class="num">Прибыль</th><th class="num">Маржа</th></tr></thead>
+            <tbody>
+            {% for g in top %}
+            <tr><td>{{ g.article or '—' }}<div class="help-text">{{ g.title }}</div></td>
+                <td class="num">{{ g.totals.net_qty }}</td><td class="num">{{ money(g.totals.profit, true) }}</td>
+                <td class="num">{{ g.totals.margin | pct }}</td></tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        {% else %}<div class="empty-state">Прибыльных позиций за период нет.</div>{% endif %}
+    </div>
+    <div class="card">
+        <h2 style="margin-top:0; font-size:15px;">Убыточные артикулы</h2>
+        {% if losers %}
+        <table>
+            <thead><tr><th>Артикул</th><th class="num">Шт</th><th class="num">Убыток</th><th class="num">Маржа</th></tr></thead>
+            <tbody>
+            {% for g in losers %}
+            <tr><td>{{ g.article or '—' }}<div class="help-text">{{ g.title }}</div></td>
+                <td class="num">{{ g.totals.net_qty }}</td><td class="num">{{ money(g.totals.profit, true) }}</td>
+                <td class="num">{{ g.totals.margin | pct }}</td></tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        {% else %}<div class="empty-state">Убыточных позиций за период нет.</div>{% endif %}
+        <p class="help-text"><a href="/finance/unit-economics?date_from={{ d_from.isoformat() }}&date_to={{ d_to.isoformat() }}">Вся юнит-экономика →</a></p>
+    </div>
+</div>
+
+{% endif %}
+
+{% if chart %}
+<script>
+(function () {
+    var wrap = document.getElementById('revenue-chart');
+    var tip = document.getElementById('revenue-tip');
+    if (!wrap || !tip) { return; }
+    var labels = {{ platform_labels | tojson }};
+    var colors = {{ platform_colors | tojson }};
+    function show(target, x, y) {
+        // Подписи — только через textContent: в них данные из отчётов.
+        tip.textContent = '';
+        var title = document.createElement('div');
+        title.className = 'chart-tip__title';
+        title.textContent = target.getAttribute('data-title');
+        tip.appendChild(title);
+        (target.getAttribute('data-rows') || '').split(';').forEach(function (pair) {
+            if (!pair) { return; }
+            var parts = pair.split('=');
+            var row = document.createElement('div');
+            row.className = 'chart-tip__row';
+            var key = document.createElement('span');
+            key.className = 'chart-tip__key';
+            key.style.background = colors[parts[0]] || '#898781';
+            var name = document.createElement('span');
+            name.textContent = labels[parts[0]] || parts[0];
+            var value = document.createElement('b');
+            value.textContent = parts.slice(1).join('=');
+            row.appendChild(key); row.appendChild(name); row.appendChild(value);
+            tip.appendChild(row);
+        });
+        var total = document.createElement('div');
+        total.className = 'chart-tip__row';
+        total.style.marginTop = '4px';
+        var totalName = document.createElement('span');
+        totalName.textContent = 'Всего';
+        var totalValue = document.createElement('b');
+        totalValue.textContent = target.getAttribute('data-total');
+        total.appendChild(totalName); total.appendChild(totalValue);
+        tip.appendChild(total);
+        tip.style.display = 'block';
+        var box = wrap.getBoundingClientRect();
+        var left = Math.min(x - box.left + 12, box.width - tip.offsetWidth - 4);
+        tip.style.left = Math.max(left, 0) + 'px';
+        tip.style.top = Math.max(y - box.top - tip.offsetHeight - 8, 0) + 'px';
+    }
+    wrap.querySelectorAll('.chart-hit').forEach(function (hit) {
+        hit.addEventListener('pointermove', function (e) { show(hit, e.clientX, e.clientY); });
+        hit.addEventListener('pointerleave', function () { tip.style.display = 'none'; });
+        hit.addEventListener('focus', function () {
+            var r = hit.getBoundingClientRect();
+            show(hit, r.left + r.width / 2, r.top + 40);
+        });
+        hit.addEventListener('blur', function () { tip.style.display = 'none'; });
+    });
+})();
+</script>
+{% endif %}
+
+{% endblock %}

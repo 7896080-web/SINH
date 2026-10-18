@@ -1,0 +1,137 @@
+{% extends "base.html" %}
+{% from "finance_macros.html" import period_filter, money %}
+{% block title %}Юнит-экономика{% endblock %}
+{% block content %}
+
+{% set query = '&platform=' ~ platform ~ '&group_by=' ~ group_by ~ ('&account_id=' ~ account_id if account_id else '') ~ ('&allocate=true' if allocate else '') %}
+
+<div class="page-header">
+    <div>
+        <h1>Юнит-экономика</h1>
+        <p>Прибыль на единицу и маржинальность {{ groups[group_by] }} за {{ d_from.strftime('%d.%m.%Y') }} — {{ d_to.strftime('%d.%m.%Y') }}</p>
+    </div>
+    <div class="toolbar">
+        <a class="btn" href="/finance/unit-economics/export?date_from={{ d_from.isoformat() }}&date_to={{ d_to.isoformat() }}{{ query }}">Экспорт в Excel</a>
+    </div>
+</div>
+
+{% call period_filter('/finance/unit-economics', preset, presets, d_from, d_to, query) %}
+    <div class="field">
+        <label for="platform">Площадка</label>
+        <select id="platform" name="platform">
+            <option value="">Все</option>
+            {% for p in platforms %}<option value="{{ p }}" {% if platform == p %}selected{% endif %}>{{ platform_labels[p] }}</option>{% endfor %}
+        </select>
+    </div>
+    <div class="field">
+        <label for="account_id">Кабинет</label>
+        <select id="account_id" name="account_id">
+            <option value="">Все</option>
+            {% for a in accounts %}<option value="{{ a.id }}" {% if account_id == a.id %}selected{% endif %}>{{ platform_labels[a.platform] }} · {{ a.name }}</option>{% endfor %}
+        </select>
+    </div>
+    <div class="field">
+        <label for="group_by">Группировка</label>
+        <select id="group_by" name="group_by">
+            {% for code, label in groups.items() %}<option value="{{ code }}" {% if group_by == code %}selected{% endif %}>{{ label }}</option>{% endfor %}
+        </select>
+    </div>
+    <div class="field">
+        <label>&nbsp;</label>
+        <label class="checkbox-inline"><input type="checkbox" name="allocate" value="true" {% if allocate %}checked{% endif %}>
+            Распределить общие расходы по выручке</label>
+    </div>
+{% endcall %}
+
+<p class="help-text">
+    Прибыль = к перечислению − себестоимость − доп. расходы ({{ settings.extra_cost_kop | rub }} ₽/шт) − налог
+    ({{ tax_modes[settings.tax_mode] }}{% if settings.tax_mode != 'none' %}, {{ settings.tax_rate }} %{% endif %}).
+    Себестоимость берётся на дату операции. <a href="/finance/costs#settings">Настройки</a>
+</p>
+
+{% if rows or unassigned.total_payout %}
+<div class="card" style="padding:0;">
+    <div class="table-scroll">
+    <table>
+        <thead>
+            <tr>
+                <th style="min-width:220px;">Товар</th>
+                <th class="num">Продано</th>
+                <th class="num">Возвр.</th>
+                <th class="num">Выручка</th>
+                <th class="num">Комиссия</th>
+                <th class="num">Логистика</th>
+                <th class="num">Хранение и прочее</th>
+                <th class="num">К перечислению</th>
+                <th class="num">Себестоимость</th>
+                <th class="num">Налог и доп.</th>
+                <th class="num">Прибыль</th>
+                <th class="num">Маржа</th>
+                <th class="num">ROI</th>
+                <th class="num">Прибыль / шт</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for g in rows %}{% set t = g.totals %}
+        <tr>
+            <td>
+                <div>{{ g.article or '—' }}{% if group_by == 'sku' and (g.size or g.color) %} · {{ g.size }}{% if g.color %} · {{ g.color }}{% endif %}{% endif %}</div>
+                <div class="help-text">{{ g.title or '' }}
+                    {% for p in g.platforms | sort %}<span class="swatch" title="{{ platform_labels.get(p, p) }}" style="background: {{ platform_colors.get(p, '#898781') }}; margin-left:4px;"></span>{% endfor %}
+                </div>
+                {% if not g.matched %}<span class="badge badge--warn">нет в 1С</span>{% endif %}
+                {% if t.cost_missing_qty %}<span class="badge badge--warn">без себестоимости: {{ t.cost_missing_qty }} шт</span>{% endif %}
+            </td>
+            <td class="num">{{ t.sold_qty }}</td>
+            <td class="num">{{ t.returned_qty }}<div class="help-text">{{ t.return_rate | pct(0) }}</div></td>
+            <td class="num">{{ money(t.revenue, true) }}</td>
+            <td class="num">{{ money(t.commission, true) }}</td>
+            <td class="num">{{ money(t.logistics, true) }}</td>
+            <td class="num">{{ money(t.storage + t.other_costs, true) }}</td>
+            <td class="num">{{ money(t.total_payout, true) }}</td>
+            <td class="num">{{ money(t.cogs, true) }}</td>
+            <td class="num">{{ money(t.tax + t.extra, true) }}</td>
+            <td class="num"><b>{{ money(t.profit, true) }}</b></td>
+            <td class="num">{{ t.margin | pct }}</td>
+            <td class="num">{{ t.roi | pct(0) }}</td>
+            <td class="num">{{ money(t.profit_per_unit, true) }}</td>
+        </tr>
+        {% endfor %}
+        {% if not allocated and (unassigned.total_payout or unassigned.revenue) %}{% set t = unassigned %}
+        <tr class="row--sub">
+            <td>Не привязано к товару
+                <div class="help-text">хранение, удержания без баркода</div></td>
+            <td class="num">{{ t.sold_qty or '' }}</td><td class="num">{{ t.returned_qty or '' }}</td>
+            <td class="num">{{ money(t.revenue, true) }}</td><td class="num">{{ money(t.commission, true) }}</td>
+            <td class="num">{{ money(t.logistics, true) }}</td><td class="num">{{ money(t.storage + t.other_costs, true) }}</td>
+            <td class="num">{{ money(t.total_payout, true) }}</td><td class="num">{{ money(t.cogs, true) }}</td>
+            <td class="num">{{ money(t.tax + t.extra, true) }}</td><td class="num">{{ money(t.profit, true) }}</td>
+            <td></td><td></td><td></td>
+        </tr>
+        {% endif %}
+        {% set t = total %}
+        <tr class="row--total">
+            <td>Итого</td>
+            <td class="num">{{ t.sold_qty }}</td><td class="num">{{ t.returned_qty }}<div class="help-text">{{ t.return_rate | pct(0) }}</div></td>
+            <td class="num">{{ money(t.revenue, true) }}</td><td class="num">{{ money(t.commission, true) }}</td>
+            <td class="num">{{ money(t.logistics, true) }}</td><td class="num">{{ money(t.storage + t.other_costs, true) }}</td>
+            <td class="num">{{ money(t.total_payout, true) }}</td><td class="num">{{ money(t.cogs, true) }}</td>
+            <td class="num">{{ money(t.tax + t.extra, true) }}</td><td class="num">{{ money(t.profit, true) }}</td>
+            <td class="num">{{ t.margin | pct }}</td><td class="num">{{ t.roi | pct(0) }}</td>
+            <td class="num">{{ money(t.profit_per_unit, true) }}</td>
+        </tr>
+        </tbody>
+    </table>
+    </div>
+</div>
+<p class="help-text">Суммы в таблице округлены до рубля, точные — в выгрузке в Excel.
+   «Не привязано к товару» можно разнести по позициям пропорционально выручке — галочкой в фильтре.</p>
+{% if total.cost_missing_qty %}
+<p class="help-text"><span class="badge badge--warn">внимание</span> Продано {{ total.cost_missing_qty }} шт без себестоимости —
+   прибыль и ROI по ним завышены. <a href="/finance/costs?missing=true">Заполнить себестоимость</a></p>
+{% endif %}
+{% else %}
+<div class="card empty-state">За выбранный период и отбор строк отчётов нет.</div>
+{% endif %}
+
+{% endblock %}

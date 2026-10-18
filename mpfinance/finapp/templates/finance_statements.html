@@ -1,0 +1,94 @@
+{% extends "base.html" %}
+{% from "finance_macros.html" import money %}
+{% block title %}Сверка со сводом WB{% endblock %}
+{% block content %}
+
+<div class="page-header">
+    <div>
+        <h1>Сверка со сводом WB</h1>
+        <p>Каждый ли отчёт WB загружен и сходится ли итог его строк с «Итого к оплате» WB</p>
+    </div>
+</div>
+
+<div class="card">
+    <p class="help-text" style="margin-top:0;">
+        Свод — список финансовых отчётов WB с итогами. Обновляется сам при каждой загрузке отчётов по API;
+        можно загрузить и файлом: кабинет WB → «Финансовые отчёты» → выгрузить список (колонки «№ отчета»,
+        «Дата начала», «Дата конца», «Итого к оплате» и статьи удержаний). Отчёт сопоставляется со сводом
+        по номеру; отчёту без «Итого к оплате» сумма WB подставляется из свода.
+    </p>
+    <form method="post" action="/finance/statements/upload" enctype="multipart/form-data" class="filters" style="margin:0;">
+        <div class="field">
+            <label>Кабинет WB</label>
+            <select name="account_id">
+                <option value="">— не указан —</option>
+                {% for a in wb_accounts %}<option value="{{ a.id }}">{{ a.name }}</option>{% endfor %}
+            </select>
+        </div>
+        <div class="field"><label>Файл свода (.xlsx)</label><input type="file" name="file" accept=".xlsx,.zip" required></div>
+        <div class="field"><label>&nbsp;</label><button type="submit" class="btn btn-primary">Загрузить свод</button></div>
+    </form>
+</div>
+
+{% if total_rows %}
+<div class="kpi-row">
+    <div class="kpi"><div class="kpi__label">Отчётов в своде</div><div class="kpi__value">{{ total_rows }}</div></div>
+    <div class="kpi"><div class="kpi__label">Сходятся</div><div class="kpi__value">{{ counts.ok }}</div></div>
+    <div class="kpi"><div class="kpi__label">Расходятся</div><div class="kpi__value">{{ counts.diff }}</div></div>
+    <div class="kpi"><div class="kpi__label">Не загружены</div><div class="kpi__value">{{ counts.missing }}</div></div>
+</div>
+<div class="card">
+    <table style="max-width:720px;">
+        <tbody>
+            <tr><td>«Итого к оплате» по своду, всего</td><td class="num">{{ money(totals.wb) }}</td></tr>
+            <tr><td>то же — по загруженным отчётам</td><td class="num">{{ money(totals.wb_loaded) }}</td></tr>
+            <tr><td>Итог строк загруженных отчётов</td><td class="num">{{ money(totals.ours) }}</td></tr>
+            <tr><td>Разница</td><td class="num"><b>{{ money(totals.ours - totals.wb_loaded) }}</b></td></tr>
+        </tbody>
+    </table>
+</div>
+{% endif %}
+
+<form method="get" action="/finance/statements" class="filters">
+    <div class="field">
+        <label>Показать</label>
+        <select name="status">{% for key, label in statuses.items() %}<option value="{{ key }}" {% if status == key %}selected{% endif %}>{{ label }}</option>{% endfor %}</select>
+    </div>
+    <div class="field">
+        <label>Год</label>
+        <select name="year"><option value="">все</option>{% for y in years %}<option value="{{ y }}" {% if year == y|string %}selected{% endif %}>{{ y }}</option>{% endfor %}</select>
+    </div>
+    <div class="field"><label>&nbsp;</label><button type="submit" class="btn">Показать</button></div>
+</form>
+
+<div class="card" style="padding:0;">
+    {% if rows %}
+    <div class="table-scroll">
+    <table>
+        <thead><tr><th>№ отчёта</th><th>Период</th><th>Тип</th><th class="num">Итого к оплате WB</th><th class="num">Итог строк</th><th class="num">Разница</th><th>Сверка</th></tr></thead>
+        <tbody>
+        {% for r in rows %}{% set s = r.statement %}
+        <tr>
+            <td class="mono">{{ s.report_number }}<div class="help-text">{{ 'API' if s.source == 'api' else 'файл' }}{% if s.account %} · {{ s.account.name }}{% endif %}</div></td>
+            <td class="mono">{{ s.period_from.strftime('%d.%m.%Y') }} — {{ s.period_to.strftime('%d.%m.%Y') }}</td>
+            <td>{{ s.report_kind or '—' }}</td>
+            <td class="num">{{ money(s.total_kop) }}</td>
+            <td class="num">{% if r.report %}{{ money(r.ours.total_kop) }}{% else %}—{% endif %}</td>
+            <td class="num">{% if r.report %}{{ money(r.diff) }}{% endif %}</td>
+            <td>
+                {% if r.status == 'missing' %}<span class="badge badge--warn">не загружен</span>
+                {% elif r.status == 'ok' %}<span class="badge badge--good">сходится</span> <a href="/finance/reports/{{ r.report.id }}">отчёт</a>
+                {% else %}<span class="badge badge--bad">расходится</span> <a href="/finance/reports/{{ r.report.id }}">отчёт</a>
+                    {% for label, theirs, ours in r.bucket_diffs() %}<div class="help-text">{{ label }}: WB {{ money(theirs) }}, у нас {{ money(ours) }}</div>{% endfor %}
+                {% endif %}
+            </td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    </div>
+    {% else %}
+    <div class="empty-state">{% if total_rows %}Под фильтр ничего не попало.{% else %}Свода ещё нет — загрузите его файлом или запустите загрузку отчётов WB по API.{% endif %}</div>
+    {% endif %}
+</div>
+{% endblock %}
