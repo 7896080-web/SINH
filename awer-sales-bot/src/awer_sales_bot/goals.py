@@ -17,7 +17,7 @@ from .db import DB
 # показатель: (название, больше — лучше, тема урока)
 METRICS = {
     "upt": ("вещей в чеке", True, "items"),
-    "items_per_shift": ("вещей за смену", True, "items"),
+    "items_per_shift": ("вещей за рабочий день", True, "items"),
     "avg_price": ("средняя цена вещи", True, "avg_price"),
     "discount_share": ("доля скидок", False, "discount"),
 }

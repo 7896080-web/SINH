@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import date, timedelta
 
 from . import achievements, goals
+from .achievements import plural
 from . import metrics as M
 from .config import Settings
 from .db import DB
@@ -53,21 +54,21 @@ def daily(db: DB, cfg: Settings, sid: int, day: date) -> str:
     L += [f"🏅 {a.text}" for a in achievements.for_day(db, cfg, sid, day, st.plan_full)]
     L.append("")
     if st.plan_month:
-        L += [f"**Ваш план на {MONTHS[day.month]}**, смен {st.worked} из {st.planned_shifts}:",
+        L += [f"**Ваш план на {MONTHS[day.month]}**, рабочих дней {st.worked} из {st.planned_shifts}:",
               f"Продано {rub(st.sales)} — {pct(st.sales / st.plan_month)} плана месяца",
               f"Базовый план: {rub(st.plan_month)}"]
         if st.to_base:
-            per = f" (≈ {rub(st.per_shift_needed_base)} за смену)" if st.per_shift_needed_base else ""
+            per = f" (≈ {rub(st.per_shift_needed_base)} в рабочий день)" if st.per_shift_needed_base else ""
             L.append(f"До базы осталось: **{rub(st.to_base)}**{per}")
         else:
             L.append("Базовый план выполнен ✅")
         if st.next_level and st.to_next is not None:
-            per = f" (≈ {rub(st.per_shift_needed_next)} за смену)" if st.per_shift_needed_next else ""
+            per = f" (≈ {rub(st.per_shift_needed_next)} в рабочий день)" if st.per_shift_needed_next else ""
             L.append(f"До ступени {pct(st.next_level)} (ставка {rub(st.next_rate)}): **{rub(st.to_next)}**{per}")
         elif st.plan_month:
             L.append("Максимальная ступень достигнута 🏆")
         if st.pace_per_shift:
-            L.append(f"Ваш темп: {rub(st.pace_per_shift)} за смену → выполнение {pct(st.performance)}, "
+            L.append(f"Ваш темп: {rub(st.pace_per_shift)} за рабочий день → выполнение {pct(st.performance)}, "
                      f"ставка по итогам месяца при таком темпе {rub(st.projected_rate)}")
     else:
         L.append("План на месяц ещё не рассчитан — уточните у администратора.")
@@ -76,12 +77,12 @@ def daily(db: DB, cfg: Settings, sid: int, day: date) -> str:
         L += [""] + gl
     shop_m = M.store(db, day.replace(day=1), day)
     L += ["", "**Ваши показатели с начала месяца** (вы / команда):",
-          f"Продажи за смену: {rub(mtd.per_shift)} / {rub(tm.per_shift)}"]
+          f"Продажи за рабочий день: {rub(mtd.per_shift)} / {rub(tm.per_shift)}"]
     if mtd.has_receipts:
         L += [f"Средний чек: {rub(mtd.avg_check)} / {rub(tm.avg_check)}",
               f"Вещей в чеке: {d1(mtd.upt)} / {d1(tm.upt)}"]
     else:
-        L += [f"Вещей за смену: {d1(mtd.items_per_shift)} / {d1(tm.items_per_shift)}",
+        L += [f"Вещей за рабочий день: {d1(mtd.items_per_shift)} / {d1(tm.items_per_shift)}",
               f"Средняя цена вещи: {rub(mtd.avg_price)} / {rub(tm.avg_price)}"]
         if mtd.card_purchases or tm.card_purchases:
             L.append(f"Покупка клиента с картой: {rub(mtd.card_avg)} / {rub(tm.card_avg)}, "
@@ -135,7 +136,7 @@ def month_start(db: DB, cfg: Settings, sid: int, month: str) -> str:
     planned = db.planned_shifts(sid, month) or cfg.norm_shifts
     k = planned / cfg.norm_shifts
     admin = s["role"] == "admin"
-    L = [f"{s['first_name'] or s['name']}, ваш план на {MONTHS[int(month[5:])]} ({planned} смен):", ""]
+    L = [f"{s['first_name'] or s['name']}, ваш план на {MONTHS[int(month[5:])]} ({planned} {plural(planned, 'рабочий день', 'рабочих дня', 'рабочих дней')}):", ""]
     for amount, rate in threshold_amounts(r["plan_full"], p):
         lvl = round(amount / r["plan_full"] * 100)
         add = f" + {rub(p.admin_bonus)} админ." if admin else ""
@@ -146,7 +147,7 @@ def month_start(db: DB, cfg: Settings, sid: int, month: str) -> str:
 
 def month_result(row: dict) -> str:
     return (f"Итоги месяца: продажи {rub(row['sales'])}, выполнение плана {pct(row['performance'])}, "
-            f"ставка {rub(row['rate'])} (за полный месяц; при неполном — пропорционально сменам).")
+            f"ставка {rub(row['rate'])} (за полный месяц; при неполном — пропорционально рабочим дням).")
 
 
 def owner_summary(db: DB, cfg: Settings, day: date) -> str:
@@ -164,11 +165,11 @@ def owner_summary(db: DB, cfg: Settings, day: date) -> str:
          *store_goal(db, cfg, day), ""]
     for name, st, m in sorted(rows, key=lambda x: -(x[1].performance or 0)):
         q = (f"чек {rub(m.avg_check)} · {d1(m.upt)} вещ./чек" if m.has_receipts
-             else f"{d1(m.items_per_shift)} вещ./смену · цена вещи {rub(m.avg_price)}")
+             else f"{d1(m.items_per_shift)} вещ./день · цена вещи {rub(m.avg_price)}")
         manual = f" · ручные скидки {rub(m.manual_discount)}" if m.manual_discount else ""
         cards = f" · по картам {pct(m.card_share)}" if m.card_purchases else ""
         L.append(f"{name}: {rub(st.sales)} · выполнение {pct(st.performance)} · ставка "
-                 f"{rub(st.projected_rate or st.current_rate)} · за смену {rub(m.per_shift)} · {q}{manual}{cards}")
+                 f"{rub(st.projected_rate or st.current_rate)} · за день {rub(m.per_shift)} · {q}{manual}{cards}")
     good = achievements.praise(db, cfg, day)
     if good:
         L += ["", "👏 **Кого похвалить:**"] + [f"{name} — {'; '.join(why)}" for _, name, why in good]

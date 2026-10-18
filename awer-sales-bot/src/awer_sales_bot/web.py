@@ -70,7 +70,7 @@ def create_app(cfg: Settings, db: DB) -> FastAPI:
     def page(title: str, body: str) -> HTMLResponse:
         cur = date.today().strftime("%Y-%m")
         nav = (f'<nav><a href="/month/{cur}">Настройки месяца</a><a href="/sellers">Продавцы</a>'
-               f'<a href="/schedule/{cur}">График смен</a><a href="/month/{cur}/results">Итоги и ведомость</a></nav>')
+               f'<a href="/schedule/{cur}">График работы</a><a href="/month/{cur}/results">Итоги и ведомость</a></nav>')
         return HTMLResponse(f"<!doctype html><html lang=ru><head><meta charset=utf-8><title>{title}</title>"
                             f"<style>{CSS}</style></head><body>{nav}<h1>{title}</h1>{body}</body></html>")
 
@@ -123,7 +123,7 @@ def create_app(cfg: Settings, db: DB) -> FastAPI:
              '</table>',
              f'<form method=post action="/month/{month}/plans"><h2>Личные планы (на полный месяц)</h2><table>',
              '<tr><th>Продавец</th><th>Роль</th><th>Уровень 3 мес.</th><th>План расчёт</th><th>План вручную</th>'
-             f'<th>План итог</th><th>+{p.step:.0%} → ставка</th><th>Факт с 1-го</th><th>Выполн. (на смену)</th><th>Ставка сейчас</th></tr>']
+             f'<th>План итог</th><th>+{p.step:.0%} → ставка</th><th>Факт с 1-го</th><th>Выполн. (за рабочий день)</th><th>Ставка сейчас</th></tr>']
         for r in mp.rows:
             st = service.status(db, cfg, r.seller_id, today) if today.strftime("%Y-%m") == month else None
             th = threshold_amounts(r.plan_final, p, 1)[1] if r.plan_final else None
@@ -237,11 +237,11 @@ def create_app(cfg: Settings, db: DB) -> FastAPI:
         b = [f'<p><a href="/schedule/{month_add(month, -1)}">← {month_add(month, -1)}</a> · '
              f'<a href="/schedule/{month_add(month, 1)}">{month_add(month, 1)} →</a></p>',
              f'<p class=note>{html.escape(msg)}</p>' if msg else "",
-             f'<p class=note>Норма — {norm} смен в месяц. Отработанной считается смена, в которую у продавца есть продажи '
-             'в 1С: если кто-то вышел на замену, бот учтёт это сам. График нужен, чтобы знать смены впереди — от них '
-             'считается «до базы» в утреннем сообщении.</p>',
+             f'<p class=note>Норма — {norm} рабочих дней в месяц. Отработанным считается день, в который у продавца есть '
+             'продажи в 1С: если кто-то вышел на замену, бот учтёт это сам. График нужен, чтобы знать рабочие дни '
+             'впереди — от них считается «до базы» в утреннем сообщении.</p>',
              f'<form method=post action="/schedule/{month}"><table class=grid>'
-             f'<tr><th>Продавец</th>{head}<th>Смен</th><th>Заполнить по схеме</th></tr>']
+             f'<tr><th>Продавец</th>{head}<th>Дней</th><th>Заполнить по схеме</th></tr>']
         for s in db.sellers():
             sid, mine = s["id"], days.get(s["id"], set())
             cells = "".join(f'<td class="{"we" if date(y, mo, d).weekday() >= 5 else ""}"><input type=checkbox '
@@ -263,7 +263,7 @@ def create_app(cfg: Settings, db: DB) -> FastAPI:
                  'document.querySelectorAll(`input[data-s="${s}"]`).forEach(x=>{const d=+x.dataset.d;'
                  'x.checked=!clear&&d>=k&&((d-k)%(on+off))<on;});cnt(s);}'
                  'document.addEventListener("change",e=>{if(e.target.dataset.s)cnt(e.target.dataset.s);});</script>')
-        return page(f"График смен {month}", "".join(b))
+        return page(f"График работы {month}", "".join(b))
 
     @app.post("/schedule/{month}", dependencies=[Depends(auth)])
     async def schedule_save(month: str, request: Request):
@@ -307,7 +307,7 @@ def create_app(cfg: Settings, db: DB) -> FastAPI:
              '<form method=post action="/sellers">',
              f'<h2>Ждут подключения к боту ({len(waiting)})</h2>']
         if waiting:
-            b.append('<table><tr><th>Продавец (как в 1С)</th><th>Обращение</th><th>Роль</th><th>Первая смена</th>'
+            b.append('<table><tr><th>Продавец (как в 1С)</th><th>Обращение</th><th>Роль</th><th>Первый рабочий день</th>'
                      '<th>Код</th><th></th></tr>')
             for s in waiting:
                 first, _ = db.shift_range(s["id"])
@@ -322,7 +322,7 @@ def create_app(cfg: Settings, db: DB) -> FastAPI:
             b.append('<p class=note>Все работающие продавцы подключены.</p>')
         b.append(f'<h2>Работают ({len(working)})</h2>')
         if working:
-            b.append('<table><tr><th>Продавец (как в 1С)</th><th>Обращение</th><th>Роль</th><th>Последняя смена</th>'
+            b.append('<table><tr><th>Продавец (как в 1С)</th><th>Обращение</th><th>Роль</th><th>Последний рабочий день</th>'
                      '<th>MAX</th><th></th></tr>')
             for s in working:
                 _, last = db.shift_range(s["id"])
@@ -337,7 +337,7 @@ def create_app(cfg: Settings, db: DB) -> FastAPI:
             b.append('<button class=btn>Сохранить обращение и роли</button>')
         b.append(f'<h2>Уволены ({len(fired)})</h2>')
         if fired:
-            b.append('<table><tr><th>Продавец</th><th>Уволен</th><th>Последняя смена</th><th></th></tr>')
+            b.append('<table><tr><th>Продавец</th><th>Уволен</th><th>Последний рабочий день</th><th></th></tr>')
             for s in fired:
                 _, last = db.shift_range(s["id"])
                 b.append(f'<tr><td>{html.escape(s["name"])}</td><td class=n>{_date(s["fired_at"])}</td>'
@@ -399,7 +399,7 @@ def create_app(cfg: Settings, db: DB) -> FastAPI:
             raise HTTPException(404)
         name = html.escape(s["first_name"] or s["name"])
         if s["max_user_id"]:
-            body = (f'<p>✅ <b>{html.escape(s["name"])}</b> подключён к боту. Утром после следующей смены придёт первое '
+            body = (f'<p>✅ <b>{html.escape(s["name"])}</b> подключён к боту. Утром после следующего рабочего дня придёт первое '
                     'сообщение.</p><p><a href="/sellers">← к списку продавцов</a></p>')
             return page(f"Подключение: {html.escape(s['name'])}", body)
         if not s["active"] or not s["invite_code"]:

@@ -37,15 +37,15 @@ def test_records_and_streak(env, tmp_path):  # noqa: F811
     cfg, db = env
     service.freeze(db, cfg, "2026-10")
     sid = db.seller_id("Продавец04", create=False)
-    rows = [(oct_day(i), "Продавец04", 30_000, 3) for i in range(1, 12)]  # 11 смен по 30 000
+    rows = [(oct_day(i), "Продавец04", 30_000, 3) for i in range(1, 12)]  # 11 рабочих дней по 30 000
     rows += [(oct_day(12), "Продавец04", 40_000, 4), (oct_day(13), "Продавец04", 45_000, 5),
              (oct_day(14), "Продавец04", 50_000, 6)]
     import_file(write_sales(tmp_path / "s.csv", rows), db, cfg)
-    plan = service.frozen_plan(db, "2026-10", sid)  # 561 764 → норма смены ≈ 37 451
+    plan = service.frozen_plan(db, "2026-10", sid)  # 561 764 / 18 → дневная норма ≈ 31 209
     got = {a.kind: a for a in achievements.for_day(db, cfg, sid, oct_day(14), plan)}
     assert "Личный рекорд: 50 000 ₽" in got["record_sales"].text and "45 000 ₽" in got["record_sales"].text
     assert got["record_items"].notable
-    assert got["streak"].text.startswith("Серия: 3 смены подряд") and got["streak"].notable
+    assert got["streak"].text.startswith("Серия: 3 рабочих дня подряд") and got["streak"].notable
     assert achievements.for_day(db, cfg, sid, oct_day(15), plan) == []  # не работал — нечего хвалить
     text = daily(db, cfg, sid, oct_day(14))
     assert "🏅 Личный рекорд: 50 000 ₽" in text
@@ -58,7 +58,7 @@ def test_best_shift_of_month_before_enough_history(env, tmp_path):  # noqa: F811
             (oct_day(3), "Продавец04", 30_000, 3)]
     import_file(write_sales(tmp_path / "s.csv", rows), db, cfg)
     kinds = [a.kind for a in achievements.for_day(db, cfg, sid, oct_day(3), None)]
-    assert kinds == ["best_month"]  # «за всё время» — только после 10 смен в истории
+    assert kinds == ["best_month"]  # «за всё время» — только после 10 рабочих дней в истории
 
 
 def test_weekly_goal_set_progress_and_close(env, tmp_path):  # noqa: F811
@@ -79,14 +79,14 @@ def test_weekly_goal_set_progress_and_close(env, tmp_path):  # noqa: F811
     assert g.metric == "items_per_shift" and g.baseline == 1 and g.team == 2 and g.target == pytest.approx(1.5)
     assert db.one("SELECT COUNT(*) n FROM weekly_goals")["n"] == 2
     assert goals.lines(db, sid, date(2026, 10, 18)) == [
-        "🎯 **Цель новой недели:** вещей за смену 1,5 (сейчас 1,0, команда 2,0)"]
+        "🎯 **Цель новой недели:** вещей за рабочий день 1,5 (сейчас 1,0, команда 2,0)"]
     assert goals.lines(db, sid, date(2026, 10, 20)) == [
-        "🎯 Цель недели: вещей за смену 1,5 — с понедельника у вас 2,0"]
+        "🎯 Цель недели: вещей за рабочий день 1,5 — с понедельника у вас 2,0"]
 
     closed = goals.ensure_week(db, cfg, date(2026, 10, 26))
     assert {(c.seller_id, c.done) for c in closed} >= {(sid, 1)}
     assert goals.lines(db, sid, date(2026, 10, 25))[0] == \
-        "Итог недели: цель «вещей за смену 1,5» выполнена ✅, у вас 2,0"
+        "Итог недели: цель «вещей за рабочий день 1,5» выполнена ✅, у вас 2,0"
     assert "🎯" in daily(db, cfg, sid, date(2026, 10, 20))
 
 
@@ -99,13 +99,13 @@ def test_owner_praise(env, tmp_path):  # noqa: F811
     import_file(write_sales(tmp_path / "s.csv", rows), db, cfg)
     text = owner_summary(db, cfg, oct_day(12))
     assert "👏 **Кого похвалить:**" in text and "Продавец04 — Личный рекорд: 60 000 ₽" in text
-    assert "Кого похвалить" not in owner_summary(db, cfg, oct_day(11))  # обычная смена — без похвалы
+    assert "Кого похвалить" not in owner_summary(db, cfg, oct_day(11))  # обычный рабочий день — без похвалы
 
     sid = db.seller_id("Продавец04", create=False)
     with db.tx() as c:  # цель недели 05.10–11.10 выполнена → в сводке за воскресенье 11.10
         c.execute("INSERT INTO weekly_goals(week,seller_id,metric,target,result,done,closed_at) "
                   "VALUES('2026-10-05',?,'items_per_shift',2.5,3,1,'x')", (sid,))
-    assert any("цель недели «вещей за смену 2,5» выполнена" in w
+    assert any("цель недели «вещей за рабочий день 2,5» выполнена" in w
                for _, _, why in achievements.praise(db, cfg, oct_day(11)) for w in why)
     assert goals.monday(oct_day(11)).isoformat() == "2026-10-05"
 
@@ -240,8 +240,8 @@ def test_coach_sheet_to_admins_and_owner_once(env, tmp_path):  # noqa: F811
     assert sorted(u for u, _ in got) == sorted([1, admin_uid, db.seller(db.seller_id("Админ2", create=False))["max_user_id"]])
     assert not seller_uids & {u for u, _ in got}  # рядовым продавцам листок не уходит
     text = got[0][1]
-    assert "**Продавец05** — похвалить: вещей за смену 3,0 (команда 2,0)" in text
-    assert "**Продавец04** — обсудить: вещей за смену 1,0 → цель 1,5; урок недели «Образ 1»" in text
+    assert "**Продавец05** — похвалить: вещей за рабочий день 3,0 (команда 2,0)" in text
+    assert "**Продавец04** — обсудить: вещей за рабочий день 1,0 → цель 1,5; урок недели «Образ 1»" in text
 
 
 def test_newcomer_mid_month_gets_plan_and_payroll_row(env, tmp_path):  # noqa: F811
@@ -281,7 +281,7 @@ def test_onboarding_lessons_one_per_day(env, tmp_path, monkeypatch):  # noqa: F8
     nid = db.seller_id("Новенькая Анна")
     code = db.new_invite(nid)
     bot.handle(db, cfg, client, {"update_type": "bot_started", "user": {"user_id": 777}, "payload": code})
-    assert [t.splitlines()[0] for _, t, _ in client.sent][1] == "📚 **Программа новичка, смена 1 из 2: Знакомство**"
+    assert [t.splitlines()[0] for _, t, _ in client.sent][1] == "📚 **Программа новичка, рабочий день 1 из 2: Знакомство**"
 
     import_file(write_sales(tmp_path / "s.csv", [(oct_day(10), "Новенькая Анна", 30_000, 3)]), db, cfg)
     client.sent.clear()
@@ -289,7 +289,7 @@ def test_onboarding_lessons_one_per_day(env, tmp_path, monkeypatch):  # noqa: F8
     training_run(db, cfg, sender, oct_day(11))  # повтор в тот же день — без второго урока
     training_run(db, cfg, sender, oct_day(12))  # смена 2 уже отправлена — больше уроков программы нет
     mine = [t.splitlines()[0] for u, t, _ in client.sent if u == 777]
-    assert mine == ["📚 **Программа новичка, смена 2 из 2: Примерочная**"]
+    assert mine == ["📚 **Программа новичка, рабочий день 2 из 2: Примерочная**"]
 
 
 def test_real_lessons_file_is_valid_and_returns_topic(env, tmp_path):  # noqa: F811

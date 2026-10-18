@@ -1,7 +1,7 @@
 """Личные рекорды и серии — мотивация без денег (docs/SPEC.md, «Мотивация и обучение»).
 
-Продавец сравнивается только с собой: рекорд смены, лучшая смена месяца, рекорд по вещам, серия смен выше нормы.
-Нормой смены считается личный план на полный месяц / норма смен. Те же достижения владелец видит в блоке
+Продавец сравнивается только с собой: рекорд рабочего дня, лучший день месяца, рекорд по вещам, серия рабочих
+дней не ниже дневной нормы. Дневная норма = личный план на полный месяц / норма рабочих дней (18). Те же достижения владелец видит в блоке
 «Кого похвалить» — там только заметные (рекорды и круглые серии), чтобы не повторяться каждый день.
 """
 from __future__ import annotations
@@ -66,20 +66,20 @@ def for_day(db: DB, cfg: Settings, sid: int, day: date, plan_full: float | None)
     best_prev = max((s for _, s, _ in prev), default=0.0)
     month_prev = [s for d, s, _ in prev if d[:7] == day.isoformat()[:7]]
     if enough and sales > best_prev > 0:
-        out.append(Achievement("record_sales", f"Личный рекорд: {_rub(sales)} за смену (прежний — {_rub(best_prev)})",
+        out.append(Achievement("record_sales", f"Личный рекорд: {_rub(sales)} за рабочий день (прежний — {_rub(best_prev)})",
                                True))
     elif len(month_prev) >= 2 and sales > max(month_prev):
-        out.append(Achievement("best_month", f"Лучшая смена месяца: {_rub(sales)}", len(month_prev) >= 4))
+        out.append(Achievement("best_month", f"Лучший рабочий день месяца: {_rub(sales)}", len(month_prev) >= 4))
     best_items = max((n for _, _, n in prev), default=0.0)
     if enough and items > best_items > 0:
-        out.append(Achievement("record_items", f"Рекорд по вещам: {items:.0f} за смену (прежний — {best_items:.0f})",
+        out.append(Achievement("record_items", f"Рекорд по вещам: {items:.0f} за рабочий день (прежний — {best_items:.0f})",
                                True))
     if plan_full:
         norm = plan_full / cfg.norm_shifts
         n = streak(hist, norm)
         if n >= cfg.motivation.streak_min:
-            word = plural(n, "смена", "смены", "смен")
-            out.append(Achievement("streak", f"Серия: {n} {word} подряд не ниже нормы смены ({_rub(norm)})",
+            word = plural(n, "рабочий день", "рабочих дня", "рабочих дней")
+            out.append(Achievement("streak", f"Серия: {n} {word} подряд не ниже дневной нормы ({_rub(norm)})",
                                    n in STREAK_MARKS))
     return out
 

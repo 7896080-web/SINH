@@ -1,4 +1,4 @@
-"""График смен и норма 18: «% плана месяца» к концу месяца совпадает с выполнением для ставки."""
+"""График работы и норма 18 рабочих дней: «% плана месяца» к концу месяца совпадает с выполнением для ставки."""
 from datetime import date
 
 import pytest
@@ -50,7 +50,7 @@ def test_no_schedule_falls_back_to_norm_and_owner_is_reminded(env, tmp_path):  #
     daily_run(db, cfg, sender, today=oct_day(21), force=True)
     daily_run(db, cfg, sender, today=oct_day(22), force=True)
     rows = db.q("SELECT text FROM message_log WHERE kind='no_schedule'")
-    assert len(rows) == 2 and rows[0]["text"].startswith("График смен на 2026-10 не заполнен")  # dry-run пишет каждый раз
+    assert len(rows) == 2 and rows[0]["text"].startswith("График работы на 2026-10 не заполнен")  # dry-run пишет каждый раз
 
 
 def test_schedule_page(env):  # noqa: F811
@@ -58,7 +58,7 @@ def test_schedule_page(env):  # noqa: F811
     web = TestClient(create_app(cfg, db))
     sid = db.seller_id("Продавец04", create=False)
     page = web.get("/schedule/2026-10", auth=AUTH).text
-    assert "График смен 2026-10" in page and "Норма — 18 смен" in page and f'name="s{sid}_31"' in page
+    assert "График работы 2026-10" in page and "Норма — 18 рабочих дней" in page and f'name="s{sid}_31"' in page
     r = web.post("/schedule/2026-10", data={f"s{sid}_1": "on", f"s{sid}_2": "on", f"s{sid}_5": "on"}, auth=AUTH)
     assert "График сохранён" in r.text
     assert db.schedule_days("2026-10")[sid] == {1, 2, 5}

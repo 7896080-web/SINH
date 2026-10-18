@@ -99,4 +99,4 @@ def next_onboarding(db: DB, cfg: Settings, sid: int) -> dict | None:
 
 
 def onboarding_text(lesson: dict, total: int) -> str:
-    return text(lesson, f"Программа новичка, смена {lesson['shift']} из {total}")
+    return text(lesson, f"Программа новичка, рабочий день {lesson['shift']} из {total}")

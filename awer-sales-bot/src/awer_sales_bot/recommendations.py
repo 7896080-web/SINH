@@ -78,7 +78,7 @@ def rules(db: DB, cfg: Settings, sid: int, st: Status, day: date) -> list[tuple[
     # 1. Темп отстаёт от плана
     if st.plan_month and st.pace_per_shift is not None and st.per_shift_needed_base and st.remaining_shifts:
         if st.pace_per_shift < st.per_shift_needed_base:
-            out.append((90, f"Чтобы выйти на план, нужно в среднем {_rub(st.per_shift_needed_base)} за смену "
+            out.append((90, f"Чтобы выйти на план, нужно в среднем {_rub(st.per_shift_needed_base)} в рабочий день "
                             f"(сейчас {_rub(st.pace_per_shift)})."))
 
     # 2. Комплектность: по чекам (если есть) или вещей за смену; какую категорию-дополнение продавец «недопредлагает»
@@ -102,7 +102,7 @@ def rules(db: DB, cfg: Settings, sid: int, st: Status, day: date) -> list[tuple[
             single = f" {me.single_share:.0%} ваших чеков — одна вещь." if me.single_share else ""
             head = f"Вещей в чеке {_d1(me.upt)} против {_d1(tm.upt)} у команды.{single}"
         else:
-            head = f"Вещей за смену {_d1(me.items_per_shift)} против {_d1(tm.items_per_shift)} у команды."
+            head = f"Вещей за рабочий день {_d1(me.items_per_shift)} против {_d1(tm.items_per_shift)} у команды."
         out.append((80, f"{head} Предлагайте второй товар к образу.{tip}"))
 
     # 2б. Средний чек ниже команды (только если есть чеки)

@@ -30,7 +30,7 @@ def strength(me: M.SellerMetrics, tm: M.SellerMetrics) -> str | None:
         return None
     m = best[1]
     if m == "per_shift":
-        name, show = "продажи за смену", lambda v: goals.fmt("avg_price", v)
+        name, show = "продажи за рабочий день", lambda v: goals.fmt("avg_price", v)
     else:
         name, show = goals.METRICS[m][0], lambda v: goals.fmt(m, v)
     return f"{name} {show(getattr(me, m))} (команда {show(getattr(tm, m))})"
