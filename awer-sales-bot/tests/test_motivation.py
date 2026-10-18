@@ -385,3 +385,29 @@ def test_max_step_tip_does_not_promise_next_step(env, tmp_path):  # noqa: F811
     import_file(write_sales(tmp_path / "s.csv", [(oct_day(i), "Продавец04", 80_000, 8) for i in range(1, 11)]), db, cfg)
     text = daily(db, cfg, sid, oct_day(10))
     assert "Максимальная ступень достигнута" in text and "следующая ступень уже близко" not in text
+
+
+def test_tips_name_only_categories_in_stock(env, tmp_path):  # noqa: F811
+    from awer_sales_bot import recommendations as R
+    cfg, db = env
+    service.freeze(db, cfg, "2026-10")
+    sid = db.seller_id("Продавец04", create=False)
+    rows = []
+    for i in range(12):  # команда (Продавец05) продаёт джинсы с ремнём и галстуком, Продавец04 — одну вещь
+        d = oct_day(1 + i % 6)
+        rows += [(d, "Продавец05", 5_000, 1, "Джинсы", f"Б{i}"), (d, "Продавец05", 1_500, 1, "Ремень", f"Б{i}"),
+                 (d, "Продавец05", 900, 1, "Галстук", f"Б{i}"), (d, "Продавец04", 5_000, 1, "Джинсы", f"А{i}")]
+    import_file(write_sales(tmp_path / "s.csv", rows), db, cfg)
+    st = service.status(db, cfg, sid, oct_day(6))
+
+    tips = " ".join(t for _, t in R.rules(db, cfg, sid, st, oct_day(6)))  # остатков из 1С ещё нет
+    assert "Предлагайте второй товар" in tips and "«Галстук»" not in tips and "«Ремень»" not in tips
+    assert "к основной вещи предлагайте вторую" in tips
+
+    (tmp_path / "stock_1.csv").write_text(  # на остатке ГОРОДа: джинсы и ремни, галстуков нет
+        "Дата;Склад;Номенклатура;Номенклатурная группа;Характеристика;Остаток\n"
+        "06.10.2026;ГОРОД_склад;Джинсы слим;Джинсы;32;5\n06.10.2026;ГОРОД_склад;Ремень кожа;Ремень;U;7\n", encoding="utf-8")
+    import_file(tmp_path / "stock_1.csv", db, cfg)
+    tips = " ".join(t for _, t in R.rules(db, cfg, sid, st, oct_day(6)))
+    assert "«Ремень»" in tips and "Галстук" not in tips
+    assert "«Джинсы» + «Ремень»" in tips
