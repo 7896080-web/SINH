@@ -232,3 +232,20 @@ def test_daily_done_and_no_duplicates_for_owner(env):  # noqa: F811
     assert db.get_kv("daily_done") == "2026-10-17"
     kinds = [r["kind"] for r in db.q("SELECT kind FROM message_log WHERE max_user_id=900 AND status='ok'")]
     assert kinds.count("owner_daily") == 1 and kinds.count("missing_day") == 1
+
+
+def test_onec_error_file_reaches_owner(env):  # noqa: F811
+    cfg, db = env
+    cfg.max.owners = [900]
+    err = cfg.onec.inbox / "error_20261018-020000_sales.txt"
+    err.write_text("sales: {Запрос}: Поле не найдено \"Т.Продавец\"\n", encoding="utf-8-sig")
+    part = cfg.onec.inbox / "sales_20261017_20261017.csv.part"  # 1С ещё пишет — не трогаем
+    part.write_text("Дата;Склад", encoding="utf-8")
+    old = time.time() - 600
+    os.utime(err, (old, old))
+    os.utime(part, (old, old))
+    daily_run(db, cfg, Sender(db, cfg, None, dry_run=True), today=date(2026, 10, 18), force=True)
+    r = db.one("SELECT text FROM message_log WHERE kind LIKE 'bad_file:error_%'")
+    assert "Поле не найдено" in r["text"] and "1С не смогла выгрузить" in r["text"]
+    assert part.exists() and not err.exists()
+

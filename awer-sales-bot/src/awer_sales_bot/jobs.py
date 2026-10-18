@@ -86,7 +86,11 @@ def daily_run(db: DB, cfg: Settings, sender: Sender, today: date | None = None, 
     day = today - timedelta(days=1)
     for rep in import_inbox(db, cfg):
         log.info("импорт %s: строк %s, дни %s", rep.file, rep.lines, rep.days)
-        if rep.error:  # аудит В1: битый файл не останавливает рассылку, но владелец о нём знает
+        if rep.kind == "onec_error":  # аудит 1С-1: ошибка обработки 1С видна владельцу, а не только в журнале 1С
+            sender.to_owners(today.isoformat(), f"bad_file:{rep.file}",
+                             f"1С не смогла выгрузить часть данных: {rep.error}\nОстальное выгружено. Обычно причина — "
+                             "имя реквизита в обработке (docs/1C.md, пометки «ПРОВЕРИТЬ»).", once=True)
+        elif rep.error:  # аудит В1: битый файл не останавливает рассылку, но владелец о нём знает
             sender.to_owners(today.isoformat(), f"bad_file:{rep.file}",
                              f"Файл из 1С «{rep.file}» не прочитан: {rep.error}. Он перенесён в data/archive/bad, "
                              "остальные файлы загружены. Выгрузите этот день из 1С ещё раз.", once=True)

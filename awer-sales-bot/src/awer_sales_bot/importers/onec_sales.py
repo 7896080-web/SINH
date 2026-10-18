@@ -41,7 +41,7 @@ class ImportReport:
     days: list[tuple[str, str]]
     skipped: int = 0
     unknown_sellers: set[str] = field(default_factory=set)
-    error: str = ""  # файл не распознан / не прочитан — перенесён в archive/bad
+    error: str = ""  # файл не распознан / ошибка выгрузки из 1С (kind onec_error) — перенесён в archive/bad
 
 
 def _num(v) -> float:
@@ -283,4 +283,12 @@ def import_inbox(db: DB, cfg: Settings) -> list[ImportReport]:
             bad.mkdir(exist_ok=True)
             shutil.move(str(f), archive_name(bad, f.name))
             out.append(ImportReport(f.name, "error", 0, [], error=str(e)[:300]))
+    # обработка 1С пишет error_*.txt, если раздел не выгрузился (неверное имя реквизита и т. п.)
+    for f in sorted(inbox.glob("error_*.txt")):
+        if now - f.stat().st_mtime < FRESH_SECONDS:
+            continue
+        text = " ".join(f.read_text(encoding="utf-8-sig", errors="replace").split())
+        (archive / "bad").mkdir(exist_ok=True)
+        shutil.move(str(f), archive_name(archive / "bad", f.name))
+        out.append(ImportReport(f.name, "onec_error", 0, [], error=text[:500] or "без описания"))
     return out

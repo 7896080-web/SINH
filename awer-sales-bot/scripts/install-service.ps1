@@ -1,4 +1,4 @@
-# Установка awer-sales-bot как службы Windows через NSSM (https://nssm.cc/download).
+﻿# Установка awer-sales-bot как службы Windows через NSSM (https://nssm.cc/download).
 # Запуск: PowerShell от администратора, из папки проекта:  .\scripts\install-service.ps1
 param(
     [string]$Nssm = "C:\nssm\win64\nssm.exe",
@@ -14,5 +14,8 @@ if (!(Test-Path $exe)) { throw "Не найден $exe — сначала pip in
 & $Nssm set $Name AppRotateFiles 1
 & $Nssm set $Name AppRotateBytes 5000000
 & $Nssm set $Name Start SERVICE_AUTO_START
+# поток бота упал — программа завершается сама (bot.guarded); NSSM поднимает её через 10 секунд
+& $Nssm set $Name AppExit Default Restart
+& $Nssm set $Name AppRestartDelay 10000
 & $Nssm start $Name
 Write-Host "Служба $Name запущена. Админка: http://127.0.0.1:8080"
