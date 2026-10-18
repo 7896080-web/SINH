@@ -44,18 +44,22 @@ class Goal:
         return METRICS[self.metric][2]
 
     def fmt(self, v: float | None) -> str:
-        if v is None:
-            return "—"
-        if self.metric == "avg_price":
-            return f"{v:,.0f}".replace(",", " ") + " ₽"
-        if self.metric == "discount_share":
-            return f"{v:.0%}"
-        return f"{v:.1f}".replace(".", ",")
+        return fmt(self.metric, v)
 
     def reached(self, v: float | None) -> bool:
         if v is None:
             return False
         return v >= self.target if METRICS[self.metric][1] else v <= self.target
+
+
+def fmt(metric: str, v: float | None) -> str:
+    if v is None:
+        return "—"
+    if metric == "avg_price":
+        return f"{v:,.0f}".replace(",", " ") + " ₽"
+    if metric == "discount_share":
+        return f"{v:.0%}"
+    return f"{v:.1f}".replace(".", ",")
 
 
 def monday(d: date) -> date:

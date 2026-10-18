@@ -209,3 +209,30 @@ def test_arrivals_pairing(env, tmp_path):  # noqa: F811
     import_file(tmp_path / "arrivals_1.csv", db, cfg)
     assert pairing(db, cfg, oct_day(10), ["Джинсы"]) == ["С чем предлагать: к «Джинсы» чаще берут «Ремень» (75%)"]
     assert "С чем предлагать: к «Джинсы»" in daily(db, cfg, sid, oct_day(10))
+
+
+def test_coach_sheet_to_admins_and_owner_once(env, tmp_path):  # noqa: F811
+    from awer_sales_bot import coach, goals
+    from awer_sales_bot.jobs import training_run
+    cfg, db, client, sender = linked_env(env, tmp_path)
+    cfg.max.owners = [1]
+    rows = []
+    for i in range(10):
+        d = date(2026, 9, 22) + timedelta(days=i * 2)
+        rows += [(d, "Продавец04", 4_000, 1), (d, "Продавец05", 12_000, 3)]
+    import_file(write_sales(tmp_path / "s.csv", rows), db, cfg)
+    monday = date(2026, 10, 19)
+    goals.ensure_week(db, cfg, monday)
+    training_run(db, cfg, sender, monday)
+    client.sent.clear()
+    coach.run(db, cfg, sender, monday)
+    coach.run(db, cfg, sender, monday + timedelta(days=2))  # в ту же неделю — без повтора
+
+    admin_uid = db.seller(db.seller_id("Админ1", create=False))["max_user_id"]
+    seller_uids = {db.seller(db.seller_id(n, create=False))["max_user_id"] for n in ("Продавец04", "Продавец05")}
+    got = [(u, t) for u, t, _ in client.sent]
+    assert sorted(u for u, _ in got) == sorted([1, admin_uid, db.seller(db.seller_id("Админ2", create=False))["max_user_id"]])
+    assert not seller_uids & {u for u, _ in got}  # рядовым продавцам листок не уходит
+    text = got[0][1]
+    assert "**Продавец05** — похвалить: вещей за смену 3,0 (команда 2,0)" in text
+    assert "**Продавец04** — обсудить: вещей за смену 1,0 → цель 1,5; урок недели «Образ 1»" in text

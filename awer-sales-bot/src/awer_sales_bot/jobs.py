@@ -5,7 +5,7 @@ import logging
 import time
 from datetime import date, datetime, timedelta
 
-from . import goals, lessons, messages
+from . import coach, goals, lessons, messages
 from .config import Settings
 from .db import DB
 from .importers.onec_sales import import_inbox
@@ -90,6 +90,7 @@ def daily_run(db: DB, cfg: Settings, sender: Sender, today: date | None = None, 
             sender.to_seller(day.isoformat(), "daily", s["id"], messages.daily(db, cfg, s["id"], day))
     sender.to_owners(day.isoformat(), "owner_daily", messages.owner_summary(db, cfg, day))
     training_run(db, cfg, sender, today)
+    coach.run(db, cfg, sender, today)
     return "sent"
 
 
