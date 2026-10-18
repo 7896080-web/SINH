@@ -5,7 +5,7 @@ import logging
 import time
 from datetime import date, datetime, timedelta
 
-from . import coach, goals, lessons, messages
+from . import achievements, coach, goals, lessons, messages, quiz
 from . import metrics as M
 from .config import Settings
 from .db import DB
@@ -95,7 +95,9 @@ def daily_run(db: DB, cfg: Settings, sender: Sender, today: date | None = None, 
         if s["max_user_id"] and (db.worked_shifts(s["id"], day.strftime("%Y-%m"), upto=day) or
                                  db.one("SELECT 1 FROM plans WHERE month=? AND seller_id=?", day.strftime("%Y-%m"), s["id"])):
             sender.to_seller(day.isoformat(), "daily", s["id"], messages.daily(db, cfg, s["id"], day))
-    sender.to_owners(day.isoformat(), "owner_daily", messages.owner_summary(db, cfg, day))
+    good = achievements.praise(db, cfg, day)
+    sender.to_owners(day.isoformat(), "owner_daily", messages.owner_summary(db, cfg, day),
+                     quiz.praise_buttons(good, day) or None)
     training_run(db, cfg, sender, today)
     coach.run(db, cfg, sender, today)
     return "sent"
@@ -130,6 +132,8 @@ def training_run(db: DB, cfg: Settings, sender: Sender, today: date) -> None:
         lesson = lessons.pick(db, cfg, sid, topic)
         if lesson and sender.to_seller(week.isoformat(), "lesson", sid, lessons.text(lesson)) == "ok":
             lessons.mark_sent(db, sid, lesson["id"])
+            if cfg.training.quizzes and lesson.get("quiz"):
+                sender.to_seller(week.isoformat(), "quiz", sid, *quiz.question(lesson, 0))
 
 
 def month_turn(db: DB, cfg: Settings, sender: Sender, today: date) -> None:

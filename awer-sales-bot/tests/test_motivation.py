@@ -185,8 +185,9 @@ def test_weekly_lesson_by_goal_topic(env, tmp_path):  # noqa: F811
         goals.ensure_week(db, cfg, monday)
         training_run(db, cfg, sender, monday)
         training_run(db, cfg, sender, monday + timedelta(days=1))  # повтор в ту же неделю — без второго урока
-        mine = [t for u, t, _ in client.sent if u == uid]
-        titles.append(mine[-1].splitlines()[0])
+        mine = [t for u, t, _ in client.sent if u == uid and t.startswith("📚")]
+        assert len(mine) == 1
+        titles.append(mine[0].splitlines()[0])
         client.sent.clear()
     assert titles == ["📚 **Урок недели: Образ 1**", "📚 **Урок недели: Образ 2**", "📚 **Урок недели: Контакт**"]
     assert {"obraz-1", "obraz-2", "kontakt-1"} <= {r["lesson_id"] for r in db.q("SELECT lesson_id FROM lessons_sent")}
@@ -307,8 +308,67 @@ def test_real_lessons_file_is_valid_and_returns_topic(env, tmp_path):  # noqa: F
     import_file(write_sales(tmp_path / "s.csv", rows), db, cfg)
     uid = db.seller(db.seller_id("Продавец04", create=False))["max_user_id"]
     training_run(db, cfg, sender, date(2026, 10, 12))  # возвраты 3 000 / 80 000 = 3,75 % — урок не про возвраты
-    first = [t for u, t, _ in client.sent if u == uid][-1]
+    first = [t for u, t, _ in client.sent if u == uid and t.startswith("📚")][-1]
     assert "Примерка, после которой" not in first
     import_file(write_sales(tmp_path / "s.csv", rows + [(oct_day(10), "Продавец04", -8_000, -2)]), db, cfg)
     training_run(db, cfg, sender, date(2026, 10, 19))  # 11 000 / 80 000 = 13,75 % > 8 %
-    assert [t for u, t, _ in client.sent if u == uid][-1].startswith("📚 **Урок недели: Примерка, после которой")
+    assert [t for u, t, _ in client.sent if u == uid and t.startswith("📚")][-1].startswith(
+        "📚 **Урок недели: Примерка, после которой")
+
+
+def test_quiz_after_lesson_and_answers(env, tmp_path, monkeypatch):  # noqa: F811
+    from awer_sales_bot import bot, goals
+    from awer_sales_bot.jobs import training_run
+    cfg, db, client, sender = linked_env(env, tmp_path)
+    monkeypatch.setattr(bot.time, "sleep", lambda s: None)
+    rows = []
+    for i in range(10):
+        d = date(2026, 9, 22) + timedelta(days=i * 2)
+        rows += [(d, "Продавец04", 4_000, 1), (d, "Продавец05", 12_000, 3)]
+    import_file(write_sales(tmp_path / "s.csv", rows), db, cfg)
+    sid = db.seller_id("Продавец04", create=False)
+    uid = db.seller(sid)["max_user_id"]
+    goals.ensure_week(db, cfg, date(2026, 10, 19))
+    training_run(db, cfg, sender, date(2026, 10, 19))
+    q = [(t, b) for u, t, b in client.sent if u == uid][-1]
+    assert q[0].startswith("❓ Вопрос 1 из 1 к уроку «Образ 1»") and q[1][1][0]["payload"] == "quiz|obraz-1|0|1"
+
+    def press(user, payload):
+        client.sent.clear()
+        bot.handle(db, cfg, client, {"update_type": "message_callback",
+                                     "callback": {"callback_id": "cb1", "payload": payload, "user": {"user_id": user}}})
+        return client.answers[-1][1], [t for _, t, _ in client.sent]
+
+    note, msgs = press(uid, "quiz|obraz-1|0|1")  # неверно: правильный — «Ремень» (0)
+    assert note == "Ответ принят" and msgs[0].startswith("Не совсем. Верный ответ: «Ремень».")
+    assert msgs[1] == "Квиз пройден: 0 из 1. Спасибо! Следующий урок — через неделю."
+    assert press(uid, "quiz|obraz-1|0|0")[0] == "Ответ уже принят"  # переответить нельзя
+    other = db.seller(db.seller_id("Админ1", create=False))["max_user_id"]  # урок ему не отправлялся
+    assert press(other, "quiz|obraz-1|0|0") == ("Кнопка устарела", [])
+    assert press(uid, "quiz|obraz-1|abc|0")[0] == "Кнопка устарела"
+    assert db.one("SELECT correct FROM quiz_answers WHERE seller_id=?", sid)["correct"] == 0
+
+
+def test_owner_praise_button(env, tmp_path, monkeypatch):  # noqa: F811
+    from awer_sales_bot import bot
+    from awer_sales_bot.jobs import daily_run
+    cfg, db, client, sender = linked_env(env, tmp_path)
+    monkeypatch.setattr(bot.time, "sleep", lambda s: None)
+    cfg.max.owners = [1]
+    service.freeze(db, cfg, "2026-10")
+    rows = [(oct_day(i), "Продавец04", 30_000, 3) for i in range(1, 12)] + [(oct_day(12), "Продавец04", 60_000, 4)]
+    import_file(write_sales(tmp_path / "s.csv", rows), db, cfg)
+    daily_run(db, cfg, sender, today=oct_day(13), force=True)
+    owner_msgs = [(t, b) for u, t, b in client.sent if u == 1 and t.startswith("**Сводка")]
+    button = owner_msgs[0][1][0][0]
+    assert button["text"] == "👏 Похвалить: Продавец04" and button["payload"].startswith("praise|")
+
+    sid = db.seller_id("Продавец04", create=False)
+    seller_uid = db.seller(sid)["max_user_id"]
+    for who, expect in ((seller_uid, "Кнопка устарела"), (1, "Отправлено 👏"), (1, "Уже отправлено")):
+        client.sent.clear()
+        bot.handle(db, cfg, client, {"update_type": "message_callback", "callback": {
+            "callback_id": "c", "payload": button["payload"], "user": {"user_id": who}}})
+        assert client.answers[-1][1] == expect
+    assert db.one("SELECT text FROM message_log WHERE kind='praise'")["text"].startswith(
+        "👏 Владелец отметил ваш результат за 12.10: Личный рекорд: 60 000 ₽")

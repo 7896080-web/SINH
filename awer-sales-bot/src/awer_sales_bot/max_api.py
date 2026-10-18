@@ -4,7 +4,7 @@
   * способ передачи токена: заголовок `Authorization: <token>` (config max.auth=header)
     или query-параметр `access_token` (max.auth=query);
   * формат апдейтов (`bot_started`, `message_created`) — поля разобраны в bot.py.
-Методы: GET /me, POST /messages?user_id=…, GET /updates (long polling).
+Методы: GET /me, POST /messages?user_id=…, POST /answers?callback_id=…, GET /updates (long polling).
 """
 from __future__ import annotations
 
@@ -53,8 +53,17 @@ class MaxClient:
             body["attachments"] = [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
         return self._req("POST", "/messages", params=params, json=body)
 
+    def answer(self, callback_id: str, notification: str | None = None, message: dict | None = None) -> dict:
+        """Ответ на нажатие кнопки (POST /answers): короткое уведомление и/или замена сообщения с кнопками."""
+        body: dict = {}
+        if notification:
+            body["notification"] = notification
+        if message:
+            body["message"] = message
+        return self._req("POST", "/answers", params={"callback_id": callback_id}, json=body)
+
     def updates(self, marker: int | None = None, timeout: int = 30) -> dict:
-        params: dict = {"timeout": timeout, "types": "message_created,bot_started"}
+        params: dict = {"timeout": timeout, "types": "message_created,bot_started,message_callback"}
         if marker is not None:
             params["marker"] = marker
         return self._req("GET", "/updates", params=params)
