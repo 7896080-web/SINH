@@ -34,7 +34,8 @@ def test_scripts_use_our_names_not_another_programs():
 IN_REPOSITORY = (ROOT.parent / ".git").exists()
 
 
-@pytest.mark.skipif(not IN_REPOSITORY, reason="пакет собирается из git — только в репозитории")
+@pytest.mark.skipif(not IN_REPOSITORY or shutil.which("git") is None,
+                    reason="пакет собирается из git — только в репозитории")
 def test_package_lays_out_every_release_file(tmp_path):
     import gen_package
 
@@ -92,6 +93,11 @@ def test_shortcut_gets_our_icon_on_install_and_on_update():
 
 # ------------------------------------------------------------ патч для вставки в консоль
 
+# Патч собирается из git, а на боевом сервере git нет (тесты гоняются там при
+# каждом накате): без пропуска эти тесты остановили бы накат на ровном месте.
+needs_git = pytest.mark.skipif(not IN_REPOSITORY or shutil.which("git") is None,
+                               reason="патч собирается из git — только в репозитории")
+
 def _repo(tmp_path):
     """Маленький «релиз» в своём git: версия A (как на сервере) и правки после."""
     root = tmp_path / "repo"
@@ -130,6 +136,7 @@ def _run_apply(tmp_path, source):
                           encoding="utf-8", errors="replace")
 
 
+@needs_git
 def test_paste_patch_carries_only_what_changed_and_lands_byte_for_byte(tmp_path):
     import gen_package
     root, base, server = _repo(tmp_path)
@@ -146,6 +153,7 @@ def test_paste_patch_carries_only_what_changed_and_lands_byte_for_byte(tmp_path)
     assert again.returncode == 0 and "DONE 0" in again.stdout                  # повтор ничего не пишет
 
 
+@needs_git
 def test_paste_patch_refuses_another_version_and_touches_nothing(tmp_path):
     import gen_package
     root, base, server = _repo(tmp_path)
@@ -157,6 +165,7 @@ def test_paste_patch_refuses_another_version_and_touches_nothing(tmp_path):
     assert not (server / "finapp" / "new.py").exists()
 
 
+@needs_git
 def test_paste_patch_does_not_start_over_a_hand_edited_file(tmp_path):
     """Сверка до первой записи: файл, правленный руками, не перезаписывается, и
     остальные тоже не пишутся — половина патча хуже, чем ни одного."""
@@ -170,6 +179,7 @@ def test_paste_patch_does_not_start_over_a_hand_edited_file(tmp_path):
     assert not (server / "finapp" / "new.py").exists()
 
 
+@needs_git
 def test_paste_patch_is_refused_when_a_file_was_deleted(tmp_path):
     import gen_package
     root, base, server = _repo(tmp_path)
