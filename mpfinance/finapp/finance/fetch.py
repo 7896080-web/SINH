@@ -406,8 +406,7 @@ def _drop_superseded_kit(db: Session, account_id: int, stored: list[SalesReport]
     for report in db.query(SalesReport).filter(
             SalesReport.platform == "kit", SalesReport.account_id == account_id,
             SalesReport.source == "api", SalesReport.period_from >= first, SalesReport.period_to <= last,
-            SalesReport.onec_status.in_((OneCUploadStatus.none, OneCUploadStatus.failed,
-                                         OneCUploadStatus.timeout))):
+            SalesReport.onec_status.in_((OneCUploadStatus.none, OneCUploadStatus.failed))):
         if report.id in keep:
             continue
         monday = report.period_from - timedelta(days=report.period_from.weekday())

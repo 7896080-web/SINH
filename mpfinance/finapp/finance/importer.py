@@ -435,9 +435,11 @@ def store_api_report(db: Session, *, platform: str, account_id: int | None, pars
     if existing is not None:
         same_kind = existing.source == source or (report_kind is not None
                                                   and existing.report_kind == report_kind)
+        # «1С не ответила» (timeout) — документ в 1С МОГ создаться: заменив отчёт,
+        # мы потеряли бы поздний OK, а следующая отправка под другим ключом
+        # завела бы второй документ. Заменяем только то, что в 1С точно нет.
         replaceable = (replace_unsent and same_kind
-                       and existing.onec_status in (OneCUploadStatus.none, OneCUploadStatus.failed,
-                                                    OneCUploadStatus.timeout))
+                       and existing.onec_status in (OneCUploadStatus.none, OneCUploadStatus.failed))
         if not replaceable:
             outcome.skipped = True
             outcome.report = existing

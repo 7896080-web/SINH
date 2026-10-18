@@ -146,3 +146,52 @@ def test_broken_attachment_does_not_block_the_mailbox(db, monkeypatch):
     stats = mail.fetch_new(db, connect=lambda h, p: imap)
     assert calls == ["плохой.xlsx", "хороший.xlsx"]
     assert db.query(MailMessage).count() == 2 and stats["messages"] == 2
+
+
+# ------------------------------------------------------------ ответ 1С и отправка
+
+def test_late_answer_to_a_previous_send_does_not_touch_the_current_one(db):
+    """Отчёт отправлен повторно (вторым файлом). Поздний ERROR на первую
+    отправку не объявляет ошибку, а OK на вторую — принимается."""
+    from finapp.finance import sales_1c
+    report = make_report(db, key="SR-wb-777")
+    report.onec_status = OneCUploadStatus.sent
+    report.onec_batch_filename = "task_fin_second.txt"
+    db.commit()
+    assert sales_1c.apply_result(db, "SR-wb-777", "ERROR", "старый отказ", "task_fin_first.txt") is False
+    assert report.onec_status == OneCUploadStatus.sent
+    assert sales_1c.apply_result(db, "SR-wb-777", "OK", "ЦБ-1", "task_fin_second.txt") is True
+    assert report.onec_status == OneCUploadStatus.done
+
+
+def test_unmatched_1c_answer_goes_to_the_action_log(db, exchange_dirs):
+    from finapp import onec
+    from finapp.exchange import LocalExchange
+    from finapp.models import AuditLog
+    (exchange_dirs.ONEC_RESULTS_DIR / "result_fin_x.txt").write_text(
+        "SR-wb-nothing|OK|ЦБ-1|SALES_REPORT\n", encoding="utf-8")
+    ex = LocalExchange(exchange_dirs.ONEC_TASKS_DIR, exchange_dirs.ONEC_RESULTS_DIR, exchange_dirs.ONEC_ARCHIVE_DIR)
+    total = onec.collect_results(db, ex)
+    assert total["unmatched"] == 1
+    assert db.query(AuditLog).filter(AuditLog.action == "onec_unmatched").count() == 1
+
+
+def test_report_1c_did_not_answer_is_not_replaced_by_a_refetch(db):
+    """«1С не ответила» — документ мог создаться: перезабор его не заменяет."""
+    from finapp.finance.formats import ParseResult
+    from finapp.finance.fetch import KIT_API_FORMAT
+    from finapp.finance.importer import store_api_report
+    from tests.finance_factories import make_account
+    account = make_account(db, platform="kit", name="Сайт")
+    line = dict(v.empty_line(), operation=v.LOGISTICS, logistics=25000, operation_date=date(2026, 9, 8))
+    first = store_api_report(db, platform="kit", account_id=account.id,
+                             parsed=ParseResult(format=KIT_API_FORMAT, lines=[dict(line)]),
+                             period_from=date(2026, 9, 7), period_to=date(2026, 9, 13), user="t",
+                             replace_unsent=True, kind="kitdlv").report
+    first.onec_status = OneCUploadStatus.timeout
+    db.commit()
+    again = store_api_report(db, platform="kit", account_id=account.id,
+                             parsed=ParseResult(format=KIT_API_FORMAT, lines=[dict(line)]),
+                             period_from=date(2026, 9, 7), period_to=date(2026, 9, 13), user="t",
+                             replace_unsent=True, kind="kitdlv")
+    assert again.skipped and again.report.id == first.id

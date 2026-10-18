@@ -220,7 +220,7 @@
         </form>
         {% endif %}
         <form method="post" action="/finance/reports/{{ report.id }}/delete" class="inline-form"
-              onsubmit="return confirm('Удалить отчёт из программы? Документы, уже созданные в 1С, останутся.');">
+              onsubmit="return confirm('{% if report.onec_status.value == 'timeout' %}1С не ответила по этому отчёту — документы в 1С МОГЛИ создаться. Проверьте в 1С перед удалением. {% endif %}Удалить отчёт из программы? Документы, уже созданные в 1С, останутся.');">
             <button type="submit" class="btn btn-danger" {% if in_flight %}disabled{% endif %}>Удалить отчёт</button>
         </form>
     </div>

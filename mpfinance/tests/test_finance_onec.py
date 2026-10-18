@@ -188,8 +188,10 @@ def test_result_ok_error_unknown_and_late(db, epf_ready, exchange_dirs):
     report.onec_sent_at = now_utc() - timedelta(minutes=config.ONEC_TIMEOUT_MINUTES + 1)
     db.commit()
     assert [r.id for r in detect_timed_out(db)] == [report.id]
-    # Опоздавший ответ принимается: документы в 1С созданы.
-    _answer(exchange_dirs, "fin_9", "SR-wb-100|OK|продажи №15, возвраты №3|SALES_REPORT")
+    # Опоздавший ответ принимается: документы в 1С созданы. Ответ — на тот файл
+    # заданий, которым отчёт ушёл (result_<метка> отвечает task_<метка>).
+    label = report.onec_batch_filename[len("task_"):-len(".txt")]
+    _answer(exchange_dirs, label, "SR-wb-100|OK|продажи №15, возвраты №3|SALES_REPORT")
     onec.exchange_once(db)
     db.refresh(report)
     assert report.onec_status == OneCUploadStatus.done

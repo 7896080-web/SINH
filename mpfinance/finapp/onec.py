@@ -33,6 +33,7 @@ from sqlalchemy.orm import Session
 
 from finapp import catalog, config, exchange, settings
 from finapp.finance import costs, sales_1c
+from finapp.audit import log_action
 from finapp.models import OnecTask, OnecTaskStatus
 from finapp.timeutils import now_utc
 
@@ -180,8 +181,10 @@ def parse_result_line(line: str) -> tuple[str, str, str, str] | None:
             parts[-1].strip())
 
 
-def apply_result_text(db: Session, text: str, cost_text: str = "", dict_text: str = "") -> dict:
-    """Применяет файл ответа. Не коммитит."""
+def apply_result_text(db: Session, text: str, cost_text: str = "", dict_text: str = "",
+                      task_file: str | None = None) -> dict:
+    """Применяет файл ответа. Не коммитит. `task_file` — файл заданий, на который
+    этот ответ (по метке имени)."""
     stats = {"ok": 0, "error": 0, "unmatched": 0}
     for raw in text.splitlines():
         parsed = parse_result_line(raw)
@@ -190,7 +193,7 @@ def apply_result_text(db: Session, text: str, cost_text: str = "", dict_text: st
         key, status, detail, command = parsed
         ok = status == "OK"
         if sales_1c.is_sales_report_result(key, command):
-            if sales_1c.apply_result(db, key, status, detail):
+            if sales_1c.apply_result(db, key, status, detail, task_file):
                 stats["ok" if ok else "error"] += 1
             else:
                 stats["unmatched"] += 1
@@ -243,7 +246,12 @@ def collect_results(db: Session, ex) -> dict:
             if text is None:
                 continue
             stats = apply_result_text(db, text, ex.read_result(cost_name) or "",
-                                      ex.read_result(dict_name) or "")
+                                      ex.read_result(dict_name) or "", task_file=f"task_{label}.txt")
+            if stats["unmatched"]:
+                # Несопоставленный ответ — в журнал действий: отметка фона
+                # затирается через 30 с, а ответ 1С больше не придёт.
+                log_action(db, "1С", "onec_unmatched",
+                           f"{name}: строк ответа без задания или на прежнюю отправку — {stats['unmatched']}")
             db.commit()
         except Exception as e:                    # noqa: BLE001 — файл остаётся, разберём снова
             db.rollback()

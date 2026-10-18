@@ -218,15 +218,24 @@ def is_sales_report_result(key: str, command: str) -> bool:
     return command == SALES_REPORT_COMMAND or key.startswith(SALES_REPORT_KEY_PREFIX)
 
 
-def apply_result(db: Session, key: str, status: str, detail: str) -> bool:
+def apply_result(db: Session, key: str, status: str, detail: str, task_file: str | None = None) -> bool:
     """Строка ответа по отчёту. Принимается и опоздавший ответ (timeout):
-    документ в 1С создан, и потерять это знание хуже, чем принять поздно."""
+    документ в 1С создан, и потерять это знание хуже, чем принять поздно.
+
+    `task_file` — файл заданий, на который этот ответ (`result_<метка>` отвечает
+    на `task_<метка>`). Ответ на ПРЕЖНЮЮ отправку отчёта, отправленного
+    повторно, к нынешней не относится: поздний ERROR на первую отправку иначе
+    объявлял бы ошибку, пока вторая ещё в пути, а её OK потом не сопоставлялся."""
     report = db.query(SalesReport).filter(
         SalesReport.onec_key == key,
         SalesReport.onec_status.in_([OneCUploadStatus.sent, OneCUploadStatus.timeout]),
     ).first()
     if report is None:
         logger.warning("ответ 1С по отчёту %s (%s) не сопоставлен", key, status)
+        return False
+    if task_file and report.onec_batch_filename and report.onec_batch_filename != task_file:
+        logger.warning("ответ 1С по отчёту %s (%s) — на прежнюю отправку %s, а отчёт ушёл файлом %s; "
+                       "статус не меняю", key, status, task_file, report.onec_batch_filename)
         return False
     ok = status == "OK"
     report.onec_status = OneCUploadStatus.done if ok else OneCUploadStatus.failed
