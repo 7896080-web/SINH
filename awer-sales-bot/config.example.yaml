@@ -1,0 +1,61 @@
+# Скопируйте в config.yaml и поправьте под себя. Секреты — в .env (см. .env.example).
+db_path: data/awer.db
+timezone: Europe/Moscow
+stores: ["Город", "МСЛ"]        # день закрыт, когда пришла выгрузка по всем этим магазинам (как в 1С)
+norm_shifts: 15                 # смен в полном месяце — для пересчёта «на полный месяц»
+
+params:                          # значения по умолчанию; помесячно меняются в админке
+  base_rate: 25000               # базовая ставка
+  admin_bonus: 13000             # админ. доплата старшим — фиксированная, схемой не меняется
+  step: 0.10                     # шаг перевыполнения плана
+  step_bonus: 5000               # надбавка за шаг
+  max_rate: 45000                # потолок ставки без админ. доплаты
+  min_fte: 1.0                   # меньше 1 полного месяца за 3 мес. — план новичка
+  window: 3                      # окно тренда, мес.
+  sales_percent: 0.04            # % от продаж — только для ведомости
+  stabilizer: none               # none | one_step (ставка меняется не больше чем на 1 ступень за месяц)
+
+onec:
+  inbox: data/inbox              # сюда внешняя обработка 1С кладёт orp_lines_*.csv и orp_docs_*.csv
+  archive: data/archive
+  columns:                       # строки «Отчета о розничных продажах»
+    date: "Дата"
+    store: "Склад"
+    seller: "Продавец"
+    doc: "Документ"
+    item: "Номенклатура"
+    category: "Номенклатурная группа"
+    qty: "Количество"
+    amount: "Сумма"
+    discount: "Скидка"
+  doc_columns:                   # шапки ОРП
+    date: "Дата"
+    store: "Магазин"
+    kassa: "Касса"
+    doc: "Документ"
+    checks: "Чеков"
+    return_checks: "Чеков возврата"
+    revenue: "Выручка"
+  store_map:                     # склад / касса из 1С → магазин (по части названия, без учёта регистра)
+    "ГОРОД": "Город"
+    "МСЛ": "МСЛ"
+  exclude_sellers: ["", "Wildberries", "Ozon", "Lamoda"]
+  seller_store_suffixes: {" МСЛ": "МСЛ"}
+  default_store: "Город"
+
+schedule:
+  daily_send_time: "09:30"       # отправка за вчерашний день
+  retry_minutes: 30              # повтор, если выгрузка ещё не пришла
+  deadline_time: "13:00"         # после — отправка по имеющимся данным + предупреждение владельцу
+
+max:
+  base_url: https://platform-api.max.ru
+  auth: header                   # header | query — проверить по dev.max.ru
+  owners: []                     # user_id владельца/управляющего в MAX (узнать: написать боту, см. журнал)
+  poll_timeout: 30
+  bot_link: ""                   # https://max.ru/<имя_бота> — для ссылок-приглашений
+
+recommendations:
+  lookback_days: 90
+  llm: false                     # true — советы переформулирует Claude API (ANTHROPIC_API_KEY)
+  llm_model: claude-sonnet-5-5

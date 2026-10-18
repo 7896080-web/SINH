@@ -1,0 +1,47 @@
+# awer-sales-bot
+
+Индивидуальные планы продавцов AWER и ежедневные сообщения в мессенджер MAX.
+
+Каждое утро продавец получает: базовый план на месяц, сколько осталось до базы и до следующей ступени
+(+5 000 ₽ за каждые 10 % сверх плана), продажи и вещи за смену, среднюю цену вещи, средний чек и вещей в чеке
+по магазину и совет, как продать больше.
+Владелец — сводку по всем. Данные — из 1С (внешняя обработка), настройки — в веб-админке.
+
+Правила расчёта: [docs/SPEC.md](docs/SPEC.md) · 1С: [docs/1C.md](docs/1C.md) · бот MAX: [docs/MAX.md](docs/MAX.md)
+
+## Установка (Windows, на компьютере с 1С или рядом)
+
+```powershell
+# Python 3.11+  (https://www.python.org/downloads/ — галочка «Add to PATH»)
+cd C:\awer-sales-bot
+python -m venv .venv
+.venv\Scripts\activate
+pip install -e .[dev]
+copy config.example.yaml config.yaml
+copy .env.example .env      # вписать MAX_BOT_TOKEN, ADMIN_PASSWORD, UPLOAD_TOKEN
+pytest -q                   # все тесты должны пройти
+```
+
+## Первый запуск
+
+```powershell
+awer-bot init-db
+awer-bot import-history "D:\ЗП" --admins "Эльвина Абдулиннанова" "Букалова Юлия"   # история из ведомостей
+awer-bot plan 2026-11                       # посмотреть расчёт плана
+awer-bot web                                # админка http://127.0.0.1:8080 (admin / ADMIN_PASSWORD)
+```
+
+В админке: «Настройки месяца» — расчётный и ручной коэффициент год к году, шаг %, надбавка, база,
+максимум, ручные личные планы → «Зафиксировать план». «Продавцы» — роли, коды привязки к боту.
+
+Каждый день: обработка 1С (по расписанию Windows) кладёт строки и шапки «Отчетов о розничных продажах» в `data/inbox` →
+в 09:30 бот рассылает итоги за вчера.
+
+```powershell
+awer-bot import-sales                       # забрать файлы из data/inbox вручную
+awer-bot daily --dry-run --force            # показать сообщения без отправки
+awer-bot serve --host 127.0.0.1             # бот + админка (для постоянной работы)
+awer-bot close-month 2026-11                # итоги и ставки → ведомость xlsx в админке
+```
+
+Служба Windows (автозапуск): `scripts/install-service.ps1`.
