@@ -346,6 +346,66 @@ class DB:
         with self.tx() as c:
             c.execute("UPDATE sellers SET active=1, fired_at=NULL WHERE id=?", (sid,))
 
+    # ------------------------------------------------------------------ имена в 1С: написания и дубли
+    MERGE_KEYED = ("schedule", "plans", "results", "plan_overrides", "weekly_goals", "deliveries", "answers",
+                   "lessons_sent", "quiz_answers")  # есть ключ с seller_id: при совпадении остаётся запись основного
+
+    def aliases(self, sid: int) -> list[str]:
+        return [r["alias"] for r in self.q("SELECT alias FROM seller_aliases WHERE seller_id=? ORDER BY alias", sid)]
+
+    def add_alias(self, sid: int, alias: str) -> None:
+        """Другое написание в 1С / ведомостях. ValueError — имя уже занято (тогда это объединение, не написание)."""
+        alias = " ".join(alias.split())
+        if not alias:
+            raise ValueError("пустое имя")
+        other = self.seller_id(alias, create=False)
+        if other == sid:
+            return
+        if other:
+            raise ValueError(f"«{alias}» уже есть отдельным продавцом — если это один человек, нажмите «Объединить»")
+        with self.tx() as c:
+            c.execute("INSERT INTO seller_aliases(alias, seller_id) VALUES(?,?)", (alias, sid))
+
+    def remove_alias(self, alias: str) -> None:
+        with self.tx() as c:
+            c.execute("DELETE FROM seller_aliases WHERE alias=?", (alias,))
+
+    def merge_sellers(self, keep: int, drop: int) -> list[str]:
+        """Два продавца — один человек (разное написание в 1С и ведомостях): всё переносится на keep, имя drop
+        становится его другим написанием. Возвращает месяцы, где история была у обоих (взято большее)."""
+        a, b = self.seller(keep), self.seller(drop)
+        if not a or not b or keep == drop:
+            raise ValueError("продавец не найден")
+        both = []
+        with self.tx() as c:
+            # месяц из ведомостей у обоих — скорее всего, один месяц учтён дважды: берём большее, не складываем
+            for r in c.execute("SELECT d.month, d.sales, d.fte FROM monthly_history d JOIN monthly_history k "
+                               "ON k.month=d.month AND k.seller_id=? WHERE d.seller_id=?", (keep, drop)).fetchall():
+                c.execute("UPDATE monthly_history SET sales=MAX(sales,?), fte=MAX(fte,?) WHERE month=? AND seller_id=?",
+                          (r["sales"], r["fte"], r["month"], keep))
+                both.append(r["month"])
+            # план: запись из 1С могла получить план новичка, а у записи из ведомостей — план по истории
+            c.execute("DELETE FROM plans WHERE seller_id=? AND method='newcomer' AND month IN "
+                      "(SELECT month FROM plans WHERE seller_id=? AND method<>'newcomer')", (keep, drop))
+            for t in ("monthly_history",) + self.MERGE_KEYED:
+                c.execute(f"UPDATE OR IGNORE {t} SET seller_id=? WHERE seller_id=?", (keep, drop))
+                c.execute(f"DELETE FROM {t} WHERE seller_id=?", (drop,))
+            for t in ("sales_lines", "message_log", "kb_views", "seller_aliases"):
+                c.execute(f"UPDATE {t} SET seller_id=? WHERE seller_id=?", (keep, drop))
+            # аккаунт MAX, коды, смена — у основного, если у него нет; уникальные поля сначала снимаем со второго
+            take = {k: b[k] for k in ("max_user_id", "max_name", "invite_code", "training_user_id", "training_code",
+                                      "crew_id", "hired_at") if a[k] is None and b[k] is not None}
+            c.execute("UPDATE sellers SET max_user_id=NULL, invite_code=NULL, training_user_id=NULL, "
+                      "training_code=NULL WHERE id=?", (drop,))
+            if take:
+                c.execute(f"UPDATE sellers SET {', '.join(f'{k}=?' for k in take)} WHERE id=?", (*take.values(), keep))
+            c.execute("UPDATE sellers SET role=CASE WHEN ?='admin' THEN 'admin' ELSE role END, "
+                      "weekend_key=MAX(weekend_key, ?), active=MAX(active, ?) WHERE id=?",
+                      (b["role"], b["weekend_key"], b["active"], keep))
+            c.execute("DELETE FROM sellers WHERE id=?", (drop,))
+            c.execute("INSERT OR REPLACE INTO seller_aliases(alias, seller_id) VALUES(?,?)", (b["name"], keep))
+        return both
+
     def shift_range(self, sid: int) -> tuple[str | None, str | None]:
         r = self.one("SELECT MIN(day) a, MAX(day) b FROM sales_lines WHERE seller_id=?", sid)
         return r["a"], r["b"]

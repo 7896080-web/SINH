@@ -17,7 +17,7 @@ from fastapi import Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-from . import botcfg, content, health
+from . import botcfg, content, health, names
 from . import tasks as tasks_mod
 from . import crews as crews_mod
 from .config import Settings
@@ -817,6 +817,7 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
         b = [f'<p class=note>{html.escape(msg)}</p>' if msg else "",
              '<p class=note>Новые продавцы появляются здесь сами, когда впервые встречаются в выгрузке 1С. '
              'Можно добавить заранее — тогда первый урок программы новичка придёт сразу после подключения к боту.</p>',
+             names_link(),
              '<h2>Добавить продавца</h2><form method=post action="/sellers/add"><table>',
              '<tr><td>Фамилия Имя — точно как в 1С</td><td><input type=text name=name style="width:260px" required></td></tr>',
              '<tr><td>Обращение в сообщениях</td><td><input type=text name=first_name style="width:260px" placeholder="по умолчанию — имя из 1С"></td></tr>',
@@ -911,6 +912,94 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
                 c.execute("INSERT INTO seller_aliases(alias, seller_id) VALUES(?,?)", (alias, sid))
         db.new_invite(sid)
         return RedirectResponse(f"/sellers/{sid}/card", status_code=303)
+
+    # ------------------------------------------------------------------ имена в 1С ↔ продавец ↔ MAX
+    def names_link() -> str:
+        n = len(names.suspects(db))
+        warn = f' <b class=off>— похоже, есть повторы: {n}</b>' if n else ""
+        return f'<p><a href="/sellers/names">Имена в 1С и в боте — сопоставление →</a>{warn}</p>'
+
+    @app.get("/sellers/names", dependencies=[Depends(auth)])
+    def names_page(msg: str = ""):
+        rows = db.sellers(active_only=False)
+        b = [f'<p class=note>{html.escape(msg)}</p>' if msg else "",
+             '<p>Как бот понимает, чей это план: <b>имя в 1С</b> → продавец в этом списке → его личный QR-код → '
+             '<b>аккаунт MAX</b>. Продажи из 1С и история из ведомостей зарплаты собираются по имени продавца, '
+             'поэтому один человек должен быть здесь <b>одной строкой</b>.</p>',
+             '<p class=note>Если в 1С или в ведомостях человек записан по-другому (другой порядок слов, отчество, '
+             'опечатка, новая фамилия) — добавьте это написание в его строку. «Фамилия Имя МСЛ» в 1С — тот же '
+             'продавец в магазине МСЛ, добавлять не нужно.</p>']
+        sus = names.suspects(db)
+        if sus:
+            b.append('<h2>Похоже, это один человек</h2><form method=post action="/sellers/names"><table>'
+                     '<tr><th>Останется (как в 1С)</th><th>Будет другим написанием</th><th></th></tr>')
+            for keep, drop in sus:
+                b.append(f'<tr><td>{html.escape(keep["name"])}</td><td>{html.escape(drop["name"])}</td><td>'
+                         f'<button class=btn name=action value="merge:{keep["id"]}:{drop["id"]}" '
+                         f'onclick="return confirm(\'Объединить? Продажи, история, план и подключение к боту '
+                         f'перейдут к одному продавцу.\')">Объединить</button>'
+                         f'<button class=btn name=action value="notdup:{keep["id"]}:{drop["id"]}">Это разные люди'
+                         '</button></td></tr>')
+            b.append('</table></form>')
+        b.append('<h2>Все продавцы</h2><form method=post action="/sellers/names"><table>'
+                 '<tr><th>Имя в 1С</th><th>Другие написания (1С, ведомости)</th><th>Продажи в 1С</th>'
+                 '<th>Ведомости</th><th>Аккаунт MAX</th><th>Это тот же человек, что…</th></tr>')
+        opts = "".join(f'<option value={s["id"]}>{html.escape(s["name"])}</option>' for s in rows)
+        for s in rows:
+            sid = s["id"]
+            al = "".join(f'{html.escape(x)} <button class=btn name=action value="unalias:{html.escape(x)}" '
+                         'title="Убрать это написание" style="padding:0 6px">×</button><br>' for x in db.aliases(sid))
+            first, last = db.shift_range(sid)
+            hist = db.one("SELECT COUNT(*) n, MIN(month) a, MAX(month) b FROM monthly_history WHERE seller_id=?", sid)
+            hist_s = f'{hist["n"]} мес. ({hist["a"]} – {hist["b"]})' if hist["n"] else "—"
+            mx = ("✅ " + html.escape(s["max_name"] or "подключён")) if s["max_user_id"] else "не подключён"
+            fired = ' <span class=note>(уволен)</span>' if not s["active"] else ""
+            b.append(f'<tr><td>{html.escape(s["name"])}{fired}</td>'
+                     f'<td>{al}<input type=text name="alias{sid}" placeholder="другое написание" style="width:180px">'
+                     f'<button class=btn name=action value="alias:{sid}">Добавить</button></td>'
+                     f'<td class=n>{f"{_date(first)} – {_date(last)}" if first else "—"}</td><td class=n>{hist_s}</td><td>{mx}</td>'
+                     f'<td><select name="same{sid}"><option value="">—</option>{opts}</select>'
+                     f'<button class=btn name=action value="same:{sid}" onclick="return confirm(\'Объединить '
+                     f'двух продавцов в одного?\')">Объединить</button></td></tr>')
+        b.append('</table></form><p><a href="/sellers">← к списку продавцов</a></p>')
+        return page("Имена в 1С и в боте", "".join(b))
+
+    @app.post("/sellers/names", dependencies=[Depends(auth)])
+    async def names_save(request: Request):
+        form = await request.form()
+        action = str(form.get("action") or "")
+        kind, _, arg = action.partition(":")
+        msg = ""
+        try:
+            if kind == "alias":
+                alias = " ".join(str(form.get(f"alias{arg}") or "").split())
+                db.add_alias(int(arg), alias)
+                msg = f"«{alias}» теперь считается тем же продавцом, что «{db.seller(int(arg))['name']}»."
+            elif kind == "unalias":
+                db.remove_alias(arg)
+                msg = f"Написание «{arg}» убрано."
+            elif kind in ("merge", "same", "notdup"):
+                if kind == "same":
+                    other = str(form.get(f"same{arg}") or "")
+                    if not other or other == arg:
+                        raise ValueError("выберите, с кем объединить")
+                    keep, drop = names.main_of(db, db.seller(int(arg)), db.seller(int(other)))
+                else:
+                    a, bb = map(int, arg.split(":"))
+                    keep, drop = db.seller(a), db.seller(bb)
+                if kind == "notdup":
+                    names.not_duplicate(db, keep["id"], drop["id"])
+                    msg = f"Хорошо: «{keep['name']}» и «{drop['name']}» — разные люди."
+                else:
+                    both = db.merge_sellers(keep["id"], drop["id"])
+                    msg = (f"Объединено: «{drop['name']}» теперь другое написание «{keep['name']}». "
+                           "Продажи, история, план и подключение к боту — у одного продавца.")
+                    if both:
+                        msg += f" В месяцах {', '.join(both)} история была у обоих — взята большая сумма."
+                    msg += " Если план этого месяца уже зафиксирован — проверьте его в «Настройки месяца»."
+        except ValueError as e:
+            msg = f"Не сделано: {e}"
+        return RedirectResponse(f"/sellers/names?msg={quote(msg)}", status_code=303)
 
     @app.get("/sellers/{sid}/card", dependencies=[Depends(auth)])
     def seller_card(sid: int):
