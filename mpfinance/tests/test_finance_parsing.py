@@ -379,13 +379,24 @@ def test_kit_orders_export_counts_only_delivered_and_refunds():
     ]
     result = _parse(make_xlsx(KIT_HEADERS, rows), "kit")
     assert result.format is KIT_FORMAT
-    assert [(l["order_id"], l["operation"]) for l in result.lines] == [("1001", v.SALE), ("1004", v.RETURN)]
+    # FULL_REFUND — «полный возврат» заказа (спека KIT): в выгрузке по текущему
+    # статусу продажи у него уже нет — не возврат с минусом, а пропуск.
+    assert [(l["order_id"], l["operation"]) for l in result.lines] == [("1001", v.SALE)]
     # Выручка — цена позиции (после скидки), а не «Итого к оплате» заказа.
     assert result.lines[0]["revenue"] == 300000
     assert result.lines[0]["payout"] == 300000        # своей комиссии KIT не берёт
-    assert result.lines[1]["revenue"] == -200000
-    assert len(result.warnings) == 3                  # отмена, «Новый», частичный возврат
+    assert len(result.warnings) == 4                  # отмена, «Новый», полный и частичный возврат
     assert any("Частичный возврат" in w for w in result.warnings)
+
+
+def test_kit_refusals_are_neither_sale_nor_return():
+    """«Отказ при получении», «Не доставлен», «Полный возврат» — по подстроке
+    они читались бы как «получен»/«доставлен» (продажа) или «возврат»."""
+    rows = [[str(1100 + i), "01.09.2026", status, 2000, f"{1100 + i}-1", "A-1", "2000000000012", "Джинсы",
+             2500, 2000] for i, status in enumerate(
+        ["Отказ при получении", "Не доставлен", "Не получен", "Полный возврат", "Получен", "Возврат"])]
+    result = _parse(make_xlsx(KIT_HEADERS, rows), "kit")
+    assert [(l["order_id"], l["operation"]) for l in result.lines] == [("1104", v.SALE), ("1105", v.RETURN)]
 
 
 def test_yandex_pay_detail_gives_signed_acquiring_fees():

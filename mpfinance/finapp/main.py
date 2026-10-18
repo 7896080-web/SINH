@@ -3,7 +3,7 @@ import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
@@ -42,6 +42,16 @@ SESSION_SECRET = os.environ.get("MPFIN_SESSION_SECRET")
 if not SESSION_SECRET:
     raise RuntimeError("Не задана переменная окружения MPFIN_SESSION_SECRET")
 
+def same_origin(request: Request) -> bool:
+    """POST — только со страниц самой программы. Браузер ставит Origin на
+    каждый POST, и в нём есть ПОРТ (в отличие от SameSite у cookie). Нет
+    заголовка — не браузерная форма (накат, тесты): пропускаем."""
+    origin = request.headers.get("origin")
+    if origin is None:
+        return True
+    return origin == f"{request.url.scheme}://{request.headers.get('host', '')}"
+
+
 async def progress_middleware(request: Request, call_next):
     """Кнопки со шкалой прогресса (`static/progress.js`) шлют форму в фоне.
 
@@ -54,6 +64,11 @@ async def progress_middleware(request: Request, call_next):
 
     Стоит ВНУТРИ SessionMiddleware: cookie сессии с этим сообщением ложится и
     на JSON-ответ."""
+    if request.method == "POST" and not same_origin(request):
+        # Подделка запроса со страницы на 127.0.0.1:<другой порт>: SameSite=Lax
+        # порт не различает, и cookie входа ушла бы с чужой формой — а здесь
+        # кнопки, меняющие склад 1С и отправляющие отчёты в 1С.
+        return PlainTextResponse("Запрос пришёл не со страницы программы — отклонён.", status_code=403)
     token = progress.begin(request.headers.get("x-progress-id"))
     try:
         response = await call_next(request)

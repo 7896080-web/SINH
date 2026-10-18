@@ -77,7 +77,7 @@ def build_xlsx_bytes(headers: list[str], rows: list[list],
                     length = len(str(value))
                     if length > widths[col_idx]:
                         widths[col_idx] = length
-        ws.append(row)
+        ws.append([_as_text_if_formula(ws, value) for value in row])
 
     for col_idx, width in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(col_idx)].width = min(width + 3, 60)
@@ -85,6 +85,17 @@ def build_xlsx_bytes(headers: list[str], rows: list[list],
     buffer = io.BytesIO()
     wb.save(buffer)
     return buffer.getvalue()
+
+
+def _as_text_if_formula(ws, value):
+    """Текст, начинающийся с «=», openpyxl пишет ФОРМУЛОЙ, и Excel выполнит её у
+    оператора при открытии выгрузки. В выгрузки попадают имена и артикулы из
+    отчётов площадок и из 1С — такой текст остаётся текстом."""
+    if isinstance(value, str) and value.startswith("="):
+        cell = WriteOnlyCell(ws, value=value)
+        cell.data_type = "s"
+        return cell
+    return value
 
 
 def build_xlsx_response(headers: list[str], rows: list[list], filename: str,

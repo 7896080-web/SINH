@@ -21,7 +21,7 @@ from finapp.finance.economics import (Filters, Totals, load_lines, platform_summ
                                    unit_economics)
 from finapp.finance.formats import FORMATS
 from finapp.finance.readers import ReportReadError, read_sheets
-from finapp.finance.importer import import_report, resolve_uids
+from finapp.finance.importer import import_report, resolve_uids, sales_overlaps
 from finapp.finance.sales_1c import IN_FLIGHT, build_plan, request_upload, upload_problems
 from finapp.finance.rates import RateBook
 from finapp.finance.reconcile import breakdown, money_check, order_check, unmatched_barcodes
@@ -280,6 +280,7 @@ def report_detail(
         plan=plan, plan_sale=plan.totals("SALE"), plan_return=plan.totals("RETURN"),
         warehouse=warehouse, problems=upload_problems(db, report, warehouse),
         onec_labels=ONEC_LABELS, in_flight=report.onec_status in IN_FLIGHT,
+        overlaps=sales_overlaps(db, report),
     ))
 
 
@@ -668,8 +669,8 @@ def finance_settings_save(
             errors.append(f"{label} — вне допустимых границ")
     warehouses = {"FIN_WAREHOUSE_WB": FIN_WAREHOUSE_WB, "FIN_WAREHOUSE_OZON": FIN_WAREHOUSE_OZON,
                   "FIN_WAREHOUSE_KIT": FIN_WAREHOUSE_KIT, "FIN_WAREHOUSE_LAMODA": FIN_WAREHOUSE_LAMODA}
-    if any("|" in name for name in warehouses.values()):
-        errors.append("в имени склада 1С не может быть символа «|»")
+    if any(any(ch in name for ch in "|\r\n") for name in warehouses.values()):
+        errors.append("в имени склада 1С не может быть «|» и переводов строки")
     if errors:
         set_flash(request, "Настройки не сохранены: " + "; ".join(errors) + ".", "warn")
         return RedirectResponse("/finance/costs#settings", status_code=303)

@@ -121,8 +121,9 @@ def upload_problems(db: Session, report: SalesReport, warehouse: str,
     if not warehouse:
         problems.append(f"Не задан склад 1С для площадки {v.PLATFORM_LABELS[report.platform]} "
                         f"(страница «Себестоимость», блок «Настройки»).")
-    if "|" in warehouse:
-        problems.append("В имени склада 1С есть символ «|» — он разделяет поля в файле обмена.")
+    if not field_is_safe(warehouse):
+        problems.append("В имени склада 1С есть «|» или перевод строки — они разделяют поля и строки "
+                        "в файле обмена с 1С. Исправьте имя склада в настройках.")
     plan = build_plan(db, report)
     if not plan.lines:
         problems.append("В отчёте нет продаж и возвратов с количеством — в 1С грузить нечего.")
@@ -165,6 +166,12 @@ def pending_reports(db: Session) -> list[SalesReport]:
         .limit(MAX_REPORTS_PER_BATCH).all()
 
 
+def field_is_safe(text: str) -> bool:
+    """Поле строки задания 1С: без «|» (разделитель полей) и переводов строки
+    (разделитель команд — `СтрРазделить(Содержимое, Символы.ПС)` в обработке)."""
+    return not any(ch in (text or "") for ch in "|\r\n")
+
+
 def task_lines(db: Session, reports: list[SalesReport], filename: str) -> list[str]:
     """Строки SALES_REPORT для файла заданий; отчёты помечаются отправленными.
 
@@ -185,12 +192,21 @@ def task_lines(db: Session, reports: list[SalesReport], filename: str) -> list[s
             continue
         plan = build_plan(db, report)
         day = f"{report.period_to:%Y%m%d}"
+        rows = []
         for item in plan.lines:
             amount = v.kop_to_rub(item.amount_kop)
-            lines.append("|".join([
-                SALES_REPORT_COMMAND, report.onec_key, report.platform, warehouse, day,
-                item.kind, item.barcode, str(item.quantity), f"{amount:.2f}",
-            ]))
+            rows.append([SALES_REPORT_COMMAND, report.onec_key, report.platform, warehouse, day,
+                         item.kind, item.barcode, str(item.quantity), f"{amount:.2f}"])
+        # Последний рубеж: поле с «|» или переводом строки дало бы 1С ЛИШНЮЮ
+        # строку — отдельную команду в общем канале, где ходят и перемещения
+        # Sync Admin с настоящими остатками.
+        bad = [f for row in rows for f in row if not field_is_safe(f)]
+        if bad:
+            report.onec_status = OneCUploadStatus.failed
+            report.onec_detail = f"не отправлен: недопустимый символ в поле «{bad[0][:40]}»"[:255]
+            report.onec_completed_at = now_utc()
+            continue
+        lines.extend("|".join(row) for row in rows)
         report.onec_status = OneCUploadStatus.sent
         report.onec_sent_at = now_utc()
         report.onec_batch_filename = filename

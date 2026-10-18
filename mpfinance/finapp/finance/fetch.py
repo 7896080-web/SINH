@@ -60,6 +60,10 @@ KIT_API_FORMAT = ReportFormat(code="kit_api", label="Яндекс KIT — зак
                               platforms=("kit",), aliases={}, build=lambda row: {})
 # Вид отчёта KIT по API, когда продажи берутся из AWER CRM: только доставка.
 KIT_DELIVERY_KIND = "доставка"
+# Род отчёта в ключе 1С (`make_onec_key`): доставка и продажи за одну неделю —
+# разные отчёты, и ни один не должен занимать ключ другого.
+KIT_SALES_KEY = "kitapi"
+KIT_DELIVERY_KEY = "kitdlv"
 
 
 class FetchError(RuntimeError):
@@ -254,9 +258,9 @@ def _run_wb(db: Session, job: ReportFetch, heartbeat, session, sleep) -> str:
             continue
         if outcome.report is not None and not outcome.skipped:
             job.imported += 1
-            mismatch = [w for w in outcome.warnings if "Итого к оплате" in w]
-            if mismatch:
-                notes.append(f"отчёт {report_id}: {mismatch[0]}")
+            for warning in outcome.warnings:
+                if "Итого к оплате" in warning or _is_overlap_warning(warning):
+                    notes.append(f"отчёт {report_id}: {warning}")
         _step(db, job, heartbeat)
     summary = f"отчётов WB за период: {job.found}, загружено новых: {job.imported}"
     if skipped:
@@ -272,20 +276,43 @@ def _kit_variant_map(db: Session, account_id: int) -> dict[str, str | None]:
     return {vid: bc for vid, bc in rows}
 
 
+def kit_weeks(date_from: date, date_to: date) -> list[tuple[date, date]]:
+    """Календарные недели (пн–вс), покрывающие период. Будущие — нет.
+
+    Отчёт KIT по API — ВСЕГДА на календарную неделю. Ключ отчёта без номера
+    строится по периоду, и окно «две последние недели», сдвигаясь каждый
+    понедельник на семь дней, давало новый отчёт поверх прежнего: каждая неделя
+    лежала в двух отчётах (доставка вдвое, а в режиме «продажи из API» — и
+    продажи, причём оба можно было отправить в 1С). С неделей в ключе та же
+    неделя всегда попадает в тот же отчёт и заменяется свежей, пока не ушла в 1С.
+    """
+    monday = date_from - timedelta(days=date_from.weekday())
+    last = min(date_to, today_local())
+    weeks = []
+    while monday <= last:
+        weeks.append((monday, monday + timedelta(days=6)))
+        monday += timedelta(days=7)
+    return weeks
+
+
 def _run_kit(db: Session, job: ReportFetch, heartbeat, session, sleep) -> str:
     account = job.account
     token = (credentials_of(db, account).get("token") or "").strip()
     if not token:
         raise FetchError(f"У кабинета «{account.name}» не задан токен KIT (страница «API-ключи»).")
     api = kit_source.KitOrdersApi(token, session=session, sleep=sleep)
-    job.progress_total = 3
-    orders = api.orders_updated_since(local_day_start_utc(job.date_from))
+    weeks = kit_weeks(job.date_from, job.date_to)
+    if not weeks:
+        return "период целиком в будущем — загружать нечего"
+    job.progress_total = len(weeks) + 1
+    orders = api.orders_updated_since(local_day_start_utc(weeks[0][0]))
     job.progress_done = 1
     _step(db, job, heartbeat, f"получено заказов: {len(orders)}")
     # Продажи сайта берутся из AWER CRM — тогда из заказов KIT нужна только
     # доставка: продажи в них те же, и посчитались бы дважды. Баркоды вариантов
     # тогда не нужны вовсе, и запросов к KIT за ними не делаем.
     delivery_only = load_settings(db).kit_sales_source == "crm"
+    kind = KIT_DELIVERY_KEY if delivery_only else KIT_SALES_KEY
 
     known = _kit_variant_map(db, account.id)
     asked: dict[str, str | None] = {}
@@ -299,73 +326,101 @@ def _run_kit(db: Session, job: ReportFetch, heartbeat, session, sleep) -> str:
             asked[variant_id] = api.variant_barcode(variant_id)
         return asked[variant_id]
 
-    lines, stats = kit_source.build_lines(orders, job.date_from, job.date_to, barcode_for)
-    if delivery_only:
-        lines = [line for line in lines if line["operation"] == v.LOGISTICS]
+    notes, stored, stored_weeks, warnings = [], [], set(), []
+    totals = {"orders": 0, "sold_qty": 0, "refused_qty": 0, "no_barcode": 0, "cost": 0, "paid": 0}
+    for monday, sunday in weeks:
+        where = f"неделя {monday:%d.%m}–{sunday:%d.%m.%Y}"
+        lines, stats = kit_source.build_lines(orders, monday, sunday, barcode_for)
+        if delivery_only:
+            lines = [line for line in lines if line["operation"] == v.LOGISTICS]
+        for key in ("orders", "sold_qty", "refused_qty", "no_barcode"):
+            totals[key] += stats[key]
+        totals["cost"] += sum(line["logistics"] for line in lines if line["operation"] == v.LOGISTICS)
+        totals["paid"] += sum(line["compensation"] for line in lines if line["operation"] == v.LOGISTICS)
+        job.progress_done += 1
+        if not lines:
+            _step(db, job, heartbeat, f"{where}: нет данных")
+            continue
+        outcome = store_api_report(
+            db, platform="kit", account_id=account.id, parsed=ParseResult(format=KIT_API_FORMAT, lines=lines),
+            period_from=monday, period_to=sunday, user=f"api:{job.requested_by or 'system'}",
+            file_name="Яндекс KIT, доставка по API" if delivery_only else "Яндекс KIT, заказы по API",
+            replace_unsent=True, report_kind=KIT_DELIVERY_KIND if delivery_only else None, kind=kind)
+        if outcome.errors:
+            raise FetchError(f"{where}: " + " ".join(outcome.errors))
+        if outcome.skipped:
+            notes.append(f"{where}: отчёт уже отправлен в 1С (#{outcome.report.id}) — не перезаписываю")
+        else:
+            stored.append(outcome.report)
+            stored_weeks.add(monday)
+            warnings.extend(w for w in outcome.warnings if _is_overlap_warning(w))
+        _step(db, job, heartbeat, where)
     for variant_id, barcode in asked.items():
         cached = db.get(KitVariant, (account.id, variant_id))
         if cached is None:
             db.add(KitVariant(account_id=account.id, variant_id=variant_id[:64], barcode=barcode))
         else:
             cached.barcode, cached.fetched_at = barcode, now_utc()
+    dropped = _drop_superseded_kit(db, account.id, stored, stored_weeks)
     db.flush()
-    job.found = stats["orders"]
-    job.progress_done = 2
-    _step(db, job, heartbeat, "запись отчёта")
-    if not lines:
-        what = "стоимости доставки в заказах KIT" if delivery_only and stats["orders"] else "заказов KIT"
+    job.found = totals["orders"]
+    job.imported = len(stored)
+    if not stored and not notes:
+        what = "стоимости доставки в заказах KIT" if delivery_only and totals["orders"] else "заказов KIT"
         return (f"{what}, доставленных за {job.date_from:%d.%m}–{job.date_to:%d.%m.%Y}, нет "
                 f"(просмотрено изменённых: {len(orders)})")
-    dropped = _drop_unsent_kit_sales(db, account.id, job) if delivery_only else 0
-    parsed = ParseResult(format=KIT_API_FORMAT, lines=lines)
-    outcome = store_api_report(
-        db, platform="kit", account_id=account.id, parsed=parsed, period_from=job.date_from,
-        period_to=job.date_to, user=f"api:{job.requested_by or 'system'}",
-        file_name="Яндекс KIT, доставка по API" if delivery_only else "Яндекс KIT, заказы по API",
-        replace_unsent=True, report_kind=KIT_DELIVERY_KIND if delivery_only else None,
-        key_suffix="-dlv" if delivery_only else "")
-    if outcome.errors:
-        raise FetchError(" ".join(outcome.errors))
-    job.progress_done = 3
-    if outcome.skipped:
-        return (f"отчёт KIT за этот период уже отправлен в 1С (#{outcome.report.id}) — "
-                f"не перезаписываю")
-    job.imported = 1
     if delivery_only:
-        cost = sum(line["logistics"] for line in lines)
-        paid = sum(line["compensation"] for line in lines)
-        note = (f"только доставка (продажи — из AWER CRM): заказов {stats['orders']}, доставка для "
-                f"продавца {v.format_rub(cost)} ₽, оплачено покупателями {v.format_rub(paid)} ₽")
-        if outcome.replaced:
-            note += "; прежний неотправленный отчёт за период заменён свежим"
-        if dropped:
-            note += ("; прежний отчёт по API с продажами за этот период удалён — продажи теперь из "
-                     "AWER CRM")
-        return note
-    note = (f"заказов: {stats['orders']}, продано {stats['sold_qty']} шт, отказов при получении "
-            f"{stats['refused_qty']} шт")
-    if stats["no_barcode"]:
-        note += f", позиций без баркода: {stats['no_barcode']}"
-    if outcome.replaced:
-        note += "; прежний неотправленный отчёт за период заменён свежим"
-    return note
+        head = (f"только доставка (продажи — из AWER CRM): недель {len(stored)}, заказов {totals['orders']}, "
+                f"доставка для продавца {v.format_rub(totals['cost'])} ₽, оплачено покупателями "
+                f"{v.format_rub(totals['paid'])} ₽")
+    else:
+        head = (f"недель {len(stored)}, заказов {totals['orders']}, продано {totals['sold_qty']} шт, "
+                f"отказов при получении {totals['refused_qty']} шт")
+        if totals["no_barcode"]:
+            head += f", позиций без баркода: {totals['no_barcode']}"
+    if dropped:
+        head += (f"; убраны прежние неотправленные отчёты по API за эти недели: {dropped} "
+                 f"(в том числе прежнего режима продаж KIT)")
+    return "; ".join([head] + notes + warnings)[:2000]
 
 
-def _drop_unsent_kit_sales(db: Session, account_id: int, job: ReportFetch) -> int:
-    """Продажи KIT переключили на AWER CRM: отчёт по API С ПРОДАЖАМИ за тот же
-    период (прежний режим) задвоил бы их с CRM. Пока он не ушёл в 1С, его можно
-    забрать заново в любой момент — удаляем; ушедший в 1С не трогаем."""
-    key = make_onec_key("kit", account_id, "", job.date_from, job.date_to)
-    old = db.query(SalesReport).filter(
-        SalesReport.onec_key == key, SalesReport.source == "api",
-        SalesReport.onec_status.in_((OneCUploadStatus.none, OneCUploadStatus.failed,
-                                     OneCUploadStatus.timeout))).first()
-    if old is None:
+def _is_overlap_warning(text: str) -> bool:
+    """Предупреждение о задвоении — его обязано увидеть сообщение заявки: у
+    загрузки по API другого читателя нет."""
+    return "дважды" in text or "пересекается" in text
+
+
+def _drop_superseded_kit(db: Session, account_id: int, stored: list[SalesReport],
+                         stored_weeks: set[date]) -> int:
+    """Неотправленные отчёты KIT по API, ЦЕЛИКОМ покрытые только что записанными
+    неделями: прежние окна до понедельной загрузки и отчёты другого режима
+    продаж KIT (переключили CRM ↔ API). Их данные только что забраны заново, и
+    оставь мы их — неделя легла бы дважды. Отчёт, захватывающий неделю, которую
+    сейчас НЕ забирали, остаётся: удалить его значило бы потерять ту неделю.
+    Отправленные в 1С не трогаем никогда."""
+    if not stored_weeks:
         return 0
-    db.query(SalesReportLine).filter(SalesReportLine.report_id == old.id).delete(synchronize_session=False)
-    db.delete(old)
-    db.flush()
-    return 1
+    keep = {r.id for r in stored}
+    first, last = min(stored_weeks), max(stored_weeks) + timedelta(days=6)
+    dropped = 0
+    for report in db.query(SalesReport).filter(
+            SalesReport.platform == "kit", SalesReport.account_id == account_id,
+            SalesReport.source == "api", SalesReport.period_from >= first, SalesReport.period_to <= last,
+            SalesReport.onec_status.in_((OneCUploadStatus.none, OneCUploadStatus.failed,
+                                         OneCUploadStatus.timeout))):
+        if report.id in keep:
+            continue
+        monday = report.period_from - timedelta(days=report.period_from.weekday())
+        spanned = set()
+        while monday <= report.period_to:
+            spanned.add(monday)
+            monday += timedelta(days=7)
+        if spanned <= stored_weeks:
+            db.query(SalesReportLine).filter(SalesReportLine.report_id == report.id) \
+                .delete(synchronize_session=False)
+            db.delete(report)
+            dropped += 1
+    return dropped
 
 
 # ---------------------------------------------------------------- курс ЦБ

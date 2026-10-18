@@ -17,6 +17,15 @@
     </div>
 </div>
 
+{% if overlaps %}
+<div class="flash flash--warn">
+    Период пересекается с другими отчётами этой площадки и кабинета:
+    {% for r in overlaps %}<a href="/finance/reports/{{ r.id }}">#{{ r.id }} ({{ r.period_from.strftime('%d.%m') }}–{{ r.period_to.strftime('%d.%m.%Y') }}{% if r.report_kind %}, {{ r.report_kind }}{% endif %})</a>{% if not loop.last %}, {% endif %}{% endfor %}.
+    Если это те же продажи — они посчитаются дважды, на дашборде и в 1С: удалите лишний отчёт.
+    У WB «основной» и «по выкупам» за одну неделю — разные отчёты, их не трогайте.
+</div>
+{% endif %}
+
 <div class="card">
     <h2 style="margin-top:0; font-size:15px;">Итоги по операциям</h2>
     <div class="table-scroll">

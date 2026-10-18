@@ -144,3 +144,51 @@ def test_progress_script_parses():
     result = subprocess.run(["node", "--check", str(ROOT / "finapp" / "static" / "progress.js")],
                             capture_output=True, text=True, encoding="utf-8", errors="replace")
     assert result.returncode == 0, result.stderr
+
+
+# ------------------------------------------------------------ аудит 18.10: безопасность
+
+def test_post_from_another_origin_is_refused(client):
+    """SameSite=Lax порт не различает: форма со страницы 127.0.0.1:<другой порт>
+    ушла бы с cookie входа. Origin порт несёт — по нему и отказ."""
+    data = {"FIN_TAX_MODE": "revenue", "FIN_TAX_RATE": "9"}
+    refused = client.post("/finance/settings", data=data, headers={"Origin": "http://127.0.0.1:8000"},
+                          follow_redirects=False)
+    assert refused.status_code == 403
+    own = client.post("/finance/settings", data=data, headers={"Origin": "http://testserver"},
+                      follow_redirects=False)
+    assert own.status_code == 303
+
+
+def test_warehouse_name_with_a_line_break_is_refused(client):
+    response = client.post("/finance/settings", data={"FIN_TAX_MODE": "revenue", "FIN_TAX_RATE": "6",
+                                                      "FIN_WAREHOUSE_KIT": "Сайт\nCANCEL_MOVEMENT|x"},
+                           follow_redirects=True)
+    assert "не сохранены" in response.text
+
+
+def test_1c_task_line_never_carries_a_line_break(db, epf_ready):
+    """Склад с переводом строки, попавший в базу мимо формы, не даёт 1С лишней
+    строки-команды: отчёт получает отказ, а файл заданий — ни строки."""
+    from finapp.finance import sales_1c, values as v
+    from finapp.finance.settings import save_setting
+    from tests.finance_factories import make_product, make_report
+    make_product(db)
+    save_setting(db, "FIN_WAREHOUSE_WB", "Склад\nCANCEL_MOVEMENT")
+    report = make_report(db, key="SR-wb-inj", lines=[{"operation": v.SALE, "quantity": 1, "revenue": 1000,
+                                                       "payout": 900, "barcode": "2000000000012"}])
+    from finapp.finance.importer import resolve_uids
+    resolve_uids(db, report)
+    db.commit()
+    assert sales_1c.task_lines(db, [report], "task_fin_x.txt") == []
+    assert report.onec_status == OneCUploadStatus.failed
+
+
+def test_excel_export_keeps_formula_like_text_as_text():
+    import io
+    import zipfile
+
+    from finapp.excel_utils import build_xlsx_bytes
+    data = build_xlsx_bytes(["Товар"], [["=HYPERLINK(\"http://x\",\"y\")"], ["обычный"]])
+    sheet = zipfile.ZipFile(io.BytesIO(data)).read("xl/worksheets/sheet1.xml").decode()
+    assert "<f>" not in sheet and "HYPERLINK" in sheet

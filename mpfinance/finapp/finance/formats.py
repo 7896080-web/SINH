@@ -318,6 +318,7 @@ _SALE_WORDS = ("продаж", "реализац", "выкуп", "доставл
                "delivered", "completed", "sale", "sold")
 _RETURN_WORDS = ("возврат", "refund", "return")
 _PARTIAL_WORDS = ("частичн", "partial")
+_REFUSAL_WORDS = ("отказ", "не доставлен", "не получен", "не выкуп", "невыкуп", "refus")
 _SKIP_WORDS = ("отмен", "cancel", "не выкуп", "невыкуп", "ожида", "wait", "setup_delivery",
                "creating", "в доставке", "в пути", "собира", "processing")
 
@@ -333,6 +334,15 @@ def classify_generic(text: str, status_column: bool = False) -> str | None:
     t = _norm(text)
     if not t:
         return v.SALE
+    # Отказ и «не доставлен» — не продажа, хотя в них есть «получен» и
+    # «доставлен»: проверяются раньше слов продажи.
+    if any(w in t for w in _REFUSAL_WORDS):
+        return None
+    # Статус ЗАКАЗА «полный возврат» (FULL_REFUND у KIT) — заказ вернули целиком:
+    # в выгрузке по текущему статусу продажи у него уже нет, и минус без плюса
+    # дал бы отрицательную выручку и возврат в 1С за то, что не продавали.
+    if status_column and (("full" in t and "refund" in t) or "полный возврат" in t):
+        return None
     if any(w in t for w in _RETURN_WORDS):
         return v.RETURN
     if any(w in t for w in _SKIP_WORDS):

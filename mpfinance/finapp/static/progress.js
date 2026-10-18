@@ -214,7 +214,16 @@
                 try { body = JSON.parse(xhr.responseText); } catch (e) { body = null; }
                 if (body && body.location) {
                     done("готово, открываю страницу…");
-                    location.assign(body.location);
+                    var target = new URL(body.location, location.href);
+                    if (target.pathname === location.pathname && target.search === location.search) {
+                        // Тот же адрес (часто с якорем: #settings, #money) — переход
+                        // только прокрутил бы страницу: шкала повисла бы на «открываю»,
+                        // а итог всплыл бы на следующей странице. Перезагружаем.
+                        if (target.hash) location.hash = target.hash;
+                        location.reload();
+                    } else {
+                        location.assign(body.location);
+                    }
                     return;
                 }
             }

@@ -14,7 +14,7 @@ from finapp.crypto import encrypt_value
 from finapp.finance import fetch, values as v
 from finapp.finance.sources import kit as kit_source
 from finapp.finance.sources import wb as wb_source
-from finapp.models import ApiCredential, KitVariant, OneCUploadStatus, ReportFetch, SalesReport
+from finapp.models import ApiCredential, KitVariant, OneCUploadStatus, ReportFetch, SalesReport, SalesReportLine
 from finapp.timeutils import local_date_of, local_day_start_utc, now_utc
 from tests.finance_factories import make_account, make_product
 
@@ -271,10 +271,12 @@ def test_kit_fetch_builds_report_and_refreshes_it_until_sent_to_1c(db, kit_sales
     session = run([_kit_order()])
     report = db.query(SalesReport).one()
     assert (report.platform, report.source, report.unmatched_lines) == ("kit", "api", 0)
+    # Отчёт — на календарную неделю доставки (08.09 — неделя 07–13.09).
+    assert (report.period_from, report.period_to) == (date(2026, 9, 7), date(2026, 9, 13))
     assert session.headers["Authorization"] == "Bearer kit-token"
-    # Запрос — по дате изменения от начала периода, по возрастанию.
+    # Запрос — по дате изменения от понедельника первой недели, по возрастанию.
     params = session.calls[0][2]
-    start = local_day_start_utc(date(2026, 9, 1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    start = local_day_start_utc(date(2026, 8, 31)).strftime("%Y-%m-%dT%H:%M:%SZ")
     assert (params["sort_by"], params["sort_direction"], params["updated_from"]) == \
         ("updated_at", "asc", start)
 
@@ -324,7 +326,7 @@ def test_kit_fetch_takes_only_delivery_when_sales_come_from_crm(db):
     assert not [c for c in session.calls if c[1].startswith("/v1/variants")]
     report = db.query(SalesReport).one()
     assert {l.operation for l in report.lines} == {v.LOGISTICS}
-    assert report.report_kind == fetch.KIT_DELIVERY_KIND and report.onec_key.endswith("-dlv")
+    assert report.report_kind == fetch.KIT_DELIVERY_KIND and "-kitdlv-" in report.onec_key
     assert sum(l.logistics_kop for l in report.lines) == 2 * 25000
     job = db.query(ReportFetch).one()
     assert "только доставка" in job.message and "500,00" in job.message
@@ -358,7 +360,55 @@ def test_switching_to_crm_replaces_unsent_api_sales_of_the_period(db, kit_sales_
     _kit_run(db, account, [_kit_order()])
     report = db.query(SalesReport).one()                       # прежний с продажами удалён
     assert {l.operation for l in report.lines} == {v.LOGISTICS}
-    assert "продажи теперь из AWER CRM" in db.query(ReportFetch).order_by(ReportFetch.id.desc()).first().message
+    assert "прежнего режима продаж KIT" in db.query(ReportFetch).order_by(ReportFetch.id.desc()).first().message
+
+
+def test_two_mondays_in_a_row_count_a_week_once(db):
+    """Окно автоплана «две последние недели» каждый понедельник сдвигается на
+    неделю. Отчёт на календарную неделю: та же неделя — тот же отчёт, и доставка
+    08.10 учтена один раз, а не в двух пересекающихся окнах."""
+    account = make_account(db, platform="kit", name="Сайт")
+    _cred(db, account, "token", "t")
+    order = _kit_order(delivered="2026-10-08T10:00:00+03:00")
+    for start, end in ((date(2026, 9, 28), date(2026, 10, 11)), (date(2026, 10, 5), date(2026, 10, 18))):
+        fetch.request_fetch(db, "kit_api", "system", account.id, start, end)
+        db.commit()
+        fetch.run_pending(db, session=FakeSession({"/v1/orders": {"orders": [order], "total_count": 1}}),
+                          sleep=lambda s: None)
+    lines = db.query(SalesReportLine).join(SalesReport).filter(SalesReport.platform == "kit").all()
+    assert sum(l.logistics_kop for l in lines) == 25000
+    assert [(r.period_from, r.period_to) for r in db.query(SalesReport)] == [(date(2026, 10, 5), date(2026, 10, 11))]
+
+
+def test_old_window_report_is_superseded_by_weeks_it_covers(db):
+    """Отчёт прежнего окна (две недели одним отчётом), целиком покрытый
+    забранными заново неделями, убирается; захватывающий незабранную неделю —
+    остаётся (иначе та неделя пропала бы)."""
+    from finapp.finance.importer import make_onec_key
+    from tests.finance_factories import make_report
+    account = make_account(db, platform="kit", name="Сайт")
+    _cred(db, account, "token", "t")
+    for start, end in ((date(2026, 10, 5), date(2026, 10, 18)), (date(2026, 9, 28), date(2026, 10, 11))):
+        old = make_report(db, platform="kit", account_id=account.id, period=(start, end),
+                          key=make_onec_key("kit", account.id, "", start, end),
+                          lines=[{"operation": v.LOGISTICS, "quantity": 0, "logistics": 25000}])
+        old.source = "api"
+    db.commit()
+    orders = [_kit_order(delivered="2026-10-08T10:00:00+03:00"),
+              _kit_order(order_id="o-2", delivered="2026-10-15T10:00:00+03:00")]
+    fetch.request_fetch(db, "kit_api", "system", account.id, date(2026, 10, 5), date(2026, 10, 18))
+    db.commit()
+    fetch.run_pending(db, session=FakeSession({"/v1/orders": {"orders": orders, "total_count": 2}}),
+                      sleep=lambda s: None)
+    periods = sorted((r.period_from, r.period_to) for r in db.query(SalesReport))
+    assert periods == [(date(2026, 9, 28), date(2026, 10, 11)),          # захватывает 28.09–04.10
+                       (date(2026, 10, 5), date(2026, 10, 11)), (date(2026, 10, 12), date(2026, 10, 18))]
+
+
+def test_kit_weeks_cover_the_period_and_skip_the_future():
+    assert fetch.kit_weeks(date(2026, 9, 1), date(2026, 9, 30))[0] == (date(2026, 8, 31), date(2026, 9, 6))
+    assert fetch.kit_weeks(date(2026, 9, 1), date(2026, 9, 30))[-1] == (date(2026, 9, 28), date(2026, 10, 4))
+    assert fetch.kit_weeks(date(2099, 1, 1), date(2099, 1, 7)) == []
 
 
 # ------------------------------------------------------------ автоплан

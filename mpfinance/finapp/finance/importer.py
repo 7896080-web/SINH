@@ -11,6 +11,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import date
 
+from sqlalchemy import or_, true
 from sqlalchemy.orm import Session
 
 from finapp.audit import log_action
@@ -41,7 +42,7 @@ class ImportOutcome:
 
 
 def make_onec_key(platform: str, account_id: int | None, report_number: str | None,
-                  period_from: date, period_to: date) -> str:
+                  period_from: date, period_to: date, kind: str = "") -> str:
     """Ключ документа в 1С. Один и тот же отчёт → один и тот же ключ, поэтому
     перезагрузка исправленного отчёта заменяет документ в 1С, а не дублирует.
     Только латиница, цифры и «-»: ключ едет в строке файла с разделителем «|»
@@ -49,7 +50,12 @@ def make_onec_key(platform: str, account_id: int | None, report_number: str | No
     number = re.sub(r"[^0-9A-Za-z_-]", "", report_number or "")[:40]
     if number:
         return f"SR-{platform}-{number}"
-    return f"SR-{platform}-{account_id or 0}-{period_from:%Y%m%d}-{period_to:%Y%m%d}"
+    # Без номера отчёт узнаётся по периоду — и по РОДУ (`kind`: формат файла,
+    # продажи или доставка по API). Без рода файл Яндекс Пэй или AWER CRM за тот
+    # же период занимал ключ, и отчёт KIT по API молча не ложился со словами
+    # «уже отправлен в 1С» — про чужой отчёт, который в 1С не уходил вовсе.
+    tag = re.sub(r"[^0-9A-Za-z]", "", kind or "")[:16]
+    return f"SR-{platform}-{tag + '-' if tag else ''}{account_id or 0}-{period_from:%Y%m%d}-{period_to:%Y%m%d}"
 
 
 _FILENAME_NUMBER_RE = re.compile(r"№\s*(\d+)")
@@ -110,14 +116,36 @@ def _with_goods(db: Session, report_ids: list[int]) -> set[int]:
         SalesReportLine.operation.in_(v.GOODS_OPERATIONS)).distinct()}
 
 
+def overlap_warning(overlaps: list[SalesReport]) -> str:
+    return ("Период пересекается с уже загруженными отчётами этой площадки: "
+            + ", ".join(f"#{r.id} ({r.period_from:%d.%m}–{r.period_to:%d.%m.%Y})" for r in overlaps[:5])
+            + ". Если это те же продажи — они посчитаются дважды (у WB «основной» и «по выкупам» "
+              "за одну неделю — разные отчёты).")
+
+
+def sales_overlaps(db: Session, report: SalesReport) -> list[SalesReport]:
+    """Отчёты с продажами, пересекающиеся с этим по периоду и кабинету, —
+    для карточки на странице отчёта: в сообщении при загрузке предупреждение
+    могло потеряться."""
+    if report.report_kind == lamoda.PROVISIONAL:
+        return []
+    others = [r for r in overlapping_reports(db, report) if r.report_kind != lamoda.PROVISIONAL]
+    if not others:
+        return []
+    with_goods = _with_goods(db, [report.id] + [r.id for r in others])
+    return [r for r in others if r.id in with_goods] if report.id in with_goods else []
+
+
 def overlapping_reports(db: Session, report: SalesReport) -> list[SalesReport]:
     """Другие отчёты той же площадки и кабинета с пересекающимся периодом —
     риск посчитать одни и те же продажи дважды (недельный + месячный отчёт)."""
+    # Кабинет на форме загрузки необязателен: отчёт без кабинета может быть
+    # отчётом любого кабинета, и сравнивать его надо со всеми (и наоборот).
     return db.query(SalesReport).filter(
         SalesReport.id != report.id,
         SalesReport.platform == report.platform,
-        SalesReport.account_id.is_(None) if report.account_id is None
-        else SalesReport.account_id == report.account_id,
+        true() if report.account_id is None
+        else or_(SalesReport.account_id == report.account_id, SalesReport.account_id.is_(None)),
         SalesReport.period_from <= report.period_to,
         SalesReport.period_to >= report.period_from,
     ).order_by(SalesReport.period_from).all()
@@ -209,8 +237,14 @@ def import_report(db: Session, *, platform: str, file_bytes: bytes, filename: st
     if not number and not parsed.report_numbers:
         number = number_from_filename(filename)
 
-    onec_key = make_onec_key(platform, account_id, number, period_from, period_to)
+    onec_key = make_onec_key(platform, account_id, number, period_from, period_to, parsed.format.code)
     same_key = db.query(SalesReport).filter(SalesReport.onec_key == onec_key).first()
+    if same_key is None and not number:
+        # Отчёт, загруженный до появления рода в ключе: тот же формат и период —
+        # тот же отчёт.
+        same_key = db.query(SalesReport).filter(
+            SalesReport.onec_key == make_onec_key(platform, account_id, "", period_from, period_to),
+            SalesReport.source_format == parsed.format.code).first()
     if same_key is not None:
         outcome.errors.append(
             f"Отчёт с тем же {'номером' if number else 'периодом и кабинетом'} уже загружен — "
@@ -320,7 +354,7 @@ def _store(db: Session, outcome: ImportOutcome, *, platform: str, account_id: in
     if declared_payout is not None:
         computed = sum(v.line_total(line) for line in lines)
         if computed != declared_payout:
-            outcome.warnings.append(
+            outcome.warnings.insert(0,
                 f"Итог строк ({v.format_rub(computed)}) не совпал с «Итого к оплате» площадки "
                 f"({v.format_rub(declared_payout)}) — проверьте раздел «Сверка денег».")
     others = sorted({line["source_operation"] for line in lines
@@ -350,10 +384,9 @@ def _store(db: Session, outcome: ImportOutcome, *, platform: str, account_id: in
         with_goods = _with_goods(db, [report.id] + [r.id for r in overlaps])
         overlaps = [r for r in overlaps if r.id in with_goods] if report.id in with_goods else []
     if overlaps:
-        outcome.warnings.append(
-            "Период пересекается с уже загруженными отчётами этой площадки: "
-            + ", ".join(f"#{r.id} ({r.period_from:%d.%m}–{r.period_to:%d.%m.%Y})" for r in overlaps[:5])
-            + ". Если это один и тот же период — продажи посчитаются дважды.")
+        # ПЕРВЫМ: сообщение режется по MAX_FLASH_CHARS, а задвоение продаж —
+        # самое дорогое из всего, что тут можно сказать.
+        outcome.warnings.insert(0, overlap_warning(overlaps))
 
     log_action(db, user, "sales_report_imported",
                f"#{report.id} {platform} {period_from:%Y-%m-%d}..{period_to:%Y-%m-%d} "
@@ -369,7 +402,7 @@ def store_api_report(db: Session, *, platform: str, account_id: int | None, pars
                      period_from: date, period_to: date, user: str, report_number: str = "",
                      report_kind: str | None = None, declared_payout: int | None = None,
                      file_name: str = "", replace_unsent: bool = False,
-                     source: str = "api", key_suffix: str = "") -> ImportOutcome:
+                     source: str = "api", kind: str = "") -> ImportOutcome:
     """Отчёт, собранный не из файла отчёта: официальный из API или неделя
     еженедельного отчёта Lamoda (`lamoda.py`).
 
@@ -382,9 +415,7 @@ def store_api_report(db: Session, *, platform: str, account_id: int | None, pars
     if parsed.errors:
         outcome.errors.extend(parsed.errors)
         return outcome
-    # `key_suffix` — отчёт другого рода за тот же период (доставка KIT по API
-    # рядом с продажами AWER CRM): без него ключи совпали бы, и он молча не лёг бы.
-    onec_key = make_onec_key(platform, account_id, report_number, period_from, period_to) + key_suffix
+    onec_key = make_onec_key(platform, account_id, report_number, period_from, period_to, kind)
     existing = db.query(SalesReport).filter(SalesReport.onec_key == onec_key).first()
     if existing is not None:
         same_kind = existing.source == source or (report_kind is not None
@@ -396,6 +427,9 @@ def store_api_report(db: Session, *, platform: str, account_id: int | None, pars
             outcome.skipped = True
             outcome.report = existing
             return outcome
+        # Ввод оператора на странице отчёта (поступление на счёт, примечание)
+        # переживает замену: ежедневный перезабор иначе стирал бы его молча.
+        kept = {"bank_payout_kop": existing.bank_payout_kop, "note": existing.note}
         db.query(SalesReportLine).filter(SalesReportLine.report_id == existing.id) \
             .delete(synchronize_session=False)
         db.delete(existing)
@@ -405,6 +439,11 @@ def store_api_report(db: Session, *, platform: str, account_id: int | None, pars
            number=report_number, period_from=period_from, period_to=period_to, source=source,
            file_name=file_name, file_sha256=None, declared_payout=declared_payout,
            report_kind=report_kind, onec_key=onec_key)
+    if outcome.replaced and outcome.report is not None:
+        for name, value in kept.items():
+            if value is not None:
+                setattr(outcome.report, name, value)
+        db.commit()
     overlapping_files = [r for r in overlapping_reports(db, outcome.report) if r.source in ("file", "email")] \
         if report_kind != lamoda.PROVISIONAL else []
     if overlapping_files:
