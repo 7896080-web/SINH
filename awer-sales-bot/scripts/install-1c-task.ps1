@@ -9,7 +9,8 @@
 param(
     [Parameter(Mandatory = $true)][string]$Base,
     [string]$OneC = "C:\Program Files\1cv8\8.3.9.2233\bin\1cv8.exe",
-    [string]$Time = "07:30",          # раньше утренней рассылки бота (schedule.daily_send_time, 09:30)
+    [string]$Time = "07:30",          # раньше утренней рассылки бота (schedule.daily_send_time, 09:30) и открытия магазинов
+    [string]$Retry = "08:30",         # повтор: если в 07:30 не хватило лицензии 1С; выгрузка дня просто заменится
     [string]$OneCUser = "",
     [string]$Name = "AwerSalesBot-1C"
 )
@@ -28,13 +29,15 @@ if ($OneCUser) {
 # /DisableStartupDialogs — без него при нехватке лицензий 1С ждёт ответа человека вечно
 $arguments = "ENTERPRISE /S`"$Base`" $auth /Execute`"$epf`" /CAUTO /DisableStartupDialogs /DisableStartupMessages"
 $action = New-ScheduledTaskAction -Execute $OneC -Argument $arguments
-$trigger = New-ScheduledTaskTrigger -Daily -At $Time
-# не дольше 30 минут (зависшая 1С держит лицензию), пропущенный запуск — когда пользователь войдёт, без копий
-$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 30) -StartWhenAvailable `
+$triggers = @(New-ScheduledTaskTrigger -Daily -At $Time)
+if ($Retry) { $triggers += New-ScheduledTaskTrigger -Daily -At $Retry }
+# обычно 1–2 минуты; дольше 15 — 1С зависла и держит лицензию (её нужна и Sync Admin) — снять;
+# пропущенный запуск — когда пользователь войдёт; вторая копия не запускается
+$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 15) -StartWhenAvailable `
     -MultipleInstances IgnoreNew
 # «Выполнять только для вошедшего пользователя» — интерактивная сессия, пароль Windows не нужен
 $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive
-Register-ScheduledTask -TaskName $Name -Action $action -Trigger $trigger -Settings $settings -Principal $principal `
+Register-ScheduledTask -TaskName $Name -Action $action -Trigger $triggers -Settings $settings -Principal $principal `
     -Description "Выгрузка продаж, остатков и поступлений для awer-sales-bot" -Force | Out-Null
-Write-Host "Задача $Name создана: каждый день в $Time, в сессии $env:USERNAME (на сервере этот пользователь должен быть вошедшим)."
+Write-Host "Задача $Name создана: каждый день в $Time и $Retry, в сессии $env:USERNAME (на сервере он должен быть вошедшим)."
 Write-Host "Проверка: Планировщик заданий → $Name → «Выполнить»; через пару минут файлы появятся в data\inbox."
