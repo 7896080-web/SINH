@@ -104,6 +104,27 @@ class Barcode(Base):
     uid_1c = Column(String(64), primary_key=True, index=True)
 
 
+class LamodaArticle(Base):
+    """Артикул Lamoda (модель-размер) → EAN — из партнёрского отчёта Lamoda
+    («Lamoda Sales Report - AWER ….xlsx», лист «Артикулы», `lamoda.import_catalog`).
+
+    В еженедельном отчёте EAN нет — только короткий артикул модели и размер
+    партнёра, — а в «Мэппинге» Sync Admin артикулов Lamoda нет вовсе. Партнёрский
+    отчёт называет в одной строке короткий артикул, размер партнёра, полный артикул
+    и EAN: по нему строка недельного отчёта находит товар 1С. Строки не удаляются:
+    на снятый с продажи артикул ещё ссылаются прошлые недели."""
+    __tablename__ = "lamoda_articles"
+
+    lamoda_sku = Column(String(64), primary_key=True)                 # полный: MP002XM0WFXNINL
+    short_sku = Column(String(32), nullable=False, index=True)        # модель: MP002XM0WFXN
+    partner_size = Column(String(32), nullable=False, default="")     # как в недельном: «XXL», «2.5XL»
+    lamoda_size = Column(String(32), nullable=True)
+    ean = Column(String(64), nullable=True)
+    partner_article = Column(String(255), nullable=True)
+    report_date = Column(Date, nullable=True)                         # «Дата отчета» файла
+    updated_at = Column(DateTime, default=now_utc, onupdate=now_utc)
+
+
 class OnecTaskStatus(str, enum.Enum):
     pending = "pending"     # ждёт файла заданий
     sent = "sent"           # строка в task_fin_*.txt, ждём result_fin_*.txt

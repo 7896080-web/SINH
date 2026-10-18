@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.orm import Session
 
-from finapp.finance import fetch
+from finapp.finance import fetch, lamoda
 from finapp.excel_utils import ExcelReadError, read_upload
 from finapp import backup, catalog, config, onec, progress, settings, syncdb
 from finapp.finance.sources import crm as crm_source
@@ -48,6 +48,7 @@ def page(request: Request, db: Session = Depends(get_db), user: User = Depends(g
                  "архив обмена": config.ONEC_ARCHIVE_DIR, "копии базы": config.BACKUP_DIR},
         "sync_status": syncdb.status_text(),
         "crm_status": crm_source.status_text(),
+        "lamoda_catalog_status": lamoda.catalog_status(db),
         "freshness": fetch.account_freshness(db),
         "remote": settings.get(db, settings.BACKUP_REMOTE, ""),
         "remote_result": settings.get(db, settings.BACKUP_REMOTE_RESULT, ""),

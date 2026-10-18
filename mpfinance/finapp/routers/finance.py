@@ -253,6 +253,10 @@ def reports_upload(
         user=user.username, account_id=_int_or_none(account_id), report_number=report_number,
         period_from=d_from, period_to=d_to,
     )
+    if outcome.catalog is not None:
+        # Партнёрский отчёт Lamoda — справочник артикулов, отчёта о продажах нет.
+        set_flash(request, " ".join(outcome.notes), "good")
+        return RedirectResponse("/finance/reports?platform=lamoda", status_code=303)
     if outcome.report is None:
         db.rollback()
         set_flash(request, "Отчёт не загружен. " + " ".join(outcome.errors), "warn")

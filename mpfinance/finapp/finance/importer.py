@@ -40,6 +40,9 @@ class ImportOutcome:
     repeat: bool = False         # отказ: эти продажи уже лежат в другом отчёте (`repeats.py`)
     # Еженедельный отчёт Lamoda раскладывается на несколько отчётов (по неделе).
     reports: list[SalesReport] = field(default_factory=list)
+    # Не отчёт о продажах, а справочник (партнёрский отчёт Lamoda) — принят, итоги
+    # в `notes`; `report` при этом пуст, а `errors` нет.
+    catalog: dict | None = None
 
 
 def make_onec_key(platform: str, account_id: int | None, report_number: str | None,
@@ -93,7 +96,8 @@ _LAMODA_SHORT_RE = re.compile(r"^MP[0-9A-Z]{10}$")
 
 
 def lamoda_sku_keys(platform_sku: str | None, size: str | None) -> list[str]:
-    """Чем ещё искать строку Lamoda в «Мэппинге» Sync Admin, когда EAN нет.
+    """Чем ещё искать строку Lamoda в «Мэппинге» Sync Admin, когда EAN нет и
+    справочник артикулов (`lamoda.ArticleBook`) строку не знает.
 
     В отчёте комиссионера «Артикул» — полный артикул Lamoda с размером
     («MP002XM0WFWSIN3XL»): ищется как есть. В еженедельном отчёте — только
@@ -118,7 +122,10 @@ def resolve_uids(db: Session, report: SalesReport, notes: list[str] | None = Non
     sync_admin могли дополнить.
 
     У Lamoda строка без EAN (или с EAN, которого нет в мэппинге) ищется ещё по
-    артикулу Lamoda (`lamoda_sku_keys`) — он тоже записан в «Мэппинг»."""
+    справочнику артикулов из партнёрского отчёта Lamoda (`lamoda.ArticleBook`:
+    артикул → EAN) и по самому артикулу Lamoda (`lamoda_sku_keys`), если его
+    завели в «Мэппинг». 18.10.2026 на бою артикулов Lamoda в «Мэппинге» не было
+    ни одного — без справочника недельные строки товар 1С не находили вовсе."""
     lines = db.query(SalesReportLine).filter(SalesReportLine.report_id == report.id).all()
     found = mapping.resolve(db, (line.barcode for line in lines))
     if notes is not None and found.note:
@@ -129,34 +136,50 @@ def resolve_uids(db: Session, report: SalesReport, notes: list[str] | None = Non
     for line in lines:
         line.uid_1c = found.uid_by_barcode.get(line.barcode) if line.barcode else None
     if report.platform == "lamoda":
-        rest = [(line, lamoda_sku_keys(line.platform_sku, line.size)) for line in lines
-                if line.uid_1c is None and line.operation in v.GOODS_OPERATIONS]
-        rest = [(line, keys) for line, keys in rest if keys]
-        if rest:
-            by_sku = mapping.resolve(db, (key for _line, keys in rest for key in keys))
+        rest = [line for line in lines if line.uid_1c is None and line.operation in v.GOODS_OPERATIONS]
+        book = lamoda.ArticleBook(db, rest) if rest else None
+        wanted = []
+        for line in rest:
+            article = book.find(line.platform_sku, line.size)
+            keys = []
+            if article is not None:
+                if article.ean:
+                    keys.append(article.ean)
+                    if not line.barcode:
+                        # EAN из партнёрского отчёта — дальше строка ищется по нему
+                        # первым же проходом и показывает его в отчёте.
+                        line.barcode = article.ean
+                keys.append(article.lamoda_sku)
+            keys = list(dict.fromkeys(keys + lamoda_sku_keys(line.platform_sku, line.size)))
+            if keys:
+                wanted.append((line, keys))
+        if wanted:
+            by_key = mapping.resolve(db, (key for _line, keys in wanted for key in keys))
             matched = 0
-            for line, keys in rest:
-                uid = next((by_sku.uid_by_barcode[k] for k in keys if k in by_sku.uid_by_barcode), None)
+            for line, keys in wanted:
+                uid = next((by_key.uid_by_barcode[k] for k in keys if k in by_key.uid_by_barcode), None)
                 if uid is not None:
                     line.uid_1c = uid
                     matched += 1
             if notes is not None and matched:
-                notes.append(f"По артикулу Lamoda (EAN нет или его нет в «Мэппинге») сопоставлено строк: "
-                             f"{matched}.")
+                notes.append(f"По артикулу Lamoda (EAN нет или его нет в «Мэппинге»; EAN — из партнёрского "
+                             f"отчёта Lamoda) сопоставлено строк: {matched}.")
     unmatched = sum(1 for line in lines if line.operation in v.GOODS_OPERATIONS and line.uid_1c is None)
     report.unmatched_lines = unmatched
     return unmatched
 
 
-def remap_unmatched(db: Session, limit: int = 200) -> tuple[int, int]:
+def remap_unmatched(db: Session, limit: int = 200, platform: str | None = None) -> tuple[int, int]:
     """Пересопоставить неотправленные отчёты, где остались строки без товара 1С:
     «Мэппинг» Sync Admin дополняют, а нажимать «Пересопоставить» в каждом отчёте
     руками никто не станет. Отправленные в 1С не трогаем — документ построен.
     Возвращает (отчётов просмотрено, строк сопоставлено). Не коммитит."""
-    reports = db.query(SalesReport).filter(
+    query = db.query(SalesReport).filter(
         SalesReport.unmatched_lines > 0,
-        SalesReport.onec_status.in_((OneCUploadStatus.none, OneCUploadStatus.failed))) \
-        .order_by(SalesReport.id.desc()).limit(limit).all()
+        SalesReport.onec_status.in_((OneCUploadStatus.none, OneCUploadStatus.failed)))
+    if platform:
+        query = query.filter(SalesReport.platform == platform)
+    reports = query.order_by(SalesReport.id.desc()).limit(limit).all()
     fixed = 0
     for report in reports:
         before = report.unmatched_lines or 0
@@ -250,6 +273,8 @@ def import_report(db: Session, *, platform: str, file_bytes: bytes, filename: st
     if platform == "lamoda" and lamoda.is_weekly(sheets):
         return _import_lamoda_weekly(db, sheets, account_id=account_id, user=user, filename=filename,
                                      source=source)
+    if platform == "lamoda" and lamoda.is_catalog(sheets):
+        return _import_lamoda_catalog(db, sheets, filename=filename)
 
     parsed = parse_sheets(sheets, platform)
     if parsed.errors:
@@ -366,6 +391,30 @@ def _import_lamoda_weekly(db: Session, sheets, *, account_id, user: str, filenam
     if not weeks:
         outcome.errors.append("В еженедельном отчёте нет продаж за незакрытые недели.")
     return outcome
+
+def _import_lamoda_catalog(db: Session, sheets, *, filename: str) -> ImportOutcome:
+    """Партнёрский отчёт Lamoda — справочник артикулов, не продажи
+    (`lamoda.import_catalog`). Принят — сразу пересопоставляются неотправленные
+    отчёты Lamoda: ждать часового прохода незачем. Коммитит."""
+    outcome = ImportOutcome()
+    try:
+        stats = lamoda.import_catalog(db, sheets, filename)
+    except lamoda.CatalogError as e:
+        outcome.errors.append(f"Партнёрский отчёт Lamoda не разобран: {e}.")
+        return outcome
+    seen, fixed = remap_unmatched(db, platform="lamoda")
+    db.commit()
+    outcome.catalog = stats
+    outcome.notes.append(
+        f"Партнёрский отчёт Lamoda от {stats['date']:%d.%m.%Y} принят как справочник артикулов: "
+        f"{stats['rows']} артикулов, с EAN {stats['with_ean']}, новых {stats['added']}. Продажи из него "
+        f"не берутся: дат и заказов в нём нет, а продажи «за последние 7 дней» задвоили бы недельный "
+        f"отчёт. Строк продаж Lamoda нашли товар 1С: {fixed}"
+        + (f" (в {seen} неотправленных отчётах)" if seen else "") + ".")
+    if stats["older"]:
+        outcome.notes.append(f"Не обновлено артикулов — справочник уже свежее этого файла: {stats['older']}.")
+    return outcome
+
 
 def _awer_crm(db: Session, parsed: ParseResult, outcome: ImportOutcome) -> None:
     """«Сумма» AWER CRM — до комиссии: вычесть её по ставке из настроек и

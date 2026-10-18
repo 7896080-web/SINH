@@ -24,6 +24,15 @@ Lamoda присылает на почту (b2b@lamoda.ru) «AWER - Weekly Report
    писем, пришедших позже, за этот период не загружаются.
 3. В 1С уходит только отчёт комиссионера: предварительный — без баркодов и
    возвратов, и `sales_1c.upload_problems` его не пускает.
+
+С 14.09.2026 на ту же почту приходит ещё и ПАРТНЁРСКИЙ отчёт («Lamoda Sales
+Report - AWER ГГГГ-ММ-ДД.xlsx», дважды в неделю): лист «Артикулы» — по строке на
+артикул-размер с полным и коротким артикулом Lamoda, размером партнёра и EAN,
+плюс продажи за 7/14/28/180 дней, сток, оборачиваемость. Это аналитика, а не
+отчёт о продажах: дат продаж и заказов в нём нет, а продажи за «последние 7
+дней» задвоили бы недельный отчёт за те же дни. Поэтому продажи из него НЕ
+берутся — он ложится справочником `LamodaArticle` (`import_catalog`), и строка
+недельного отчёта находит по нему EAN (`ArticleBook`), а по EAN — товар 1С.
 """
 from __future__ import annotations
 
@@ -33,12 +42,14 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from finapp.finance import values as v
 from finapp.finance.formats import ParseResult, ReportFormat
 from finapp.finance.readers import find_header
-from finapp.models import SalesReport, SalesReportLine
+from finapp.models import LamodaArticle, SalesReport, SalesReportLine
+from finapp.timeutils import now_utc, today_local
 
 PROVISIONAL = "предварительный"
 OFFICIAL_FORMAT = "lamoda"
@@ -257,3 +268,158 @@ def apply_correction(db: Session, official: SalesReport) -> dict:
                            f"№{official.report_number or official.id}.").strip()
     db.flush()
     return stats
+
+
+# ---------------------------------------------------------- партнёрский отчёт
+
+CATALOG_ALIASES = {
+    "lamoda_sku": ("Артикул Lamoda",),
+    "short_sku": ("Короткий артикул Lamoda",),
+    "partner_size": ("Размер Партнера", "Размер партнёра"),
+    "lamoda_size": ("Размер Lamoda",),
+    "ean": ("EAN (штрихкод)", "EAN"),
+    "partner_article": ("Артикул Партнера", "Артикул партнёра"),
+}
+CATALOG_REQUIRED = ("lamoda_sku", "short_sku", "partner_size", "ean")
+_REPORT_DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
+
+
+class CatalogError(ValueError):
+    pass
+
+
+def norm_sku(text) -> str:
+    return "".join(v.parse_text(text).split()).upper()
+
+
+def norm_size(text) -> str:
+    """Размер партнёра для сравнения: «2xl » и «2XL» — один размер."""
+    return "".join(v.parse_text(text).split()).upper()
+
+
+def is_catalog(sheets: list[tuple[str, list[list]]]) -> bool:
+    """Партнёрский отчёт: полный и короткий артикул Lamoda, размер партнёра и EAN
+    в одной строке. У недельного отчёта нет ни полного артикула, ни EAN."""
+    return any(find_header(rows, CATALOG_ALIASES, CATALOG_REQUIRED, min_fields=4) for _n, rows in sheets)
+
+
+def _report_date(rows: list[list], header_row: int) -> date | None:
+    """«Дата отчета:» над таблицей — значение в соседней непустой ячейке."""
+    for row in rows[:header_row]:
+        cells = [c for c in row if c not in (None, "")]
+        for i, cell in enumerate(cells[:-1]):
+            if isinstance(cell, str) and cell.strip().lower().startswith("дата отчета"):
+                try:
+                    return v.parse_date(cells[i + 1])
+                except v.ValueParseError:
+                    return None
+    return None
+
+
+def parse_catalog(sheets: list[tuple[str, list[list]]], filename: str = "") -> tuple[date, list[dict]]:
+    for _name, rows in sheets:
+        found = find_header(rows, CATALOG_ALIASES, CATALOG_REQUIRED, min_fields=4)
+        if found is None:
+            continue
+        header_row, mapping, _ = found
+
+        def cell(cells, key):
+            idx = mapping.get(key)
+            return cells[idx] if idx is not None and idx < len(cells) else None
+
+        day = _report_date(rows, header_row)
+        if day is None:
+            match = _REPORT_DATE_RE.search(filename or "")
+            day = date.fromisoformat(match.group(1)) if match else today_local()
+        items: dict[str, dict] = {}
+        for cells in rows[header_row + 1:]:
+            if not cells or all(c in (None, "") for c in cells):
+                continue
+            sku, short = norm_sku(cell(cells, "lamoda_sku")), norm_sku(cell(cells, "short_sku"))
+            if not sku or not short:
+                continue
+            items[sku] = {
+                "lamoda_sku": sku[:64], "short_sku": short[:32],
+                "partner_size": norm_size(cell(cells, "partner_size"))[:32],
+                "lamoda_size": v.parse_text(cell(cells, "lamoda_size"))[:32] or None,
+                "ean": "".join(v.parse_text(cell(cells, "ean")).split())[:64] or None,
+                "partner_article": v.parse_text(cell(cells, "partner_article"))[:255] or None,
+            }
+        return day, list(items.values())
+    raise CatalogError("не найден лист «Артикулы» (Артикул Lamoda, Короткий артикул Lamoda, "
+                       "Размер Партнера, EAN (штрихкод))")
+
+
+def import_catalog(db: Session, sheets, filename: str = "") -> dict:
+    """Партнёрский отчёт → справочник артикулов. Не коммитит.
+
+    Файл постарше (письма перечитываются в любом порядке) не перетирает данные
+    свежего, а пустой EAN не стирает известный: артикул EAN не теряет, пустая
+    ячейка значит, что Lamoda его не прислала."""
+    day, items = parse_catalog(sheets, filename)
+    if not items:
+        raise CatalogError("в партнёрском отчёте нет ни одного артикула")
+    stats = {"date": day, "rows": len(items), "with_ean": sum(1 for i in items if i["ean"]),
+             "added": 0, "updated": 0, "older": 0}
+    skus = [i["lamoda_sku"] for i in items]
+    known: dict[str, LamodaArticle] = {}
+    for start in range(0, len(skus), 500):
+        for row in db.query(LamodaArticle).filter(LamodaArticle.lamoda_sku.in_(skus[start:start + 500])):
+            known[row.lamoda_sku] = row
+    for item in items:
+        row = known.get(item["lamoda_sku"])
+        if row is None:
+            row = LamodaArticle(lamoda_sku=item["lamoda_sku"])
+            db.add(row)
+            stats["added"] += 1
+        elif row.report_date and row.report_date > day:
+            stats["older"] += 1
+            continue
+        else:
+            stats["updated"] += 1
+        row.short_sku, row.partner_size = item["short_sku"], item["partner_size"]
+        row.lamoda_size, row.partner_article = item["lamoda_size"], item["partner_article"]
+        if item["ean"]:
+            row.ean = item["ean"]
+        row.report_date, row.updated_at = day, now_utc()
+    db.flush()
+    return stats
+
+
+class ArticleBook:
+    """Справочник артикулов для строк Lamoda без товара: по полному артикулу, а
+    у недельного отчёта — по короткому артикулу и размеру партнёра.
+
+    Полный артикул НЕ собирается из короткого и размера: у Lamoda это не
+    всегда «короткий + IN + размер» («2.5XL» → «…IN25XL», джинсы — «…JE3234»), и
+    собранный ключ промахнулся бы. Два разных артикула на одну пару «модель +
+    размер» — не угадываем."""
+
+    def __init__(self, db: Session, lines):
+        wanted = sorted({norm_sku(line.platform_sku) for line in lines} - {""})
+        self.by_sku: dict[str, LamodaArticle] = {}
+        self.by_model: dict[tuple[str, str], LamodaArticle | None] = {}
+        for start in range(0, len(wanted), 250):
+            chunk = wanted[start:start + 250]
+            for row in db.query(LamodaArticle).filter(
+                    (LamodaArticle.lamoda_sku.in_(chunk)) | (LamodaArticle.short_sku.in_(chunk))):
+                self.by_sku[row.lamoda_sku] = row
+                key = (row.short_sku, row.partner_size)
+                self.by_model[key] = row if key not in self.by_model else None
+
+    def find(self, platform_sku, size) -> LamodaArticle | None:
+        sku = norm_sku(platform_sku)
+        if not sku:
+            return None
+        return self.by_sku.get(sku) or self.by_model.get((sku, norm_size(size)))
+
+
+def catalog_status(db: Session) -> str:
+    """Строка для «Диагностики»: есть ли справочник и насколько он свежий."""
+    total, with_ean, last = db.query(func.count(LamodaArticle.lamoda_sku), func.count(LamodaArticle.ean),
+                                     func.max(LamodaArticle.report_date)).one()
+    if not total:
+        return ("пуст — строки недельного отчёта Lamoda без EAN не найдут товар 1С; загрузите партнёрский "
+                "отчёт Lamoda («Lamoda Sales Report …xlsx») или настройте почту")
+    return (f"артикулов {total}, с EAN {with_ean}"
+            + (f", последний партнёрский отчёт от {last:%d.%m.%Y}" if last else ""))

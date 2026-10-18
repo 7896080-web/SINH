@@ -55,6 +55,7 @@
             <tr><td>Себестоимость из 1С</td><td>{{ costs_at|local('%d.%m.%Y %H:%M') if costs_at else 'ещё не загружалась' }}</td></tr>
             <tr><td>База Sync Admin (мэппинг, заказы)</td><td>{{ sync_status }}</td></tr>
             <tr><td>База AWER CRM (продажи сайта)</td><td>{{ crm_status }}</td></tr>
+            <tr><td>Артикулы Lamoda → EAN (партнёрский отчёт)</td><td>{{ lamoda_catalog_status }}</td></tr>
             {% for name, path in dirs.items() %}<tr><td>{{ name }}</td><td class="mono">{{ path }}</td></tr>{% endfor %}
         </tbody>
     </table>
@@ -66,6 +67,7 @@
             <tr><td>Справочник баркодов</td><td>{% if barcodes %}{{ barcodes }} баркодов, {{ products }} товаров{% else %}пуст — нажмите «Обновить справочник из Sync Admin»{% endif %}</td></tr>
             <tr><td>База Sync Admin (мэппинг, заказы, справочник)</td><td>{{ sync_status }}</td></tr>
             <tr><td>База AWER CRM (продажи сайта)</td><td>{{ crm_status }}</td></tr>
+            <tr><td>Артикулы Lamoda → EAN (партнёрский отчёт)</td><td>{{ lamoda_catalog_status }}</td></tr>
         </tbody>
     </table>
 </div>

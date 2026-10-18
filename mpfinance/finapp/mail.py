@@ -179,6 +179,10 @@ def fetch_new(db: Session, connect=None, days: int = LOOKBACK_DAYS) -> dict:
                 if outcome.report is not None:
                     imported += 1
                     notes.append(f"{name}: " + (" ".join(outcome.warnings) or "загружен"))
+                elif outcome.catalog is not None:
+                    # Партнёрский отчёт — справочник артикулов, а не продажи.
+                    imported += 1
+                    notes.append(f"{name}: " + " ".join(outcome.notes))
                 else:
                     db.rollback()
                     # Тот же отчёт прислали второй раз — не ошибка.
