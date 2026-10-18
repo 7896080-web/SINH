@@ -67,7 +67,14 @@ class Totals:
     # убыток. Учти её — одна строка перевернула бы итоги всей площадки (18.10:
     # артикул, принятый за цену, дал себестоимость WB 692 млрд ₽).
     cost_suspicious_qty: int = 0
+    # Из них — штуки, у которых товар 1С не определён: себестоимость к ним не
+    # подставить, пока не решён мэппинг (`unmatched_lines`).
+    cost_missing_unmatched_qty: int = 0
     unmatched_lines: int = 0
+    # Из строк без товара — те, у которых в самом отчёте нет баркода (так в
+    # еженедельных отчётах Lamoda): «Мэппинг» их не исправит, товар появится с
+    # отчётом комиссионера.
+    unmatched_no_barcode: int = 0
     tax: int = 0
     vat: int = 0          # невозвратный НДС (внутри цены продажи)
     extra: int = 0
@@ -77,7 +84,7 @@ class Totals:
 
     def add(self, other: "Totals"):
         for name in ("sold_qty", "returned_qty", "cost_missing_qty", "cost_suspicious_qty",
-                     "unmatched_lines") + self.MONEY:
+                     "cost_missing_unmatched_qty", "unmatched_lines", "unmatched_no_barcode") + self.MONEY:
             setattr(self, name, getattr(self, name) + getattr(other, name))
 
     @property
@@ -265,7 +272,7 @@ SUSPICIOUS_COST_RATIO = 10
 
 
 def add_line(totals: Totals, line, cost: int | None):
-    (platform, _account, operation, _day, uid, _bc, _art, _name, _size, qty, revenue, commission,
+    (platform, _account, operation, _day, uid, barcode, _art, _name, _size, qty, revenue, commission,
      payout, logistics, storage, penalty, acceptance, deduction, compensation) = line
     totals.revenue += revenue
     totals.commission += commission
@@ -284,11 +291,15 @@ def add_line(totals: Totals, line, cost: int | None):
             totals.returned_qty += qty
         if uid is None:
             totals.unmatched_lines += 1
+            if not barcode:
+                totals.unmatched_no_barcode += 1
         if cost is not None and qty and revenue and cost * qty > SUSPICIOUS_COST_RATIO * abs(revenue):
             totals.cost_suspicious_qty += sign * qty
             cost = None
         if cost is None:
             totals.cost_missing_qty += sign * qty
+            if uid is None:
+                totals.cost_missing_unmatched_qty += sign * qty
         else:
             totals.cogs += sign * qty * cost
 

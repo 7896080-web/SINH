@@ -120,8 +120,8 @@ if (Test-Path "$Root\.venv\Scripts\python.exe") {{
 PATCH_APPLY_TEMPLATE = r'''import base64, datetime, hashlib, io, os, shutil, sys
 ROOT = {root!r}
 TAG = {tag!r}
-BASE_TAG = {base_tag!r}
-# (путь, sha нового, sha прежнего или None — файла не было, "t"/"b", содержимое)
+BASE_TAGS = {base_tags!r}
+# (путь, sha нового, [sha в каждой прежней версии; None — файла не было], "t"/"b", содержимое)
 FILES = {files!r}
 
 def sha(b):
@@ -135,14 +135,14 @@ installed = ""
 if os.path.exists(marker):
     with io.open(marker, encoding="utf-8") as f:
         installed = (f.readline() or "").strip()
-if installed not in (BASE_TAG, TAG):
+if installed not in BASE_TAGS + (TAG,):
     sys.exit("На диске версия '%s', а патч %s рассчитан на %s — ничего не тронуто. "
-             "Нужен полный пакет." % (installed or "неизвестна", TAG, BASE_TAG))
+             "Нужен полный пакет." % (installed or "неизвестна", TAG, " или ".join(BASE_TAGS)))
 
 # Сначала сверяем ВСЁ, потом пишем: файл, правленный руками или другой
 # версии, патч не перезаписывает — и не начинает, если такой есть.
 plan, wrong = [], []
-for rel, expect, before, kind, body in FILES:
+for rel, expect, befores, kind, body in FILES:
     data = payload(kind, body)
     assert sha(data) == expect, "payload corrupted: " + rel
     path = os.path.join(ROOT, rel.replace("/", os.sep))
@@ -153,12 +153,12 @@ for rel, expect, before, kind, body in FILES:
     if current == expect:
         print("skip", rel)
         continue
-    if current != before:
+    if current not in befores:
         wrong.append(rel + (" (нет файла)" if current is None else " (не та версия)"))
         continue
     plan.append((rel, path, expect, data, current is not None))
 if wrong:
-    print("Не сходятся с версией %s:" % BASE_TAG)
+    print("Не сходятся с версией %s:" % " / ".join(BASE_TAGS))
     for item in wrong:
         print("   ", item)
     sys.exit("Ничего не тронуто.")
@@ -274,32 +274,40 @@ def changed_since(root: str, ref: str) -> tuple[list[tuple[str, bytes, bytes | N
 
 
 def build_patch(root: str, tag: str, since: str, base_tag: str, target: str,
-                parts: int = 3, width: int = 80, var: str = "m", paste: bool = True) -> tuple[str, dict]:
+                parts: int = 3, width: int = 80, var: str = "m", paste: bool = True,
+                also: tuple[tuple[str, str], ...] = ()) -> tuple[str, dict]:
+    """`also` — ещё версии сервера (коммит, метка), поверх которых патч обязан
+    встать: когда неизвестно, поставлена ли промежуточная. `since` — самая
+    ранняя из них: от неё считается состав патча."""
     changed, gone = changed_since(root, since)
     if gone:
         # Патч только пишет. Удалённый файл остался бы на сервере, и тест,
         # берущий каталог глобом, увидел бы там не релиз, а осадок.
         raise SystemExit("после %s удалены файлы — патчем это не накатить, нужен полный пакет: %s"
                          % (since, ", ".join(gone)))
+    def digest(data: bytes | None) -> str | None:
+        return hashlib.sha256(data).hexdigest() if data is not None else None
+
     entries = []
     for rel, data, before in changed:
         try:
             kind, body = "t", data.decode("utf-8")
         except UnicodeDecodeError:
             kind, body = "b", base64.b64encode(data).decode("ascii")
-        entries.append((rel, hashlib.sha256(data).hexdigest(),
-                        hashlib.sha256(before).hexdigest() if before is not None else None, kind, body))
-    apply_src = PATCH_APPLY_TEMPLATE.format(root=target, tag=tag, base_tag=base_tag, files=entries)
+        befores = [digest(before)] + [digest(_git_bytes(root, ref, rel)) for ref, _tag in also]
+        entries.append((rel, hashlib.sha256(data).hexdigest(), sorted(set(befores), key=str), kind, body))
+    base_tags = (base_tag,) + tuple(t for _ref, t in also)
+    apply_src = PATCH_APPLY_TEMPLATE.format(root=target, tag=tag, base_tags=base_tags, files=entries)
     b64 = base64.b64encode(lzma.compress(apply_src.encode("utf-8"), preset=9 | lzma.PRESET_EXTREME)).decode("ascii")
     full_sha = hashlib.sha256(b64.encode("ascii")).hexdigest()
     info = {"files": [e[0] for e in entries], "b64_len": len(b64), "full_sha": full_sha}
     if not paste:
         body = "\n".join(b64[i:i + 100] for i in range(0, len(b64), 100))
-        return PATCH_FILE.format(tag=tag, root=target, base_tag=base_tag, count=len(entries), body=body,
-                                 full_sha=full_sha), info
+        return PATCH_FILE.format(tag=tag, root=target, base_tag=" или ".join(base_tags), count=len(entries),
+                                 body=body, full_sha=full_sha), info
     chunk = (len(b64) + parts - 1) // parts
     pieces = [b64[i:i + chunk] for i in range(0, len(b64), chunk)]
-    out = [f"# ===== {tag}: патч «Финансов площадок» для {target} — поверх {base_tag} =====\n"
+    out = [f"# ===== {tag}: патч «Финансов площадок» для {target} — поверх {' или '.join(base_tags)} =====\n"
            f"# Вставлять в PowerShell НА СЕРВЕРЕ (от администратора) по очереди: БЛОК 1 … БЛОК "
            f"{len(pieces)}, потом БЛОК APPLY.\n"
            f"# После каждого блока строки got и expect должны совпасть.\n"]
@@ -351,13 +359,17 @@ def main() -> int:
     ap.add_argument("--target", default=r"C:\mpfinance")
     ap.add_argument("--since", help="патч: только изменённое после этой версии git")
     ap.add_argument("--base-tag", help="метка версии на сервере, на которую рассчитан патч (с --since)")
+    ap.add_argument("--also", action="append", default=[], metavar="КОММИТ:МЕТКА",
+                    help="ещё версия сервера, поверх которой патч обязан встать (можно несколько)")
     ap.add_argument("--paste", action="store_true", help="патч блоками для вставки в консоль, а не файлом")
     ap.add_argument("--parts", type=int, default=3, help="сколько блоков base64 (с --paste)")
     a = ap.parse_args()
     if a.since:
         if not a.base_tag:
             ap.error("с --since нужен --base-tag — какая версия стоит на сервере")
-        text, info = build_patch(HERE, a.tag, a.since, a.base_tag, a.target, parts=a.parts, paste=a.paste)
+        also = tuple(tuple(item.split(":", 1)) for item in a.also)
+        text, info = build_patch(HERE, a.tag, a.since, a.base_tag, a.target, parts=a.parts, paste=a.paste,
+                                 also=also)
     else:
         text, info = build(HERE, a.tag, a.target)
     # С BOM: Windows PowerShell 5.1 читает .ps1 без BOM как cp1251, и кириллица

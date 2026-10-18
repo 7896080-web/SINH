@@ -86,12 +86,20 @@
         {% if total.cost_missing_qty %}
         <li><span class="badge badge--warn">себестоимость</span>
             Продано {{ total.cost_missing_qty }} шт без себестоимости{% if total.cost_suspicious_qty %} (с теми, что под сомнением){% endif %} — прибыль по ним завышена.
-            <a href="/finance/costs?missing=true">Заполнить себестоимость</a></li>
+            {% set no_cost = total.cost_missing_qty - total.cost_missing_unmatched_qty %}
+            {% if total.cost_missing_unmatched_qty %}Из них {{ total.cost_missing_unmatched_qty }} шт — товар 1С не определён (строки без товара, см. ниже), себестоимость к ним не подставить.{% endif %}
+            {% if no_cost > 0 %}{{ 'Ещё' if total.cost_missing_unmatched_qty else 'У' }} {{ no_cost }} шт у товара не задана себестоимость —
+            <a href="/finance/costs?missing=true">список проданных без себестоимости</a>.{% endif %}</li>
         {% endif %}
         {% if total.unmatched_lines %}
         <li><span class="badge badge--warn">мэппинг</span>
             Строк продаж/возвратов без товара 1С: {{ total.unmatched_lines }} — себестоимость к ним не
-            подставится, в 1С такие отчёты не отправляются. Привяжите баркоды в «Мэппинге» Sync Admin.</li>
+            подставится, в 1С такие отчёты не отправляются.
+            {% set with_bc = total.unmatched_lines - total.unmatched_no_barcode %}
+            {% if total.unmatched_no_barcode %}Из них {{ total.unmatched_no_barcode }} — без баркода в самом отчёте (так в
+            еженедельных отчётах Lamoda): «Мэппинг» их не исправит, товар и себестоимость появятся с отчётом
+            комиссионера, который их заменит.{% endif %}
+            {% if with_bc > 0 %}{{ 'Остальные' if total.unmatched_no_barcode else 'Их' }} {{ with_bc }} — привяжите баркоды в «Мэппинге» Sync Admin.{% endif %}</li>
         {% endif %}
         {% if not_in_1c %}
         <li><span class="badge badge--warn">1С</span>
@@ -200,7 +208,7 @@
             <tbody>
             {% for g in top %}
             <tr><td>{{ g.article or '—' }}<div class="help-text">{{ g.title }}</div>
-                {% if g.totals.cost_suspicious_qty %}<span class="badge badge--bad" title="Себестоимость больше цены продажи в 10 раз и больше — это ошибка данных, в прибыль она не взята. Исправьте на «Себестоимости»">себестоимость под сомнением</span>{% elif g.totals.cost_missing_qty > 0 %}<span class="badge badge--warn" title="Прибыль завышена: себестоимость не задана — «Себестоимость»">без себестоимости</span>{% endif %}</td>
+                {% if g.totals.cost_suspicious_qty %}<span class="badge badge--bad" title="Себестоимость больше цены продажи в 10 раз и больше — это ошибка данных, в прибыль она не взята. Исправьте на «Себестоимости»">себестоимость под сомнением</span>{% elif g.totals.cost_missing_qty > 0 %}<span class="badge badge--warn" title="Прибыль завышена: у части штук себестоимость не задана — «Себестоимость»">без себестоимости: {{ g.totals.cost_missing_qty }} из {{ g.totals.net_qty }} шт</span>{% endif %}</td>
                 <td class="num">{{ g.totals.net_qty }}</td><td class="num">{{ money(g.totals.profit, true) }}</td>
                 <td class="num">{{ g.totals.margin | pct }}</td></tr>
             {% endfor %}

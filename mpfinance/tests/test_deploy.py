@@ -204,3 +204,29 @@ def test_file_patch_runs_the_same_apply_and_carries_both_commands(tmp_path):
     assert done.returncode == 0, done.stdout + done.stderr
     assert (server / "finapp" / "new.py").read_bytes() == (root / "finapp" / "new.py").read_bytes()
     assert (server / "deploy" / "INSTALLED_TAG").read_text(encoding="utf-8").startswith("finB")
+
+
+@needs_git
+def test_patch_lands_on_either_of_two_server_versions(tmp_path):
+    """Неизвестно, поставлена ли промежуточная версия: патч встаёт и на A, и на
+    B, а на правленном руками — нет."""
+    import lzma
+    import gen_package
+    root, base, server = _repo(tmp_path)
+    git = ["git", "-C", str(root), "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run(git + ["add", "."], check=True)
+    subprocess.run(git + ["commit", "-qm", "B"], check=True)
+    mid = subprocess.run(git + ["rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+    on_b = tmp_path / "server_b"
+    shutil.copytree(root, on_b, ignore=shutil.ignore_patterns(".git"))
+    (on_b / "deploy" / "INSTALLED_TAG").write_text("finB\n", encoding="utf-8")
+    (root / "finapp" / "a.py").write_text("print('C')\n", encoding="utf-8")
+    for target, installed in ((server, "finA"), (on_b, "finB")):
+        text, _ = gen_package.build_patch(str(root), "finC", base, "finA", str(target), paste=False,
+                                          also=((mid, "finB"),))
+        body = text.split("$b = @'\n", 1)[1].split("\n'@", 1)[0]
+        source = lzma.decompress(base64.b64decode(re.sub(r"\s", "", body))).decode("utf-8")
+        done = _run_apply(tmp_path, source)
+        assert done.returncode == 0, installed + done.stdout + done.stderr
+        assert (target / "finapp" / "a.py").read_text(encoding="utf-8") == "print('C')\n"
+        assert (target / "finapp" / "new.py").read_bytes() == (root / "finapp" / "new.py").read_bytes()

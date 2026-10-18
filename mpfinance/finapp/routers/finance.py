@@ -523,27 +523,54 @@ def _current_costs(db: Session, uids: list[str]) -> dict[str, ProductCost]:
     return result
 
 
-@router.get("/finance/costs", response_class=HTMLResponse)
-def costs_page(
-    request: Request, q: str = Query(""), missing: bool = Query(False),
-    db: Session = Depends(get_db), user: User = Depends(get_current_user),
-):
-    query = db.query(Product)
+def _sold_subquery(db: Session):
+    """Проданные товары и сколько штук: справочник из Sync Admin — весь каталог
+    1С (150 с лишним тысяч), а для расчёта нужны только те, что есть в отчётах."""
+    return db.query(SalesReportLine.uid_1c.label("uid_1c"),
+                    func.sum(SalesReportLine.quantity).label("sold")) \
+        .filter(SalesReportLine.operation == v.SALE, SalesReportLine.uid_1c.isnot(None)) \
+        .group_by(SalesReportLine.uid_1c).subquery()
+
+
+def _costs_query(db: Session, q: str, missing: bool):
+    """Отбор страницы «Себестоимость» и её выгрузки — один на оба: иначе
+    «выгрузить отобранное» выгрузило бы другое. `missing` — ПРОДАННЫЕ без
+    себестоимости, самые продаваемые сверху: только они искажают прибыль."""
+    sold = _sold_subquery(db)
+    query = db.query(Product, sold.c.sold).outerjoin(sold, sold.c.uid_1c == Product.uid_1c)
     if q.strip():
         like = f"%{q.strip()}%"
         query = query.filter(or_(Product.article.ilike(like), Product.name.ilike(like),
                                  Product.uid_1c.ilike(like)))
     if missing:
-        query = query.filter(~Product.uid_1c.in_(db.query(ProductCost.uid_1c)))
+        query = query.filter(sold.c.sold.isnot(None),
+                             ~Product.uid_1c.in_(db.query(ProductCost.uid_1c)))
+        return query.order_by(sold.c.sold.desc(), Product.article, Product.size)
+    return query.order_by(Product.article, Product.size)
+
+
+@router.get("/finance/costs", response_class=HTMLResponse)
+def costs_page(
+    request: Request, q: str = Query(""), missing: bool = Query(False),
+    db: Session = Depends(get_db), user: User = Depends(get_current_user),
+):
+    query = _costs_query(db, q, missing)
     total = query.count()
-    products = query.order_by(Product.article, Product.size).limit(COSTS_LIMIT).all()
+    rows = query.limit(COSTS_LIMIT).all()
+    products = [p for p, _sold in rows]
+    sold_qty = {p.uid_1c: int(n or 0) for p, n in rows}
     costs = _current_costs(db, [p.uid_1c for p in products])
     with_cost = db.query(func.count(func.distinct(ProductCost.uid_1c))).scalar() or 0
+    sold = _sold_subquery(db)
+    sold_total = db.query(func.count()).select_from(sold).scalar() or 0
+    sold_with_cost = db.query(func.count()).select_from(sold) \
+        .filter(sold.c.uid_1c.in_(db.query(ProductCost.uid_1c))).scalar() or 0
     rates = RateBook(db)
     return templates.TemplateResponse(request, "finance_costs.html", _ctx(
         request, user, "finance-costs",
         products=products, costs=costs, total=total, limit=COSTS_LIMIT, q=q, missing=missing,
-        with_cost=with_cost, products_total=db.query(Product).count(),
+        with_cost=with_cost, products_total=db.query(Product).count(), sold_qty=sold_qty,
+        sold_total=sold_total, sold_with_cost=sold_with_cost,
         raw=raw_settings(db), tax_modes=TAX_MODES, warehouse_keys=WAREHOUSE_KEYS,
         tax_text=tax_text(load_settings(db)), tax_effective=effective_rate(load_settings(db)),
         kit_sales_sources=KIT_SALES_SOURCES,
@@ -571,9 +598,12 @@ def costs_request_1c(request: Request, db: Session = Depends(get_db),
 
 
 @router.get("/finance/costs/export")
-def costs_export(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    """Все товары с текущей себестоимостью — заполнить в Excel и загрузить обратно."""
-    products = db.query(Product).order_by(Product.article, Product.size).all()
+def costs_export(q: str = Query(""), missing: bool = Query(False),
+                 db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Товары по отбору страницы с текущей себестоимостью — заполнить в Excel и
+    загрузить обратно. С «только проданные без себестоимости» — ровно то, что
+    надо заполнить, а не весь каталог 1С."""
+    products = [p for p, _sold in _costs_query(db, q, missing).all()]
     costs = _current_costs(db, [p.uid_1c for p in products])
     first_barcode = dict(db.query(Barcode.uid_1c, func.min(Barcode.barcode))
                          .group_by(Barcode.uid_1c).all())

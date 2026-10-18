@@ -5,11 +5,14 @@
 <div class="page-header">
     <div>
         <h1>Себестоимость и настройки расчёта</h1>
-        <p>Себестоимость задана у {{ with_cost }} из {{ products_total }} товаров ·
+        <p>Себестоимость задана у <b>{{ sold_with_cost }} из {{ sold_total }}</b> проданных товаров (тех, что есть в
+           отчётах площадок){% if sold_total > sold_with_cost %} — <a href="/finance/costs?missing=true">без себестоимости: {{ sold_total - sold_with_cost }}</a>{% endif %}.
+           <span class="help-text">В справочнике 1С всего {{ products_total }} товаров, себестоимость у {{ with_cost }}; остальные
+           на площадках не продавались и на расчёт не влияют.</span> ·
            <a href="#settings">Настройки расчёта ↓</a> (налог, склады 1С, курс, продажи KIT и комиссия AWER CRM)</p>
     </div>
     <div class="toolbar">
-        <a class="btn" href="/finance/costs/export" data-download>Выгрузить в Excel</a>
+        <a class="btn" href="/finance/costs/export{% if missing or q %}?missing={{ 'true' if missing else '' }}&q={{ q | urlencode }}{% endif %}" data-download>Выгрузить в Excel{% if missing %} (проданные без себестоимости){% endif %}</a>
         <form method="post" action="/finance/costs/import" enctype="multipart/form-data" class="inline-form">
             <label class="btn file-upload-btn">Загрузить из Excel
                 <input type="file" name="file" accept=".xlsx" onchange="this.form.requestSubmit()">
@@ -62,7 +65,7 @@
     </div>
     <div class="field">
         <label>&nbsp;</label>
-        <label class="checkbox-inline"><input type="checkbox" name="missing" value="true" {% if missing %}checked{% endif %}> Только без себестоимости</label>
+        <label class="checkbox-inline"><input type="checkbox" name="missing" value="true" {% if missing %}checked{% endif %}> Только проданные без себестоимости</label>
     </div>
     <div class="field">
         <label>&nbsp;</label>
@@ -73,12 +76,13 @@
 <div class="card" style="padding:0;">
     {% if products %}
     <table>
-        <thead><tr><th>Товар</th><th>Размер / цвет</th><th class="num">Себестоимость</th><th>Действует с</th><th>Источник</th></tr></thead>
+        <thead><tr><th>Товар</th><th>Размер / цвет</th><th class="num">Продано, шт</th><th class="num">Себестоимость</th><th>Действует с</th><th>Источник</th></tr></thead>
         <tbody>
         {% for p in products %}{% set c = costs.get(p.uid_1c) %}
         <tr>
             <td>{{ p.name or '—' }}<div class="help-text mono">{{ p.article or '—' }}</div></td>
             <td>{{ p.size or '' }}{% if p.color %} · {{ p.color }}{% endif %}</td>
+            <td class="num">{{ sold_qty.get(p.uid_1c) or '' }}</td>
             <td class="num">{% if c %}{{ c.cost_minor | rub }} {{ '₽' if c.currency == 'RUB' else '$' }}{% else %}<span class="badge badge--warn">не задана</span>{% endif %}</td>
             <td class="mono">{% if c %}{{ 'всегда' if c.valid_from.year == 2000 else c.valid_from.strftime('%d.%m.%Y') }}{% endif %}</td>
             <td>{% if c %}{{ '1С' if c.source == '1c' else (c.updated_by or 'Excel') }}{% endif %}</td>
