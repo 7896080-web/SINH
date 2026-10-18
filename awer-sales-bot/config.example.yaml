@@ -55,6 +55,9 @@ max:
   poll_timeout: 30
   bot_link: ""                   # https://max.ru/<имя_бота> — для ссылок-приглашений
 
+max_training:                    # второй бот — «Обучение» (токен MAX_TRAINING_BOT_TOKEN в .env)
+  bot_link: ""                   # https://max.ru/<имя бота обучения> — для кнопки «Подключить обучение»
+
 recommendations:
   lookback_days: 90
   add_ons: ["Ремень", "Футболка", "Рубашка", "Носки", "Галстук", "Свитшот", "Джемпер"]  # запасной список

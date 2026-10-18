@@ -25,7 +25,8 @@ src/awer_sales_bot/
   achievements.py, goals.py  # рекорды и серии; цель недели (мотивация без денег — SPEC «Мотивация и обучение»)
   lessons.py, quiz.py, coach.py  # урок недели и программа новичка; квиз и «Похвалить» (кнопки); листок 1:1
   messages.py           # тексты сообщений
-  max_api.py, bot.py    # клиент MAX, long polling, привязка по коду, команды
+  max_api.py, bot.py    # клиент MAX; два бота: «План» (handle) и «Обучение» (handle_training), привязка по коду
+  crews.py              # смены (состав, ротация по средам), магазин рабочего дня, проверка минимума в магазине
   jobs.py               # ежедневная рассылка, 1-е число: итоги + новый план
   web.py                # админка FastAPI (+ /api/upload для 1С)
   cli.py                # awer-bot <команда>

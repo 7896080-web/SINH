@@ -1,7 +1,9 @@
-"""Бот MAX: long polling + расписание в одном процессе.
+"""Боты MAX: «План» и «Обучение» — long polling + расписание в одном процессе.
 
 Привязка продавца: админка/CLI выдаёт код (или ссылку max.ru/<бот>?start=<код>), продавец
-отправляет код боту → его user_id записывается в sellers.max_user_id.
+отправляет код боту «План» → его user_id записывается в sellers.max_user_id. Если подключён второй бот
+(MAX_TRAINING_BOT_TOKEN), «План» сразу присылает кнопку «Подключить обучение» со своим кодом → user_id в боте
+«Обучение» — sellers.training_user_id. Без второго бота всё обучение идёт в «План».
 Команды продавца: /plan — статус на сейчас, /help. Владелец (max.owners): /svodka. Всем: /id — свой user_id.
 Кнопки (message_callback): ответы на квиз после урока недели, «Похвалить» в сводке владельца — quiz.py.
 """
@@ -22,6 +24,8 @@ from .max_api import MaxClient
 log = logging.getLogger(__name__)
 HELP = ("Я присылаю каждое утро ваш план, сколько осталось до базы и до следующей ступени, средний чек, "
         "вещей в чеке и советы.\n/plan — состояние на сейчас\n/help — помощь")
+TRAINING_HELP = ("Здесь уроки, тесты и база знаний: ткани, утеплители, уход за вещами. Раз в неделю — урок "
+                 "по вашей цели недели.\n/help — помощь")
 
 
 def _extract(u: dict) -> tuple[str, int | None, str]:
@@ -40,10 +44,10 @@ def _extract(u: dict) -> tuple[str, int | None, str]:
     return t, None, ""
 
 
-def on_callback(db: DB, cfg: Settings, client: MaxClient, u: dict, uid: int, payload: str) -> None:
-    """Кнопки квиза (продавец) и «Похвалить» (владелец)."""
+def on_callback(db: DB, cfg: Settings, client: MaxClient, u: dict, uid: int, payload: str, seller=None) -> None:
+    """Кнопки квиза (продавец) и «Похвалить» (владелец). seller — уже найденный продавец этого бота."""
     cb_id = (u.get("callback") or {}).get("callback_id")
-    seller = db.seller_by_user(uid)
+    seller = seller or db.seller_by_user(uid)
     if payload.startswith("quiz|") and seller:
         note, out = quiz.on_quiz(db, cfg, seller["id"], payload)
     elif payload.startswith("praise|") and uid in cfg.max.owners:
@@ -100,6 +104,47 @@ def handle(db: DB, cfg: Settings, client: MaxClient, u: dict) -> None:
     if reply:
         client.send(reply, user_id=uid)
     if linked:
+        if cfg.training_token:  # второй бот: кнопка подключения, первый урок новичку придёт уже туда
+            offer_training(db, cfg, client, linked["id"], uid)
+        else:
+            welcome_newcomer(db, cfg, client, linked["id"], uid)
+
+
+def offer_training(db: DB, cfg: Settings, client: MaxClient, sid: int, uid: int) -> None:
+    """Кнопка «Подключить обучение» — ссылка на второй бот с кодом этого продавца."""
+    code = db.new_training_code(sid)
+    time.sleep(0.6)  # MAX: не больше 2 сообщений в секунду в один диалог
+    if cfg.max_training.bot_link:
+        client.send("Уроки, тесты и база знаний — в отдельном боте «Обучение», чтобы здесь остались только план "
+                    "и показатели. Нажмите кнопку и «Начать».",
+                    user_id=uid, buttons=[[{"type": "link", "text": "Подключить обучение",
+                                            "url": f"{cfg.max_training.bot_link}?start={code}"}]])
+    else:
+        client.send(f"Уроки и тесты — в боте «Обучение». Найдите его в MAX и отправьте код {code}.", user_id=uid)
+
+
+def handle_training(db: DB, cfg: Settings, client: MaxClient, u: dict) -> None:
+    """События бота «Обучение»: подключение по коду из бота «План», кнопки квиза, помощь."""
+    t, uid, text = _extract(u)
+    if not uid:
+        return
+    seller = db.seller_by_training_user(uid)
+    if t == "message_callback":
+        on_callback(db, cfg, client, u, uid, text, seller=seller)
+        return
+    linked = None
+    if text and (t == "bot_started" or (not seller and len(text) == 6)):
+        linked = db.link_training(text, uid)
+        reply = f"Готово, {linked['first_name']}! {TRAINING_HELP}" if linked else \
+            "Код не найден. Нажмите «Подключить обучение» в боте «План» ещё раз."
+    elif t == "bot_started" or not seller:
+        reply = TRAINING_HELP if seller else "Сначала подключитесь к боту «План» — он пришлёт кнопку для подключения сюда."
+    elif text.lower() == "/id":
+        reply = f"Ваш user_id в MAX: {uid}"
+    else:
+        reply = TRAINING_HELP
+    client.send(reply, user_id=uid)
+    if linked:
         welcome_newcomer(db, cfg, client, linked["id"], uid)
 
 
@@ -116,20 +161,21 @@ def welcome_newcomer(db: DB, cfg: Settings, client: MaxClient, sid: int, uid: in
     db.log_message(date.today().isoformat(), "onboarding", sid, uid, "ok", text)
 
 
-def poll_forever(db: DB, cfg: Settings, client: MaxClient, stop: threading.Event) -> None:
-    marker = int(db.get_kv("max_marker") or 0) or None
+def poll_forever(db: DB, cfg: Settings, client: MaxClient, stop: threading.Event, handler=handle,
+                 marker_key: str = "max_marker") -> None:
+    marker = int(db.get_kv(marker_key) or 0) or None
     backoff = 5
     while not stop.is_set():
         try:
             res = client.updates(marker, timeout=cfg.max.poll_timeout)
             for u in res.get("updates", []):
                 try:
-                    handle(db, cfg, client, u)
+                    handler(db, cfg, client, u)
                 except Exception:  # noqa: BLE001
                     log.exception("update failed: %s", u)
             if res.get("marker") is not None:
                 marker = res["marker"]
-                db.set_kv("max_marker", str(marker))
+                db.set_kv(marker_key, str(marker))
             backoff = 5
         except Exception:  # noqa: BLE001
             log.exception("polling error, retry in %ss", backoff)
@@ -139,8 +185,12 @@ def poll_forever(db: DB, cfg: Settings, client: MaxClient, stop: threading.Event
 
 def run(cfg: Settings, db: DB) -> None:
     client = MaxClient(cfg.max_token, cfg.max.base_url, cfg.max.auth)
-    log.info("MAX bot: %s", client.me())
-    sender = jobs.Sender(db, cfg, client)
+    log.info("MAX bot «План»: %s", client.me())
+    training = None
+    if cfg.training_token:
+        training = MaxClient(cfg.training_token, cfg.max.base_url, cfg.max.auth)
+        log.info("MAX bot «Обучение»: %s", training.me())
+    sender = jobs.Sender(db, cfg, client, training_client=training)
     sched = BackgroundScheduler(timezone=cfg.timezone)
     hh, mm = map(int, cfg.schedule.daily_send_time.split(":"))
 
@@ -152,6 +202,9 @@ def run(cfg: Settings, db: DB) -> None:
     sched.add_job(daily, "cron", hour=hh, minute=mm, id="daily")
     sched.start()
     stop = threading.Event()
+    if training:  # у второго бота свой опрос событий и своя отметка marker
+        threading.Thread(target=poll_forever, args=(DB(cfg.db_path), cfg, training, stop, handle_training,
+                                                     "max_marker_training"), daemon=True, name="max-training").start()
     try:
         poll_forever(db, cfg, client, stop)
     except KeyboardInterrupt:

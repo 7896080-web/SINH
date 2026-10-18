@@ -58,6 +58,10 @@ message_created: {update_type, timestamp, message: {sender: {user_id, is_bot, ..
   рассылки без договора с MAX. Ежедневные сообщения сотрудникам, которые сами запустили бота, скорее всего не
   массовая рассылка, но **вопрос к владельцу**: прочитать https://dev.max.ru/docs/legal/rules до запуска.
 
+## Два бота проекта
+
+«План» (`MAX_BOT_TOKEN`, `bot.handle`) и «Обучение» (`MAX_TRAINING_BOT_TOKEN`, `bot.handle_training`) — один процесс, два опроса событий (`max_marker`, `max_marker_training`). Какие виды сообщений идут во второй бот — `jobs.Sender.TRAINING_KINDS`. Пользователь второго бота — `sellers.training_user_id` (не считаем, что user_id в двух ботах совпадает). Кнопка «Подключить обучение» — `type: link` на `max_training.bot_link?start=<код>`.
+
 ## Как работать с кодом проекта
 
 * Клиент — `src/awer_sales_bot/max_api.py`, разбор событий — `bot.py::_extract`, отправка с журналом —

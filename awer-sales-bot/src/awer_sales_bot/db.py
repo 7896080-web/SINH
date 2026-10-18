@@ -196,7 +196,9 @@ class DB:
     def _migrate(self) -> None:
         """Новые колонки в базах, созданных раньше (CREATE TABLE IF NOT EXISTS их не добавляет)."""
         new = {"sellers": [("hired_at", "TEXT"), ("fired_at", "TEXT"), ("crew_id", "INTEGER"),
-                           ("weekend_key", "INTEGER NOT NULL DEFAULT 0")],  # сильный продавец — ставить на сб и вс
+                           ("weekend_key", "INTEGER NOT NULL DEFAULT 0"),  # сильный продавец — ставить на сб и вс
+                           ("training_user_id", "INTEGER"),  # user_id в боте «Обучение»
+                           ("training_code", "TEXT")],  # код подключения к боту «Обучение»
                "schedule": [("store", "TEXT")]}
         for table, cols in new.items():
             have = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
@@ -257,6 +259,24 @@ class DB:
     def seller_by_user(self, user_id: int) -> sqlite3.Row | None:
         return self.one("SELECT * FROM sellers WHERE max_user_id=? AND active=1", user_id)
 
+    def seller_by_training_user(self, user_id: int) -> sqlite3.Row | None:
+        return self.one("SELECT * FROM sellers WHERE training_user_id=? AND active=1", user_id)
+
+    def new_training_code(self, sid: int) -> str:
+        code = secrets.token_hex(3).upper()
+        with self.tx() as c:
+            c.execute("UPDATE sellers SET training_code=? WHERE id=?", (code, sid))
+        return code
+
+    def link_training(self, code: str, user_id: int) -> sqlite3.Row | None:
+        r = self.one("SELECT * FROM sellers WHERE training_code=? AND active=1", code.strip().upper())
+        if not r:
+            return None
+        with self.tx() as c:
+            c.execute("UPDATE sellers SET training_user_id=NULL WHERE training_user_id=?", (user_id,))
+            c.execute("UPDATE sellers SET training_user_id=?, training_code=NULL WHERE id=?", (user_id, r["id"]))
+        return self.seller(r["id"])
+
     def add_seller(self, name: str, first_name: str | None = None, role: str = "seller") -> int:
         """Продавец, добавленный в админке до первой выгрузки 1С. ValueError — такое имя уже есть."""
         name = " ".join(name.split())
@@ -273,7 +293,8 @@ class DB:
     def fire(self, sid: int, day: date | None = None) -> None:
         """Увольнение: не участвует в планах и рассылке, отвязан от бота. Продажи и итоги остаются."""
         with self.tx() as c:
-            c.execute("UPDATE sellers SET active=0, fired_at=?, max_user_id=NULL, invite_code=NULL WHERE id=?",
+            c.execute("UPDATE sellers SET active=0, fired_at=?, max_user_id=NULL, invite_code=NULL, "
+                      "training_user_id=NULL, training_code=NULL WHERE id=?",
                       ((day or date.today()).isoformat(), sid))
 
     def restore(self, sid: int) -> None:

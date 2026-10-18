@@ -23,17 +23,23 @@ class Sender:
     MAX принимает не больше 2 сообщений в секунду в один диалог — между сообщениями одному человеку пауза."""
 
     GAP = 0.6  # секунд между сообщениями одному получателю
+    # что уходит в бот «Обучение» (если он подключён); остальное — в бот «План»
+    TRAINING_KINDS = {"lesson", "quiz", "onboarding", "coach"}
 
-    def __init__(self, db: DB, cfg: Settings, client: MaxClient | None, dry_run: bool = False):
+    def __init__(self, db: DB, cfg: Settings, client: MaxClient | None, dry_run: bool = False,
+                 training_client: MaxClient | None = None):
         self.db, self.cfg, self.client, self.dry = db, cfg, client, dry_run
+        self.training = training_client
         self._last: dict[int, float] = {}
 
     def to_seller(self, day: str, kind: str, sid: int, text: str, buttons: list[list[dict]] | None = None) -> str | None:
         """Статус отправки ('ok', 'dry', 'no_user', 'error') или None, если отправлять нечего / уже отправлено."""
         if not text or self.db.already_sent(day, kind, sid):
             return None
-        uid = self.db.seller(sid)["max_user_id"]
-        return self._send(day, kind, sid, uid, text, buttons)
+        s = self.db.seller(sid)
+        if kind in self.TRAINING_KINDS and (self.training or (self.dry and self.cfg.training_token)):
+            return self._send(day, kind, sid, s["training_user_id"], text, buttons, self.training)
+        return self._send(day, kind, sid, s["max_user_id"], text, buttons)
 
     def to_owners(self, day: str, kind: str, text: str, buttons: list[list[dict]] | None = None,
                   once: bool = False) -> None:
@@ -43,7 +49,7 @@ class Sender:
                 continue
             self._send(day, kind, None, uid, text, buttons)
 
-    def _send(self, day, kind, sid, uid, text, buttons=None) -> str:
+    def _send(self, day, kind, sid, uid, text, buttons=None, client: MaxClient | None = None) -> str:
         if self.dry or uid is None:
             print(f"--- {kind} {day} → {uid or 'не привязан'}\n{text}\n")
             status = "dry" if self.dry else "no_user"
@@ -53,7 +59,7 @@ class Sender:
         if wait > 0:
             time.sleep(wait)
         try:
-            self.client.send(text, user_id=uid, buttons=buttons)
+            (client or self.client).send(text, user_id=uid, buttons=buttons)
             self.db.log_message(day, kind, sid, uid, "ok", text)
             return "ok"
         except Exception as e:  # noqa: BLE001

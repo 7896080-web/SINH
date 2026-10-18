@@ -367,6 +367,13 @@ def create_app(cfg: Settings, db: DB) -> FastAPI:
                 f'продавец</option><option value=admin {"selected" if s["role"] == "admin" else ""}>'
                 'админ (старший)</option></select>')
 
+    def _training_mark(s) -> str:
+        if not cfg.training_token:
+            return ""
+        if s["training_user_id"]:
+            return " · обучение ✅"
+        return f' · <a href="/sellers/{s["id"]}/card">обучение — подключить</a>'
+
     def _fire_btn(s) -> str:
         msg = (f'Уволить {s["name"]}? Бот перестанет присылать сообщения и отвечать ему. '
                'Продажи этого месяца останутся в итогах и ведомости.')
@@ -414,7 +421,7 @@ def create_app(cfg: Settings, db: DB) -> FastAPI:
                 b.append(f'<tr><td>{html.escape(s["name"])}</td>'
                          f'<td><input type=text name="fn{s["id"]}" value="{html.escape(s["first_name"] or "")}"></td>'
                          f'<td>{_role_select(s)}</td><td class=n>{_date(last)}</td>'
-                         f'<td>✅ подключён <button class=btn name=action value="invite:{s["id"]}" '
+                         f'<td>✅ подключён{_training_mark(s)} <button class=btn name=action value="invite:{s["id"]}" '
                          'title="Если сменил телефон или аккаунт MAX">Новый код</button></td>'
                          f'<td>{_fire_btn(s)}</td></tr>')
             b.append('</table>')
@@ -483,9 +490,21 @@ def create_app(cfg: Settings, db: DB) -> FastAPI:
         if not s:
             raise HTTPException(404)
         name = html.escape(s["first_name"] or s["name"])
+        back = '<p><a href="">Проверить, подключился ли</a> · <a href="/sellers">← к списку продавцов</a></p>'
+        if s["max_user_id"] and cfg.training_token and not s["training_user_id"] and s["active"]:
+            code = s["training_code"] or db.new_training_code(sid)
+            b = [f'<p>✅ Бот «План» подключён. Осталось подключить бот «Обучение» — уроки, тесты и база знаний.</p>',
+                 '<p class=note>Бот «План» уже прислал продавцу кнопку «Подключить обучение». Если кнопки нет — '
+                 'покажите этот QR-код.</p>']
+            if cfg.max_training.bot_link:
+                link = f"{cfg.max_training.bot_link}?start={code}"
+                b += [f'<div class=qr>{qr_svg(link)}</div>', f'<p class=note>Ссылка: {html.escape(link)}</p>']
+            b += [f'<p>Или найдите бот «Обучение» в MAX и отправьте ему код <b class=code>{code}</b>.</p>', back]
+            return page(f"Подключение к обучению: {html.escape(s['name'])}", "".join(b))
         if s["max_user_id"]:
-            body = (f'<p>✅ <b>{html.escape(s["name"])}</b> подключён к боту. Утром после следующего рабочего дня придёт первое '
-                    'сообщение.</p><p><a href="/sellers">← к списку продавцов</a></p>')
+            both = " и к боту «Обучение»" if cfg.training_token else ""
+            body = (f'<p>✅ <b>{html.escape(s["name"])}</b> подключён к боту «План»{both}. Утром после следующего '
+                    'рабочего дня придёт первое сообщение.</p><p><a href="/sellers">← к списку продавцов</a></p>')
             return page(f"Подключение: {html.escape(s['name'])}", body)
         if not s["active"] or not s["invite_code"]:
             return RedirectResponse("/sellers", status_code=303)
@@ -504,7 +523,10 @@ def create_app(cfg: Settings, db: DB) -> FastAPI:
                   f'<li>Отправьте ему код <b class=code>{code}</b>.</li>',
                   f'<li>Бот ответит «Готово, {name}!» — подключение закончено.</li></ol>',
                   '<p class=note>Чтобы здесь был QR-код, впишите ссылку на бота в config.yaml → max.bot_link.</p>']
-        b.append('<p><a href="">Проверить, подключился ли</a> · <a href="/sellers">← к списку продавцов</a></p>')
+        if cfg.training_token:
+            b.append('<p class=note>После подключения бот «План» пришлёт кнопку «Подключить обучение» — нажать её '
+                     'и «Начать» во втором боте.</p>')
+        b.append(back)
         return page(f"Подключение: {html.escape(s['name'])}", "".join(b))
 
     return app

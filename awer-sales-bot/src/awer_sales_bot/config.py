@@ -85,6 +85,13 @@ class MaxCfg(BaseModel):
     bot_link: str = ""  # https://max.ru/<имя_бота> — для ссылок-приглашений
 
 
+class TrainingBot(BaseModel):
+    """Второй бот — «Обучение» (уроки, квизы, программа новичка, тесты, опросы, база знаний).
+    Токен — MAX_TRAINING_BOT_TOKEN в .env; без него всё обучение идёт в бот «План»."""
+
+    bot_link: str = ""  # https://max.ru/<имя бота обучения> — для кнопки «Подключить обучение»
+
+
 class Recs(BaseModel):
     lookback_days: int = 90  # окно для «что докупают вместе»
     # запасной список «дополнений», пока в 1С нет чеков/покупок по картам; в советах всё равно только то,
@@ -132,6 +139,7 @@ class Settings(BaseModel):
     onec: OneC = OneC()
     schedule: Schedule = Schedule()
     max: MaxCfg = MaxCfg()
+    max_training: TrainingBot = TrainingBot()
     recommendations: Recs = Recs()
     staffing: Staffing = Staffing()
     motivation: Motivation = Motivation()
@@ -144,6 +152,11 @@ class Settings(BaseModel):
         if not tok:
             raise RuntimeError("MAX_BOT_TOKEN не задан (см. .env.example)")
         return tok
+
+    @property
+    def training_token(self) -> str | None:
+        """Токен бота «Обучение»; None — второго бота нет."""
+        return os.environ.get("MAX_TRAINING_BOT_TOKEN") or None
 
     @property
     def anthropic_key(self) -> str | None:
