@@ -139,6 +139,9 @@ def owner_summary(db: DB, cfg: Settings, day: date) -> str:
         cards = f" · по картам {pct(m.card_share)}" if m.card_purchases else ""
         L.append(f"{name}: {rub(st.sales)} · выполнение {pct(st.performance)} · ставка "
                  f"{rub(st.projected_rate or st.current_rate)} · за смену {rub(m.per_shift)} · {q}{manual}{cards}")
+    good = achievements.praise(db, cfg, day)
+    if good:
+        L += ["", "👏 **Кого похвалить:**"] + [f"{name} — {'; '.join(why)}" for _, name, why in good]
     start = day.replace(day=1)
     no_seller = M.unattributed(db, start, day)
     if no_seller:

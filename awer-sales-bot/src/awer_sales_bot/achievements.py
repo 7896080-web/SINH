@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 
 from .config import Settings
 from .db import DB
@@ -81,4 +81,27 @@ def for_day(db: DB, cfg: Settings, sid: int, day: date, plan_full: float | None)
             word = plural(n, "смена", "смены", "смен")
             out.append(Achievement("streak", f"Серия: {n} {word} подряд не ниже нормы смены ({_rub(norm)})",
                                    n in STREAK_MARKS))
+    return out
+
+
+def praise(db: DB, cfg: Settings, day: date) -> list[tuple[int, str, list[str]]]:
+    """«Кого похвалить» для владельца: [(seller_id, имя, [за что])] — заметные достижения смены `day`,
+    а в понедельник ещё и выполненные цели прошлой недели."""
+    from . import goals
+    from .planning.service import frozen_plan
+
+    week_done: dict[int, str] = {}
+    if (day + timedelta(days=1)).weekday() == 0:
+        prev = goals.monday(day)
+        for r in db.q("SELECT seller_id FROM weekly_goals WHERE week=? AND done=1", prev.isoformat()):
+            g = goals.get(db, r["seller_id"], prev)
+            week_done[g.seller_id] = f"цель недели «{g.name} {g.fmt(g.target)}» выполнена"
+    out = []
+    for s in db.sellers():
+        why = [a.text for a in for_day(db, cfg, s["id"], day, frozen_plan(db, day.strftime("%Y-%m"), s["id"]))
+               if a.notable]
+        if s["id"] in week_done:
+            why.append(week_done[s["id"]])
+        if why:
+            out.append((s["id"], s["name"], why))
     return out

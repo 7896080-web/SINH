@@ -88,3 +88,23 @@ def test_weekly_goal_set_progress_and_close(env, tmp_path):  # noqa: F811
     assert goals.lines(db, sid, date(2026, 10, 25))[0] == \
         "Итог недели: цель «вещей за смену 1,5» выполнена ✅, у вас 2,0"
     assert "🎯" in daily(db, cfg, sid, date(2026, 10, 20))
+
+
+def test_owner_praise(env, tmp_path):  # noqa: F811
+    from awer_sales_bot import goals
+    from awer_sales_bot.messages import owner_summary
+    cfg, db = env
+    service.freeze(db, cfg, "2026-10")
+    rows = [(oct_day(i), "Продавец04", 30_000, 3) for i in range(1, 12)] + [(oct_day(12), "Продавец04", 60_000, 4)]
+    import_file(write_sales(tmp_path / "s.csv", rows), db, cfg)
+    text = owner_summary(db, cfg, oct_day(12))
+    assert "👏 **Кого похвалить:**" in text and "Продавец04 — Личный рекорд: 60 000 ₽" in text
+    assert "Кого похвалить" not in owner_summary(db, cfg, oct_day(11))  # обычная смена — без похвалы
+
+    sid = db.seller_id("Продавец04", create=False)
+    with db.tx() as c:  # цель недели 05.10–11.10 выполнена → в сводке за воскресенье 11.10
+        c.execute("INSERT INTO weekly_goals(week,seller_id,metric,target,result,done,closed_at) "
+                  "VALUES('2026-10-05',?,'items_per_shift',2.5,3,1,'x')", (sid,))
+    assert any("цель недели «вещей за смену 2,5» выполнена" in w
+               for _, _, why in achievements.praise(db, cfg, oct_day(11)) for w in why)
+    assert goals.monday(oct_day(11)).isoformat() == "2026-10-05"
