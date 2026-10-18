@@ -195,3 +195,56 @@ def test_report_1c_did_not_answer_is_not_replaced_by_a_refetch(db):
                              period_from=date(2026, 9, 7), period_to=date(2026, 9, 13), user="t",
                              replace_unsent=True, kind="kitdlv")
     assert again.skipped and again.report.id == first.id
+
+
+# ------------------------------------------------------------ свежесть загрузок
+
+def test_account_freshness_names_a_rejected_key_and_staleness(db):
+    from finapp.crypto import encrypt_value
+    from finapp.finance import fetch
+    from finapp.models import ApiCredential, ReportFetch
+    from finapp.timeutils import now_utc
+    from tests.finance_factories import make_account
+    wb = make_account(db, name="WB Яворская")
+    db.add(ApiCredential(account_id=wb.id, field_name="finance_token", encrypted_value=encrypt_value("t")))
+    db.add(ReportFetch(kind="wb_api", account_id=wb.id, status="done", finished_at=now_utc() - timedelta(days=12)))
+    db.add(ReportFetch(kind="wb_api", account_id=wb.id, status="failed", message="WB: 401 Unauthorized",
+                       finished_at=now_utc() - timedelta(days=1)))
+    kit = make_account(db, platform="kit", name="Сайт")
+    db.commit()
+    rows = {f["account"].name: f for f in fetch.account_freshness(db)}
+    assert rows["WB Яворская"]["stale"] and "не приняла ключ" in rows["WB Яворская"]["problem"]
+    assert rows["WB Яворская"]["days"] == 12
+    assert rows["Сайт"]["stale"] and "ключ не задан" in rows["Сайт"]["problem"]
+
+
+def test_fresh_account_is_ok_and_pages_show_freshness(client, db):
+    from finapp.crypto import encrypt_value
+    from finapp.models import ApiCredential, ReportFetch
+    from finapp.timeutils import now_utc
+    from tests.finance_factories import make_account
+    wb = make_account(db, name="WB Яворский")
+    db.add(ApiCredential(account_id=wb.id, field_name="finance_token", encrypted_value=encrypt_value("t")))
+    db.add(ReportFetch(kind="wb_api", account_id=wb.id, status="done", finished_at=now_utc() - timedelta(days=2)))
+    stale = make_account(db, name="WB старый")
+    db.add(ApiCredential(account_id=stale.id, field_name="finance_token", encrypted_value=encrypt_value("t")))
+    db.add(ReportFetch(kind="wb_api", account_id=stale.id, status="failed", message="403 Forbidden",
+                       finished_at=now_utc()))
+    db.commit()
+    page = client.get("/diagnostics").text
+    assert "Загрузки по кабинетам" in page and "WB Яворский" in page and "не приняла ключ" in page
+    dash = client.get("/finance").text
+    assert "WB старый" in dash and "не приняла ключ" in dash and "WB Яворский: " not in dash
+
+
+def test_not_in_1c_counts_only_reports_that_go_to_1c(client, db):
+    """Предварительные недели Lamoda и доставка KIT в 1С не уходят никогда —
+    «не загружено в 1С» их не считает, а обычный отчёт (вид пуст) — считает."""
+    period = (today_local() - timedelta(days=3), today_local())
+    sale = [{"operation": v.SALE, "quantity": 1, "revenue": 100000, "payout": 80000}]
+    make_report(db, key="SR-plain", period=period, lines=sale)
+    weekly = make_report(db, platform="lamoda", key="SR-week", period=period, lines=sale)
+    weekly.report_kind = "предварительный"
+    db.commit()
+    dash = client.get("/finance").text
+    assert "не загруженных в 1С: 1 из 2" in dash

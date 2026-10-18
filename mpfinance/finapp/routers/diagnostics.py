@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.orm import Session
 
+from finapp.finance import fetch
 from finapp.excel_utils import ExcelReadError, read_upload
 from finapp import backup, catalog, config, onec, settings, syncdb
 from finapp.audit import log_action
@@ -41,6 +42,7 @@ def page(request: Request, db: Session = Depends(get_db), user: User = Depends(g
         "dirs": {"задания 1С": config.ONEC_TASKS_DIR, "ответы 1С": config.ONEC_RESULTS_DIR,
                  "архив обмена": config.ONEC_ARCHIVE_DIR, "копии базы": config.BACKUP_DIR},
         "sync_status": syncdb.status_text(),
+        "freshness": fetch.account_freshness(db),
     })
 
 

@@ -422,6 +422,69 @@ def _drop_superseded_kit(db: Session, account_id: int, stored: list[SalesReport]
     return dropped
 
 
+# ---------------------------------------------------------------- свежесть по кабинетам
+
+# Сколько без успешной загрузки — уже повод смотреть. WB формирует отчёт раз в
+# неделю (по понедельникам, бывает позже), KIT забирается каждый день, письма
+# Lamoda приходят раз в неделю.
+STALE_AFTER = {"wb": timedelta(days=8), "kit": timedelta(days=2), "lamoda": timedelta(days=9)}
+FETCH_KIND = {"wb": "wb_api", "kit": "kit_api"}
+
+
+def _explain(message: str) -> str:
+    """Причина отказа словами оператора: ключ, истёкший через полгода (токены
+    WB живут ограниченно), иначе выглядел бы просто «ошибкой загрузки»."""
+    text = message or ""
+    if any(code in text for code in ("401", "403", "Unauthorized", "Forbidden", "токен", "Финансы")):
+        return "площадка не приняла ключ — впишите новый на «API-ключах» (у WB ключ живёт ограниченный срок)"
+    return text[:300]
+
+
+def account_freshness(db: Session) -> list[dict]:
+    """По каждому активному кабинету с автозагрузкой: когда последний раз
+    загрузка УДАЛАСЬ, давно ли это, и почему не удалась последняя. Отказ по
+    ключу (401/403) иначе виден только в журнале загрузок, а данные просто
+    перестают приходить."""
+    from finapp import mail
+    from finapp.models import MailMessage
+    now = now_utc()
+    out = []
+    for account in db.query(PlatformAccount).filter(PlatformAccount.is_active.is_(True)) \
+            .order_by(PlatformAccount.platform, PlatformAccount.name):
+        item = {"account": account, "last_ok": None, "problem": "", "stale": False}
+        if account.platform in FETCH_KIND:
+            kind = FETCH_KIND[account.platform]
+            creds = credentials_of(db, account)
+            has_key = wb_report_token(creds) if account.platform == "wb" else (creds.get("token") or "").strip()
+            ok = db.query(ReportFetch).filter(ReportFetch.kind == kind, ReportFetch.account_id == account.id,
+                                              ReportFetch.status == "done") \
+                .order_by(ReportFetch.finished_at.desc()).first()
+            last = db.query(ReportFetch).filter(ReportFetch.kind == kind, ReportFetch.account_id == account.id,
+                                                ReportFetch.status.in_(("done", "failed"))) \
+                .order_by(ReportFetch.finished_at.desc()).first()
+            item["last_ok"] = ok.finished_at if ok else None
+            if not has_key:
+                item["problem"] = "ключ не задан — загрузка по API не идёт"
+            elif last is not None and last.status == "failed":
+                item["problem"] = _explain(last.message)
+        elif account.platform == "lamoda":
+            cfg = mail.load(db)
+            if not cfg.configured:
+                item["problem"] = "почта для отчётов не настроена"
+            else:
+                got = db.query(MailMessage).filter(MailMessage.status == "imported") \
+                    .order_by(MailMessage.processed_at.desc()).first()
+                item["last_ok"] = got.processed_at if got else None
+        else:
+            continue
+        limit = STALE_AFTER.get(account.platform)
+        item["stale"] = bool(item["problem"]) or item["last_ok"] is None or \
+            (limit is not None and now - item["last_ok"] > limit)
+        item["days"] = (now - item["last_ok"]).days if item["last_ok"] else None
+        out.append(item)
+    return out
+
+
 # ---------------------------------------------------------------- курс ЦБ
 
 _rates_retry_after: datetime | None = None

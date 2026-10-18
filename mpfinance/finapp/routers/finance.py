@@ -16,7 +16,7 @@ from finapp.audit import log_action
 from finapp.database import get_db
 from finapp.deps import get_current_user
 from finapp.excel_utils import ExcelReadError, build_xlsx_response, read_upload, read_xlsx_rows
-from finapp.finance import charts, fetch, statements, values as v
+from finapp.finance import charts, fetch, lamoda, statements, values as v
 from finapp.finance.economics import (Filters, Totals, load_lines, platform_summary, trend,
                                    unit_economics)
 from finapp.finance.formats import FORMATS
@@ -129,11 +129,19 @@ def finance_dashboard(
     top = [g for g in articles if g.totals.profit > 0][:10]
     losers = sorted([g for g in articles if g.totals.profit < 0], key=lambda g: g.totals.profit)[:5]
 
+    # «Не загружено в 1С» — только отчёты, которые в 1С уходят: предварительные
+    # недели Lamoda, доставка KIT по API и детализация Яндекс Пэй не уходят
+    # никогда, и сигнал горел бы всегда.
+    # coalesce обязателен: у большинства отчётов вид пуст (NULL), а NOT (NULL IN …)
+    # в SQL — NULL, и такие отчёты выпали бы из счёта молча.
+    never_to_1c = or_(func.coalesce(SalesReport.report_kind, "").in_([lamoda.PROVISIONAL, fetch.KIT_DELIVERY_KIND]),
+                      SalesReport.source_format == "kit_yandex_pay")
     not_in_1c = db.query(SalesReport).filter(
-        SalesReport.period_from <= d_to, SalesReport.period_to >= d_from,
+        SalesReport.period_from <= d_to, SalesReport.period_to >= d_from, ~never_to_1c,
         SalesReport.onec_status.in_([OneCUploadStatus.none, OneCUploadStatus.failed,
                                      OneCUploadStatus.timeout]),
     ).count()
+    stale_fetches = [f for f in fetch.account_freshness(db) if f["stale"]]
     reports_in_period = db.query(SalesReport).filter(
         SalesReport.period_from <= d_to, SalesReport.period_to >= d_from).count()
 
@@ -144,7 +152,7 @@ def finance_dashboard(
         trend_rows=trend_rows, top=top, losers=losers, settings=settings,
         tax_modes=TAX_MODES, not_in_1c=not_in_1c, reports_in_period=reports_in_period,
         tax_text=tax_text(settings), tax_effective=effective_rate(settings),
-        meter_width=charts.meter_width,
+        meter_width=charts.meter_width, stale_fetches=stale_fetches,
     ))
 
 

@@ -100,6 +100,24 @@
     </form>
 </div>
 
+<div class="card" id="freshness">
+    <h2 style="margin-top:0; font-size:15px;">Загрузки по кабинетам</h2>
+    {% if freshness %}
+    <table>
+        <thead><tr><th>Кабинет</th><th>Последняя успешная загрузка</th><th>Что не так</th></tr></thead>
+        <tbody>
+        {% for f in freshness %}
+        <tr><td>{{ f.account.name }} <span class="help-text">{{ {'wb': 'WB, по API', 'kit': 'Яндекс KIT, по API', 'lamoda': 'Lamoda, с почты'}[f.account.platform] }}</span></td>
+            <td class="mono">{% if f.last_ok %}{{ f.last_ok|local('%d.%m.%Y %H:%M') }}{% if f.days %} <span class="help-text">({{ f.days }} дн. назад)</span>{% endif %}{% else %}не было{% endif %}</td>
+            <td>{% if f.stale %}<span class="badge badge--warn">внимание</span>{% else %}<span class="badge badge--good">ок</span>{% endif %}
+                {{ f.problem or ('давно не было — проверьте журнал загрузок на «Отчётах площадок»' if f.stale else '') }}</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    <p class="help-text">«Внимание» — загрузки не было дольше обычного (WB — неделя, KIT — двое суток, письма Lamoda — 9 дней) или последняя попытка не удалась.</p>
+    {% else %}<div class="empty-state">Активных кабинетов с автозагрузкой нет.</div>{% endif %}
+</div>
+
 <div class="card">
     <h2 style="margin-top:0; font-size:15px;">Фоновые задания</h2>
     {% if stale %}<ul class="check-list">{% for s in stale %}<li><span class="badge badge--bad">внимание</span> {{ s }}</li>{% endfor %}</ul>{% endif %}

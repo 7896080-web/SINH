@@ -16,6 +16,21 @@
 
 {{ period_filter('/finance', preset, presets, d_from, d_to) }}
 
+{# Загрузки — ДО пустого состояния: пустой период из-за отказа загрузки — как
+   раз тот случай, когда это предупреждение нужнее всего. #}
+{% if stale_fetches %}
+<div class="card">
+    <h2 style="margin-top:0; font-size:15px;">Загрузки по кабинетам</h2>
+    <ul class="check-list">
+        {% for f in stale_fetches %}
+        <li><span class="badge badge--warn">загрузка</span>
+            {{ f.account.name }}: {% if f.last_ok %}последняя успешная загрузка {{ f.days }} дн. назад{% else %}успешной загрузки ещё не было{% endif %}{% if f.problem %} — {{ f.problem }}{% endif %}.
+            Свежие продажи сюда не попадают. <a href="/diagnostics#freshness">Подробнее</a></li>
+        {% endfor %}
+    </ul>
+</div>
+{% endif %}
+
 {% if not total %}
 <div class="card empty-state">
     За этот период нет ни одного загруженного отчёта площадки.
