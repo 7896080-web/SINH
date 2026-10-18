@@ -6,7 +6,7 @@ import secrets
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Iterator
 
@@ -451,7 +451,7 @@ class DB:
                 continue
             y, mm = map(int, m.split("-"))
             days_in = calendar.monthrange(y, mm)[1]
-            n_days = self.one("SELECT COUNT(DISTINCT day) n FROM imported_days WHERE substr(day,1,7)=?", m)["n"]
+            n_days = self.covered_days(m)
             h.coverage[m] = min(1.0, n_days / days_in) if n_days else 1.0
             for r in self.q(
                 "SELECT seller_id, SUM(amount) s, COUNT(DISTINCT day) shifts FROM sales_lines "
@@ -492,6 +492,43 @@ class DB:
     def planned_shifts(self, sid: int, month: str) -> int | None:
         n = self.one("SELECT COUNT(*) n FROM schedule WHERE seller_id=? AND substr(day,1,7)=?", sid, month)["n"]
         return n or None
+
+    # «магазины закрыты» (праздник, отключение света) — строки imported_days с source='closed': день не пропуск
+    # данных (месяц в истории не досчитывается), выгрузку за него бот не ждёт, продавцам «продаж нет» не шлёт
+    def set_store_closed(self, day: date, stores: list[str], closed: bool = True) -> None:
+        with self.tx() as c:
+            if closed:
+                c.executemany("INSERT INTO imported_days(day,store,source,lines,imported_at) VALUES(?,?,'closed',0,?) "
+                              "ON CONFLICT(day,store) DO NOTHING",  # продажи из 1С за день главнее отметки
+                              [(day.isoformat(), st, datetime.now().isoformat(timespec="seconds")) for st in stores])
+            else:
+                c.execute("DELETE FROM imported_days WHERE day=? AND source='closed'", (day.isoformat(),))
+
+    def store_closed_days(self) -> list[str]:
+        return [r["day"] for r in self.q("SELECT DISTINCT day FROM imported_days WHERE source='closed' ORDER BY day")]
+
+    def store_closed(self, day: date) -> bool:
+        """Все строки дня — отметка «закрыто» (ни одной продажи из 1С)."""
+        r = self.one("SELECT COUNT(*) n, SUM(source='closed') c FROM imported_days WHERE day=?", day.isoformat())
+        return bool(r["n"]) and r["n"] == r["c"]
+
+    def data_gaps(self, until: date) -> list[str]:
+        """Дни внутри истории 1С (от первого выгруженного дня до `until`), по которым нет ничего: ни продаж,
+        ни отметки «закрыто», — либо магазины не работали, либо выгрузка потерялась."""
+        first = self.one("SELECT MIN(day) d FROM imported_days")["d"]
+        if not first:
+            return []
+        have = {r["day"] for r in self.q("SELECT DISTINCT day FROM imported_days WHERE day>=?", first)}
+        d, out = date.fromisoformat(first), []
+        while d <= until:
+            if d.isoformat() not in have:
+                out.append(d.isoformat())
+            d += timedelta(days=1)
+        return out
+
+    def covered_days(self, month: str) -> int:
+        """Дней месяца с выгрузкой 1С или отметкой «закрыто» — доля месяца в данных."""
+        return self.one("SELECT COUNT(DISTINCT day) n FROM imported_days WHERE substr(day,1,7)=?", month)["n"]
 
     def day_closed(self, day: date, stores: list[str]) -> list[str]:
         """Список магазинов, по которым ещё нет выгрузки за день (пусто = день закрыт)."""

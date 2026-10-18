@@ -130,10 +130,12 @@ def daily_run(db: DB, cfg: Settings, sender: Sender, today: date | None = None, 
     if missing and not force and datetime.now() < deadline:
         return "waiting"
     empty = bool(missing) and set(missing) >= set(cfg.stores)  # за день нет ничего ни по одному магазину (аудит С2)
+    closed = not missing and db.store_closed(day)  # владелец отметил: магазины не работали — сводок за день нет
     if missing:
         sender.to_owners(day.isoformat(), "missing_day", f"Нет выгрузки 1С за {day:%d.%m} по: {', '.join(missing)}. " +
                          ("Продавцам рассылка за этот день не отправлена: без данных у всех было бы «продаж нет». "
-                          "Бот отправит её сам, как только выгрузка появится (сегодня)." if empty else
+                          "Бот отправит её сам, как только выгрузка появится (сегодня). Если магазины в этот день "
+                          "не работали — отметьте: админка → «График работы» → «Закрытые дни»." if empty else
                           "Рассылка по имеющимся данным."), once=True)
     if month_due(db, today):  # не «сегодня 1-е»: служба могла не работать 1-го числа (аудит В2)
         month_turn(db, cfg, sender, today)
@@ -143,13 +145,14 @@ def daily_run(db: DB, cfg: Settings, sender: Sender, today: date | None = None, 
                          f"{messages.rub(r['plan'])} на полный месяц ({METHOD_NAMES.get(r['method'], r['method'])}). "
                          "Изменить — админка → «Настройки месяца» → «План вручную».")
     goals.ensure_week(db, cfg, today)
-    for s in ([] if empty else db.sellers()):
+    for s in ([] if empty or closed else db.sellers()):
         if s["max_user_id"] and (db.worked_shifts(s["id"], day.strftime("%Y-%m"), upto=day) or
                                  db.one("SELECT 1 FROM plans WHERE month=? AND seller_id=?", day.strftime("%Y-%m"), s["id"])):
             sender.to_seller(day.isoformat(), "daily", s["id"], messages.daily(db, cfg, s["id"], day))
-    good = achievements.praise(db, cfg, day)
-    sender.to_owners(day.isoformat(), "owner_daily", messages.owner_summary(db, cfg, day),
-                     quiz.praise_buttons(good, day) or None, once=True)
+    if not closed:
+        good = achievements.praise(db, cfg, day)
+        sender.to_owners(day.isoformat(), "owner_daily", messages.owner_summary(db, cfg, day),
+                         quiz.praise_buttons(good, day) or None, once=True)
     training_run(db, cfg, sender, today)
     arrivals_run(db, cfg, sender, today, day)
     coach.run(db, cfg, sender, today)

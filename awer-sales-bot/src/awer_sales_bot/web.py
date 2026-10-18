@@ -9,7 +9,7 @@ import html
 import io
 import os
 import secrets
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from urllib.parse import quote
 
 import openpyxl
@@ -552,7 +552,8 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
         we = lambda d: " we" if d.weekday() >= 5 else ""  # noqa: E731
         probs = crews_mod.problems(db, cfg, dates[0], dates[-1])
         b = [f'<p><a href="/schedule/{month_add(month, -1)}">← {month_add(month, -1)}</a> · '
-             f'<a href="/schedule/{month_add(month, 1)}">{month_add(month, 1)} →</a> · <a href="/crews">Смены</a></p>',
+             f'<a href="/schedule/{month_add(month, 1)}">{month_add(month, 1)} →</a> · <a href="/crews">Смены</a> · '
+             '<a href="/closed">Закрытые дни</a></p>',
              f'<p class=note>{e(msg)}</p>' if msg else "",
              '<p class=note>Отдельная таблица на каждый магазин. Строка «смена» — какая смена в этом магазине: каждую '
              'среду смены меняются магазинами. Белые клетки — дни, когда смена продавца в этом магазине; серые — '
@@ -636,6 +637,46 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
                     days[d] = None if st == dflt else st
             db.set_schedule(month, sl["id"], days)
         return RedirectResponse(f"/schedule/{month}?msg=" + quote("График сохранён"), status_code=303)
+
+    # ------------------------------------------------------------------ дни, когда магазины не работали
+    @app.get("/closed", dependencies=[Depends(auth)])
+    def closed_days(msg: str = ""):
+        fmt = lambda d: date.fromisoformat(d).strftime("%d.%m.%Y")  # noqa: E731
+        b = [f'<p class=note>{html.escape(msg)}</p>' if msg else "",
+             '<p class=note>Праздник, ремонт, отключение света — в такой день продаж нет не из-за 1С. Отмеченный день '
+             'бот не считает пропуском данных (иначе досчитывает месяц, и план следующего года завышается), не ждёт за '
+             'него выгрузку и не шлёт продавцам «продаж нет». Если продажи за день всё же придут из 1С, отметка '
+             'снимется сама.</p>']
+        gaps = db.data_gaps(date.today() - timedelta(days=2))  # вчера и позавчера выгрузка ещё может прийти
+        if gaps:
+            b.append('<h2>Дни без данных из 1С</h2><p class=note>Ни продаж, ни отметки. Если магазины работали — '
+                     'выгрузите эти дни из 1С ещё раз.</p><form method=post action="/closed"><table>'
+                     + "".join(f'<tr><td>{fmt(d)}</td><td><button class=btn name=add value="{d}">Магазины были '
+                               f'закрыты</button></td></tr>' for d in gaps) + '</table></form>')
+        marked = db.store_closed_days()
+        b.append('<h2>Отмечены закрытыми</h2>' + ('<form method=post action="/closed"><table>' + "".join(
+            f'<tr><td>{fmt(d)}</td><td><button class=btn name=remove value="{d}">Снять отметку</button></td></tr>'
+            for d in marked) + '</table></form>' if marked else '<p class=note>Пока нет.</p>'))
+        b.append('<h2>Отметить день</h2><form method=post action="/closed">Дата <input type=text name=day '
+                 'placeholder="25.06.2026" style="width:110px"> <button class=btn>Магазины были закрыты</button></form>')
+        return page("Дни, когда магазины были закрыты", "".join(b))
+
+    @app.post("/closed", dependencies=[Depends(auth)])
+    def closed_save(add: str = Form(""), remove: str = Form(""), day: str = Form("")):
+        try:
+            if remove:
+                d = date.fromisoformat(remove)
+                db.set_store_closed(d, cfg.stores, closed=False)
+                msg = f"Отметка снята: {d:%d.%m.%Y}"
+            else:
+                d = date.fromisoformat(add) if add else datetime.strptime(day.strip(), "%d.%m.%Y").date()
+                if d >= date.today():
+                    raise ValueError("отмечается только прошедший день")
+                db.set_store_closed(d, cfg.stores)
+                msg = f"Отмечено: {d:%d.%m.%Y} магазины были закрыты"
+        except ValueError as e:
+            msg = f"Не отмечено: {e}. Дата — как 25.06.2026"
+        return RedirectResponse("/closed?msg=" + quote(msg), status_code=303)
 
     # ------------------------------------------------------------------ обучение: правка контента
     def _learn_tabs(kind: str) -> str:

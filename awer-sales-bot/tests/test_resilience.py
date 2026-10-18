@@ -278,6 +278,47 @@ def test_empty_day_is_not_sent_to_sellers(env):  # noqa: F811
     assert "не отправлена" in db.one("SELECT text FROM message_log WHERE kind='missing_day'")["text"]
 
 
+def test_closed_day_is_not_a_gap(env):  # noqa: F811
+    """Магазины не работали (25.06.2026): день не пропуск данных — месяц не досчитывается, выгрузку не ждём,
+    продавцам «продаж нет» не шлём; продажи из 1С за этот день главнее отметки."""
+    cfg, db = env
+    cfg.max.owners = [900]
+    m = FakeMax()
+    s = Sender(db, cfg, m)
+    s.GAP = 0
+    sid = db.seller_id("Продавец04", create=False)
+    with db.tx() as c:
+        c.execute("UPDATE sellers SET max_user_id=501 WHERE id=?", (sid,))
+    service.freeze(db, cfg, "2026-10")
+    f = write_sales(cfg.onec.inbox / "s.csv", [(date(2026, 10, 16), "Продавец04", 5600, 1)])
+    os.utime(f, (time.time() - 600,) * 2)
+    import_inbox(db, cfg)
+    web = TestClient(create_app(cfg, db))
+    page = web.get("/closed", auth=("admin", "pw")).text
+    assert "Дни без данных из 1С" not in page  # 16.10 — первый день истории, пропусков до него нет
+
+    closed = date(2026, 10, 17)
+    assert db.covered_days("2026-10") == 1
+    r = web.post("/closed", data={"day": "17.10.2026"}, auth=("admin", "pw"), follow_redirects=False)
+    assert r.status_code == 303 and db.store_closed(closed) and db.covered_days("2026-10") == 2
+    assert db.history(cfg.norm_shifts).coverage["2026-10"] == pytest.approx(2 / 31)
+    assert not db.day_closed(closed, cfg.stores)  # выгрузку за этот день бот не ждёт
+    daily_run(db, cfg, s, today=date(2026, 10, 18), force=True)
+    # сводки за день нет ни продавцу, ни владельцу (урок недели — про сегодня, он уходит как обычно)
+    assert not db.one("SELECT 1 FROM message_log WHERE kind IN ('daily','missing_day','owner_daily')")
+    assert db.get_kv("daily_done") == closed.isoformat()  # догон не повторяет
+
+    web.post("/closed", data={"remove": closed.isoformat()}, auth=("admin", "pw"))
+    assert not db.store_closed(closed) and db.data_gaps(closed) == [closed.isoformat()]
+    assert "Магазины были закрыты" in web.get("/closed", auth=("admin", "pw")).text
+    db.set_store_closed(closed, cfg.stores)
+    f = write_sales(cfg.onec.inbox / "s2.csv", [(closed, "Продавец04", 3000, 1)])
+    os.utime(f, (time.time() - 600,) * 2)
+    import_inbox(db, cfg)
+    assert not db.store_closed(closed)  # пришли продажи — отметка снялась
+    assert "не отмечено" in web.post("/closed", data={"day": "мусор"}, auth=("admin", "pw")).text.lower()
+
+
 def test_foreign_warehouse_is_not_revenue(env):  # noqa: F811
     cfg, db = env
     cfg.max.owners = [900]

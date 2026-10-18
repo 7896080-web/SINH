@@ -63,7 +63,7 @@ def run(db: DB, cfg: Settings, month: str) -> Month:
     fact = h.months.get(month, {})
     daily = month in db.daily_months()
     days_in = calendar.monthrange(*map(int, month.split("-")))[1]
-    n_days = db.one("SELECT COUNT(DISTINCT day) n FROM imported_days WHERE substr(day,1,7)=?", month)["n"]
+    n_days = db.covered_days(month)
     out = Month(month, p, sp, h.store_total(month), "1С" if daily else "ведомости" if fact else "нет данных",
                 min(1.0, n_days / days_in) if daily else 1.0)
     for sid, x in fact.items():
