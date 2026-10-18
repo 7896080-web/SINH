@@ -16,7 +16,7 @@ from datetime import date, datetime, timedelta
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from . import jobs, lessons, messages, quiz
+from . import jobs, lessons, messages, quiz, tasks
 from .config import Settings
 from .db import DB
 from .max_api import MaxClient
@@ -76,10 +76,12 @@ def handle(db: DB, cfg: Settings, client: MaxClient, u: dict) -> None:
     t, uid, text = _extract(u)
     if not uid:
         return
+    seller = db.seller_by_user(uid)
+    if not cfg.training_token and task_event(db, cfg, client, u, t, uid, text, seller):
+        return  # второго бота нет — задания отвечаются здесь
     if t == "message_callback":
         on_callback(db, cfg, client, u, uid, text)
         return
-    seller = db.seller_by_user(uid)
     is_owner = uid in cfg.max.owners
     reply = linked = None
     if t == "bot_started" and text:
@@ -110,6 +112,27 @@ def handle(db: DB, cfg: Settings, client: MaxClient, u: dict) -> None:
             welcome_newcomer(db, cfg, client, linked["id"], uid)
 
 
+def task_event(db: DB, cfg: Settings, client: MaxClient, u: dict, t: str, uid: int, text: str, seller) -> bool:
+    """Тест, опрос, чек-лист: кнопка или свой ответ текстом. True — событие обработано."""
+    if not seller:
+        return False
+    if t == "message_callback" and text[:2] in ("t|", "s|", "c|"):
+        note, out, replace = tasks.on_callback(db, cfg, seller["id"], uid, text)
+        cb_id = (u.get("callback") or {}).get("callback_id")
+        if cb_id:
+            client.answer(cb_id, notification=note, message=replace)
+    elif t == "message_created" and text and not text.startswith("/"):
+        out = tasks.on_text(db, cfg, seller["id"], uid, text)  # свой ответ в опросе
+        if out is None:
+            return False
+    else:
+        return False
+    for msg, buttons in out:
+        time.sleep(0.6)  # MAX: не больше 2 сообщений в секунду в один диалог
+        client.send(msg, user_id=uid, buttons=buttons)
+    return True
+
+
 def offer_training(db: DB, cfg: Settings, client: MaxClient, sid: int, uid: int) -> None:
     """Кнопка «Подключить обучение» — ссылка на второй бот с кодом этого продавца."""
     code = db.new_training_code(sid)
@@ -130,7 +153,10 @@ def handle_training(db: DB, cfg: Settings, client: MaxClient, u: dict) -> None:
         return
     seller = db.seller_by_training_user(uid)
     if t == "message_callback":
-        on_callback(db, cfg, client, u, uid, text, seller=seller)
+        if not task_event(db, cfg, client, u, t, uid, text, seller):
+            on_callback(db, cfg, client, u, uid, text, seller=seller)
+        return
+    if task_event(db, cfg, client, u, t, uid, text, seller):
         return
     linked = None
     if text and (t == "bot_started" or (not seller and len(text) == 6)):
@@ -200,6 +226,8 @@ def run(cfg: Settings, db: DB) -> None:
             sched.add_job(daily, "date", run_date=datetime.now() + timedelta(minutes=cfg.schedule.retry_minutes))
 
     sched.add_job(daily, "cron", hour=hh, minute=mm, id="daily")
+    # тесты, опросы, чек-листы — каждые 15 минут проверяем, у каких рассылок сейчас тестовые часы
+    sched.add_job(lambda: tasks.run_due(db, cfg, sender), "cron", minute="*/15", id="tasks")
     sched.start()
     stop = threading.Event()
     if training:  # у второго бота свой опрос событий и своя отметка marker

@@ -24,7 +24,7 @@ class Sender:
 
     GAP = 0.6  # секунд между сообщениями одному получателю
     # что уходит в бот «Обучение» (если он подключён); остальное — в бот «План»
-    TRAINING_KINDS = {"lesson", "quiz", "onboarding", "coach"}
+    TRAINING_KINDS = {"lesson", "quiz", "onboarding", "coach", "task"}
 
     def __init__(self, db: DB, cfg: Settings, client: MaxClient | None, dry_run: bool = False,
                  training_client: MaxClient | None = None):

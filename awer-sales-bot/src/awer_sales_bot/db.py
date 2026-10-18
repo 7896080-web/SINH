@@ -176,6 +176,28 @@ CREATE TABLE IF NOT EXISTS content (            -- обучение: content.py;
     origin TEXT,                          -- yaml — из файла; admin — правка владельца (файлом не перезаписывается)
     updated_at TEXT
 );
+CREATE TABLE IF NOT EXISTS campaigns (          -- рассылка заданий: тест, опрос, чек-лист (tasks.py)
+    id INTEGER PRIMARY KEY,
+    content_id TEXT NOT NULL,             -- content.id (kind test | survey | checklist)
+    audience TEXT NOT NULL,               -- all | newcomers | store:<магазин> | crew:<id>
+    repeat TEXT NOT NULL,                 -- once | daily | weekly
+    start_day TEXT NOT NULL,
+    weekday INTEGER,                      -- weekly: 0 = пн
+    hour_from TEXT, hour_to TEXT,         -- тестовые часы этой рассылки; пусто — training.test_hours
+    only_working INTEGER NOT NULL DEFAULT 1,  -- только тем, у кого сегодня рабочий день по графику
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS deliveries (         -- кому и когда ушло задание; score — тест: доля верных, иначе 1
+    campaign_id INTEGER NOT NULL, seller_id INTEGER NOT NULL, day TEXT NOT NULL,
+    sent_at TEXT, done_at TEXT, score REAL,
+    PRIMARY KEY (campaign_id, seller_id, day)
+);
+CREATE TABLE IF NOT EXISTS answers (            -- ответы на тесты, опросы (в т.ч. своими словами), отметки чек-листов
+    campaign_id INTEGER NOT NULL, seller_id INTEGER NOT NULL, day TEXT NOT NULL, q INTEGER NOT NULL,
+    answer INTEGER, text TEXT, correct INTEGER, at TEXT,
+    PRIMARY KEY (campaign_id, seller_id, day, q)
+);
 CREATE TABLE IF NOT EXISTS lessons_sent (       -- какие уроки и когда ушли продавцу, lessons.py
     seller_id INTEGER NOT NULL REFERENCES sellers(id),
     lesson_id TEXT NOT NULL,              -- id из content/lessons.yaml; программа новичка — onb-<смена>

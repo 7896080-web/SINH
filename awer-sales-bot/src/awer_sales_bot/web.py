@@ -18,6 +18,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 from . import content
+from . import tasks as tasks_mod
 from . import crews as crews_mod
 from .config import Settings
 from .db import DB
@@ -72,7 +73,7 @@ def create_app(cfg: Settings, db: DB) -> FastAPI:
     def page(title: str, body: str) -> HTMLResponse:
         cur = date.today().strftime("%Y-%m")
         nav = (f'<nav><a href="/month/{cur}">Настройки месяца</a><a href="/sellers">Продавцы</a>'
-               f'<a href="/crews">Смены</a><a href="/learn">Обучение</a><a href="/schedule/{cur}">График работы</a><a href="/month/{cur}/results">Итоги и ведомость</a></nav>')
+               f'<a href="/crews">Смены</a><a href="/learn">Обучение</a><a href="/tasks">Задания</a><a href="/schedule/{cur}">График работы</a><a href="/month/{cur}/results">Итоги и ведомость</a></nav>')
         return HTMLResponse(f"<!doctype html><html lang=ru><head><meta charset=utf-8><title>{title}</title>"
                             f"<style>{CSS}</style></head><body>{nav}<h1>{title}</h1>{body}</body></html>")
 
@@ -499,6 +500,123 @@ def create_app(cfg: Settings, db: DB) -> FastAPI:
             return _learn_form(x, str(err))
         content.save(db, cid, kind, title, body, x["try_today"], x["topic"], data, bool(x["active"]))
         return RedirectResponse(f"/learn?kind={kind}&msg=" + quote(f"Сохранено: {title}"), status_code=303)
+
+    # ------------------------------------------------------------------ задания: тесты, опросы, чек-листы
+    @app.get("/tasks", dependencies=[Depends(auth)])
+    def tasks_page(msg: str = ""):
+        crews_mod.ensure_crews(db, cfg)
+        e = html.escape
+        cs = db.q("SELECT * FROM campaigns ORDER BY active DESC, id DESC")
+        quiet = tasks_mod.quiet_hours(db, date.today())
+        b = [f'<p class=note>{e(msg)}</p>' if msg else "",
+             '<p class=note>Тесты, опросы и чек-листы приходят в бот «Обучение» в тестовые часы — только тем, у кого '
+             'сегодня рабочий день по графику. Тексты — на странице «Обучение». Рейтинг по результатам — '
+             '<a href="/rating">информативный</a>, на ставку не влияет.</p>',
+             '<h2>Рассылки</h2><table><tr><th>Что</th><th>Кому</th><th>Когда</th><th>Часы</th><th>Получили</th>'
+             '<th>Выполнили</th><th>Включена</th></tr>']
+        for c in cs:
+            x = content.get(db, cfg, c["content_id"])
+            st = db.one("SELECT COUNT(*) n, SUM(done_at IS NOT NULL) d FROM deliveries WHERE campaign_id=?", c["id"])
+            a, z = tasks_mod.hours(cfg, c)
+            when = tasks_mod.REPEATS[c["repeat"]] + (
+                f" ({['пн', 'вт', 'ср', 'чт', 'пт', 'сб', 'вс'][c['weekday']]})" if c["repeat"] == "weekly" and
+                c["weekday"] is not None else "") + f", с {date.fromisoformat(c['start_day']):%d.%m}"
+            b.append(f'<tr><td><a href="/tasks/{c["id"]}">{e(content.KINDS[x["kind"]][:-1] if x else "?")}: '
+                     f'{e(x["title"] if x else c["content_id"])}</a></td><td>{e(tasks_mod.audience_label(db, c["audience"]))}'
+                     f'</td><td>{e(when)}</td><td>{a:%H:%M}–{z:%H:%M}</td><td class=n>{st["n"]}</td>'
+                     f'<td class=n>{st["d"] or 0}</td><td>{"да" if c["active"] else "нет"}</td></tr>')
+        b.append("</table>")
+        opts = "".join(f'<option value="{e(x["id"])}">{e(content.KINDS[x["kind"]])}: {e(x["title"])}</option>'
+                       for k in ("test", "survey", "checklist") for x in content.items(db, cfg, k))
+        aud = "".join(f'<option value="{k}">{v}</option>' for k, v in tasks_mod.AUDIENCES.items())
+        aud += "".join(f'<option value="store:{e(st)}">магазин «{e(st)}» (кто сегодня там)</option>' for st in cfg.stores)
+        aud += "".join(f'<option value="crew:{c["id"]}">смена «{e(c["name"])}»</option>' for c in crews_mod.crews(db))
+        rep = "".join(f'<option value="{k}">{v}</option>' for k, v in tasks_mod.REPEATS.items())
+        wd = "".join(f'<option value="{i}">{n}</option>' for i, n in enumerate(crews_mod.WD))
+        a, z = tasks_mod.hours(cfg)
+        hint = (f" Самые тихие часы по чекам 1С: {', '.join(f'{h}:00–{h + 1}:00' for h in quiet)}." if quiet else "")
+        b += ['<h2>Новая рассылка</h2><form method=post action="/tasks"><table>',
+              f'<tr><td>Что</td><td><select name=content_id>{opts}</select></td></tr>',
+              f'<tr><td>Кому</td><td><select name=audience>{aud}</select></td></tr>',
+              f'<tr><td>Когда</td><td><select name=repeat>{rep}</select> день недели (для «раз в неделю»): '
+              f'<select name=weekday>{wd}</select></td></tr>',
+              f'<tr><td>Начиная с</td><td><input type=date name=start_day value="{date.today().isoformat()}"></td></tr>',
+              f'<tr><td>Тестовые часы</td><td>с <input type=time name=hour_from value="{a:%H:%M}"> до '
+              f'<input type=time name=hour_to value="{z:%H:%M}"><span class=note>{hint}</span></td></tr>',
+              '<tr><td>Только в рабочий день по графику</td><td><input type=checkbox name=only_working checked></td></tr>',
+              '</table><button class=btn>Создать рассылку</button></form>']
+        return page("Задания: тесты, опросы, чек-листы", "".join(b))
+
+    @app.post("/tasks", dependencies=[Depends(auth)])
+    def tasks_create(content_id: str = Form(...), audience: str = Form("all"), repeat: str = Form("once"),
+                     weekday: int = Form(0), start_day: str = Form(""), hour_from: str = Form(""),
+                     hour_to: str = Form(""), only_working: str = Form("")):
+        x = content.get(db, cfg, content_id)
+        if not x or x["kind"] not in ("test", "survey", "checklist") or repeat not in tasks_mod.REPEATS:
+            raise HTTPException(400)
+        with db.tx() as c:
+            c.execute("INSERT INTO campaigns(content_id,audience,repeat,start_day,weekday,hour_from,hour_to,only_working,"
+                      "active,created_at) VALUES(?,?,?,?,?,?,?,?,1,?)",
+                      (content_id, audience, repeat, start_day or date.today().isoformat(), weekday,
+                       hour_from or None, hour_to or None, 1 if only_working else 0, date.today().isoformat()))
+        return RedirectResponse("/tasks?msg=" + quote(f"Рассылка создана: {x['title']}"), status_code=303)
+
+    @app.get("/tasks/{cid}", dependencies=[Depends(auth)])
+    def task_results(cid: int):
+        e = html.escape
+        c = db.one("SELECT * FROM campaigns WHERE id=?", cid)
+        if not c:
+            raise HTTPException(404)
+        x = content.get(db, cfg, c["content_id"]) or {"title": c["content_id"], "kind": "test", "data": {}}
+        qs = x["data"].get("questions") or [{"q": it} for it in x["data"].get("items") or []]
+        b = [f'<p>{e(tasks_mod.audience_label(db, c["audience"]))} · {e(tasks_mod.REPEATS[c["repeat"]])} · '
+             f'<a href="/learn/{quote(c["content_id"])}">текст</a></p>',
+             f'<form method=post action="/tasks/{cid}/toggle"><button class=btn>'
+             f'{"Выключить рассылку" if c["active"] else "Включить рассылку"}</button></form>',
+             '<table><tr><th>Продавец</th><th>День</th><th>Выполнено</th><th>Результат</th>'
+             + "".join(f'<th>{e(q["q"][:40])}</th>' for q in qs) + '</tr>']
+        for d in db.q("SELECT d.*, s.name FROM deliveries d JOIN sellers s ON s.id=d.seller_id WHERE campaign_id=? "
+                      "ORDER BY day DESC, s.name", cid):
+            ans = {r["q"]: r for r in db.q("SELECT * FROM answers WHERE campaign_id=? AND seller_id=? AND day=?",
+                                           cid, d["seller_id"], d["day"])}
+            cells = []
+            for i, q in enumerate(qs):
+                r = ans.get(i)
+                if r is None:
+                    cells.append("<td></td>")
+                elif x["kind"] == "test":
+                    cells.append(f'<td>{"✅" if r["correct"] else "✗ " + e(q["options"][r["answer"]][:30])}</td>')
+                elif x["kind"] == "checklist":
+                    cells.append("<td>✅</td>")
+                else:
+                    cells.append(f'<td>{e((r["text"] or "")[:200])}</td>')
+            score = "" if d["score"] is None else f'{d["score"]:.0%}'
+            b.append(f'<tr><td>{e(d["name"])}</td><td>{date.fromisoformat(d["day"]):%d.%m}</td>'
+                     f'<td>{"да" if d["done_at"] else "нет"}</td><td class=n>{score}</td>{"".join(cells)}</tr>')
+        b.append("</table>")
+        return page(f"{content.KINDS[x['kind']][:-1]}: {e(x['title'])}", "".join(b))
+
+    @app.post("/tasks/{cid}/toggle", dependencies=[Depends(auth)])
+    def task_toggle(cid: int):
+        with db.tx() as c:
+            c.execute("UPDATE campaigns SET active=1-active WHERE id=?", (cid,))
+        return RedirectResponse(f"/tasks/{cid}", status_code=303)
+
+    @app.get("/rating", dependencies=[Depends(auth)])
+    def rating_page(month: str = ""):
+        month = month or date.today().strftime("%Y-%m")
+        pct_ = lambda v: "" if v is None else f"{v:.0%}"  # noqa: E731
+        b = [f'<p><a href="/rating?month={month_add(month, -1)}">← {month_add(month, -1)}</a> · '
+             f'<a href="/rating?month={month_add(month, 1)}">{month_add(month, 1)} →</a></p>',
+             '<p class=note>Информативно, на ставку и ЗП не влияет (решение владельца). Итог — среднее из: тесты '
+             '(доля верных), квизы после уроков, задания (выполнено из полученных). Продавцам не показывается.</p>',
+             '<table><tr><th>#</th><th>Продавец</th><th>Итог</th><th>Тесты</th><th>Квизы</th><th>Задания</th></tr>']
+        for i, r in enumerate(tasks_mod.rating(db, month), 1):
+            b.append(f'<tr><td>{i}</td><td>{html.escape(r["name"])}</td><td class=n><b>{pct_(r["score"])}</b></td>'
+                     f'<td class=n>{pct_(r["test"])}</td><td class=n>{pct_(r["quiz"])}</td>'
+                     f'<td class=n>{r["done"]} из {r["sent"]}</td></tr>')
+        b.append("</table>")
+        return page(f"Рейтинг по обучению {month}", "".join(b))
 
     # ------------------------------------------------------------------ продавцы: подключение и увольнение
     def _date(d: str | None) -> str:

@@ -119,7 +119,8 @@ class Training(BaseModel):
     lessons_path: Path = Path("content/lessons.yaml")  # уроки, квизы, программа новичка
     weekly_lesson: bool = True  # урок недели по теме цели недели
     quizzes: bool = True  # 2 вопроса с кнопками после урока (нужны входящие события MAX)
-    onboarding_shifts: int = 10  # новичок — первые N смен: вместо урока недели уроки программы новичка
+    onboarding_shifts: int = 10  # новичок — первые N рабочих дней: вместо урока недели уроки программы новичка
+    test_hours: str = "11:00-13:00"  # тестовые часы: когда рассылать тесты, опросы, чек-листы (у рассылки — свои)
 
 
 class Staffing(BaseModel):
