@@ -17,7 +17,7 @@ from datetime import date, datetime, timedelta
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from . import health, jobs, kb, lessons, messages, quiz, tasks
+from . import botcfg, health, jobs, kb, lessons, messages, quiz, tasks
 from .config import Settings
 from .db import DB
 from .max_api import MaxAuthError, MaxClient
@@ -44,6 +44,12 @@ def _by_code(db: DB, uid: int, code: str, link) -> tuple[object | None, bool]:
     if not linked:
         db.log_message(date.today().isoformat(), "bad_code", None, uid, "error", code[:20])
     return linked, False
+
+
+def _who(u: dict) -> str:
+    """Имя из профиля MAX (bot_started.user, message_created.message.sender) — для сверки, тот ли человек."""
+    p = u.get("user") or (u.get("message") or {}).get("sender") or (u.get("callback") or {}).get("user") or {}
+    return " ".join(x for x in (p.get("first_name"), p.get("last_name")) if x) or p.get("name") or ""
 
 
 def _extract(u: dict) -> tuple[str, int | None, str]:
@@ -100,6 +106,10 @@ def handle(db: DB, cfg: Settings, client: MaxClient, u: dict) -> None:
     if t == "bot_stopped":
         _stopped(db, seller, uid)
         return
+    if text and t != "message_callback" and botcfg.link_owner(db, cfg, text, uid, _who(u)):
+        client.send("Вы подключены как владелец: каждое утро — сводка по продавцам, «Кого похвалить» и "
+                    "предупреждения. /svodka — сводка сейчас.", user_id=uid)
+        return
     if not cfg.training_token and (task_event(db, cfg, client, u, t, uid, text, seller) or
                                    kb_event(db, cfg, client, u, t, uid, text, seller, search=False)):
         return  # второго бота нет — задания и база знаний (/baza, без поиска по любому слову) здесь
@@ -108,8 +118,9 @@ def handle(db: DB, cfg: Settings, client: MaxClient, u: dict) -> None:
         return
     is_owner = uid in cfg.max.owners
     reply = linked = None
+    link = lambda code, user: db.link_by_code(code, user, _who(u))  # noqa: E731
     if t == "bot_started" and text:
-        linked, blocked = _by_code(db, uid, text, db.link_by_code)
+        linked, blocked = _by_code(db, uid, text, link)
         reply = BLOCKED if blocked else f"Готово, {linked['first_name']}! {HELP}" if linked else \
             "Код не найден. Возьмите новый у администратора."
     elif t == "bot_started":
@@ -124,7 +135,7 @@ def handle(db: DB, cfg: Settings, client: MaxClient, u: dict) -> None:
         reply = messages.daily(db, cfg, seller["id"], date.today() - timedelta(days=1)) if seller else \
             "Сначала отправьте код от администратора."
     elif not seller and len(text) == 6:
-        linked, blocked = _by_code(db, uid, text, db.link_by_code)
+        linked, blocked = _by_code(db, uid, text, link)
         reply = BLOCKED if blocked else f"Готово, {linked['first_name']}! {HELP}" if linked else \
             "Код не найден. Возьмите новый у администратора."
     else:
@@ -386,6 +397,32 @@ def _training_loop(cfg: Settings, client: MaxClient, stop: threading.Event) -> N
     tdb = DB(cfg.db_path)
     if connect(tdb, client, "training", stop, cfg) is not None:
         poll_forever(tdb, cfg, client, stop, handle_training, "max_marker_training", "training")
+
+
+class Runner:
+    """Поток бота в службе (awer-bot serve): запуск со страницы «Бот MAX», когда токен появился, и перезапуск
+    службы, когда токен сменили (клиенты MAX создаются при старте потока)."""
+
+    def __init__(self, cfg: Settings):
+        self.cfg, self.running = cfg, False
+        self._lock = threading.Lock()
+
+    def start(self) -> bool:
+        with self._lock:
+            if self.running or not os.environ.get("MAX_BOT_TOKEN"):
+                return False
+            self.running = True
+        threading.Thread(target=guarded, args=(run, self.cfg, DB(self.cfg.db_path)), daemon=True,
+                         name="max-bot").start()
+        return True
+
+    def restart(self, delay: float = 1.5) -> None:
+        """Завершить процесс после ответа браузеру — служба (NSSM) поднимет его заново с новым токеном."""
+        def stop():
+            log.warning("перезапуск службы со страницы «Бот MAX»")
+            logging.shutdown()
+            os._exit(0)
+        threading.Timer(delay, stop).start()
 
 
 def guarded(target, *args) -> None:

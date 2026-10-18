@@ -5,7 +5,7 @@ import logging
 import time
 from datetime import date, datetime, timedelta
 
-from . import achievements, coach, crews, goals, health, kb, lessons, messages, quiz
+from . import achievements, botcfg, coach, crews, goals, health, kb, lessons, messages, quiz
 from . import metrics as M
 from .config import Settings
 from .db import DB
@@ -84,6 +84,7 @@ def daily_run(db: DB, cfg: Settings, sender: Sender, today: date | None = None, 
     продавцам и владельцу ничего не уйдёт дважды (журнал message_log) — на этом держится догон (bot.catch_up)."""
     today = today or date.today()
     day = today - timedelta(days=1)
+    botcfg.apply(cfg, db)  # владельцы и ссылки со страницы «Бот MAX», если админка — отдельный процесс
     for rep in import_inbox(db, cfg):
         log.info("импорт %s: строк %s, дни %s", rep.file, rep.lines, rep.days)
         if rep.kind == "onec_error":  # аудит 1С-1: ошибка обработки 1С видна владельцу, а не только в журнале 1С

@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, PrivateAttr, field_validator
 
 from .planning.engine import Params
 
@@ -154,6 +154,13 @@ class Settings(BaseModel):
     motivation: Motivation = Motivation()
     training: Training = Training()
 
+    _env_path: Path = PrivateAttr(default_factory=lambda: Path(".env"))
+
+    @property
+    def env_path(self) -> Path:
+        """Файл .env рядом с config.yaml — туда страница «Бот MAX» пишет токены."""
+        return self._env_path
+
     # секреты — только из окружения
     @property
     def max_token(self) -> str:
@@ -187,4 +194,6 @@ def load(path: str | Path = "config.yaml") -> Settings:
     path = Path(path)
     _load_dotenv(path.parent / ".env")
     data = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else {}
-    return Settings.model_validate(data or {})
+    cfg = Settings.model_validate(data or {})
+    cfg._env_path = path.parent / ".env"
+    return cfg

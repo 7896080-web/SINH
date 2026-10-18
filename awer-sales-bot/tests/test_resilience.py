@@ -160,7 +160,7 @@ def test_groups_bots_and_stopped(env):  # noqa: F811
 def test_health_line(env, monkeypatch):  # noqa: F811
     cfg, db = env
     monkeypatch.delenv("MAX_BOT_TOKEN", raising=False)
-    assert "нет MAX_BOT_TOKEN" in health.line(db, cfg)
+    assert "нет токена" in health.line(db, cfg) and 'href="/bot"' in health.line(db, cfg)
     monkeypatch.setenv("MAX_BOT_TOKEN", "x")
     health.ok(db, "plan")
     now = datetime.now()

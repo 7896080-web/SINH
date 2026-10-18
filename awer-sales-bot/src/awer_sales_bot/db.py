@@ -240,7 +240,8 @@ class DB:
                "sellers": [("hired_at", "TEXT"), ("fired_at", "TEXT"), ("crew_id", "INTEGER"),
                            ("weekend_key", "INTEGER NOT NULL DEFAULT 0"),  # сильный продавец — ставить на сб и вс
                            ("training_user_id", "INTEGER"),  # user_id в боте «Обучение»
-                           ("training_code", "TEXT")],  # код подключения к боту «Обучение»
+                           ("training_code", "TEXT"),  # код подключения к боту «Обучение»
+                           ("max_name", "TEXT")],  # имя из профиля MAX при подключении — сверить, тот ли человек
                "schedule": [("store", "TEXT")]}
         for table, cols in new.items():
             have = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
@@ -355,13 +356,14 @@ class DB:
             c.execute("UPDATE sellers SET invite_code=? WHERE id=?", (code, sid))
         return code
 
-    def link_by_code(self, code: str, user_id: int) -> sqlite3.Row | None:
+    def link_by_code(self, code: str, user_id: int, max_name: str | None = None) -> sqlite3.Row | None:
         r = self.one("SELECT * FROM sellers WHERE invite_code=? AND active=1", code.strip().upper())
         if not r:
             return None
         with self.tx() as c:
             c.execute("UPDATE sellers SET max_user_id=NULL WHERE max_user_id=?", (user_id,))
-            c.execute("UPDATE sellers SET max_user_id=?, invite_code=NULL WHERE id=?", (user_id, r["id"]))
+            c.execute("UPDATE sellers SET max_user_id=?, invite_code=NULL, max_name=? WHERE id=?",
+                      (user_id, max_name, r["id"]))
         return self.seller(r["id"])
 
     def roles(self) -> dict[int, str]:

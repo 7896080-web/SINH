@@ -52,6 +52,8 @@ def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     cfg = config_mod.load(a.config)
     db = DB(cfg.db_path)
+    from .botcfg import apply
+    apply(cfg, db)  # ссылки на ботов и владельцы со страницы «Бот MAX» главнее config.yaml
 
     if a.cmd == "init-db":
         print(f"База: {cfg.db_path}")
@@ -124,17 +126,14 @@ def main(argv: list[str] | None = None) -> None:
         from .bot import run
         run(cfg, db)
     elif a.cmd == "serve":
-        import threading
-
         import uvicorn
 
-        from .bot import guarded, run
+        from .bot import Runner
         from .web import create_app
-        if os.environ.get("MAX_BOT_TOKEN"):  # иначе только админка; в строке состояния — «бот не запущен»
-            threading.Thread(target=guarded, args=(run, cfg, DB(cfg.db_path)), daemon=True, name="max-bot").start()
-        else:
+        runner = Runner(cfg)
+        if not runner.start():  # токена нет — только админка; бот запустится со страницы «Бот MAX»
             logging.warning("MAX_BOT_TOKEN не задан — запущена только админка")
-        uvicorn.run(create_app(cfg, db), host=a.host, port=a.port)
+        uvicorn.run(create_app(cfg, db, runner=runner), host=a.host, port=a.port)
     elif a.cmd == "web":
         import uvicorn
 

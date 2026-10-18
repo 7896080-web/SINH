@@ -19,7 +19,7 @@ python -m venv .venv
 .venv\Scripts\activate
 pip install -e .[dev]
 copy config.example.yaml config.yaml
-copy .env.example .env      # вписать MAX_BOT_TOKEN, ADMIN_PASSWORD, UPLOAD_TOKEN
+copy .env.example .env      # вписать ADMIN_PASSWORD, UPLOAD_TOKEN; токены ботов — в админке «Бот MAX»
 pytest -q                   # все тесты должны пройти
 ```
 

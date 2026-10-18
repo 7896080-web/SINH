@@ -69,7 +69,7 @@ def line(db: DB, cfg: Settings) -> str:
     """HTML-строка состояния для каждой страницы админки."""
     parts: list[tuple[bool, str]] = []
     if not os.environ.get("MAX_BOT_TOKEN"):
-        parts.append((False, "бот не запущен: нет MAX_BOT_TOKEN в .env"))
+        parts.append((False, "бот не подключён: нет токена"))
     else:
         parts.append(bot_state(db, "plan"))
         if cfg.training_token:
@@ -77,4 +77,5 @@ def line(db: DB, cfg: Settings) -> str:
         parts.append(daily_state(db, cfg))
     bad = not all(good for good, _ in parts)
     text = " · ".join(html.escape(t) for _, t in parts)
-    return f'<p class="health{" bad" if bad else ""}">{"⚠ " if bad else ""}{text}</p>'
+    more = ' <a href="/bot">Бот MAX →</a>' if bad else ""
+    return f'<p class="health{" bad" if bad else ""}">{"⚠ " if bad else ""}{text}{more}</p>'

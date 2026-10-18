@@ -17,7 +17,7 @@ from fastapi import Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-from . import content, health
+from . import botcfg, content, health
 from . import tasks as tasks_mod
 from . import crews as crews_mod
 from .config import Settings
@@ -61,7 +61,9 @@ def _num(s: str | None) -> float | None:
     return float(str(s).replace(" ", "").replace("\xa0", "").replace(",", ".").rstrip("%"))
 
 
-def create_app(cfg: Settings, db: DB) -> FastAPI:
+def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
+    """runner — поток бота в службе (bot.Runner; None, если админка запущена отдельно: awer-bot web);
+    max_client — фабрика клиента MAX по токену (тесты подменяют)."""
     app = FastAPI(title="AWER — планы продавцов")
     security = HTTPBasic()
     password = os.environ.get("ADMIN_PASSWORD", "")
@@ -75,7 +77,7 @@ def create_app(cfg: Settings, db: DB) -> FastAPI:
     def page(title: str, body: str) -> HTMLResponse:
         cur = date.today().strftime("%Y-%m")
         nav = (f'<nav><a href="/month/{cur}">Настройки месяца</a><a href="/sellers">Продавцы</a>'
-               f'<a href="/crews">Смены</a><a href="/learn">Обучение</a><a href="/tasks">Задания</a><a href="/schedule/{cur}">График работы</a><a href="/month/{cur}/results">Итоги и ведомость</a></nav>')
+               f'<a href="/bot">Бот MAX</a><a href="/crews">Смены</a><a href="/learn">Обучение</a><a href="/tasks">Задания</a><a href="/schedule/{cur}">График работы</a><a href="/month/{cur}/results">Итоги и ведомость</a></nav>')
         return HTMLResponse(f"<!doctype html><html lang=ru><head><meta charset=utf-8><title>{title}</title>"
                             f"<style>{CSS}</style></head><body>{nav}{health.line(db, cfg)}<h1>{title}</h1>{body}</body></html>")
 
@@ -232,6 +234,138 @@ def create_app(cfg: Settings, db: DB) -> FastAPI:
             raise HTTPException(422, f"{name}: файл не распознан — {e}") from e
         path.replace(archive_name(archive, name))
         return {"lines": rep.lines, "days": rep.days, "unknown_sellers": sorted(rep.unknown_sellers)}
+
+    # ------------------------------------------------------------------ бот MAX: токены, ссылки, владелец
+    def _client(token: str):
+        if max_client:
+            return max_client(token)
+        from .max_api import MaxClient
+        return MaxClient(token, cfg.max.base_url, cfg.max.ca_file, timeout=15, pause=0.5)
+
+    def _check(bot: str) -> str:
+        """GET /me: имя бота или причина ошибки — в kv для страницы; ссылку на бота подставляем сами."""
+        from .max_api import MaxAuthError
+        tok = botcfg.token(bot)
+        if not tok:
+            return ""
+        try:
+            me = _client(tok).me()
+        except MaxAuthError:
+            res = "❌ MAX не принял токен — скопируйте его из business.max.ru заново"
+        except Exception as e:  # noqa: BLE001
+            res = f"❌ нет связи с MAX ({type(e).__name__})"
+        else:
+            nick = me.get("username") or ""
+            if nick and not botcfg.link(cfg, bot):
+                botcfg.set_link(db, cfg, bot, f"https://max.ru/{nick}")
+            res = f"✅ на связи: {me.get('first_name') or me.get('name') or nick}" + (f" (@{nick})" if nick else "")
+        db.set_kv(f"bot_check:{bot}", f"{res} — проверено {date.today():%d.%m}")
+        return res
+
+    @app.get("/bot", dependencies=[Depends(auth)])
+    def bot_page(msg: str = ""):
+        names = {"plan": "«План» — план и показатели", "training": "«Обучение» — уроки, тесты, база знаний"}
+        cell = lambda f: "".join(f"<td>{f(b)}</td>" for b in names)  # noqa: E731
+        b = [f'<p class=note>{html.escape(msg)}</p>' if msg else "",
+             '<p class=note>Токен и ссылку на бота MAX выдаёт после модерации (business.max.ru → бот). Токен — как '
+             'пароль: он хранится только в файле .env на этом компьютере, здесь видны последние 4 знака. Второй бот '
+             'можно подключить позже — до этого уроки и тесты приходят в «План».</p>',
+             '<h2>1. Боты</h2><form method=post action="/bot"><table>',
+             '<tr><th></th>' + "".join(f"<th>{t}</th>" for t in names.values()) + '</tr>',
+             '<tr><td>Токен</td>' + cell(lambda bt: f'<input type=password name="token_{bt}" autocomplete=off '
+                                        f'style="width:260px" placeholder="вставьте токен"><br><span class=note>'
+                                        f'{botcfg.mask(botcfg.token(bt))}</span>') + '</tr>',
+             '<tr><td>Ссылка на бота</td>' + cell(lambda bt: f'<input type=text name="link_{bt}" style="width:260px" '
+                                                 f'value="{html.escape(botcfg.link(cfg, bt))}" '
+                                                 'placeholder="заполнится сама после проверки">') + '</tr>',
+             '<tr><td>Связь с MAX</td>' + cell(lambda bt: html.escape(db.get_kv(f"bot_check:{bt}") or "—")) + '</tr>',
+             '</table><button class=btn name=action value=save>Сохранить и проверить связь</button>']
+        if runner and runner.running:
+            b.append('<button class=btn name=action value=restart title="Нужно после смены токена">'
+                     'Перезапустить службу</button><span class=note> — админка будет недоступна ~15 секунд</span>')
+        b.append('</form>')
+
+        own = botcfg.owners(db, cfg)
+        b.append('<h2>2. Владелец</h2><p class=note>Владельцу каждое утро — сводка по всем продавцам, «Кого похвалить», '
+                 'предупреждения о графике и выгрузке 1С. Продавцы этого не видят.</p>')
+        if own:
+            b.append('<form method=post action="/bot"><table><tr><th>Имя в MAX</th><th>user_id</th><th>Подключён</th>'
+                     '<th></th></tr>')
+            for o in own:
+                b.append(f'<tr><td>{html.escape(o.get("name") or "—")}</td><td class=n>{o["id"]}</td>'
+                         f'<td class=n>{_date((o.get("at") or "")[:10] or None)}</td><td><button class=btn name=action '
+                         f'value="owner_del:{o["id"]}">Отключить</button></td></tr>')
+            b.append('</table></form>')
+        else:
+            b.append('<p class=off>Владелец ещё не подключён — сводку получать некому.</p>')
+        code = botcfg.owner_code(db)
+        if code:
+            lk = botcfg.link(cfg, "plan")
+            if lk:
+                b += [f'<div class=qr>{qr_svg(f"{lk}?start={code}")}</div>',
+                      '<p>Наведите камеру телефона на QR-код и нажмите «Начать» в боте «План».</p>',
+                      f'<p class=note>Ссылка: {html.escape(f"{lk}?start={code}")}</p>']
+            b.append(f'<p>Или отправьте боту «План» код <b class=code>{code}</b>. Код одноразовый, действует сутки.</p>')
+        else:
+            b.append('<form method=post action="/bot"><button class=btn name=action value=owner_code>'
+                     'Подключить владельца</button></form>')
+
+        rows = [s for s in db.sellers() if s["role"] != "system"]
+        plan = [s for s in rows if s["max_user_id"]]
+        wait = [s for s in rows if not s["max_user_id"]]
+        b.append('<h2>3. Продавцы</h2><p class=note>Каждый продавец подключается своим QR-кодом из карточки на странице '
+                 '«Продавцы». Бот запоминает его аккаунт MAX и присылает только его личный план и показатели — чужих '
+                 'цифр продавец не видит. Рядом с подключённым видно имя из его профиля MAX: проверьте, что подключился '
+                 'тот самый человек.</p>')
+        line = f'<p>Подключены к «Плану»: <b>{len(plan)} из {len(rows)}</b>'
+        if botcfg.token("training"):
+            line += f' · к «Обучению»: <b>{len([s for s in rows if s["training_user_id"]])} из {len(rows)}</b>'
+        b.append(line + ' · <a href="/sellers">Продавцы →</a></p>')
+        if wait:
+            b.append('<p class=note>Ещё не подключены: ' + ", ".join(html.escape(s["name"]) for s in wait) + '</p>')
+        return page("Бот MAX", "".join(b))
+
+    @app.post("/bot", dependencies=[Depends(auth)])
+    async def bot_save(request: Request):
+        form = await request.form()
+        action = str(form.get("action") or "")
+        msg = []
+        if action == "owner_code":
+            botcfg.new_owner_code(db)
+        elif action.startswith("owner_del:"):
+            botcfg.remove_owner(db, cfg, int(action.split(":", 1)[1]))
+            msg.append("Владелец отключён: сводка ему больше не приходит.")
+        elif action == "restart" and runner:
+            runner.restart()
+            return HTMLResponse('<!doctype html><meta charset=utf-8><meta http-equiv=refresh content="20;url=/bot">'
+                                '<p style="font-family:Arial">Служба перезапускается… Страница обновится сама через '
+                                '20 секунд.</p>')
+        elif action == "save":
+            changed = False
+            for bot in ("plan", "training"):
+                tok = str(form.get(f"token_{bot}") or "").strip()
+                if tok and tok != botcfg.token(bot):
+                    try:
+                        botcfg.set_token(cfg.env_path, bot, tok)
+                        changed = True
+                    except ValueError as e:
+                        msg.append(f"{'«План»' if bot == 'plan' else '«Обучение»'}: {e}.")
+                lk = str(form.get(f"link_{bot}") or "").strip()
+                if lk != botcfg.link(cfg, bot):
+                    if lk and not lk.startswith("https://max.ru/"):
+                        msg.append("Ссылка на бота должна начинаться с https://max.ru/ — оставьте поле пустым, "
+                                   "она заполнится сама.")
+                    else:
+                        botcfg.set_link(db, cfg, bot, lk)
+                _check(bot)
+            if runner and changed:
+                msg.append("Бот запущен." if runner.start() else
+                           "Новый токен заработает после перезапуска службы — кнопка «Перезапустить службу».")
+            elif changed:
+                msg.append("Сохранено. Перезапустите службу AwerSalesBot, чтобы бот начал работать с новым токеном.")
+            else:
+                msg.append("Сохранено.")
+        return RedirectResponse(f"/bot?msg={quote(' '.join(msg))}" if msg else "/bot", status_code=303)
 
     # ------------------------------------------------------------------ смены и график работы
     def _short(store: str) -> str:
@@ -657,6 +791,10 @@ def create_app(cfg: Settings, db: DB) -> FastAPI:
                 f'продавец</option><option value=admin {"selected" if s["role"] == "admin" else ""}>'
                 'админ (старший)</option></select>')
 
+    def _max_name(s) -> str:
+        """Имя из профиля MAX при подключении — владелец сверяет, что подключился тот самый человек."""
+        return f' <span class=note>(в MAX: {html.escape(s["max_name"])})</span>' if s["max_name"] else ""
+
     def _training_mark(s) -> str:
         if not cfg.training_token:
             return ""
@@ -711,7 +849,7 @@ def create_app(cfg: Settings, db: DB) -> FastAPI:
                 b.append(f'<tr><td>{html.escape(s["name"])}</td>'
                          f'<td><input type=text name="fn{s["id"]}" value="{html.escape(s["first_name"] or "")}"></td>'
                          f'<td>{_role_select(s)}</td><td class=n>{_date(last)}</td>'
-                         f'<td>✅ подключён{_training_mark(s)} <button class=btn name=action value="invite:{s["id"]}" '
+                         f'<td>✅ подключён{_max_name(s)}{_training_mark(s)} <button class=btn name=action value="invite:{s["id"]}" '
                          'title="Если сменил телефон или аккаунт MAX">Новый код</button></td>'
                          f'<td>{_fire_btn(s)}</td></tr>')
             b.append('</table>')
@@ -793,8 +931,8 @@ def create_app(cfg: Settings, db: DB) -> FastAPI:
             return page(f"Подключение к обучению: {html.escape(s['name'])}", "".join(b))
         if s["max_user_id"]:
             both = " и к боту «Обучение»" if cfg.training_token else ""
-            body = (f'<p>✅ <b>{html.escape(s["name"])}</b> подключён к боту «План»{both}. Утром после следующего '
-                    'рабочего дня придёт первое сообщение.</p><p><a href="/sellers">← к списку продавцов</a></p>')
+            body = (f'<p>✅ <b>{html.escape(s["name"])}</b> подключён к боту «План»{both}{_max_name(s)}. Утром после '
+                    'следующего рабочего дня придёт первое сообщение.</p><p><a href="/sellers">← к списку продавцов</a></p>')
             return page(f"Подключение: {html.escape(s['name'])}", body)
         if not s["active"] or not s["invite_code"]:
             return RedirectResponse("/sellers", status_code=303)
@@ -812,7 +950,7 @@ def create_app(cfg: Settings, db: DB) -> FastAPI:
             b += ['<ol><li>Откройте в MAX бота магазина.</li>',
                   f'<li>Отправьте ему код <b class=code>{code}</b>.</li>',
                   f'<li>Бот ответит «Готово, {name}!» — подключение закончено.</li></ol>',
-                  '<p class=note>Чтобы здесь был QR-код, впишите ссылку на бота в config.yaml → max.bot_link.</p>']
+                  '<p class=note>Чтобы здесь был QR-код, подключите бота на странице <a href="/bot">«Бот MAX»</a>.</p>']
         if cfg.training_token:
             b.append('<p class=note>После подключения бот «План» пришлёт кнопку «Подключить обучение» — нажать её '
                      'и «Начать» во втором боте.</p>')
