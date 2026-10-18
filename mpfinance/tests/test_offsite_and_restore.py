@@ -113,6 +113,24 @@ def test_rollout_backup_never_goes_to_the_cloud(db, monkeypatch):
     assert backup.make_backup() == ""
 
 
+def test_two_backups_in_one_second_keep_both_copies(db, monkeypatch):
+    """18.10 накат fin8 встал на Windows: копия той же секунды уже лежала, и
+    переименование .part -> .db отказало. На Linux та же ошибка молча затирала
+    копию. Обе копии обязаны уцелеть."""
+    class Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 10, 18, 17, 6, 23)
+    monkeypatch.setattr(backup, "datetime", Frozen)
+    if config.BACKUP_DIR.exists():
+        for f in config.BACKUP_DIR.glob("mpfinance-*"):
+            f.unlink()
+    first, second = backup.make_backup_ex(), backup.make_backup_ex()
+    assert first[0] == "" and second[0] == ""
+    assert sorted(p.name for p in config.BACKUP_DIR.glob("mpfinance-*.db")) == [
+        "mpfinance-20261018-170623.db", "mpfinance-20261018-170624.db"]
+
+
 def test_remote_path_is_validated_on_the_page(client, db):
     bad = client.post("/diagnostics/backup-remote", data={"remote": "--config C:/x"}, follow_redirects=True)
     assert "Путь в облаке — вида" in bad.text

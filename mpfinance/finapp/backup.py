@@ -98,9 +98,18 @@ def make_backup_ex() -> tuple[str, Path | None]:
     if src_path is None or not src_path.exists():
         return "база не SQLite-файл — копию снимают средствами СУБД", None
     config.BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    dst = config.BACKUP_DIR / f"{PREFIX}{datetime.now():%Y%m%d-%H%M%S}.db"
-    tmp = dst.with_suffix(".part")
     sweep_leftovers()
+    # Имя — с точностью до секунды, и две копии в одну секунду (накат сразу за
+    # суточной, две кнопки подряд) получили бы одно имя. На Windows переименование
+    # поверх существующего файла — отказ (так 18.10 встал накат fin8 на тесте), на
+    # Linux — молча затёртая копия. Копия — последний рубеж, её не затираем:
+    # занято — берём следующую свободную секунду, имя остаётся в формате уборки.
+    stamp = datetime.now()
+    dst = config.BACKUP_DIR / f"{PREFIX}{stamp:%Y%m%d-%H%M%S}.db"
+    while dst.exists() or dst.with_suffix(".part").exists():
+        stamp += timedelta(seconds=1)
+        dst = config.BACKUP_DIR / f"{PREFIX}{stamp:%Y%m%d-%H%M%S}.db"
+    tmp = dst.with_suffix(".part")
     src = sqlite3.connect(str(src_path))
     out = sqlite3.connect(str(tmp))
     try:
@@ -116,7 +125,7 @@ def make_backup_ex() -> tuple[str, Path | None]:
     out.close()
     src.close()
     if ok != "ok":
-        tmp.rename(tmp.with_suffix(".bad"))
+        tmp.replace(tmp.with_suffix(".bad"))       # прежний .bad той же секунды не нужен
         return f"копия не прошла проверку: {ok}", None
     tmp.rename(dst)
     for old in names_to_drop(sorted(config.BACKUP_DIR.glob(f"{PREFIX}*.db"))):
