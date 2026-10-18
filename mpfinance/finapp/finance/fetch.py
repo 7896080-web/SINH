@@ -14,17 +14,27 @@ FIN_AUTO_FETCH). Разбирает заявки фоновое задание `
   ставке из настроек — то же, что выгрузка CRM файлом, но без рук.
 
 Площадкам — только чтение. Себестоимость из 1С ходит обменом с 1С (`onec.py`).
+
+Кабинеты WB разбираются ПАРАЛЛЕЛЬНО, каждый своим потоком (`run_pending`, дорожка
+на кабинет): лимит WB — запрос в минуту на ПРОФИЛЬ ПРОДАВЦА, у каждого ИП свой, а
+по очереди три кабинета ждали друг друга — загрузка за месяц шла втрое дольше.
+KIT и CRM — одна общая дорожка: их отчёты заменяют друг друга
+(`_drop_superseded_kit`). Запись отчёта в базу — под общим замком (`_store_locked`):
+параллельно идёт только ожидание площадки (минуты), а запись занимает секунды, и
+две записи разом заводили бы один и тот же товар 1С дважды (`mapping._ensure_products`).
 """
 from __future__ import annotations
 
 import logging
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from typing import Callable
 
 import requests
 from sqlalchemy import func
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from finapp import accounts, settings as store
 from finapp.finance import statements, values as v
@@ -190,13 +200,43 @@ def crm_account(db: Session, active: list[PlatformAccount] | None = None) -> Pla
 
 # ---------------------------------------------------------------- исполнение
 
-def _next_job(db: Session) -> ReportFetch | None:
+# Запись отчёта в базу — по одной на процесс (см. начало модуля).
+_WRITE_LOCK = threading.Lock()
+OTHER_LANE = ("other",)
+
+
+def _ready(db: Session):
     stale = now_utc() - timedelta(minutes=STALE_MINUTES)
     return db.query(ReportFetch).filter(
         ReportFetch.kind.in_(tuple(KIND_PLATFORM)),
         (ReportFetch.status == "pending")
-        | ((ReportFetch.status == "running") & (ReportFetch.progress_at < stale)),
-    ).order_by(ReportFetch.id.asc()).first()
+        | ((ReportFetch.status == "running") & (ReportFetch.progress_at < stale)))
+
+
+def lane_of(kind: str, account_id: int | None) -> tuple:
+    """Дорожка заявки: у WB — кабинет (свой лимит запросов у каждого ИП), у
+    остальных — одна общая."""
+    return ("wb", account_id) if kind == "wb_api" else OTHER_LANE
+
+
+def _next_job(db: Session, lane: tuple | None = None) -> ReportFetch | None:
+    query = _ready(db)
+    if lane == OTHER_LANE:
+        query = query.filter(ReportFetch.kind != "wb_api")
+    elif lane is not None:
+        query = query.filter(ReportFetch.kind == "wb_api", ReportFetch.account_id == lane[1])
+    return query.order_by(ReportFetch.id.asc()).first()
+
+
+def _store_locked(db: Session, **kwargs):
+    """`store_api_report` и коммит — под общим замком. Без коммита внутри замка
+    смысла в нём нет: незакоммиченный товар 1С соседний поток не видит и заведёт
+    второй раз. Отказ (`errors`) не коммитится — с ним разбирается вызывающий."""
+    with _WRITE_LOCK:
+        outcome = store_api_report(db, **kwargs)
+        if not outcome.errors:
+            db.commit()
+    return outcome
 
 
 def _step(db: Session, job: ReportFetch, heartbeat: Callable[[], None], note: str | None = None):
@@ -210,11 +250,43 @@ def _step(db: Session, job: ReportFetch, heartbeat: Callable[[], None], note: st
 def run_pending(db: Session, heartbeat: Callable[[], None] = lambda: None,
                 session: requests.Session | None = None,
                 sleep: Callable[[float], None] = time.sleep, max_jobs: int = 10) -> dict:
-    """Разобрать заявки WB/KIT по одной. Ошибка одной заявки не останавливает
-    остальные: она получает статус failed и человекочитаемую причину."""
+    """Разобрать заявки: каждая дорожка (`lane_of`) — своим потоком со своей
+    сессией базы, заявки внутри дорожки — по одной. Одна дорожка — в этом же
+    потоке. Ошибка одной заявки не останавливает остальные: она получает статус
+    failed и человекочитаемую причину; упавшая дорожка — тоже не останавливает."""
+    lanes = sorted({lane_of(kind, account_id) for kind, account_id in
+                    _ready(db).with_entities(ReportFetch.kind, ReportFetch.account_id)},
+                   key=lambda lane: (lane[0], lane[1] if len(lane) > 1 else 0))
+    if len(lanes) <= 1:
+        return _run_lane(db, lanes[0] if lanes else None, heartbeat, session, sleep, max_jobs)
+
+    beat_lock = threading.Lock()
+
+    def beat():
+        with beat_lock:
+            heartbeat()
+    factory = sessionmaker(bind=db.get_bind(), autocommit=False, autoflush=False)
+
+    def work(lane):
+        own = factory()
+        try:
+            return _run_lane(own, lane, beat, session, sleep, max_jobs)
+        except Exception:                        # noqa: BLE001 — дорожка не роняет соседей
+            own.rollback()
+            logger.exception("finance_fetch: дорожка %s упала", lane)
+            return {"jobs": 0, "imported": 0, "failed": 1}
+        finally:
+            own.close()
+    with ThreadPoolExecutor(max_workers=len(lanes), thread_name_prefix="mpfinance-fetch") as pool:
+        results = list(pool.map(work, lanes))
+    db.expire_all()                              # заявки менялись в чужих сессиях
+    return {key: sum(r[key] for r in results) for key in ("jobs", "imported", "failed")}
+
+
+def _run_lane(db: Session, lane: tuple | None, heartbeat, session, sleep, max_jobs: int) -> dict:
     stats = {"jobs": 0, "imported": 0, "failed": 0}
     for _ in range(max_jobs):
-        job = _next_job(db)
+        job = _next_job(db, lane)
         if job is None:
             break
         stats["jobs"] += 1
@@ -262,10 +334,13 @@ def _run_wb(db: Session, job: ReportFetch, heartbeat, session, sleep) -> str:
     # Список отчётов — это и свод для сверки (`statements.py`): какие отчёты WB
     # сформировал и с каким «Итого к оплате».
     if reports:
-        try:
-            statements.store(db, "wb", account.id, statements.parse_api_list(reports), "api")
-        except statements.StatementError as e:
-            logger.warning("свод WB из API не записан: %s", e)
+        with _WRITE_LOCK:
+            try:
+                statements.store(db, "wb", account.id, statements.parse_api_list(reports), "api")
+                db.commit()
+            except statements.StatementError as e:
+                db.rollback()
+                logger.warning("свод WB из API не записан: %s", e)
     notes, skipped, todo = [], 0, []
     for header in sorted(reports, key=lambda r: (str(r.get("dateFrom")), int(r.get("reportId") or 0))):
         report_id = header.get("reportId")
@@ -295,7 +370,7 @@ def _run_wb(db: Session, job: ReportFetch, heartbeat, session, sleep) -> str:
             notes.append(f"отчёт {report_id}: WB вернул пустую детализацию")
             continue
         parsed = parse_records(records, "wb")
-        outcome = store_api_report(
+        outcome = _store_locked(
             db, platform="wb", account_id=account.id, parsed=parsed,
             period_from=period_from, period_to=period_to, user=f"api:{job.requested_by or 'system'}",
             report_number=str(report_id),
@@ -392,7 +467,7 @@ def _run_kit(db: Session, job: ReportFetch, heartbeat, session, sleep) -> str:
         if not lines:
             _step(db, job, heartbeat, f"{where}: нет данных")
             continue
-        outcome = store_api_report(
+        outcome = _store_locked(
             db, platform="kit", account_id=account.id, parsed=ParseResult(format=KIT_API_FORMAT, lines=lines),
             period_from=monday, period_to=sunday, user=f"api:{job.requested_by or 'system'}",
             file_name="Яндекс KIT, доставка по API" if delivery_only else "Яндекс KIT, заказы по API",
@@ -503,7 +578,7 @@ def _run_crm(db: Session, job: ReportFetch, heartbeat) -> str:
                 notes.append(f"{where}: продаж в CRM больше нет — прежний отчёт #{existing.id} удалён")
             _step(db, job, heartbeat, f"{where}: продаж нет")
             continue
-        outcome = store_api_report(
+        outcome = _store_locked(
             db, platform="kit", account_id=account.id,
             parsed=ParseResult(format=CRM_DB_FORMAT, lines=lines),
             period_from=monday, period_to=sunday, user=user, file_name="AWER CRM, база kitcrm.db",

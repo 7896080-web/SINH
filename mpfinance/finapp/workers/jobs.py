@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from datetime import datetime, timedelta
 
 from finapp import backup, catalog, config, exchange, mail, onec, settings
@@ -127,12 +129,34 @@ def job_daily() -> None:
         db.close()
 
 
+FETCH_BEAT_EVERY = 20            # секунд: отметку из дорожек чаще писать незачем
+
+
+def _fetch_heartbeat():
+    """Отметка задания загрузки для дорожек `run_pending`: их потоки зовут её
+    параллельно, а сессия базы потокобезопасной не бывает — у отметки своя.
+    Не чаще раза в `FETCH_BEAT_EVERY`: одна строка, а писать её хотят все сразу."""
+    lock, last = threading.Lock(), [0.0]
+
+    def heartbeat():
+        with lock:
+            if time.monotonic() - last[0] < FETCH_BEAT_EVERY:
+                return
+            own = SessionLocal()
+            try:
+                beat(own, "finance_fetch", True)
+                last[0] = time.monotonic()
+            finally:
+                own.close()
+    return heartbeat
+
+
 def job_finance_fetch() -> None:
     db = SessionLocal()
     try:
         beat(db, "finance_fetch", True)
         planned = fetch.plan_regular(db)
-        stats = fetch.run_pending(db, heartbeat=lambda: beat(db, "finance_fetch", True))
+        stats = fetch.run_pending(db, heartbeat=_fetch_heartbeat())
         rates = fetch.ensure_rates(db)
         if planned or stats["jobs"] or rates:
             logger.info("загрузка отчётов: заявок поставлено %s, разобрано %s, загружено %s, "
