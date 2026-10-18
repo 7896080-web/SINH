@@ -15,7 +15,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS sellers (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,            -- как в 1С, без суффикса магазина
-    role TEXT NOT NULL DEFAULT 'seller',  -- seller | admin
+    role TEXT NOT NULL DEFAULT 'seller',  -- seller | admin | system («(без продавца)» — только в общий выторг)
     active INTEGER NOT NULL DEFAULT 1,
     first_name TEXT,                      -- обращение в сообщениях
     max_user_id INTEGER UNIQUE,           -- кому отправлять в MAX
@@ -30,14 +30,38 @@ CREATE TABLE IF NOT EXISTS sales_lines (        -- строки «Отчета �
     day TEXT NOT NULL,                    -- YYYY-MM-DD
     store TEXT NOT NULL,
     seller_id INTEGER NOT NULL REFERENCES sellers(id),
-    doc TEXT,                             -- номер ОРП
+    doc TEXT,                             -- номер ОРП или чека
+    receipt TEXT,                         -- номер чека (если выгрузка из чеков; из ОРП — пусто)
+    time TEXT,                            -- время чека HH:MM (если из чеков)
     item TEXT,
     category TEXT,
     qty REAL NOT NULL,
     amount REAL NOT NULL,                 -- со скидкой; возврат — отрицательный
-    discount REAL NOT NULL DEFAULT 0,     -- сумма скидки по строке
+    discount REAL NOT NULL DEFAULT 0,     -- сумма скидки по строке (цена × кол-во − сумма)
+    manual_discount REAL NOT NULL DEFAULT 0, -- из неё ручная скидка, ₽
+    card TEXT,                            -- дисконтная карта (пусто — без карты)
     source TEXT
 );
+CREATE INDEX IF NOT EXISTS ix_sales_card ON sales_lines(card);
+CREATE TABLE IF NOT EXISTS stock (              -- остатки на складах магазинов (последний снимок на дату)
+    day TEXT NOT NULL,
+    store TEXT NOT NULL,
+    item TEXT NOT NULL,
+    category TEXT,
+    size TEXT NOT NULL DEFAULT '',
+    qty REAL NOT NULL,
+    PRIMARY KEY (day, store, item, size)
+);
+CREATE TABLE IF NOT EXISTS arrivals (           -- поступления на склады магазинов
+    day TEXT NOT NULL,
+    store TEXT NOT NULL,
+    item TEXT NOT NULL,
+    category TEXT,
+    size TEXT NOT NULL DEFAULT '',
+    qty REAL NOT NULL,
+    doc TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_arrivals_day ON arrivals(day);
 CREATE TABLE IF NOT EXISTS store_days (         -- шапка ОРП: чеков и выручка по кассе за день
     day TEXT NOT NULL,
     store TEXT NOT NULL,
@@ -174,7 +198,8 @@ class DB:
             return cur.lastrowid
 
     def sellers(self, active_only: bool = True) -> list[sqlite3.Row]:
-        sql = "SELECT * FROM sellers" + (" WHERE active=1" if active_only else "") + " ORDER BY role DESC, name"
+        sql = ("SELECT * FROM sellers WHERE role<>'system'" + (" AND active=1" if active_only else "")
+               + " ORDER BY role DESC, name")
         return self.q(sql)
 
     def seller(self, sid: int) -> sqlite3.Row:
@@ -210,7 +235,7 @@ class DB:
 
         Месяцы с ежедневными данными из 1С берутся из sales_lines (отработано = смены / норма),
         остальные — из monthly_history (ведомости ЗП)."""
-        h = History(roles={str(k): ("admin" if v == "admin" else "seller") for k, v in self.roles().items()})
+        h = History(roles={str(k): (v if v in ("admin", "system") else "seller") for k, v in self.roles().items()})
         daily = set(self.daily_months())
         for r in self.q("SELECT month, seller_id, sales, fte FROM monthly_history"):
             if r["month"] not in daily:

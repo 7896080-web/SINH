@@ -22,6 +22,24 @@ class Columns(BaseModel):
     qty: str = "Количество"
     amount: str = "Сумма"  # со скидкой
     discount: str = "Скидка"
+    price: str = "Цена"
+    card: str = "Дисконтная карта"
+    manual_pct: str = "Ручная скидка %"
+    receipt: str = "Чек"  # есть только при выгрузке из чеков
+    time: str = "Время"
+
+
+class StockColumns(BaseModel):
+    """Остатки на складах магазинов на дату (stock_*.csv) и поступления за день (arrivals_*.csv)."""
+
+    date: str = "Дата"
+    store: str = "Склад"
+    item: str = "Номенклатура"
+    category: str = "Номенклатурная группа"
+    size: str = "Характеристика"
+    stock: str = "Остаток"
+    arrived: str = "Поступило"
+    doc: str = "Документ"
 
 
 class DocColumns(BaseModel):
@@ -41,9 +59,12 @@ class OneC(BaseModel):
     archive: Path = Path("data/archive")
     columns: Columns = Columns()
     doc_columns: DocColumns = DocColumns()
+    stock_columns: StockColumns = StockColumns()
     # склад / магазин / касса из 1С → короткое имя магазина (без учёта регистра; частичное совпадение)
     store_map: dict[str, str] = {"ГОРОД": "Город", "МСЛ": "МСЛ"}
-    exclude_sellers: list[str] = ["", "Wildberries", "Ozon", "Lamoda"]
+    exclude_sellers: list[str] = ["Wildberries", "Ozon", "Lamoda"]
+    # строки без продавца не теряются: идут в общий выторг под этим именем и видны владельцу
+    no_seller_name: str = "(без продавца)"
     # «Букалова Юлия МСЛ» -> продавец «Букалова Юлия», магазин «МСЛ» (как в ведомостях ЗП)
     seller_store_suffixes: dict[str, str] = {" МСЛ": "МСЛ"}
     # если в выгрузке нет колонки «Магазин» — какой магазин подставить

@@ -1,12 +1,13 @@
-"""Импорт выгрузки из 1С по «Отчетам о розничных продажах» (ОРП) — CSV (;) или Excel.
+"""Импорт выгрузок из 1С — CSV (;) или Excel. Тип файла определяется по заголовкам
+(названия колонок — config.yaml → onec):
 
-Два вида файлов (тип определяется по заголовкам; названия колонок — config.yaml → onec):
-
-1. Строки ОРП (ТЧ «Товары» и «Возвращенные товары»), файл orp_lines_*.csv:
-       Дата;Склад;Документ;Продавец;Номенклатура;Номенклатурная группа;Количество;Сумма;Скидка
-   Возврат — отрицательные количество и сумма.
-2. Шапки ОРП, файл orp_docs_*.csv:
-       Дата;Магазин;Касса;Документ;Чеков;Чеков возврата;Выручка
+1. Строки продаж, sales_*.csv — из чеков ККМ (есть «Чек» и «Время») или из ОРП (без них):
+       Дата;Время;Склад;Документ;Чек;Продавец;Номенклатура;Номенклатурная группа;Количество;Цена;Сумма;Скидка;
+       Ручная скидка %;Дисконтная карта
+   Возврат — отрицательные количество и сумма. Пустой продавец → «(без продавца)».
+2. Шапки ОРП, orp_docs_*.csv:  Дата;Магазин;Касса;Документ;Чеков;Чеков возврата;Выручка
+3. Остатки, stock_*.csv:       Дата;Склад;Номенклатура;Номенклатурная группа;Характеристика;Остаток
+4. Поступления, arrivals_*.csv: Дата;Склад;Документ;Номенклатура;Номенклатурная группа;Характеристика;Поступило
 
 Импорт идемпотентен: данные за (день, магазин) из файла полностью заменяются.
 Пары (день, магазин) отмечаются в imported_days — признак «день закрыт» (ОРП проведён).
@@ -30,7 +31,7 @@ from ..db import DB
 @dataclass
 class ImportReport:
     file: str
-    kind: str  # lines | docs
+    kind: str  # lines | docs | stock | arrivals
     lines: int
     days: list[tuple[str, str]]
     skipped: int = 0
@@ -124,10 +125,12 @@ def _import_lines(path: Path, rows, h, idx, db: DB, cfg: Settings) -> ImportRepo
         if not row or all(c in (None, "") for c in row):
             continue
         get = lambda k: row[idx[k]] if k in idx and idx[k] < len(row) else None  # noqa: E731
-        raw_seller = get("seller")
-        if raw_seller is None or str(raw_seller).strip().lower() in excl or str(raw_seller).lower().startswith("итог"):
+        raw_seller = str(get("seller") or "").strip()
+        if raw_seller.lower() in excl or raw_seller.lower().startswith("итог"):
             skipped += 1
             continue
+        if not raw_seller:
+            raw_seller = cfg.onec.no_seller_name
         d = _day(get("date"))
         if d is None:
             skipped += 1
@@ -136,17 +139,30 @@ def _import_lines(path: Path, rows, h, idx, db: DB, cfg: Settings) -> ImportRepo
         store = store_name(get("store") or store_from_name, cfg)
         sid = db.seller_id(seller, create=False)
         if sid is None:
-            unknown.add(seller)
             sid = db.seller_id(seller, create=True)
+            if seller == cfg.onec.no_seller_name:
+                with db.tx() as c:
+                    c.execute("UPDATE sellers SET role='system', active=0 WHERE id=?", (sid,))
+            else:
+                unknown.add(seller)
+        qty, amount = _num(get("qty")), _num(get("amount"))
+        disc = abs(_num(get("discount")))
+        if not disc and "price" in idx and amount > 0:
+            disc = max(0.0, _num(get("price")) * qty - amount)
+        manual = abs(_num(get("price")) * qty) * _num(get("manual_pct")) / 100 if amount > 0 else 0.0
+        receipt = str(get("receipt") or "").strip() or None
+        t = get("time")
+        tm = t.strftime("%H:%M") if hasattr(t, "strftime") else (str(t).strip()[:5] if t else None)
+        card = str(get("card") or "").strip() or None
         data[(d.isoformat(), store)].append(
-            (d.isoformat(), store, sid, str(get("doc") or ""), get("item"), get("category"), _num(get("qty")),
-             _num(get("amount")), abs(_num(get("discount"))), path.name))
+            (d.isoformat(), store, sid, str(get("doc") or ""), receipt, tm, get("item"), get("category"), qty,
+             amount, disc, min(manual, disc) if disc else manual, card, path.name))
     n = 0
     with db.tx() as c:
         for (day, store), lines in data.items():
             c.execute("DELETE FROM sales_lines WHERE day=? AND store=?", (day, store))
-            c.executemany("INSERT INTO sales_lines(day,store,seller_id,doc,item,category,qty,amount,discount,source) "
-                          "VALUES(?,?,?,?,?,?,?,?,?,?)", lines)
+            c.executemany("INSERT INTO sales_lines(day,store,seller_id,doc,receipt,time,item,category,qty,amount,"
+                          "discount,manual_discount,card,source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", lines)
             n += len(lines)
         _mark_days(c, {k: len(v) for k, v in data.items()}, path.name)
     return ImportReport(path.name, "lines", n, sorted(data), skipped, unknown)
@@ -178,9 +194,46 @@ def _import_docs(path: Path, rows, h, idx, db: DB, cfg: Settings) -> ImportRepor
     return ImportReport(path.name, "docs", len(data), days)
 
 
+def _import_stock(path: Path, rows, h, idx, db: DB, cfg: Settings, kind: str) -> ImportReport:
+    recs = []
+    for row in rows[h + 1:]:
+        if not row or all(c in (None, "") for c in row):
+            continue
+        get = lambda k: row[idx[k]] if k in idx and idx[k] < len(row) else None  # noqa: E731
+        d = _day(get("date"))
+        if d is None or not get("item"):
+            continue
+        qty = _num(get("stock" if kind == "stock" else "arrived"))
+        recs.append((d.isoformat(), store_name(get("store"), cfg), str(get("item")).strip(),
+                     get("category"), str(get("size") or "").strip(), qty, str(get("doc") or "")))
+    pairs = sorted({(r[0], r[1]) for r in recs})
+    with db.tx() as c:
+        for day, store in pairs:
+            c.execute(f"DELETE FROM {kind} WHERE day=? AND store=?", (day, store))
+        if kind == "stock":
+            # одинаковые позиции (разные партии) складываем
+            agg: dict[tuple, list] = {}
+            for r in recs:
+                k = r[:3] + (r[4],)
+                agg.setdefault(k, [r[3], 0.0])[1] += r[5]
+            c.executemany("INSERT INTO stock(day,store,item,size,category,qty) VALUES(?,?,?,?,?,?)",
+                          [(k[0], k[1], k[2], k[3], v[0], v[1]) for k, v in agg.items() if v[1] > 0])
+        else:
+            c.executemany("INSERT INTO arrivals(day,store,item,category,size,qty,doc) VALUES(?,?,?,?,?,?,?)",
+                          [r for r in recs if r[5] > 0])
+    return ImportReport(path.name, kind, len(recs), pairs)
+
+
 def import_file(path: str | Path, db: DB, cfg: Settings) -> ImportReport:
     path = Path(path)
     rows = _rows(path)
+    sc = cfg.onec.stock_columns.model_dump()
+    hs = _header(rows, sc, ("store", "item", "stock"))
+    if hs:
+        return _import_stock(path, rows, hs[0], hs[1], db, cfg, "stock")
+    ha = _header(rows, sc, ("store", "item", "arrived"))
+    if ha:
+        return _import_stock(path, rows, ha[0], ha[1], db, cfg, "arrivals")
     dc = cfg.onec.doc_columns.model_dump()
     hd = _header(rows, dc, ("checks", "revenue"))
     if hd:
@@ -199,7 +252,8 @@ def import_inbox(db: DB, cfg: Settings) -> list[ImportReport]:
     archive.mkdir(parents=True, exist_ok=True)
     out = []
     files = [f for f in inbox.glob("*") if f.suffix.lower() in (".xlsx", ".xlsm", ".csv") and not f.name.startswith("~$")]
-    for f in sorted(files, key=lambda f: (0 if "doc" in f.name.lower() else 1, f.name)):
+    order = lambda f: (0 if "doc" in f.name.lower() else 2 if f.name.lower().startswith(("stock", "arrival")) else 1, f.name)  # noqa: E731
+    for f in sorted(files, key=order):
         out.append(import_file(f, db, cfg))
         shutil.move(str(f), archive / f"{datetime.now():%Y%m%d-%H%M%S}_{f.name}")
     return out

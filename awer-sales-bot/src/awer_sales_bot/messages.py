@@ -38,9 +38,15 @@ def daily(db: DB, cfg: Settings, sid: int, day: date) -> str:
     shop = M.store(db, day, day)
     L = [f"Доброе утро, {s['first_name'] or s['name']}! Итоги {day.day} {MONTHS_GEN[day.month]}.", ""]
     if y.sales or y.items:
-        L.append(f"**Вчера:** {rub(y.sales)} · вещей {y.items:.0f} · средняя цена вещи {rub(y.avg_price)}")
-        if shop.checks:
-            L.append(f"Магазины вчера: средний чек {rub(shop.avg_check)} · вещей в чеке {d1(shop.upt)}")
+        if y.has_receipts:
+            L.append(f"**Вчера:** {rub(y.sales)} · чеков {y.receipts} · средний чек {rub(y.avg_check)} · "
+                     f"вещей в чеке {d1(y.upt)}")
+        else:
+            L.append(f"**Вчера:** {rub(y.sales)} · вещей {y.items:.0f} · средняя цена вещи {rub(y.avg_price)}")
+            if y.card_purchases:
+                L.append(f"Покупок по картам: {y.card_purchases}, средняя {rub(y.card_avg)}")
+            if shop.checks:
+                L.append(f"Магазины вчера: средний чек {rub(shop.avg_check)} · вещей в чеке {d1(shop.upt)}")
     else:
         L.append("**Вчера:** продаж нет (выходной?)")
     L.append("")
@@ -65,11 +71,21 @@ def daily(db: DB, cfg: Settings, sid: int, day: date) -> str:
         L.append("План на месяц ещё не рассчитан — уточните у администратора.")
     shop_m = M.store(db, day.replace(day=1), day)
     L += ["", "**С начала месяца, вы / команда:**",
-          f"Продажи за смену: {rub(mtd.per_shift)} / {rub(tm.per_shift)}",
-          f"Вещей за смену: {d1(mtd.items_per_shift)} / {d1(tm.items_per_shift)}",
-          f"Средняя цена вещи: {rub(mtd.avg_price)} / {rub(tm.avg_price)}"]
-    if shop_m.checks:
-        L.append(f"Магазины: средний чек {rub(shop_m.avg_check)} · вещей в чеке {d1(shop_m.upt)}")
+          f"Продажи за смену: {rub(mtd.per_shift)} / {rub(tm.per_shift)}"]
+    if mtd.has_receipts:
+        L += [f"Средний чек: {rub(mtd.avg_check)} / {rub(tm.avg_check)}",
+              f"Вещей в чеке: {d1(mtd.upt)} / {d1(tm.upt)}"]
+    else:
+        L += [f"Вещей за смену: {d1(mtd.items_per_shift)} / {d1(tm.items_per_shift)}",
+              f"Средняя цена вещи: {rub(mtd.avg_price)} / {rub(tm.avg_price)}"]
+        if mtd.card_purchases or tm.card_purchases:
+            L.append(f"Покупка клиента с картой: {rub(mtd.card_avg)} / {rub(tm.card_avg)}, "
+                     f"вещей {d1(mtd.card_upt)} / {d1(tm.card_upt)}")
+        if shop_m.checks:
+            L.append(f"Магазины: средний чек {rub(shop_m.avg_check)} · вещей в чеке {d1(shop_m.upt)}")
+    arr = M.arrivals_summary(db, day)
+    if arr:
+        L += ["", "📦 **Новые поступления:** " + ", ".join(f"{c} — {m} мод. ({q:.0f} шт.)" for c, m, q in arr)]
     tips = advise(db, cfg, sid, st, day)
     if tips:
         L += ["", "💡 " + "\n💡 ".join(tips)]
@@ -112,8 +128,29 @@ def owner_summary(db: DB, cfg: Settings, day: date) -> str:
     L = [f"**Сводка на {day:%d.%m.%Y}**",
          f"С начала месяца: {rub(allm.sales)} · средний чек {rub(tot.avg_check)} · вещей в чеке {d1(tot.upt)}", ""]
     for name, st, m in sorted(rows, key=lambda x: -(x[1].performance or 0)):
-        L.append(f"{name}: {rub(st.sales)} · выполнение {pct(st.performance)} · ставка {rub(st.projected_rate or st.current_rate)}"
-                 f" · за смену {rub(m.per_shift)} · {d1(m.items_per_shift)} вещ. · цена вещи {rub(m.avg_price)}")
+        q = (f"чек {rub(m.avg_check)} · {d1(m.upt)} вещ./чек" if m.has_receipts
+             else f"{d1(m.items_per_shift)} вещ./смену · цена вещи {rub(m.avg_price)}")
+        manual = f" · ручные скидки {rub(m.manual_discount)}" if m.manual_discount else ""
+        cards = f" · по картам {pct(m.card_share)}" if m.card_purchases else ""
+        L.append(f"{name}: {rub(st.sales)} · выполнение {pct(st.performance)} · ставка "
+                 f"{rub(st.projected_rate or st.current_rate)} · за смену {rub(m.per_shift)} · {q}{manual}{cards}")
+    start = day.replace(day=1)
+    no_seller = M.unattributed(db, start, day)
+    if no_seller:
+        L += ["", f"⚠️ Продажи без продавца с начала месяца: {rub(no_seller)} — ни в чей план не попали."]
+    if allm.manual_discount:
+        L.append(f"Ручные скидки с начала месяца: {rub(allm.manual_discount)} ({pct(allm.manual_share)} от суммы до скидок)")
+    hrs = M.hours(db, start, day)
+    if hrs:
+        best = sorted(hrs.items(), key=lambda x: -x[1])[:3]
+        L.append("Лучшие часы: " + ", ".join(f"{h}:00–{h + 1}:00" for h, _ in sorted(best)))
+    bs = M.broken_sizes(db, day, limit=5)
+    if bs:
+        L += ["", "**Ходовые модели, осталось 1–2 размера:**"] + [
+            f"{st_}: {item} — {sz} разм., {q:.0f} шт. (продано за 30 дн.: {n:.0f})" for st_, item, sz, q, n in bs]
+    stale_m, stale_q = M.stale_stock(db, day)
+    if stale_m:
+        L.append(f"Без продаж 90+ дней на остатке: {stale_m} моделей, {stale_q:.0f} шт.")
     return "\n".join(x for x in L if x is not None)
 
 
