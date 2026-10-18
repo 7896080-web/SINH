@@ -24,7 +24,7 @@
     <ul class="check-list">
         {% for f in stale_fetches %}
         <li><span class="badge badge--warn">загрузка</span>
-            {{ f.account.name }}: {% if f.last_ok %}последняя успешная загрузка {{ f.days }} дн. назад{% else %}успешной загрузки ещё не было{% endif %}{% if f.problem %} — {{ f.problem }}{% endif %}.
+            {{ f.account.name }} ({{ f.label }}): {% if f.last_ok %}последняя успешная загрузка {{ f.days }} дн. назад{% else %}успешной загрузки ещё не было{% endif %}{% if f.problem %} — {{ f.problem }}{% endif %}.
             Свежие продажи сюда не попадают. <a href="/diagnostics#freshness">Подробнее</a></li>
         {% endfor %}
     </ul>

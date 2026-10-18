@@ -212,10 +212,13 @@ def test_account_freshness_names_a_rejected_key_and_staleness(db):
                        finished_at=now_utc() - timedelta(days=1)))
     kit = make_account(db, platform="kit", name="Сайт")
     db.commit()
-    rows = {f["account"].name: f for f in fetch.account_freshness(db)}
-    assert rows["WB Яворская"]["stale"] and "не приняла ключ" in rows["WB Яворская"]["problem"]
-    assert rows["WB Яворская"]["days"] == 12
-    assert rows["Сайт"]["stale"] and "ключ не задан" in rows["Сайт"]["problem"]
+    # У кабинета KIT строк две: загрузка по API и продажи сайта из базы AWER CRM.
+    rows = {(f["account"].name, f["source"]): f for f in fetch.account_freshness(db)}
+    wb_row, kit_row = rows[("WB Яворская", "wb")], rows[("Сайт", "kit")]
+    assert wb_row["stale"] and "не приняла ключ" in wb_row["problem"]
+    assert wb_row["days"] == 12
+    assert kit_row["stale"] and "ключ не задан" in kit_row["problem"]
+    assert "kitcrm.db" in rows[("Сайт", "crm")]["problem"]
 
 
 def test_fresh_account_is_ok_and_pages_show_freshness(client, db):

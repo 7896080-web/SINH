@@ -8,7 +8,10 @@ FIN_AUTO_FETCH). Разбирает заявки фоновое задание `
 - `wb_api`  — официальные еженедельные отчёты реализации WB (finance-api):
   список за период, затем детализация каждого нового отчёта. «Итого к оплате»
   WB ложится в отчёт как сумма площадки для сверки с итогом строк;
-- `kit_api` — отчёт о продажах KIT за период из официальных данных заказов.
+- `kit_api` — отчёт о продажах KIT за период из официальных данных заказов;
+- `crm_db`  — продажи сайта на KIT из базы AWER CRM на этом же сервере
+  (`sources/crm.py`, только чтение), по календарным неделям, с комиссией по
+  ставке из настроек — то же, что выгрузка CRM файлом, но без рук.
 
 Площадкам — только чтение. Себестоимость из 1С ходит обменом с 1С (`onec.py`).
 """
@@ -20,14 +23,16 @@ from datetime import date, datetime, timedelta
 from typing import Callable
 
 import requests
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from finapp import accounts, settings as store
 from finapp.finance import statements, values as v
-from finapp.finance.formats import ParseResult, ReportFormat, parse_records
+from finapp.finance.formats import ParseResult, ReportFormat, apply_commission, parse_records
 from finapp.finance.importer import make_onec_key, store_api_report
 from finapp.finance.rates import RateError, fetch_cbr_range, missing_range
 from finapp.finance.settings import load_settings
+from finapp.finance.sources import crm as crm_source
 from finapp.finance.sources import kit as kit_source
 from finapp.finance.sources import wb as wb_source
 from finapp.models import (KitVariant, OneCUploadStatus, PlatformAccount, ReportFetch, SalesReport,
@@ -39,8 +44,9 @@ logger = logging.getLogger("mpfinance.fetch")
 KINDS = {
     "wb_api": "WB — официальные отчёты реализации (API)",
     "kit_api": "Яндекс KIT — продажи по заказам (API)",
+    "crm_db": "AWER CRM — продажи сайта (база CRM)",
 }
-KIND_PLATFORM = {"wb_api": "wb", "kit_api": "kit"}
+KIND_PLATFORM = {"wb_api": "wb", "kit_api": "kit", "crm_db": "kit"}
 ACTIVE = ("pending", "running")
 # «running», у которого отметка шага не двигалась дольше этого, — проход,
 # оборванный перезапуском службы: его берут заново (уже загруженные отчёты при
@@ -52,6 +58,10 @@ WB_AUTO_DAYS = 28
 # KIT: отказы при получении доезжают в заказы позже доставки, поэтому две
 # последние полные недели перезабираются каждый день, пока не ушли в 1С.
 KIT_AUTO_WEEKS = 2
+# AWER CRM узнаёт о выполнении заказа, когда его опросит, — бывает, через
+# неделю после вручения (06.10 вручён, отмечен 14.10, пока CRM переезжала на
+# сервер). Поэтому окно шире, чем у KIT: четыре полные недели.
+CRM_AUTO_WEEKS = 4
 AUTO_EVERY = timedelta(hours=20)
 
 AUTO_FETCH_KEY = "FIN_AUTO_FETCH"
@@ -64,6 +74,12 @@ KIT_DELIVERY_KIND = "доставка"
 # разные отчёты, и ни один не должен занимать ключ другого.
 KIT_SALES_KEY = "kitapi"
 KIT_DELIVERY_KEY = "kitdlv"
+CRM_KEY = "crmdb"
+CRM_DB_FORMAT = ReportFormat(code="kit_awer_crm_db", label="AWER CRM — продажи сайта (база CRM)",
+                             platforms=("kit",), aliases={}, build=lambda row: {})
+# Источник отчёта в `SalesReport.source`: не «api» — отчёты KIT по API за ту же
+# неделю (`_drop_superseded_kit`) иначе считали бы его своим прежним и удаляли.
+CRM_SOURCE = "crm"
 
 
 class FetchError(RuntimeError):
@@ -92,6 +108,12 @@ def request_fetch(db: Session, kind: str, user: str, account_id: int | None = No
         return None, "Выберите кабинет нужной площадки."
     if date_from is None or date_to is None or date_from > date_to:
         return None, "Укажите период: дата «с» не позже даты «по»."
+    if kind == "crm_db":
+        if load_settings(db).kit_sales_source != "crm":
+            return None, ("Продажи сайта сейчас берутся из API KIT («Себестоимость» → «Настройки»): "
+                          "продажи из AWER CRM легли бы поверх них второй раз.")
+        if not crm_source.available():
+            return None, f"База AWER CRM: {crm_source.status_text()}."
     if kind == "wb_api" and date_from < wb_source.FIRST_AVAILABLE:
         date_from = wb_source.FIRST_AVAILABLE
     if date_to > today_local():
@@ -125,6 +147,12 @@ def plan_regular(db: Session) -> int:
                                             ReportFetch.account_id == account_id).first() is not None
 
     active = db.query(PlatformAccount).filter(PlatformAccount.is_active.is_(True)).all()
+    target = crm_account(db, active)
+    if target is not None and not recent("crm_db", target.id):
+        monday = today - timedelta(days=today.weekday())
+        job, _ = request_fetch(db, "crm_db", "system", target.id,
+                               monday - timedelta(weeks=CRM_AUTO_WEEKS), monday - timedelta(days=1))
+        created += 1 if job else 0
     for account in active:
         creds = credentials_of(db, account)
         if account.platform == "wb" and wb_report_token(creds) and not recent("wb_api", account.id):
@@ -138,6 +166,26 @@ def plan_regular(db: Session) -> int:
             created += 1 if job else 0
     db.commit()
     return created
+
+
+def crm_account(db: Session, active: list[PlatformAccount] | None = None) -> PlatformAccount | None:
+    """Кабинет KIT, к которому автозагрузка кладёт продажи из AWER CRM.
+
+    CRM ведёт ОДИН магазин. Активный кабинет KIT один — он. Несколько — только
+    тот, по которому продажи из CRM уже забирали руками: угадывать нельзя,
+    продажи одного магазина легли бы на чужой кабинет. Продажи сайта из API KIT
+    или базы CRM нет — None."""
+    if load_settings(db).kit_sales_source != "crm" or not crm_source.available():
+        return None
+    if active is None:
+        active = db.query(PlatformAccount).filter(PlatformAccount.is_active.is_(True)).all()
+    kits = [a for a in active if a.platform == "kit"]
+    if len(kits) == 1:
+        return kits[0]
+    used = {aid for (aid,) in db.query(ReportFetch.account_id).filter(
+        ReportFetch.kind == "crm_db", ReportFetch.status == "done").distinct()}
+    chosen = [a for a in kits if a.id in used]
+    return chosen[0] if len(chosen) == 1 else None
 
 
 # ---------------------------------------------------------------- исполнение
@@ -178,11 +226,13 @@ def run_pending(db: Session, heartbeat: Callable[[], None] = lambda: None,
         try:
             if job.kind == "wb_api":
                 notes = _run_wb(db, job, heartbeat, session, sleep)
+            elif job.kind == "crm_db":
+                notes = _run_crm(db, job, heartbeat)
             else:
                 notes = _run_kit(db, job, heartbeat, session, sleep)
             job.status = "done"
             job.message = notes
-        except (FetchError, wb_source.WbFinanceError) as e:
+        except (FetchError, wb_source.WbFinanceError, crm_source.CrmDbError) as e:
             db.rollback()
             job.status = "failed"
             job.message = str(e)[:2000]
@@ -361,7 +411,10 @@ def _run_kit(db: Session, job: ReportFetch, heartbeat, session, sleep) -> str:
             db.add(KitVariant(account_id=account.id, variant_id=variant_id[:64], barcode=barcode))
         else:
             cached.barcode, cached.fetched_at = barcode, now_utc()
-    dropped = _drop_superseded_kit(db, account.id, stored, stored_weeks)
+    # Продажи из API KIT заменяют и продажи из базы CRM за те же недели (переключили
+    # CRM → API); доставка — нет: продажи из CRM она не заменяет.
+    dropped = _drop_superseded_kit(db, account.id, stored, stored_weeks,
+                                   sources=("api",) if delivery_only else ("api", CRM_SOURCE))
     db.flush()
     job.found = totals["orders"]
     job.imported = len(stored)
@@ -384,6 +437,113 @@ def _run_kit(db: Session, job: ReportFetch, heartbeat, session, sleep) -> str:
     return "; ".join([head] + notes + warnings)[:2000]
 
 
+UNSENT = (OneCUploadStatus.none, OneCUploadStatus.failed)
+
+
+def _goods_of(db: Session, report_id: int) -> tuple[int, int]:
+    """(штук, выручка) по продажам и возвратам отчёта."""
+    pieces, revenue = db.query(func.coalesce(func.sum(SalesReportLine.quantity), 0),
+                               func.coalesce(func.sum(SalesReportLine.revenue_kop), 0)).filter(
+        SalesReportLine.report_id == report_id,
+        SalesReportLine.operation.in_(v.GOODS_OPERATIONS)).one()
+    return int(pieces), int(revenue)
+
+
+def _run_crm(db: Session, job: ReportFetch, heartbeat) -> str:
+    """Продажи сайта из базы AWER CRM — по календарным неделям, как доставка
+    KIT по API: одна неделя — один отчёт, и та же неделя всегда ложится в тот же
+    отчёт (ключ по периоду), заменяясь свежим, пока не ушла в 1С.
+
+    CRM дополняет прошлые недели задним числом (узнала о вручении позже, отказ
+    доехал позже). Неотправленный отчёт просто заменяется; по ОТПРАВЛЕННОМУ
+    документ в 1С уже построен, его не трогаем — но разницу называем в
+    сообщении заявки: молча она не попала бы в 1С никогда."""
+    account = job.account
+    weeks = kit_weeks(job.date_from, job.date_to)
+    if not weeks:
+        return "период целиком в будущем — загружать нечего"
+    job.progress_total = len(weeks) + 1
+    _step(db, job, heartbeat, "чтение базы AWER CRM")
+    sales, stats = crm_source.sales_between(weeks[0][0], weeks[-1][1])
+    job.progress_done = 1
+    _step(db, job, heartbeat, f"продано за период: {stats['pieces']} шт")
+    percent = load_settings(db).kit_crm_commission
+    user = f"crm:{job.requested_by or 'system'}"
+    notes, warnings, stored, stored_weeks = [], [], [], set()
+    revenue = commission = 0
+    for monday, sunday in weeks:
+        where = f"неделя {monday:%d.%m}–{sunday:%d.%m.%Y}"
+        lines = [crm_source.to_line(sale) for sale in sales if monday <= sale.day <= sunday]
+        week_commission = apply_commission(lines, percent)
+        job.progress_done += 1
+        key = make_onec_key("kit", account.id, "", monday, sunday, CRM_KEY)
+        existing = db.query(SalesReport).filter(SalesReport.onec_key == key).first()
+        if existing is not None and existing.onec_status not in UNSENT:
+            was = _goods_of(db, existing.id)
+            now = (len(lines), sum(line["revenue"] for line in lines))
+            if was != now:
+                notes.append(f"{where}: отчёт #{existing.id} уже в 1С ({was[0]} шт, {v.format_rub(was[1])} ₽), "
+                             f"а в CRM теперь {now[0]} шт, {v.format_rub(now[1])} ₽ — разница в 1С сама "
+                             f"не попадёт")
+            _step(db, job, heartbeat, where)
+            continue
+        if not lines:
+            if existing is not None:
+                # Все продажи недели отпали (отказ, отмена): прежний отчёт врёт.
+                db.query(SalesReportLine).filter(SalesReportLine.report_id == existing.id) \
+                    .delete(synchronize_session=False)
+                db.delete(existing)
+                notes.append(f"{where}: продаж в CRM больше нет — прежний отчёт #{existing.id} удалён")
+            _step(db, job, heartbeat, f"{where}: продаж нет")
+            continue
+        outcome = store_api_report(
+            db, platform="kit", account_id=account.id,
+            parsed=ParseResult(format=CRM_DB_FORMAT, lines=lines),
+            period_from=monday, period_to=sunday, user=user, file_name="AWER CRM, база kitcrm.db",
+            replace_unsent=True, source=CRM_SOURCE, kind=CRM_KEY)
+        if outcome.errors:
+            raise FetchError(f"{where}: " + " ".join(outcome.errors))
+        stored.append(outcome.report)
+        stored_weeks.add(monday)
+        revenue += sum(line["revenue"] for line in lines)
+        commission += week_commission
+        warnings.extend(w for w in outcome.warnings if _is_overlap_warning(w))
+        _step(db, job, heartbeat, where)
+    # Переключили продажи сайта API KIT → CRM: неотправленные продажи из API за
+    # эти недели — те же продажи. Доставку KIT не трогаем.
+    dropped = _drop_superseded_kit(db, account.id, stored, stored_weeks,
+                                   sources=("api", CRM_SOURCE), keep_delivery=True)
+    db.flush()
+    job.found = stats["orders"]
+    job.imported = len(stored)
+    period = f"{weeks[0][0]:%d.%m}–{weeks[-1][1]:%d.%m.%Y}"
+    if stored:
+        head = (f"недель {len(stored)}, заказов {stats['orders']}, продано {stats['pieces']} шт на "
+                f"{v.format_rub(revenue)} ₽, комиссия {str(percent).replace('.', ',')}% — "
+                f"{v.format_rub(commission)} ₽")
+    else:
+        head = f"продаж в AWER CRM за {period} нет (выполненных заказов, врученных в эти недели)"
+    redated = stats[crm_source.HISTORY] + stats[crm_source.KIT]
+    if redated:
+        head += (f"; без даты вручения в KIT — {redated} шт: датированы выполнением по истории CRM "
+                 f"({stats[crm_source.HISTORY]}) и по KIT ({stats[crm_source.KIT]})")
+    unmatched = sum(r.unmatched_lines or 0 for r in stored)
+    if unmatched:
+        head += f"; строк без товара 1С: {unmatched} — отправить в 1С их отчёты пока нельзя"
+    problems = []
+    if stats["no_barcode"]:
+        problems.append(f"штук без баркода в CRM: {stats['no_barcode']}")
+    if stats["undated"]:
+        problems.append(f"штук без всякой даты (не загружены): {stats['undated']}")
+    if stats["unreadable"]:
+        problems.append(f"заказов с нечитаемыми данными (не загружены): {stats['unreadable']}")
+    if stats["bad_price"]:
+        problems.append(f"штук без цены (не загружены): {stats['bad_price']}")
+    if dropped:
+        problems.append(f"убраны неотправленные продажи из API KIT за эти недели: {dropped}")
+    return "; ".join([head] + problems + warnings + notes)[:2000]
+
+
 def _is_overlap_warning(text: str) -> bool:
     """Предупреждение о задвоении — его обязано увидеть сообщение заявки: у
     загрузки по API другого читателя нет."""
@@ -391,13 +551,15 @@ def _is_overlap_warning(text: str) -> bool:
 
 
 def _drop_superseded_kit(db: Session, account_id: int, stored: list[SalesReport],
-                         stored_weeks: set[date]) -> int:
+                         stored_weeks: set[date], sources: tuple[str, ...] = ("api",),
+                         keep_delivery: bool = False) -> int:
     """Неотправленные отчёты KIT по API, ЦЕЛИКОМ покрытые только что записанными
     неделями: прежние окна до понедельной загрузки и отчёты другого режима
     продаж KIT (переключили CRM ↔ API). Их данные только что забраны заново, и
     оставь мы их — неделя легла бы дважды. Отчёт, захватывающий неделю, которую
     сейчас НЕ забирали, остаётся: удалить его значило бы потерять ту неделю.
-    Отправленные в 1С не трогаем никогда."""
+    Отправленные в 1С не трогаем никогда. `keep_delivery` — доставку KIT не
+    трогать (продажи из CRM её не заменяют)."""
     if not stored_weeks:
         return 0
     keep = {r.id for r in stored}
@@ -405,9 +567,9 @@ def _drop_superseded_kit(db: Session, account_id: int, stored: list[SalesReport]
     dropped = 0
     for report in db.query(SalesReport).filter(
             SalesReport.platform == "kit", SalesReport.account_id == account_id,
-            SalesReport.source == "api", SalesReport.period_from >= first, SalesReport.period_to <= last,
+            SalesReport.source.in_(sources), SalesReport.period_from >= first, SalesReport.period_to <= last,
             SalesReport.onec_status.in_((OneCUploadStatus.none, OneCUploadStatus.failed))):
-        if report.id in keep:
+        if report.id in keep or (keep_delivery and report.report_kind == KIT_DELIVERY_KIND):
             continue
         monday = report.period_from - timedelta(days=report.period_from.weekday())
         spanned = set()
@@ -427,8 +589,11 @@ def _drop_superseded_kit(db: Session, account_id: int, stored: list[SalesReport]
 # Сколько без успешной загрузки — уже повод смотреть. WB формирует отчёт раз в
 # неделю (по понедельникам, бывает позже), KIT забирается каждый день, письма
 # Lamoda приходят раз в неделю.
-STALE_AFTER = {"wb": timedelta(days=8), "kit": timedelta(days=2), "lamoda": timedelta(days=9)}
+STALE_AFTER = {"wb": timedelta(days=8), "kit": timedelta(days=2), "lamoda": timedelta(days=9),
+               "crm": timedelta(days=2)}
 FETCH_KIND = {"wb": "wb_api", "kit": "kit_api"}
+SOURCE_LABELS = {"wb": "WB, по API", "kit": "Яндекс KIT, по API", "lamoda": "Lamoda, с почты",
+                 "crm": "продажи сайта, база AWER CRM"}
 
 
 def _explain(message: str) -> str:
@@ -449,9 +614,11 @@ def account_freshness(db: Session) -> list[dict]:
     from finapp.models import MailMessage
     now = now_utc()
     out = []
-    for account in db.query(PlatformAccount).filter(PlatformAccount.is_active.is_(True)) \
-            .order_by(PlatformAccount.platform, PlatformAccount.name):
-        item = {"account": account, "last_ok": None, "problem": "", "stale": False}
+    active = db.query(PlatformAccount).filter(PlatformAccount.is_active.is_(True)) \
+        .order_by(PlatformAccount.platform, PlatformAccount.name).all()
+    for account in active:
+        item = {"account": account, "last_ok": None, "problem": "", "stale": False,
+                "source": account.platform}
         if account.platform in FETCH_KIND:
             kind = FETCH_KIND[account.platform]
             creds = credentials_of(db, account)
@@ -477,12 +644,47 @@ def account_freshness(db: Session) -> list[dict]:
                 item["last_ok"] = got.processed_at if got else None
         else:
             continue
-        limit = STALE_AFTER.get(account.platform)
+        out.append(item)
+    crm = _crm_freshness(db, active)
+    if crm is not None:
+        out.append(crm)
+    for item in out:
+        limit = STALE_AFTER.get(item["source"])
         item["stale"] = bool(item["problem"]) or item["last_ok"] is None or \
             (limit is not None and now - item["last_ok"] > limit)
         item["days"] = (now - item["last_ok"]).days if item["last_ok"] else None
-        out.append(item)
+        item["label"] = SOURCE_LABELS.get(item["source"], item["source"])
     return out
+
+
+def _crm_freshness(db: Session, active: list[PlatformAccount]) -> dict | None:
+    """Строка про AWER CRM — только когда продажи сайта берутся из CRM. Базы
+    нет или кабинет не ясен — тоже строка, с причиной: иначе продажи сайта
+    просто перестали бы приходить, и сказать об этом было бы некому."""
+    if load_settings(db).kit_sales_source != "crm":
+        return None
+    kits = [a for a in active if a.platform == "kit"]
+    if not kits:
+        return None
+    account = crm_account(db, active)
+    item = {"account": account or kits[0], "last_ok": None, "problem": "", "stale": False, "source": "crm"}
+    if not crm_source.available():
+        item["problem"] = f"база AWER CRM: {crm_source.status_text()}"
+        return item
+    if account is None:
+        item["problem"] = ("кабинетов KIT несколько — один раз загрузите продажи из CRM по кнопке на "
+                           "«Отчётах площадок», выбрав нужный кабинет; дальше автозагрузка пойдёт в него")
+        return item
+    ok = db.query(ReportFetch).filter(ReportFetch.kind == "crm_db", ReportFetch.account_id == account.id,
+                                      ReportFetch.status == "done") \
+        .order_by(ReportFetch.finished_at.desc()).first()
+    last = db.query(ReportFetch).filter(ReportFetch.kind == "crm_db", ReportFetch.account_id == account.id,
+                                        ReportFetch.status.in_(("done", "failed"))) \
+        .order_by(ReportFetch.finished_at.desc()).first()
+    item["last_ok"] = ok.finished_at if ok else None
+    if last is not None and last.status == "failed":
+        item["problem"] = (last.message or "")[:300]
+    return item
 
 
 # ---------------------------------------------------------------- курс ЦБ

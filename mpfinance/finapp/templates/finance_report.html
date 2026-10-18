@@ -8,7 +8,7 @@
         <h1>{{ platform_labels[report.platform] }}: отчёт за {{ report.period_from.strftime('%d.%m.%Y') }} — {{ report.period_to.strftime('%d.%m.%Y') }}</h1>
         <p>#{{ report.id }}{% if report.report_number %} · номер площадки {{ report.report_number }}{% endif %}
            · {{ report.account.name if report.account else 'кабинет не указан' }}
-           · {{ report.lines_count }} строк · {{ {'api': 'по API', 'email': 'с почты'}.get(report.source, 'файл') }} «{{ report.file_name }}»{% if report.report_kind %} · {{ report.report_kind }}{% endif %}
+           · {{ report.lines_count }} строк · {{ {'api': 'по API', 'email': 'с почты', 'crm': 'из базы AWER CRM'}.get(report.source, 'файл') }} «{{ report.file_name }}»{% if report.report_kind %} · {{ report.report_kind }}{% endif %}
            · загрузил {{ report.uploaded_by or '—' }} {{ report.uploaded_at|local('%d.%m.%Y %H:%M') }}</p>
     </div>
     <div class="toolbar">

@@ -54,8 +54,45 @@
     {% else %}
     <p class="muted">Нет кабинетов WB или KIT — заведите их на странице «API-ключи».</p>
     {% endif %}
+
+    <h3 style="font-size:14px; margin:16px 0 4px;" id="crm">Продажи сайта из AWER CRM</h3>
+    <p class="help-text" style="margin-top:0;">CRM стоит на этом же сервере: программа читает её базу
+        (<span class="mono">{{ crm_status }}</span>) и раскладывает продажи по календарным неделям — то же, что выгрузка
+        «Продажи» из CRM, только без рук и без задвоений: дата продажи — вручение заказа, отказы при получении не
+        считаются, комиссия {{ crm_commission }}% вычитается по ставке из настроек.</p>
+    {% if crm_sales_off %}
+    <p class="muted">Продажи сайта сейчас берутся из API KIT («Себестоимость» → «Настройки расчёта»).</p>
+    {% elif not crm_available %}
+    <p class="muted">Базы AWER CRM на этом сервере не видно — продажи сайта загружаются выгрузкой CRM файлом ниже.</p>
+    {% elif kit_accounts %}
+    <form method="post" action="/finance/fetch" class="filters" style="border:none; padding:0;">
+        <input type="hidden" name="kind" value="crm_db">
+        <div class="field">
+            <label for="crm_account">Кабинет KIT</label>
+            <select id="crm_account" name="account_id">
+                {% for a in kit_accounts %}<option value="{{ a.id }}">{{ a.name }}</option>{% endfor %}
+            </select>
+        </div>
+        <div class="field">
+            <label for="crm_from">Период с</label>
+            <input type="date" id="crm_from" name="date_from" value="{{ default_from }}" max="{{ today }}" required>
+        </div>
+        <div class="field">
+            <label for="crm_to">по</label>
+            <input type="date" id="crm_to" name="date_to" value="{{ today }}" max="{{ today }}" required>
+        </div>
+        <div class="field">
+            <label>&nbsp;</label>
+            <button type="submit" class="btn btn-primary">Забрать из CRM</button>
+        </div>
+    </form>
+    {% else %}
+    <p class="muted">Нет кабинета KIT — заведите его на странице «API-ключи».</p>
+    {% endif %}
+
     <p class="help-text">Автозагрузка: {% if auto_fetch %}<span class="badge badge--good">включена</span> — раз в сутки WB за
-        последние 4 недели и KIT за две полные недели (пока отчёт не отправлен в 1С, он обновляется: отказы при получении
+        последние 4 недели, KIT за две полные недели{% if not crm_sales_off and crm_available %} и продажи из AWER CRM за
+        четыре полные недели{% endif %} (пока отчёт не отправлен в 1С, он обновляется: отказы и поздние вручения
         доезжают позже){% else %}<span class="badge badge--muted">выключена</span> — только по кнопке{% endif %}.
         Переключается на странице «Себестоимость».</p>
 
@@ -172,7 +209,7 @@
                 <div class="help-text">{{ r.account.name if r.account else 'кабинет не указан' }}</div></td>
             <td class="mono">{{ r.period_from.strftime('%d.%m.%Y') }} — {{ r.period_to.strftime('%d.%m.%Y') }}</td>
             <td class="mono">{{ r.report_number or '—' }}
-                <div class="help-text">{{ {'api': 'API', 'email': 'почта'}.get(r.source, 'файл') }}{% if r.report_kind %} · {{ r.report_kind }}{% endif %}</div></td>
+                <div class="help-text">{{ {'api': 'API', 'email': 'почта', 'crm': 'база CRM'}.get(r.source, 'файл') }}{% if r.report_kind %} · {{ r.report_kind }}{% endif %}</div></td>
             <td class="num">{{ r.lines_count }}</td>
             <td class="num">{{ money(t[0]) }}</td>
             <td class="num">{{ money(t[1]) }}</td>

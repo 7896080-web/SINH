@@ -25,6 +25,7 @@ from finapp.finance.importer import import_report, resolve_uids, sales_overlaps
 from finapp.finance.sales_1c import IN_FLIGHT, build_plan, request_upload, upload_problems
 from finapp.finance.rates import RateBook
 from finapp.finance.reconcile import breakdown, money_check, order_check, unmatched_barcodes
+from finapp.finance.sources import crm as crm_source
 from finapp.finance.settings import (DEFAULT_WAREHOUSES, KIT_SALES_SOURCES, TAX_MODES, WAREHOUSE_KEYS,
                                   effective_rate, load_settings, raw_settings, save_setting, tax_text)
 from finapp.flash import pop_flash, set_flash
@@ -185,6 +186,7 @@ def reports_page(
         totals = {rid: (int(rev or 0), int(pay or 0)) for rid, rev, pay in rows}
 
     accounts = _accounts(db)
+    fin_settings = load_settings(db)
     return templates.TemplateResponse(request, "finance_reports.html", _ctx(
         request, user, "finance-reports",
         reports=reports, totals=totals, accounts=accounts, platform=platform,
@@ -192,6 +194,10 @@ def reports_page(
         api_accounts=[a for a in accounts if a.platform in ("wb", "kit")],
         fetches=db.query(ReportFetch).order_by(ReportFetch.id.desc()).limit(FETCH_LOG_LIMIT).all(),
         fetch_kinds=fetch.KINDS, auto_fetch=fetch.auto_enabled(db),
+        kit_accounts=[a for a in accounts if a.platform == "kit"],
+        crm_status=crm_source.status_text(), crm_available=crm_source.available(),
+        crm_sales_off=fin_settings.kit_sales_source != "crm",
+        crm_commission=str(fin_settings.kit_crm_commission).replace(".", ","),
         default_from=(today_local() - timedelta(days=28)).isoformat(), today=today_local().isoformat(),
     ))
 
