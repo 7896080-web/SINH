@@ -52,14 +52,19 @@
                 <label>&nbsp;</label>
                 <button type="submit" class="btn btn-primary">Сохранить</button>
             </div>
+            {% if a.platform in ('wb', 'kit') %}
+            {# В ТОЙ ЖЕ форме: отдельная форма проверки стирала вписанный, но не
+               сохранённый ключ и отвечала «токен не задан». #}
+            <div class="field">
+                <label>&nbsp;</label>
+                <button type="submit" class="btn" name="then_check" value="1">Сохранить и проверить доступ</button>
+            </div>
+            {% endif %}
         </div>
+        {% if a.platform in ('wb', 'kit') %}
+        <p class="help-text" style="margin:4px 0 0;">Проверка — один запрос к {{ 'WB finance-api (список отчётов за две недели)' if a.platform == 'wb' else 'KIT (первая страница заказов)' }}.</p>
+        {% endif %}
     </form>
-    {% if a.platform in ('wb', 'kit') %}
-    <form method="post" action="/api-keys/{{ a.id }}/check" class="inline-form" style="margin-top:8px;">
-        <button type="submit" class="btn">Проверить доступ</button>
-        <span class="help-text">один запрос к {{ 'WB finance-api (список отчётов за две недели)' if a.platform == 'wb' else 'KIT (первая страница заказов)' }} с сохранённым ключом</span>
-    </form>
-    {% endif %}
 </div>
 {% endfor %}
 

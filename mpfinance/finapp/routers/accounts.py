@@ -96,13 +96,20 @@ def save(account_id: int, request: Request, form=Depends(posted_form), db: Sessi
                f"{account.name}: активен={account.is_active}, кабинет Sync Admin="
                f"{account.sync_account_id or '—'}, изменены ключи: {', '.join(changed) or 'нет'}")
     db.commit()
+    labels = dict(acc.CREDENTIAL_FIELDS[account.platform])
     if autofilled:
         set_flash(request, f"«{account.name}» сохранён, но в поле «{'», «'.join(autofilled)}» браузер "
                            f"подставил ваш пароль входа — поле НЕ изменено. Впишите ключ из кабинета "
                            f"площадки.", "warn")
+    elif form.get("then_check") == "1":
+        ok, message = fetch.check_access(db, account)
+        log_action(db, user.username, "account_checked", f"{account.name}: {'ок' if ok else 'ошибка'} — {message}")
+        db.commit()
+        set_flash(request, f"«{account.name}» сохранён. Проверка доступа: {message}", "good" if ok else "warn")
     else:
         set_flash(request, f"«{account.name}» сохранён."
-                  + (f" Изменены ключи: {', '.join(changed)}." if changed else ""), "good")
+                  + (f" Изменены ключи: {', '.join(labels.get(f, f) for f in changed)}." if changed else ""),
+                  "good")
     return _back()
 
 

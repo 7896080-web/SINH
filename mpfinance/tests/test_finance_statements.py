@@ -273,3 +273,19 @@ def test_check_button_on_accounts_page(client, db, monkeypatch):
     monkeypatch.setattr(fetch, "check_access", lambda db_, acc: (True, "доступ есть"))
     response = client.post(f"/api-keys/{account.id}/check", follow_redirects=True)
     assert "доступ есть" in response.text
+
+
+def test_save_and_check_uses_the_token_just_typed(client, db, monkeypatch):
+    """Аудит 18.10: проверка доступа отдельной формой стирала вписанный, но не
+    сохранённый ключ. «Сохранить и проверить» сохраняет и проверяет им."""
+    from finapp import accounts
+    account = make_account(db)
+    seen = []
+    monkeypatch.setattr(fetch, "check_access",
+                        lambda db_, acc: (seen.append(accounts.credentials(db_, acc).get("finance_token")),
+                                          (True, "доступ есть"))[1])
+    response = client.post(f"/api-keys/{account.id}", data={"name": "ИП Тест", "is_active": "1",
+                                                           "finance_token": "new-token", "then_check": "1"},
+                           follow_redirects=True)
+    assert "Проверка доступа: доступ есть" in response.text
+    assert seen == ["new-token"]
