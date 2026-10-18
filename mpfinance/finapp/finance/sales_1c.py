@@ -105,6 +105,9 @@ def upload_problems(db: Session, report: SalesReport, warehouse: str,
     from finapp import onec          # здесь, а не наверху: onec сам импортирует этот модуль
 
     problems = []
+    if report.report_kind == "предварительный":
+        problems.append("Это предварительные данные еженедельного отчёта Lamoda (без баркодов и "
+                        "возвратов) — в 1С уходит отчёт комиссионера, итоговый документ.")
     if not onec.epf_ready(db):
         problems.append("Обработка 1С ещё не подтвердила версию mark-4 («Диагностика» → "
                         "«Проверить обработку 1С»).")

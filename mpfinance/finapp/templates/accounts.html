@@ -63,6 +63,49 @@
 </div>
 {% endfor %}
 
+<div class="card" id="mail">
+    <h2 style="margin-top:0; font-size:15px;">Почта: отчёты Lamoda</h2>
+    <p class="help-text" style="margin-top:0;">
+        Lamoda присылает еженедельные отчёты письмом (от {{ mail.sender }}). Программа читает ящик по IMAP
+        <b>только на чтение</b> — ничего не помечает и не удаляет — и загружает вложения: еженедельный отчёт —
+        предварительными неделями, отчёт комиссионера — итоговым отчётом (предварительные данные за его период
+        заменяются). Для Gmail и Яндекс 360 нужен <b>пароль приложения</b>.
+        {% if mail_last_check %}<br>Последняя проверка: {{ mail_last_check|local('%d.%m.%Y %H:%M') }} — {{ mail_last_result }}{% endif %}
+    </p>
+    <form method="post" action="/mail/settings" class="filters" style="margin:0;" autocomplete="off">
+        <div class="field"><label>Сервер IMAP</label><input type="text" name="host" value="{{ mail.host }}" placeholder="imap.yandex.ru"></div>
+        <div class="field"><label>Порт</label><input type="text" name="port" value="{{ mail.port }}" style="width:70px;"></div>
+        <div class="field"><label>Логин (адрес)</label><input type="text" name="user_name" value="{{ mail.user }}"></div>
+        <div class="field"><label>Пароль приложения</label><input type="password" name="password" placeholder="{{ 'сохранён' if mail_password_set else 'не задан' }}" autocomplete="new-password"></div>
+        <div class="field"><label>Папка</label><input type="text" name="folder" value="{{ mail.folder }}"></div>
+        <div class="field"><label>От кого</label><input type="text" name="sender" value="{{ mail.sender }}"></div>
+        <div class="field">
+            <label>Кабинет Lamoda</label>
+            <select name="account_id">
+                <option value="">— не указан —</option>
+                {% for a in lamoda_accounts %}<option value="{{ a.id }}" {% if mail.account_id == a.id %}selected{% endif %}>{{ a.name }}</option>{% endfor %}
+            </select>
+        </div>
+        <div class="field"><label>&nbsp;</label><button type="submit" class="btn btn-primary">Сохранить</button></div>
+    </form>
+    <form method="post" action="/mail/check" class="inline-form" style="margin-top:8px;">
+        <button type="submit" class="btn" {% if not mail.configured %}disabled{% endif %}>Проверить почту сейчас</button>
+    </form>
+    {% if mail_messages %}
+    <table style="margin-top:10px;">
+        <thead><tr><th>Письмо</th><th>Получено</th><th>Итог</th></tr></thead>
+        <tbody>
+        {% for m in mail_messages %}
+        <tr><td>{{ m.subject or '—' }}<div class="help-text">{{ m.attachments or '' }}</div></td>
+            <td class="mono">{{ m.received_at|local('%d.%m.%Y %H:%M') }}</td>
+            <td><span class="badge {% if m.status == 'imported' %}badge--good{% elif m.status == 'failed' %}badge--bad{% else %}badge--muted{% endif %}">{{ {'imported': 'загружено', 'failed': 'ошибка', 'skipped': 'пропущено'}.get(m.status, m.status) }}</span>
+                <div class="help-text" style="white-space:pre-line;">{{ m.note or '' }}</div></td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% endif %}
+</div>
+
 <div class="card">
     <h2 style="margin-top:0; font-size:15px;">Новый кабинет</h2>
     <form method="post" action="/api-keys/new" class="filters" style="margin:0;">

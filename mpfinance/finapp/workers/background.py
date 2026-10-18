@@ -3,9 +3,9 @@
 Потоков два, чтобы долгое не держало быстрое:
 - быстрый — обмен с 1С каждые 30 с (своя папка, дёшево), суточное задание и
   копия базы через 10 минут после запуска;
-- тяжёлый — загрузка отчётов по API раз в 5 минут: одна заявка WB идёт
-  десятки минут (WB отдаёт запрос в минуту), и в одном потоке с обменом ответы
-  1С всё это время лежали бы неразобранными.
+- тяжёлый — почта (отчёты Lamoda) раз в 30 минут и загрузка отчётов по API раз
+  в 5 минут: одна заявка WB идёт десятки минут (WB отдаёт запрос в минуту), и в
+  одном потоке с обменом ответы 1С всё это время лежали бы неразобранными.
 SQLite спорит сам с собой только за запись: WAL и `busy_timeout`.
 """
 import logging
@@ -22,6 +22,7 @@ DAILY_EVERY = 3600            # задание само решит, пора л�
 BACKUP_FIRST_AFTER = 600
 FETCH_FIRST_AFTER = 240
 FETCH_EVERY = 300
+MAIL_EVERY = 1800
 
 _stop = threading.Event()
 _fast: threading.Thread | None = None
@@ -32,7 +33,7 @@ def dead_threads() -> list[str]:
     """Какие фоновые потоки должны работать, но умерли (пусто, если фон не запускали)."""
     if _fast is None:
         return []
-    return [name for name, thread in (("быстрый (1С, копия)", _fast), ("тяжёлый (отчёты по API)", _heavy))
+    return [name for name, thread in (("быстрый (1С, копия)", _fast), ("тяжёлый (почта, отчёты по API)", _heavy))
             if thread is None or not thread.is_alive()]
 
 
@@ -61,7 +62,11 @@ def _fast_loop() -> None:
 
 def _heavy_loop() -> None:
     _stop.wait(FETCH_FIRST_AFTER)
+    last_mail = None
     while not _stop.is_set():
+        if last_mail is None or time.monotonic() - last_mail >= MAIL_EVERY:
+            _safe(jobs.job_mail)
+            last_mail = time.monotonic()
         _safe(jobs.job_finance_fetch)
         _stop.wait(FETCH_EVERY)
 

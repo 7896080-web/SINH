@@ -7,14 +7,14 @@ from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.orm import Session
 
-from finapp import accounts as acc, syncdb
+from finapp import accounts as acc, mail, settings, syncdb
 from finapp.audit import log_action
 from finapp.finance import fetch
 from finapp.crypto import mask_value
 from finapp.database import get_db
 from finapp.deps import get_current_user, posted_form
 from finapp.flash import pop_flash, set_flash
-from finapp.models import PLATFORMS, PlatformAccount, User
+from finapp.models import PLATFORMS, MailMessage, PlatformAccount, User
 from finapp.security import verify_password
 from finapp.templating import templates
 
@@ -45,6 +45,10 @@ def page(request: Request, db: Session = Depends(get_db), user: User = Depends(g
         "current_user": user, "active_page": "accounts", "flash": pop_flash(request),
         "rows": rows, "platforms": PLATFORMS, "sync_error": sync_error,
         "sync_names": {s.id: s.name for s in sync_accounts},
+        "mail": mail.load(db), "mail_password_set": bool(settings.get(db, mail.PASSWORD)),
+        "mail_last_check": settings.get(db, mail.LAST_CHECK), "mail_last_result": settings.get(db, mail.LAST_RESULT),
+        "mail_messages": db.query(MailMessage).order_by(MailMessage.id.desc()).limit(15).all(),
+        "lamoda_accounts": [r["account"] for r in rows if r["account"].platform == "lamoda"],
     })
 
 
@@ -112,4 +116,38 @@ def check(account_id: int, request: Request, db: Session = Depends(get_db),
     log_action(db, user.username, "account_checked", f"{account.name}: {'ок' if ok else 'ошибка'} — {message}")
     db.commit()
     set_flash(request, f"{account.name}: {message}", "good" if ok else "warn")
+    return _back()
+
+
+@router.post("/mail/settings")
+def mail_settings(request: Request, host: str = Form(""), port: str = Form("993"), user_name: str = Form(""),
+                  password: str = Form(""), folder: str = Form("INBOX"), sender: str = Form(mail.DEFAULT_SENDER),
+                  account_id: str = Form(""), db: Session = Depends(get_db),
+                  user: User = Depends(get_current_user)):
+    if password.strip() and verify_password(password.strip(), user.password_hash):
+        set_flash(request, "В поле пароля почты браузер подставил ваш пароль входа — почта НЕ сохранена. "
+                           "Впишите пароль приложения от почтового ящика.", "warn")
+        return _back()
+    mail.save(db, host=host, port=port, user=user_name, password=password, folder=folder, sender=sender,
+              account_id=account_id)
+    log_action(db, user.username, "mail_settings", f"{user_name}@{host}:{port}, папка {folder}, от {sender}")
+    db.commit()
+    set_flash(request, "Почта сохранена. Письма проверяются раз в 30 минут, или нажмите «Проверить почту сейчас».",
+              "good")
+    return _back()
+
+
+@router.post("/mail/check")
+def mail_check(request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    try:
+        stats = mail.fetch_new(db)
+    except mail.MailError as e:
+        db.rollback()
+        set_flash(request, f"Почта: {e}", "warn")
+        return _back()
+    if not stats["configured"]:
+        set_flash(request, "Почта не настроена: впишите сервер, логин и пароль.", "warn")
+    else:
+        set_flash(request, f"Почта проверена: новых писем {stats['messages']}, загружено {stats['imported']}, "
+                           f"с ошибкой {stats['failed']}.", "good" if not stats["failed"] else "warn")
     return _back()

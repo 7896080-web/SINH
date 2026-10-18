@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from finapp.audit import log_action
 from finapp import mapping
-from finapp.finance import statements, values as v
+from finapp.finance import lamoda, statements, values as v
 from finapp.finance.formats import ParseResult, parse_sheets
 from finapp.finance.readers import ReportReadError, read_sheets
 from finapp.models import OneCUploadStatus, PlatformAccount, SalesReport, SalesReportLine
@@ -32,6 +32,8 @@ class ImportOutcome:
     warnings: list[str] = field(default_factory=list)
     skipped: bool = False        # такой отчёт уже есть — ничего не записано
     replaced: bool = False       # прежний (ещё не отправленный в 1С) отчёт заменён свежим
+    # Еженедельный отчёт Lamoda раскладывается на несколько отчётов (по неделе).
+    reports: list[SalesReport] = field(default_factory=list)
 
 
 def make_onec_key(platform: str, account_id: int | None, report_number: str | None,
@@ -95,7 +97,8 @@ def overlapping_reports(db: Session, report: SalesReport) -> list[SalesReport]:
 
 def import_report(db: Session, *, platform: str, file_bytes: bytes, filename: str, user: str,
                   account_id: int | None = None, report_number: str = "",
-                  period_from: date | None = None, period_to: date | None = None) -> ImportOutcome:
+                  period_from: date | None = None, period_to: date | None = None,
+                  source: str = "file") -> ImportOutcome:
     outcome = ImportOutcome()
 
     if platform not in v.REPORT_PLATFORMS:
@@ -132,6 +135,10 @@ def import_report(db: Session, *, platform: str, file_bytes: bytes, filename: st
     except ReportReadError as e:
         outcome.errors.append(str(e))
         return outcome
+
+    if platform == "lamoda" and lamoda.is_weekly(sheets):
+        return _import_lamoda_weekly(db, sheets, account_id=account_id, user=user, filename=filename,
+                                     source=source)
 
     parsed = parse_sheets(sheets, platform)
     if parsed.errors:
@@ -180,11 +187,41 @@ def import_report(db: Session, *, platform: str, file_bytes: bytes, filename: st
         return outcome
 
     _store(db, outcome, platform=platform, account_id=account_id, parsed=parsed, user=user,
-           number=number, period_from=period_from, period_to=period_to, source="file",
+           number=number, period_from=period_from, period_to=period_to, source=source,
            file_name=filename, file_sha256=sha256,
            declared_payout=parsed.declared_payout if parsed.declared_payout is not None
            else statements.declared_for(db, platform, number),
            report_kind=None, onec_key=onec_key)
+    if outcome.report is not None and parsed.format.code == lamoda.OFFICIAL_FORMAT:
+        # Отчёт комиссионера — итоговый документ: предварительные данные
+        # еженедельных отчётов за его период заменяются им.
+        fixed = lamoda.apply_correction(db, outcome.report)
+        db.commit()
+        if fixed["lines"]:
+            outcome.warnings.append(
+                f"Коррекция: предварительные данные еженедельных отчётов за период заменены этим "
+                f"отчётом — удалено строк {fixed['lines']} из {fixed['reports']} недельных отчётов.")
+    return outcome
+
+
+def _import_lamoda_weekly(db: Session, sheets, *, account_id, user: str, filename: str,
+                          source: str = "file") -> ImportOutcome:
+    outcome = ImportOutcome()
+    try:
+        weeks, summary = lamoda.import_weekly(db, sheets, account_id=account_id, user=user,
+                                              file_name=filename, source=source)
+    except lamoda.WeeklyError as e:
+        outcome.errors.append(f"Еженедельный отчёт Lamoda не разобран: {e}.")
+        return outcome
+    for week in weeks:
+        if week.errors:
+            outcome.errors.extend(week.errors)
+        elif week.report is not None:
+            outcome.reports.append(week.report)
+    outcome.report = outcome.reports[-1] if outcome.reports else None
+    outcome.warnings.append(summary[:1].upper() + summary[1:] + ".")
+    if not weeks:
+        outcome.errors.append("В еженедельном отчёте нет продаж за незакрытые недели.")
     return outcome
 
 def _store(db: Session, outcome: ImportOutcome, *, platform: str, account_id: int | None,
@@ -253,7 +290,10 @@ def _store(db: Session, outcome: ImportOutcome, *, platform: str, account_id: in
     # бывает два официальных отчёта («основной» и «по выкупам») с одним
     # периодом, и это разные продажи. Задвоение там грозит только от отчёта,
     # загруженного файлом, — про него предупреждает `store_api_report`.
-    overlaps = overlapping_reports(db, report) if source == "file" else []
+    # Предварительные недели Lamoda не в счёт: отчёт комиссионера их заменяет
+    # (`lamoda.apply_correction`), задвоения не будет.
+    overlaps = [r for r in overlapping_reports(db, report) if r.report_kind != lamoda.PROVISIONAL] \
+        if source in ("file", "email") and report_kind != lamoda.PROVISIONAL else []
     if overlaps:
         outcome.warnings.append(
             "Период пересекается с уже загруженными отчётами этой площадки: "
@@ -273,13 +313,16 @@ def _store(db: Session, outcome: ImportOutcome, *, platform: str, account_id: in
 def store_api_report(db: Session, *, platform: str, account_id: int | None, parsed: ParseResult,
                      period_from: date, period_to: date, user: str, report_number: str = "",
                      report_kind: str | None = None, declared_payout: int | None = None,
-                     file_name: str = "", replace_unsent: bool = False) -> ImportOutcome:
-    """Официальный отчёт, забранный по API.
+                     file_name: str = "", replace_unsent: bool = False,
+                     source: str = "api") -> ImportOutcome:
+    """Отчёт, собранный не из файла отчёта: официальный из API или неделя
+    еженедельного отчёта Lamoda (`lamoda.py`).
 
     Тот же отчёт второй раз не загружается (ключ по номеру или периоду). Отчёт,
     который площадка может дополнить задним числом (KIT: отказы при получении
-    доезжают позже), с `replace_unsent=True` ЗАМЕНЯЕТСЯ свежим — но только
-    пока он не ушёл в 1С: документ в 1С уже построен по прежним цифрам."""
+    доезжают позже; Lamoda: каждое письмо повторяет 8 недель), с
+    `replace_unsent=True` ЗАМЕНЯЕТСЯ свежим — но только пока он не ушёл в 1С:
+    документ в 1С уже построен по прежним цифрам."""
     outcome = ImportOutcome()
     if parsed.errors:
         outcome.errors.extend(parsed.errors)
@@ -287,7 +330,9 @@ def store_api_report(db: Session, *, platform: str, account_id: int | None, pars
     onec_key = make_onec_key(platform, account_id, report_number, period_from, period_to)
     existing = db.query(SalesReport).filter(SalesReport.onec_key == onec_key).first()
     if existing is not None:
-        replaceable = (replace_unsent and existing.source == "api"
+        same_kind = existing.source == source or (report_kind is not None
+                                                  and existing.report_kind == report_kind)
+        replaceable = (replace_unsent and same_kind
                        and existing.onec_status in (OneCUploadStatus.none, OneCUploadStatus.failed,
                                                     OneCUploadStatus.timeout))
         if not replaceable:
@@ -300,10 +345,11 @@ def store_api_report(db: Session, *, platform: str, account_id: int | None, pars
         db.flush()
         outcome.replaced = True
     _store(db, outcome, platform=platform, account_id=account_id, parsed=parsed, user=user,
-           number=report_number, period_from=period_from, period_to=period_to, source="api",
+           number=report_number, period_from=period_from, period_to=period_to, source=source,
            file_name=file_name, file_sha256=None, declared_payout=declared_payout,
            report_kind=report_kind, onec_key=onec_key)
-    overlapping_files = [r for r in overlapping_reports(db, outcome.report) if r.source == "file"]
+    overlapping_files = [r for r in overlapping_reports(db, outcome.report) if r.source in ("file", "email")] \
+        if report_kind != lamoda.PROVISIONAL else []
     if overlapping_files:
         outcome.warnings.append(
             "За тот же период есть отчёты, загруженные файлом: "

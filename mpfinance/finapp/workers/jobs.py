@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta
 
-from finapp import backup, config, exchange, onec, settings
+from finapp import backup, config, exchange, mail, onec, settings
 from finapp.database import SessionLocal
 from finapp.finance import fetch
 from finapp.models import OnecTask
@@ -116,5 +116,24 @@ def job_backup() -> None:
     except Exception as e:                       # noqa: BLE001
         logger.exception("копия базы упала")
         beat(db, "backup", False, f"{type(e).__name__}: {e}")
+    finally:
+        db.close()
+
+
+def job_mail() -> None:
+    """Письма с отчётами Lamoda — раз в 30 минут, если почта настроена."""
+    db = SessionLocal()
+    try:
+        if not mail.load(db).configured:
+            return
+        stats = mail.fetch_new(db)
+        if stats["messages"]:
+            logger.info("почта: %s", stats)
+        beat(db, "mail", not stats["failed"],
+             f"писем с ошибкой: {stats['failed']}" if stats["failed"] else "")
+    except Exception as e:                       # noqa: BLE001
+        db.rollback()
+        logger.warning("почта: %s", e)
+        beat(db, "mail", False, f"{type(e).__name__}: {e}")
     finally:
         db.close()

@@ -22,8 +22,10 @@
         несколько недель идёт десятки минут — в фоне.
         <b>Яндекс KIT</b> — финансового отчёта у KIT нет; отчёт за период собирается из официальных
         данных заказов: доставленное за вычетом отказов, стоимость доставки для магазина.
-        <b>Lamoda</b> — финансовых отчётов в API Lamoda нет (только кабинет и ЭДО): официальный отчёт
-        агента загружайте файлом ниже.
+        <b>Lamoda</b> — финансовых отчётов в API Lamoda нет. Еженедельные отчёты приходят письмом и
+        забираются с почты сами (настройка — на «API-ключах»): это предварительные данные. Отчёт
+        комиссионера — итоговый документ: при его загрузке (файлом ниже или письмом) предварительные
+        данные за его период заменяются им, и в 1С уходит только он.
     </p>
     {% if api_accounts %}
     <form method="post" action="/finance/fetch" class="filters" style="border:none; padding:0;">
@@ -170,7 +172,7 @@
                 <div class="help-text">{{ r.account.name if r.account else 'кабинет не указан' }}</div></td>
             <td class="mono">{{ r.period_from.strftime('%d.%m.%Y') }} — {{ r.period_to.strftime('%d.%m.%Y') }}</td>
             <td class="mono">{{ r.report_number or '—' }}
-                <div class="help-text">{{ 'API' if r.source == 'api' else 'файл' }}{% if r.report_kind %} · {{ r.report_kind }}{% endif %}</div></td>
+                <div class="help-text">{{ {'api': 'API', 'email': 'почта'}.get(r.source, 'файл') }}{% if r.report_kind %} · {{ r.report_kind }}{% endif %}</div></td>
             <td class="num">{{ r.lines_count }}</td>
             <td class="num">{{ money(t[0]) }}</td>
             <td class="num">{{ money(t[1]) }}</td>

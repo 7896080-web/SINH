@@ -341,3 +341,19 @@ class PlatformStatement(Base):
     loaded_at = Column(DateTime, default=now_utc, onupdate=now_utc)
 
     account = relationship("PlatformAccount")
+
+
+class MailMessage(Base):
+    """Письмо с отчётом, уже разобранное с почты (`mail.py`). Ящик программа
+    только читает и ничего в нём не помечает — что разобрано, помнит здесь."""
+    __tablename__ = "mail_messages"
+
+    id = Column(Integer, primary_key=True)
+    message_id = Column(String(255), unique=True, nullable=False)
+    received_at = Column(DateTime, nullable=True)
+    sender = Column(String(255), nullable=True)
+    subject = Column(String(500), nullable=True)
+    attachments = Column(Text, nullable=True)            # имена вложений через «; »
+    status = Column(String(16), nullable=False)          # imported / skipped / failed
+    note = Column(Text, nullable=True)
+    processed_at = Column(DateTime, default=now_utc)

@@ -29,6 +29,7 @@
 | AWER CRM | сервер, `C:\awer_crm_data` | снимок `kitcrm.db` (SQLite backup + integrity_check); разово 5 копий из `backups\` | `selectel:awer-backups/awer_crm` (+ `/app_backups`) | каждые 6 ч | 7 снимков | 30 дней; `app_backups` без срока | работает с 15.10 |
 | direct (WB, Директ) | сервер, `C:\direct` | zip: снимки `wb_history.db`, `wb_rec.db` + таблицы, откаты, журналы, скрипты | `selectel:awer-backups/direct` | 05:30 | 7 архивов | 30 дней | работает с 16.10 |
 | Маркировка | рабочий ПК, `C:\marking` | `marking.db` | `selectel:awer-backups/marking` | раз в сутки, через 10 мин после запуска | по программе | по программе | **НЕ настроено**: в `.env` ещё `yandex:marking_backups` |
+| Финансы площадок | сервер, `C:\mpfinance` | `mpfinance-*.db` (копии в `C:\mpfinance\backups`) | — | раз в сутки и перед каждым накатом | всё за сутки + 1/день за 14 дней | — | **в облако НЕ настроено** (программа новая, с 18.10) |
 
 Время в именах копий Sync Admin — UTC, у остальных — московское.
 
@@ -42,6 +43,7 @@
 | AWER CRM | задача «AWER CRM cloud backup» (SYSTEM), `C:\awer_crm_data\cloud_backup\cloud_copy.ps1` + `snap.py` | `C:\awer_crm_data\cloud_backup\rclone.conf` | `C:\awer_crm_data\cloud_backup\cloud_copy.log` | `config.json`, `auth.json` |
 | direct | задача «Direct cloud backup» (SYSTEM), `C:\direct_backup\cloud_copy.ps1` + `snap_direct.py` | `C:\direct_backup\rclone.conf` | `C:\direct_backup\cloud_copy.log` | `wb_tokens.txt`, `*token*.txt`, `config.json`, `crm_config.json`, `.env`, `.venv`, `*.old.*` |
 | Маркировка | встроено; `MARKING_RCLONE_REMOTE` в `C:\marking\.env` | `C:\marking\rclone.conf` | «Диагностика» Маркировки | `.env` |
+| Финансы площадок | встроено (`finapp/backup.py`), только локально | — | «Диагностика» → задание `backup` | `.env` (`MPFIN_SECRETS_KEY`) |
 
 Скрипты задач Windows написаны в ASCII нарочно: Windows PowerShell на сервере
 портит кириллицу в файлах без BOM. Вывод Python в журнал — через

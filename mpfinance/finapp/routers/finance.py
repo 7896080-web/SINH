@@ -193,8 +193,8 @@ def request_api_fetch(
     date_from: str = Form(""), date_to: str = Form(""),
     db: Session = Depends(get_db), user: User = Depends(get_current_user),
 ):
-    """Заявка на загрузку официальных отчётов по API. Сама загрузка — в задании
-    планировщика: WB отдаёт один запрос в минуту, держать на этом страницу нельзя."""
+    """Заявка на загрузку официальных отчётов по API. Сама загрузка — в фоновом
+    задании: WB отдаёт один запрос в минуту, держать на этом страницу нельзя."""
     back = "/finance/reports#api"
     job, error = fetch.request_fetch(db, kind, user.username, _int_or_none(account_id),
                                      _parse_day(date_from), _parse_day(date_to))
@@ -233,6 +233,10 @@ def reports_upload(
         set_flash(request, "Отчёт не загружен. " + " ".join(outcome.errors), "warn")
         return RedirectResponse("/finance/reports", status_code=303)
 
+    if outcome.reports:
+        # Еженедельный отчёт Lamoda — несколько предварительных недель сразу.
+        set_flash(request, " ".join(outcome.warnings), "good")
+        return RedirectResponse("/finance/reports?platform=lamoda", status_code=303)
     report = outcome.report
     message = (f"Отчёт загружен: {report.lines_count} строк, период "
                f"{report.period_from:%d.%m.%Y}–{report.period_to:%d.%m.%Y}.")
