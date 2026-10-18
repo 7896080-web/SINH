@@ -279,3 +279,13 @@ def test_pages_offer_and_describe_crm_load(client, db, crm_db):
                                                    "date_from": "2026-09-07", "date_to": "2026-09-20"},
                            follow_redirects=True)
     assert "AWER CRM — продажи сайта (база CRM)" in response.text
+
+
+def test_fixtures_refuse_to_delete_anything_outside_the_test_folder(tmp_path):
+    """Тесты идут на боевом сервере при каждом накате, рядом с живыми базами
+    sync_admin и AWER CRM: удалить фикстура вправе только свой временный файл."""
+    from tests.conftest import _test_file
+    for path in (tmp_path / "kitcrm.db", r"C:\awer_crm_data\kitcrm.db", r"C:\sync_admin\sync_admin.db"):
+        with pytest.raises(RuntimeError, match="ничего не тронуто"):
+            _test_file(str(path))
+    assert _test_file(config.CRM_DB_PATH).name == "kitcrm.db"

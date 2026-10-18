@@ -129,7 +129,12 @@ Ok "Тесты зелёные"
 $count = & $venvPy -c "import finapp; from finapp.database import SessionLocal; from finapp.models import User; s=SessionLocal(); print(s.query(User).count())"
 if ($count -eq "0") {
     $login = Read-Host "Логин первого пользователя"
-    $pass = Read-Host "Пароль (не короче 8 символов)"
+    # Скрытый ввод: пароль, набранный открыто, остаётся на экране и уезжает
+    # вместе с выводом установки, когда его копируют для разбора.
+    $secure = Read-Host "Пароль (не короче 8 символов, на экране не виден)" -AsSecureString
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+    try { $pass = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
+    finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
     & $venvPy (Join-Path $Root "create_user.py") $login $pass
 } else {
     Ok "Пользователей в базе: $count"

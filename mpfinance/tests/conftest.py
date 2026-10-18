@@ -88,10 +88,23 @@ def db():
         Base.metadata.drop_all(bind=engine)
 
 
+def _test_file(raw: str) -> Path:
+    """Путь, который фикстура вправе удалить: ТОЛЬКО файл во временной папке
+    тестов. Тесты гоняются на боевом сервере при каждом накате, а рядом лежат
+    живые базы sync_admin и AWER CRM (`C:\\sync_admin\\sync_admin.db`,
+    `C:\\awer_crm_data\\kitcrm.db`). Укажи путь туда — правкой окружения выше или
+    порядком импорта, — и фикстура удалила бы их. Здесь отказ, а не удаление."""
+    path = Path(raw).resolve()
+    if _TMP.resolve() not in path.parents:
+        raise RuntimeError(f"тест хотел удалить {path} — это не временный файл тестов; "
+                           f"ничего не тронуто")
+    return path
+
+
 @pytest.fixture(autouse=True)
 def _no_sync_db():
     """По умолчанию базы sync_admin нет; фикстура `sync_db` её заводит."""
-    path = Path(config.SYNC_DB_PATH)
+    path = _test_file(config.SYNC_DB_PATH)
     path.unlink(missing_ok=True)
     yield
     path.unlink(missing_ok=True)
@@ -99,7 +112,7 @@ def _no_sync_db():
 
 @pytest.fixture
 def sync_db():
-    return FakeSyncDb(Path(config.SYNC_DB_PATH))
+    return FakeSyncDb(_test_file(config.SYNC_DB_PATH))
 
 
 # Схема — те таблицы базы AWER CRM (kitcrm.db), которые читает
@@ -186,7 +199,7 @@ class FakeCrm:
 @pytest.fixture(autouse=True)
 def _no_crm_db():
     """По умолчанию базы AWER CRM нет; фикстура `crm_db` её заводит."""
-    path = Path(config.CRM_DB_PATH)
+    path = _test_file(config.CRM_DB_PATH)
     path.unlink(missing_ok=True)
     yield
     path.unlink(missing_ok=True)
@@ -194,7 +207,7 @@ def _no_crm_db():
 
 @pytest.fixture
 def crm_db():
-    return FakeCrm(Path(config.CRM_DB_PATH))
+    return FakeCrm(_test_file(config.CRM_DB_PATH))
 
 
 @pytest.fixture
