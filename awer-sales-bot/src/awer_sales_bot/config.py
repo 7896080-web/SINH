@@ -40,6 +40,8 @@ class StockColumns(BaseModel):
     stock: str = "Остаток"
     arrived: str = "Поступило"
     doc: str = "Документ"
+    brand: str = "Бренд"  # только в поступлениях (карточки новинок)
+    color: str = "Цвет"
 
 
 class DocColumns(BaseModel):

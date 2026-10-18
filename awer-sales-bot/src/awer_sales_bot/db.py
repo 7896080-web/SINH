@@ -198,6 +198,9 @@ CREATE TABLE IF NOT EXISTS answers (            -- ответы на тесты,
     answer INTEGER, text TEXT, correct INTEGER, at TEXT,
     PRIMARY KEY (campaign_id, seller_id, day, q)
 );
+CREATE TABLE IF NOT EXISTS kb_views (           -- кто какие статьи базы знаний открывал (kb.py)
+    seller_id INTEGER NOT NULL, article_id TEXT NOT NULL, at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS lessons_sent (       -- какие уроки и когда ушли продавцу, lessons.py
     seller_id INTEGER NOT NULL REFERENCES sellers(id),
     lesson_id TEXT NOT NULL,              -- id из content/lessons.yaml; программа новичка — onb-<смена>
@@ -229,7 +232,8 @@ class DB:
 
     def _migrate(self) -> None:
         """Новые колонки в базах, созданных раньше (CREATE TABLE IF NOT EXISTS их не добавляет)."""
-        new = {"sellers": [("hired_at", "TEXT"), ("fired_at", "TEXT"), ("crew_id", "INTEGER"),
+        new = {"arrivals": [("brand", "TEXT"), ("color", "TEXT")],
+               "sellers": [("hired_at", "TEXT"), ("fired_at", "TEXT"), ("crew_id", "INTEGER"),
                            ("weekend_key", "INTEGER NOT NULL DEFAULT 0"),  # сильный продавец — ставить на сб и вс
                            ("training_user_id", "INTEGER"),  # user_id в боте «Обучение»
                            ("training_code", "TEXT")],  # код подключения к боту «Обучение»

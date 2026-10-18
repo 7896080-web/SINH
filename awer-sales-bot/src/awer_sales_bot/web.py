@@ -384,6 +384,9 @@ def create_app(cfg: Settings, db: DB) -> FastAPI:
                           x["id"] if kind != "onboarding" else f"onb-{x['data'].get('shift')}")["n"]
             q = db.one("SELECT COUNT(*) n, COALESCE(SUM(correct),0) ok FROM quiz_answers WHERE lesson_id=?", x["id"])
             stat = f"{sent}" + (f" · квиз {q['ok']} из {q['n']} верно" if q["n"] else "")
+            if kind == "article":
+                v = db.one("SELECT COUNT(*) n, COUNT(DISTINCT seller_id) p FROM kb_views WHERE article_id=?", x["id"])
+                stat = f"открыли {v['n']} раз ({v['p']} чел.)"
             topic = (content.LESSON_TOPICS.get(x["topic"]) or content.ARTICLE_SECTIONS.get(x["topic"]) or
                      (f"рабочий день {x['data'].get('shift')}" if kind == "onboarding" else ""))
             b.append(f'<tr><td><a href="/learn/{quote(x["id"])}">{html.escape(x["title"])}</a></td>'

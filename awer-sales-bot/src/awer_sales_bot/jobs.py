@@ -5,7 +5,7 @@ import logging
 import time
 from datetime import date, datetime, timedelta
 
-from . import achievements, coach, crews, goals, lessons, messages, quiz
+from . import achievements, coach, crews, goals, kb, lessons, messages, quiz
 from . import metrics as M
 from .config import Settings
 from .db import DB
@@ -24,7 +24,7 @@ class Sender:
 
     GAP = 0.6  # секунд между сообщениями одному получателю
     # что уходит в бот «Обучение» (если он подключён); остальное — в бот «План»
-    TRAINING_KINDS = {"lesson", "quiz", "onboarding", "coach", "task"}
+    TRAINING_KINDS = {"lesson", "quiz", "onboarding", "coach", "task", "arrivals"}
 
     def __init__(self, db: DB, cfg: Settings, client: MaxClient | None, dry_run: bool = False,
                  training_client: MaxClient | None = None):
@@ -122,8 +122,23 @@ def daily_run(db: DB, cfg: Settings, sender: Sender, today: date | None = None, 
     sender.to_owners(day.isoformat(), "owner_daily", messages.owner_summary(db, cfg, day),
                      quiz.praise_buttons(good, day) or None)
     training_run(db, cfg, sender, today)
+    arrivals_run(db, cfg, sender, today, day)
     coach.run(db, cfg, sender, today)
     return "sent"
+
+
+def arrivals_run(db: DB, cfg: Settings, sender: Sender, today: date, day: date) -> None:
+    """Карточка новинок (модель, бренд, цвет, размеры + статьи) — в бот «Обучение» тем, у кого сегодня рабочий день
+    (нет графика на месяц — всем)."""
+    card = kb.arrivals_card(db, cfg, day)
+    if not card:
+        return
+    month = today.strftime("%Y-%m")
+    for s in db.sellers():
+        if db.scheduled_after(s["id"], month, today - timedelta(days=1)) is not None and \
+                not db.one("SELECT 1 FROM schedule WHERE seller_id=? AND day=?", s["id"], today.isoformat()):
+            continue
+        sender.to_seller(day.isoformat(), "arrivals", s["id"], card[0], card[1])
 
 
 def training_run(db: DB, cfg: Settings, sender: Sender, today: date) -> None:

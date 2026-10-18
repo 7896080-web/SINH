@@ -8,6 +8,7 @@
 2. Шапки ОРП, orp_docs_*.csv:  Дата;Магазин;Касса;Документ;Чеков;Чеков возврата;Выручка
 3. Остатки, stock_*.csv:       Дата;Склад;Номенклатура;Номенклатурная группа;Характеристика;Остаток
 4. Поступления, arrivals_*.csv: Дата;Склад;Документ;Номенклатура;Номенклатурная группа;Характеристика;Поступило
+   [;Бренд;Цвет] — для карточек новинок в боте «Обучение»
 
 Импорт идемпотентен: данные за (день, магазин) из файла полностью заменяются.
 Пары (день, магазин) отмечаются в imported_days — признак «день закрыт» (ОРП проведён).
@@ -205,7 +206,8 @@ def _import_stock(path: Path, rows, h, idx, db: DB, cfg: Settings, kind: str) ->
             continue
         qty = _num(get("stock" if kind == "stock" else "arrived"))
         recs.append((d.isoformat(), store_name(get("store"), cfg), str(get("item")).strip(),
-                     get("category"), str(get("size") or "").strip(), qty, str(get("doc") or "")))
+                     get("category"), str(get("size") or "").strip(), qty, str(get("doc") or ""),
+                     str(get("brand") or "").strip() or None, str(get("color") or "").strip() or None))
     pairs = sorted({(r[0], r[1]) for r in recs})
     with db.tx() as c:
         for day, store in pairs:
@@ -219,8 +221,8 @@ def _import_stock(path: Path, rows, h, idx, db: DB, cfg: Settings, kind: str) ->
             c.executemany("INSERT INTO stock(day,store,item,size,category,qty) VALUES(?,?,?,?,?,?)",
                           [(k[0], k[1], k[2], k[3], v[0], v[1]) for k, v in agg.items() if v[1] > 0])
         else:
-            c.executemany("INSERT INTO arrivals(day,store,item,category,size,qty,doc) VALUES(?,?,?,?,?,?,?)",
-                          [r for r in recs if r[5] > 0])
+            c.executemany("INSERT INTO arrivals(day,store,item,category,size,qty,doc,brand,color) "
+                          "VALUES(?,?,?,?,?,?,?,?,?)", [r for r in recs if r[5] > 0])
     return ImportReport(path.name, kind, len(recs), pairs)
 
 

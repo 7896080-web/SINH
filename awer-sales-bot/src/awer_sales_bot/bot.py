@@ -16,7 +16,7 @@ from datetime import date, datetime, timedelta
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from . import jobs, lessons, messages, quiz, tasks
+from . import jobs, kb, lessons, messages, quiz, tasks
 from .config import Settings
 from .db import DB
 from .max_api import MaxClient
@@ -25,7 +25,8 @@ log = logging.getLogger(__name__)
 HELP = ("Я присылаю каждое утро ваш план, сколько осталось до базы и до следующей ступени, средний чек, "
         "вещей в чеке и советы.\n/plan — состояние на сейчас\n/help — помощь")
 TRAINING_HELP = ("Здесь уроки, тесты и база знаний: ткани, утеплители, уход за вещами. Раз в неделю — урок "
-                 "по вашей цели недели.\n/help — помощь")
+                 "по вашей цели недели.\n/baza — база знаний; или просто напишите слово, например «кашемир»\n"
+                 "/help — помощь")
 
 
 def _extract(u: dict) -> tuple[str, int | None, str]:
@@ -77,8 +78,9 @@ def handle(db: DB, cfg: Settings, client: MaxClient, u: dict) -> None:
     if not uid:
         return
     seller = db.seller_by_user(uid)
-    if not cfg.training_token and task_event(db, cfg, client, u, t, uid, text, seller):
-        return  # второго бота нет — задания отвечаются здесь
+    if not cfg.training_token and (task_event(db, cfg, client, u, t, uid, text, seller) or
+                                   kb_event(db, cfg, client, u, t, uid, text, seller, search=False)):
+        return  # второго бота нет — задания и база знаний (/baza, без поиска по любому слову) здесь
     if t == "message_callback":
         on_callback(db, cfg, client, u, uid, text)
         return
@@ -110,6 +112,28 @@ def handle(db: DB, cfg: Settings, client: MaxClient, u: dict) -> None:
             offer_training(db, cfg, client, linked["id"], uid)
         else:
             welcome_newcomer(db, cfg, client, linked["id"], uid)
+
+
+def kb_event(db: DB, cfg: Settings, client: MaxClient, u: dict, t: str, uid: int, text: str, seller,
+             search: bool = True) -> bool:
+    """База знаний: /baza, кнопки разделов и статей (меняют то же сообщение), поиск по словам. True — обработано."""
+    if t == "message_callback" and text.startswith("k|"):
+        msg, rows = kb.on_callback(db, cfg, text, seller["id"] if seller else None)
+        cb_id = (u.get("callback") or {}).get("callback_id")
+        if cb_id:
+            client.answer(cb_id, message={"text": msg, "format": "markdown", "attachments": [
+                {"type": "inline_keyboard", "payload": {"buttons": rows}}]})
+        return True
+    if t != "message_created" or not text:
+        return False
+    if text.lower() in ("/baza", "база", "база знаний"):
+        msg, rows = kb.home(db, cfg)
+    elif search and seller and not text.startswith("/") and len(text) >= 3:
+        msg, rows = kb.answer_search(db, cfg, text)
+    else:
+        return False
+    client.send(msg, user_id=uid, buttons=rows)
+    return True
 
 
 def task_event(db: DB, cfg: Settings, client: MaxClient, u: dict, t: str, uid: int, text: str, seller) -> bool:
@@ -153,11 +177,15 @@ def handle_training(db: DB, cfg: Settings, client: MaxClient, u: dict) -> None:
         return
     seller = db.seller_by_training_user(uid)
     if t == "message_callback":
-        if not task_event(db, cfg, client, u, t, uid, text, seller):
+        if not task_event(db, cfg, client, u, t, uid, text, seller) and \
+                not kb_event(db, cfg, client, u, t, uid, text, seller):
             on_callback(db, cfg, client, u, uid, text, seller=seller)
         return
     if task_event(db, cfg, client, u, t, uid, text, seller):
         return
+    if text.lower() not in ("/help", "помощь", "/id") and not (not seller and len(text) == 6) and \
+            kb_event(db, cfg, client, u, t, uid, text, seller):
+        return  # /baza или поиск по базе знаний
     linked = None
     if text and (t == "bot_started" or (not seller and len(text) == 6)):
         linked = db.link_training(text, uid)
