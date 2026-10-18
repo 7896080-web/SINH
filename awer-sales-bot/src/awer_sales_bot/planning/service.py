@@ -75,10 +75,12 @@ class MonthPlan:
 
 
 def participants(db: DB, month: str, h: History) -> list:
-    """Активные продавцы, работавшие в окне 3 мес., в самом месяце или стоящие в графике."""
+    """Активные продавцы, работавшие в окне 3 мес., в самом месяце, стоящие в графике или уже в плане месяца."""
     window = {month_add(month, -k) for k in range(0, 4)}
     ids = {int(s) for m in window for s in h.months.get(m, {})}
     ids |= {r["seller_id"] for r in db.q("SELECT DISTINCT seller_id FROM schedule WHERE substr(day,1,7)=?", month)}
+    ids |= {r["seller_id"] for r in db.q("SELECT seller_id FROM plans WHERE month=?", month)}
+    ids |= {r["seller_id"] for r in db.q("SELECT DISTINCT seller_id FROM sales_lines WHERE substr(day,1,7)=?", month)}
     return [r for r in db.sellers() if r["id"] in ids]
 
 
@@ -113,6 +115,32 @@ def freeze(db: DB, cfg: Settings, month: str) -> MonthPlan:
                        mp.store.coef, now))
     mp.frozen_at = now
     return mp
+
+
+def ensure_plans(db: DB, cfg: Settings, month: str) -> list[dict]:
+    """SPEC п. 10: продавцу с продажами в месяце, у которого нет строки в зафиксированном плане, — его план
+    (обычно новичка) одной строкой, не трогая остальных. Возвращает добавленные строки."""
+    if not db.one("SELECT 1 FROM plans WHERE month=?", month):
+        return []
+    missing = db.q("SELECT DISTINCT s.id, s.name FROM sales_lines l JOIN sellers s ON s.id=l.seller_id "
+                   "WHERE substr(l.day,1,7)=? AND s.active=1 AND s.role<>'system' "
+                   "AND s.id NOT IN (SELECT seller_id FROM plans WHERE month=?)", month, month)
+    if not missing:
+        return []
+    p = month_params(db, cfg, month)
+    h = db.history(cfg.norm_shifts, until_month=month_add(month, -1))
+    sp = store_plan(h, month, p, trend_override=trend_manual(db, month))
+    manual = {r["seller_id"]: r["plan_manual"] for r in db.q("SELECT * FROM plan_overrides WHERE month=?", month)}
+    now = datetime.now().isoformat(timespec="seconds")
+    out = []
+    with db.tx() as c:
+        for r in missing:
+            calc = seller_plan(h, month, str(r["id"]), sp, p, manual.get(r["id"]))
+            c.execute("INSERT INTO plans(month,seller_id,plan_full,method,level,trend,store_plan,coef,frozen_at) "
+                      "VALUES(?,?,?,?,?,?,?,?,?)",
+                      (month, r["id"], calc.plan_full, calc.method, calc.level, sp.trend, sp.plan, sp.coef, now))
+            out.append(dict(seller_id=r["id"], name=r["name"], plan=calc.plan_full, method=calc.method))
+    return out
 
 
 def frozen_plan(db: DB, month: str, sid: int) -> float | None:
@@ -190,8 +218,11 @@ def close_month(db: DB, cfg: Settings, month: str) -> list[dict]:
     out = []
     now = datetime.now().isoformat(timespec="seconds")
     with db.tx() as c:
-        for r in db.q("SELECT p.seller_id, p.plan_full, s.role, s.name FROM plans p JOIN sellers s ON s.id=p.seller_id "
-                      "WHERE p.month=?", month):
+        # все из плана + все, у кого есть продажи (SPEC п. 10): без плана — базовая ставка, но в ведомости
+        for r in db.q("SELECT s.id seller_id, p.plan_full, s.role, s.name FROM sellers s "
+                      "LEFT JOIN plans p ON p.seller_id=s.id AND p.month=? "
+                      "WHERE s.role<>'system' AND (p.seller_id IS NOT NULL OR s.id IN "
+                      "(SELECT seller_id FROM sales_lines WHERE substr(day,1,7)=?))", month, month):
             x = h.get(month, str(r["seller_id"]))
             sales, fte = (x.sales, x.fte) if x else (0.0, 0.0)
             res = evaluate(sales, fte, r["plan_full"], r["role"], p, prev.get(r["seller_id"]))

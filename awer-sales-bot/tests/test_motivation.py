@@ -236,3 +236,79 @@ def test_coach_sheet_to_admins_and_owner_once(env, tmp_path):  # noqa: F811
     text = got[0][1]
     assert "**Продавец05** — похвалить: вещей за смену 3,0 (команда 2,0)" in text
     assert "**Продавец04** — обсудить: вещей за смену 1,0 → цель 1,5; урок недели «Образ 1»" in text
+
+
+def test_newcomer_mid_month_gets_plan_and_payroll_row(env, tmp_path):  # noqa: F811
+    from awer_sales_bot.jobs import Sender, daily_run
+    cfg, db = env
+    cfg.max.owners = [1]
+    mp = service.freeze(db, cfg, "2026-10")
+    before = {r["seller_id"]: r["plan_full"] for r in db.q("SELECT * FROM plans WHERE month='2026-10'")}
+    rows = [(oct_day(10 + i), "Новенькая Анна", 40_000, 4) for i in range(8)]
+    import_file(write_sales(tmp_path / "s.csv", rows), db, cfg)
+    for n in ("Новенькая Анна", "Ушедший Пётр"):  # второй: продажи есть, а плана не будет (не активен)
+        db.seller_id(n)
+    with db.tx() as c:
+        c.execute("UPDATE sellers SET active=0 WHERE name='Ушедший Пётр'")
+    import_file(write_sales(tmp_path / "s2.csv", [(oct_day(25), "Ушедший Пётр", 10_000, 1)]), db, cfg)
+
+    daily_run(db, cfg, Sender(db, cfg, None, dry_run=True), today=oct_day(18), force=True)
+    nid = db.seller_id("Новенькая Анна", create=False)
+    row = db.one("SELECT * FROM plans WHERE month='2026-10' AND seller_id=?", nid)
+    assert row["method"] == "newcomer" and row["plan_full"] == pytest.approx(mp.store.newcomer_plan)
+    after = {r["seller_id"]: r["plan_full"] for r in db.q("SELECT * FROM plans WHERE month='2026-10'")}
+    assert {k: v for k, v in after.items() if k != nid} == before  # остальные планы не тронуты
+    note = db.one("SELECT text FROM message_log WHERE kind=?", f"new_plan_{nid}")["text"]
+    assert note.startswith("Новый продавец Новенькая Анна: план 449 146 ₽ на полный месяц (новичок)")
+    assert service.ensure_plans(db, cfg, "2026-10") == []  # второй раз — ничего
+
+    res = {r["name"]: r for r in service.close_month(db, cfg, "2026-10")}
+    assert res["Новенькая Анна"]["plan"] == pytest.approx(mp.store.newcomer_plan)
+    assert res["Ушедший Пётр"]["plan"] is None and res["Ушедший Пётр"]["rate"] == 25_000  # в ведомости, база
+
+
+def test_onboarding_lessons_one_per_day(env, tmp_path, monkeypatch):  # noqa: F811
+    from awer_sales_bot import bot
+    from awer_sales_bot.jobs import training_run
+    cfg, db, client, sender = linked_env(env, tmp_path)
+    monkeypatch.setattr(bot.time, "sleep", lambda s: None)
+    nid = db.seller_id("Новенькая Анна")
+    code = db.new_invite(nid)
+    bot.handle(db, cfg, client, {"update_type": "bot_started", "user": {"user_id": 777}, "payload": code})
+    assert [t.splitlines()[0] for _, t, _ in client.sent][1] == "📚 **Программа новичка, смена 1 из 2: Знакомство**"
+
+    import_file(write_sales(tmp_path / "s.csv", [(oct_day(10), "Новенькая Анна", 30_000, 3)]), db, cfg)
+    client.sent.clear()
+    training_run(db, cfg, sender, oct_day(11))
+    training_run(db, cfg, sender, oct_day(11))  # повтор в тот же день — без второго урока
+    training_run(db, cfg, sender, oct_day(12))  # смена 2 уже отправлена — больше уроков программы нет
+    mine = [t.splitlines()[0] for u, t, _ in client.sent if u == 777]
+    assert mine == ["📚 **Программа новичка, смена 2 из 2: Примерочная**"]
+
+
+def test_real_lessons_file_is_valid_and_returns_topic(env, tmp_path):  # noqa: F811
+    from awer_sales_bot import lessons
+    from awer_sales_bot.config import Settings
+    from awer_sales_bot.jobs import training_run
+    data = lessons.load(Settings())  # content/lessons.yaml из репозитория
+    assert len(data["lessons"]) >= 14 and [x["shift"] for x in data["onboarding"]] == list(range(1, 11))
+    ids = [x["id"] for x in data["lessons"]]
+    assert len(ids) == len(set(ids))
+    for x in data["lessons"]:
+        assert x["topic"] in {"items", "avg_price", "discount", "returns", "general"}
+        assert len(x["title"]) <= 60 and len(x["text"]) <= 900 and len(x["try_today"]) <= 200
+        assert "*" not in x["text"] + x["title"] + x["try_today"] and "_" not in x["text"]
+        for q in x["quiz"]:
+            assert len(q["options"]) == 3 and 0 <= q["correct"] < 3 and all(len(o) <= 60 for o in q["options"])
+
+    cfg, db, client, sender = linked_env(env, tmp_path)
+    cfg.training.lessons_path = Settings().training.lessons_path
+    rows = [(oct_day(i), "Продавец04", 10_000, 2) for i in range(1, 9)] + [(oct_day(9), "Продавец04", -3_000, -1)]
+    import_file(write_sales(tmp_path / "s.csv", rows), db, cfg)
+    uid = db.seller(db.seller_id("Продавец04", create=False))["max_user_id"]
+    training_run(db, cfg, sender, date(2026, 10, 12))  # возвраты 3 000 / 80 000 = 3,75 % — урок не про возвраты
+    first = [t for u, t, _ in client.sent if u == uid][-1]
+    assert "Примерка, после которой" not in first
+    import_file(write_sales(tmp_path / "s.csv", rows + [(oct_day(10), "Продавец04", -8_000, -2)]), db, cfg)
+    training_run(db, cfg, sender, date(2026, 10, 19))  # 11 000 / 80 000 = 13,75 % > 8 %
+    assert [t for u, t, _ in client.sent if u == uid][-1].startswith("📚 **Урок недели: Примерка, после которой")

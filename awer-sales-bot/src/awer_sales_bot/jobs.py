@@ -6,6 +6,7 @@ import time
 from datetime import date, datetime, timedelta
 
 from . import coach, goals, lessons, messages
+from . import metrics as M
 from .config import Settings
 from .db import DB
 from .importers.onec_sales import import_inbox
@@ -13,6 +14,7 @@ from .max_api import MaxClient
 from .planning import service
 
 log = logging.getLogger(__name__)
+RETURNS_SHARE = 0.08  # доля возвратов, с которой урок недели — про примерку и размер (recommendations, правило 5)
 
 
 class Sender:
@@ -83,6 +85,11 @@ def daily_run(db: DB, cfg: Settings, sender: Sender, today: date | None = None, 
                                                           "Рассылка по имеющимся данным.")
     if today.day == 1:
         month_turn(db, cfg, sender, today)
+    for r in service.ensure_plans(db, cfg, day.strftime("%Y-%m")):
+        sender.to_owners(day.isoformat(), f"new_plan_{r['seller_id']}",
+                         f"Новый продавец {r['name']}: план {messages.rub(r['plan'])} на полный месяц "
+                         f"({'новичок' if r['method'] == 'newcomer' else r['method']}). "
+                         "Изменить — админка → «Настройки месяца» → «План вручную».")
     goals.ensure_week(db, cfg, today)
     for s in db.sellers():
         if s["max_user_id"] and (db.worked_shifts(s["id"], day.strftime("%Y-%m"), upto=day) or
@@ -95,21 +102,32 @@ def daily_run(db: DB, cfg: Settings, sender: Sender, today: date | None = None, 
 
 
 def training_run(db: DB, cfg: Settings, sender: Sender, today: date) -> None:
-    """Урок недели (раз в неделю, по теме цели недели) тем, кто работал последние 4 недели."""
-    if not cfg.training.weekly_lesson:
-        return
+    """Новичку — урок программы к следующей смене; остальным — урок недели (раз в неделю, по теме цели недели),
+    если работали последние 4 недели."""
     week = goals.monday(today)
     since = (today - timedelta(days=cfg.motivation.goal_lookback_days)).isoformat()
+    total = len(lessons.load(cfg)["onboarding"])
     for s in db.sellers():
         sid = s["id"]
-        if not s["max_user_id"] or lessons.newcomer_shifts(db, cfg, sid) is not None:
+        if not s["max_user_id"]:
+            continue
+        if lessons.newcomer_shifts(db, cfg, sid) is not None:
+            x = lessons.next_onboarding(db, cfg, sid)  # не больше одного урока программы в день
+            if x and sender.to_seller(today.isoformat(), "onboarding", sid, lessons.onboarding_text(x, total)) == "ok":
+                lessons.mark_sent(db, sid, f"onb-{x['shift']}")
+            continue
+        if not cfg.training.weekly_lesson:
             continue
         if not db.one("SELECT 1 FROM sales_lines WHERE seller_id=? AND day>=?", sid, since):
             continue
         if db.already_sent(week.isoformat(), "lesson", sid):
             continue
         g = goals.get(db, sid, week)
-        lesson = lessons.pick(db, cfg, sid, g.topic if g else "general")
+        topic = g.topic if g else "general"
+        me = M.seller(db, sid, date.fromisoformat(since), today - timedelta(days=1))
+        if (me.returns_share or 0) > RETURNS_SHARE:  # тот же порог, что у совета про возвраты
+            topic = "returns"
+        lesson = lessons.pick(db, cfg, sid, topic)
         if lesson and sender.to_seller(week.isoformat(), "lesson", sid, lessons.text(lesson)) == "ok":
             lessons.mark_sent(db, sid, lesson["id"])
 

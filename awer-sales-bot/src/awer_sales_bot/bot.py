@@ -13,7 +13,7 @@ from datetime import date, datetime, timedelta
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from . import jobs, messages
+from . import jobs, lessons, messages
 from .config import Settings
 from .db import DB
 from .max_api import MaxClient
@@ -42,10 +42,10 @@ def handle(db: DB, cfg: Settings, client: MaxClient, u: dict) -> None:
         return
     seller = db.seller_by_user(uid)
     is_owner = uid in cfg.max.owners
-    reply = None
+    reply = linked = None
     if t == "bot_started" and text:
-        s = db.link_by_code(text, uid)
-        reply = f"Готово, {s['first_name']}! {HELP}" if s else "Код не найден. Возьмите новый у администратора."
+        linked = db.link_by_code(text, uid)
+        reply = f"Готово, {linked['first_name']}! {HELP}" if linked else "Код не найден. Возьмите новый у администратора."
     elif t == "bot_started":
         reply = HELP if seller or is_owner else "Здравствуйте! Отправьте код, который выдал администратор."
     elif text.lower() in ("/help", "помощь"):
@@ -56,12 +56,27 @@ def handle(db: DB, cfg: Settings, client: MaxClient, u: dict) -> None:
         reply = messages.daily(db, cfg, seller["id"], date.today() - timedelta(days=1)) if seller else \
             "Сначала отправьте код от администратора."
     elif not seller and len(text) == 6:
-        s = db.link_by_code(text, uid)
-        reply = f"Готово, {s['first_name']}! {HELP}" if s else "Код не найден. Возьмите новый у администратора."
+        linked = db.link_by_code(text, uid)
+        reply = f"Готово, {linked['first_name']}! {HELP}" if linked else "Код не найден. Возьмите новый у администратора."
     else:
         reply = HELP
     if reply:
         client.send(reply, user_id=uid)
+    if linked:
+        welcome_newcomer(db, cfg, client, linked["id"], uid)
+
+
+def welcome_newcomer(db: DB, cfg: Settings, client: MaxClient, sid: int, uid: int) -> None:
+    """Сразу после привязки новичку — первый урок программы новичка (остальные — с утренней рассылкой)."""
+    x = lessons.next_onboarding(db, cfg, sid)
+    if not x:
+        return
+    key = f"onb-{x['shift']}"
+    text = lessons.onboarding_text(x, len(lessons.load(cfg)["onboarding"]))
+    time.sleep(0.6)  # MAX: не больше 2 сообщений в секунду в один диалог
+    client.send(text, user_id=uid)
+    lessons.mark_sent(db, sid, key)
+    db.log_message(date.today().isoformat(), "onboarding", sid, uid, "ok", text)
 
 
 def poll_forever(db: DB, cfg: Settings, client: MaxClient, stop: threading.Event) -> None:
