@@ -17,7 +17,7 @@ from fastapi import Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-from . import content
+from . import content, health
 from . import tasks as tasks_mod
 from . import crews as crews_mod
 from .config import Settings
@@ -47,6 +47,7 @@ input[type=text],input[type=number]{width:110px;padding:3px;background:#fffbe6;b
 table.grid td,table.grid th{padding:2px 3px;text-align:center}table.grid td.nm{text-align:left;white-space:nowrap}
 table.grid th.we,table.grid td.we{background:#f6f8fa}.off{color:#9a3412;font-weight:bold}
 table.grid td.alien{background:#eceff3}table.grid td.swap{background:#fde68a}table.grid td.sh{font-size:11px;color:#57606a}
+.health{font-size:12px;color:#57606a;margin:4px 0 0}.health.bad{color:#9a3412;font-weight:bold}
 """
 
 
@@ -76,7 +77,7 @@ def create_app(cfg: Settings, db: DB) -> FastAPI:
         nav = (f'<nav><a href="/month/{cur}">Настройки месяца</a><a href="/sellers">Продавцы</a>'
                f'<a href="/crews">Смены</a><a href="/learn">Обучение</a><a href="/tasks">Задания</a><a href="/schedule/{cur}">График работы</a><a href="/month/{cur}/results">Итоги и ведомость</a></nav>')
         return HTMLResponse(f"<!doctype html><html lang=ru><head><meta charset=utf-8><title>{title}</title>"
-                            f"<style>{CSS}</style></head><body>{nav}<h1>{title}</h1>{body}</body></html>")
+                            f"<style>{CSS}</style></head><body>{nav}{health.line(db, cfg)}<h1>{title}</h1>{body}</body></html>")
 
     @app.get("/", dependencies=[Depends(auth)])
     def root():
@@ -216,16 +217,20 @@ def create_app(cfg: Settings, db: DB) -> FastAPI:
             raise HTTPException(401, "bad token")
         from urllib.parse import unquote
 
-        from .importers.onec_sales import import_file
+        from .importers.onec_sales import archive_name, import_file
         name = os.path.basename(unquote(request.headers.get("X-Filename", "upload.csv"))) or "upload.csv"
-        inbox = cfg.onec.inbox
+        inbox, archive = cfg.onec.inbox, cfg.onec.archive
         inbox.mkdir(parents=True, exist_ok=True)
-        path = inbox / name
-        path.write_bytes(await request.body())
-        rep = import_file(path, db, cfg)
-        archive = cfg.onec.archive
         archive.mkdir(parents=True, exist_ok=True)
-        path.replace(archive / name)
+        path = inbox / f".upload-{secrets.token_hex(4)}-{name}"  # не под итоговым именем: import_inbox не заберёт
+        path.write_bytes(await request.body())
+        try:
+            rep = import_file(path, db, cfg)
+        except Exception as e:  # noqa: BLE001 — битый файл в archive/bad, ответ 1С с причиной (аудит В1)
+            (archive / "bad").mkdir(exist_ok=True)
+            path.replace(archive_name(archive / "bad", name))
+            raise HTTPException(422, f"{name}: файл не распознан — {e}") from e
+        path.replace(archive_name(archive, name))
         return {"lines": rep.lines, "days": rep.days, "unknown_sellers": sorted(rep.unknown_sellers)}
 
     # ------------------------------------------------------------------ смены и график работы

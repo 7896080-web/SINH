@@ -5,12 +5,12 @@ import logging
 import time
 from datetime import date, datetime, timedelta
 
-from . import achievements, coach, crews, goals, kb, lessons, messages, quiz
+from . import achievements, coach, crews, goals, health, kb, lessons, messages, quiz
 from . import metrics as M
 from .config import Settings
 from .db import DB
 from .importers.onec_sales import import_inbox
-from .max_api import MaxClient
+from .max_api import MaxAuthError, MaxClient, MaxDenied
 from .planning import service
 
 log = logging.getLogger(__name__)
@@ -33,7 +33,8 @@ class Sender:
         self._last: dict[int, float] = {}
 
     def to_seller(self, day: str, kind: str, sid: int, text: str, buttons: list[list[dict]] | None = None) -> str | None:
-        """Статус отправки ('ok', 'dry', 'no_user', 'error') или None, если отправлять нечего / уже отправлено."""
+        """Статус отправки ('ok', 'dry', 'no_user', 'stopped' — продавец остановил бота, 'error')
+        или None, если отправлять нечего / уже отправлено."""
         if not text or self.db.already_sent(day, kind, sid):
             return None
         s = self.db.seller(sid)
@@ -62,7 +63,13 @@ class Sender:
             (client or self.client).send(text, user_id=uid, buttons=buttons)
             self.db.log_message(day, kind, sid, uid, "ok", text)
             return "ok"
+        except MaxDenied as e:  # продавец остановил или заблокировал бота — не сбой, видно в журнале
+            self.db.log_message(day, kind, sid, uid, "stopped", text, str(e))
+            return "stopped"
         except Exception as e:  # noqa: BLE001
+            if isinstance(e, MaxAuthError):
+                health.error(self.db, "training" if client is not None and client is self.training else "plan",
+                             "MAX не принял токен — нужен новый токен в .env и перезапуск службы")
             log.exception("send failed")
             self.db.log_message(day, kind, sid, uid, "error", text, str(e))
             return "error"
@@ -71,17 +78,22 @@ class Sender:
 
 
 def daily_run(db: DB, cfg: Settings, sender: Sender, today: date | None = None, force: bool = False) -> str:
-    """Импорт выгрузок → проверка закрытия дня → (1-го числа) итоги/план месяца → рассылка за вчера.
+    """Импорт выгрузок → проверка закрытия дня → (новый месяц) итоги/план месяца → рассылка за вчера.
 
-    Возвращает 'sent' | 'waiting' (день не закрыт, повторить позже)."""
+    Возвращает 'sent' | 'waiting' (день не закрыт, повторить позже). Повторный вызов за тот же день безопасен:
+    продавцам и владельцу ничего не уйдёт дважды (журнал message_log) — на этом держится догон (bot.catch_up)."""
     today = today or date.today()
     day = today - timedelta(days=1)
     for rep in import_inbox(db, cfg):
         log.info("импорт %s: строк %s, дни %s", rep.file, rep.lines, rep.days)
+        if rep.error:  # аудит В1: битый файл не останавливает рассылку, но владелец о нём знает
+            sender.to_owners(today.isoformat(), f"bad_file:{rep.file}",
+                             f"Файл из 1С «{rep.file}» не прочитан: {rep.error}. Он перенесён в data/archive/bad, "
+                             "остальные файлы загружены. Выгрузите этот день из 1С ещё раз.", once=True)
         if rep.unknown_sellers:
             sender.to_owners(day.isoformat(), "unknown_sellers",
                              "Новые продавцы в выгрузке 1С: " + ", ".join(sorted(rep.unknown_sellers)) +
-                             ". Подключите их к боту: админка → «Продавцы» → «Выдать код».")
+                             ". Подключите их к боту: админка → «Продавцы» → «Выдать код».", once=True)
     gone = db.q("SELECT s.name, SUM(l.amount) a FROM sales_lines l JOIN sellers s ON s.id=l.seller_id "
                 "WHERE l.day=? AND s.active=0 AND s.role<>'system' AND l.day>s.fired_at GROUP BY s.id", day.isoformat())
     if gone:  # уволенный продавец в чеках — скорее всего, в 1С выбран не тот продавец
@@ -105,8 +117,8 @@ def daily_run(db: DB, cfg: Settings, sender: Sender, today: date | None = None, 
         return "waiting"
     if missing:
         sender.to_owners(day.isoformat(), "missing_day", f"Нет выгрузки 1С за {day:%d.%m} по: {', '.join(missing)}. "
-                                                          "Рассылка по имеющимся данным.")
-    if today.day == 1:
+                                                          "Рассылка по имеющимся данным.", once=True)
+    if month_due(db, today):  # не «сегодня 1-е»: служба могла не работать 1-го числа (аудит В2)
         month_turn(db, cfg, sender, today)
     for r in service.ensure_plans(db, cfg, day.strftime("%Y-%m")):
         sender.to_owners(day.isoformat(), f"new_plan_{r['seller_id']}",
@@ -120,10 +132,12 @@ def daily_run(db: DB, cfg: Settings, sender: Sender, today: date | None = None, 
             sender.to_seller(day.isoformat(), "daily", s["id"], messages.daily(db, cfg, s["id"], day))
     good = achievements.praise(db, cfg, day)
     sender.to_owners(day.isoformat(), "owner_daily", messages.owner_summary(db, cfg, day),
-                     quiz.praise_buttons(good, day) or None)
+                     quiz.praise_buttons(good, day) or None, once=True)
     training_run(db, cfg, sender, today)
     arrivals_run(db, cfg, sender, today, day)
     coach.run(db, cfg, sender, today)
+    if not sender.dry:
+        db.set_kv("daily_done", day.isoformat())  # строка состояния в админке и догон (bot.catch_up)
     return "sent"
 
 
@@ -174,8 +188,16 @@ def training_run(db: DB, cfg: Settings, sender: Sender, today: date) -> None:
                 sender.to_seller(week.isoformat(), "quiz", sid, *quiz.question(lesson, 0))
 
 
+def month_due(db: DB, today: date) -> bool:
+    """Пора ли начинать месяц: план текущего месяца не зафиксирован или прошлый месяц с планом не закрыт."""
+    prev = (today.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+    return not db.one("SELECT 1 FROM plans WHERE month=?", today.strftime("%Y-%m")) or bool(
+        db.one("SELECT 1 FROM plans WHERE month=?", prev) and not db.one("SELECT 1 FROM results WHERE month=?", prev))
+
+
 def month_turn(db: DB, cfg: Settings, sender: Sender, today: date) -> None:
-    """1-го числа: итоги прошлого месяца, фиксация и рассылка нового плана."""
+    """Начало месяца (1-го числа или первый запуск после него): итоги прошлого месяца, фиксация и рассылка
+    нового плана. Сообщения за месяц уходят один раз — журнал по ключу месяца."""
     prev = (today.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
     cur = today.strftime("%Y-%m")
     if db.one("SELECT 1 FROM plans WHERE month=?", prev):

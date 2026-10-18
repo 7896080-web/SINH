@@ -16,8 +16,10 @@
 from __future__ import annotations
 
 import csv
+import logging
 import re
 import shutil
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -28,6 +30,8 @@ import openpyxl
 from ..config import Settings
 from ..db import DB
 
+log = logging.getLogger(__name__)
+
 
 @dataclass
 class ImportReport:
@@ -37,6 +41,7 @@ class ImportReport:
     days: list[tuple[str, str]]
     skipped: int = 0
     unknown_sellers: set[str] = field(default_factory=set)
+    error: str = ""  # файл не распознан / не прочитан — перенесён в archive/bad
 
 
 def _num(v) -> float:
@@ -248,14 +253,34 @@ def import_file(path: str | Path, db: DB, cfg: Settings) -> ImportReport:
                      f"«{cfg.onec.doc_columns.revenue}») — см. docs/1C.md")
 
 
+FRESH_SECONDS = 60  # файл моложе минуты может ещё дописываться 1С — заберём в следующий раз
+
+
+def archive_name(archive: Path, name: str) -> Path:
+    """Имя в архиве со временем приёма — файл с тем же именем не затирает прошлый (аудит Н6)."""
+    return archive / f"{datetime.now():%Y%m%d-%H%M%S}_{name}"
+
+
 def import_inbox(db: DB, cfg: Settings) -> list[ImportReport]:
-    """Импортирует все файлы из папки входящих (сначала шапки, потом строки) и переносит в архив."""
+    """Импортирует все файлы из папки входящих (сначала шапки, потом строки) и переносит в архив.
+
+    Файл, который не удалось прочитать, не останавливает остальные (аудит В1): он уходит в archive/bad,
+    в отчёте — error, и владелец получает сообщение (jobs.daily_run)."""
     inbox, archive = Path(cfg.onec.inbox), Path(cfg.onec.archive)
     archive.mkdir(parents=True, exist_ok=True)
     out = []
-    files = [f for f in inbox.glob("*") if f.suffix.lower() in (".xlsx", ".xlsm", ".csv") and not f.name.startswith("~$")]
+    now = time.time()
+    files = [f for f in inbox.glob("*") if f.suffix.lower() in (".xlsx", ".xlsm", ".csv")
+             and not f.name.startswith(("~$", ".")) and now - f.stat().st_mtime >= FRESH_SECONDS]
     order = lambda f: (0 if "doc" in f.name.lower() else 2 if f.name.lower().startswith(("stock", "arrival")) else 1, f.name)  # noqa: E731
     for f in sorted(files, key=order):
-        out.append(import_file(f, db, cfg))
-        shutil.move(str(f), archive / f"{datetime.now():%Y%m%d-%H%M%S}_{f.name}")
+        try:
+            out.append(import_file(f, db, cfg))
+            shutil.move(str(f), archive_name(archive, f.name))
+        except Exception as e:  # noqa: BLE001
+            log.exception("файл %s не импортирован", f.name)
+            bad = archive / "bad"
+            bad.mkdir(exist_ok=True)
+            shutil.move(str(f), archive_name(bad, f.name))
+            out.append(ImportReport(f.name, "error", 0, [], error=str(e)[:300]))
     return out

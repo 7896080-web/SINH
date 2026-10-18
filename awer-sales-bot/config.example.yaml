@@ -49,8 +49,8 @@ schedule:
   deadline_time: "13:00"         # после — отправка по имеющимся данным + предупреждение владельцу
 
 max:
-  base_url: https://platform-api.max.ru
-  auth: header                   # header | query — проверить по dev.max.ru
+  base_url: https://platform-api2.max.ru   # с 19.07.2026; сертификат Минцифры встроен в бота
+  ca_file: ""                    # свой корневой сертификат — только если MAX сменит цепочку
   owners: []                     # user_id владельца/управляющего в MAX (узнать: написать боту, см. журнал)
   poll_timeout: 30
   bot_link: ""                   # https://max.ru/<имя_бота> — для ссылок-приглашений

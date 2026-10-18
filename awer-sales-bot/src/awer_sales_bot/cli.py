@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 from datetime import date
 
 from . import config as config_mod
@@ -38,6 +39,7 @@ def main(argv: list[str] | None = None) -> None:
     dr.add_argument("--force", action="store_true", help="не ждать закрытия дня")
     cl = sub.add_parser("close-month", help="итоги месяца и ставки")
     cl.add_argument("month")
+    sub.add_parser("check-max", help="проверить связь с MAX и токены ботов (ничего не отправляет)")
     sub.add_parser("bot", help="запустить бота (long polling + расписание)")
     sv = sub.add_parser("serve", help="бот + админка в одном процессе (для службы Windows)")
     sv.add_argument("--host", default="127.0.0.1")
@@ -94,7 +96,7 @@ def main(argv: list[str] | None = None) -> None:
     elif a.cmd == "daily":
         from .jobs import Sender, daily_run
         from .max_api import MaxClient
-        client = None if a.dry_run else MaxClient(cfg.max_token, cfg.max.base_url, cfg.max.auth)
+        client = None if a.dry_run else MaxClient(cfg.max_token, cfg.max.base_url, cfg.max.ca_file)
         today = date.fromisoformat(a.today) if a.today else date.today()
         print(daily_run(db, cfg, Sender(db, cfg, client, dry_run=a.dry_run), today, force=a.force))
     elif a.cmd == "close-month":
@@ -102,6 +104,19 @@ def main(argv: list[str] | None = None) -> None:
         for r in service.close_month(db, cfg, a.month):
             perf = "—" if r["performance"] is None else f"{r['performance']:.0%}"
             print(f"  {r['name']:<28} {r['sales']:>12,.0f}  {perf:>5}  ставка {r['rate']:,.0f}")
+    elif a.cmd == "check-max":
+        from .max_api import MaxAuthError, MaxClient
+        for name, token in (("«План»", os.environ.get("MAX_BOT_TOKEN")), ("«Обучение»", cfg.training_token)):
+            if not token:
+                print(f"{name}: токен не задан в .env")
+                continue
+            try:
+                me = MaxClient(token, cfg.max.base_url, cfg.max.ca_file).me()
+                print(f"{name}: на связи — {me.get('name') or me.get('first_name')} (user_id {me.get('user_id')})")
+            except MaxAuthError:
+                print(f"{name}: MAX не принял токен — проверьте .env")
+            except Exception as e:  # noqa: BLE001
+                print(f"{name}: нет связи с {cfg.max.base_url} — {e}")
     elif a.cmd == "bot":
         from .bot import run
         run(cfg, db)
@@ -110,9 +125,12 @@ def main(argv: list[str] | None = None) -> None:
 
         import uvicorn
 
-        from .bot import run
+        from .bot import guarded, run
         from .web import create_app
-        threading.Thread(target=run, args=(cfg, DB(cfg.db_path)), daemon=True, name="max-bot").start()
+        if os.environ.get("MAX_BOT_TOKEN"):  # иначе только админка; в строке состояния — «бот не запущен»
+            threading.Thread(target=guarded, args=(run, cfg, DB(cfg.db_path)), daemon=True, name="max-bot").start()
+        else:
+            logging.warning("MAX_BOT_TOKEN не задан — запущена только админка")
         uvicorn.run(create_app(cfg, db), host=a.host, port=a.port)
     elif a.cmd == "web":
         import uvicorn

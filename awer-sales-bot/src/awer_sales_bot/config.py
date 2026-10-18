@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .planning.engine import Params
 
@@ -80,11 +80,17 @@ class Schedule(BaseModel):
 
 
 class MaxCfg(BaseModel):
-    base_url: str = "https://platform-api.max.ru"
-    auth: str = "header"  # header -> Authorization: <token>; query -> ?access_token=<token>
+    base_url: str = "https://platform-api2.max.ru"  # с 19.07.2026; токен — заголовок Authorization
+    ca_file: str = ""  # свой файл корневого сертификата, если MAX сменит цепочку (Минцифры уже встроен)
     owners: list[int] = Field(default_factory=list)  # user_id владельца/управляющих — получают сводку
-    poll_timeout: int = 30
+    poll_timeout: int = 30  # секунд ожидания событий в одном запросе (MAX: 0–90)
     bot_link: str = ""  # https://max.ru/<имя_бота> — для ссылок-приглашений
+
+    @field_validator("base_url")
+    @classmethod
+    def _new_address(cls, v: str) -> str:
+        # старый адрес из ранних config.yaml: с 19.07.2026 MAX работает только на platform-api2
+        return v.replace("://platform-api.max.ru", "://platform-api2.max.ru")
 
 
 class TrainingBot(BaseModel):

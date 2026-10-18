@@ -28,6 +28,9 @@ awer-bot = "awer_sales_bot.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+awer_sales_bot = ["certs/*.pem"]  # сертификат Минцифры для platform-api2.max.ru
+
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]

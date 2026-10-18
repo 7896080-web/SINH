@@ -10,16 +10,17 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from datetime import date, datetime, timedelta
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from . import jobs, kb, lessons, messages, quiz, tasks
+from . import health, jobs, kb, lessons, messages, quiz, tasks
 from .config import Settings
 from .db import DB
-from .max_api import MaxClient
+from .max_api import MaxAuthError, MaxClient
 
 log = logging.getLogger(__name__)
 HELP = ("Я присылаю каждое утро ваш план, сколько осталось до базы и до следующей ступени, средний чек, "
@@ -30,14 +31,16 @@ TRAINING_HELP = ("Здесь уроки, тесты и база знаний: т
 
 
 def _extract(u: dict) -> tuple[str, int | None, str]:
-    """(тип, user_id, текст/payload) из апдейта MAX."""
+    """(тип, user_id, текст/payload) из апдейта MAX. Сообщения из групп и от ботов — без user_id (не отвечаем)."""
     t = u.get("update_type", "")
-    if t == "bot_started":
+    if t in ("bot_started", "bot_stopped"):
         user = u.get("user") or {}
         return t, user.get("user_id"), (u.get("payload") or "")
     if t == "message_created":
         msg = u.get("message") or {}
         sender = msg.get("sender") or {}
+        if sender.get("is_bot") or (msg.get("recipient") or {}).get("chat_type", "dialog") != "dialog":
+            return t, None, ""
         return t, sender.get("user_id"), ((msg.get("body") or {}).get("text") or "").strip()
     if t == "message_callback":  # нажатие кнопки: payload вместо текста
         cb = u.get("callback") or {}
@@ -78,6 +81,9 @@ def handle(db: DB, cfg: Settings, client: MaxClient, u: dict) -> None:
     if not uid:
         return
     seller = db.seller_by_user(uid)
+    if t == "bot_stopped":
+        _stopped(db, seller, uid)
+        return
     if not cfg.training_token and (task_event(db, cfg, client, u, t, uid, text, seller) or
                                    kb_event(db, cfg, client, u, t, uid, text, seller, search=False)):
         return  # второго бота нет — задания и база знаний (/baza, без поиска по любому слову) здесь
@@ -176,6 +182,9 @@ def handle_training(db: DB, cfg: Settings, client: MaxClient, u: dict) -> None:
     if not uid:
         return
     seller = db.seller_by_training_user(uid)
+    if t == "bot_stopped":
+        _stopped(db, seller, uid)
+        return
     if t == "message_callback":
         if not task_event(db, cfg, client, u, t, uid, text, seller) and \
                 not kb_event(db, cfg, client, u, t, uid, text, seller):
@@ -215,56 +224,144 @@ def welcome_newcomer(db: DB, cfg: Settings, client: MaxClient, sid: int, uid: in
     db.log_message(date.today().isoformat(), "onboarding", sid, uid, "ok", text)
 
 
+def _stopped(db: DB, seller, uid: int) -> None:
+    """Продавец остановил бота (bot_stopped) — в журнал, чтобы владелец видел, почему сообщения не доходят."""
+    db.log_message(date.today().isoformat(), "bot_stopped", seller["id"] if seller else None, uid, "stopped", "")
+
+
+AUTH_TEXT = "MAX не принял токен — нужен новый токен в .env и перезапуск службы"
+AUTH_WAIT = 600  # секунд между проверками при отозванном токене — чаще бессмысленно
+
+
+def _failed(db: DB, client: MaxClient, u: dict, err: Exception) -> None:
+    """Событие не обработано: в журнал (видно владельцу) и человеку — просьба повторить. Marker всё равно
+    сдвигается — иначе одно «ядовитое» событие остановит бота навсегда."""
+    t, uid, text = _extract(u)
+    db.log_message(date.today().isoformat(), "incoming", None, uid, "error", f"{t}: {text}"[:500], repr(err)[:300])
+    if uid and t in ("message_created", "bot_started"):
+        try:
+            client.send("Не получилось обработать сообщение. Попробуйте ещё раз через минуту.", user_id=uid)
+        except Exception:  # noqa: BLE001
+            log.exception("не удалось сообщить об ошибке")
+
+
+def connect(db: DB, client: MaxClient, bot: str, stop: threading.Event) -> dict | None:
+    """GET /me с повторами: нет связи при старте службы — ждём, а не падаем (аудит В5). None — если остановили."""
+    backoff = 5
+    while not stop.is_set():
+        try:
+            me = client.me()
+            health.ok(db, bot)
+            log.info("MAX bot %s: %s", health.NAMES[bot], me)
+            return me
+        except MaxAuthError as e:
+            log.error("MAX bot %s: %s", health.NAMES[bot], e)
+            health.error(db, bot, AUTH_TEXT)
+            stop.wait(AUTH_WAIT)
+        except Exception as e:  # noqa: BLE001
+            log.warning("MAX bot %s: нет связи (%s), повтор через %s с", health.NAMES[bot], e, backoff)
+            health.error(db, bot, f"нет связи с MAX ({type(e).__name__})")
+            stop.wait(backoff)
+            backoff = min(backoff * 2, 300)
+    return None
+
+
 def poll_forever(db: DB, cfg: Settings, client: MaxClient, stop: threading.Event, handler=handle,
-                 marker_key: str = "max_marker") -> None:
+                 marker_key: str = "max_marker", bot: str = "plan") -> None:
     marker = int(db.get_kv(marker_key) or 0) or None
     backoff = 5
     while not stop.is_set():
         try:
             res = client.updates(marker, timeout=cfg.max.poll_timeout)
+            health.ok(db, bot)
             for u in res.get("updates", []):
                 try:
                     handler(db, cfg, client, u)
-                except Exception:  # noqa: BLE001
+                except Exception as e:  # noqa: BLE001
                     log.exception("update failed: %s", u)
+                    _failed(db, client, u, e)
             if res.get("marker") is not None:
                 marker = res["marker"]
                 db.set_kv(marker_key, str(marker))
             backoff = 5
-        except Exception:  # noqa: BLE001
+        except MaxAuthError as e:
+            log.error("MAX bot %s: %s", health.NAMES[bot], e)
+            health.error(db, bot, AUTH_TEXT)
+            stop.wait(AUTH_WAIT)
+        except Exception as e:  # noqa: BLE001
             log.exception("polling error, retry in %ss", backoff)
+            health.error(db, bot, f"нет связи с MAX ({type(e).__name__})")
             stop.wait(backoff)
             backoff = min(backoff * 2, 60)
 
 
-def run(cfg: Settings, db: DB) -> None:
-    client = MaxClient(cfg.max_token, cfg.max.base_url, cfg.max.auth)
-    log.info("MAX bot «План»: %s", client.me())
-    training = None
-    if cfg.training_token:
-        training = MaxClient(cfg.training_token, cfg.max.base_url, cfg.max.auth)
-        log.info("MAX bot «Обучение»: %s", training.me())
-    sender = jobs.Sender(db, cfg, client, training_client=training)
-    sched = BackgroundScheduler(timezone=cfg.timezone)
+def run(cfg: Settings, db: DB, stop: threading.Event | None = None) -> None:
+    stop = stop or threading.Event()
+    client = MaxClient(cfg.max_token, cfg.max.base_url, cfg.max.ca_file)
+    if connect(db, client, "plan", stop) is None:
+        return
+    training = MaxClient(cfg.training_token, cfg.max.base_url, cfg.max.ca_file) if cfg.training_token else None
+    jdb = DB(cfg.db_path)  # у заданий по расписанию своё соединение — не делят транзакцию с опросом (аудит В6)
+    sender = jobs.Sender(jdb, cfg, client, training_client=training)
+    # пропущенный на минуты запуск (сон, нагрузка) выполняется, а не теряется; несколько пропущенных — один раз
+    sched = BackgroundScheduler(timezone=cfg.timezone, job_defaults={"misfire_grace_time": 3600, "coalesce": True})
     hh, mm = map(int, cfg.schedule.daily_send_time.split(":"))
+    busy = threading.Lock()
 
     def daily():
-        # повторяем, пока день не закрыт (нет выгрузок по всем магазинам) или не наступил дедлайн
-        if jobs.daily_run(db, cfg, sender) == "waiting":
-            sched.add_job(daily, "date", run_date=datetime.now() + timedelta(minutes=cfg.schedule.retry_minutes))
+        if not busy.acquire(blocking=False):
+            return  # рассылка уже идёт (догон и расписание совпали)
+        try:
+            # повторяем, пока день не закрыт (нет выгрузок по всем магазинам) или не наступил дедлайн
+            if jobs.daily_run(jdb, cfg, sender) == "waiting":
+                sched.add_job(daily, "date", run_date=datetime.now() + timedelta(minutes=cfg.schedule.retry_minutes),
+                              id="daily_retry", replace_existing=True)
+        except Exception as e:  # noqa: BLE001
+            log.exception("daily failed")
+            sender.to_owners(date.today().isoformat(), "daily_failed",
+                             f"Утренняя рассылка не прошла: {e}. Бот повторяет каждые 15 минут; "
+                             "подробности — data/service.log.", once=True)
+        finally:
+            busy.release()
+
+    def catch_up():
+        """Аудит В2: служба не работала во время рассылки (перезагрузка, сбой) или рассылка упала — догоняем
+        рассылку за вчера. Признак — kv daily_done, а не время запуска."""
+        due = datetime.now().strftime("%H:%M") >= cfg.schedule.daily_send_time
+        if due and jdb.get_kv("daily_done") != (date.today() - timedelta(days=1)).isoformat() \
+                and not sched.get_job("daily_retry"):
+            daily()
 
     sched.add_job(daily, "cron", hour=hh, minute=mm, id="daily")
+    sched.add_job(catch_up, "interval", minutes=15, id="catch_up", next_run_time=datetime.now() + timedelta(seconds=30))
     # тесты, опросы, чек-листы — каждые 15 минут проверяем, у каких рассылок сейчас тестовые часы
-    sched.add_job(lambda: tasks.run_due(db, cfg, sender), "cron", minute="*/15", id="tasks")
+    sched.add_job(lambda: tasks.run_due(jdb, cfg, sender), "cron", minute="*/15", id="tasks")
     sched.start()
-    stop = threading.Event()
     if training:  # у второго бота свой опрос событий и своя отметка marker
-        threading.Thread(target=poll_forever, args=(DB(cfg.db_path), cfg, training, stop, handle_training,
-                                                     "max_marker_training"), daemon=True, name="max-training").start()
+        threading.Thread(target=guarded, args=(_training_loop, cfg, training, stop), daemon=True,
+                         name="max-training").start()
     try:
         poll_forever(db, cfg, client, stop)
     except KeyboardInterrupt:
         stop.set()
     finally:
-        sched.shutdown()
+        sched.shutdown(wait=False)
         time.sleep(0.1)
+
+
+def _training_loop(cfg: Settings, client: MaxClient, stop: threading.Event) -> None:
+    tdb = DB(cfg.db_path)
+    if connect(tdb, client, "training", stop) is not None:
+        poll_forever(tdb, cfg, client, stop, handle_training, "max_marker_training", "training")
+
+
+def guarded(target, *args) -> None:
+    """Поток бота упал из-за ошибки в программе — завершаем процесс целиком, служба (NSSM) его перезапустит.
+    Иначе админка продолжает работать, а рассылки нет, и никто этого не замечает (аудит В5)."""
+    try:
+        target(*args)
+        log.critical("поток %s завершился — перезапуск службы", threading.current_thread().name)
+    except BaseException:  # noqa: BLE001
+        log.critical("поток %s упал — перезапуск службы", threading.current_thread().name, exc_info=True)
+    logging.shutdown()
+    os._exit(1)
