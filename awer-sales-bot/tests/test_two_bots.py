@@ -36,7 +36,7 @@ def test_one_qr_connects_both_bots_and_messages_are_split(env, tmp_path, monkeyp
     bot.handle_training(db, cfg, train, {"update_type": "bot_started", "user": {"user_id": 9501}, "payload": code})
     assert db.seller(sid)["training_user_id"] == 9501
     assert train.sent[0][1].startswith("Готово, Мария! Здесь уроки, тесты и база знаний")
-    assert train.sent[1][1].startswith("📚 **Программа новичка, рабочий день 1 из 2")
+    assert train.sent[1][1].startswith("📚 **Программа новичка (1 из 2)")
     assert "обучение ✅" in web.get("/sellers", auth=AUTH).text
 
     # уроки — в «Обучение», план — в «План»

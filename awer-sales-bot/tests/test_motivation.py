@@ -281,7 +281,7 @@ def test_onboarding_lessons_one_per_day(env, tmp_path, monkeypatch):  # noqa: F8
     nid = db.seller_id("Новенькая Анна")
     code = db.new_invite(nid)
     bot.handle(db, cfg, client, {"update_type": "bot_started", "user": {"user_id": 777}, "payload": code})
-    assert [t.splitlines()[0] for _, t, _ in client.sent][1] == "📚 **Программа новичка, рабочий день 1 из 2: Знакомство**"
+    assert [t.splitlines()[0] for _, t, _ in client.sent][1] == "📚 **Программа новичка (1 из 2): Знакомство**"
 
     import_file(write_sales(tmp_path / "s.csv", [(oct_day(10), "Новенькая Анна", 30_000, 3)]), db, cfg)
     client.sent.clear()
@@ -289,7 +289,7 @@ def test_onboarding_lessons_one_per_day(env, tmp_path, monkeypatch):  # noqa: F8
     training_run(db, cfg, sender, oct_day(11))  # повтор в тот же день — без второго урока
     training_run(db, cfg, sender, oct_day(12))  # смена 2 уже отправлена — больше уроков программы нет
     mine = [t.splitlines()[0] for u, t, _ in client.sent if u == 777]
-    assert mine == ["📚 **Программа новичка, рабочий день 2 из 2: Примерочная**"]
+    assert mine == ["📚 **Программа новичка (2 из 2): Примерочная**"]
 
 
 def test_real_lessons_file_is_valid_and_returns_topic(env, tmp_path):  # noqa: F811

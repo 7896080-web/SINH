@@ -82,3 +82,21 @@ def test_learn_pages(env, tmp_path):  # noqa: F811
     star = web.post("/learn/obraz-1", data={"kind": "lesson", "title": "Образ *1*", "questions": QS}, auth=AUTH)
     assert "Символы * и _" in star.text
     assert date.today()  # страница отвечает без ошибок
+
+
+def test_repo_content_loads(env):  # noqa: F811
+    from awer_sales_bot.config import Settings
+    cfg, db = env
+    cfg.training.lessons_path = Settings().training.lessons_path  # content/ из репозитория
+    n = {k: len(content.items(db, cfg, k)) for k in content.KINDS}
+    assert n["lesson"] >= 14 and n["onboarding"] == 10 and n["article"] >= 20
+    assert n["test"] == 4 and n["survey"] == 3 and n["checklist"] == 3
+    for x in content.items(db, cfg, "article"):
+        assert x["topic"] in content.ARTICLE_SECTIONS and len(x["body"]) <= 1500
+        assert "*" not in x["body"] and "_" not in x["body"]
+    for x in content.items(db, cfg, "test"):
+        for q in x["data"]["questions"]:
+            assert 0 <= q["correct"] < len(q["options"]) and all(len(o) <= 128 for o in q["options"])
+    texts = " ".join((x["body"] or "") + " " + (x["try_today"] or "") for k in ("lesson", "onboarding")
+                     for x in content.items(db, cfg, k)).lower()
+    assert "к брюкам и джинсам — ремень" not in texts and "к джинсам — ремень" not in texts
