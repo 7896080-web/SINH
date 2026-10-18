@@ -186,3 +186,21 @@ def test_paste_patch_is_refused_when_a_file_was_deleted(tmp_path):
     (root / "finapp" / "b.py").unlink()
     with pytest.raises(SystemExit, match="finapp/b.py"):
         gen_package.build_patch(str(root), "finB", base, "finA", str(server))
+
+
+@needs_git
+def test_file_patch_runs_the_same_apply_and_carries_both_commands(tmp_path):
+    """Патч файлом (кладут в папку программы и запускают) — тот же apply, что и
+    блоками, с проверкой SHA всего тела и обеими командами наката в шапке."""
+    import lzma
+    import gen_package
+    root, base, server = _repo(tmp_path)
+    text, info = gen_package.build_patch(str(root), "finB", base, "finA", str(server), paste=False)
+    assert f"-File {server}\\finB_deploy.ps1" in text and "update_server.ps1 -Tag finB" in text
+    body = text.split("$b = @'\n", 1)[1].split("\n'@", 1)[0]
+    b64 = re.sub(r"\s", "", body)
+    assert hashlib.sha256(b64.encode()).hexdigest() == info["full_sha"] and info["full_sha"] in text
+    done = _run_apply(tmp_path, lzma.decompress(base64.b64decode(b64)).decode("utf-8"))
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (server / "finapp" / "new.py").read_bytes() == (root / "finapp" / "new.py").read_bytes()
+    assert (server / "deploy" / "INSTALLED_TAG").read_text(encoding="utf-8").startswith("finB")

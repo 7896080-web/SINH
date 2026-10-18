@@ -15,15 +15,15 @@ Apply-скрипт:
 
     python scripts/gen_package.py --tag fin1 --out /tmp/mpfinance_fin1.ps1
 
-Патч для вставки в консоль (`--since`): только файлы, изменённые после версии,
-что стоит на сервере, — блоками base64, как патчи sync_admin (БЛОК 1 … БЛОК N,
-потом БЛОК APPLY; после каждого блока печатается его SHA256). Apply-скрипт
-патча ДО первой записи сверяет версию на диске (`deploy\\INSTALLED_TAG` —
-та, на которую патч рассчитан) и SHA256 каждого файла, который собирается
-заменить: файл обязан быть либо прежней версии, либо уже новой. Разошёлся хоть
-один — не трогается ничего.
+Патч (`--since`): только файлы, изменённые после версии, что стоит на сервере.
+Файл `finN_deploy.ps1` кладут в папку программы и запускают (как патчи
+sync_admin). Apply-скрипт патча ДО первой записи сверяет версию на диске
+(`deploy\\INSTALLED_TAG` — та, на которую патч рассчитан) и SHA256 каждого
+файла, который собирается заменить: файл обязан быть либо прежней версии, либо
+уже новой. Разошёлся хоть один — не трогается ничего. С `--paste` тот же патч
+выходит блоками для вставки в консоль (БЛОК 1 … БЛОК N, потом БЛОК APPLY).
 
-    python scripts/gen_package.py --tag fin7 --since c0d0a1c --base-tag fin5 --out /tmp/fin7_patch.ps1
+    python scripts/gen_package.py --tag fin8 --since c0d0a1c --base-tag fin5 --out /tmp/fin8_deploy.ps1
 """
 from __future__ import annotations
 
@@ -218,6 +218,36 @@ if ((Hx $b) -ne "{full_sha}") {{
 '''
 
 
+PATCH_FILE = r'''# ===== {tag}: патч программы «Финансы площадок» для {root} — поверх {base_tag} =====
+# Положить в {root} и запустить (PowerShell от администратора):
+#     powershell -ExecutionPolicy Bypass -File {root}\{tag}_deploy.ps1
+#     powershell -ExecutionPolicy Bypass -File {root}\deploy\update_server.ps1 -Tag {tag}
+# Файлов в патче: {count}. До первой записи сверяются версия на диске ({base_tag}) и
+# SHA256 каждого заменяемого файла; разошлось хоть что-то — не трогается ничего.
+$ErrorActionPreference = "Stop"
+$Root = "{root}"
+function Hx($s) {{
+    $h = [System.Security.Cryptography.SHA256]::Create()
+    ($h.ComputeHash([Text.Encoding]::ASCII.GetBytes($s)) | ForEach-Object {{ $_.ToString("x2") }}) -join ""
+}}
+$b = @'
+{body}
+'@
+$b = $b -replace "\s", ""
+if ((Hx $b) -ne "{full_sha}") {{ Write-Host "[X] Патч повреждён (SHA256 не сошёлся) — перенесите файл заново" -ForegroundColor Red; exit 1 }}
+$py = "$Root\.venv\Scripts\python.exe"
+if (-not (Test-Path $py)) {{ Write-Host "[X] Нет $py — программа не установлена (сначала deploy\install_server.ps1)" -ForegroundColor Red; exit 1 }}
+[IO.File]::WriteAllText("$Root\{tag}.b64", $b, [Text.Encoding]::ASCII)
+& $py -c "import base64,lzma,sys;open(sys.argv[2],'wb').write(lzma.decompress(base64.b64decode(open(sys.argv[1]).read())))" "$Root\{tag}.b64" "$Root\{tag}_apply.py"
+& $py "$Root\{tag}_apply.py"
+$rc = $LASTEXITCODE
+Remove-Item "$Root\{tag}.b64", "$Root\{tag}_apply.py" -Force -ErrorAction SilentlyContinue
+if ($rc -ne 0) {{ Write-Host "[X] Патч не применён — см. вывод выше" -ForegroundColor Red; exit 1 }}
+Write-Host "[OK] Патч {tag} разложен в $Root" -ForegroundColor Green
+Write-Host "Дальше: powershell -ExecutionPolicy Bypass -File $Root\deploy\update_server.ps1 -Tag {tag}"
+'''
+
+
 def _git_bytes(root: str, ref: str, rel: str) -> bytes | None:
     """Файл в версии `ref` (путь — от корня программы) или None, если его там нет."""
     done = subprocess.run(["git", "-C", root, "show", f"{ref}:./{rel}"], capture_output=True)
@@ -244,7 +274,7 @@ def changed_since(root: str, ref: str) -> tuple[list[tuple[str, bytes, bytes | N
 
 
 def build_patch(root: str, tag: str, since: str, base_tag: str, target: str,
-                parts: int = 3, width: int = 80, var: str = "m") -> tuple[str, dict]:
+                parts: int = 3, width: int = 80, var: str = "m", paste: bool = True) -> tuple[str, dict]:
     changed, gone = changed_since(root, since)
     if gone:
         # Патч только пишет. Удалённый файл остался бы на сервере, и тест,
@@ -262,6 +292,11 @@ def build_patch(root: str, tag: str, since: str, base_tag: str, target: str,
     apply_src = PATCH_APPLY_TEMPLATE.format(root=target, tag=tag, base_tag=base_tag, files=entries)
     b64 = base64.b64encode(lzma.compress(apply_src.encode("utf-8"), preset=9 | lzma.PRESET_EXTREME)).decode("ascii")
     full_sha = hashlib.sha256(b64.encode("ascii")).hexdigest()
+    info = {"files": [e[0] for e in entries], "b64_len": len(b64), "full_sha": full_sha}
+    if not paste:
+        body = "\n".join(b64[i:i + 100] for i in range(0, len(b64), 100))
+        return PATCH_FILE.format(tag=tag, root=target, base_tag=base_tag, count=len(entries), body=body,
+                                 full_sha=full_sha), info
     chunk = (len(b64) + parts - 1) // parts
     pieces = [b64[i:i + chunk] for i in range(0, len(b64), chunk)]
     out = [f"# ===== {tag}: патч «Финансов площадок» для {target} — поверх {base_tag} =====\n"
@@ -279,8 +314,7 @@ def build_patch(root: str, tag: str, since: str, base_tag: str, target: str,
     concat = " + ".join(f"${var}{i}" for i in range(1, len(pieces) + 1))
     out.append(PASTE_APPLY.format(part_checks=part_checks, concat=concat, full_sha=full_sha,
                                   root=target, tag=tag))
-    return "".join(out), {"files": [e[0] for e in entries], "b64_len": len(b64), "parts": len(pieces),
-                          "full_sha": full_sha}
+    return "".join(out), dict(info, parts=len(pieces))
 
 
 def release_files(root: str) -> list[str]:
@@ -315,14 +349,15 @@ def main() -> int:
     ap.add_argument("--tag", required=True, help="метка пакета, напр. fin1")
     ap.add_argument("--out", required=True)
     ap.add_argument("--target", default=r"C:\mpfinance")
-    ap.add_argument("--since", help="патч для вставки в консоль: только изменённое после этой версии git")
+    ap.add_argument("--since", help="патч: только изменённое после этой версии git")
     ap.add_argument("--base-tag", help="метка версии на сервере, на которую рассчитан патч (с --since)")
-    ap.add_argument("--parts", type=int, default=3, help="сколько блоков base64 в патче")
+    ap.add_argument("--paste", action="store_true", help="патч блоками для вставки в консоль, а не файлом")
+    ap.add_argument("--parts", type=int, default=3, help="сколько блоков base64 (с --paste)")
     a = ap.parse_args()
     if a.since:
         if not a.base_tag:
             ap.error("с --since нужен --base-tag — какая версия стоит на сервере")
-        text, info = build_patch(HERE, a.tag, a.since, a.base_tag, a.target, parts=a.parts)
+        text, info = build_patch(HERE, a.tag, a.since, a.base_tag, a.target, parts=a.parts, paste=a.paste)
     else:
         text, info = build(HERE, a.tag, a.target)
     # С BOM: Windows PowerShell 5.1 читает .ps1 без BOM как cp1251, и кириллица

@@ -73,9 +73,11 @@
 Его запускают на сервере, затем `deploy\update_server.ps1 -Tag finN`. Первая
 установка — `deploy\install_server.ps1`.
 
-Патч вставкой в консоль (как у Sync Admin: БЛОК 1…N, затем БЛОК APPLY) — только
-изменённое после версии на сервере: `python scripts/gen_package.py --tag finN
---since <коммит той версии> --base-tag finM --out finN_patch.ps1`. Apply сверяет
+Патч — только изменённое после версии на сервере: `python scripts/gen_package.py
+--tag finN --since <коммит той версии> --base-tag finM --out finN_deploy.ps1`.
+Файл переносят в `C:\mpfinance` и запускают (`powershell -ExecutionPolicy Bypass
+-File C:\mpfinance\finN_deploy.ps1`) — так накатывают и на этом сервере, и Sync
+Admin. С `--paste` тот же патч выходит блоками для вставки в консоль. Apply сверяет
 `INSTALLED_TAG` и SHA256 каждого заменяемого файла ДО первой записи; разошлось
 хоть что-то — не трогает ничего. Удалённые файлы патчем не накатить — нужен
 полный пакет. После патча — тот же `update_server.ps1 -Tag finN`.
