@@ -144,7 +144,7 @@
             <tr>
                 <th>Площадка</th><th class="num">Выручка</th><th class="num">Комиссия</th><th class="num">Логистика</th>
                 <th class="num">Хранение</th><th class="num">Штрафы и удержания</th><th class="num">Себестоимость</th>
-                <th class="num">Налог и доп. расходы</th><th class="num">Прибыль</th>
+                <th class="num">Налоги и доп. расходы</th><th class="num">Прибыль</th>
             </tr>
         </thead>
         <tbody>
@@ -152,7 +152,7 @@
         <tr>
             <td>{{ platform_badge(p, platform_labels, platform_colors) }}</td>
             <td class="num">{{ money(t.revenue, true) }}</td>
-            {% for part in [t.commission, t.logistics, t.storage, t.other_costs, t.cogs, t.tax + t.extra, t.profit] %}
+            {% for part in [t.commission, t.logistics, t.storage, t.other_costs, t.cogs, t.taxes + t.extra, t.profit] %}
             <td class="num">{{ money(part, true) }}<div class="help-text">{{ ((part / t.revenue) if t.revenue > 0 else none) | pct }}</div></td>
             {% endfor %}
         </tr>
@@ -160,7 +160,7 @@
         </tbody>
     </table>
     </div>
-    <p class="help-text">Налог: {{ tax_modes[settings.tax_mode] }}{% if settings.tax_mode != 'none' %}, {{ settings.tax_rate }} %{% endif %}.
+    <p class="help-text">Налоги: {{ tax_text }}{% if tax_effective is not none %} — {{ '%.2f'|format(tax_effective)|replace('.', ',') }}% выручки{% endif %}.
        Настраивается на странице <a href="/finance/costs#settings">«Себестоимость»</a>.</p>
 </div>
 

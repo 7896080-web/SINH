@@ -93,6 +93,24 @@ def test_tax_modes_and_extra_cost(db):
     assert rows[0].totals.tax == 15750          # 15 % от (2100 − 1000 − 50)
 
 
+def test_usn_income_with_non_refundable_vat_inside_the_price(db):
+    """Режим владельца (18.10.2026): УСН «доходы» 5% и невозвратный НДС 5%.
+    НДС — внутри цены (из 2500 ₽ — 2500·5/105 = 119,05 ₽), база УСН — выручка
+    без НДС. Вместе — 10/105 ≈ 9,52% выручки, а не 10%."""
+    from finapp.finance.settings import effective_rate, tax_text
+    make_product(db)
+    _cost(db, "u1", 100000)
+    make_report(db, lines=[_sale()])
+    settings = FinanceSettings(tax_mode="revenue", tax_rate=Decimal("5"), vat_rate=Decimal("5"))
+    rows, *_ = unit_economics(db, PERIOD, settings)
+    t = rows[0].totals
+    assert t.vat == 11905                        # 250000 · 5/105 = 11904,76
+    assert t.tax == 11905                        # (250000 − 11905) · 5% = 11904,75
+    assert t.profit == 210000 - 100000 - 11905 - 11905
+    assert round(effective_rate(settings), 2) == Decimal("9.52")
+    assert tax_text(settings) == "УСН «доходы» 5% от выручки без НДС + НДС 5% внутри цены, невозвратный"
+
+
 def test_unassigned_costs_shown_separately_or_allocated_to_the_kopeck(db):
     make_product(db, uid="u1", article="A-1", barcodes=("111",))
     make_product(db, uid="u2", article="B-2", barcodes=("222",))

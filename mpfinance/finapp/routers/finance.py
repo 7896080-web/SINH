@@ -26,7 +26,7 @@ from finapp.finance.sales_1c import IN_FLIGHT, build_plan, request_upload, uploa
 from finapp.finance.rates import RateBook
 from finapp.finance.reconcile import breakdown, money_check, order_check, unmatched_barcodes
 from finapp.finance.settings import (DEFAULT_WAREHOUSES, KIT_SALES_SOURCES, TAX_MODES, WAREHOUSE_KEYS,
-                                  load_settings, raw_settings, save_setting)
+                                  effective_rate, load_settings, raw_settings, save_setting, tax_text)
 from finapp.flash import pop_flash, set_flash
 from finapp.models import (Barcode, OnecTask, OneCUploadStatus, PlatformAccount, PlatformStatement, Product,
                            ProductCost, ReportFetch, SalesReport, SalesReportLine, User)
@@ -143,6 +143,7 @@ def finance_dashboard(
         summary=summary, platforms=platforms, total=total, chart=chart, bucket=bucket,
         trend_rows=trend_rows, top=top, losers=losers, settings=settings,
         tax_modes=TAX_MODES, not_in_1c=not_in_1c, reports_in_period=reports_in_period,
+        tax_text=tax_text(settings), tax_effective=effective_rate(settings),
         meter_width=charts.meter_width,
     ))
 
@@ -444,7 +445,8 @@ def unit_economics_page(
         rows=rows, unassigned=unassigned, total=total, allocated=allocated, allocate=allocate,
         d_from=d_from, d_to=d_to, preset=preset, presets=PRESETS, platform=platform,
         account_id=account, accounts=_accounts(db), group_by=group_by, groups=GROUPS,
-        platforms=v.REPORT_PLATFORMS, settings=settings, tax_modes=TAX_MODES,
+        platforms=v.REPORT_PLATFORMS, settings=settings, tax_modes=TAX_MODES, tax_text=tax_text(settings),
+        tax_effective=effective_rate(settings),
     ))
 
 
@@ -464,7 +466,8 @@ def unit_economics_export(
     headers = ["Артикул", "Наименование", "Размер", "Цвет", "ID_1С", "Площадки", "Продано, шт",
                "Возвраты, шт", "Чистые продажи, шт", "Выручка", "Комиссия площадки", "Логистика",
                "Хранение", "Штрафы, приёмка, удержания − компенсации", "К перечислению",
-               "Себестоимость", "Доп. расходы", "Налог", "Прибыль", "Маржинальность, %", "ROI, %",
+               "Себестоимость", "Доп. расходы", "Налог УСН", "НДС (невозвратный)", "Прибыль",
+               "Маржинальность, %", "ROI, %",
                "Прибыль на единицу", "Продано без себестоимости, шт", "Нет в 1С"]
 
     def pct(value):
@@ -475,7 +478,7 @@ def unit_economics_export(
                 t.net_qty, v.kop_to_rub(t.revenue), v.kop_to_rub(t.commission),
                 v.kop_to_rub(t.logistics), v.kop_to_rub(t.storage), v.kop_to_rub(t.other_costs),
                 v.kop_to_rub(t.total_payout), v.kop_to_rub(t.cogs), v.kop_to_rub(t.extra),
-                v.kop_to_rub(t.tax), v.kop_to_rub(t.profit), pct(t.margin), pct(t.roi),
+                v.kop_to_rub(t.tax), v.kop_to_rub(t.vat), v.kop_to_rub(t.profit), pct(t.margin), pct(t.roi),
                 v.kop_to_rub(t.profit_per_unit), t.cost_missing_qty, "" if matched else "да"]
 
     data = [line(g.title, g.article, g.size, g.color, g.uid_1c,
@@ -525,6 +528,7 @@ def costs_page(
         products=products, costs=costs, total=total, limit=COSTS_LIMIT, q=q, missing=missing,
         with_cost=with_cost, products_total=db.query(Product).count(),
         raw=raw_settings(db), tax_modes=TAX_MODES, warehouse_keys=WAREHOUSE_KEYS,
+        tax_text=tax_text(load_settings(db)), tax_effective=effective_rate(load_settings(db)),
         kit_sales_sources=KIT_SALES_SOURCES,
         latest_rate=rates.latest(),
         cost_jobs=db.query(OnecTask).filter(OnecTask.command == "EXPORT_COST_PRICES")
@@ -651,7 +655,7 @@ def costs_import(
 def finance_settings_save(
     request: Request, FIN_TAX_MODE: str = Form("revenue"), FIN_TAX_RATE: str = Form("6"),
     FIN_EXTRA_COST_PER_UNIT: str = Form("0"), FIN_USD_RATE_MANUAL: str = Form(""),
-    FIN_AUTO_FETCH: str = Form("1"), FIN_KIT_CRM_COMMISSION: str = Form("3.5"),
+    FIN_AUTO_FETCH: str = Form("1"), FIN_KIT_CRM_COMMISSION: str = Form("3.5"), FIN_VAT_RATE: str = Form("0"),
     FIN_KIT_SALES_SOURCE: str = Form("crm"),
     FIN_WAREHOUSE_WB: str = Form(""), FIN_WAREHOUSE_OZON: str = Form(""),
     FIN_WAREHOUSE_KIT: str = Form(""), FIN_WAREHOUSE_LAMODA: str = Form(""),
@@ -668,6 +672,7 @@ def finance_settings_save(
             ("ставка налога", FIN_TAX_RATE, Decimal(100), False),
             ("доп. расходы на единицу", FIN_EXTRA_COST_PER_UNIT, None, False),
             ("комиссия AWER CRM", FIN_KIT_CRM_COMMISSION, Decimal(100), False),
+            ("ставка НДС", FIN_VAT_RATE, Decimal(100), False),
             ("курс доллара", FIN_USD_RATE_MANUAL, Decimal(100000), True)):
         cleaned = (text or "").replace(",", ".").replace(" ", "").strip()
         if not cleaned and allow_empty:
@@ -694,6 +699,7 @@ def finance_settings_save(
         "FIN_USD_RATE_MANUAL": (FIN_USD_RATE_MANUAL or "").replace(",", ".").replace(" ", "").strip(),
         "FIN_AUTO_FETCH": FIN_AUTO_FETCH,
         "FIN_KIT_CRM_COMMISSION": (FIN_KIT_CRM_COMMISSION or "0").replace(",", ".").replace(" ", "").strip(),
+        "FIN_VAT_RATE": (FIN_VAT_RATE or "0").replace(",", ".").replace(" ", "").strip(),
         "FIN_KIT_SALES_SOURCE": FIN_KIT_SALES_SOURCE,
         **{key: name.strip() for key, name in warehouses.items()},
     }

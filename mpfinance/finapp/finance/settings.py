@@ -43,7 +43,9 @@ DEFAULT_WAREHOUSES = {
 WAREHOUSE_KEYS = {p: f"FIN_WAREHOUSE_{p.upper()}" for p in DEFAULT_WAREHOUSES}
 DEFAULTS = {
     "FIN_TAX_MODE": "revenue",
-    "FIN_TAX_RATE": "6",
+    # УСН «доходы» 5% и невозвратный НДС 5% — режим владельца (18.10.2026).
+    "FIN_TAX_RATE": "5",
+    "FIN_VAT_RATE": "5",
     "FIN_EXTRA_COST_PER_UNIT": "0",
     "FIN_USD_RATE_MANUAL": "",
     "FIN_AUTO_FETCH": "1",
@@ -63,6 +65,9 @@ class FinanceSettings:
     warehouses: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_WAREHOUSES))
     usd_rate_manual: Decimal | None = None      # ₽ за доллар, если курса ЦБ нет
     kit_crm_commission: Decimal = Decimal("3.5")  # % от «Суммы» AWER CRM
+    # НДС на УСН (пониженная ставка 5% или 7%): ВНУТРИ цены продажи и
+    # невозвратный — входящий НДС к вычету не принимается. 0 — без НДС.
+    vat_rate: Decimal = Decimal("0")
     kit_sales_source: str = "crm"                # KIT_SALES_SOURCES
 
 
@@ -94,6 +99,7 @@ def load_settings(db: Session) -> FinanceSettings:
         usd_rate_manual=manual if manual and manual > 0 else None,
         kit_crm_commission=min(_decimal(raw["FIN_KIT_CRM_COMMISSION"], DEFAULTS["FIN_KIT_CRM_COMMISSION"]),
                                Decimal(100)),
+        vat_rate=min(_decimal(raw["FIN_VAT_RATE"], DEFAULTS["FIN_VAT_RATE"]), Decimal(100)),
         kit_sales_source=raw["FIN_KIT_SALES_SOURCE"] if raw["FIN_KIT_SALES_SOURCE"] in KIT_SALES_SOURCES
         else DEFAULTS["FIN_KIT_SALES_SOURCE"],
     )
@@ -104,3 +110,29 @@ def save_setting(db: Session, key: str, value: str) -> bool:
     if key not in DEFAULTS:
         raise KeyError(key)
     return store.put(db, key, value)
+
+
+def tax_text(settings: FinanceSettings) -> str:
+    """Как считается налог — одной строкой для страниц: дашборд, юнит-экономика и
+    настройки говорят одно и то же."""
+    def pct(value: Decimal) -> str:
+        return f"{value.normalize():f}".replace(".", ",") + "%"
+    parts = []
+    if settings.tax_mode == "revenue":
+        parts.append(f"УСН «доходы» {pct(settings.tax_rate)}" + (" от выручки без НДС" if settings.vat_rate else " от выручки"))
+    elif settings.tax_mode == "profit":
+        parts.append(f"УСН «доходы − расходы» {pct(settings.tax_rate)} от прибыли до налога")
+    if settings.vat_rate:
+        parts.append(f"НДС {pct(settings.vat_rate)} внутри цены, невозвратный")
+    return " + ".join(parts) if parts else "налог не учитывается"
+
+
+def effective_rate(settings: FinanceSettings) -> Decimal | None:
+    """Доля выручки, уходящая в налоги при УСН «доходы» (с НДС внутри цены).
+    Для «доходы − расходы» от выручки не считается — None."""
+    vat_share = settings.vat_rate / (100 + settings.vat_rate)
+    if settings.tax_mode == "revenue":
+        return (vat_share + (1 - vat_share) * settings.tax_rate / 100) * 100
+    if settings.tax_mode == "none":
+        return vat_share * 100
+    return None

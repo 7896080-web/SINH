@@ -18,7 +18,7 @@ from finapp.audit import log_action
 from finapp import progress
 from finapp import mapping
 from finapp.finance import lamoda, statements, values as v
-from finapp.finance.formats import AWER_CRM_FORMAT, ParseResult, apply_commission, parse_sheets
+from finapp.finance.formats import AWER_CRM_FORMAT, KIT_PAY_FORMAT, ParseResult, apply_commission, parse_sheets
 from finapp.finance.settings import load_settings
 from finapp.finance.readers import ReportReadError, read_sheets
 from finapp.models import OneCUploadStatus, PlatformAccount, SalesReport, SalesReportLine
@@ -206,6 +206,14 @@ def import_report(db: Session, *, platform: str, file_bytes: bytes, filename: st
                                   "Исправьте файл и загрузите снова.")
         return outcome
 
+    if parsed.format is KIT_PAY_FORMAT and load_settings(db).kit_sales_source == "crm":
+        # 3,5% AWER CRM — это и есть эквайринг Яндекс Пэй (владелец, 18.10.2026):
+        # продажи из CRM уже за его вычетом, и детализация Пэй вычла бы его второй раз.
+        outcome.errors.append(
+            "Детализация Яндекс Пэй не загружена: продажи сайта берутся из AWER CRM, и комиссия "
+            "эквайринга уже вычтена из них (ставка — «Себестоимость» → «Настройки»). Загрузка Пэй "
+            "вычла бы её второй раз.")
+        return outcome
     if parsed.format is AWER_CRM_FORMAT:
         _awer_crm(db, parsed, outcome)
 
@@ -259,6 +267,13 @@ def import_report(db: Session, *, platform: str, file_bytes: bytes, filename: st
            declared_payout=parsed.declared_payout if parsed.declared_payout is not None
            else statements.declared_for(db, platform, number),
            report_kind=None, onec_key=onec_key)
+    if outcome.report is not None and parsed.format is AWER_CRM_FORMAT:
+        pay = [r for r in overlapping_reports(db, outcome.report) if r.source_format == KIT_PAY_FORMAT.code]
+        if pay:
+            outcome.warnings.insert(0, "За этот период загружена детализация Яндекс Пэй: "
+                                    + ", ".join(f"#{r.id}" for r in pay[:5])
+                                    + " — комиссия эквайринга посчитается дважды (она уже вычтена из "
+                                      "продаж AWER CRM). Удалите детализацию Пэй.")
     if outcome.report is not None and parsed.format.code == lamoda.OFFICIAL_FORMAT:
         # Отчёт комиссионера — итоговый документ: предварительные данные
         # еженедельных отчётов за его период заменяются им.

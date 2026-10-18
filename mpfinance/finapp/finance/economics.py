@@ -64,10 +64,11 @@ class Totals:
     cost_missing_qty: int = 0
     unmatched_lines: int = 0
     tax: int = 0
+    vat: int = 0          # невозвратный НДС (внутри цены продажи)
     extra: int = 0
 
     MONEY = ("revenue", "commission", "payout", "logistics", "storage", "penalty", "acceptance",
-             "deduction", "compensation", "cogs", "tax", "extra")
+             "deduction", "compensation", "cogs", "tax", "vat", "extra")
 
     def add(self, other: "Totals"):
         for name in ("sold_qty", "returned_qty", "cost_missing_qty", "unmatched_lines") + self.MONEY:
@@ -93,7 +94,12 @@ class Totals:
 
     @property
     def profit(self) -> int:
-        return self.total_payout - self.cogs - self.extra - self.tax
+        return self.total_payout - self.cogs - self.extra - self.tax - self.vat
+
+    @property
+    def taxes(self) -> int:
+        """Налоги вместе: УСН и невозвратный НДС."""
+        return self.tax + self.vat
 
     @staticmethod
     def _ratio(num: int, den: int) -> float | None:
@@ -146,12 +152,21 @@ def _round(value: Decimal) -> int:
 
 
 def apply_tax_and_extra(totals: Totals, settings: FinanceSettings):
+    """Налоги на выручку.
+
+    НДС на УСН (5% или 7%) — ВНУТРИ цены продажи: из выручки 105 ₽ НДС 5 ₽, то
+    есть доля ставка/(100+ставка). Он невозвратный — входящий НДС на УСН к
+    вычету не принимается, поэтому это чистый расход. В доходы УСН НДС,
+    предъявленный покупателю, не входит, поэтому база «доходов» — выручка без
+    НДС. При 5% + 5% налоги — 10/105 ≈ 9,52% выручки, а не 10%.
+    """
     totals.extra = totals.net_qty * settings.extra_cost_kop
     rate = settings.tax_rate / 100
+    totals.vat = _round(Decimal(totals.revenue) * settings.vat_rate / (100 + settings.vat_rate))
     if settings.tax_mode == "revenue":
-        totals.tax = _round(Decimal(totals.revenue) * rate)
+        totals.tax = _round(Decimal(totals.revenue - totals.vat) * rate)
     elif settings.tax_mode == "profit":
-        totals.tax = _round(Decimal(totals.total_payout - totals.cogs - totals.extra) * rate)
+        totals.tax = _round(Decimal(totals.total_payout - totals.vat - totals.cogs - totals.extra) * rate)
     else:
         totals.tax = 0
 

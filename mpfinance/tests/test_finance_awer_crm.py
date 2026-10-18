@@ -106,3 +106,36 @@ def test_order_check_does_not_call_every_order_missing(db, sync_db):
                            account_id=account.id).report
     check = order_check(db, report)
     assert check.applicable is False and "номера заказов для покупателя" in check.reason
+
+
+
+PAY_CSV = ("\ufeffДата транзакции;merchant_id;ID транзакции;Источник транзакции;Номер заказа;"
+           "Сумма транзакции;Комиссия за сервис;Комиссия за обслуживание;"
+           "Сумма транзакции попавшая в перечисление\n"
+           "2026-09-05T14:54:42+03:00;m;t1;payment;100608;4600;-161;0;4600\n").encode("utf-8")
+
+
+def test_yandex_pay_detail_is_refused_while_sales_come_from_crm(db):
+    """3,5% AWER CRM — это эквайринг Яндекс Пэй: детализация Пэй вычла бы
+    комиссию второй раз."""
+    outcome = import_report(db, platform="kit", file_bytes=PAY_CSV, filename="pay.csv", user="admin")
+    assert outcome.report is None and "вычла бы её второй раз" in outcome.errors[0]
+
+
+def test_yandex_pay_detail_loads_when_sales_come_from_api(db):
+    from finapp.finance.settings import save_setting
+    save_setting(db, "FIN_KIT_SALES_SOURCE", "api")
+    db.commit()
+    outcome = import_report(db, platform="kit", file_bytes=PAY_CSV, filename="pay.csv", user="admin")
+    assert outcome.report is not None
+
+
+def test_crm_over_an_existing_yandex_pay_detail_warns(db):
+    from finapp.finance.settings import save_setting
+    save_setting(db, "FIN_KIT_SALES_SOURCE", "api")
+    db.commit()
+    import_report(db, platform="kit", file_bytes=PAY_CSV, filename="pay.csv", user="admin")
+    save_setting(db, "FIN_KIT_SALES_SOURCE", "crm")
+    db.commit()
+    outcome = import_report(db, platform="kit", file_bytes=_file(), filename=FILENAME, user="admin")
+    assert "посчитается дважды" in outcome.warnings[0]

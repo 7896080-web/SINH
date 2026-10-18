@@ -44,8 +44,8 @@
 {% endcall %}
 
 <p class="help-text">
-    Прибыль = к перечислению − себестоимость − доп. расходы ({{ settings.extra_cost_kop | rub }} ₽/шт) − налог
-    ({{ tax_modes[settings.tax_mode] }}{% if settings.tax_mode != 'none' %}, {{ settings.tax_rate }} %{% endif %}).
+    Прибыль = к перечислению − себестоимость − доп. расходы ({{ settings.extra_cost_kop | rub }} ₽/шт) − налоги
+    ({{ tax_text }}{% if tax_effective is not none %} — {{ '%.2f'|format(tax_effective)|replace('.', ',') }}% выручки{% endif %}).
     Себестоимость берётся на дату операции. <a href="/finance/costs#settings">Настройки</a>
 </p>
 
@@ -64,7 +64,7 @@
                 <th class="num">Хранение и прочее</th>
                 <th class="num">К перечислению</th>
                 <th class="num">Себестоимость</th>
-                <th class="num">Налог и доп.</th>
+                <th class="num">Налоги и доп.</th>
                 <th class="num">Прибыль</th>
                 <th class="num">Маржа</th>
                 <th class="num">ROI</th>
@@ -90,7 +90,7 @@
             <td class="num">{{ money(t.storage + t.other_costs, true) }}</td>
             <td class="num">{{ money(t.total_payout, true) }}</td>
             <td class="num">{{ money(t.cogs, true) }}</td>
-            <td class="num">{{ money(t.tax + t.extra, true) }}</td>
+            <td class="num">{{ money(t.taxes + t.extra, true) }}</td>
             <td class="num"><b>{{ money(t.profit, true) }}</b></td>
             <td class="num">{{ t.margin | pct }}</td>
             <td class="num">{{ t.roi | pct(0) }}</td>
@@ -105,7 +105,7 @@
             <td class="num">{{ money(t.revenue, true) }}</td><td class="num">{{ money(t.commission, true) }}</td>
             <td class="num">{{ money(t.logistics, true) }}</td><td class="num">{{ money(t.storage + t.other_costs, true) }}</td>
             <td class="num">{{ money(t.total_payout, true) }}</td><td class="num">{{ money(t.cogs, true) }}</td>
-            <td class="num">{{ money(t.tax + t.extra, true) }}</td><td class="num">{{ money(t.profit, true) }}</td>
+            <td class="num">{{ money(t.taxes + t.extra, true) }}</td><td class="num">{{ money(t.profit, true) }}</td>
             <td></td><td></td><td></td>
         </tr>
         {% endif %}
@@ -116,7 +116,7 @@
             <td class="num">{{ money(t.revenue, true) }}</td><td class="num">{{ money(t.commission, true) }}</td>
             <td class="num">{{ money(t.logistics, true) }}</td><td class="num">{{ money(t.storage + t.other_costs, true) }}</td>
             <td class="num">{{ money(t.total_payout, true) }}</td><td class="num">{{ money(t.cogs, true) }}</td>
-            <td class="num">{{ money(t.tax + t.extra, true) }}</td><td class="num">{{ money(t.profit, true) }}</td>
+            <td class="num">{{ money(t.taxes + t.extra, true) }}</td><td class="num">{{ money(t.profit, true) }}</td>
             <td class="num">{{ t.margin | pct }}</td><td class="num">{{ t.roi | pct(0) }}</td>
             <td class="num">{{ money(t.profit_per_unit, true) }}</td>
         </tr>
