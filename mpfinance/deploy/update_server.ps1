@@ -87,4 +87,9 @@ for ($i = 0; $i -lt 30 -and -not $alive; $i++) {
 }
 $ErrorActionPreference = "Stop"
 if (-not $alive) { Fail "Страница отвечает, но фон нового процесса за 150 с не отметился — журнал: $Root\logs\mpfinance.err.log" }
+# Ярлык со значком — и на сервере, поставленном до появления значка. Сбой ярлыка
+# накат не валит: программа уже обновлена и работает.
+$ErrorActionPreference = "Continue"
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "create_shortcut.ps1") -WebPort $WebPort
+$ErrorActionPreference = "Stop"
 Ok "Обновление завершено ($installed), программа отвечает и фон работает: $url"

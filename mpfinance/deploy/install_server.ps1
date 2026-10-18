@@ -16,7 +16,8 @@
     5. Служба «mpfinance» через NSSM (как службы sync_admin и «Репрайсера»):
        работает без входа в систему, перезапускается при сбое, журналы с
        ротацией. Слушает только 127.0.0.1:8003 — снаружи сервера её не видно.
-    6. Ярлык «Финансы площадок» на общем рабочем столе — через Chrome/Edge.
+    6. Ярлык «Финансы площадок» на общем рабочем столе — через Chrome/Edge, со
+       своим значком (deploy\create_shortcut.ps1).
 
     sync_admin, «Репрайсер», 1С и обмен других программ не трогает. Повторный
     запуск безопасен.
@@ -158,28 +159,9 @@ if (-not $up) { Fail "Служба $Service не отвечает на $url — 
 Ok "Служба $Service работает: $url"
 
 # --- 7. Ярлык ---
-$browser = @(
-    "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
-    "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe",
-    "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
-    "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe",
-    "$env:LOCALAPPDATA\Yandex\YandexBrowser\Application\browser.exe"
-) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
-$desk = Join-Path $env:PUBLIC "Desktop"
-if (-not (Test-Path $desk)) { $desk = [Environment]::GetFolderPath("Desktop") }
-if ($browser) {
-    $lnk = Join-Path $desk "Финансы площадок.lnk"
-    if (Test-Path $lnk) { Remove-Item $lnk -Force }
-    $s = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
-    $s.TargetPath = $browser
-    $s.Arguments = '"' + $url + '"'
-    $s.WorkingDirectory = Split-Path $browser
-    $s.Description = "Финансы площадок — $url"
-    $s.Save()
-    Ok "Ярлык «Финансы площадок» на рабочем столе ($desk)"
-} else {
-    Warn "Chrome/Edge не найден — ярлык не создан. Откройте $url в Chrome вручную (Internet Explorer не подойдёт)."
-}
+# Общий скрипт с update_server.ps1: ярлык со своим значком (deploy\mpfinance.ico).
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "create_shortcut.ps1") -WebPort $WebPort
+if ($LASTEXITCODE -ne 0) { Warn "Ярлык не создан — запустите deploy\create_shortcut.ps1 отдельно" }
 
 Write-Host ""
 Ok "Готово. Дальше: войти -> «Диагностика» -> «Обновить справочник из Sync Admin» -> «API-ключи»: кабинеты, токены, почта Lamoda. Обмен с 1С выключен — его включают последним этапом."

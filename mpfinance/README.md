@@ -93,7 +93,9 @@ Admin, раз в сутки и кнопкой на «Диагностике». �
    `powershell -ExecutionPolicy Bypass -File C:\mpfinance\deploy\install_server.ps1`.
    Скрипт создаёт venv, `.env` со своими ключами, миграции, прогоняет тесты,
    заводит первого пользователя, ставит службу `mpfinance` на `127.0.0.1:8003`
-   и ярлык «Финансы площадок».
+   и ярлык «Финансы площадок» со своим значком (круговая диаграмма,
+   `deploy\mpfinance.ico`; рисует его `scripts/gen_icon.py`). Обновление
+   пересоздаёт ярлык тоже; отдельно — `deploy\create_shortcut.ps1`.
 3. Обновление: новый пакет, затем
    `powershell -ExecutionPolicy Bypass -File C:\mpfinance\deploy\update_server.ps1 -Tag finN`.
    По порядку: копия базы, миграции, тесты, перезапуск, проверка фона.
