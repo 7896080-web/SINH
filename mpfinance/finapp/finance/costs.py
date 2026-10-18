@@ -60,20 +60,26 @@ def import_costs(db: Session, costs: dict[str, int]) -> dict:
     uids = sorted(costs)
     known: set[str] = set()
     latest: dict[str, ProductCost] = {}
+    manual: set[str] = set()
     for start in range(0, len(uids), _CHUNK):
         chunk = uids[start:start + _CHUNK]
         known |= {uid for (uid,) in db.query(Product.uid_1c).filter(Product.uid_1c.in_(chunk))}
         for cost in db.query(ProductCost).filter(ProductCost.uid_1c.in_(chunk)) \
                 .order_by(ProductCost.valid_from.asc()):
-            latest[cost.uid_1c] = cost
+            # Ручная цена, действующая на сегодня, — приоритетнее 1С
+            # (`economics.CostBook`), хоть она и старше по дате записи.
+            if cost.source == "excel" and cost.valid_from <= today:
+                manual.add(cost.uid_1c)
+            elif cost.source != "excel":
+                latest[cost.uid_1c] = cost
     for uid in uids:
         if uid not in known:
             stats["unknown"] += 1
             continue
-        current = latest.get(uid)
-        if current is not None and current.source == "excel":
+        if uid in manual:
             stats["manual"] += 1
             continue
+        current = latest.get(uid)
         if current is not None and (current.currency, current.cost_minor) == ("USD", costs[uid]):
             stats["same"] += 1
             continue

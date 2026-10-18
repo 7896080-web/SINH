@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.orm import Session
 
+from finapp.excel_utils import ExcelReadError, read_upload
 from finapp import backup, catalog, config, onec, settings, syncdb
 from finapp.audit import log_action
 from finapp.database import get_db
@@ -64,7 +65,7 @@ def upload(request: Request, kind: str = Form(...), file: UploadFile = File(...)
            db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Ручная загрузка файла из 1С (barcodes_*.txt / cost_*.txt) — пока обмен не настроен."""
     try:
-        text = catalog.decode_upload(file.file.read())
+        text = catalog.decode_upload(read_upload(file.file))
         if kind == "dict":
             st = catalog.load_catalog(db, catalog.parse_barcode_dict(text))
             message = (f"Справочник загружен: баркодов {st['barcodes']}, товаров {st['products']} "
@@ -74,7 +75,7 @@ def upload(request: Request, kind: str = Form(...), file: UploadFile = File(...)
             if not parsed:
                 raise catalog.CatalogError("в файле себестоимости нет ни одной строки (ждём uid|цена)")
             message = costs.summary(costs.import_costs(db, parsed), bad).capitalize() + "."
-    except catalog.CatalogError as e:
+    except (catalog.CatalogError, ExcelReadError) as e:
         db.rollback()
         set_flash(request, f"Файл не принят: {e}", "warn")
         return _back()
@@ -89,10 +90,16 @@ def onec_switch(request: Request, enabled: str = Form("0"), db: Session = Depend
                 user: User = Depends(get_current_user)):
     value = "1" if enabled == "1" else "0"
     settings.put(db, settings.ONEC_ENABLED, value)
-    log_action(db, user.username, "onec_switch", "включён" if value == "1" else "выключен")
+    returned = onec.withdraw_unsent(db) if value == "0" else 0
+    log_action(db, user.username, "onec_switch", ("включён" if value == "1" else "выключен")
+               + (f", возвращено неотправленного: {returned}" if returned else ""))
     db.commit()
-    set_flash(request, "Обмен с 1С включён. Нажмите «Проверить обработку 1С»." if value == "1"
-              else "Обмен с 1С выключен: в папки обмена программа больше не пишет.", "good")
+    message = ("Обмен с 1С включён. Нажмите «Проверить обработку 1С»." if value == "1"
+               else "Обмен с 1С выключен: в папки обмена программа больше не пишет.")
+    if returned:
+        message += (f" Неотправленные задания и отчёты ({returned}) сняты с очереди — после включения "
+                    f"отправьте их заново.")
+    set_flash(request, message, "good")
     return _back()
 
 

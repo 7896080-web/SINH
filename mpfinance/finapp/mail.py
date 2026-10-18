@@ -163,9 +163,19 @@ def fetch_new(db: Session, connect=None, days: int = LOOKBACK_DAYS) -> dict:
                 if not ATTACHMENT_RE.search(name):
                     continue
                 names.append(name)
-                outcome = import_report(db, platform="lamoda", file_bytes=part.get_payload(decode=True) or b"",
-                                        filename=name, user="почта", account_id=cfg.account_id,
-                                        source="email")
+                try:
+                    outcome = import_report(db, platform="lamoda",
+                                            file_bytes=part.get_payload(decode=True) or b"",
+                                            filename=name, user="почта", account_id=cfg.account_id,
+                                            source="email")
+                except Exception as e:           # noqa: BLE001 — одно письмо не уносит очередь
+                    # Неожиданный сбой разбора одного вложения записывается в
+                    # письмо, а не роняет проход: иначе это письмо и все более
+                    # новые не разбирались бы до выпадения из окна поиска (45 дней).
+                    db.rollback()
+                    logger.exception("письмо %s: вложение %s не разобрано", mid, name)
+                    notes.append(f"{name}: не разобран ({type(e).__name__}: {e})"[:400])
+                    continue
                 if outcome.report is not None:
                     imported += 1
                     notes.append(f"{name}: " + (" ".join(outcome.warnings) or "загружен"))

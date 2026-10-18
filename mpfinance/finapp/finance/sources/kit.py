@@ -78,7 +78,12 @@ class KitOrdersApi:
             data = self._get("/v1/orders", params={
                 "page": page, "per_page": PER_PAGE, "sort_by": "updated_at",
                 "sort_direction": "asc", "updated_from": stamp})
-            batch = data.get("orders") or []
+            if not isinstance(data, dict) or not isinstance(data.get("orders"), list):
+                # «Заказов нет» и «формат ответа сменился» — разные вещи; второе
+                # иначе выглядело бы первым.
+                raise RuntimeError("KIT: в ответе нет списка заказов («orders») — формат ответа "
+                                   "изменился? Начало ответа: " + str(data)[:200])
+            batch = data["orders"]
             for order in batch:
                 # Заказ, изменившийся во время обхода, может сдвинуться между
                 # страницами и прийти дважды.

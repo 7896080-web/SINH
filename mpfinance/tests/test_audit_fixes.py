@@ -1,0 +1,148 @@
+"""Исправления по аудиту 18.10.2026 (`АУДИТ_2026-10-18.md`): каждая проверка —
+про следствие, которое было неверным до правки."""
+from datetime import date, timedelta
+from decimal import Decimal
+
+from finapp.finance import values as v
+from finapp.models import CurrencyRate, OnecTask, OneCUploadStatus, ProductCost
+from finapp.timeutils import today_local
+from tests.finance_factories import make_product, make_report
+
+
+def _cost(db, uid, day, minor, currency, source):
+    db.add(ProductCost(uid_1c=uid, valid_from=day, cost_minor=minor, currency=currency, source=source))
+
+
+def test_manual_cost_beats_a_newer_1c_cost(db):
+    """Цена из Excel без даты ложится с 01.01.2000, а выгрузка 1С — с сегодня.
+    Раньше продажа брала «последнюю запись не позже даты», то есть 1С."""
+    from finapp.finance.economics import CostBook
+    make_product(db)
+    db.add(CurrencyRate(rate_date=date(2026, 10, 5), usd_rub_e4=900000))
+    _cost(db, "u1", date(2000, 1, 1), 150000, "RUB", "excel")
+    _cost(db, "u1", date(2026, 10, 5), 1000, "USD", "1c")
+    db.commit()
+    assert CostBook(db, {"u1"}).cost_on("u1", date(2026, 10, 10)) == 150000
+
+
+def test_dated_manual_cost_applies_from_its_date_only(db):
+    from finapp.finance.economics import CostBook
+    make_product(db)
+    _cost(db, "u1", date(2026, 9, 1), 80000, "RUB", "1c")
+    _cost(db, "u1", date(2026, 10, 1), 150000, "RUB", "excel")
+    db.commit()
+    book = CostBook(db, {"u1"})
+    assert book.cost_on("u1", date(2026, 9, 15)) == 80000      # до ручной цены — 1С
+    assert book.cost_on("u1", date(2026, 10, 15)) == 150000
+    assert book.cost_on("u1", date(2026, 1, 1)) == 150000      # раньше всех записей — ручная
+
+
+def test_1c_export_leaves_a_manual_cost_alone(db):
+    from finapp.finance.costs import import_costs
+    make_product(db)
+    _cost(db, "u1", date(2000, 1, 1), 150000, "RUB", "excel")
+    _cost(db, "u1", date(2026, 10, 5), 1000, "USD", "1c")
+    db.commit()
+    stats = import_costs(db, {"u1": 1200})
+    assert (stats["manual"], stats["updated"]) == (1, 0)
+
+
+def test_stale_cbr_rate_is_not_used_silently(db):
+    from finapp.finance.rates import RateBook
+    db.add(CurrencyRate(rate_date=date(2026, 9, 1), usd_rub_e4=800000))
+    db.commit()
+    assert RateBook(db).rate_on(date(2026, 9, 7)) == Decimal(80)          # выходные/праздники — да
+    assert RateBook(db).rate_on(date(2026, 10, 15)) is None                # полтора месяца — нет
+    assert RateBook(db, manual=Decimal(95)).rate_on(date(2026, 10, 15)) == Decimal(95)
+
+
+def test_cbr_answer_in_another_markup_is_an_error():
+    import pytest
+
+    from finapp.finance.rates import RateError, parse_cbr_dynamic
+    with pytest.raises(RateError):
+        parse_cbr_dynamic(b'<ValCurs><Item Date="01.09.2026"><Value>80</Value></Item></ValCurs>')
+    assert parse_cbr_dynamic(b"<ValCurs ID='R01235'></ValCurs>") == {}    # выходные — пусто, не ошибка
+
+
+def test_api_answers_of_another_shape_are_errors():
+    import pytest
+    import requests
+
+    from finapp.finance.sources import kit as kit_source
+    from finapp.finance.sources import wb as wb_source
+    from tests.test_finance_api_fetch import FakeSession
+    with pytest.raises(wb_source.WbFinanceError, match="не списком"):
+        wb_source.WbFinanceApi("t", session=FakeSession({wb_source.LIST_PATH: {"data": []}}),
+                               sleep=lambda s: None).list_reports(date(2026, 9, 1), date(2026, 9, 7))
+    with pytest.raises(RuntimeError, match="нет списка заказов"):
+        kit_source.KitOrdersApi("t", session=FakeSession({"/v1/orders": {"done": []}}),
+                                sleep=lambda s: None).orders_updated_since(
+            __import__("datetime").datetime(2026, 9, 1, tzinfo=__import__("datetime").timezone.utc))
+
+
+def test_disabling_1c_withdraws_what_has_not_left(client, db, onec_on):
+    report = make_report(db, key="SR-q")
+    report.onec_status = OneCUploadStatus.pending
+    db.add(OnecTask(command="FIN_PING", key="FINPING-1", line="x", status="pending"))
+    db.add(OnecTask(command="BARCODE_DICT", key="FINDICT-2", line="x", status="sent"))
+    db.commit()
+    response = client.post("/diagnostics/onec-enabled", data={"enabled": "0"}, follow_redirects=True)
+    assert "сняты с очереди" in response.text
+    db.expire_all()
+    assert report.onec_status == OneCUploadStatus.none
+    statuses = {t.command: t.status for t in db.query(OnecTask)}
+    assert statuses == {"FIN_PING": "failed", "BARCODE_DICT": "sent"}      # ушедшее не трогаем
+
+
+def test_no_new_1c_command_while_the_last_one_went_unanswered(db, epf_ready):
+    from finapp import settings
+    from finapp.workers import jobs
+    db.add(OnecTask(command="BARCODE_DICT", key="FINDICT-1", line="x", status="timeout"))
+    db.add(OnecTask(command="EXPORT_COST_PRICES", key="FINCOST-2", line="x", status="done"))
+    db.commit()
+    jobs.job_daily()
+    db.expire_all()
+    commands = [t.command for t in db.query(OnecTask).filter(OnecTask.status == "pending")]
+    assert commands == ["EXPORT_COST_PRICES"]
+
+
+def test_backup_leftovers_are_swept(db):
+    import os
+    import time
+
+    from finapp import backup, config
+    config.BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    part = config.BACKUP_DIR / "mpfinance-20261018-100000.part"
+    old_bad = config.BACKUP_DIR / "mpfinance-20261010-100000.bad"
+    new_bad = config.BACKUP_DIR / "mpfinance-20261018-100001.bad"
+    for f in (part, old_bad, new_bad):
+        f.write_bytes(b"x")
+    two_days = time.time() - 2 * 86400
+    os.utime(old_bad, (two_days, two_days))
+    assert backup.sweep_leftovers() == 2
+    assert not part.exists() and not old_bad.exists() and new_bad.exists()   # свежую .bad — на разбор
+    new_bad.unlink()
+
+
+def test_broken_attachment_does_not_block_the_mailbox(db, monkeypatch):
+    """Неожиданный сбой разбора вложения записывается в письмо, а не роняет
+    проход: следующие письма разбираются."""
+    from finapp import mail
+    from finapp.finance import importer
+    from finapp.models import MailMessage
+    from tests.finance_factories import make_account
+    from tests.test_finance_lamoda import FakeImap, _configure, _letter
+    _configure(db, make_account(db, platform="lamoda", name="AWER"))
+    imap = FakeImap([_letter(b"PK", "плохой.xlsx", "<a@x>"), _letter(b"PK", "хороший.xlsx", "<b@x>")])
+    calls = []
+
+    def flaky(db_, **kw):
+        calls.append(kw["filename"])
+        if kw["filename"] == "плохой.xlsx":
+            raise KeyError("worksheet")
+        return importer.ImportOutcome(errors=["не опознан"])
+    monkeypatch.setattr(importer, "import_report", flaky)
+    stats = mail.fetch_new(db, connect=lambda h, p: imap)
+    assert calls == ["плохой.xlsx", "хороший.xlsx"]
+    assert db.query(MailMessage).count() == 2 and stats["messages"] == 2

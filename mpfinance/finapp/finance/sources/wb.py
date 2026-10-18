@@ -75,7 +75,13 @@ class WbFinanceApi:
         if response.status_code == 204 or not response.content:
             return []
         data = response.json()
-        return data if isinstance(data, list) else []
+        if not isinstance(data, list):
+            # Ответ другой формы при коде 200 — изменился формат API. Молчаливый
+            # пустой список выглядел бы как «отчётов за период нет», а свод из
+            # того же API ничего бы не поймал.
+            raise WbFinanceError("WB ответил не списком — формат ответа изменился? Начало ответа: "
+                                 + str(data)[:200])
+        return data
 
     def list_reports(self, date_from: date, date_to: date) -> list[dict]:
         """Еженедельные отчёты, период которых попадает в [date_from, date_to]."""

@@ -79,6 +79,22 @@ NOT_READY = ("обработка 1С ещё не подтвердила верс
 
 # --- Очередь ---------------------------------------------------------------------
 
+def withdraw_unsent(db: Session) -> int:
+    """Обмен выключили: то, что ещё НЕ ушло в файл, снимается с очереди. Иначе
+    отчёт навсегда стоял бы в «ждёт отправки» — ни удалить (он «в пути»), ни
+    отправить заново, — а полоса фоновых дел писала бы «идёт». Ушедшее в файл
+    не трогаем: 1С могла его уже обработать, и поздний ответ мы примем."""
+    from finapp.models import OneCUploadStatus, SalesReport
+    tasks = db.query(OnecTask).filter(OnecTask.status == OnecTaskStatus.pending.value).all()
+    for task in tasks:
+        task.status = OnecTaskStatus.failed.value
+        task.result_detail = "снято с очереди: обмен с 1С выключен до отправки"
+    reports = db.query(SalesReport).filter(SalesReport.onec_status == OneCUploadStatus.pending).all()
+    for report in reports:
+        report.onec_status = OneCUploadStatus.none
+        report.onec_detail = "отправка отменена: обмен с 1С выключен до отправки"
+    return len(tasks) + len(reports)
+
 def enqueue(db: Session, command: str, user: str = "system") -> OnecTask:
     if command not in COMMANDS:
         raise OnecError(f"команда {command} не наша — в 1С её не посылаем")

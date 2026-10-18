@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from finapp import backup, catalog, config, exchange, mail, onec, settings
 from finapp.database import SessionLocal
 from finapp.finance import fetch
-from finapp.models import OnecTask
+from finapp.models import OnecTask, OnecTaskStatus
 from finapp.timeutils import now_utc
 from finapp.workers.heartbeat import beat
 
@@ -55,6 +55,16 @@ def job_onec_exchange() -> None:
         db.close()
 
 
+def _unanswered_recently(db, command: str) -> bool:
+    """1С не ответила на эту команду за последние сутки. Пока 1С стоит, новое
+    задание каждый час легло бы ещё одним файлом в общую папку заданий — к её
+    возвращению их были бы десятки тяжёлых выгрузок в одном цикле с
+    перемещениями Sync Admin. Хватит одного раза в сутки."""
+    last = db.query(OnecTask).filter(OnecTask.command == command).order_by(OnecTask.id.desc()).first()
+    return (last is not None and last.status == OnecTaskStatus.timeout.value
+            and now_utc() - last.created_at < DAILY)
+
+
 def job_daily() -> None:
     """Раз в сутки: проверка версии обработки (пока не подтверждена), справочник
     баркодов и себестоимость из 1С, чистка архива обмена. Пока обмен с 1С
@@ -70,6 +80,10 @@ def job_daily() -> None:
                 except catalog.CatalogError as e:
                     db.rollback()
                     logger.warning("справочник из Sync Admin не загружен: %s", e)
+                    # Причина — в отметку, её показывает «Диагностика»: лог
+                    # читают, когда уже что-то случилось.
+                    beat(db, "daily", True, f"обмен с 1С выключен; справочник из Sync Admin не загружен: {e}")
+                    return
             beat(db, "daily", True, "обмен с 1С выключен")
             return
         if not onec.epf_ready(db):
@@ -79,10 +93,10 @@ def job_daily() -> None:
                 onec.enqueue(db, onec.PROBE)
                 db.commit()
         else:
-            if _older_than(settings.get(db, settings.CATALOG_LOADED_AT), DAILY):
-                onec.enqueue(db, "BARCODE_DICT")
-            if _older_than(settings.get(db, settings.COSTS_LOADED_AT), DAILY):
-                onec.enqueue(db, "EXPORT_COST_PRICES")
+            for command, stamp in (("BARCODE_DICT", settings.CATALOG_LOADED_AT),
+                                   ("EXPORT_COST_PRICES", settings.COSTS_LOADED_AT)):
+                if _older_than(settings.get(db, stamp), DAILY) and not _unanswered_recently(db, command):
+                    onec.enqueue(db, command)
             db.commit()
         exchange.prune_archive(config.ONEC_ARCHIVE_DIR)
         beat(db, "daily", True, "")
@@ -129,6 +143,10 @@ def job_backup() -> None:
         _backup_failed_at = now_utc() if err else None
         beat(db, "backup", not err, err)
     except Exception as e:                       # noqa: BLE001
+        # Любой сбой (не только SQLite: переименование, которое держит
+        # антивирус) — пауза BACKUP_RETRY. Без неё повтор шёл каждые 30 с и
+        # оставлял по полноразмерной недописанной копии на общем диске.
+        _backup_failed_at = now_utc()
         logger.exception("копия базы упала")
         beat(db, "backup", False, f"{type(e).__name__}: {e}")
     finally:

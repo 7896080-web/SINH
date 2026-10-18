@@ -58,6 +58,29 @@ def last_backup() -> datetime | None:
     return datetime.fromtimestamp(newest, tz=timezone.utc).replace(tzinfo=None)
 
 
+# Недописанная (.part — служба остановлена посреди копии, сбой переименования)
+# и забракованная (.bad) копии. Копия — размером с базу, а диск общий с 1С и
+# Sync Admin: оставленные навсегда, они съели бы его. .bad держим сутки — на
+# разбор, почему копия не прошла проверку.
+LEFTOVER_KEEP = timedelta(days=1)
+
+
+def sweep_leftovers() -> int:
+    if not config.BACKUP_DIR.exists():
+        return 0
+    limit = datetime.now().timestamp() - LEFTOVER_KEEP.total_seconds()
+    removed = 0
+    for pattern in (f"{PREFIX}*.part", f"{PREFIX}*.bad"):
+        for f in config.BACKUP_DIR.glob(pattern):
+            try:
+                if pattern.endswith(".part") or f.stat().st_mtime < limit:
+                    f.unlink()
+                    removed += 1
+            except OSError:
+                pass
+    return removed
+
+
 def make_backup() -> str:
     """Снять копию. Возвращает текст ошибки или пустую строку."""
     src_path = _db_path()
@@ -66,6 +89,7 @@ def make_backup() -> str:
     config.BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     dst = config.BACKUP_DIR / f"{PREFIX}{datetime.now():%Y%m%d-%H%M%S}.db"
     tmp = dst.with_suffix(".part")
+    sweep_leftovers()
     src = sqlite3.connect(str(src_path))
     out = sqlite3.connect(str(tmp))
     try:

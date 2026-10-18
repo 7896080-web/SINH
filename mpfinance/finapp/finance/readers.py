@@ -55,6 +55,12 @@ def _read_xlsx(file_bytes: bytes) -> list[tuple[str, list[list]]]:
                 if len(rows) % 2000 == 0:
                     progress.report(len(rows), None, f"чтение файла: строк {len(rows)}")
             sheets.append((ws.title, rows))
+    except ReportReadError:
+        raise
+    except Exception as e:
+        # Битый XML внутри .xlsx ломается не на открытии, а на чтении листа —
+        # и улетал бы наверх как есть: у почты он ронял разбор ВСЕХ писем.
+        raise ReportReadError(f"Лист файла не читается ({type(e).__name__}) — файл повреждён?") from e
     finally:
         wb.close()
     return sheets

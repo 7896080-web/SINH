@@ -15,7 +15,7 @@ from finapp import onec
 from finapp.audit import log_action
 from finapp.database import get_db
 from finapp.deps import get_current_user
-from finapp.excel_utils import ExcelReadError, build_xlsx_response, read_xlsx_rows
+from finapp.excel_utils import ExcelReadError, build_xlsx_response, read_upload, read_xlsx_rows
 from finapp.finance import charts, fetch, statements, values as v
 from finapp.finance.economics import (Filters, Totals, load_lines, platform_summary, trend,
                                    unit_economics)
@@ -223,8 +223,15 @@ def reports_upload(
         set_flash(request, "Даты периода — в формате ГГГГ-ММ-ДД.", "warn")
         return RedirectResponse("/finance/reports", status_code=303)
 
+    # Предел размера: огромный файл, выбранный по ошибке, занял бы память
+    # единственного веб-процесса целиком.
+    try:
+        data = read_upload(file.file)
+    except ExcelReadError as e:
+        set_flash(request, f"Отчёт не загружен. {e}", "warn")
+        return RedirectResponse("/finance/reports", status_code=303)
     outcome = import_report(
-        db, platform=platform, file_bytes=file.file.read(), filename=file.filename or "",
+        db, platform=platform, file_bytes=data, filename=file.filename or "",
         user=user.username, account_id=_int_or_none(account_id), report_number=report_number,
         period_from=d_from, period_to=d_to,
     )
@@ -319,8 +326,13 @@ def report_remap(
     before = report.unmatched_lines
     after = resolve_uids(db, report)
     db.commit()
-    set_flash(request, f"Баркоды пересопоставлены: без товара 1С было {before}, стало {after}.",
-              "good" if after == 0 else "warn")
+    message = f"Баркоды пересопоставлены: без товара 1С было {before}, стало {after}."
+    if report.onec_status in (OneCUploadStatus.done, OneCUploadStatus.sent, OneCUploadStatus.timeout):
+        # В 1С уже ушло по прежнему сопоставлению: если товары сменились,
+        # документ в 1С устарел, и сам он не обновится.
+        message += (" Отчёт уже отправлялся в 1С по прежнему сопоставлению — если товары изменились, "
+                    "отправьте его повторно: 1С перезаполнит тот же документ.")
+    set_flash(request, message, "good" if after == 0 and report.onec_status == OneCUploadStatus.none else "warn")
     return RedirectResponse(f"/finance/reports/{report_id}", status_code=303)
 
 
@@ -570,7 +582,7 @@ def costs_import(
     артикулу — тогда цена ставится всем размерам артикула (у одежды себестоимость
     обычно одна на модель). Пустая себестоимость — строка пропускается."""
     try:
-        rows = read_xlsx_rows(file.file.read())
+        rows = read_xlsx_rows(read_upload(file.file))
     except ExcelReadError as e:
         set_flash(request, str(e), "warn")
         return RedirectResponse("/finance/costs", status_code=303)
@@ -748,8 +760,8 @@ def statements_upload(
     db: Session = Depends(get_db), user: User = Depends(get_current_user),
 ):
     try:
-        rows = statements.parse_wb_summary(read_sheets(file.file.read(), file.filename or ""))
-    except (ReportReadError, statements.StatementError) as e:
+        rows = statements.parse_wb_summary(read_sheets(read_upload(file.file), file.filename or ""))
+    except (ReportReadError, statements.StatementError, ExcelReadError) as e:
         set_flash(request, f"Свод не загружен: {e}", "warn")
         return RedirectResponse("/finance/statements", status_code=303)
     target = _int_or_none(account_id)

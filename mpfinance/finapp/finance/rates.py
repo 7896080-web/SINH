@@ -58,6 +58,12 @@ def parse_cbr_dynamic(content: bytes) -> dict[date, Decimal]:
         if nominal <= 0 or value <= 0:
             raise RateError("курс доллара в ответе ЦБ не положителен")
         result[day] = (value / nominal).quantize(Decimal("0.0001"))
+    if root.tag != "ValCurs" or (len(root) and not result):
+        # Записи есть, а «Record» среди них нет — сменилась разметка ответа.
+        # Пустой результат выглядел бы как «за эти дни курса нет», и курс
+        # устаревал бы молча.
+        raise RateError(f"ответ ЦБ другой разметки (корень «{root.tag}», записей {len(root)}) — "
+                        f"формат изменился?")
     return result
 
 
@@ -99,6 +105,9 @@ def missing_range(db: Session, need_from: date, need_to: date) -> tuple[date, da
     return (start or last[0]), need_to
 
 
+MAX_RATE_AGE_DAYS = 14
+
+
 class RateBook:
     """Курс на дату: последний опубликованный не позже этой даты."""
 
@@ -111,7 +120,12 @@ class RateBook:
 
     def rate_on(self, day: date) -> Decimal | None:
         idx = bisect_right(self._dates, day) - 1
-        if idx >= 0:
+        # Последний опубликованный курс годится, только если он свежий: ЦБ не
+        # публикует курс в выходные и праздники (дольше всего — новогодние), но
+        # курс двухнедельной давности значит, что курсы перестали приходить, и
+        # себестоимость молча считалась бы по старому. Тогда — ручной курс, а
+        # нет его — «без себестоимости», как и обещано.
+        if idx >= 0 and (day - self._dates[idx]).days <= MAX_RATE_AGE_DAYS:
             return self._values[idx]
         return self.manual
 

@@ -181,37 +181,51 @@ def load_lines(db: Session, filters: Filters) -> list:
 
 
 class CostBook:
-    """Себестоимость на дату, в копейках. Для продаж раньше первой известной
-    даты берётся самая ранняя цена: себестоимость обычно заводят «с сегодняшнего
-    дня», и без этого все прошлые месяцы выглядели бы как продажи без
-    себестоимости. Доллары (себестоимость из 1С) переводятся курсом ЦБ на дату
-    операции; нет курса — нет и себестоимости (`None`), а не ноль."""
+    """Себестоимость на дату, в копейках. Доллары (себестоимость из 1С)
+    переводятся курсом ЦБ на дату операции; нет курса — нет и себестоимости
+    (`None`), а не ноль.
+
+    **Ручная цена (Excel) приоритетнее 1С везде, где она действует по дате.**
+    Выбор «последняя запись не позже даты» без учёта источника отдавал продажу
+    цене 1С, как только у 1С появлялась запись свежее ручной: цена из Excel без
+    даты ложится с 01.01.2000, и любая выгрузка 1С её перебивала — молча, при
+    сообщении «себестоимость обновлена». Для продаж раньше первой известной даты
+    берётся самая ранняя цена (ручная, если есть): себестоимость обычно заводят
+    «с сегодняшнего дня», и без этого прошлые месяцы выглядели бы как продажи без
+    себестоимости."""
 
     def __init__(self, db: Session, uids: set[str], settings: FinanceSettings | None = None):
-        self._dates: dict[str, list[date]] = {}
-        self._costs: dict[str, list[tuple[int, str]]] = {}
+        # uid → {"excel"|"1c": (даты, [(сумма, валюта)])}
+        self._series: dict[str, dict[str, tuple[list[date], list[tuple[int, str]]]]] = {}
         self.rates = RateBook(db, manual=settings.usd_rate_manual if settings else None)
         rows = []
         ordered = sorted(uids)
         for start in range(0, len(ordered), _CHUNK):
             chunk = ordered[start:start + _CHUNK]
             rows += db.query(ProductCost.uid_1c, ProductCost.valid_from, ProductCost.cost_minor,
-                             ProductCost.currency) \
+                             ProductCost.currency, ProductCost.source) \
                 .filter(ProductCost.uid_1c.in_(chunk)).all()
-        by_uid = defaultdict(list)
-        for uid, valid_from, cost, currency in rows:
-            by_uid[uid].append((valid_from, cost, currency or "RUB"))
-        for uid, items in by_uid.items():
-            items.sort()
-            self._dates[uid] = [d for d, _, _ in items]
-            self._costs[uid] = [(c, cur) for _, c, cur in items]
+        by_uid = defaultdict(lambda: defaultdict(list))
+        for uid, valid_from, cost, currency, source in rows:
+            by_uid[uid]["excel" if source == "excel" else "1c"].append((valid_from, cost, currency or "RUB"))
+        for uid, groups in by_uid.items():
+            self._series[uid] = {}
+            for source, items in groups.items():
+                items.sort()
+                self._series[uid][source] = ([d for d, _, _ in items], [(c, cur) for _, c, cur in items])
 
     def cost_on(self, uid: str | None, day: date) -> int | None:
-        if not uid or uid not in self._dates:
+        series = self._series.get(uid) if uid else None
+        if not series:
             return None
-        idx = bisect_right(self._dates[uid], day) - 1
-        minor, currency = self._costs[uid][max(idx, 0)]
-        return to_kop(minor, currency, day, self.rates)
+        for source in ("excel", "1c"):
+            if source in series:
+                dates, costs = series[source]
+                idx = bisect_right(dates, day) - 1
+                if idx >= 0:
+                    return to_kop(costs[idx][0], costs[idx][1], day, self.rates)
+        dates, costs = series.get("excel") or series["1c"]
+        return to_kop(costs[0][0], costs[0][1], day, self.rates)
 
 
 def _products(db: Session, uids: set[str]) -> dict[str, Product]:

@@ -172,7 +172,8 @@
             <thead><tr><th>Артикул</th><th class="num">Шт</th><th class="num">Прибыль</th><th class="num">Маржа</th></tr></thead>
             <tbody>
             {% for g in top %}
-            <tr><td>{{ g.article or '—' }}<div class="help-text">{{ g.title }}</div></td>
+            <tr><td>{{ g.article or '—' }}<div class="help-text">{{ g.title }}</div>
+                {% if g.totals.cost_missing_qty > 0 %}<span class="badge badge--warn" title="Прибыль завышена: себестоимость не задана — «Себестоимость»">без себестоимости</span>{% endif %}</td>
                 <td class="num">{{ g.totals.net_qty }}</td><td class="num">{{ money(g.totals.profit, true) }}</td>
                 <td class="num">{{ g.totals.margin | pct }}</td></tr>
             {% endfor %}
