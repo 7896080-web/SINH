@@ -115,6 +115,14 @@ class Training(BaseModel):
     onboarding_shifts: int = 10  # новичок — первые N смен: вместо урока недели уроки программы новичка
 
 
+class Staffing(BaseModel):
+    """Минимум продавцов в каждом магазине (решение владельца 18.10.2026)."""
+
+    weekday_min: int = 2  # понедельник–пятница
+    weekend_min: int = 3  # суббота и воскресенье
+    lookahead_days: int = 7  # за сколько дней вперёд предупреждать владельца о недоборе
+
+
 class Settings(BaseModel):
     db_path: Path = Path("data/awer.db")
     timezone: str = "Europe/Moscow"
@@ -125,6 +133,7 @@ class Settings(BaseModel):
     schedule: Schedule = Schedule()
     max: MaxCfg = MaxCfg()
     recommendations: Recs = Recs()
+    staffing: Staffing = Staffing()
     motivation: Motivation = Motivation()
     training: Training = Training()
 

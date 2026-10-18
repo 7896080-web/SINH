@@ -17,6 +17,7 @@ from fastapi import Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
+from . import crews as crews_mod
 from .config import Settings
 from .db import DB
 from .planning import service
@@ -70,7 +71,7 @@ def create_app(cfg: Settings, db: DB) -> FastAPI:
     def page(title: str, body: str) -> HTMLResponse:
         cur = date.today().strftime("%Y-%m")
         nav = (f'<nav><a href="/month/{cur}">Настройки месяца</a><a href="/sellers">Продавцы</a>'
-               f'<a href="/schedule/{cur}">График работы</a><a href="/month/{cur}/results">Итоги и ведомость</a></nav>')
+               f'<a href="/crews">Смены</a><a href="/schedule/{cur}">График работы</a><a href="/month/{cur}/results">Итоги и ведомость</a></nav>')
         return HTMLResponse(f"<!doctype html><html lang=ru><head><meta charset=utf-8><title>{title}</title>"
                             f"<style>{CSS}</style></head><body>{nav}<h1>{title}</h1>{body}</body></html>")
 
@@ -224,44 +225,121 @@ def create_app(cfg: Settings, db: DB) -> FastAPI:
         path.replace(archive / name)
         return {"lines": rep.lines, "days": rep.days, "unknown_sellers": sorted(rep.unknown_sellers)}
 
-    # ------------------------------------------------------------------ график смен
+    # ------------------------------------------------------------------ смены и график работы
+    def _short(store: str) -> str:
+        return store[:1].upper()
+
+    @app.get("/crews", dependencies=[Depends(auth)])
+    def crews_page(msg: str = ""):
+        crews_mod.ensure_crews(db, cfg)
+        today = date.today()
+        wed = crews_mod.wednesday(today)
+        cs = crews_mod.crews(db)
+        b = [f'<p class=note>{html.escape(msg)}</p>' if msg else "",
+             '<p class=note>Смена — состав продавцов одного магазина. Каждую среду смены меняются магазинами. '
+             'Магазин на эту неделю можно поправить — дальше бот чередует сам. Заболел кто-то и его заменили — '
+             'это правится в «Графике работы» в конкретном дне, а не здесь.</p>',
+             f'<form method=post action="/crews"><h2>Неделя со среды {wed:%d.%m.%Y}</h2><table>'
+             '<tr><th>Смена</th><th>Магазин на этой неделе</th><th>Со следующей среды</th></tr>']
+        for c in cs:
+            now = crews_mod.crew_store(c, today, cfg.stores)
+            nxt = crews_mod.crew_store(c, wed + timedelta(days=7), cfg.stores)
+            opts = "".join(f'<option {"selected" if st == now else ""}>{html.escape(st)}</option>' for st in cfg.stores)
+            b.append(f'<tr><td><input type=text name="name{c["id"]}" value="{html.escape(c["name"])}"></td>'
+                     f'<td><select name="store{c["id"]}">{opts}</select></td><td>{html.escape(nxt)}</td></tr>')
+        b.append('</table><h2>Состав</h2><table><tr><th>Продавец</th><th>Смена</th>'
+                 '<th>Сильный продавец — ставить на сб и вс</th></tr>')
+        for sl in db.sellers():
+            opts = '<option value="">—</option>' + "".join(
+                f'<option value="{c["id"]}" {"selected" if sl["crew_id"] == c["id"] else ""}>{html.escape(c["name"])}</option>'
+                for c in cs)
+            b.append(f'<tr><td>{html.escape(sl["name"])}</td><td><select name="crew{sl["id"]}">{opts}</select></td>'
+                     f'<td><input type=checkbox name="key{sl["id"]}" {"checked" if sl["weekend_key"] else ""}></td></tr>')
+        b.append('</table><button class=btn>Сохранить смены</button></form>'
+                 f'<p class=note>Минимум в каждом магазине: в будни {cfg.staffing.weekday_min}, в субботу и воскресенье '
+                 f'{cfg.staffing.weekend_min} продавца. Проверка — в «Графике работы».</p>')
+        return page("Смены", "".join(b))
+
+    @app.post("/crews", dependencies=[Depends(auth)])
+    async def crews_save(request: Request):
+        form = await request.form()
+        wed = crews_mod.wednesday(date.today()).isoformat()
+        with db.tx() as c:
+            for cr in crews_mod.crews(db):
+                name = " ".join(str(form.get(f"name{cr['id']}", cr["name"])).split()) or cr["name"]
+                store = form.get(f"store{cr['id']}")
+                store = store if store in cfg.stores else crews_mod.crew_store(cr, date.today(), cfg.stores)
+                c.execute("UPDATE crews SET name=?, store=?, anchor=? WHERE id=?", (name, store, wed, cr["id"]))
+            for sl in db.sellers():
+                crew = form.get(f"crew{sl['id']}")
+                c.execute("UPDATE sellers SET crew_id=?, weekend_key=? WHERE id=?",
+                          (int(crew) if crew and str(crew).isdigit() else None,
+                           1 if form.get(f"key{sl['id']}") else 0, sl["id"]))
+        return RedirectResponse("/crews?msg=" + quote("Сохранено"), status_code=303)
+
     @app.get("/schedule/{month}", dependencies=[Depends(auth)])
     def schedule(month: str, msg: str = ""):
+        crews_mod.ensure_crews(db, cfg)
         y, mo = map(int, month.split("-"))
         n = service.days_in(month)
         days = db.schedule_days(month)
         norm = cfg.norm_shifts
-        wd = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
-        head = "".join(f'<th class="{"we" if date(y, mo, d).weekday() >= 5 else ""}">{d}<br>'
-                       f'{wd[date(y, mo, d).weekday()]}</th>' for d in range(1, n + 1))
+        dates = [date(y, mo, d) for d in range(1, n + 1)]
+        we = lambda d: "we" if d.weekday() >= 5 else ""  # noqa: E731
+        head = "".join(f'<th class="{we(d)}">{d.day}<br>{crews_mod.WD[d.weekday()]}</th>' for d in dates)
+        probs = crews_mod.problems(db, cfg, dates[0], dates[-1])
         b = [f'<p><a href="/schedule/{month_add(month, -1)}">← {month_add(month, -1)}</a> · '
-             f'<a href="/schedule/{month_add(month, 1)}">{month_add(month, 1)} →</a></p>',
+             f'<a href="/schedule/{month_add(month, 1)}">{month_add(month, 1)} →</a> · <a href="/crews">Смены</a></p>',
              f'<p class=note>{html.escape(msg)}</p>' if msg else "",
-             f'<p class=note>Норма — {norm} рабочих дней в месяц. Отработанным считается день, в который у продавца есть '
-             'продажи в 1С: если кто-то вышел на замену, бот учтёт это сам. График нужен, чтобы знать рабочие дни '
-             'впереди — от них считается «до базы» в утреннем сообщении.</p>',
-             f'<form method=post action="/schedule/{month}"><table class=grid>'
-             f'<tr><th>Продавец</th>{head}<th>Дней</th><th>Заполнить по схеме</th></tr>']
-        for s in db.sellers():
-            sid, mine = s["id"], days.get(s["id"], set())
-            cells = "".join(f'<td class="{"we" if date(y, mo, d).weekday() >= 5 else ""}"><input type=checkbox '
-                            f'name="s{sid}_{d}" data-s="{sid}" data-d="{d}" {"checked" if d in mine else ""}></td>'
-                            for d in range(1, n + 1))
+             f'<p class=note>Норма — {norm} рабочих дней в месяц. В клетке — магазин рабочего дня: по умолчанию магазин '
+             'смены продавца (по средам смены меняются); заменил коллегу в другом магазине — выберите этот магазин. '
+             'Отработанным считается день, в который у продавца есть продажи в 1С.</p>']
+        if probs:
+            b.append('<p class=off>Нарушены правила графика:</p><ul>' +
+                     "".join(f"<li>{html.escape(x)}</li>" for x in probs) + "</ul>")
+        b.append(f'<form method=post action="/schedule/{month}"><table class=grid>'
+                 f'<tr><th>Продавец</th>{head}<th>Дней</th><th>Заполнить по схеме</th></tr>')
+        for sl in db.sellers():
+            sid, mine = sl["id"], days.get(sl["id"], {})
+            cells = []
+            for d in dates:
+                dflt = crews_mod.default_store(db, cfg, sid, d) or ""
+                cur = (mine.get(d.day) or dflt or cfg.stores[0]) if d.day in mine else ""
+                opts = '<option value="">—</option>' + "".join(
+                    f'<option value="{html.escape(st)}" {"selected" if st == cur else ""}>{_short(st)}</option>'
+                    for st in cfg.stores)
+                cells.append(f'<td class="{we(d)}"><select name="s{sid}_{d.day}" data-s="{sid}" data-d="{d.day}" '
+                             f'data-def="{html.escape(dflt or cfg.stores[0])}" data-we="{int(d.weekday() >= 5)}">{opts}</select></td>')
             fill = (f'<select id="p{sid}"><option value="3,2">3/2</option><option value="2,2">2/2</option>'
                     f'<option value="5,2">5/2</option></select> с <input type=number id="k{sid}" value=1 min=1 max=7 '
                     f'style="width:42px">-го <button type=button class=btn onclick="fill({sid})">Заполнить</button>'
-                    f'<button type=button class=btn onclick="fill({sid},true)">Очистить</button>')
-            b.append(f'<tr><td class=nm>{html.escape(s["name"])}</td>{cells}'
+                    f'<button type=button class=btn onclick="weekends({sid})" title="Отметить все субботы и воскресенья">'
+                    f'+ сб и вс</button><button type=button class=btn onclick="fill({sid},true)">Очистить</button>')
+            crew = next((c["name"] for c in crews_mod.crews(db) if c["id"] == sl["crew_id"]), "без смены")
+            b.append(f'<tr><td class=nm>{html.escape(sl["name"])}<br><span class=note>{html.escape(crew)}'
+                     f'{" · сильный" if sl["weekend_key"] else ""}</span></td>{"".join(cells)}'
                      f'<td id="c{sid}" class="{"" if len(mine) == norm else "off"}">{len(mine)}</td>'
                      f'<td class=nm>{fill}</td></tr>')
+        have = crews_mod.staffing(db, cfg, dates[0], dates[-1])
+        for st in cfg.stores:
+            cnt = []
+            for d in dates:
+                k, need = len(have.get((d.isoformat(), st), [])), crews_mod.minimum(cfg, d)
+                cnt.append(f'<td class="{we(d)} {"off" if k < need else ""}" title="нужно {need}">{k}</td>')
+            b.append(f'<tr><td class=nm><b>{html.escape(st)}</b>: продавцов</td>{"".join(cnt)}<td></td><td></td></tr>')
         b.append(f'</table><button class=btn>Сохранить график</button></form>'
-                 f'<script>const N={n},NORM={norm};'
-                 'function cnt(s){const c=[...document.querySelectorAll(`input[data-s="${s}"]`)].filter(x=>x.checked).length;'
+                 f'<p class=note>Г, М — магазин. Красное в строках магазинов — меньше минимума: в будни '
+                 f'{cfg.staffing.weekday_min}, в субботу и воскресенье {cfg.staffing.weekend_min}. Счётчик пересчитывается '
+                 'после сохранения.</p>'
+                 f'<script>const NORM={norm};'
+                 'function cnt(s){const c=[...document.querySelectorAll(`select[data-s="${s}"]`)].filter(x=>x.value).length;'
                  'const e=document.getElementById("c"+s);e.textContent=c;e.className=c===NORM?"":"off";}'
                  'function fill(s,clear){const [on,off]=document.getElementById("p"+s).value.split(",").map(Number);'
                  'const k=+document.getElementById("k"+s).value||1;'
-                 'document.querySelectorAll(`input[data-s="${s}"]`).forEach(x=>{const d=+x.dataset.d;'
-                 'x.checked=!clear&&d>=k&&((d-k)%(on+off))<on;});cnt(s);}'
+                 'document.querySelectorAll(`select[data-s="${s}"]`).forEach(x=>{const d=+x.dataset.d;'
+                 'x.value=(!clear&&d>=k&&((d-k)%(on+off))<on)?x.dataset.def:"";});cnt(s);}'
+                 'function weekends(s){document.querySelectorAll(`select[data-s="${s}"]`).forEach(x=>{'
+                 'if(x.dataset.we==="1"&&!x.value)x.value=x.dataset.def;});cnt(s);}'
                  'document.addEventListener("change",e=>{if(e.target.dataset.s)cnt(e.target.dataset.s);});</script>')
         return page(f"График работы {month}", "".join(b))
 
@@ -269,8 +347,15 @@ def create_app(cfg: Settings, db: DB) -> FastAPI:
     async def schedule_save(month: str, request: Request):
         form = await request.form()
         n = service.days_in(month)
-        for s in db.sellers():
-            db.set_schedule(month, s["id"], {d for d in range(1, n + 1) if form.get(f"s{s['id']}_{d}")})
+        y, mo = map(int, month.split("-"))
+        for sl in db.sellers():
+            days = {}
+            for d in range(1, n + 1):
+                v = form.get(f"s{sl['id']}_{d}")
+                if v:  # магазин храним, только если он не магазин смены (замена) — иначе он следует за сменой
+                    dflt = crews_mod.default_store(db, cfg, sl["id"], date(y, mo, d))
+                    days[d] = v if v in cfg.stores and v != dflt else None
+            db.set_schedule(month, sl["id"], days)
         return RedirectResponse(f"/schedule/{month}?msg=" + quote("График сохранён"), status_code=303)
 
     # ------------------------------------------------------------------ продавцы: подключение и увольнение

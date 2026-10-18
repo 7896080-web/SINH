@@ -62,7 +62,13 @@ def _d1(x: float) -> str:
     return f"{x:.1f}".replace(".", ",")
 
 
-def _main_store(db: DB, sid: int, start: date, end: date) -> str | None:
+def _main_store(db: DB, sid: int, start: date, end: date, cfg: Settings | None = None) -> str | None:
+    """Магазин продавца: по графику и смене на день `end`, иначе — где он чаще продавал."""
+    if cfg is not None:
+        from .crews import store_on
+        st = store_on(db, cfg, sid, end)
+        if st:
+            return st
     r = db.one("SELECT store, COUNT(*) n FROM sales_lines WHERE seller_id=? AND day BETWEEN ? AND ? "
                "GROUP BY store ORDER BY n DESC LIMIT 1", sid, start.isoformat(), end.isoformat())
     return r["store"] if r else None
@@ -87,7 +93,7 @@ def rules(db: DB, cfg: Settings, sid: int, st: Status, day: date) -> list[tuple[
                and me.items_per_shift < tm.items_per_shift * 0.9)
     if low_upt:
         mine, team_mix = M.category_mix(db, sid, lb_start, day), M.category_mix(db, None, lb_start, day)
-        stock = M.stock_by_category(db, _main_store(db, sid, m_start, day))
+        stock = M.stock_by_category(db, _main_store(db, sid, m_start, day, cfg))
         adds = companions(db, cfg, day)
         # называем только категории, которые есть на остатке магазина по 1С; остатков нет — без названий
         gaps = sorted(((c, team_mix[c] - mine.get(c, 0.0)) for c in team_mix
@@ -107,7 +113,7 @@ def rules(db: DB, cfg: Settings, sid: int, st: Status, day: date) -> list[tuple[
 
     # 2б. Средний чек ниже команды (только если есть чеки)
     if me.has_receipts and me.avg_check and tm.avg_check and me.avg_check < tm.avg_check * 0.9:
-        pair = best_pair(db, cfg, day, M.stock_by_category(db, _main_store(db, sid, m_start, day)))
+        pair = best_pair(db, cfg, day, M.stock_by_category(db, _main_store(db, sid, m_start, day, cfg)))
         how = (f"собирайте образ целиком: «{pair[0]}» + «{pair[1]}» — их чаще всего берут вместе" if pair
                else "собирайте образ целиком: к основной вещи предлагайте вторую")
         out.append((75, f"Средний чек {_rub(me.avg_check)} против {_rub(tm.avg_check)} у команды — {how}."))

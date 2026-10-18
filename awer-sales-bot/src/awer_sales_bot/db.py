@@ -97,10 +97,17 @@ CREATE TABLE IF NOT EXISTS month_coverage (     -- доля месяца в да
     month TEXT PRIMARY KEY,
     coverage REAL NOT NULL
 );
-CREATE TABLE IF NOT EXISTS schedule (           -- график смен (необязательно); иначе норма смен
+CREATE TABLE IF NOT EXISTS schedule (           -- график работы: рабочие дни продавцов (необязательно; иначе норма)
     day TEXT NOT NULL,
     seller_id INTEGER NOT NULL REFERENCES sellers(id),
+    store TEXT,                           -- магазин в этот день; пусто — магазин его смены (crews.py)
     PRIMARY KEY (day, seller_id)
+);
+CREATE TABLE IF NOT EXISTS crews (              -- смены: состав продавцов одного магазина; по средам меняются магазинами
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    store TEXT NOT NULL,                  -- магазин смены на неделю, которая начинается в среду `anchor`
+    anchor TEXT NOT NULL                  -- среда YYYY-MM-DD; дальше магазины чередуются каждую среду
 );
 CREATE TABLE IF NOT EXISTS plans (              -- план фиксируется 1-го числа и не меняется в течение месяца
     month TEXT NOT NULL,
@@ -188,10 +195,14 @@ class DB:
 
     def _migrate(self) -> None:
         """Новые колонки в базах, созданных раньше (CREATE TABLE IF NOT EXISTS их не добавляет)."""
-        have = {r["name"] for r in self.conn.execute("PRAGMA table_info(sellers)")}
-        for col in ("hired_at", "fired_at"):
-            if col not in have:
-                self.conn.execute(f"ALTER TABLE sellers ADD COLUMN {col} TEXT")
+        new = {"sellers": [("hired_at", "TEXT"), ("fired_at", "TEXT"), ("crew_id", "INTEGER"),
+                           ("weekend_key", "INTEGER NOT NULL DEFAULT 0")],  # сильный продавец — ставить на сб и вс
+               "schedule": [("store", "TEXT")]}
+        for table, cols in new.items():
+            have = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+            for col, typ in cols:
+                if col not in have:
+                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
         self.conn.commit()
 
     @contextmanager
@@ -335,19 +346,21 @@ class DB:
                      day.isoformat(), sid, month)
         return int(r["ahead"] or 0) if r["n"] else None
 
-    def schedule_days(self, month: str) -> dict[int, set[int]]:
-        """{seller_id: {числа месяца по графику}}."""
-        out: dict[int, set[int]] = {}
-        for r in self.q("SELECT seller_id, day FROM schedule WHERE substr(day,1,7)=?", month):
-            out.setdefault(r["seller_id"], set()).add(int(r["day"][8:10]))
+    def schedule_days(self, month: str) -> dict[int, dict[int, str | None]]:
+        """{seller_id: {число месяца: магазин или None — магазин его смены}}."""
+        out: dict[int, dict[int, str | None]] = {}
+        for r in self.q("SELECT seller_id, day, store FROM schedule WHERE substr(day,1,7)=?", month):
+            out.setdefault(r["seller_id"], {})[int(r["day"][8:10])] = r["store"]
         return out
 
-    def set_schedule(self, month: str, sid: int, days: set[int]) -> None:
+    def set_schedule(self, month: str, sid: int, days) -> None:
+        """days: {число: магазин или None} или просто множество чисел (магазин — по смене)."""
         y, m = map(int, month.split("-"))
+        days = days if isinstance(days, dict) else {d: None for d in days}
         with self.tx() as c:
             c.execute("DELETE FROM schedule WHERE seller_id=? AND substr(day,1,7)=?", (sid, month))
-            c.executemany("INSERT INTO schedule(day, seller_id) VALUES(?,?)",
-                          [(date(y, m, d).isoformat(), sid) for d in sorted(days)])
+            c.executemany("INSERT INTO schedule(day, seller_id, store) VALUES(?,?,?)",
+                          [(date(y, m, d).isoformat(), sid, st or None) for d, st in sorted(days.items())])
 
     def planned_shifts(self, sid: int, month: str) -> int | None:
         n = self.one("SELECT COUNT(*) n FROM schedule WHERE seller_id=? AND substr(day,1,7)=?", sid, month)["n"]

@@ -61,7 +61,7 @@ def test_schedule_page(env):  # noqa: F811
     assert "График работы 2026-10" in page and "Норма — 18 рабочих дней" in page and f'name="s{sid}_31"' in page
     r = web.post("/schedule/2026-10", data={f"s{sid}_1": "on", f"s{sid}_2": "on", f"s{sid}_5": "on"}, auth=AUTH)
     assert "График сохранён" in r.text
-    assert db.schedule_days("2026-10")[sid] == {1, 2, 5}
+    assert set(db.schedule_days("2026-10")[sid]) == {1, 2, 5}
     web.post("/schedule/2026-10", data={f"s{sid}_3": "on"}, auth=AUTH)  # пересохранение заменяет месяц
-    assert db.schedule_days("2026-10")[sid] == {3}
+    assert set(db.schedule_days("2026-10")[sid]) == {3}
     assert db.planned_shifts(sid, "2026-10") == 1 and db.planned_shifts(sid, "2026-11") is None

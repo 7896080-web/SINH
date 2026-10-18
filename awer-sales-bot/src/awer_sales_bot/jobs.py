@@ -5,7 +5,7 @@ import logging
 import time
 from datetime import date, datetime, timedelta
 
-from . import achievements, coach, goals, lessons, messages, quiz
+from . import achievements, coach, crews, goals, lessons, messages, quiz
 from . import metrics as M
 from .config import Settings
 from .db import DB
@@ -85,6 +85,10 @@ def daily_run(db: DB, cfg: Settings, sender: Sender, today: date | None = None, 
                          ". Проверьте продавца в документах 1С, иначе эти продажи не попадут в план работающего.",
                          once=True)
     month = today.strftime("%Y-%m")
+    probs = crews.problems(db, cfg, today, today + timedelta(days=cfg.staffing.lookahead_days - 1))
+    if probs and db.one("SELECT 1 FROM schedule WHERE substr(day,1,7)=?", month):
+        sender.to_owners(today.isoformat(), "staffing", "График работы на ближайшие дни:\n" + "\n".join(probs) +
+                         "\nПоправьте: админка → «График работы».", once=True)
     if not db.one("SELECT 1 FROM schedule WHERE substr(day,1,7)=?", month):
         sender.to_owners(month, "no_schedule", f"График работы на {month} не заполнен — бот считает «до базы» по норме "
                                                f"{cfg.norm_shifts} рабочих дней. Заполните: админка → «График работы».",
