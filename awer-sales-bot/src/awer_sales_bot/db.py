@@ -307,6 +307,10 @@ class DB:
                       "VALUES(?,?,?,?,?,?,?,?)",
                       (datetime.now().isoformat(timespec="seconds"), day, kind, sid, uid, status, text, error))
 
+    def already_sent_to(self, day: str, kind: str, uid: int) -> bool:
+        return bool(self.one("SELECT 1 FROM message_log WHERE day=? AND kind=? AND max_user_id=? AND status='ok'",
+                             day, kind, uid))
+
     def already_sent(self, day: str, kind: str, sid: int | None) -> bool:
         r = self.one("SELECT 1 FROM message_log WHERE day=? AND kind=? AND seller_id IS ? AND status='ok'",
                      day, kind, sid)

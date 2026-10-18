@@ -126,3 +126,67 @@ def test_store_goal_and_example_config_keeps_no_seller(env, tmp_path):  # noqa: 
 
     ex = config.load(Path(__file__).parents[1] / "config.example.yaml")
     assert "" not in ex.onec.exclude_sellers and ex.motivation.records and ex.training.onboarding_shifts == 10
+
+
+LESSONS_YAML = """
+lessons:
+  - {id: obraz-1, topic: items, title: Образ 1, text: Текст образа 1, try_today: Предложите ремень,
+     quiz: [{q: "Что предложить к брюкам?", options: [Ремень, Ничего, Скидку], correct: 0,
+            explain: Ремень завершает образ}]}
+  - {id: obraz-2, topic: items, title: Образ 2, text: Текст образа 2, try_today: Вторая вещь, quiz: []}
+  - {id: kontakt-1, topic: general, title: Контакт, text: Текст контакта, try_today: Поздоровайтесь, quiz: []}
+onboarding:
+  - {shift: 2, title: Примерочная, text: Текст смены 2, try_today: Проводите до примерочной}
+  - {shift: 1, title: Знакомство, text: Текст смены 1, try_today: Обойдите зал}
+"""
+
+
+class FakeMax:
+    def __init__(self):
+        self.sent, self.answers = [], []
+
+    def send(self, text, user_id=None, buttons=None, **kw):
+        self.sent.append((user_id, text, buttons))
+        return {}
+
+    def answer(self, callback_id, notification=None, message=None):
+        self.answers.append((callback_id, notification, message))
+        return {}
+
+
+def linked_env(env, tmp_path):  # noqa: F811
+    from awer_sales_bot.jobs import Sender
+    cfg, db = env
+    (tmp_path / "lessons.yaml").write_text(LESSONS_YAML, encoding="utf-8")
+    cfg.training.lessons_path = tmp_path / "lessons.yaml"
+    with db.tx() as c:
+        for i, s in enumerate(db.sellers()):
+            c.execute("UPDATE sellers SET max_user_id=? WHERE id=?", (1000 + i, s["id"]))
+    client = FakeMax()
+    sender = Sender(db, cfg, client)
+    sender.GAP = 0
+    return cfg, db, client, sender
+
+
+def test_weekly_lesson_by_goal_topic(env, tmp_path):  # noqa: F811
+    from awer_sales_bot import goals
+    from awer_sales_bot.jobs import training_run
+    cfg, db, client, sender = linked_env(env, tmp_path)
+    sid = db.seller_id("Продавец04", create=False)
+    rows = []
+    for i in range(10):
+        d = date(2026, 9, 22) + timedelta(days=i * 2)
+        rows += [(d, "Продавец04", 4_000, 1), (d, "Продавец05", 12_000, 3)]
+    import_file(write_sales(tmp_path / "s.csv", rows), db, cfg)
+    uid = db.seller(sid)["max_user_id"]
+
+    titles = []
+    for monday in (date(2026, 10, 19), date(2026, 10, 26), date(2026, 11, 2)):
+        goals.ensure_week(db, cfg, monday)
+        training_run(db, cfg, sender, monday)
+        training_run(db, cfg, sender, monday + timedelta(days=1))  # повтор в ту же неделю — без второго урока
+        mine = [t for u, t, _ in client.sent if u == uid]
+        titles.append(mine[-1].splitlines()[0])
+        client.sent.clear()
+    assert titles == ["📚 **Урок недели: Образ 1**", "📚 **Урок недели: Образ 2**", "📚 **Урок недели: Контакт**"]
+    assert {"obraz-1", "obraz-2", "kontakt-1"} <= {r["lesson_id"] for r in db.q("SELECT lesson_id FROM lessons_sent")}
