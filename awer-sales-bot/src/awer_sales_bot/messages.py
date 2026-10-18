@@ -174,7 +174,7 @@ def owner_summary(db: DB, cfg: Settings, day: date) -> str:
     if good:
         L += ["", "👏 **Кого похвалить:**"] + [f"{name} — {'; '.join(why)}" for _, name, why in good]
     start = day.replace(day=1)
-    no_seller = M.unattributed(db, start, day)
+    no_seller = M.unattributed(db, start, day, cfg.onec.no_seller_name)
     if no_seller:
         L += ["", f"⚠️ Продажи без продавца с начала месяца: {rub(no_seller)} — ни в чей план не попали."]
     if allm.manual_discount:

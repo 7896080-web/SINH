@@ -13,6 +13,7 @@ from datetime import date, timedelta
 from urllib.parse import quote
 
 import openpyxl
+from openpyxl.styles import Font
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -33,6 +34,8 @@ def qr_svg(text: str) -> str:
     img = qrcode.make(text, image_factory=qrcode.image.svg.SvgPathImage, box_size=10)
     return img.to_string(encoding="unicode")
 
+
+CHECK_HOW = {"personal": "по личной истории", "newcomer": "новичок", "none": "плана нет"}  # backtest.Row.method
 
 CSS = """
 body{font-family:Arial,sans-serif;margin:24px;color:#1f2328;background:#fff}
@@ -284,7 +287,7 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
                     cells.append(f'<td class="n{" ok" if ok else ""}">{_pct(y.performance) if y else ""}</td>')
                 b.append(f'<tr><td>{html.escape(x.name)}</td>{"".join(cells)}</tr>')
             b.append('</table>')
-        how = {"personal": "по личной истории", "newcomer": "новичок", "none": "плана нет"}
+        how = CHECK_HOW
         for r in res:
             b.append(f'<h2>{r.month}</h2>')
             if not r.rows:
@@ -305,6 +308,19 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
             b.append('</table>')
         return page("Проверка плана на прошлых месяцах", "".join(b))
 
+    RUB = '#,##0" ₽"'
+
+    def _xlsx_formats(sheet, fmt: dict[int, str], width: int) -> None:
+        """Числа — в рублях и процентах, как на странице; шапка жирная, колонки пошире."""
+        for c in sheet[1]:
+            c.font = Font(bold=True)
+            sheet.column_dimensions[c.column_letter].width = width
+        sheet.column_dimensions["A"].width = 26
+        for row in sheet.iter_rows(min_row=2):
+            for c in row:
+                if c.column in fmt:
+                    c.number_format = fmt[c.column]
+
     @app.get("/check.xlsx", dependencies=[Depends(auth)])
     def check_xlsx(frm: str = "", to: str = ""):
         months = _check_range(frm, to)
@@ -321,8 +337,11 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
             d.append(["Продавец", "Роль", "Как считали план", "План (полный мес.)", "Рабочих дней", "Отработано (доля)",
                       "План на отработанное", "Факт", "Факт − план", "Выполнение", "Ступеней", "Ставка (полный мес.)"])
             for x in r.rows:
-                d.append([x.name, x.role, x.method, x.plan, x.days, x.fte, x.plan_worked, x.sales,
+                d.append([x.name, "старший" if x.role == "admin" else "продавец", CHECK_HOW.get(x.method, x.method),
+                          x.plan, x.days, x.fte, x.plan_worked, x.sales,
                           x.sales - x.plan_worked if x.plan_worked else None, x.performance, x.steps, x.rate])
+            _xlsx_formats(d, {4: RUB, 6: "0.00", 7: RUB, 8: RUB, 9: RUB, 10: "0%", 12: RUB}, 16)
+        _xlsx_formats(ws, {3: "0%", 4: RUB, 5: RUB, 6: "0.000", 9: RUB}, 14)
         buf = io.BytesIO()
         wb.save(buf)
         buf.seek(0)

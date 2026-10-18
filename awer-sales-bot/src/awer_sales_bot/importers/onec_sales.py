@@ -123,6 +123,12 @@ def split_store(name: str, cfg: Settings) -> tuple[str, str | None]:
     return name, None
 
 
+def service_seller(name: str, cfg: Settings) -> bool:
+    """Не человек («Одежда сотрудникам Город»): выручка магазина без личного плана (onec.service_sellers)."""
+    n = name.lower()
+    return any(n.startswith(x.strip().lower()) for x in cfg.onec.service_sellers if x.strip())
+
+
 def _mark_days(c, pairs, source):
     now = datetime.now().isoformat(timespec="seconds")
     for (day, store), n in pairs.items():
@@ -134,7 +140,7 @@ def _mark_days(c, pairs, source):
 def _import_lines(path: Path, rows, h, idx, db: DB, cfg: Settings) -> ImportReport:
     excl = {s.strip().lower() for s in cfg.onec.exclude_sellers}
     data: dict[tuple[str, str], list[tuple]] = defaultdict(list)
-    skipped, unknown, foreign = 0, set(), defaultdict(float)
+    skipped, unknown, foreign, service = 0, set(), defaultdict(float), set()
     for row in rows[h + 1:]:
         if not row or all(c in (None, "") for c in row):
             continue
@@ -156,13 +162,13 @@ def _import_lines(path: Path, rows, h, idx, db: DB, cfg: Settings) -> ImportRepo
             skipped += 1
             continue
         sid = db.seller_id(seller, create=False)
+        is_service = seller == cfg.onec.no_seller_name or service_seller(seller, cfg)
         if sid is None:
             sid = db.seller_id(seller, create=True)
-            if seller == cfg.onec.no_seller_name:
-                with db.tx() as c:
-                    c.execute("UPDATE sellers SET role='system', active=0 WHERE id=?", (sid,))
-            else:
+            if not is_service:
                 unknown.add(seller)
+        if is_service:
+            service.add(sid)
         qty, amount = _num(get("qty")), _num(get("amount"))
         disc = abs(_num(get("discount")))
         if not disc and "price" in idx and amount > 0:
@@ -177,6 +183,8 @@ def _import_lines(path: Path, rows, h, idx, db: DB, cfg: Settings) -> ImportRepo
              amount, disc, min(manual, disc) if disc else manual, card, path.name))
     n = 0
     with db.tx() as c:
+        c.executemany("UPDATE sellers SET role='system', active=0 WHERE id=? AND role<>'system'",
+                      [(sid,) for sid in service])
         for (day, store), lines in data.items():
             c.execute("DELETE FROM sales_lines WHERE day=? AND store=?", (day, store))
             c.executemany("INSERT INTO sales_lines(day,store,seller_id,doc,receipt,time,item,category,qty,amount,"

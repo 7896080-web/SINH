@@ -137,9 +137,11 @@ def team(db: DB, start: date, end: date, exclude_admins: bool = True) -> SellerM
     return _seller_sql(where, [start.isoformat(), end.isoformat()], db)
 
 
-def unattributed(db: DB, start: date, end: date) -> float:
+def unattributed(db: DB, start: date, end: date, name: str = "(без продавца)") -> float:
+    """Продажи с пустым продавцом в 1С (служебные «Одежда сотрудникам» сюда не входят)."""
     r = db.one("""SELECT COALESCE(SUM(amount),0) s FROM sales_lines WHERE day BETWEEN ? AND ?
-                  AND seller_id IN (SELECT id FROM sellers WHERE role='system')""", start.isoformat(), end.isoformat())
+                  AND seller_id IN (SELECT id FROM sellers WHERE role='system' AND name=?)""",
+               start.isoformat(), end.isoformat(), name)
     return r["s"]
 
 
