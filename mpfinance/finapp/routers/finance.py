@@ -25,8 +25,8 @@ from finapp.finance.importer import import_report, resolve_uids
 from finapp.finance.sales_1c import IN_FLIGHT, build_plan, request_upload, upload_problems
 from finapp.finance.rates import RateBook
 from finapp.finance.reconcile import breakdown, money_check, order_check, unmatched_barcodes
-from finapp.finance.settings import (DEFAULT_WAREHOUSES, TAX_MODES, WAREHOUSE_KEYS, load_settings,
-                                  raw_settings, save_setting)
+from finapp.finance.settings import (DEFAULT_WAREHOUSES, KIT_SALES_SOURCES, TAX_MODES, WAREHOUSE_KEYS,
+                                  load_settings, raw_settings, save_setting)
 from finapp.flash import pop_flash, set_flash
 from finapp.models import (Barcode, OnecTask, OneCUploadStatus, PlatformAccount, PlatformStatement, Product,
                            ProductCost, ReportFetch, SalesReport, SalesReportLine, User)
@@ -240,10 +240,9 @@ def reports_upload(
     report = outcome.report
     message = (f"Отчёт загружен: {report.lines_count} строк, период "
                f"{report.period_from:%d.%m.%Y}–{report.period_to:%d.%m.%Y}.")
-    if outcome.warnings:
-        set_flash(request, message + " " + " ".join(outcome.warnings), "warn")
-    else:
-        set_flash(request, message, "good")
+    # Предупреждения — раньше справки: сообщение режется по MAX_FLASH_CHARS.
+    tail = " ".join(outcome.warnings + outcome.notes)
+    set_flash(request, (message + " " + tail).strip(), "warn" if outcome.warnings else "good")
     return RedirectResponse(f"/finance/reports/{report.id}", status_code=303)
 
 
@@ -513,6 +512,7 @@ def costs_page(
         products=products, costs=costs, total=total, limit=COSTS_LIMIT, q=q, missing=missing,
         with_cost=with_cost, products_total=db.query(Product).count(),
         raw=raw_settings(db), tax_modes=TAX_MODES, warehouse_keys=WAREHOUSE_KEYS,
+        kit_sales_sources=KIT_SALES_SOURCES,
         latest_rate=rates.latest(),
         cost_jobs=db.query(OnecTask).filter(OnecTask.command == "EXPORT_COST_PRICES")
         .order_by(OnecTask.id.desc()).limit(5).all(),
@@ -638,7 +638,8 @@ def costs_import(
 def finance_settings_save(
     request: Request, FIN_TAX_MODE: str = Form("revenue"), FIN_TAX_RATE: str = Form("6"),
     FIN_EXTRA_COST_PER_UNIT: str = Form("0"), FIN_USD_RATE_MANUAL: str = Form(""),
-    FIN_AUTO_FETCH: str = Form("1"),
+    FIN_AUTO_FETCH: str = Form("1"), FIN_KIT_CRM_COMMISSION: str = Form("3.5"),
+    FIN_KIT_SALES_SOURCE: str = Form("crm"),
     FIN_WAREHOUSE_WB: str = Form(""), FIN_WAREHOUSE_OZON: str = Form(""),
     FIN_WAREHOUSE_KIT: str = Form(""), FIN_WAREHOUSE_LAMODA: str = Form(""),
     db: Session = Depends(get_db), user: User = Depends(get_current_user),
@@ -648,9 +649,12 @@ def finance_settings_save(
         errors.append("неизвестный режим налога")
     if FIN_AUTO_FETCH not in ("0", "1"):
         errors.append("автозагрузка — 0 или 1")
+    if FIN_KIT_SALES_SOURCE not in KIT_SALES_SOURCES:
+        errors.append("неизвестный источник продаж KIT")
     for label, text, upper, allow_empty in (
             ("ставка налога", FIN_TAX_RATE, Decimal(100), False),
             ("доп. расходы на единицу", FIN_EXTRA_COST_PER_UNIT, None, False),
+            ("комиссия AWER CRM", FIN_KIT_CRM_COMMISSION, Decimal(100), False),
             ("курс доллара", FIN_USD_RATE_MANUAL, Decimal(100000), True)):
         cleaned = (text or "").replace(",", ".").replace(" ", "").strip()
         if not cleaned and allow_empty:
@@ -676,6 +680,8 @@ def finance_settings_save(
         "FIN_EXTRA_COST_PER_UNIT": (FIN_EXTRA_COST_PER_UNIT or "0").replace(",", ".").replace(" ", "").strip(),
         "FIN_USD_RATE_MANUAL": (FIN_USD_RATE_MANUAL or "").replace(",", ".").replace(" ", "").strip(),
         "FIN_AUTO_FETCH": FIN_AUTO_FETCH,
+        "FIN_KIT_CRM_COMMISSION": (FIN_KIT_CRM_COMMISSION or "0").replace(",", ".").replace(" ", "").strip(),
+        "FIN_KIT_SALES_SOURCE": FIN_KIT_SALES_SOURCE,
         **{key: name.strip() for key, name in warehouses.items()},
     }
     changed = [key for key, value in values.items() if save_setting(db, key, value)]

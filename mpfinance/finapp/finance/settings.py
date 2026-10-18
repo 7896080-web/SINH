@@ -1,5 +1,5 @@
 """Настройки финансового расчёта: налог, доп. расходы на единицу, склады 1С,
-ручной курс доллара.
+ручной курс доллара, комиссия по продажам сайта из AWER CRM.
 
 Хранятся общим механизмом настроек (`finapp/settings.py`); здесь — значения
 по умолчанию и разбор в типы.
@@ -17,6 +17,14 @@ TAX_MODES = {
     "revenue": "УСН «Доходы» — % от выручки",
     "profit": "УСН «Доходы − расходы» — % от прибыли до налога",
     "none": "Не учитывать налог",
+}
+
+# Откуда берутся продажи сайта на KIT. Из AWER CRM (файлом) — тогда загрузка
+# KIT по API берёт из заказов только доставку (`seller_costs` /
+# `customer_costs`): продажи в ней те же, что в CRM, и посчитались бы дважды.
+KIT_SALES_SOURCES = {
+    "crm": "AWER CRM (файл), по API — только доставка",
+    "api": "API KIT (заказы целиком)",
 }
 
 # Склад продаж площадки в 1С. Для WB/Ozon/KIT — тот же склад, куда sync_admin
@@ -39,6 +47,10 @@ DEFAULTS = {
     "FIN_EXTRA_COST_PER_UNIT": "0",
     "FIN_USD_RATE_MANUAL": "",
     "FIN_AUTO_FETCH": "1",
+    # Комиссия с продаж сайта на KIT (AWER CRM): «Сумма» в выгрузке CRM — до
+    # неё, а к перечислению приходит за вычетом. Ставку назвал владелец 18.10.2026.
+    "FIN_KIT_CRM_COMMISSION": "3.5",
+    "FIN_KIT_SALES_SOURCE": "crm",
     **{key: DEFAULT_WAREHOUSES[p] for p, key in WAREHOUSE_KEYS.items()},
 }
 
@@ -50,6 +62,8 @@ class FinanceSettings:
     extra_cost_kop: int = 0                     # упаковка, маркировка и пр. на проданную единицу
     warehouses: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_WAREHOUSES))
     usd_rate_manual: Decimal | None = None      # ₽ за доллар, если курса ЦБ нет
+    kit_crm_commission: Decimal = Decimal("3.5")  # % от «Суммы» AWER CRM
+    kit_sales_source: str = "crm"                # KIT_SALES_SOURCES
 
 
 def _decimal(text: str, default: str | None) -> Decimal | None:
@@ -78,6 +92,10 @@ def load_settings(db: Session) -> FinanceSettings:
         extra_cost_kop=int((extra * 100).to_integral_value()),
         warehouses={p: raw[key].strip() for p, key in WAREHOUSE_KEYS.items()},
         usd_rate_manual=manual if manual and manual > 0 else None,
+        kit_crm_commission=min(_decimal(raw["FIN_KIT_CRM_COMMISSION"], DEFAULTS["FIN_KIT_CRM_COMMISSION"]),
+                               Decimal(100)),
+        kit_sales_source=raw["FIN_KIT_SALES_SOURCE"] if raw["FIN_KIT_SALES_SOURCE"] in KIT_SALES_SOURCES
+        else DEFAULTS["FIN_KIT_SALES_SOURCE"],
     )
 
 

@@ -183,7 +183,7 @@ def test_settings_validation_and_save(client, db):
 
     client.post("/finance/settings", data={
         "FIN_TAX_MODE": "profit", "FIN_TAX_RATE": "15", "FIN_EXTRA_COST_PER_UNIT": "35,5",
-        "FIN_USD_RATE_MANUAL": "92,5",
+        "FIN_USD_RATE_MANUAL": "92,5", "FIN_KIT_CRM_COMMISSION": "4,2", "FIN_KIT_SALES_SOURCE": "api",
         "FIN_WAREHOUSE_WB": "Wildberries_Склад_FBO", "FIN_WAREHOUSE_OZON": "OZON_Склад",
         "FIN_WAREHOUSE_KIT": "Сайт AWER", "FIN_WAREHOUSE_LAMODA": "Lamaoda_Склад"})
     from finapp.finance.settings import load_settings
@@ -192,6 +192,11 @@ def test_settings_validation_and_save(client, db):
     assert settings.extra_cost_kop == 3550
     assert settings.warehouses["lamoda"] == "Lamaoda_Склад"
     assert str(settings.usd_rate_manual) == "92.5"
+    assert str(settings.kit_crm_commission) == "4.2" and settings.kit_sales_source == "api"
+    for bad in ({"FIN_KIT_CRM_COMMISSION": "150"}, {"FIN_KIT_SALES_SOURCE": "почта"}):
+        response = client.post("/finance/settings", data={"FIN_TAX_MODE": "revenue", "FIN_TAX_RATE": "6",
+                                                          **bad}, follow_redirects=True)
+        assert "не сохранены" in response.text
 
 
 def test_missing_report_redirects(client):

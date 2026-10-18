@@ -27,9 +27,11 @@ from finapp.finance import statements, values as v
 from finapp.finance.formats import ParseResult, ReportFormat, parse_records
 from finapp.finance.importer import make_onec_key, store_api_report
 from finapp.finance.rates import RateError, fetch_cbr_range, missing_range
+from finapp.finance.settings import load_settings
 from finapp.finance.sources import kit as kit_source
 from finapp.finance.sources import wb as wb_source
-from finapp.models import KitVariant, PlatformAccount, ReportFetch, SalesReport, SalesReportLine
+from finapp.models import (KitVariant, OneCUploadStatus, PlatformAccount, ReportFetch, SalesReport,
+                           SalesReportLine)
 from finapp.timeutils import local_day_start_utc, now_utc, today_local
 
 logger = logging.getLogger("mpfinance.fetch")
@@ -56,6 +58,8 @@ AUTO_FETCH_KEY = "FIN_AUTO_FETCH"
 
 KIT_API_FORMAT = ReportFormat(code="kit_api", label="Яндекс KIT — заказы (API)",
                               platforms=("kit",), aliases={}, build=lambda row: {})
+# Вид отчёта KIT по API, когда продажи берутся из AWER CRM: только доставка.
+KIT_DELIVERY_KIND = "доставка"
 
 
 class FetchError(RuntimeError):
@@ -264,11 +268,17 @@ def _run_kit(db: Session, job: ReportFetch, heartbeat, session, sleep) -> str:
     api = kit_source.KitOrdersApi(token, session=session, sleep=sleep)
     orders = api.orders_updated_since(local_day_start_utc(job.date_from))
     _step(db, job, heartbeat)
+    # Продажи сайта берутся из AWER CRM — тогда из заказов KIT нужна только
+    # доставка: продажи в них те же, и посчитались бы дважды. Баркоды вариантов
+    # тогда не нужны вовсе, и запросов к KIT за ними не делаем.
+    delivery_only = load_settings(db).kit_sales_source == "crm"
 
     known = _kit_variant_map(db, account.id)
     asked: dict[str, str | None] = {}
 
     def barcode_for(variant_id: str) -> str | None:
+        if delivery_only:
+            return None
         if known.get(variant_id):
             return known[variant_id]
         if variant_id not in asked:
@@ -276,6 +286,8 @@ def _run_kit(db: Session, job: ReportFetch, heartbeat, session, sleep) -> str:
         return asked[variant_id]
 
     lines, stats = kit_source.build_lines(orders, job.date_from, job.date_to, barcode_for)
+    if delivery_only:
+        lines = [line for line in lines if line["operation"] == v.LOGISTICS]
     for variant_id, barcode in asked.items():
         cached = db.get(KitVariant, (account.id, variant_id))
         if cached is None:
@@ -285,19 +297,34 @@ def _run_kit(db: Session, job: ReportFetch, heartbeat, session, sleep) -> str:
     db.flush()
     job.found = stats["orders"]
     if not lines:
-        return (f"заказов KIT, доставленных за {job.date_from:%d.%m}–{job.date_to:%d.%m.%Y}, нет "
+        what = "стоимости доставки в заказах KIT" if delivery_only and stats["orders"] else "заказов KIT"
+        return (f"{what}, доставленных за {job.date_from:%d.%m}–{job.date_to:%d.%m.%Y}, нет "
                 f"(просмотрено изменённых: {len(orders)})")
+    dropped = _drop_unsent_kit_sales(db, account.id, job) if delivery_only else 0
     parsed = ParseResult(format=KIT_API_FORMAT, lines=lines)
     outcome = store_api_report(
         db, platform="kit", account_id=account.id, parsed=parsed, period_from=job.date_from,
         period_to=job.date_to, user=f"api:{job.requested_by or 'system'}",
-        file_name="Яндекс KIT, заказы по API", replace_unsent=True)
+        file_name="Яндекс KIT, доставка по API" if delivery_only else "Яндекс KIT, заказы по API",
+        replace_unsent=True, report_kind=KIT_DELIVERY_KIND if delivery_only else None,
+        key_suffix="-dlv" if delivery_only else "")
     if outcome.errors:
         raise FetchError(" ".join(outcome.errors))
     if outcome.skipped:
         return (f"отчёт KIT за этот период уже отправлен в 1С (#{outcome.report.id}) — "
                 f"не перезаписываю")
     job.imported = 1
+    if delivery_only:
+        cost = sum(line["logistics"] for line in lines)
+        paid = sum(line["compensation"] for line in lines)
+        note = (f"только доставка (продажи — из AWER CRM): заказов {stats['orders']}, доставка для "
+                f"продавца {v.format_rub(cost)} ₽, оплачено покупателями {v.format_rub(paid)} ₽")
+        if outcome.replaced:
+            note += "; прежний неотправленный отчёт за период заменён свежим"
+        if dropped:
+            note += ("; прежний отчёт по API с продажами за этот период удалён — продажи теперь из "
+                     "AWER CRM")
+        return note
     note = (f"заказов: {stats['orders']}, продано {stats['sold_qty']} шт, отказов при получении "
             f"{stats['refused_qty']} шт")
     if stats["no_barcode"]:
@@ -305,6 +332,23 @@ def _run_kit(db: Session, job: ReportFetch, heartbeat, session, sleep) -> str:
     if outcome.replaced:
         note += "; прежний неотправленный отчёт за период заменён свежим"
     return note
+
+
+def _drop_unsent_kit_sales(db: Session, account_id: int, job: ReportFetch) -> int:
+    """Продажи KIT переключили на AWER CRM: отчёт по API С ПРОДАЖАМИ за тот же
+    период (прежний режим) задвоил бы их с CRM. Пока он не ушёл в 1С, его можно
+    забрать заново в любой момент — удаляем; ушедший в 1С не трогаем."""
+    key = make_onec_key("kit", account_id, "", job.date_from, job.date_to)
+    old = db.query(SalesReport).filter(
+        SalesReport.onec_key == key, SalesReport.source == "api",
+        SalesReport.onec_status.in_((OneCUploadStatus.none, OneCUploadStatus.failed,
+                                     OneCUploadStatus.timeout))).first()
+    if old is None:
+        return 0
+    db.query(SalesReportLine).filter(SalesReportLine.report_id == old.id).delete(synchronize_session=False)
+    db.delete(old)
+    db.flush()
+    return 1
 
 
 # ---------------------------------------------------------------- курс ЦБ

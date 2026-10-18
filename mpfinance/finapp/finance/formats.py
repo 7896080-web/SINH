@@ -10,6 +10,7 @@
 нашли в файле, и может привести отчёт к единой форме сам (шаблон на странице).
 """
 import re
+from decimal import ROUND_HALF_UP, Decimal
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -75,6 +76,9 @@ class ReportFormat:
     required_any: tuple[tuple[str, ...], ...] = ()
     min_fields: int = 3
     note: str = ""
+    # Чей итог стоит в строке «Итого» отчёта: «payout» — к перечислению (Lamoda),
+    # «revenue» — продажи до удержаний (AWER CRM).
+    total_field: str = "payout"
 
 
 _PERIOD_RE = re.compile(r"\bс\s*(\d{2}\.\d{2}\.\d{4})\s*по\s*(\d{2}\.\d{2}\.\d{4})", re.IGNORECASE)
@@ -93,6 +97,8 @@ class ParseResult:
     # «К перечислению» из строки «Итого» самого отчёта (Lamoda и др.) — подставляется
     # как сумма площадки для сверки с итогом строк.
     declared_payout: int | None = None
+    # Итог продаж из строки «Итого», когда там выручка, а не выплата.
+    declared_revenue: int | None = None
 
 
 def _norm(text: str) -> str:
@@ -552,20 +558,21 @@ KIT_FORMAT = ReportFormat(
 # — номер для покупателя (`order_number` KIT, 100608), а не внутренний id
 # заказа, по которому принимает заказы Sync Admin, поэтому он кладётся в
 # `srid`, как и у загрузки KIT по API, — сверки по номеру с Sync Admin нет.
-# Комиссии у KIT нет, «Сумма» — деньги продавца; эквайринг приходит отдельно
-# детализацией Яндекс Пэй.
+# «Сумма» — ДО комиссии (так сказал владелец 18.10.2026), и «Итого:» — итог
+# сумм, а не выплаты. Комиссию разбор не знает: ставка — настройка, её
+# применяет импорт (`apply_commission`), а до того выплата равна сумме.
 AWER_CRM_ALIASES = {
     "operation_date": ("Дата",),
     "srid": ("Номер заказа",),
     "article": ("Артикул",),
     "barcode": ("Баркод",),
-    "payout": ("Сумма",),
+    "revenue": ("Сумма",),
 }
 
 
 def build_awer_crm(row: Row) -> dict:
     line = v.empty_line()
-    amount = row.money("payout")
+    amount = row.money("revenue")
     # Минус в сумме — возврат (в выгрузке продаж его не было, но молча считать
     # его продажей с отрицательной выручкой было бы хуже).
     line["operation"] = v.RETURN if amount < 0 else v.SALE
@@ -579,16 +586,33 @@ def build_awer_crm(row: Row) -> dict:
     return line
 
 
+def apply_commission(lines: list[dict], percent: Decimal) -> int:
+    """Комиссия `percent` % от выручки строки, до копейки (половина — вверх);
+    выплата = выручка − комиссия. У возврата комиссия со знаком минус:
+    удержанная при продаже возвращается. Возвращает сумму комиссии."""
+    total = 0
+    for line in lines:
+        if line["operation"] not in v.GOODS_OPERATIONS:
+            continue
+        commission = int((Decimal(line["revenue"]) * percent / 100).quantize(Decimal(1), ROUND_HALF_UP))
+        line["commission"] = commission
+        line["payout"] = line["revenue"] - commission
+        total += commission
+    return total
+
+
 AWER_CRM_FORMAT = ReportFormat(
     code="kit_awer_crm",
     label="AWER CRM — продажи сайта на KIT",
     platforms=("kit",),
     aliases=AWER_CRM_ALIASES,
     build=build_awer_crm,
-    required=("operation_date", "srid", "barcode", "payout"),
+    required=("operation_date", "srid", "barcode", "revenue"),
     min_fields=5,
-    note="Выгрузка «Продажи» из AWER CRM (sales-items-…xlsx). Строка — одна штука, «Сумма» — "
-         "деньги продавца; итог сверяется со строкой «Итого:». Период — из имени файла.",
+    total_field="revenue",
+    note="Выгрузка «Продажи» из AWER CRM (sales-items-…xlsx). Строка — одна штука; «Сумма» — до "
+         "комиссии, она вычитается по ставке из настроек расчёта. Итог сверяется со строкой "
+         "«Итого:», период — из имени файла.",
 )
 
 
@@ -780,9 +804,10 @@ def parse_sheets(sheets: list[tuple[str, list[list]]], platform: str) -> ParseRe
             continue
         if _is_total_row(cells):
             after_total = True
-            if "payout" in mapping and result.declared_payout is None:
+            target = "declared_payout" if fmt.total_field == "payout" else "declared_revenue"
+            if fmt.total_field in mapping and getattr(result, target) is None:
                 try:
-                    result.declared_payout = Row(cells, mapping, headers).money_or_none("payout")
+                    setattr(result, target, Row(cells, mapping, headers).money_or_none(fmt.total_field))
                 except v.ValueParseError:
                     pass
             continue

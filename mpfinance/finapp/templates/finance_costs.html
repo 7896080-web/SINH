@@ -121,6 +121,22 @@
                 <input type="text" id="usd_rate" name="FIN_USD_RATE_MANUAL" value="{{ raw['FIN_USD_RATE_MANUAL'] }}" placeholder="если курса ЦБ нет" style="width:140px;">
             </div>
         </div>
+        <h3 style="font-size:14px; margin:16px 0 4px;">Сайт на Яндекс KIT</h3>
+        <p class="help-text" style="margin-top:0;">«Сумма» в выгрузке AWER CRM — до комиссии; к перечислению идёт за её вычетом.
+            Ставка применяется при загрузке отчёта: уже загруженный отчёт пересчитается, если удалить его и загрузить снова.
+            Если продажи берутся из AWER CRM, загрузка KIT по API берёт из заказов только доставку — иначе продажи посчитались бы дважды.</p>
+        <div class="filters" style="border:none; padding:0;">
+            <div class="field">
+                <label for="kit_sales_source">Продажи KIT берём из</label>
+                <select id="kit_sales_source" name="FIN_KIT_SALES_SOURCE">
+                    {% for code, label in kit_sales_sources.items() %}<option value="{{ code }}" {% if raw['FIN_KIT_SALES_SOURCE'] == code %}selected{% endif %}>{{ label }}</option>{% endfor %}
+                </select>
+            </div>
+            <div class="field">
+                <label for="kit_crm_commission">Комиссия с продаж AWER CRM, %</label>
+                <input type="text" id="kit_crm_commission" name="FIN_KIT_CRM_COMMISSION" value="{{ raw['FIN_KIT_CRM_COMMISSION'] }}" style="width:80px;">
+            </div>
+        </div>
         <h3 style="font-size:14px; margin:16px 0 4px;">Склады продаж в 1С (для загрузки отчётов)</h3>
         <p class="help-text" style="margin-top:0;">Точное наименование склада в справочнике «Склады» 1С, с которого списываются
             продажи площадки. Для WB, Ozon и KIT по умолчанию — те же склады, куда приём заказа перемещает товар.

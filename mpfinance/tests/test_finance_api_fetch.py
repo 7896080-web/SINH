@@ -246,7 +246,15 @@ def test_kit_delivery_date_is_the_local_day():
     assert sales == ([expected] if expected.month == 9 else [])
 
 
-def test_kit_fetch_builds_report_and_refreshes_it_until_sent_to_1c(db):
+@pytest.fixture
+def kit_sales_from_api(db):
+    """Продажи KIT — из API (по умолчанию они из AWER CRM, а по API — доставка)."""
+    from finapp.finance.settings import save_setting
+    save_setting(db, "FIN_KIT_SALES_SOURCE", "api")
+    db.commit()
+
+
+def test_kit_fetch_builds_report_and_refreshes_it_until_sent_to_1c(db, kit_sales_from_api):
     make_product(db)
     account = make_account(db, platform="kit", name="Сайт")
     _cred(db, account, "token", "kit-token")
@@ -283,7 +291,7 @@ def test_kit_fetch_builds_report_and_refreshes_it_until_sent_to_1c(db):
     assert "не перезаписываю" in last.message
 
 
-def test_kit_unknown_variant_is_asked_from_api_once_and_cached(db):
+def test_kit_unknown_variant_is_asked_from_api_once_and_cached(db, kit_sales_from_api):
     account = make_account(db, platform="kit", name="Сайт")
     _cred(db, account, "token", "t")
     fetch.request_fetch(db, "kit_api", "admin", account.id, date(2026, 9, 1), date(2026, 9, 30))
@@ -297,6 +305,60 @@ def test_kit_unknown_variant_is_asked_from_api_once_and_cached(db):
     report = db.query(SalesReport).one()
     assert {l.barcode for l in report.lines if l.operation == v.SALE} == {"4600000000001"}
     assert db.get(KitVariant, (account.id, "v-1")).barcode == "4600000000001"
+
+
+def _kit_run(db, account, orders):
+    fetch.request_fetch(db, "kit_api", "admin", account.id, date(2026, 9, 1), date(2026, 9, 30))
+    db.commit()
+    session = FakeSession({"/v1/orders": {"orders": orders, "total_count": len(orders)}})
+    fetch.run_pending(db, session=session, sleep=lambda s: None)
+    return session
+
+
+def test_kit_fetch_takes_only_delivery_when_sales_come_from_crm(db):
+    """Продажи сайта — из AWER CRM: из заказов KIT берётся только доставка,
+    иначе продажи посчитались бы дважды; баркоды вариантов не запрашиваются."""
+    account = make_account(db, platform="kit", name="Сайт")
+    _cred(db, account, "token", "t")
+    session = _kit_run(db, account, [_kit_order(), _kit_order(order_id="o-9")])
+    assert not [c for c in session.calls if c[1].startswith("/v1/variants")]
+    report = db.query(SalesReport).one()
+    assert {l.operation for l in report.lines} == {v.LOGISTICS}
+    assert report.report_kind == fetch.KIT_DELIVERY_KIND and report.onec_key.endswith("-dlv")
+    assert sum(l.logistics_kop for l in report.lines) == 2 * 25000
+    job = db.query(ReportFetch).one()
+    assert "только доставка" in job.message and "500,00" in job.message
+
+
+def test_delivery_report_does_not_collide_with_crm_report_of_same_period(db):
+    """Отчёт AWER CRM за сентябрь и доставка по API за тот же сентябрь — разные
+    отчёты: доставка не должна молча «уже лечь» под ключом CRM."""
+    from finapp.finance.importer import make_onec_key
+    from tests.finance_factories import make_report
+    account = make_account(db, platform="kit", name="Сайт")
+    _cred(db, account, "token", "t")
+    make_report(db, platform="kit", account_id=account.id, period=(date(2026, 9, 1), date(2026, 9, 30)),
+                key=make_onec_key("kit", account.id, "", date(2026, 9, 1), date(2026, 9, 30)),
+                lines=[{"operation": v.SALE, "quantity": 1, "revenue": 460000, "payout": 443900}]).source = "file"
+    db.commit()
+    _kit_run(db, account, [_kit_order()])
+    assert db.query(SalesReport).count() == 2
+
+
+def test_switching_to_crm_replaces_unsent_api_sales_of_the_period(db, kit_sales_from_api):
+    from finapp.finance.settings import save_setting
+    account = make_account(db, platform="kit", name="Сайт")
+    _cred(db, account, "token", "t")
+    db.add(KitVariant(account_id=account.id, variant_id="v-1", barcode="2000000000012"))
+    db.commit()
+    _kit_run(db, account, [_kit_order()])
+    assert any(l.operation == v.SALE for l in db.query(SalesReport).one().lines)
+    save_setting(db, "FIN_KIT_SALES_SOURCE", "crm")
+    db.commit()
+    _kit_run(db, account, [_kit_order()])
+    report = db.query(SalesReport).one()                       # прежний с продажами удалён
+    assert {l.operation for l in report.lines} == {v.LOGISTICS}
+    assert "продажи теперь из AWER CRM" in db.query(ReportFetch).order_by(ReportFetch.id.desc()).first().message
 
 
 # ------------------------------------------------------------ автоплан

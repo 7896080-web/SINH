@@ -32,29 +32,55 @@ def test_crm_sales_are_read_one_piece_per_row():
     assert parsed.errors == [] and parsed.format.code == "kit_awer_crm"
     assert len(parsed.lines) == 4
     first = parsed.lines[0]
+    # Разбор комиссию не знает: до импорта выплата равна сумме.
     assert (first["operation"], first["quantity"], first["revenue"], first["payout"]) == (v.SALE, 1, 460000, 460000)
     # Номер для покупателя — не номер, по которому принимает заказы Sync Admin.
     assert (first["srid"], first["order_id"]) == ("100608", "")
     assert first["barcode"] == "2000932091174" and parsed.lines[3]["article"] == ""
-    assert parsed.declared_payout == 1743600                        # строка «Итого:»
+    # «Итого:» — итог СУММ (до комиссии), а не выплаты.
+    assert (parsed.declared_revenue, parsed.declared_payout) == (1743600, None)
 
 
-def test_import_takes_the_period_from_the_file_name(db):
+def test_import_deducts_commission_and_takes_the_period_from_the_file_name(db):
     make_product(db, barcodes=("2000932091174",))
     outcome = import_report(db, platform="kit", file_bytes=_file(), filename=FILENAME, user="admin")
     assert outcome.errors == []
     report = outcome.report
     # Продажи — с 05.09 по 20.09, а выгружен весь сентябрь.
     assert (report.period_from, report.period_to) == (date(2026, 9, 1), date(2026, 9, 30))
-    assert report.declared_payout_kop == 1743600
+    assert report.declared_payout_kop is None
     assert not any("не совпал" in w for w in outcome.warnings)
-    assert sum(line.payout_kop for line in db.query(SalesReportLine).filter_by(report_id=report.id)) == 1743600
+    lines = db.query(SalesReportLine).filter_by(report_id=report.id).order_by(SalesReportLine.row_no).all()
+    # 3,5%: 4600 → 161,00; 3336 → 116,76; 3500 → 122,50; 6000 → 210,00.
+    assert [l.commission_kop for l in lines] == [16100, 11676, 12250, 21000]
+    assert [l.payout_kop for l in lines] == [443900, 321924, 337750, 579000]
+    assert sum(l.revenue_kop for l in lines) == 1743600
+    assert any("Комиссия 3,5%" in n and "610,26" in n for n in outcome.notes)
     assert report.unmatched_lines == 3
+
+
+def test_commission_rate_is_a_setting(db):
+    from finapp.finance.settings import save_setting
+    save_setting(db, "FIN_KIT_CRM_COMMISSION", "0")
+    db.commit()
+    report = import_report(db, platform="kit", file_bytes=_file(), filename=FILENAME, user="admin").report
+    assert sum(l.payout_kop for l in db.query(SalesReportLine).filter_by(report_id=report.id)) == 1743600
+
+
+def test_commission_rounds_half_up_and_returns_get_it_back():
+    from decimal import Decimal
+    from finapp.finance.formats import apply_commission
+    lines = [dict(v.empty_line(), operation=v.SALE, revenue=343800),      # 120,33
+             dict(v.empty_line(), operation=v.SALE, revenue=10),          # 0,35 → 0
+             dict(v.empty_line(), operation=v.SALE, revenue=100),         # 3,5 → 4
+             dict(v.empty_line(), operation=v.RETURN, revenue=-460000)]   # −161,00
+    assert apply_commission(lines, Decimal("3.5")) == 12033 + 0 + 4 - 16100
+    assert [l["payout"] for l in lines] == [331767, 10, 96, -443900]
 
 
 def test_total_mismatch_is_reported(db):
     outcome = import_report(db, platform="kit", file_bytes=_file(total=17000), filename=FILENAME, user="admin")
-    assert any("не совпал" in w for w in outcome.warnings)
+    assert any("не совпала со строкой «Итого:»" in w for w in outcome.warnings)
 
 
 def test_negative_amount_is_a_return():

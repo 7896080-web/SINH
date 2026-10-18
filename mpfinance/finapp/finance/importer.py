@@ -16,7 +16,8 @@ from sqlalchemy.orm import Session
 from finapp.audit import log_action
 from finapp import mapping
 from finapp.finance import lamoda, statements, values as v
-from finapp.finance.formats import ParseResult, parse_sheets
+from finapp.finance.formats import AWER_CRM_FORMAT, ParseResult, apply_commission, parse_sheets
+from finapp.finance.settings import load_settings
 from finapp.finance.readers import ReportReadError, read_sheets
 from finapp.models import OneCUploadStatus, PlatformAccount, SalesReport, SalesReportLine
 
@@ -30,6 +31,8 @@ class ImportOutcome:
     report: SalesReport | None = None
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # Справка к итогу загрузки (не предупреждение): чем посчитана комиссия и т.п.
+    notes: list[str] = field(default_factory=list)
     skipped: bool = False        # такой отчёт уже есть — ничего не записано
     replaced: bool = False       # прежний (ещё не отправленный в 1С) отчёт заменён свежим
     # Еженедельный отчёт Lamoda раскладывается на несколько отчётов (по неделе).
@@ -99,6 +102,13 @@ def resolve_uids(db: Session, report: SalesReport, notes: list[str] | None = Non
     return unmatched
 
 
+def _with_goods(db: Session, report_ids: list[int]) -> set[int]:
+    """Из отчётов — те, в которых есть продажи или возвраты."""
+    return {rid for (rid,) in db.query(SalesReportLine.report_id).filter(
+        SalesReportLine.report_id.in_(report_ids),
+        SalesReportLine.operation.in_(v.GOODS_OPERATIONS)).distinct()}
+
+
 def overlapping_reports(db: Session, report: SalesReport) -> list[SalesReport]:
     """Другие отчёты той же площадки и кабинета с пересекающимся периодом —
     риск посчитать одни и те же продажи дважды (недельный + месячный отчёт)."""
@@ -166,6 +176,9 @@ def import_report(db: Session, *, platform: str, file_bytes: bytes, filename: st
             outcome.errors.append("Отчёт не сохранён: строки с ошибками изменили бы итоги. "
                                   "Исправьте файл и загрузите снова.")
         return outcome
+
+    if parsed.format is AWER_CRM_FORMAT:
+        _awer_crm(db, parsed, outcome)
 
     # Период без явного указания — по датам ПРОДАЖ И ВОЗВРАТОВ, если они есть. В
     # детализации WB у строк логистики «Дата продажи» бывает на месяц раньше
@@ -243,6 +256,21 @@ def _import_lamoda_weekly(db: Session, sheets, *, account_id, user: str, filenam
         outcome.errors.append("В еженедельном отчёте нет продаж за незакрытые недели.")
     return outcome
 
+def _awer_crm(db: Session, parsed: ParseResult, outcome: ImportOutcome) -> None:
+    """«Сумма» AWER CRM — до комиссии: вычесть её по ставке из настроек и
+    сверить итог сумм со строкой «Итого:» самого файла."""
+    revenue = sum(line["revenue"] for line in parsed.lines if line["operation"] in v.GOODS_OPERATIONS)
+    if parsed.declared_revenue is not None and parsed.declared_revenue != revenue:
+        outcome.warnings.append(
+            f"Сумма строк ({v.format_rub(revenue)}) не совпала со строкой «Итого:» файла "
+            f"({v.format_rub(parsed.declared_revenue)}) — файл выгружен не целиком?")
+    percent = load_settings(db).kit_crm_commission
+    commission = apply_commission(parsed.lines, percent)
+    outcome.notes.append(
+        f"Комиссия {str(percent).replace('.', ',')}% от «Суммы» AWER CRM: {v.format_rub(commission)} ₽, "
+        f"к перечислению {v.format_rub(revenue - commission)} ₽ (ставка — «Себестоимость» → «Настройки»).")
+
+
 def _store(db: Session, outcome: ImportOutcome, *, platform: str, account_id: int | None,
            parsed: ParseResult, user: str, number: str, period_from: date, period_to: date,
            source: str, file_name: str, file_sha256: str | None, declared_payout: int | None,
@@ -311,8 +339,13 @@ def _store(db: Session, outcome: ImportOutcome, *, platform: str, account_id: in
     # загруженного файлом, — про него предупреждает `store_api_report`.
     # Предварительные недели Lamoda не в счёт: отчёт комиссионера их заменяет
     # (`lamoda.apply_correction`), задвоения не будет.
+    # Отчёт без продаж (только доставка KIT по API, комиссии Яндекс Пэй) с
+    # отчётом о продажах не задваивается — про него предупреждать не о чем.
     overlaps = [r for r in overlapping_reports(db, report) if r.report_kind != lamoda.PROVISIONAL] \
         if source in ("file", "email") and report_kind != lamoda.PROVISIONAL else []
+    if overlaps:
+        with_goods = _with_goods(db, [report.id] + [r.id for r in overlaps])
+        overlaps = [r for r in overlaps if r.id in with_goods] if report.id in with_goods else []
     if overlaps:
         outcome.warnings.append(
             "Период пересекается с уже загруженными отчётами этой площадки: "
@@ -333,7 +366,7 @@ def store_api_report(db: Session, *, platform: str, account_id: int | None, pars
                      period_from: date, period_to: date, user: str, report_number: str = "",
                      report_kind: str | None = None, declared_payout: int | None = None,
                      file_name: str = "", replace_unsent: bool = False,
-                     source: str = "api") -> ImportOutcome:
+                     source: str = "api", key_suffix: str = "") -> ImportOutcome:
     """Отчёт, собранный не из файла отчёта: официальный из API или неделя
     еженедельного отчёта Lamoda (`lamoda.py`).
 
@@ -346,7 +379,9 @@ def store_api_report(db: Session, *, platform: str, account_id: int | None, pars
     if parsed.errors:
         outcome.errors.extend(parsed.errors)
         return outcome
-    onec_key = make_onec_key(platform, account_id, report_number, period_from, period_to)
+    # `key_suffix` — отчёт другого рода за тот же период (доставка KIT по API
+    # рядом с продажами AWER CRM): без него ключи совпали бы, и он молча не лёг бы.
+    onec_key = make_onec_key(platform, account_id, report_number, period_from, period_to) + key_suffix
     existing = db.query(SalesReport).filter(SalesReport.onec_key == onec_key).first()
     if existing is not None:
         same_kind = existing.source == source or (report_kind is not None
@@ -369,6 +404,10 @@ def store_api_report(db: Session, *, platform: str, account_id: int | None, pars
            report_kind=report_kind, onec_key=onec_key)
     overlapping_files = [r for r in overlapping_reports(db, outcome.report) if r.source in ("file", "email")] \
         if report_kind != lamoda.PROVISIONAL else []
+    if overlapping_files:
+        with_goods = _with_goods(db, [outcome.report.id] + [r.id for r in overlapping_files])
+        overlapping_files = [r for r in overlapping_files if r.id in with_goods] \
+            if outcome.report.id in with_goods else []
     if overlapping_files:
         outcome.warnings.append(
             "За тот же период есть отчёты, загруженные файлом: "
