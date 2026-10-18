@@ -40,6 +40,16 @@
   итоговый. При загрузке отчёта комиссионера предварительные строки за его
   период удаляются (`finance/lamoda.py`).
 
+- **Шкала прогресса** (`static/progress.js`, `finapp/progress.py`). Кнопки
+  форм уходят фоном; ответ-переход для них отдаёт JSON (`progress_middleware`
+  в `main.py`, стоит ВНУТРИ SessionMiddleware — иначе флеш съедается).
+  Формы не отправлять через `form.submit()` (нет события submit) — только
+  `requestSubmit()`; ссылки на выгрузки — с `data-download`; долгая операция в
+  обработчике сообщает ход через `progress.report`. Новое фоновое дело —
+  в `/progress/jobs` (`routers/progress.py`).
+- **AWER CRM**: «Сумма» — до комиссии (ставка — настройка). Продажи KIT из CRM
+  → загрузка KIT по API берёт только доставку (`fetch._run_kit`).
+
 ## Накат на сервер
 
 Пакет: `python scripts/gen_package.py --tag finN --out mpfinance_finN.ps1`.

@@ -95,6 +95,8 @@
             {% if flash %}
             <div class="flash flash--{{ flash.kind }}">{{ flash.message }}</div>
             {% endif %}
+            {# Фоновые дела (загрузки по API, задания 1С) — шкалой над страницей. #}
+            <div id="jobs-panel" class="jobs-panel" hidden></div>
             {% block content %}{% endblock %}
         </main>
     </div>
@@ -116,5 +118,6 @@
             });
         })();
     </script>
+    <script src="{{ static_url('progress.js') }}"></script>
 </body>
 </html>

@@ -7,7 +7,7 @@ from openpyxl.cell import WriteOnlyCell
 from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response
 
 YES_NO = ["Да", "Нет"]
 
@@ -88,7 +88,7 @@ def build_xlsx_bytes(headers: list[str], rows: list[list],
 
 
 def build_xlsx_response(headers: list[str], rows: list[list], filename: str,
-                        choices: dict[str, list[str]] | None = None) -> StreamingResponse:
+                        choices: dict[str, list[str]] | None = None) -> Response:
     """Собирает .xlsx в памяти и отдаёт как файл на скачивание.
 
     `choices` — колонки, значение в которых выбирается из списка, а не пишется
@@ -100,7 +100,7 @@ def build_xlsx_response(headers: list[str], rows: list[list], filename: str,
     ячейка после вычищенного фильтра — и файл ВЫКЛЮЧАЕТ то, что оператор
     собирался включить, не сказав об этом ни слова.
     """
-    buffer = io.BytesIO(build_xlsx_bytes(headers, rows, choices))
+    content = build_xlsx_bytes(headers, rows, choices)
 
     # Content-Disposition должен быть ASCII (latin-1) — кириллическое имя файла
     # кодируем по RFC 5987 (filename*=UTF-8''...), с ASCII-фолбэком для
@@ -109,8 +109,10 @@ def build_xlsx_response(headers: list[str], rows: list[list], filename: str,
     encoded_filename = quote(filename)
     disposition = f'attachment; filename="{ascii_fallback}"; filename*=UTF-8\'\'{encoded_filename}'
 
-    return StreamingResponse(
-        buffer,
+    # Готовые байты, а не поток: с длиной ответа шкала скачивания на кнопке
+    # показывает настоящие проценты (`static/progress.js`).
+    return Response(
+        content,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": disposition},
     )

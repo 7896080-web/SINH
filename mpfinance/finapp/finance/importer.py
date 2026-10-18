@@ -14,6 +14,7 @@ from datetime import date
 from sqlalchemy.orm import Session
 
 from finapp.audit import log_action
+from finapp import progress
 from finapp import mapping
 from finapp.finance import lamoda, statements, values as v
 from finapp.finance.formats import AWER_CRM_FORMAT, ParseResult, apply_commission, parse_sheets
@@ -306,9 +307,11 @@ def _store(db: Session, outcome: ImportOutcome, *, platform: str, account_id: in
         for name in v.MONEY_FIELDS:
             mapping[f"{name}_kop"] = line[name]
         mappings.append(mapping)
+    progress.report(None, None, f"запись строк в базу: {len(mappings)}")
     db.bulk_insert_mappings(SalesReportLine, mappings)
     db.flush()
 
+    progress.report(None, None, "сопоставление баркодов с 1С")
     mapping_notes: list[str] = []
     unmatched = resolve_uids(db, report, mapping_notes)
 

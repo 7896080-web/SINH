@@ -11,7 +11,7 @@
         <p>Прибыль на единицу и маржинальность {{ groups[group_by] }} за {{ d_from.strftime('%d.%m.%Y') }} — {{ d_to.strftime('%d.%m.%Y') }}</p>
     </div>
     <div class="toolbar">
-        <a class="btn" href="/finance/unit-economics/export?date_from={{ d_from.isoformat() }}&date_to={{ d_to.isoformat() }}{{ query }}">Экспорт в Excel</a>
+        <a class="btn" data-download href="/finance/unit-economics/export?date_from={{ d_from.isoformat() }}&date_to={{ d_to.isoformat() }}{{ query }}">Экспорт в Excel</a>
     </div>
 </div>
 

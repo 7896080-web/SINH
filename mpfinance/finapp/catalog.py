@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from sqlalchemy.orm import Session
 
-from finapp import settings
+from finapp import progress, settings
 from finapp.models import Barcode, Product
 from finapp.timeutils import now_utc
 
@@ -88,7 +88,8 @@ def load_catalog(db: Session, rows: list[dict], stamp: str = settings.CATALOG_LO
         for product in db.query(Product).filter(Product.uid_1c.in_(uids[start:start + _CHUNK])):
             existing[product.uid_1c] = product
     added = 0
-    for uid in uids:
+    for i, uid in enumerate(uids, start=1):
+        progress.every(1000, i, len(uids), "справочник: товары")
         row = products[uid]
         product = existing.get(uid)
         if product is None:
@@ -100,6 +101,7 @@ def load_catalog(db: Session, rows: list[dict], stamp: str = settings.CATALOG_LO
         product.seen_at = now
     db.flush()
 
+    progress.report(None, None, f"справочник: баркоды ({len(pairs)})")
     db.query(Barcode).delete(synchronize_session=False)
     db.bulk_insert_mappings(Barcode, [{"barcode": b, "uid_1c": u} for b, u in sorted(pairs)])
     settings.put(db, stamp, now.isoformat(timespec="seconds"))

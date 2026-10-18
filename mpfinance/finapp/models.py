@@ -304,6 +304,11 @@ class ReportFetch(Base):
     found = Column(Integer, default=0, nullable=False)
     imported = Column(Integer, default=0, nullable=False)
     message = Column(Text, nullable=True)
+    # Шкала прогресса (`/progress/jobs`): сделано шагов из запланированных и что
+    # делается сейчас. Шаг у WB — детализация одного отчёта (минута на запрос).
+    progress_done = Column(Integer, default=0, nullable=False, server_default="0")
+    progress_total = Column(Integer, nullable=True)
+    progress_note = Column(String(200), nullable=True)
 
     account = relationship("PlatformAccount")
 

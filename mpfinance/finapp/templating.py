@@ -16,10 +16,13 @@ STATIC_DIR = BASE / "static"
 
 
 def _static_version() -> str:
-    try:
-        mark = f"{(STATIC_DIR / 'style.css').stat().st_mtime:.0f}"
-    except OSError:
-        mark = "0"
+    marks = []
+    for name in ("style.css", "progress.js"):
+        try:
+            marks.append(f"{(STATIC_DIR / name).stat().st_mtime:.0f}")
+        except OSError:
+            marks.append("0")
+    mark = "-".join(marks)
     return hashlib.sha256(mark.encode()).hexdigest()[:10]
 
 

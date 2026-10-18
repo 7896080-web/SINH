@@ -12,7 +12,7 @@
            · загрузил {{ report.uploaded_by or '—' }} {{ report.uploaded_at|local('%d.%m.%Y %H:%M') }}</p>
     </div>
     <div class="toolbar">
-        <a class="btn" href="/finance/reports/{{ report.id }}/export">Единая форма (Excel)</a>
+        <a class="btn" href="/finance/reports/{{ report.id }}/export" data-download>Единая форма (Excel)</a>
         <a class="btn" href="/finance/unit-economics?date_from={{ report.period_from.isoformat() }}&date_to={{ report.period_to.isoformat() }}&platform={{ report.platform }}{% if report.account_id %}&account_id={{ report.account_id }}{% endif %}">Юнит-экономика</a>
     </div>
 </div>

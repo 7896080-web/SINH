@@ -147,7 +147,9 @@ def _next_job(db: Session) -> ReportFetch | None:
     ).order_by(ReportFetch.id.asc()).first()
 
 
-def _step(db: Session, job: ReportFetch, heartbeat: Callable[[], None]):
+def _step(db: Session, job: ReportFetch, heartbeat: Callable[[], None], note: str | None = None):
+    if note is not None:
+        job.progress_note = note[:200]
     job.progress_at = now_utc()
     db.commit()
     heartbeat()
@@ -167,6 +169,7 @@ def run_pending(db: Session, heartbeat: Callable[[], None] = lambda: None,
         job.status = "running"
         job.started_at = job.started_at or now_utc()
         job.message = None
+        job.progress_done, job.progress_total, job.progress_note = 0, None, "запрос к площадке"
         _step(db, job, heartbeat)
         try:
             if job.kind == "wb_api":
@@ -209,9 +212,7 @@ def _run_wb(db: Session, job: ReportFetch, heartbeat, session, sleep) -> str:
             statements.store(db, "wb", account.id, statements.parse_api_list(reports), "api")
         except statements.StatementError as e:
             logger.warning("свод WB из API не записан: %s", e)
-    _step(db, job, heartbeat)
-
-    notes, skipped = [], 0
+    notes, skipped, todo = [], 0, []
     for header in sorted(reports, key=lambda r: (str(r.get("dateFrom")), int(r.get("reportId") or 0))):
         report_id = header.get("reportId")
         period_from = v.parse_date(header.get("dateFrom"))
@@ -224,7 +225,18 @@ def _run_wb(db: Session, job: ReportFetch, heartbeat, session, sleep) -> str:
         if db.query(SalesReport.id).filter(SalesReport.onec_key == key).first():
             skipped += 1
             continue
-        records = api.report_lines(report_id, on_page=lambda _n: _step(db, job, heartbeat))
+        todo.append((header, report_id, period_from, period_to))
+    # Шаг шкалы — детализация одного отчёта: по минуте на запрос, ровно то, что
+    # стоит ждать.
+    job.progress_total = len(todo)
+    _step(db, job, heartbeat, f"отчётов в списке {len(reports)}, к загрузке {len(todo)}")
+
+    for header, report_id, period_from, period_to in todo:
+        where = f"отчёт №{report_id} ({job.progress_done + 1} из {len(todo)})"
+        _step(db, job, heartbeat, where)
+        records = api.report_lines(report_id, on_page=lambda n: _step(
+            db, job, heartbeat, f"{where}: строк {n}"))
+        job.progress_done += 1
         if not records:
             notes.append(f"отчёт {report_id}: WB вернул пустую детализацию")
             continue
@@ -266,8 +278,10 @@ def _run_kit(db: Session, job: ReportFetch, heartbeat, session, sleep) -> str:
     if not token:
         raise FetchError(f"У кабинета «{account.name}» не задан токен KIT (страница «API-ключи»).")
     api = kit_source.KitOrdersApi(token, session=session, sleep=sleep)
+    job.progress_total = 3
     orders = api.orders_updated_since(local_day_start_utc(job.date_from))
-    _step(db, job, heartbeat)
+    job.progress_done = 1
+    _step(db, job, heartbeat, f"получено заказов: {len(orders)}")
     # Продажи сайта берутся из AWER CRM — тогда из заказов KIT нужна только
     # доставка: продажи в них те же, и посчитались бы дважды. Баркоды вариантов
     # тогда не нужны вовсе, и запросов к KIT за ними не делаем.
@@ -296,6 +310,8 @@ def _run_kit(db: Session, job: ReportFetch, heartbeat, session, sleep) -> str:
             cached.barcode, cached.fetched_at = barcode, now_utc()
     db.flush()
     job.found = stats["orders"]
+    job.progress_done = 2
+    _step(db, job, heartbeat, "запись отчёта")
     if not lines:
         what = "стоимости доставки в заказах KIT" if delivery_only and stats["orders"] else "заказов KIT"
         return (f"{what}, доставленных за {job.date_from:%d.%m}–{job.date_to:%d.%m.%Y}, нет "
@@ -310,6 +326,7 @@ def _run_kit(db: Session, job: ReportFetch, heartbeat, session, sleep) -> str:
         key_suffix="-dlv" if delivery_only else "")
     if outcome.errors:
         raise FetchError(" ".join(outcome.errors))
+    job.progress_done = 3
     if outcome.skipped:
         return (f"отчёт KIT за этот период уже отправлен в 1С (#{outcome.report.id}) — "
                 f"не перезаписываю")

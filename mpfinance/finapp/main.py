@@ -3,12 +3,15 @@ import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
+from finapp import progress
 from finapp.deps import NotAuthenticated
 from finapp.routers import accounts, auth, diagnostics, finance, health
+from finapp.routers import progress as progress_router
 from finapp.templating import STATIC_DIR
 
 
@@ -39,13 +42,45 @@ SESSION_SECRET = os.environ.get("MPFIN_SESSION_SECRET")
 if not SESSION_SECRET:
     raise RuntimeError("Не задана переменная окружения MPFIN_SESSION_SECRET")
 
+async def progress_middleware(request: Request, call_next):
+    """Кнопки со шкалой прогресса (`static/progress.js`) шлют форму в фоне.
+
+    - `X-Progress-Id` — номер операции: долгая операция сообщает по нему свой
+      ход (`progress.report`), страница его опрашивает.
+    - `X-Progress: 1` — ответ-переход (303 после POST) отдаётся JSON с адресом,
+      и страница переходит туда сама. Иначе фоновый запрос прошёл бы по
+      переходу сам и съел бы сообщение об итоге (флеш живёт до первого показа),
+      а страница, открытая следом, осталась бы без него.
+
+    Стоит ВНУТРИ SessionMiddleware: cookie сессии с этим сообщением ложится и
+    на JSON-ответ."""
+    token = progress.begin(request.headers.get("x-progress-id"))
+    try:
+        response = await call_next(request)
+    finally:
+        progress.end(token)
+    if request.headers.get("x-progress") == "1" and response.status_code in (301, 302, 303, 307, 308):
+        headers = {k: v for k, v in response.headers.items()
+                   if k.lower() not in ("location", "content-length", "content-type", "set-cookie")}
+        result = JSONResponse({"location": response.headers.get("location", "/")}, headers=headers)
+        for key, value in response.raw_headers:
+            if key.lower() == b"set-cookie":
+                result.raw_headers.append((key, value))
+        return result
+    return response
+
+
+# Порядок важен: добавленный позже — снаружи. progress_middleware — внутри
+# сессии (см. её описание).
+app.add_middleware(BaseHTTPMiddleware, dispatch=progress_middleware)
+
 # Имя cookie своё: sync_admin и «Репрайсер» на той же машине ставят свои, и при
 # общем имени вход в одну программу выбивал бы из другой (все на 127.0.0.1).
 app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET, same_site="lax",
                    session_cookie="mpfinance_session", max_age=60 * 60 * 10)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-for r in (auth, finance, accounts, diagnostics, health):
+for r in (auth, finance, accounts, diagnostics, health, progress_router):
     app.include_router(r.router)
 
 

@@ -646,3 +646,100 @@ details.table-view summary { cursor: pointer; font-size: 13px; color: var(--acce
 .inline-form { display: inline; }
 .btn-danger { color: var(--bad); border-color: var(--bad); }
 .status-line { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+
+/* ---------------------------------------------------------------- шкала прогресса
+   Кнопки (`progress.js`): карточка вверху по центру, пока идёт дело.
+   Фоновые задания: полоса над содержимым страницы (#jobs-panel). */
+.progress-box {
+    position: fixed;
+    top: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: min(440px, calc(100vw - 32px));
+    z-index: 1000;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    box-shadow: 0 6px 24px rgba(28, 33, 38, .14);
+    padding: 12px 14px 10px;
+}
+.progress-box[hidden] { display: none; }
+.progress-box__head { display: flex; align-items: flex-start; gap: 8px; }
+.progress-box__title { flex: 1; font-weight: 600; font-size: 14px; }
+.progress-box__close, .job__close {
+    border: none;
+    background: none;
+    color: var(--ink-soft);
+    font-size: 18px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 0 2px;
+}
+.progress-box__close[hidden] { display: none; }
+.progress-box__row {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    margin-top: 6px;
+    font-size: 13px;
+    color: var(--ink-soft);
+}
+.progress-box__detail { overflow-wrap: anywhere; }
+.progress-box__pct { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.progress-box--done .progress-track__fill { background: var(--good); }
+.progress-box--error { border-color: var(--bad); }
+.progress-box--error .progress-track__fill { background: var(--bad); }
+.progress-box--error .progress-box__detail { color: var(--bad); }
+
+.progress-track {
+    height: 6px;
+    margin-top: 8px;
+    border-radius: 3px;
+    background: var(--line-soft);
+    overflow: hidden;
+}
+.progress-track__fill {
+    height: 100%;
+    width: 0;
+    border-radius: 3px;
+    background: var(--accent);
+    transition: width .2s ease;
+}
+/* Сколько всего шагов, ещё неизвестно — бегущая полоса, а не застывшая. */
+.progress-track--busy .progress-track__fill {
+    width: 30% !important;
+    animation: progress-busy 1.4s ease-in-out infinite;
+}
+@keyframes progress-busy {
+    0% { transform: translateX(-100%); }
+    100% { transform: translateX(340%); }
+}
+@media (prefers-reduced-motion: reduce) {
+    .progress-track__fill { transition: none; }
+    .progress-track--busy .progress-track__fill { animation: none; width: 100% !important; opacity: .45; }
+}
+
+.jobs-panel {
+    display: grid;
+    gap: 8px;
+    margin-bottom: 16px;
+}
+.jobs-panel[hidden] { display: none; }
+.job {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--accent);
+    border-radius: var(--radius);
+    padding: 10px 12px;
+}
+.job--done { border-left-color: var(--good); }
+.job--done .progress-track__fill { background: var(--good); }
+.job--failed { border-left-color: var(--bad); }
+.job--failed .progress-track__fill { background: var(--bad); }
+.job__head { display: flex; align-items: baseline; gap: 10px; }
+.job__label { flex: 1; font-weight: 600; font-size: 14px; }
+.job__state { font-size: 13px; color: var(--ink-soft); white-space: nowrap; }
+.job--failed .job__state { color: var(--bad); }
+.job--done .job__state { color: var(--good); }
+.job__note { margin-top: 6px; font-size: 13px; color: var(--ink-soft); overflow-wrap: anywhere; }
+.job__reload { display: inline-block; margin-top: 6px; font-size: 13px; }

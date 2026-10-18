@@ -12,6 +12,8 @@ import zipfile
 
 from openpyxl import load_workbook
 
+from finapp import progress
+
 # Защита от «zip-бомбы» и случайно выбранного гигантского файла: отчёт площадки
 # за неделю — единицы мегабайт; распаковка без предела могла бы съесть память
 # веб-процесса.
@@ -35,6 +37,7 @@ def _read_xlsx(file_bytes: bytes) -> list[tuple[str, list[list]]]:
     except Exception as e:
         raise ReportReadError(f"Файл не читается как .xlsx ({type(e).__name__}).") from e
     sheets = []
+    progress.report(0, None, "чтение файла")
     try:
         for ws in wb.worksheets:
             # Размер листа в режиме read_only берётся из тега <dimension> файла,
@@ -49,6 +52,8 @@ def _read_xlsx(file_bytes: bytes) -> list[tuple[str, list[list]]]:
                         f"На листе «{ws.title}» больше {MAX_ROWS_PER_SHEET} строк — "
                         f"разбейте отчёт на несколько файлов по периодам.")
                 rows.append(list(raw) if raw is not None else [])
+                if len(rows) % 2000 == 0:
+                    progress.report(len(rows), None, f"чтение файла: строк {len(rows)}")
             sheets.append((ws.title, rows))
     finally:
         wb.close()

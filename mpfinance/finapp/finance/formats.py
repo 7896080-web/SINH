@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from finapp.finance import values as v
+from finapp import progress
 from finapp.finance.readers import find_header, header_preview, normalize_header
 
 # Сколько ошибок разбора показываем оператору (остальные — числом).
@@ -799,7 +800,9 @@ def parse_sheets(sheets: list[tuple[str, list[list]]], platform: str) -> ParseRe
     # разбирается, пропускаем с предупреждением, а не роняем отчёт.
     after_total = False
     footer_skipped = 0
+    body = len(rows) - header_row - 1
     for offset, cells in enumerate(rows[header_row + 1:], start=header_row + 2):
+        progress.every(500, offset - header_row - 1, body, f"разбор строк ({fmt.label})")
         if not cells or all(c in (None, "") for c in cells):
             continue
         if _is_total_row(cells):

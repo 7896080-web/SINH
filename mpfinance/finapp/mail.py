@@ -27,7 +27,7 @@ from email.utils import parsedate_to_datetime
 from cryptography.fernet import InvalidToken
 from sqlalchemy.orm import Session
 
-from finapp import settings
+from finapp import progress, settings
 from finapp.crypto import decrypt_value, encrypt_value
 from finapp.models import MailMessage, PlatformAccount
 from finapp.timeutils import now_utc, today_local
@@ -127,6 +127,7 @@ def fetch_new(db: Session, connect=None, days: int = LOOKBACK_DAYS) -> dict:
         return stats
     if cfg.account_id is not None and db.get(PlatformAccount, cfg.account_id) is None:
         cfg.account_id = None
+    progress.report(0, None, f"вход в почту {cfg.host}")
     try:
         imap = (connect or (lambda h, p: imaplib.IMAP4_SSL(h, p, timeout=60)))(cfg.host, cfg.port)
         imap.login(cfg.user, cfg.password)
@@ -139,7 +140,10 @@ def fetch_new(db: Session, connect=None, days: int = LOOKBACK_DAYS) -> dict:
         typ, data = imap.search(None, "FROM", f'"{cfg.sender}"', "SINCE", _since(days))
         if typ != "OK":
             raise MailError(f"поиск писем не удался: {typ}")
-        for num in (data[0] or b"").split():
+        numbers = (data[0] or b"").split()
+        progress.report(0, len(numbers), f"писем от {cfg.sender}: {len(numbers)}")
+        for i, num in enumerate(numbers, start=1):
+            progress.report(i - 1, len(numbers), f"письмо {i} из {len(numbers)}")
             head = _header(_fetch_bytes(imap, num, "HEADER"))
             mid = _message_id(head)
             if db.query(MailMessage.id).filter(MailMessage.message_id == mid).first():

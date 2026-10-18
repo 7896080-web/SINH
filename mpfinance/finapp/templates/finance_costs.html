@@ -8,10 +8,10 @@
         <p>Себестоимость задана у {{ with_cost }} из {{ products_total }} товаров</p>
     </div>
     <div class="toolbar">
-        <a class="btn" href="/finance/costs/export">Выгрузить в Excel</a>
+        <a class="btn" href="/finance/costs/export" data-download>Выгрузить в Excel</a>
         <form method="post" action="/finance/costs/import" enctype="multipart/form-data" class="inline-form">
             <label class="btn file-upload-btn">Загрузить из Excel
-                <input type="file" name="file" accept=".xlsx" onchange="this.form.submit()">
+                <input type="file" name="file" accept=".xlsx" onchange="this.form.requestSubmit()">
             </label>
         </form>
     </div>
