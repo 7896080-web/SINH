@@ -190,3 +190,22 @@ def test_weekly_lesson_by_goal_topic(env, tmp_path):  # noqa: F811
         client.sent.clear()
     assert titles == ["📚 **Урок недели: Образ 1**", "📚 **Урок недели: Образ 2**", "📚 **Урок недели: Контакт**"]
     assert {"obraz-1", "obraz-2", "kontakt-1"} <= {r["lesson_id"] for r in db.q("SELECT lesson_id FROM lessons_sent")}
+
+
+def test_arrivals_pairing(env, tmp_path):  # noqa: F811
+    from awer_sales_bot.messages import pairing
+    cfg, db = env
+    sid = db.seller_id("Продавец04", create=False)
+    rows = []
+    for i in range(12):  # 12 чеков: 9 «джинсы + ремень», 3 — только джинсы
+        d = oct_day(1 + i % 5)
+        rows.append((d, "Продавец04", 5_000, 1, "Джинсы", f"Ч{i}"))
+        if i < 9:
+            rows.append((d, "Продавец04", 1_500, 1, "Ремень", f"Ч{i}"))
+    import_file(write_sales(tmp_path / "s.csv", rows), db, cfg)
+    (tmp_path / "arrivals_1.csv").write_text(
+        "Дата;Склад;Документ;Номенклатура;Номенклатурная группа;Характеристика;Поступило\n"
+        "10.10.2026;ГОРОД_склад;П1;Джинсы слим;Джинсы;32;6", encoding="utf-8")
+    import_file(tmp_path / "arrivals_1.csv", db, cfg)
+    assert pairing(db, cfg, oct_day(10), ["Джинсы"]) == ["С чем предлагать: к «Джинсы» чаще берут «Ремень» (75%)"]
+    assert "С чем предлагать: к «Джинсы»" in daily(db, cfg, sid, oct_day(10))

@@ -92,10 +92,23 @@ def daily(db: DB, cfg: Settings, sid: int, day: date) -> str:
     arr = M.arrivals_summary(db, day)
     if arr:
         L += ["", "📦 **Новые поступления:** " + ", ".join(f"{c} — {m} мод. ({q:.0f} шт.)" for c, m, q in arr)]
+        L += pairing(db, cfg, day, [c for c, _, _ in arr])
     tips = advise(db, cfg, sid, st, day)
     if tips:
         L += ["", "💡 " + "\n💡 ".join(tips)]
     return "\n".join(L)
+
+
+def pairing(db: DB, cfg: Settings, day: date, categories: list[str], top: int = 2) -> list[str]:
+    """«С чем предлагать» новинки: что покупатели чаще всего берут вместе с этой категорией (чеки или
+    покупки по дисконтной карте за recommendations.lookback_days). Только связки от 15 %."""
+    pairs = M.cross_sell(db, day - timedelta(days=cfg.recommendations.lookback_days), day)
+    tips = []
+    for c in categories[:top]:
+        with_c = [(b, sh) for b, sh in pairs.get(c, []) if sh >= 0.15][:2]
+        if with_c:
+            tips.append(f"к «{c}» чаще берут " + ", ".join(f"«{b}» ({sh:.0%})" for b, sh in with_c))
+    return ["С чем предлагать: " + "; ".join(tips)] if tips else []
 
 
 def store_goal(db: DB, cfg: Settings, day: date) -> list[str]:
