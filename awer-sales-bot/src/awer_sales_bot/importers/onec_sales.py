@@ -216,7 +216,13 @@ def _import_docs(path: Path, rows, h, idx, db: DB, cfg: Settings) -> ImportRepor
     return ImportReport(path.name, "docs", len(data), days, foreign=dict(foreign))
 
 
+def _brand(value, not_brands: set[str]) -> str | None:
+    v = str(value or "").strip()
+    return v if v and v.upper() not in not_brands else None
+
+
 def _import_stock(path: Path, rows, h, idx, db: DB, cfg: Settings, kind: str) -> ImportReport:
+    not_brands = {b.strip().upper() for b in cfg.onec.ignore_brands}
     recs = []
     for row in rows[h + 1:]:
         if not row or all(c in (None, "") for c in row):
@@ -231,7 +237,7 @@ def _import_stock(path: Path, rows, h, idx, db: DB, cfg: Settings, kind: str) ->
             continue
         recs.append((d.isoformat(), store, str(get("item")).strip(),
                      get("category"), str(get("size") or "").strip(), qty, str(get("doc") or ""),
-                     str(get("brand") or "").strip() or None, str(get("color") or "").strip() or None))
+                     _brand(get("brand"), not_brands), str(get("color") or "").strip() or None))
     pairs = sorted({(r[0], r[1]) for r in recs})
     with db.tx() as c:
         for day, store in pairs:
