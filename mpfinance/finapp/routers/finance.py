@@ -16,7 +16,7 @@ from finapp.audit import log_action
 from finapp.database import get_db
 from finapp.deps import get_current_user
 from finapp.excel_utils import ExcelReadError, build_xlsx_response, read_upload, read_xlsx_rows
-from finapp.finance import charts, fetch, lamoda, statements, values as v
+from finapp.finance import charts, fetch, lamoda, repeats, statements, values as v
 from finapp.finance.economics import (Filters, Totals, load_lines, platform_summary, trend,
                                    unit_economics)
 from finapp.finance.formats import FORMATS
@@ -143,6 +143,9 @@ def finance_dashboard(
                                      OneCUploadStatus.timeout]),
     ).count()
     stale_fetches = [f for f in fetch.account_freshness(db) if f["stale"]]
+    # Отчёты, загруженные до защиты от повторов, могут лежать парами с одними и
+    # теми же продажами: выручка тогда задвоена, и видно это должно быть здесь.
+    repeat_groups = repeats.in_period(db, d_from, d_to)
     reports_in_period = db.query(SalesReport).filter(
         SalesReport.period_from <= d_to, SalesReport.period_to >= d_from).count()
 
@@ -153,7 +156,7 @@ def finance_dashboard(
         trend_rows=trend_rows, top=top, losers=losers, settings=settings,
         tax_modes=TAX_MODES, not_in_1c=not_in_1c, reports_in_period=reports_in_period,
         tax_text=tax_text(settings), tax_effective=effective_rate(settings),
-        meter_width=charts.meter_width, stale_fetches=stale_fetches,
+        meter_width=charts.meter_width, stale_fetches=stale_fetches, repeat_groups=repeat_groups,
     ))
 
 
@@ -302,7 +305,7 @@ def report_detail(
         plan=plan, plan_sale=plan.totals("SALE"), plan_return=plan.totals("RETURN"),
         warehouse=warehouse, problems=upload_problems(db, report, warehouse),
         onec_labels=ONEC_LABELS, in_flight=report.onec_status in IN_FLIGHT,
-        overlaps=sales_overlaps(db, report),
+        overlaps=sales_overlaps(db, report), repeats=repeats.of_report(db, report),
     ))
 
 

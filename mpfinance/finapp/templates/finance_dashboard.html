@@ -67,10 +67,16 @@
     </div>
 </div>
 
-{% if total.cost_missing_qty or total.unmatched_lines or not_in_1c %}
+{% if total.cost_missing_qty or total.unmatched_lines or not_in_1c or repeat_groups %}
 <div class="card">
     <h2 style="margin-top:0; font-size:15px;">Что искажает цифры</h2>
     <ul class="check-list">
+        {% for group in repeat_groups[:5] %}
+        <li><span class="badge badge--bad">повтор</span>
+            Одни и те же продажи лежат в отчётах
+            {% for r in group %}<a href="/finance/reports/{{ r.id }}">#{{ r.id }} ({{ r.period_from.strftime('%d.%m') }}–{{ r.period_to.strftime('%d.%m.%Y') }})</a>{% if not loop.last %} и {% endif %}{% endfor %}
+            — выручка задвоена. Оставьте один, лишний удалите.</li>
+        {% endfor %}
         {% if total.cost_suspicious_qty %}
         <li><span class="badge badge--bad">себестоимость</span>
             У {{ total.cost_suspicious_qty }} шт себестоимость больше цены продажи в 10 раз и больше — это ошибка

@@ -219,7 +219,8 @@ class SalesReportLine(Base):
     operation_date = Column(Date, nullable=False, index=True)
     order_date = Column(Date, nullable=True)
     order_id = Column(String(128), nullable=True, index=True)
-    srid = Column(String(128), nullable=True)
+    # Индекс — для защиты от повторов (`finance/repeats.py`): продажа ищется по номеру заказа.
+    srid = Column(String(128), nullable=True, index=True)
     barcode = Column(String(64), nullable=True, index=True)
     article = Column(String(128), nullable=True)
     platform_sku = Column(String(64), nullable=True)

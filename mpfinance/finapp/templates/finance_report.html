@@ -17,7 +17,14 @@
     </div>
 </div>
 
-{% if overlaps %}
+{% if repeats %}
+<div class="flash flash--bad">
+    Те же продажи уже есть в отчётах
+    {% for r in repeats.reports %}<a href="/finance/reports/{{ r.id }}">#{{ r.id }} ({{ r.period_from.strftime('%d.%m') }}–{{ r.period_to.strftime('%d.%m.%Y') }})</a>{% if not loop.last %}, {% endif %}{% endfor %}:
+    {{ repeats.pieces }} шт из {{ repeats.total }} совпадают по номеру заказа, баркоду и сумме. Выручка на дашборде
+    задвоена, и в 1С этот отчёт не отправится. Оставьте один отчёт, лишний удалите.
+</div>
+{% elif overlaps %}
 <div class="flash flash--warn">
     Период пересекается с другими отчётами этой площадки и кабинета:
     {% for r in overlaps %}<a href="/finance/reports/{{ r.id }}">#{{ r.id }} ({{ r.period_from.strftime('%d.%m') }}–{{ r.period_to.strftime('%d.%m.%Y') }}{% if r.report_kind %}, {{ r.report_kind }}{% endif %})</a>{% if not loop.last %}, {% endif %}{% endfor %}.

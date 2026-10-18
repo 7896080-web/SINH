@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 from finapp.audit import log_action
 from finapp import progress
 from finapp import mapping
-from finapp.finance import lamoda, statements, values as v
+from finapp.finance import lamoda, repeats, statements, values as v
 from finapp.finance.formats import AWER_CRM_FORMAT, KIT_PAY_FORMAT, ParseResult, apply_commission, parse_sheets
 from finapp.finance.settings import load_settings
 from finapp.finance.readers import ReportReadError, read_sheets
@@ -37,6 +37,7 @@ class ImportOutcome:
     notes: list[str] = field(default_factory=list)
     skipped: bool = False        # такой отчёт уже есть — ничего не записано
     replaced: bool = False       # прежний (ещё не отправленный в 1С) отчёт заменён свежим
+    repeat: bool = False         # отказ: эти продажи уже лежат в другом отчёте (`repeats.py`)
     # Еженедельный отчёт Lamoda раскладывается на несколько отчётов (по неделе).
     reports: list[SalesReport] = field(default_factory=list)
 
@@ -260,6 +261,12 @@ def import_report(db: Session, *, platform: str, file_bytes: bytes, filename: st
             + ("" if number else " или укажите номер отчёта площадки, если это другой отчёт")
             + ".")
         return outcome
+    found = repeats.find(db, platform=platform, account_id=account_id, numbered=bool(number),
+                         lines=goods_of(parsed.lines))
+    if found:
+        outcome.errors.append("Отчёт не загружен: " + found.text())
+        outcome.repeat = True
+        return outcome
 
     _store(db, outcome, platform=platform, account_id=account_id, parsed=parsed, user=user,
            number=number, period_from=period_from, period_to=period_to, source=source,
@@ -413,11 +420,17 @@ def _store(db: Session, outcome: ImportOutcome, *, platform: str, account_id: in
     return outcome
 
 
+def goods_of(lines: list[dict]) -> list[tuple]:
+    """Продажи и возвраты строк единой формы — в виде, который сверяет `repeats.find`."""
+    return [(line["srid"], line["barcode"], line["operation"], line["revenue"], line["quantity"])
+            for line in lines if line["operation"] in v.GOODS_OPERATIONS]
+
+
 def store_api_report(db: Session, *, platform: str, account_id: int | None, parsed: ParseResult,
                      period_from: date, period_to: date, user: str, report_number: str = "",
                      report_kind: str | None = None, declared_payout: int | None = None,
                      file_name: str = "", replace_unsent: bool = False,
-                     source: str = "api", kind: str = "") -> ImportOutcome:
+                     source: str = "api", kind: str = "", superseded=None) -> ImportOutcome:
     """Отчёт, собранный не из файла отчёта: официальный из API или неделя
     еженедельного отчёта Lamoda (`lamoda.py`).
 
@@ -425,13 +438,27 @@ def store_api_report(db: Session, *, platform: str, account_id: int | None, pars
     который площадка может дополнить задним числом (KIT: отказы при получении
     доезжают позже; Lamoda: каждое письмо повторяет 8 недель), с
     `replace_unsent=True` ЗАМЕНЯЕТСЯ свежим — но только пока он не ушёл в 1С:
-    документ в 1С уже построен по прежним цифрам."""
+    документ в 1С уже построен по прежним цифрам.
+
+    Продажи, которые уже лежат в ДРУГОМ отчёте (`repeats.py`), — отказ
+    (`outcome.repeat`), кроме отчётов, которые вызывающий сейчас заменит сам
+    (`superseded(report)` — неотправленные продажи прежнего источника за те же
+    недели)."""
     outcome = ImportOutcome()
     if parsed.errors:
         outcome.errors.extend(parsed.errors)
         return outcome
     onec_key = make_onec_key(platform, account_id, report_number, period_from, period_to, kind)
     existing = db.query(SalesReport).filter(SalesReport.onec_key == onec_key).first()
+    if report_kind != lamoda.PROVISIONAL:
+        found = repeats.find(db, platform=platform, account_id=account_id, numbered=bool(report_number),
+                             lines=goods_of(parsed.lines),
+                             exclude_ids=[existing.id] if existing is not None else [],
+                             skip=superseded or (lambda report: False))
+        if found:
+            outcome.errors.append(found.text())
+            outcome.repeat = True
+            return outcome
     if existing is not None:
         same_kind = existing.source == source or (report_kind is not None
                                                   and existing.report_kind == report_kind)

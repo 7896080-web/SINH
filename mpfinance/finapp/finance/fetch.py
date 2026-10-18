@@ -378,6 +378,7 @@ def _run_kit(db: Session, job: ReportFetch, heartbeat, session, sleep) -> str:
 
     notes, stored, stored_weeks, warnings = [], [], set(), []
     totals = {"orders": 0, "sold_qty": 0, "refused_qty": 0, "no_barcode": 0, "cost": 0, "paid": 0}
+    replaced = _replaceable(weeks, ("api",) if delivery_only else ("api", CRM_SOURCE))
     for monday, sunday in weeks:
         where = f"неделя {monday:%d.%m}–{sunday:%d.%m.%Y}"
         lines, stats = kit_source.build_lines(orders, monday, sunday, barcode_for)
@@ -395,7 +396,12 @@ def _run_kit(db: Session, job: ReportFetch, heartbeat, session, sleep) -> str:
             db, platform="kit", account_id=account.id, parsed=ParseResult(format=KIT_API_FORMAT, lines=lines),
             period_from=monday, period_to=sunday, user=f"api:{job.requested_by or 'system'}",
             file_name="Яндекс KIT, доставка по API" if delivery_only else "Яндекс KIT, заказы по API",
-            replace_unsent=True, report_kind=KIT_DELIVERY_KIND if delivery_only else None, kind=kind)
+            replace_unsent=True, report_kind=KIT_DELIVERY_KIND if delivery_only else None, kind=kind,
+            superseded=replaced)
+        if outcome.repeat:
+            notes.append(f"{where}: не загружена — " + " ".join(outcome.errors))
+            _step(db, job, heartbeat, where)
+            continue
         if outcome.errors:
             raise FetchError(f"{where}: " + " ".join(outcome.errors))
         if outcome.skipped:
@@ -471,6 +477,7 @@ def _run_crm(db: Session, job: ReportFetch, heartbeat) -> str:
     user = f"crm:{job.requested_by or 'system'}"
     notes, warnings, stored, stored_weeks = [], [], [], set()
     revenue = commission = 0
+    replaced = _replaceable(weeks, ("api", CRM_SOURCE))
     for monday, sunday in weeks:
         where = f"неделя {monday:%d.%m}–{sunday:%d.%m.%Y}"
         lines = [crm_source.to_line(sale) for sale in sales if monday <= sale.day <= sunday]
@@ -500,7 +507,14 @@ def _run_crm(db: Session, job: ReportFetch, heartbeat) -> str:
             db, platform="kit", account_id=account.id,
             parsed=ParseResult(format=CRM_DB_FORMAT, lines=lines),
             period_from=monday, period_to=sunday, user=user, file_name="AWER CRM, база kitcrm.db",
-            replace_unsent=True, source=CRM_SOURCE, kind=CRM_KEY)
+            replace_unsent=True, source=CRM_SOURCE, kind=CRM_KEY, superseded=replaced)
+        if outcome.repeat:
+            # Эти недели уже лежат отчётом, загруженным файлом (выгрузка CRM за
+            # месяц): вторая копия задвоила бы выручку. Решает человек — какой
+            # из двух оставить.
+            notes.append(f"{where}: не загружена — " + " ".join(outcome.errors))
+            _step(db, job, heartbeat, where)
+            continue
         if outcome.errors:
             raise FetchError(f"{where}: " + " ".join(outcome.errors))
         stored.append(outcome.report)
@@ -548,6 +562,18 @@ def _is_overlap_warning(text: str) -> bool:
     """Предупреждение о задвоении — его обязано увидеть сообщение заявки: у
     загрузки по API другого читателя нет."""
     return "дважды" in text or "пересекается" in text
+
+
+def _replaceable(weeks: list[tuple[date, date]], sources: tuple[str, ...]):
+    """Отчёт, который эта заявка заменит сама (`_drop_superseded_kit`): не
+    отправленный в 1С, из тех же источников, целиком внутри забираемых недель.
+    Его продажи — не повтор, а прежняя версия тех же недель."""
+    first, last = weeks[0][0], weeks[-1][1]
+
+    def check(report: SalesReport) -> bool:
+        return (report.source in sources and report.onec_status in (OneCUploadStatus.none, OneCUploadStatus.failed)
+                and report.period_from >= first and report.period_to <= last)
+    return check
 
 
 def _drop_superseded_kit(db: Session, account_id: int, stored: list[SalesReport],

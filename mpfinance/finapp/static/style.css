@@ -412,6 +412,7 @@ tr:hover td { background: var(--bg); }
    а этим цветом идут все отказы импорта. */
 .flash--warn { background: var(--warn-soft); color: #7a4f00; border-color: var(--warn); }
 .flash--info { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
+.flash--bad { background: var(--bad-soft); color: var(--bad); border-color: var(--bad); }
 
 .toolbar {
     display: flex;

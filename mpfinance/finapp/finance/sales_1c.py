@@ -133,6 +133,12 @@ def upload_problems(db: Session, report: SalesReport, warehouse: str,
                           "Пропишите баркод в 1С и обновите справочник («Диагностика»).")
     elif any(not line.barcode for line in plan.lines) and not report.unmatched_lines:
         problems.append("Есть продажи без баркода — 1С не найдёт по ним номенклатуру.")
+    from finapp.finance import repeats
+    found = repeats.of_report(db, report)
+    if found:
+        problems.append("Те же продажи уже есть в отчётах " + ", ".join(f"#{r.id}" for r in found.reports[:5])
+                        + f" ({found.pieces} шт) — в 1С ушёл бы второй документ на одни продажи. "
+                          "Оставьте один отчёт, лишний удалите.")
     negative = [line.barcode for line in plan.lines if line.amount_kop < 0]
     if negative:
         problems.append("Отрицательная сумма к перечислению по баркодам " + ", ".join(negative[:5])
