@@ -3,6 +3,9 @@
 Канал общий с sync_admin, «Маркировкой» и «Репрайсером»: та же обработка
 `ОбменССайтом`, та же папка заданий. Правила:
 
+0. **Выключатель.** Обмен включает человек на «Диагностике» (`enabled`), по
+   умолчанию он выключен: программу сначала проверяют без 1С. Выключен — ни
+   одного файла в папках обмена, ни одного чтения из них.
 1. **Свои команды.** FIN_PING (версия обработки), BARCODE_DICT (справочник
    баркодов), EXPORT_COST_PRICES (себестоимость) — только читают; SALES_REPORT
    (отчёт о продажах → документы) — пишет, но уходит ТОЛЬКО по кнопке на
@@ -49,7 +52,15 @@ class OnecError(ValueError):
     pass
 
 
-# --- Версия обработки ----------------------------------------------------------
+# --- Выключатель и версия обработки --------------------------------------------
+
+def enabled(db: Session) -> bool:
+    return settings.get(db, settings.ONEC_ENABLED) == "1"
+
+
+DISABLED = ("обмен с 1С выключен — его включают последним этапом на «Диагностике» "
+            "(«Включить обмен с 1С»), когда модуль обработки обновлён до mark-4")
+
 
 def epf_version(db: Session) -> int:
     """Номер версии по ответу на FIN_PING: «mark-4» → 4; ответа не было — 0."""
@@ -71,6 +82,8 @@ NOT_READY = ("обработка 1С ещё не подтвердила верс
 def enqueue(db: Session, command: str, user: str = "system") -> OnecTask:
     if command not in COMMANDS:
         raise OnecError(f"команда {command} не наша — в 1С её не посылаем")
+    if not enabled(db):
+        raise OnecError(DISABLED)
     if command != PROBE and not epf_ready(db):
         raise OnecError(NOT_READY)
     open_task = db.query(OnecTask).filter(OnecTask.command == command,
@@ -251,6 +264,8 @@ def mark_timeouts(db: Session) -> int:
 
 def exchange_once(db: Session, ex=None) -> dict:
     """Один проход обмена: просроченные → отправка ждущих → разбор ответов."""
+    if not enabled(db):
+        return {"disabled": True, "sent": {}, "files": 0, "stuck": 0, "failed_files": [], "unmatched": 0}
     stuck = mark_timeouts(db)
     ex = ex or exchange.current()
     sent = publish_pending(db, ex)

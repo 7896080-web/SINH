@@ -9,6 +9,28 @@
 </div>
 
 <div class="card">
+    <h2 style="margin-top:0; font-size:15px;">Обмен с 1С</h2>
+    {% if onec_enabled %}
+    <p><span class="badge badge--good">включён</span> Программа кладёт задания task_fin_* в папку обмена и читает ответы из results\finance.</p>
+    <form method="post" action="/diagnostics/onec-enabled" class="inline-form"><input type="hidden" name="enabled" value="0">
+        <button type="submit" class="btn">Выключить обмен с 1С</button></form>
+    {% else %}
+    <p><span class="badge badge--muted">выключен</span> Программа работает без 1С: в папки обмена C:\sync не пишет и не заглядывает.
+        Справочник товаров — из базы Sync Admin, себестоимость — из Excel. Включают последним этапом, когда программа
+        проверена, а модуль обработки «ОбменССайтом» обновлён до mark-4.</p>
+    <form method="post" action="/diagnostics/onec-enabled" class="inline-form"
+          onsubmit="return confirm('Включить обмен с 1С? Модуль обработки должен быть уже обновлён до mark-4.');">
+        <input type="hidden" name="enabled" value="1">
+        <button type="submit" class="btn btn-primary">Включить обмен с 1С</button></form>
+    {% endif %}
+    <form method="post" action="/diagnostics/catalog-from-sync" class="inline-form" style="margin-top:8px;">
+        <button type="submit" class="btn">Обновить справочник из Sync Admin</button>
+        <span class="help-text">{% if sync_catalog_at %}последний раз {{ sync_catalog_at|local('%d.%m.%Y %H:%M') }}{% else %}ещё не загружался{% endif %}; пока обмен с 1С выключен — сам раз в сутки</span>
+    </form>
+</div>
+
+{% if onec_enabled %}
+<div class="card">
     <h2 style="margin-top:0; font-size:15px;">Обработка 1С «ОбменССайтом»</h2>
     <p>
         {% if epf_ready %}<span class="badge badge--good">{{ epf_version }}</span> подтверждена {{ epf_checked_at|local('%d.%m.%Y %H:%M') }}
@@ -36,6 +58,16 @@
         </tbody>
     </table>
 </div>
+{% else %}
+<div class="card">
+    <table style="max-width:760px;">
+        <tbody>
+            <tr><td>Справочник баркодов</td><td>{% if barcodes %}{{ barcodes }} баркодов, {{ products }} товаров{% else %}пуст — нажмите «Обновить справочник из Sync Admin»{% endif %}</td></tr>
+            <tr><td>База Sync Admin (мэппинг, заказы, справочник)</td><td>{{ sync_status }}</td></tr>
+        </tbody>
+    </table>
+</div>
+{% endif %}
 
 <div class="card">
     <h2 style="margin-top:0; font-size:15px;">Задания 1С</h2>

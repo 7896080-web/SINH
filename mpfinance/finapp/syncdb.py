@@ -187,3 +187,17 @@ def products(uids) -> dict[str, dict]:
                 out[str(uid)] = {"article": article or "", "name": name or "",
                                  "size": size or "", "color": color or ""}
     return out
+
+
+def catalog_rows() -> list[dict]:
+    """Справочник товаров 1С, который sync_admin держит у себя: баркоды, пришедшие
+    ИЗ 1С (`ONEC_SOURCES`), с карточкой товара — в той же форме, что строки
+    BARCODE_DICT (`catalog.parse_barcode_dict`). Пока обмен с 1С выключен, это
+    источник справочника программы."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT b.uid_1c, p.article, p.name, b.barcode, p.size, p.color FROM barcodes b "
+            "JOIN products p ON p.uid_1c = b.uid_1c WHERE b.source_platform IN (?, ?)", ONEC_SOURCES)
+        return [{"uid_1c": str(uid)[:64], "article": (article or "")[:200], "name": (name or "")[:500],
+                 "barcode": str(bc)[:64], "size": (size or "")[:100], "color": (color or "")[:100]}
+                for uid, article, name, bc, size, color in rows if uid and bc]

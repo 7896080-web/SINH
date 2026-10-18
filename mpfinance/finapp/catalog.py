@@ -7,7 +7,10 @@
 
 Тот же справочник, по которому 1С потом ищет номенклатуру в документе продаж
 (`НайтиПоШтрихкоду`): строка отчёта, сопоставленная здесь, найдётся и там.
-Файл можно загрузить и вручную на «Диагностике» — пока обмен не настроен.
+
+Пока обмен с 1С выключен (его включают последним этапом), справочник берётся
+из базы sync_admin — там те же баркоды из 1С (`syncdb.catalog_rows`, раз в сутки
+и кнопкой на «Диагностике»). Файл можно загрузить и вручную.
 """
 from __future__ import annotations
 
@@ -63,7 +66,7 @@ def decode_upload(data: bytes) -> str:
     raise CatalogError("файл не читается ни как UTF-8, ни как cp1251")
 
 
-def load_catalog(db: Session, rows: list[dict]) -> dict:
+def load_catalog(db: Session, rows: list[dict], stamp: str = settings.CATALOG_LOADED_AT) -> dict:
     """Заменить снимок баркодов и обновить товары. Не коммитит.
 
     Пустой разбор — отказ: обрезанный файл иначе стёр бы справочник, и все
@@ -99,7 +102,7 @@ def load_catalog(db: Session, rows: list[dict]) -> dict:
 
     db.query(Barcode).delete(synchronize_session=False)
     db.bulk_insert_mappings(Barcode, [{"barcode": b, "uid_1c": u} for b, u in sorted(pairs)])
-    settings.put(db, settings.CATALOG_LOADED_AT, now.isoformat(timespec="seconds"))
+    settings.put(db, stamp, now.isoformat(timespec="seconds"))
     settings.put(db, settings.CATALOG_ROWS, str(len(pairs)))
     return {"barcodes": len(pairs), "products": len(uids), "new_products": added}
 
@@ -113,3 +116,13 @@ def owners(db: Session, barcodes) -> dict[str, set[str]]:
                 Barcode.barcode.in_(barcodes[start:start + _CHUNK])):
             out.setdefault(bc, set()).add(uid)
     return out
+
+
+def load_from_sync_admin(db: Session) -> dict:
+    """Справочник из базы sync_admin (только чтение). Не коммитит."""
+    from finapp import syncdb
+    try:
+        rows = syncdb.catalog_rows()
+    except syncdb.SyncDbError as e:
+        raise CatalogError(str(e)) from e
+    return load_catalog(db, rows, stamp=settings.SYNC_CATALOG_AT)

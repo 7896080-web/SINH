@@ -111,8 +111,16 @@ def exchange_dirs():
 
 
 @pytest.fixture
-def epf_ready(db):
-    """Обработка 1С ответила на FIN_PING версией mark-4."""
+def onec_on(db):
+    """Обмен с 1С включён на «Диагностике» (по умолчанию он выключен)."""
+    from finapp import settings
+    settings.put(db, settings.ONEC_ENABLED, "1")
+    db.commit()
+
+
+@pytest.fixture
+def epf_ready(db, onec_on):
+    """Обмен включён, и обработка 1С ответила на FIN_PING версией mark-4."""
     from finapp import settings
     settings.put(db, settings.ONEC_EPF_VERSION, "mark-4")
     db.commit()

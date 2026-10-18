@@ -108,7 +108,9 @@ def upload_problems(db: Session, report: SalesReport, warehouse: str,
     if report.report_kind == "предварительный":
         problems.append("Это предварительные данные еженедельного отчёта Lamoda (без баркодов и "
                         "возвратов) — в 1С уходит отчёт комиссионера, итоговый документ.")
-    if not onec.epf_ready(db):
+    if not onec.enabled(db):
+        problems.append("Обмен с 1С пока выключен — его включают последним этапом на «Диагностике».")
+    elif not onec.epf_ready(db):
         problems.append("Обработка 1С ещё не подтвердила версию mark-4 («Диагностика» → "
                         "«Проверить обработку 1С»).")
     if check_in_flight and report.onec_status in IN_FLIGHT:

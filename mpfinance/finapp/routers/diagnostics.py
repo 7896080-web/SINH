@@ -27,7 +27,8 @@ def page(request: Request, db: Session = Depends(get_db), user: User = Depends(g
         "current_user": user, "active_page": "diagnostics", "flash": pop_flash(request),
         "epf_version": settings.get(db, settings.ONEC_EPF_VERSION),
         "epf_checked_at": settings.get(db, settings.ONEC_EPF_CHECKED_AT),
-        "epf_ready": onec.epf_ready(db),
+        "epf_ready": onec.epf_ready(db), "onec_enabled": onec.enabled(db),
+        "sync_catalog_at": settings.get(db, settings.SYNC_CATALOG_AT),
         "catalog_at": settings.get(db, settings.CATALOG_LOADED_AT),
         "barcodes": db.query(Barcode).count(), "products": db.query(Product).count(),
         "costs_at": settings.get(db, settings.COSTS_LOADED_AT),
@@ -80,4 +81,31 @@ def upload(request: Request, kind: str = Form(...), file: UploadFile = File(...)
     log_action(db, user.username, f"upload_{kind}", f"{file.filename}: {message}")
     db.commit()
     set_flash(request, message, "good")
+    return _back()
+
+
+@router.post("/diagnostics/onec-enabled")
+def onec_switch(request: Request, enabled: str = Form("0"), db: Session = Depends(get_db),
+                user: User = Depends(get_current_user)):
+    value = "1" if enabled == "1" else "0"
+    settings.put(db, settings.ONEC_ENABLED, value)
+    log_action(db, user.username, "onec_switch", "включён" if value == "1" else "выключен")
+    db.commit()
+    set_flash(request, "Обмен с 1С включён. Нажмите «Проверить обработку 1С»." if value == "1"
+              else "Обмен с 1С выключен: в папки обмена программа больше не пишет.", "good")
+    return _back()
+
+
+@router.post("/diagnostics/catalog-from-sync")
+def catalog_from_sync(request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    try:
+        st = catalog.load_from_sync_admin(db)
+    except catalog.CatalogError as e:
+        db.rollback()
+        set_flash(request, f"Справочник из Sync Admin не загружен: {e}", "warn")
+        return _back()
+    log_action(db, user.username, "catalog_from_sync", str(st))
+    db.commit()
+    set_flash(request, f"Справочник из Sync Admin: баркодов {st['barcodes']}, товаров {st['products']} "
+                       f"(новых {st['new_products']}).", "good")
     return _back()

@@ -23,6 +23,14 @@ from tests.finance_factories import make_product, make_report
 PERIOD = (date(2026, 9, 1), date(2026, 9, 7))
 
 
+@pytest.fixture(autouse=True)
+def _exchange_switched_on(request):
+    """Тесты обмена — с включённым выключателем; тесты выключенного обмена
+    помечены `onec_off`."""
+    if "onec_off" not in request.keywords:
+        request.getfixturevalue("onec_on")
+
+
 def _report(db, platform="wb", key="SR-wb-100", lines=None):
     make_product(db, uid="u1", barcodes=("111",))
     make_product(db, uid="u2", article="B-2", barcodes=("222",))
@@ -343,3 +351,40 @@ def test_onec_module_speaks_our_protocol():
     assert '"|OK|" + ОчиститьПоле(Номера) + "|SALES_REPORT"' in source
     # По умолчанию документы не проводятся — бухгалтер проводит сам.
     assert 'Пар.Вставить("ПроводитьОтчетыПродаж", Ложь)' in source
+
+
+# ------------------------------------------------------------ обмен выключен (по умолчанию)
+
+@pytest.mark.onec_off
+def test_exchange_is_off_by_default_and_touches_no_files(db, exchange_dirs):
+    assert not onec.enabled(db)
+    with pytest.raises(onec.OnecError, match="выключен"):
+        onec.enqueue(db, onec.PROBE)
+    # Даже ответ, лежащий в папке, не читается и не уносится в архив.
+    _answer(exchange_dirs, "fin_1", "FINPING-1|OK|mark-4|FIN_PING")
+    assert onec.exchange_once(db)["disabled"]
+    assert _tasks(exchange_dirs) == []
+    assert (Path(exchange_dirs.ONEC_RESULTS_DIR) / "result_fin_1.txt").exists()
+    assert not onec.epf_ready(db)
+
+
+@pytest.mark.onec_off
+def test_report_is_not_sent_while_exchange_is_off(db):
+    report = _report(db)
+    assert any("выключен" in p for p in request_upload(db, report, "admin"))
+    assert report.onec_status == OneCUploadStatus.none
+
+
+@pytest.mark.onec_off
+def test_daily_job_takes_the_catalog_from_sync_admin_while_1c_is_off(db, sync_db, monkeypatch):
+    from finapp.workers import jobs
+    sync_db.product("u1", article="A-1", name="Джинсы", size="46", color="синий")
+    sync_db.barcode("2000000000012", "u1", "1c_dict")
+    sync_db.barcode("4600000000001", "u1", "excel_import")      # привязка площадки — не баркод 1С
+    monkeypatch.setattr(jobs, "SessionLocal", lambda: db.__class__(bind=db.get_bind()))
+    jobs.job_daily()
+    db.expire_all()
+    assert {(b.barcode, b.uid_1c) for b in db.query(Barcode)} == {("2000000000012", "u1")}
+    assert db.get(Product, "u1").article == "A-1"
+    assert settings.get(db, settings.SYNC_CATALOG_AT)
+    assert db.query(OnecTask).count() == 0                       # в 1С ничего не поставлено

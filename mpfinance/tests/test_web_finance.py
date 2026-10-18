@@ -225,6 +225,10 @@ def test_password_autofilled_into_key_field_is_not_saved(client, db):
 
 
 def test_diagnostics_ping_and_manual_dictionary_upload(client, db):
+    # Обмен с 1С по умолчанию выключен: проверка версии не ставится.
+    client.post("/diagnostics/request/FIN_PING")
+    assert db.query(OnecTask).count() == 0
+    client.post("/diagnostics/onec-enabled", data={"enabled": "1"})
     client.post("/diagnostics/request/FIN_PING")
     assert db.query(OnecTask).one().command == "FIN_PING"
     # До ответа mark-4 остальные команды не ставятся.

@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta
 
-from finapp import backup, config, exchange, mail, onec, settings
+from finapp import backup, catalog, config, exchange, mail, onec, settings
 from finapp.database import SessionLocal
 from finapp.finance import fetch
 from finapp.models import OnecTask
@@ -35,6 +35,9 @@ def job_onec_exchange() -> None:
     db = SessionLocal()
     try:
         got = onec.exchange_once(db)
+        if got.get("disabled"):
+            beat(db, "onec_exchange", True, "обмен с 1С выключен")
+            return
         notes = []
         if got.get("unmatched"):
             notes.append(f"ответов 1С без задания: {got['unmatched']}")
@@ -54,9 +57,21 @@ def job_onec_exchange() -> None:
 
 def job_daily() -> None:
     """Раз в сутки: проверка версии обработки (пока не подтверждена), справочник
-    баркодов и себестоимость из 1С, чистка архива обмена."""
+    баркодов и себестоимость из 1С, чистка архива обмена. Пока обмен с 1С
+    выключен — справочник из базы sync_admin."""
     db = SessionLocal()
     try:
+        if not onec.enabled(db):
+            if _older_than(settings.get(db, settings.SYNC_CATALOG_AT), DAILY):
+                try:
+                    stats = catalog.load_from_sync_admin(db)
+                    db.commit()
+                    logger.info("справочник из Sync Admin: %s", stats)
+                except catalog.CatalogError as e:
+                    db.rollback()
+                    logger.warning("справочник из Sync Admin не загружен: %s", e)
+            beat(db, "daily", True, "обмен с 1С выключен")
+            return
         if not onec.epf_ready(db):
             last_ping = db.query(OnecTask).filter(OnecTask.command == onec.PROBE) \
                 .order_by(OnecTask.id.desc()).first()
