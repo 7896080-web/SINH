@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 from datetime import date, datetime, timedelta
 
-from . import messages
+from . import goals, messages
 from .config import Settings
 from .db import DB
 from .importers.onec_sales import import_inbox
@@ -64,6 +64,7 @@ def daily_run(db: DB, cfg: Settings, sender: Sender, today: date | None = None, 
                                                           "Рассылка по имеющимся данным.")
     if today.day == 1:
         month_turn(db, cfg, sender, today)
+    goals.ensure_week(db, cfg, today)
     for s in db.sellers():
         if s["max_user_id"] and (db.worked_shifts(s["id"], day.strftime("%Y-%m"), upto=day) or
                                  db.one("SELECT 1 FROM plans WHERE month=? AND seller_id=?", day.strftime("%Y-%m"), s["id"])):

@@ -78,6 +78,7 @@ def for_day(db: DB, cfg: Settings, sid: int, day: date, plan_full: float | None)
         norm = plan_full / cfg.norm_shifts
         n = streak(hist, norm)
         if n >= cfg.motivation.streak_min:
-            out.append(Achievement("streak", f"Серия: {n} {plural(n, 'смена', 'смены', 'смен')} подряд не ниже нормы смены ({_rub(norm)})",
+            word = plural(n, "смена", "смены", "смен")
+            out.append(Achievement("streak", f"Серия: {n} {word} подряд не ниже нормы смены ({_rub(norm)})",
                                    n in STREAK_MARKS))
     return out

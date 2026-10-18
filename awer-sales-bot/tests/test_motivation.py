@@ -59,3 +59,32 @@ def test_best_shift_of_month_before_enough_history(env, tmp_path):  # noqa: F811
     import_file(write_sales(tmp_path / "s.csv", rows), db, cfg)
     kinds = [a.kind for a in achievements.for_day(db, cfg, sid, oct_day(3), None)]
     assert kinds == ["best_month"]  # «за всё время» — только после 10 смен в истории
+
+
+def test_weekly_goal_set_progress_and_close(env, tmp_path):  # noqa: F811
+    from awer_sales_bot import goals
+    cfg, db = env
+    sid = db.seller_id("Продавец04", create=False)
+    rows = []
+    for i in range(10):  # 4 недели до понедельника 19.10: у Продавец04 1 вещь за смену, у Продавец05 — 3
+        d = date(2026, 9, 22) + timedelta(days=i * 2)
+        rows += [(d, "Продавец04", 4_000, 1), (d, "Продавец05", 12_000, 3)]
+    rows += [(date(2026, 10, 19), "Продавец04", 8_000, 2), (date(2026, 10, 20), "Продавец04", 8_000, 2),
+             (date(2026, 10, 19), "Продавец05", 12_000, 3)]
+    import_file(write_sales(tmp_path / "s.csv", rows), db, cfg)
+
+    goals.ensure_week(db, cfg, date(2026, 10, 19))
+    goals.ensure_week(db, cfg, date(2026, 10, 19))  # повторный запуск ничего не меняет
+    g = goals.get(db, sid, date(2026, 10, 19))
+    assert g.metric == "items_per_shift" and g.baseline == 1 and g.team == 2 and g.target == pytest.approx(1.5)
+    assert db.one("SELECT COUNT(*) n FROM weekly_goals")["n"] == 2
+    assert goals.lines(db, sid, date(2026, 10, 18)) == [
+        "🎯 **Цель новой недели:** вещей за смену 1,5 (сейчас 1,0, команда 2,0)"]
+    assert goals.lines(db, sid, date(2026, 10, 20)) == [
+        "🎯 Цель недели: вещей за смену 1,5 — с понедельника у вас 2,0"]
+
+    closed = goals.ensure_week(db, cfg, date(2026, 10, 26))
+    assert {(c.seller_id, c.done) for c in closed} >= {(sid, 1)}
+    assert goals.lines(db, sid, date(2026, 10, 25))[0] == \
+        "Итог недели: цель «вещей за смену 1,5» выполнена ✅, у вас 2,0"
+    assert "🎯" in daily(db, cfg, sid, date(2026, 10, 20))

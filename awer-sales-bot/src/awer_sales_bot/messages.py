@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
-from . import achievements
+from . import achievements, goals
 from . import metrics as M
 from .config import Settings
 from .db import DB
@@ -71,6 +71,9 @@ def daily(db: DB, cfg: Settings, sid: int, day: date) -> str:
                      f"ставка по итогам месяца при таком темпе {rub(st.projected_rate)}")
     else:
         L.append("План на месяц ещё не рассчитан — уточните у администратора.")
+    gl = goals.lines(db, sid, day)
+    if gl:
+        L += [""] + gl
     shop_m = M.store(db, day.replace(day=1), day)
     L += ["", "**С начала месяца, вы / команда:**",
           f"Продажи за смену: {rub(mtd.per_shift)} / {rub(tm.per_shift)}"]
