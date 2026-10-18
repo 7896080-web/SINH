@@ -89,11 +89,36 @@ def period_from_filename(filename: str) -> tuple[date, date] | None:
     return (start, end) if start <= end else None
 
 
+_LAMODA_SHORT_RE = re.compile(r"^MP[0-9A-Z]{10}$")
+
+
+def lamoda_sku_keys(platform_sku: str | None, size: str | None) -> list[str]:
+    """Чем ещё искать строку Lamoda в «Мэппинге» Sync Admin, когда EAN нет.
+
+    В отчёте комиссионера «Артикул» — полный артикул Lamoda с размером
+    («MP002XM0WFWSIN3XL»): ищется как есть. В еженедельном отчёте — только
+    короткий артикул модели («MP002XM22QRZ») и «Размер Партнера» («4XL»): полный
+    собирается по тому же правилу, что в отчёте комиссионера, — короткий + «IN» +
+    размер. Короткий артикул сам по себе не ищется: он один на весь размерный
+    ряд, и продажа легла бы не на тот размер."""
+    sku = (platform_sku or "").strip().upper()
+    if not sku:
+        return []
+    if _LAMODA_SHORT_RE.match(sku):
+        size = "".join((size or "").split()).upper()
+        return [f"{sku}IN{size}"] if size else []
+    return [sku]
+
+
 def resolve_uids(db: Session, report: SalesReport, notes: list[str] | None = None) -> int:
     """Проставляет строкам uid_1c (`mapping.resolve`: «Мэппинг» sync_admin, затем
     справочник 1С) и пересчитывает, сколько строк продаж/возвратов осталось без
-    товара 1С. Вызывается при импорте и повторно — кнопкой «Пересопоставить» и
-    перед отправкой в 1С: мэппинг в sync_admin могли дополнить."""
+    товара 1С. Вызывается при импорте и повторно — кнопкой «Пересопоставить»,
+    перед отправкой в 1С и раз в час фоном (`remap_unmatched`): мэппинг в
+    sync_admin могли дополнить.
+
+    У Lamoda строка без EAN (или с EAN, которого нет в мэппинге) ищется ещё по
+    артикулу Lamoda (`lamoda_sku_keys`) — он тоже записан в «Мэппинг»."""
     lines = db.query(SalesReportLine).filter(SalesReportLine.report_id == report.id).all()
     found = mapping.resolve(db, (line.barcode for line in lines))
     if notes is not None and found.note:
@@ -101,13 +126,42 @@ def resolve_uids(db: Session, report: SalesReport, notes: list[str] | None = Non
     if notes is not None and found.ambiguous:
         notes.append("Баркоды у нескольких товаров в справочнике 1С (не сопоставлены): "
                      + ", ".join(sorted(found.ambiguous)[:5]) + ".")
-    unmatched = 0
     for line in lines:
         line.uid_1c = found.uid_by_barcode.get(line.barcode) if line.barcode else None
-        if line.operation in v.GOODS_OPERATIONS and line.uid_1c is None:
-            unmatched += 1
+    if report.platform == "lamoda":
+        rest = [(line, lamoda_sku_keys(line.platform_sku, line.size)) for line in lines
+                if line.uid_1c is None and line.operation in v.GOODS_OPERATIONS]
+        rest = [(line, keys) for line, keys in rest if keys]
+        if rest:
+            by_sku = mapping.resolve(db, (key for _line, keys in rest for key in keys))
+            matched = 0
+            for line, keys in rest:
+                uid = next((by_sku.uid_by_barcode[k] for k in keys if k in by_sku.uid_by_barcode), None)
+                if uid is not None:
+                    line.uid_1c = uid
+                    matched += 1
+            if notes is not None and matched:
+                notes.append(f"По артикулу Lamoda (EAN нет или его нет в «Мэппинге») сопоставлено строк: "
+                             f"{matched}.")
+    unmatched = sum(1 for line in lines if line.operation in v.GOODS_OPERATIONS and line.uid_1c is None)
     report.unmatched_lines = unmatched
     return unmatched
+
+
+def remap_unmatched(db: Session, limit: int = 200) -> tuple[int, int]:
+    """Пересопоставить неотправленные отчёты, где остались строки без товара 1С:
+    «Мэппинг» Sync Admin дополняют, а нажимать «Пересопоставить» в каждом отчёте
+    руками никто не станет. Отправленные в 1С не трогаем — документ построен.
+    Возвращает (отчётов просмотрено, строк сопоставлено). Не коммитит."""
+    reports = db.query(SalesReport).filter(
+        SalesReport.unmatched_lines > 0,
+        SalesReport.onec_status.in_((OneCUploadStatus.none, OneCUploadStatus.failed))) \
+        .order_by(SalesReport.id.desc()).limit(limit).all()
+    fixed = 0
+    for report in reports:
+        before = report.unmatched_lines or 0
+        fixed += max(before - resolve_uids(db, report), 0)
+    return len(reports), fixed
 
 
 def _with_goods(db: Session, report_ids: list[int]) -> set[int]:

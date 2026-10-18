@@ -96,9 +96,10 @@
             Строк продаж/возвратов без товара 1С: {{ total.unmatched_lines }} — себестоимость к ним не
             подставится, в 1С такие отчёты не отправляются.
             {% set with_bc = total.unmatched_lines - total.unmatched_no_barcode %}
-            {% if total.unmatched_no_barcode %}Из них {{ total.unmatched_no_barcode }} — без баркода в самом отчёте (так в
-            еженедельных отчётах Lamoda): «Мэппинг» их не исправит, товар и себестоимость появятся с отчётом
-            комиссионера, который их заменит.{% endif %}
+            {% if total.unmatched_no_barcode %}Из них {{ total.unmatched_no_barcode }} — без баркода в самом отчёте
+            (еженедельные отчёты Lamoda): им ищется артикул Lamoda в «Мэппинге» Sync Admin (короткий артикул +
+            «IN» + размер, как в отчёте комиссионера). Не нашёлся — добавьте артикул в «Мэппинг» или дождитесь
+            отчёта комиссионера, он заменит эти недели.{% endif %}
             {% if with_bc > 0 %}{{ 'Остальные' if total.unmatched_no_barcode else 'Их' }} {{ with_bc }} — привяжите баркоды в «Мэппинге» Sync Admin.{% endif %}</li>
         {% endif %}
         {% if not_in_1c %}

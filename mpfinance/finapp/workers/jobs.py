@@ -71,6 +71,17 @@ def job_daily() -> None:
     выключен — справочник из базы sync_admin."""
     db = SessionLocal()
     try:
+        # Раз в час (задание зовут ежечасно): строки без товара 1С в неотправленных
+        # отчётах — заново по «Мэппингу» Sync Admin, его дополняют.
+        try:
+            from finapp.finance.importer import remap_unmatched
+            seen, fixed = remap_unmatched(db)
+            db.commit()
+            if fixed:
+                logger.info("пересопоставление: отчётов %s, сопоставлено строк %s", seen, fixed)
+        except Exception:                        # noqa: BLE001 — не мешаем остальному суточному
+            db.rollback()
+            logger.exception("пересопоставление отчётов упало")
         if not onec.enabled(db):
             if _older_than(settings.get(db, settings.SYNC_CATALOG_AT), DAILY):
                 try:
