@@ -226,7 +226,12 @@ def apply_result_text(db: Session, text: str, cost_text: str = "", dict_text: st
                 task.status = OnecTaskStatus.failed.value
                 task.result_detail = f"справочник не принят: {e}"
         elif command == "EXPORT_COST_PRICES":
-            parsed_costs, bad = costs.parse_cost_file(cost_text)
+            try:
+                parsed_costs, bad = costs.parse_cost_file(cost_text)
+            except costs.CostFileError as e:
+                task.status = OnecTaskStatus.failed.value
+                task.result_detail = f"себестоимость не принята: {e}"[:2000]
+                continue
             if not parsed_costs:
                 task.status = OnecTaskStatus.failed.value
                 task.result_detail = "в файле себестоимости нет ни одной строки"

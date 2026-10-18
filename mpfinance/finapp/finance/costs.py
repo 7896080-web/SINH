@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import re
 from decimal import Decimal, InvalidOperation
 
 from sqlalchemy.orm import Session
@@ -21,28 +22,57 @@ from finapp.models import Product, ProductCost
 from finapp.timeutils import now_utc, today_local
 
 _CHUNK = 500
+# Цена — число с точкой (или запятой), без пробелов ВНУТРИ: пробел — признак
+# того, что во втором поле не цена. 18.10 на бою справочник баркодов
+# (`uid|артикул|наименование|баркод|размер|цвет`) загрузили как себестоимость,
+# а разбор убирал пробелы «как разделители тысяч» и брал второе поле: артикул
+# «70534 10146» стал ценой $7 053 410 146, и дашборд показал себестоимость WB
+# 692 млрд ₽.
+_PRICE_RE = re.compile(r"^\d+(?:[.,]\d{1,4})?$")
+# Доля строк не по формату, при которой файл не принимается ЦЕЛИКОМ: это уже не
+# пара испорченных строк, а другой файл. Половину чужого файла, разобранную
+# «как получилось», не принимаем — она хуже, чем ничего.
+MAX_BAD_SHARE = 0.05
+
+
+class CostFileError(ValueError):
+    pass
 
 
 def parse_cost_file(content: str) -> tuple[dict[str, int], int]:
-    """`uid|цена` → {uid: центы}; второе — число неразобранных строк."""
-    costs, bad = {}, 0
+    """`uid|цена` → {uid: центы}; второе — число неразобранных строк.
+
+    Строка — ровно два поля. Файл, в котором строк не по формату больше
+    `MAX_BAD_SHARE` (и их больше одной) или не по формату все, —
+    `CostFileError` с примером строки: угадывать, в каком
+    поле чужого файла цена, нельзя (в справочнике баркодов последнее поле —
+    ЦВЕТ, и у части товаров он числом)."""
+    costs, bad, lines, example = {}, 0, 0, ""
     for line in content.splitlines():
-        line = line.strip()
+        line = line.strip().lstrip("\ufeff")
         if not line:
             continue
+        lines += 1
         parts = line.split("|")
-        if len(parts) < 2 or not parts[0].strip():
+        price_text = parts[1].strip() if len(parts) == 2 else ""
+        if len(parts) != 2 or not parts[0].strip() or not _PRICE_RE.match(price_text):
             bad += 1
+            example = example or line
             continue
-        try:
-            price = Decimal(parts[1].strip().replace(" ", "").replace(",", "."))
-        except InvalidOperation:
+        price = Decimal(price_text.replace(",", "."))
+        if price <= 0:
             bad += 1
-            continue
-        if not price.is_finite() or price <= 0:
-            bad += 1
+            example = example or line
             continue
         costs[parts[0].strip()] = int((price * 100).to_integral_value())
+    # Одна испорченная строка — счёт, а не отказ (даже в маленьком файле);
+    # файл, где не по формату всё или больше `MAX_BAD_SHARE`, — чужой.
+    if lines and bad > lines * MAX_BAD_SHARE and (bad > 1 or bad == lines):
+        fields = example.count("|") + 1
+        hint = (" — похоже на справочник баркодов (uid|артикул|наименование|баркод|размер|цвет): "
+                "его загружают как «справочник баркодов»") if fields >= 5 else ""
+        raise CostFileError(f"это не файл себестоимости: строк не в формате uid|цена — {bad} из {lines}, "
+                            f"например «{example[:120]}» ({fields} полей){hint}")
     return costs, bad
 
 

@@ -71,9 +71,15 @@
 <div class="card">
     <h2 style="margin-top:0; font-size:15px;">Что искажает цифры</h2>
     <ul class="check-list">
+        {% if total.cost_suspicious_qty %}
+        <li><span class="badge badge--bad">себестоимость</span>
+            У {{ total.cost_suspicious_qty }} шт себестоимость больше цены продажи в 10 раз и больше — это ошибка
+            данных (например, неверный файл себестоимости), а не убыток. В прибыль она не взята, такие товары
+            помечены «себестоимость под сомнением». Исправьте её на <a href="/finance/costs">«Себестоимости»</a>.</li>
+        {% endif %}
         {% if total.cost_missing_qty %}
         <li><span class="badge badge--warn">себестоимость</span>
-            Продано {{ total.cost_missing_qty }} шт без себестоимости — прибыль по ним завышена.
+            Продано {{ total.cost_missing_qty }} шт без себестоимости{% if total.cost_suspicious_qty %} (с теми, что под сомнением){% endif %} — прибыль по ним завышена.
             <a href="/finance/costs?missing=true">Заполнить себестоимость</a></li>
         {% endif %}
         {% if total.unmatched_lines %}
@@ -188,7 +194,7 @@
             <tbody>
             {% for g in top %}
             <tr><td>{{ g.article or '—' }}<div class="help-text">{{ g.title }}</div>
-                {% if g.totals.cost_missing_qty > 0 %}<span class="badge badge--warn" title="Прибыль завышена: себестоимость не задана — «Себестоимость»">без себестоимости</span>{% endif %}</td>
+                {% if g.totals.cost_suspicious_qty %}<span class="badge badge--bad" title="Себестоимость больше цены продажи в 10 раз и больше — это ошибка данных, в прибыль она не взята. Исправьте на «Себестоимости»">себестоимость под сомнением</span>{% elif g.totals.cost_missing_qty > 0 %}<span class="badge badge--warn" title="Прибыль завышена: себестоимость не задана — «Себестоимость»">без себестоимости</span>{% endif %}</td>
                 <td class="num">{{ g.totals.net_qty }}</td><td class="num">{{ money(g.totals.profit, true) }}</td>
                 <td class="num">{{ g.totals.margin | pct }}</td></tr>
             {% endfor %}
@@ -203,7 +209,7 @@
             <thead><tr><th>Артикул</th><th class="num">Шт</th><th class="num">Убыток</th><th class="num">Маржа</th></tr></thead>
             <tbody>
             {% for g in losers %}
-            <tr><td>{{ g.article or '—' }}<div class="help-text">{{ g.title }}</div></td>
+            <tr><td>{{ g.article or '—' }}<div class="help-text">{{ g.title }}</div>{% if g.totals.cost_suspicious_qty %}<span class="badge badge--bad" title="Себестоимость больше цены продажи в 10 раз и больше — это ошибка данных, в прибыль она не взята. Исправьте на «Себестоимости»">себестоимость под сомнением</span>{% endif %}</td>
                 <td class="num">{{ g.totals.net_qty }}</td><td class="num">{{ money(g.totals.profit, true) }}</td>
                 <td class="num">{{ g.totals.margin | pct }}</td></tr>
             {% endfor %}

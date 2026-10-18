@@ -62,6 +62,11 @@ class Totals:
     # Продано штук, для которых себестоимость не задана: прибыль по ним
     # завышена, и интерфейс должен это показать, а не молча считать ноль.
     cost_missing_qty: int = 0
+    # Из них — штуки, чья себестоимость больше цены продажи в
+    # `SUSPICIOUS_COST_RATIO` раз и больше: такая цифра — ошибка данных, а не
+    # убыток. Учти её — одна строка перевернула бы итоги всей площадки (18.10:
+    # артикул, принятый за цену, дал себестоимость WB 692 млрд ₽).
+    cost_suspicious_qty: int = 0
     unmatched_lines: int = 0
     tax: int = 0
     vat: int = 0          # невозвратный НДС (внутри цены продажи)
@@ -71,7 +76,8 @@ class Totals:
              "deduction", "compensation", "cogs", "tax", "vat", "extra")
 
     def add(self, other: "Totals"):
-        for name in ("sold_qty", "returned_qty", "cost_missing_qty", "unmatched_lines") + self.MONEY:
+        for name in ("sold_qty", "returned_qty", "cost_missing_qty", "cost_suspicious_qty",
+                     "unmatched_lines") + self.MONEY:
             setattr(self, name, getattr(self, name) + getattr(other, name))
 
     @property
@@ -252,6 +258,12 @@ def _products(db: Session, uids: set[str]) -> dict[str, Product]:
     return result
 
 
+# Себестоимость, в столько раз и больше превышающая цену продажи штуки, — не
+# убыток, а ошибка данных: у одежды себестоимость — доли цены, и даже распродажа
+# в ноль не даёт десятикратного превышения.
+SUSPICIOUS_COST_RATIO = 10
+
+
 def add_line(totals: Totals, line, cost: int | None):
     (platform, _account, operation, _day, uid, _bc, _art, _name, _size, qty, revenue, commission,
      payout, logistics, storage, penalty, acceptance, deduction, compensation) = line
@@ -272,6 +284,9 @@ def add_line(totals: Totals, line, cost: int | None):
             totals.returned_qty += qty
         if uid is None:
             totals.unmatched_lines += 1
+        if cost is not None and qty and revenue and cost * qty > SUSPICIOUS_COST_RATIO * abs(revenue):
+            totals.cost_suspicious_qty += sign * qty
+            cost = None
         if cost is None:
             totals.cost_missing_qty += sign * qty
         else:

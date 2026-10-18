@@ -80,6 +80,7 @@
                     {% for p in g.platforms | sort %}<span class="swatch" title="{{ platform_labels.get(p, p) }}" style="background: {{ platform_colors.get(p, '#898781') }}; margin-left:4px;"></span>{% endfor %}
                 </div>
                 {% if not g.matched %}<span class="badge badge--warn">нет в 1С</span>{% endif %}
+                {% if t.cost_suspicious_qty %}<span class="badge badge--bad" title="Себестоимость больше цены продажи в 10 раз и больше — ошибка данных, в прибыль не взята">себестоимость под сомнением: {{ t.cost_suspicious_qty }} шт</span>{% endif %}
                 {% if t.cost_missing_qty %}<span class="badge badge--warn">без себестоимости: {{ t.cost_missing_qty }} шт</span>{% endif %}
             </td>
             <td class="num">{{ t.sold_qty }}</td>
@@ -126,6 +127,10 @@
 </div>
 <p class="help-text">Суммы в таблице округлены до рубля, точные — в выгрузке в Excel.
    «Не привязано к товару» можно разнести по позициям пропорционально выручке — галочкой в фильтре.</p>
+{% if total.cost_suspicious_qty %}
+<p class="help-text"><span class="badge badge--bad">внимание</span> У {{ total.cost_suspicious_qty }} шт себестоимость больше цены
+   продажи в 10 раз и больше — это ошибка данных, в прибыль она не взята. <a href="/finance/costs">Исправить себестоимость</a></p>
+{% endif %}
 {% if total.cost_missing_qty %}
 <p class="help-text"><span class="badge badge--warn">внимание</span> Продано {{ total.cost_missing_qty }} шт без себестоимости —
    прибыль и ROI по ним завышены. <a href="/finance/costs?missing=true">Заполнить себестоимость</a></p>

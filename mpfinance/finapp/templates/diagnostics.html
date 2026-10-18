@@ -90,12 +90,15 @@
 <div class="card">
     <h2 style="margin-top:0; font-size:15px;">Файл из 1С вручную</h2>
     <p class="help-text" style="margin-top:0;">Пока обмен не настроен: справочник баркодов
-        (<span class="mono">uid|артикул|наименование|баркод|размер|цвет</span>) или себестоимость
-        (<span class="mono">uid|цена в $</span>) — те же файлы, что кладёт обработка.</p>
+        (<span class="mono">barcodes_*.txt</span>, строки <span class="mono">uid|артикул|наименование|баркод|размер|цвет</span>)
+        или себестоимость (<span class="mono">cost_*.txt</span>, строки <span class="mono">uid|цена в $</span>) — те же
+        файлы, что кладёт обработка. Справочник баркодов программа и так берёт из базы Sync Admin (кнопка
+        «Обновить справочник из Sync Admin» выше и сама раз в сутки) — файлом он нужен, только если Sync Admin
+        недоступен. Файл не того вида программа не примет.</p>
     <form method="post" action="/diagnostics/upload" enctype="multipart/form-data" class="filters" style="margin:0;">
         <div class="field">
             <label>Что за файл</label>
-            <select name="kind"><option value="dict">справочник баркодов</option><option value="cost">себестоимость</option></select>
+            <select name="kind" required><option value="" selected disabled>— выберите —</option><option value="dict">справочник баркодов (barcodes_*.txt)</option><option value="cost">себестоимость (cost_*.txt)</option></select>
         </div>
         <div class="field"><label>Файл</label><input type="file" name="file" accept=".txt,.csv" required></div>
         <div class="field"><label>&nbsp;</label><button type="submit" class="btn">Загрузить</button></div>

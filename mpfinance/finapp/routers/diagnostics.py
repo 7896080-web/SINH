@@ -129,6 +129,9 @@ def request_1c(command: str, request: Request, db: Session = Depends(get_db),
 def upload(request: Request, kind: str = Form(...), file: UploadFile = File(...),
            db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Ручная загрузка файла из 1С (barcodes_*.txt / cost_*.txt) — пока обмен не настроен."""
+    if kind not in ("dict", "cost"):
+        set_flash(request, "Выберите, что за файл: справочник баркодов или себестоимость.", "warn")
+        return _back()
     try:
         text = catalog.decode_upload(read_upload(file.file))
         if kind == "dict":
@@ -140,7 +143,7 @@ def upload(request: Request, kind: str = Form(...), file: UploadFile = File(...)
             if not parsed:
                 raise catalog.CatalogError("в файле себестоимости нет ни одной строки (ждём uid|цена)")
             message = costs.summary(costs.import_costs(db, parsed), bad).capitalize() + "."
-    except (catalog.CatalogError, ExcelReadError) as e:
+    except (catalog.CatalogError, costs.CostFileError, ExcelReadError) as e:
         db.rollback()
         set_flash(request, f"Файл не принят: {e}", "warn")
         return _back()
