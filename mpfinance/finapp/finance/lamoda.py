@@ -196,10 +196,25 @@ def import_weekly(db: Session, sheets, *, account_id: int | None, user: str, fil
     outcomes = []
     for monday in sorted(by_week):
         iso = monday.isocalendar()
-        number = f"W{iso[0]}{iso[1]:02d}-{account_id or 0}"
+        # Та же неделя, загруженная с другим кабинетом или без него (письмо —
+        # «кабинет не указан», файл руками — с кабинетом): номер недели включает
+        # кабинет, и раньше неделя ложилась ДВАЖДЫ до прихода отчёта
+        # комиссионера. Копии, чей кабинет «совпадает» по правилу
+        # `_accounts_match`, заменяются свежей, а кабинет берётся указанный.
+        twins = _accounts_match(db.query(SalesReport).filter(
+            SalesReport.platform == "lamoda", SalesReport.report_kind == PROVISIONAL,
+            SalesReport.period_from == monday), account_id).all()
+        week_account = account_id or next((r.account_id for r in twins if r.account_id), None)
+        number = f"W{iso[0]}{iso[1]:02d}-{week_account or 0}"
+        for twin in twins:
+            if twin.report_number != number and (week_account is None or twin.account_id in (None, week_account)):
+                db.query(SalesReportLine).filter(SalesReportLine.report_id == twin.id) \
+                    .delete(synchronize_session=False)
+                db.delete(twin)
+        db.flush()
         parsed = ParseResult(format=WEEKLY_FORMAT, lines=by_week[monday])
         outcome = store_api_report(
-            db, platform="lamoda", account_id=account_id, parsed=parsed, period_from=monday,
+            db, platform="lamoda", account_id=week_account, parsed=parsed, period_from=monday,
             period_to=monday + timedelta(days=6), user=user, report_number=number,
             report_kind=PROVISIONAL, file_name=file_name, replace_unsent=True, source=source)
         outcomes.append(outcome)

@@ -233,3 +233,23 @@ def test_mail_password_is_stored_encrypted_and_kept_when_blank(db):
 
 def test_since_uses_english_month_names():
     assert mail._since(0).split("-")[1] in mail._MONTHS
+
+
+@pytest.mark.parametrize("first_with_account", [False, True])
+def test_same_week_from_mail_and_by_hand_is_one_report(db, first_with_account):
+    """Аудит 18.10: неделя с почты (кабинет не указан) и та же неделя руками с
+    кабинетом ложились двумя отчётами — продажи недели вдвое до отчёта
+    комиссионера. Теперь — один, с указанным кабинетом."""
+    account = make_account(db, platform="lamoda", name="AWER")
+    data = _weekly_file([_sale(date(2026, 10, 2))])
+    by_hand = lambda: import_report(db, platform="lamoda", file_bytes=data, filename="AWER - Weekly Report - 2026-10-05.xlsx",
+                                    user="t", account_id=account.id)
+    by_mail = lambda: import_report(db, platform="lamoda", file_bytes=data + b"", filename="w.xlsx",
+                                    user="почта", account_id=None, source="email")
+    for step in ((by_hand, by_mail) if first_with_account else (by_mail, by_hand)):
+        # тот же файл дважды отсечётся по sha — второй раз загружаем копию с другим именем
+        db.query(SalesReport).update({SalesReport.file_sha256: None})
+        db.commit()
+        step()
+    weeks = db.query(SalesReport).filter(SalesReport.report_kind == lamoda.PROVISIONAL).all()
+    assert len(weeks) == 1 and weeks[0].account_id == account.id
