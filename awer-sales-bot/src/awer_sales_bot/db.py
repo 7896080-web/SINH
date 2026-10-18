@@ -164,6 +164,18 @@ CREATE TABLE IF NOT EXISTS weekly_goals (       -- цель недели про�
     closed_at TEXT,
     PRIMARY KEY (week, seller_id)
 );
+CREATE TABLE IF NOT EXISTS content (            -- обучение: content.py; стартовые тексты — content/*.yaml
+    id TEXT PRIMARY KEY,                  -- obraz-1, onb-3, tkan-hlopok, test-tkani-1 …
+    kind TEXT NOT NULL,                   -- lesson | onboarding | article | test | survey | checklist
+    topic TEXT,                           -- урок: тема цели недели; статья: раздел базы знаний
+    title TEXT NOT NULL,
+    body TEXT,
+    try_today TEXT,
+    data TEXT,                            -- JSON: quiz / questions / items / shift / tags / article_ids
+    active INTEGER NOT NULL DEFAULT 1,
+    origin TEXT,                          -- yaml — из файла; admin — правка владельца (файлом не перезаписывается)
+    updated_at TEXT
+);
 CREATE TABLE IF NOT EXISTS lessons_sent (       -- какие уроки и когда ушли продавцу, lessons.py
     seller_id INTEGER NOT NULL REFERENCES sellers(id),
     lesson_id TEXT NOT NULL,              -- id из content/lessons.yaml; программа новичка — onb-<смена>

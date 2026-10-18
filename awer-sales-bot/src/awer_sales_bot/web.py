@@ -17,6 +17,7 @@ from fastapi import Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
+from . import content
 from . import crews as crews_mod
 from .config import Settings
 from .db import DB
@@ -71,7 +72,7 @@ def create_app(cfg: Settings, db: DB) -> FastAPI:
     def page(title: str, body: str) -> HTMLResponse:
         cur = date.today().strftime("%Y-%m")
         nav = (f'<nav><a href="/month/{cur}">Настройки месяца</a><a href="/sellers">Продавцы</a>'
-               f'<a href="/crews">Смены</a><a href="/schedule/{cur}">График работы</a><a href="/month/{cur}/results">Итоги и ведомость</a></nav>')
+               f'<a href="/crews">Смены</a><a href="/learn">Обучение</a><a href="/schedule/{cur}">График работы</a><a href="/month/{cur}/results">Итоги и ведомость</a></nav>')
         return HTMLResponse(f"<!doctype html><html lang=ru><head><meta charset=utf-8><title>{title}</title>"
                             f"<style>{CSS}</style></head><body>{nav}<h1>{title}</h1>{body}</body></html>")
 
@@ -357,6 +358,147 @@ def create_app(cfg: Settings, db: DB) -> FastAPI:
                     days[d] = v if v in cfg.stores and v != dflt else None
             db.set_schedule(month, sl["id"], days)
         return RedirectResponse(f"/schedule/{month}?msg=" + quote("График сохранён"), status_code=303)
+
+    # ------------------------------------------------------------------ обучение: правка контента
+    def _learn_tabs(kind: str) -> str:
+        return "<p>" + " · ".join(f'<b>{t}</b>' if k == kind else f'<a href="/learn?kind={k}">{t}</a>'
+                                  for k, t in content.KINDS.items()) + "</p>"
+
+    @app.get("/learn", dependencies=[Depends(auth)])
+    def learn(kind: str = "lesson", msg: str = ""):
+        if kind not in content.KINDS:
+            raise HTTPException(404)
+        rows = content.items(db, cfg, kind, active_only=False)
+        b = [_learn_tabs(kind), f'<p class=note>{html.escape(msg)}</p>' if msg else "",
+             '<p class=note>Тексты можно менять здесь — исправленное больше не перезаписывается стартовыми файлами. '
+             'Черновики новых уроков, статей и тестов может написать Claude (скилл «Продажи в магазине»): вы проверяете '
+             'и включаете. Выключенное не рассылается.</p>',
+             f'<p><a class=btn href="/learn/new?kind={kind}">+ Добавить</a></p>'
+             '<form method=post action="/learn/sync" style="display:inline"><button class=btn>Подтянуть новые тексты '
+             'из файлов</button></form>',
+             '<table><tr><th>Название</th><th>Тема / раздел</th><th>Включено</th><th>Отправлено / ответы</th>'
+             '<th>Кем изменено</th></tr>']
+        for x in rows:
+            sent = db.one("SELECT COUNT(*) n FROM lessons_sent WHERE lesson_id=?",
+                          x["id"] if kind != "onboarding" else f"onb-{x['data'].get('shift')}")["n"]
+            q = db.one("SELECT COUNT(*) n, COALESCE(SUM(correct),0) ok FROM quiz_answers WHERE lesson_id=?", x["id"])
+            stat = f"{sent}" + (f" · квиз {q['ok']} из {q['n']} верно" if q["n"] else "")
+            topic = (content.LESSON_TOPICS.get(x["topic"]) or content.ARTICLE_SECTIONS.get(x["topic"]) or
+                     (f"рабочий день {x['data'].get('shift')}" if kind == "onboarding" else ""))
+            b.append(f'<tr><td><a href="/learn/{quote(x["id"])}">{html.escape(x["title"])}</a></td>'
+                     f'<td>{html.escape(topic or "")}</td><td>{"да" if x["active"] else "<span class=off>нет</span>"}'
+                     f'</td><td class=n>{stat}</td><td>{"вы (админка)" if x["origin"] == "admin" else "стартовый файл"}'
+                     f'</td></tr>')
+        b.append("</table>")
+        return page(f"Обучение: {content.KINDS[kind]}", "".join(b))
+
+    @app.post("/learn/sync", dependencies=[Depends(auth)])
+    def learn_sync():
+        n = content.sync_from_files(db, cfg, force=True)
+        return RedirectResponse("/learn?msg=" + quote(f"Из файлов добавлено или обновлено: {n}"), status_code=303)
+
+    def _learn_form(x: dict, err: str = "") -> HTMLResponse:
+        kind = x["kind"]
+        e = html.escape
+        d = x.get("data") or {}
+        f = [_learn_tabs(kind), f'<p class=off>{e(err)}</p>' if err else "",
+             f'<form method=post action="/learn/{quote(x["id"])}"><input type=hidden name=kind value="{kind}"><table>',
+             f'<tr><td>Название</td><td><input type=text name=title style="width:520px" value="{e(x.get("title") or "")}"></td></tr>']
+        if kind == "lesson":
+            opts = "".join(f'<option value="{k}" {"selected" if x.get("topic") == k else ""}>{t}</option>'
+                           for k, t in content.LESSON_TOPICS.items())
+            f.append(f'<tr><td>Тема (по цели недели)</td><td><select name=topic>{opts}</select></td></tr>')
+        if kind == "article":
+            opts = "".join(f'<option value="{k}" {"selected" if x.get("topic") == k else ""}>{t}</option>'
+                           for k, t in content.ARTICLE_SECTIONS.items())
+            f.append(f'<tr><td>Раздел</td><td><select name=topic>{opts}</select></td></tr>')
+        if kind == "onboarding":
+            f.append(f'<tr><td>Рабочий день новичка №</td><td><input type=number name=shift min=1 max=60 '
+                     f'value="{d.get("shift") or 1}"></td></tr>')
+        if kind != "checklist":
+            f.append(f'<tr><td>Текст</td><td><textarea name=body rows=12 cols=90>{e(x.get("body") or "")}</textarea>'
+                     '<br><span class=note>Без символов * и _ (разметка MAX). Фразы для покупателя — в «ёлочках».</span></td></tr>')
+        if kind in ("lesson", "onboarding"):
+            f.append(f'<tr><td>Попробуйте сегодня</td><td><input type=text name=try_today style="width:520px" '
+                     f'value="{e(x.get("try_today") or "")}"></td></tr>')
+        if kind == "article":
+            f.append(f'<tr><td>Слова для поиска</td><td><input type=text name=tags style="width:520px" '
+                     f'value="{e(", ".join(d.get("tags") or []))}"></td></tr>')
+        if kind == "test":
+            f.append(f'<tr><td>Статьи перед тестом (id через запятую)</td><td><input type=text name=article_ids '
+                     f'style="width:520px" value="{e(", ".join(d.get("article_ids") or []))}"></td></tr>')
+        if kind in ("lesson", "test", "survey"):
+            qs = d.get("quiz") if kind == "lesson" else d.get("questions")
+            hint = ("? вопрос · - вариант · ~ свой ответ (можно ответить своими словами)" if kind == "survey" else
+                    "? вопрос · + верный вариант · - неверный · = объяснение")
+            f.append(f'<tr><td>{"Квиз после урока" if kind == "lesson" else "Вопросы"}</td><td>'
+                     f'<textarea name=questions rows=14 cols=90>'
+                     f'{e(x.get("questions_raw") or content.format_questions(qs or [], survey=kind == "survey"))}'
+                     f'</textarea><br><span class=note>{hint}</span></td></tr>')
+        if kind == "checklist":
+            f.append(f'<tr><td>Пункты (по одному в строке)</td><td><textarea name=items rows=12 cols=90>'
+                     f'{e(chr(10).join(d.get("items") or []))}</textarea></td></tr>')
+        f.append(f'<tr><td>Включено</td><td><input type=checkbox name=active {"checked" if x.get("active", 1) else ""}>'
+                 '</td></tr></table><button class=btn>Сохранить</button></form>'
+                 f'<p class=note>id: {e(x["id"])} — не меняется (по нему бот помнит, что уже отправлял).</p>')
+        return page(f"{content.KINDS[kind]}: {e(x.get('title') or 'новый')}", "".join(f))
+
+    @app.get("/learn/new", dependencies=[Depends(auth)])
+    def learn_new(kind: str = "lesson"):
+        if kind not in content.KINDS:
+            raise HTTPException(404)
+        return _learn_form({"id": content.new_id(db, kind), "kind": kind, "active": 1,
+                            "topic": "general" if kind == "lesson" else ("tkani" if kind == "article" else None)})
+
+    @app.get("/learn/{cid}", dependencies=[Depends(auth)])
+    def learn_edit(cid: str):
+        x = content.get(db, cfg, cid)
+        if not x:
+            raise HTTPException(404)
+        return _learn_form(x)
+
+    @app.post("/learn/{cid}", dependencies=[Depends(auth)])
+    async def learn_save(cid: str, request: Request):
+        form = await request.form()
+        kind = str(form.get("kind") or "")
+        if kind not in content.KINDS:
+            raise HTTPException(400)
+        old = content.get(db, cfg, cid) or {}
+        title = " ".join(str(form.get("title") or "").split())
+        body = str(form.get("body") or "").replace("\r\n", "\n").strip() or None
+        data = dict(old.get("data") or {})
+        x = {"id": cid, "kind": kind, "title": title, "body": body, "topic": form.get("topic") or None,
+             "try_today": str(form.get("try_today") or "").strip() or None, "active": 1 if form.get("active") else 0,
+             "data": data}
+        try:
+            if not title:
+                raise ValueError("Нужно название")
+            if any(ch in (title + (body or "") + (x["try_today"] or "")) for ch in "*_"):
+                raise ValueError("Символы * и _ ломают разметку MAX — уберите их")
+            if kind in ("lesson", "test", "survey"):
+                raw = str(form.get("questions") or "")
+                x["questions_raw"] = raw
+                qs = content.parse_questions(raw, survey=kind == "survey")
+                data["quiz" if kind == "lesson" else "questions"] = qs
+                if kind in ("test", "survey") and not qs:
+                    raise ValueError("Нужен хотя бы один вопрос")
+            if kind == "onboarding":
+                data["shift"] = int(form.get("shift") or 1)
+            if kind == "article":
+                data["tags"] = [t.strip().lower() for t in str(form.get("tags") or "").split(",") if t.strip()]
+            if kind == "test":
+                data["article_ids"] = [t.strip() for t in str(form.get("article_ids") or "").split(",") if t.strip()]
+            if kind == "checklist":
+                items_ = [i.strip() for i in str(form.get("items") or "").splitlines() if i.strip()]
+                if not items_:
+                    raise ValueError("Нужен хотя бы один пункт")
+                if any(len(i) > 120 for i in items_):
+                    raise ValueError("Пункт длиннее 120 символов — кнопка не поместится")
+                data["items"] = items_
+        except ValueError as err:
+            return _learn_form(x, str(err))
+        content.save(db, cid, kind, title, body, x["try_today"], x["topic"], data, bool(x["active"]))
+        return RedirectResponse(f"/learn?kind={kind}&msg=" + quote(f"Сохранено: {title}"), status_code=303)
 
     # ------------------------------------------------------------------ продавцы: подключение и увольнение
     def _date(d: str | None) -> str:

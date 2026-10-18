@@ -131,7 +131,7 @@ def training_run(db: DB, cfg: Settings, sender: Sender, today: date) -> None:
     если работали последние 4 недели."""
     week = goals.monday(today)
     since = (today - timedelta(days=cfg.motivation.goal_lookback_days)).isoformat()
-    total = len(lessons.load(cfg)["onboarding"])
+    total = len(lessons.load(cfg, db)["onboarding"])
     for s in db.sellers():
         sid = s["id"]
         if not s["max_user_id"]:

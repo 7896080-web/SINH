@@ -28,8 +28,20 @@ def _path(cfg: Settings) -> Path:
     return p
 
 
-def load(cfg: Settings) -> dict:
-    """{'lessons': [...], 'onboarding': [...]}; файл перечитывается, если владелец его поменял."""
+def load(cfg: Settings, db: DB | None = None) -> dict:
+    """{'lessons': [...], 'onboarding': [...]}.
+
+    С базой — из таблицы content (стартовые тексты из файла + правки владельца в админке «Обучение», только
+    включённые); без базы — прямо из файла (проверка файла в тестах)."""
+    if db is not None:
+        from . import content
+        les = [dict(id=x["id"], topic=x["topic"], title=x["title"], text=x["body"] or "",
+                    try_today=x["try_today"] or "", quiz=x["data"].get("quiz") or [])
+               for x in content.items(db, cfg, "lesson")]
+        onb = sorted((dict(shift=x["data"]["shift"], title=x["title"], text=x["body"] or "",
+                           try_today=x["try_today"] or "") for x in content.items(db, cfg, "onboarding")),
+                     key=lambda x: x["shift"])
+        return {"lessons": les, "onboarding": onb}
     p = _path(cfg)
     if not p.exists():
         return {"lessons": [], "onboarding": []}
@@ -44,8 +56,8 @@ def load(cfg: Settings) -> dict:
     return out
 
 
-def by_id(cfg: Settings, lesson_id: str) -> dict | None:
-    return next((x for x in load(cfg)["lessons"] if x["id"] == lesson_id), None)
+def by_id(cfg: Settings, lesson_id: str, db: DB | None = None) -> dict | None:
+    return next((x for x in load(cfg, db)["lessons"] if x["id"] == lesson_id), None)
 
 
 def sent_ids(db: DB, sid: int) -> set[str]:
@@ -59,7 +71,7 @@ def mark_sent(db: DB, sid: int, lesson_id: str) -> None:
 
 
 def pick(db: DB, cfg: Settings, sid: int, topic: str) -> dict | None:
-    lessons = load(cfg)["lessons"]
+    lessons = load(cfg, db)["lessons"]
     sent = sent_ids(db, sid)
     for t in (topic, "general"):
         for x in lessons:
@@ -68,7 +80,7 @@ def pick(db: DB, cfg: Settings, sid: int, topic: str) -> dict | None:
     ids = {x["id"] for x in lessons if x["topic"] == topic}
     for r in db.q("SELECT lesson_id FROM lessons_sent WHERE seller_id=? ORDER BY sent_at, lesson_id", sid):
         if r["lesson_id"] in ids:
-            return by_id(cfg, r["lesson_id"])
+            return by_id(cfg, r["lesson_id"], db)
     return None
 
 
@@ -92,7 +104,7 @@ def next_onboarding(db: DB, cfg: Settings, sid: int) -> dict | None:
     if n is None:
         return None
     sent = sent_ids(db, sid)
-    for x in load(cfg)["onboarding"]:
+    for x in load(cfg, db)["onboarding"]:
         if x["shift"] <= n + 1 and f"onb-{x['shift']}" not in sent:
             return x
     return None

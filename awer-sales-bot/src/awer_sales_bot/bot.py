@@ -154,7 +154,7 @@ def welcome_newcomer(db: DB, cfg: Settings, client: MaxClient, sid: int, uid: in
     if not x:
         return
     key = f"onb-{x['shift']}"
-    text = lessons.onboarding_text(x, len(lessons.load(cfg)["onboarding"]))
+    text = lessons.onboarding_text(x, len(lessons.load(cfg, db)["onboarding"]))
     time.sleep(0.6)  # MAX: не больше 2 сообщений в секунду в один диалог
     client.send(text, user_id=uid)
     lessons.mark_sent(db, sid, key)

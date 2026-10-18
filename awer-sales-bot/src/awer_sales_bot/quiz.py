@@ -28,7 +28,7 @@ def on_quiz(db: DB, cfg: Settings, sid: int, payload: str) -> tuple[str, list[tu
         qi, oi = int(qi), int(oi)
     except ValueError:
         return "Кнопка устарела", []
-    lesson = lessons.by_id(cfg, lid)
+    lesson = lessons.by_id(cfg, lid, db)
     if not lesson or lid not in lessons.sent_ids(db, sid) or not 0 <= qi < len(lesson["quiz"]):
         return "Кнопка устарела", []
     q = lesson["quiz"][qi]
