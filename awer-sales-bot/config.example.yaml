@@ -39,7 +39,7 @@ onec:
   store_map:                     # склад / касса из 1С → магазин (по части названия, без учёта регистра)
     "ГОРОД": "Город"
     "МСЛ": "МСЛ"
-  exclude_sellers: ["", "Wildberries", "Ozon", "Lamoda"]
+  exclude_sellers: ["Wildberries", "Ozon", "Lamoda"]   # пустого продавца сюда НЕ добавлять: это «(без продавца)», он входит в выторг
   seller_store_suffixes: {" МСЛ": "МСЛ"}
   default_store: "Город"
 
@@ -59,3 +59,16 @@ recommendations:
   lookback_days: 90
   llm: false                     # true — советы переформулирует Claude API (ANTHROPIC_API_KEY)
   llm_model: claude-sonnet-5-5
+
+motivation:                      # мотивация без денег: на ставку не влияет (docs/SPEC.md)
+  records: true                  # личные рекорды и серии в утреннем сообщении
+  weekly_goal: true              # цель недели по самому слабому показателю
+  store_goal: true               # «магазины вместе: X из плана»
+  store_goal_reward: ""          # что получит команда при выполнении плана магазинов (решение владельца); пусто — не пишем
+  coach_sheet: true              # по понедельникам старшим и владельцу — листок для разговоров 1:1
+
+training:
+  lessons_path: content/lessons.yaml   # уроки, квизы, программа новичка (правит владелец)
+  weekly_lesson: true            # урок недели по теме цели недели
+  quizzes: true                  # 2 вопроса с кнопками после урока (нужны входящие события MAX)
+  onboarding_shifts: 10          # новичок — первые N смен: уроки программы новичка вместо урока недели

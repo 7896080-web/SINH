@@ -8,7 +8,7 @@ from . import metrics as M
 from .config import Settings
 from .db import DB
 from .planning.engine import threshold_amounts
-from .planning.service import month_params, status
+from .planning.service import days_in, month_params, status
 from .recommendations import advise
 
 MONTHS = ["", "январь", "февраль", "март", "апрель", "май", "июнь", "июль", "август", "сентябрь", "октябрь",
@@ -71,6 +71,7 @@ def daily(db: DB, cfg: Settings, sid: int, day: date) -> str:
                      f"ставка по итогам месяца при таком темпе {rub(st.projected_rate)}")
     else:
         L.append("План на месяц ещё не рассчитан — уточните у администратора.")
+    L += store_goal(db, cfg, day)
     gl = goals.lines(db, sid, day)
     if gl:
         L += [""] + gl
@@ -95,6 +96,24 @@ def daily(db: DB, cfg: Settings, sid: int, day: date) -> str:
     if tips:
         L += ["", "💡 " + "\n💡 ".join(tips)]
     return "\n".join(L)
+
+
+def store_goal(db: DB, cfg: Settings, day: date) -> list[str]:
+    """Общая цель: продажи обоих магазинов с начала месяца против зафиксированного плана магазина."""
+    if not cfg.motivation.store_goal:
+        return []
+    month = day.strftime("%Y-%m")
+    plan = db.one("SELECT MAX(store_plan) p FROM plans WHERE month=?", month)["p"]
+    if not plan:
+        return []
+    sales = db.one("SELECT COALESCE(SUM(amount),0) s FROM sales_lines WHERE substr(day,1,7)=? AND day<=?",
+                   month, day.isoformat())["s"]
+    n = days_in(month)
+    L = [f"Магазины вместе: {rub(sales)} из {rub(plan)} — {pct(sales / plan)} плана, "
+         f"прошло {day.day} из {n} {'дня' if n % 10 == 1 else 'дней'}"]
+    if cfg.motivation.store_goal_reward:
+        L.append(f"Если магазины выполнят план: {cfg.motivation.store_goal_reward}")
+    return L
 
 
 def month_start(db: DB, cfg: Settings, sid: int, month: str) -> str:
@@ -131,7 +150,8 @@ def owner_summary(db: DB, cfg: Settings, day: date) -> str:
     tot = M.store(db, day.replace(day=1), day)
     allm = M.team(db, day.replace(day=1), day, exclude_admins=False)
     L = [f"**Сводка на {day:%d.%m.%Y}**",
-         f"С начала месяца: {rub(allm.sales)} · средний чек {rub(tot.avg_check)} · вещей в чеке {d1(tot.upt)}", ""]
+         f"С начала месяца: {rub(allm.sales)} · средний чек {rub(tot.avg_check)} · вещей в чеке {d1(tot.upt)}",
+         *store_goal(db, cfg, day)[:1], ""]
     for name, st, m in sorted(rows, key=lambda x: -(x[1].performance or 0)):
         q = (f"чек {rub(m.avg_check)} · {d1(m.upt)} вещ./чек" if m.has_receipts
              else f"{d1(m.items_per_shift)} вещ./смену · цена вещи {rub(m.avg_price)}")

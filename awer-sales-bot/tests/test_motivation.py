@@ -108,3 +108,21 @@ def test_owner_praise(env, tmp_path):  # noqa: F811
     assert any("цель недели «вещей за смену 2,5» выполнена" in w
                for _, _, why in achievements.praise(db, cfg, oct_day(11)) for w in why)
     assert goals.monday(oct_day(11)).isoformat() == "2026-10-05"
+
+
+def test_store_goal_and_example_config_keeps_no_seller(env, tmp_path):  # noqa: F811
+    from awer_sales_bot import config
+    from awer_sales_bot.messages import store_goal
+    cfg, db = env
+    assert store_goal(db, cfg, oct_day(10)) == []  # план не зафиксирован — молчим
+    mp = service.freeze(db, cfg, "2026-10")
+    rows = [(oct_day(1), "Продавец04", 1_000_000, 50), (oct_day(2), "", 121_090, 5)]
+    import_file(write_sales(tmp_path / "s.csv", rows), db, cfg)
+    line = store_goal(db, cfg, oct_day(10))[0]
+    assert line.startswith("Магазины вместе: 1 121 090 ₽ из 5 605 452 ₽ — 20% плана, прошло 10 из 31 дня")
+    assert mp.store.plan == pytest.approx(5_605_452, abs=1)
+    cfg.motivation.store_goal_reward = "общий ужин команды"
+    assert store_goal(db, cfg, oct_day(10))[1] == "Если магазины выполнят план: общий ужин команды"
+
+    ex = config.load(Path(__file__).parents[1] / "config.example.yaml")
+    assert "" not in ex.onec.exclude_sellers and ex.motivation.records and ex.training.onboarding_shifts == 10
