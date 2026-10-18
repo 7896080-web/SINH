@@ -84,6 +84,10 @@ def daily_run(db: DB, cfg: Settings, sender: Sender, today: date | None = None, 
                          ", ".join(f"{r['name']} — {messages.rub(r['a'])}" for r in gone) +
                          ". Проверьте продавца в документах 1С, иначе эти продажи не попадут в план работающего.",
                          once=True)
+    month = today.strftime("%Y-%m")
+    if not db.one("SELECT 1 FROM schedule WHERE substr(day,1,7)=?", month):
+        sender.to_owners(month, "no_schedule", f"График смен на {month} не заполнен — бот считает «до базы» по норме "
+                                               f"{cfg.norm_shifts} смен. Заполните: админка → «График смен».", once=True)
     missing = db.day_closed(day, cfg.stores)
     deadline = datetime.combine(today, datetime.strptime(cfg.schedule.deadline_time, "%H:%M").time())
     if missing and not force and datetime.now() < deadline:

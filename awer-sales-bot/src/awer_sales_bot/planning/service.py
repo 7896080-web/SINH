@@ -155,10 +155,10 @@ class Status:
     month: str
     day: date
     plan_full: float | None  # личный план на полный месяц
-    planned_shifts: int  # смен в месяце по графику (или норма)
+    planned_shifts: int  # смен в месяце: отработанные + по графику впереди (без графика — не меньше нормы)
     worked: int  # отработано смен до дня включительно
     sales: float  # продажи с начала месяца
-    plan_month: float | None  # план на свои смены = план × смены / норма
+    plan_month: float | None  # план на свои смены = план × смены месяца / норма (SPEC «Ежедневное сообщение»)
     to_base: float | None  # осталось до 100 %
     next_level: float | None  # следующая ступень, доля (1.1 ...)
     to_next: float | None  # осталось до следующей ступени
@@ -180,8 +180,10 @@ def status(db: DB, cfg: Settings, sid: int, day: date) -> Status:
     if plan is None:  # план ещё не зафиксирован — считаем на лету
         row = next((r for r in compute(db, cfg, month).rows if r.seller_id == sid), None)
         plan = row.plan_final if row else None
-    planned = db.planned_shifts(sid, month) or cfg.norm_shifts
     worked = db.worked_shifts(sid, month, upto=day)
+    ahead = db.scheduled_after(sid, month, day)
+    # отработанные + смены по графику впереди: к концу месяца «% плана месяца» = выполнению для ставки
+    planned = worked + ahead if ahead is not None else max(cfg.norm_shifts, worked)
     sales = db.one("SELECT COALESCE(SUM(amount),0) s FROM sales_lines WHERE seller_id=? AND substr(day,1,7)=? AND day<=?",
                    sid, month, day.isoformat())["s"]
     remaining = max(0, planned - worked)

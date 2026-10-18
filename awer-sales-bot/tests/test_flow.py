@@ -93,7 +93,7 @@ def test_flow(env, tmp_path):
 
     sid = db.seller_id("Продавец04", create=False)
     st = service.status(db, cfg, sid, date(2026, 10, 17))
-    assert st.worked == 17 and st.planned_shifts == 15
+    assert st.worked == 17 and st.planned_shifts == 18  # графика нет — норма 18 смен
     assert st.plan_month == pytest.approx(plan04, abs=1)
     text = daily(db, cfg, sid, date(2026, 10, 17))
     assert "Базовый план" in text and "Средний чек" in text and "Вещей в чеке" in text

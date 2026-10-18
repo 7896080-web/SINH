@@ -329,6 +329,26 @@ class DB:
             args.append(upto.isoformat())
         return self.one(sql, *args)["n"]
 
+    def scheduled_after(self, sid: int, month: str, day: date) -> int | None:
+        """Смен по графику после `day` до конца месяца; None — графика на этот месяц у продавца нет."""
+        r = self.one("SELECT COUNT(*) n, SUM(day>?) ahead FROM schedule WHERE seller_id=? AND substr(day,1,7)=?",
+                     day.isoformat(), sid, month)
+        return int(r["ahead"] or 0) if r["n"] else None
+
+    def schedule_days(self, month: str) -> dict[int, set[int]]:
+        """{seller_id: {числа месяца по графику}}."""
+        out: dict[int, set[int]] = {}
+        for r in self.q("SELECT seller_id, day FROM schedule WHERE substr(day,1,7)=?", month):
+            out.setdefault(r["seller_id"], set()).add(int(r["day"][8:10]))
+        return out
+
+    def set_schedule(self, month: str, sid: int, days: set[int]) -> None:
+        y, m = map(int, month.split("-"))
+        with self.tx() as c:
+            c.execute("DELETE FROM schedule WHERE seller_id=? AND substr(day,1,7)=?", (sid, month))
+            c.executemany("INSERT INTO schedule(day, seller_id) VALUES(?,?)",
+                          [(date(y, m, d).isoformat(), sid) for d in sorted(days)])
+
     def planned_shifts(self, sid: int, month: str) -> int | None:
         n = self.one("SELECT COUNT(*) n FROM schedule WHERE seller_id=? AND substr(day,1,7)=?", sid, month)["n"]
         return n or None

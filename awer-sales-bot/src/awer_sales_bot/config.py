@@ -114,7 +114,7 @@ class Settings(BaseModel):
     db_path: Path = Path("data/awer.db")
     timezone: str = "Europe/Moscow"
     stores: list[str] = ["Город", "МСЛ"]  # день закрыт, когда есть выгрузка по всем
-    norm_shifts: int = 15  # смен в полном месяце (для пересчёта на полный месяц)
+    norm_shifts: int = 18  # смен в полном месяце (решение владельца 18.10.2026); график — админка «График смен»
     params: Params = Params()
     onec: OneC = OneC()
     schedule: Schedule = Schedule()

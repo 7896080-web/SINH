@@ -41,6 +41,8 @@ input[type=text],input[type=number]{width:110px;padding:3px;background:#fffbe6;b
 .btn{padding:6px 14px;margin:6px 6px 6px 0;cursor:pointer}nav a{margin-right:14px}
 .note{color:#57606a;font-size:12px}
 .qr svg{width:260px;height:260px}.code{font-size:22px;letter-spacing:3px}
+table.grid td,table.grid th{padding:2px 3px;text-align:center}table.grid td.nm{text-align:left;white-space:nowrap}
+table.grid th.we,table.grid td.we{background:#f6f8fa}.off{color:#9a3412;font-weight:bold}
 """
 
 
@@ -68,7 +70,7 @@ def create_app(cfg: Settings, db: DB) -> FastAPI:
     def page(title: str, body: str) -> HTMLResponse:
         cur = date.today().strftime("%Y-%m")
         nav = (f'<nav><a href="/month/{cur}">Настройки месяца</a><a href="/sellers">Продавцы</a>'
-               f'<a href="/month/{cur}/results">Итоги и ведомость</a></nav>')
+               f'<a href="/schedule/{cur}">График смен</a><a href="/month/{cur}/results">Итоги и ведомость</a></nav>')
         return HTMLResponse(f"<!doctype html><html lang=ru><head><meta charset=utf-8><title>{title}</title>"
                             f"<style>{CSS}</style></head><body>{nav}<h1>{title}</h1>{body}</body></html>")
 
@@ -221,6 +223,55 @@ def create_app(cfg: Settings, db: DB) -> FastAPI:
         archive.mkdir(parents=True, exist_ok=True)
         path.replace(archive / name)
         return {"lines": rep.lines, "days": rep.days, "unknown_sellers": sorted(rep.unknown_sellers)}
+
+    # ------------------------------------------------------------------ график смен
+    @app.get("/schedule/{month}", dependencies=[Depends(auth)])
+    def schedule(month: str, msg: str = ""):
+        y, mo = map(int, month.split("-"))
+        n = service.days_in(month)
+        days = db.schedule_days(month)
+        norm = cfg.norm_shifts
+        wd = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
+        head = "".join(f'<th class="{"we" if date(y, mo, d).weekday() >= 5 else ""}">{d}<br>'
+                       f'{wd[date(y, mo, d).weekday()]}</th>' for d in range(1, n + 1))
+        b = [f'<p><a href="/schedule/{month_add(month, -1)}">← {month_add(month, -1)}</a> · '
+             f'<a href="/schedule/{month_add(month, 1)}">{month_add(month, 1)} →</a></p>',
+             f'<p class=note>{html.escape(msg)}</p>' if msg else "",
+             f'<p class=note>Норма — {norm} смен в месяц. Отработанной считается смена, в которую у продавца есть продажи '
+             'в 1С: если кто-то вышел на замену, бот учтёт это сам. График нужен, чтобы знать смены впереди — от них '
+             'считается «до базы» в утреннем сообщении.</p>',
+             f'<form method=post action="/schedule/{month}"><table class=grid>'
+             f'<tr><th>Продавец</th>{head}<th>Смен</th><th>Заполнить по схеме</th></tr>']
+        for s in db.sellers():
+            sid, mine = s["id"], days.get(s["id"], set())
+            cells = "".join(f'<td class="{"we" if date(y, mo, d).weekday() >= 5 else ""}"><input type=checkbox '
+                            f'name="s{sid}_{d}" data-s="{sid}" data-d="{d}" {"checked" if d in mine else ""}></td>'
+                            for d in range(1, n + 1))
+            fill = (f'<select id="p{sid}"><option value="3,2">3/2</option><option value="2,2">2/2</option>'
+                    f'<option value="5,2">5/2</option></select> с <input type=number id="k{sid}" value=1 min=1 max=7 '
+                    f'style="width:42px">-го <button type=button class=btn onclick="fill({sid})">Заполнить</button>'
+                    f'<button type=button class=btn onclick="fill({sid},true)">Очистить</button>')
+            b.append(f'<tr><td class=nm>{html.escape(s["name"])}</td>{cells}'
+                     f'<td id="c{sid}" class="{"" if len(mine) == norm else "off"}">{len(mine)}</td>'
+                     f'<td class=nm>{fill}</td></tr>')
+        b.append(f'</table><button class=btn>Сохранить график</button></form>'
+                 f'<script>const N={n},NORM={norm};'
+                 'function cnt(s){const c=[...document.querySelectorAll(`input[data-s="${s}"]`)].filter(x=>x.checked).length;'
+                 'const e=document.getElementById("c"+s);e.textContent=c;e.className=c===NORM?"":"off";}'
+                 'function fill(s,clear){const [on,off]=document.getElementById("p"+s).value.split(",").map(Number);'
+                 'const k=+document.getElementById("k"+s).value||1;'
+                 'document.querySelectorAll(`input[data-s="${s}"]`).forEach(x=>{const d=+x.dataset.d;'
+                 'x.checked=!clear&&d>=k&&((d-k)%(on+off))<on;});cnt(s);}'
+                 'document.addEventListener("change",e=>{if(e.target.dataset.s)cnt(e.target.dataset.s);});</script>')
+        return page(f"График смен {month}", "".join(b))
+
+    @app.post("/schedule/{month}", dependencies=[Depends(auth)])
+    async def schedule_save(month: str, request: Request):
+        form = await request.form()
+        n = service.days_in(month)
+        for s in db.sellers():
+            db.set_schedule(month, s["id"], {d for d in range(1, n + 1) if form.get(f"s{s['id']}_{d}")})
+        return RedirectResponse(f"/schedule/{month}?msg=" + quote("График сохранён"), status_code=303)
 
     # ------------------------------------------------------------------ продавцы: подключение и увольнение
     def _date(d: str | None) -> str:
