@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
+from . import achievements
 from . import metrics as M
 from .config import Settings
 from .db import DB
@@ -49,6 +50,7 @@ def daily(db: DB, cfg: Settings, sid: int, day: date) -> str:
                 L.append(f"Магазины вчера: средний чек {rub(shop.avg_check)} · вещей в чеке {d1(shop.upt)}")
     else:
         L.append("**Вчера:** продаж нет (выходной?)")
+    L += [f"🏅 {a.text}" for a in achievements.for_day(db, cfg, sid, day, st.plan_full)]
     L.append("")
     if st.plan_month:
         L += [f"**{MONTHS[day.month].capitalize()}**, смен {st.worked} из {st.planned_shifts}:",

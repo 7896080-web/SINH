@@ -143,6 +143,33 @@ CREATE TABLE IF NOT EXISTS plan_overrides (     -- ручной личный п�
     PRIMARY KEY (month, seller_id)
 );
 CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS weekly_goals (       -- цель недели продавца (понедельник–воскресенье), goals.py
+    week TEXT NOT NULL,                   -- понедельник, YYYY-MM-DD
+    seller_id INTEGER NOT NULL REFERENCES sellers(id),
+    metric TEXT NOT NULL,                 -- upt | items_per_shift | avg_price | discount_share
+    baseline REAL,                        -- у продавца за 4 недели до цели
+    team REAL,                            -- у команды за те же 4 недели
+    target REAL NOT NULL,
+    result REAL,                          -- за неделю цели (после её окончания)
+    done INTEGER,                         -- 1 выполнена, 0 нет, NULL — не работал на неделе
+    closed_at TEXT,
+    PRIMARY KEY (week, seller_id)
+);
+CREATE TABLE IF NOT EXISTS lessons_sent (       -- какие уроки и когда ушли продавцу, lessons.py
+    seller_id INTEGER NOT NULL REFERENCES sellers(id),
+    lesson_id TEXT NOT NULL,              -- id из content/lessons.yaml; программа новичка — onb-<смена>
+    sent_at TEXT NOT NULL,
+    PRIMARY KEY (seller_id, lesson_id)
+);
+CREATE TABLE IF NOT EXISTS quiz_answers (       -- ответы на квизы после уроков
+    seller_id INTEGER NOT NULL REFERENCES sellers(id),
+    lesson_id TEXT NOT NULL,
+    q INTEGER NOT NULL,                   -- номер вопроса с 0
+    answer INTEGER NOT NULL,
+    correct INTEGER NOT NULL,
+    answered_at TEXT NOT NULL,
+    PRIMARY KEY (seller_id, lesson_id, q)
+);
 """
 
 

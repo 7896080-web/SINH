@@ -91,6 +91,26 @@ class Recs(BaseModel):
     llm_model: str = "claude-sonnet-5-5"
 
 
+class Motivation(BaseModel):
+    """Мотивация без денег: ставка зависит только от плана по выручке (docs/SPEC.md)."""
+
+    records: bool = True  # личные рекорды и серии в утреннем сообщении
+    record_min_shifts: int = 10  # «рекорд за всё время» — когда в истории бота уже столько смен продавца
+    streak_min: int = 3  # серия смен выше нормы показывается с этой длины
+    weekly_goal: bool = True  # цель недели по самому слабому показателю
+    goal_lookback_days: int = 28  # окно для выбора цели недели
+    store_goal: bool = True  # «магазины вместе: X из плана»
+    store_goal_reward: str = ""  # что получит команда при выполнении плана магазина (решение владельца); пусто — не пишем
+    coach_sheet: bool = True  # по понедельникам старшим и владельцу — листок для разговоров 1:1
+
+
+class Training(BaseModel):
+    lessons_path: Path = Path("content/lessons.yaml")  # уроки, квизы, программа новичка
+    weekly_lesson: bool = True  # урок недели по теме цели недели
+    quizzes: bool = True  # 2 вопроса с кнопками после урока (нужны входящие события MAX)
+    onboarding_shifts: int = 10  # новичок — первые N смен: вместо урока недели уроки программы новичка
+
+
 class Settings(BaseModel):
     db_path: Path = Path("data/awer.db")
     timezone: str = "Europe/Moscow"
@@ -101,6 +121,8 @@ class Settings(BaseModel):
     schedule: Schedule = Schedule()
     max: MaxCfg = MaxCfg()
     recommendations: Recs = Recs()
+    motivation: Motivation = Motivation()
+    training: Training = Training()
 
     # секреты — только из окружения
     @property
