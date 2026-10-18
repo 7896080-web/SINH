@@ -211,6 +211,8 @@ def test_arrivals_pairing(env, tmp_path):  # noqa: F811
         "Дата;Склад;Документ;Номенклатура;Номенклатурная группа;Характеристика;Поступило\n"
         "10.10.2026;ГОРОД_склад;П1;Джинсы слим;Джинсы;32;6", encoding="utf-8")
     import_file(tmp_path / "arrivals_1.csv", db, cfg)
+    assert pairing(db, cfg, oct_day(10), ["Джинсы"]) == []  # джинсы идут с ремнём в комплекте — не советуем
+    cfg.recommendations.included = {}
     assert pairing(db, cfg, oct_day(10), ["Джинсы"]) == ["С чем предлагать: к «Джинсы» чаще берут «Ремень» (75%)"]
     assert "С чем предлагать: к «Джинсы»" in daily(db, cfg, sid, oct_day(10))
 
@@ -408,6 +410,9 @@ def test_tips_name_only_categories_in_stock(env, tmp_path):  # noqa: F811
         "Дата;Склад;Номенклатура;Номенклатурная группа;Характеристика;Остаток\n"
         "06.10.2026;ГОРОД_склад;Джинсы слим;Джинсы;32;5\n06.10.2026;ГОРОД_склад;Ремень кожа;Ремень;U;7\n", encoding="utf-8")
     import_file(tmp_path / "stock_1.csv", db, cfg)
+    tips = " ".join(t for _, t in R.rules(db, cfg, sid, st, oct_day(6)))
+    assert "Галстук" not in tips and "«Джинсы» + «Ремень»" not in tips  # ремень идёт с джинсами в комплекте
+    cfg.recommendations.included = {}
     tips = " ".join(t for _, t in R.rules(db, cfg, sid, st, oct_day(6)))
     assert "«Ремень»" in tips and "Галстук" not in tips
     assert "«Джинсы» + «Ремень»" in tips

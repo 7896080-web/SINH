@@ -9,7 +9,7 @@ from .config import Settings
 from .db import DB
 from .planning.engine import threshold_amounts
 from .planning.service import days_in, month_params, status
-from .recommendations import advise
+from .recommendations import advise, pairs_from_1c
 
 MONTHS = ["", "январь", "февраль", "март", "апрель", "май", "июнь", "июль", "август", "сентябрь", "октябрь",
           "ноябрь", "декабрь"]
@@ -101,7 +101,7 @@ def daily(db: DB, cfg: Settings, sid: int, day: date) -> str:
 def pairing(db: DB, cfg: Settings, day: date, categories: list[str], top: int = 2) -> list[str]:
     """«С чем предлагать» новинки: что покупатели чаще всего берут вместе с этой категорией (чеки или
     покупки по дисконтной карте за recommendations.lookback_days). Только связки от 15 %."""
-    pairs = M.cross_sell(db, day - timedelta(days=cfg.recommendations.lookback_days), day)
+    pairs = pairs_from_1c(db, cfg, day)  # без того, что идёт в комплекте (джинсы + ремень)
     tips = []
     for c in categories[:top]:
         with_c = [(b, sh) for b, sh in pairs.get(c, []) if sh >= 0.15][:2]

@@ -15,6 +15,20 @@ from .planning.service import Status
 PAIR_MIN = 0.15  # связка «покупают вместе» — от этой доли корзин
 
 
+def in_kit(cfg: Settings, a: str, b: str) -> bool:
+    """Связка «a + b» уже идёт в комплекте (recommendations.included) — советовать её не нужно."""
+    inc = cfg.recommendations.included
+    return any((x.startswith(k) and any(y.startswith(v) for v in vs))
+               for k, vs in inc.items() for x, y in ((a, b), (b, a)))
+
+
+def pairs_from_1c(db: DB, cfg: Settings, day: date) -> dict[str, list[tuple[str, float]]]:
+    """«Что покупают вместе» из 1С за recommendations.lookback_days — без связок, которые идут в комплекте."""
+    raw = M.cross_sell(db, day - timedelta(days=cfg.recommendations.lookback_days), day)
+    out = {a: [(b, sh) for b, sh in v if not in_kit(cfg, a, b)] for a, v in raw.items()}
+    return {a: v for a, v in out.items() if v}
+
+
 def in_stock(stock: dict[str, tuple[int, float]], c: str) -> bool:
     return stock.get(c, (0, 0))[1] > 0
 
@@ -22,7 +36,7 @@ def in_stock(stock: dict[str, tuple[int, float]], c: str) -> bool:
 def companions(db: DB, cfg: Settings, day: date) -> set[str]:
     """Категории-«дополнения» из 1С: то, что покупатели берут вместе с другой вещью (чеки или покупки по карте).
     Пока таких данных нет — запасной список recommendations.add_ons из config.yaml."""
-    pairs = M.cross_sell(db, day - timedelta(days=cfg.recommendations.lookback_days), day)
+    pairs = pairs_from_1c(db, cfg, day)
     found = {b for v in pairs.values() for b, sh in v if sh >= PAIR_MIN}
     return found or set(cfg.recommendations.add_ons)
 
@@ -30,7 +44,7 @@ def companions(db: DB, cfg: Settings, day: date) -> set[str]:
 def best_pair(db: DB, cfg: Settings, day: date, stock: dict) -> tuple[str, str] | None:
     """Самая частая связка категорий, где обе есть на остатке магазина; первой — та, что продаётся чаще."""
     start = day - timedelta(days=cfg.recommendations.lookback_days)
-    pairs = M.cross_sell(db, start, day)
+    pairs = pairs_from_1c(db, cfg, day)
     cands = [(sh, a, b) for a, v in pairs.items() for b, sh in v
              if sh >= PAIR_MIN and in_stock(stock, a) and in_stock(stock, b)]
     if not cands:
