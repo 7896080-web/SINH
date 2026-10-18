@@ -1,0 +1,13 @@
+.env
+config.yaml
+data/*.db
+data/*.db-*
+data/inbox/*
+data/archive/*
+!data/inbox/.gitkeep
+!data/archive/.gitkeep
+__pycache__/
+*.egg-info/
+.venv/
+.pytest_cache/
+*.epf
