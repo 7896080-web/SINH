@@ -102,6 +102,17 @@ def _test_file(raw: str) -> Path:
 
 
 @pytest.fixture(autouse=True)
+def _no_wb_tariffs_network(monkeypatch):
+    """Суточное задание спрашивает тарифы WB по сети. В тестах — никогда:
+    кто проверяет загрузку, подставляет свой `fetch_wb`."""
+    from finapp.finance import tariffs
+
+    def offline(token, session=None):
+        raise tariffs.TariffError("сеть в тестах выключена")
+    monkeypatch.setattr(tariffs, "fetch_wb", offline)
+
+
+@pytest.fixture(autouse=True)
 def _no_sync_db():
     """По умолчанию базы sync_admin нет; фикстура `sync_db` её заводит."""
     path = _test_file(config.SYNC_DB_PATH)

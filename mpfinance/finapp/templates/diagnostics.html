@@ -27,6 +27,10 @@
         <button type="submit" class="btn">Обновить справочник из Sync Admin</button>
         <span class="help-text">{% if sync_catalog_at %}последний раз {{ sync_catalog_at|local('%d.%m.%Y %H:%M') }}{% else %}ещё не загружался{% endif %}; пока обмен с 1С выключен — сам раз в сутки</span>
     </form>
+    <form method="post" action="/diagnostics/wb-tariffs" class="inline-form" style="margin-top:8px;">
+        <button type="submit" class="btn">Обновить тарифы WB</button>
+        <span class="help-text">текущая комиссия WB по категориям (FBS и FBO); сама — раз в сутки</span>
+    </form>
 </div>
 
 {% if onec_enabled %}
@@ -56,6 +60,7 @@
             <tr><td>База Sync Admin (мэппинг, заказы)</td><td>{{ sync_status }}</td></tr>
             <tr><td>База AWER CRM (продажи сайта)</td><td>{{ crm_status }}</td></tr>
             <tr><td>Артикулы Lamoda → EAN (партнёрский отчёт)</td><td>{{ lamoda_catalog_status }}</td></tr>
+            <tr><td>Тарифы WB (комиссия по категориям)</td><td>{{ tariffs_status }}</td></tr>
             {% for name, path in dirs.items() %}<tr><td>{{ name }}</td><td class="mono">{{ path }}</td></tr>{% endfor %}
         </tbody>
     </table>
@@ -68,6 +73,7 @@
             <tr><td>База Sync Admin (мэппинг, заказы, справочник)</td><td>{{ sync_status }}</td></tr>
             <tr><td>База AWER CRM (продажи сайта)</td><td>{{ crm_status }}</td></tr>
             <tr><td>Артикулы Lamoda → EAN (партнёрский отчёт)</td><td>{{ lamoda_catalog_status }}</td></tr>
+            <tr><td>Тарифы WB (комиссия по категориям)</td><td>{{ tariffs_status }}</td></tr>
         </tbody>
     </table>
 </div>

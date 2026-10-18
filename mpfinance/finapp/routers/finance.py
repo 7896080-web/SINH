@@ -16,7 +16,7 @@ from finapp.audit import log_action
 from finapp.database import get_db
 from finapp.deps import get_current_user
 from finapp.excel_utils import ExcelReadError, build_xlsx_response, read_upload, read_xlsx_rows
-from finapp.finance import charts, fetch, lamoda, repeats, statements, values as v
+from finapp.finance import charts, fetch, lamoda, repeats, statements, tariffs, values as v
 from finapp.finance.economics import (Filters, Totals, load_lines, platform_summary, trend,
                                    unit_economics)
 from finapp.finance.formats import FORMATS
@@ -461,6 +461,7 @@ def unit_economics_page(
     settings = load_settings(db)
     rows, unassigned, total, allocated = unit_economics(
         db, Filters(d_from, d_to, platform or None, account), settings, group_by, allocate)
+    tariffs.annotate(db, rows)
     return templates.TemplateResponse(request, "finance_unit_economics.html", _ctx(
         request, user, "finance-ue",
         rows=rows, unassigned=unassigned, total=total, allocated=allocated, allocate=allocate,
@@ -483,28 +484,35 @@ def unit_economics_export(
     settings = load_settings(db)
     rows, unassigned, total, _ = unit_economics(
         db, Filters(d_from, d_to, platform or None, account), settings, group_by, allocate)
+    tariffs.annotate(db, rows)
 
     headers = ["Артикул", "Наименование", "Размер", "Цвет", "ID_1С", "Площадки", "Продано, шт",
                "Возвраты, шт", "Чистые продажи, шт", "Выручка", "Комиссия площадки", "Логистика",
                "Хранение", "Штрафы, приёмка, удержания − компенсации", "К перечислению",
                "Себестоимость", "Доп. расходы", "Налог УСН", "НДС (невозвратный)", "Прибыль",
                "Маржинальность, %", "ROI, %",
-               "Прибыль на единицу", "Продано без себестоимости, шт", "Нет в 1С"]
+               "Прибыль на единицу", "Продано без себестоимости, шт", "Нет в 1С",
+               "Предмет WB", "Удержано WB с продаж, %", "Комиссия WB FBS сейчас, %",
+               "Комиссия WB FBO сейчас, %", "Комиссия WB FBS до смены, %"]
 
     def pct(value):
         return round(value * 100, 2) if value is not None else None
 
-    def line(title, article, size, color, uid, platforms_text, t, matched):
+    def line(title, article, size, color, uid, platforms_text, t, matched, group=None):
+        tariff = group.tariff if group is not None else None
+        wb = ([group.wb_subject or None, group.wb_commission_pct,
+               tariff.fbs if tariff else None, tariff.fbo if tariff else None,
+               tariff.prev_fbs if tariff else None] if group is not None else [None] * 5)
         return [article, title, size, color, uid or "", platforms_text, t.sold_qty, t.returned_qty,
                 t.net_qty, v.kop_to_rub(t.revenue), v.kop_to_rub(t.commission),
                 v.kop_to_rub(t.logistics), v.kop_to_rub(t.storage), v.kop_to_rub(t.other_costs),
                 v.kop_to_rub(t.total_payout), v.kop_to_rub(t.cogs), v.kop_to_rub(t.extra),
                 v.kop_to_rub(t.tax), v.kop_to_rub(t.vat), v.kop_to_rub(t.profit), pct(t.margin), pct(t.roi),
-                v.kop_to_rub(t.profit_per_unit), t.cost_missing_qty, "" if matched else "да"]
+                v.kop_to_rub(t.profit_per_unit), t.cost_missing_qty, "" if matched else "да"] + wb
 
     data = [line(g.title, g.article, g.size, g.color, g.uid_1c,
                  ", ".join(v.PLATFORM_LABELS.get(p, p) for p in sorted(g.platforms)),
-                 g.totals, g.matched) for g in rows]
+                 g.totals, g.matched, g) for g in rows]
     data.append(line("Расходы площадок, не привязанные к товару", "", "", "", None, "",
                      unassigned, True))
     data.append(line("ИТОГО", "", "", "", None, "", total, True))

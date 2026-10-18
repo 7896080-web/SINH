@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.orm import Session
 
-from finapp.finance import fetch, lamoda
+from finapp.finance import fetch, lamoda, tariffs
 from finapp.excel_utils import ExcelReadError, read_upload
 from finapp import backup, catalog, config, onec, progress, settings, syncdb
 from finapp.finance.sources import crm as crm_source
@@ -49,6 +49,7 @@ def page(request: Request, db: Session = Depends(get_db), user: User = Depends(g
         "sync_status": syncdb.status_text(),
         "crm_status": crm_source.status_text(),
         "lamoda_catalog_status": lamoda.catalog_status(db),
+        "tariffs_status": tariffs.status_text(db),
         "freshness": fetch.account_freshness(db),
         "remote": settings.get(db, settings.BACKUP_REMOTE, ""),
         "remote_result": settings.get(db, settings.BACKUP_REMOTE_RESULT, ""),
@@ -169,6 +170,17 @@ def onec_switch(request: Request, enabled: str = Form("0"), db: Session = Depend
         message += (f" Неотправленные задания и отчёты ({returned}) сняты с очереди — после включения "
                     f"отправьте их заново.")
     set_flash(request, message, "good")
+    return _back()
+
+
+@router.post("/diagnostics/wb-tariffs")
+def wb_tariffs(request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Тарифы WB по категориям — сейчас, не дожидаясь суточного задания."""
+    result = tariffs.refresh(db)
+    log_action(db, user.username, "wb_tariffs", result)
+    db.commit()
+    ok = not result.startswith("не загружены")
+    set_flash(request, f"Тарифы WB: {result}.", "good" if ok else "warn")
     return _back()
 
 

@@ -82,6 +82,14 @@ def job_daily() -> None:
         except Exception:                        # noqa: BLE001 — не мешаем остальному суточному
             db.rollback()
             logger.exception("пересопоставление отчётов упало")
+        # Раз в сутки: текущая комиссия WB по предметам (`finance/tariffs.py`).
+        # Итог, и неудачный тоже, пишется в настройку — его показывает «Диагностика».
+        try:
+            from finapp.finance import tariffs
+            tariffs.refresh_if_due(db)
+        except Exception:                        # noqa: BLE001 — не мешаем остальному суточному
+            db.rollback()
+            logger.exception("загрузка тарифов WB упала")
         if not onec.enabled(db):
             if _older_than(settings.get(db, settings.SYNC_CATALOG_AT), DAILY):
                 try:

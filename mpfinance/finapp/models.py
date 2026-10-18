@@ -125,6 +125,35 @@ class LamodaArticle(Base):
     updated_at = Column(DateTime, default=now_utc, onupdate=now_utc)
 
 
+class CategoryTariff(Base):
+    """Текущая комиссия площадки по категории (`finance/tariffs.py`). У WB —
+    `GET common-api…/api/v1/tariffs/commission` по предметам, тем же запросом, что
+    в «Репрайсере»: FBS — `kgvpMarketplace` (модель «Маркетплейс»), FBO —
+    `paidStorageKgvp` («Склад WB»). Проценты — в сотых долях (25,5% → 2550): без
+    float. Прежний тариф FBS хранится, чтобы показать, что он сменился."""
+    __tablename__ = "category_tariffs"
+
+    platform = Column(String(16), primary_key=True)
+    category_id = Column(String(64), primary_key=True)
+    category_name = Column(String(200), nullable=False, default="", index=True)
+    parent_name = Column(String(200), nullable=True)
+    fbs_bp = Column(Integer, nullable=True)
+    fbo_bp = Column(Integer, nullable=True)
+    prev_fbs_bp = Column(Integer, nullable=True)
+    changed_at = Column(DateTime, nullable=True)      # когда FBS сменился в последний раз
+    loaded_at = Column(DateTime, default=now_utc)
+
+
+class WbCard(Base):
+    """Артикул WB (nmID) → предмет: из детализации отчётов WB («Предмет»,
+    `subjectName`). По предмету карточка находит свой тариф в `CategoryTariff`."""
+    __tablename__ = "wb_cards"
+
+    nm_id = Column(String(32), primary_key=True)
+    subject_name = Column(String(200), nullable=False)
+    seen_at = Column(DateTime, default=now_utc)
+
+
 class OnecTaskStatus(str, enum.Enum):
     pending = "pending"     # ждёт файла заданий
     sent = "sent"           # строка в task_fin_*.txt, ждём result_fin_*.txt

@@ -25,6 +25,10 @@ SYNC_CATALOG_AT = "sync_catalog_loaded_at"
 BACKUP_REMOTE = "backup_remote"
 BACKUP_REMOTE_RESULT = "backup_remote_result"
 BACKUP_REMOTE_OK_AT = "backup_remote_ok_at"
+# Тарифы WB по категориям (`finance/tariffs.py`): итог последней загрузки и время
+# последней УДАЧНОЙ — суточное задание по нему решает, пора ли спрашивать снова.
+TARIFFS_RESULT = "wb_tariffs_result"
+TARIFFS_OK_AT = "wb_tariffs_ok_at"
 
 
 def get(db: Session, key: str, default: str = "") -> str:

@@ -158,6 +158,19 @@ class Group:
     matched: bool = True
     platforms: set = field(default_factory=set)
     totals: Totals = field(default_factory=Totals)
+    # WB: артикулы WB позиции (по ним — предмет и тариф комиссии) и сколько WB
+    # удержал с её продаж и возвратов — чтобы сравнить с тарифом.
+    wb_cards: set = field(default_factory=set)
+    wb_revenue: int = 0
+    wb_commission: int = 0
+    tariff: object = None          # `tariffs.CardTariff`, проставляет страница
+    wb_subject: str = ""
+
+    @property
+    def wb_commission_pct(self) -> Decimal | None:
+        if self.wb_revenue <= 0:
+            return None
+        return (Decimal(self.wb_commission) * 100 / Decimal(self.wb_revenue)).quantize(Decimal("0.1"))
 
 
 def _round(value: Decimal) -> int:
@@ -194,6 +207,9 @@ _LINE_COLUMNS = (
     SalesReportLine.payout_kop, SalesReportLine.logistics_kop, SalesReportLine.storage_kop,
     SalesReportLine.penalty_kop, SalesReportLine.acceptance_kop, SalesReportLine.deduction_kop,
     SalesReportLine.compensation_kop,
+    # Последним, за деньгами: `add_line` разбирает первые 19 полей. Артикул
+    # площадки нужен тарифу комиссии WB (`finance/tariffs.py`).
+    SalesReportLine.platform_sku,
 )
 
 
@@ -273,7 +289,7 @@ SUSPICIOUS_COST_RATIO = 10
 
 def add_line(totals: Totals, line, cost: int | None):
     (platform, _account, operation, _day, uid, barcode, _art, _name, _size, qty, revenue, commission,
-     payout, logistics, storage, penalty, acceptance, deduction, compensation) = line
+     payout, logistics, storage, penalty, acceptance, deduction, compensation) = line[:19]
     totals.revenue += revenue
     totals.commission += commission
     totals.payout += payout
@@ -375,6 +391,11 @@ def unit_economics(db: Session, filters: Filters, settings: FinanceSettings,
         if line[2] in v.GOODS_OPERATIONS and uid is None:
             group.matched = False
         group.platforms.add(line[0])
+        if line[0] == "wb" and line[2] in v.GOODS_OPERATIONS:
+            if len(line) > 19 and line[19]:
+                group.wb_cards.add(line[19])
+            group.wb_revenue += line[10]
+            group.wb_commission += line[11]
         cost = costs.cost_on(uid, line[3]) if line[2] in v.GOODS_OPERATIONS else None
         add_line(group.totals, line, cost)
 

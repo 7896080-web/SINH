@@ -86,7 +86,12 @@
             <td class="num">{{ t.sold_qty }}</td>
             <td class="num">{{ t.returned_qty }}<div class="help-text">{{ t.return_rate | pct(0) }}</div></td>
             <td class="num">{{ money(t.revenue, true) }}</td>
-            <td class="num">{{ money(t.commission, true) }}</td>
+            <td class="num">{{ money(t.commission, true) }}
+                {% if g.wb_cards or g.wb_revenue %}
+                <div class="help-text">WB удержал {{ g.wb_commission_pct | rate }}</div>
+                <div class="help-text">{% if g.tariff %}FBS сейчас <b>{{ g.tariff.fbs | rate }}</b>{% if g.tariff.prev_fbs is not none %} (было {{ g.tariff.prev_fbs | rate }}){% endif %}{% elif g.wb_subject %}тарифа по предмету нет{% else %}FBS сейчас: предмет не известен{% endif %}</div>
+                {% if g.wb_subject %}<div class="help-text">{{ g.wb_subject }}</div>{% endif %}
+                {% endif %}</td>
             <td class="num">{{ money(t.logistics, true) }}</td>
             <td class="num">{{ money(t.storage + t.other_costs, true) }}</td>
             <td class="num">{{ money(t.total_payout, true) }}</td>
@@ -127,6 +132,11 @@
 </div>
 <p class="help-text">Суммы в таблице округлены до рубля, точные — в выгрузке в Excel.
    «Не привязано к товару» можно разнести по позициям пропорционально выручке — галочкой в фильтре.</p>
+<p class="help-text">WB: «FBS сейчас» — текущая комиссия WB по предмету товара (тарифы WB по API, раз в сутки;
+   «было» — если WB сменил её за последние 30 дней). «WB удержал» — сколько WB фактически взял с продаж за период:
+   туда входят ещё эквайринг, услуги ПВЗ, программа лояльности и продажи со склада WB (там тариф FBO), поэтому
+   числа не обязаны совпадать. Предмет товара берётся из отчётов WB: у позиции, по которой отчёт ещё не
+   загружался после обновления программы, он появится с ближайшим отчётом.</p>
 {% if total.cost_suspicious_qty %}
 <p class="help-text"><span class="badge badge--bad">внимание</span> У {{ total.cost_suspicious_qty }} шт себестоимость больше цены
    продажи в 10 раз и больше — это ошибка данных, в прибыль она не взята. <a href="/finance/costs">Исправить себестоимость</a></p>

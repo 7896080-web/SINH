@@ -247,6 +247,13 @@ def format_rub_short(kop: int | None) -> str:
     return f"{sign}{abs(rub):,}".replace(",", "\u00a0") + "\u00a0₽"
 
 
+def format_rate(value) -> str:
+    """Процент, который уже в процентах (тариф 25,5) — без умножения на 100."""
+    if value is None:
+        return "—"
+    return format(Decimal(value).normalize(), "f").replace(".", ",").replace("-", "−") + "\u00a0%"
+
+
 def format_percent(value: float | None, digits: int = 1) -> str:
     if value is None:
         return "—"

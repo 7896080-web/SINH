@@ -152,7 +152,10 @@ WB_ALIASES = {
     "barcode": ("Баркод", "barcode", "sku"),
     "article": ("Артикул поставщика", "Артикул продавца", "sa_name", "vendorCode"),
     "nm_id": ("Код номенклатуры", "nm_id", "nmId"),
-    "name": ("Название", "title", "Предмет", "subject_name", "subjectName"),
+    "name": ("Название", "title"),
+    # Предмет — категория WB: по нему карточка находит тариф комиссии
+    # (`finance/tariffs.py`). Наименованием он становится, только если названия нет.
+    "subject": ("Предмет", "subject_name", "subjectName"),
     "size": ("Размер", "ts_name", "techSize"),
     "assembly_id": ("Номер сборочного задания", "assembly_id", "orderId"),
     "srid": ("Srid", "srid"),
@@ -247,7 +250,8 @@ def build_wb(row: Row) -> dict:
     line["barcode"] = row.text("barcode")
     line["article"] = row.text("article")
     line["platform_sku"] = row.text("nm_id") if row.text("nm_id") != "0" else ""
-    line["name"] = row.text("name")
+    line["subject"] = row.text("subject")
+    line["name"] = row.text("name") or line["subject"]
     line["size"] = row.text("size") if row.text("size") != "0" else ""
     return line
 

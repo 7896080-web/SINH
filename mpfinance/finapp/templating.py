@@ -67,4 +67,5 @@ templates.env.filters["local"] = local
 templates.env.filters["rub"] = v.format_rub
 templates.env.filters["rub_short"] = v.format_rub_short
 templates.env.filters["pct"] = v.format_percent
+templates.env.filters["rate"] = v.format_rate
 templates.env.filters["compact_rub"] = lambda kop: charts.compact_rub((kop or 0) / 100)

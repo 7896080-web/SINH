@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 from finapp.audit import log_action
 from finapp import progress
 from finapp import mapping
-from finapp.finance import lamoda, repeats, statements, values as v
+from finapp.finance import lamoda, repeats, statements, tariffs, values as v
 from finapp.finance.formats import AWER_CRM_FORMAT, KIT_PAY_FORMAT, ParseResult, apply_commission, parse_sheets
 from finapp.finance.settings import load_settings
 from finapp.finance.readers import ReportReadError, read_sheets
@@ -469,6 +469,8 @@ def _store(db: Session, outcome: ImportOutcome, *, platform: str, account_id: in
     progress.report(None, None, f"запись строк в базу: {len(mappings)}")
     db.bulk_insert_mappings(SalesReportLine, mappings)
     db.flush()
+    if platform == "wb":
+        tariffs.remember_subjects(db, lines)      # артикул WB → предмет, для тарифа комиссии
 
     progress.report(None, None, "сопоставление баркодов с 1С")
     mapping_notes: list[str] = []
