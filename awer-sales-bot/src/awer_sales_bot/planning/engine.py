@@ -8,7 +8,10 @@
 3. Коэффициент месяца = план магазина / средний месяц магазина за 3 последних.
 4. Личный план (на полный отработанный месяц) =
    Σ личных продаж за 3 мес / Σ отработанного за 3 мес × коэффициент месяца.
-5. Новичок (отработано < min_fte за 3 мес) =
+5. Вернулся после перерыва (за 3 мес < min_fte, но раньше, до lookback мес. назад, работал) =
+   Σ личных продаж / Σ (отработанное × выторг магазина) по своим последним месяцам, пока отработанное не наберёт
+   min_fte, × план магазина (решение владельца 19.10.2026, сверх Excel-модели).
+5а. Новичок (за lookback мес. < min_fte) =
    средний рядовой продавец (без админов) в этом месяце прошлого года × тренд.
 6. Выполнение = (продажи за месяц / отработано) / личный план.
    Ставка = база + надбавка × полные шаги перевыполнения (шаг 10 %), не выше максимума;
@@ -95,6 +98,7 @@ class Params:
     max_rate: float = 45_000  # максимальная ставка без доплаты админа
     min_fte: float = 1.0  # минимум отработанного за 3 мес. для личного плана
     window: int = 3  # окно тренда и личного уровня, мес.
+    lookback: int = 12  # вернувшийся после перерыва: своя история не дальше стольких месяцев назад
     sales_percent: float = 0.04  # процент от продаж (для ведомости)
     stabilizer: Literal["none", "one_step"] = "none"  # см. docs/SPEC.md
 
@@ -142,12 +146,16 @@ def store_plan(h: History, month: str, p: Params = Params(), trend_override: flo
 
 
 # ----------------------------------------------------------------------------- seller level
+METHOD_NAMES = {"personal": "по личной истории", "returning": "после перерыва — по своим месяцам за год",
+                "newcomer": "новичок", "manual": "вручную", "none": "плана нет"}
+
+
 @dataclass
 class SellerPlan:
     month: str
     seller: str
     plan_full: float | None  # личный план на полный месяц, ₽
-    method: Literal["personal", "newcomer", "manual", "none"]
+    method: Literal["personal", "returning", "newcomer", "manual", "none"]
     level: float | None  # личный средний уровень за окно (на полный месяц)
 
 
@@ -168,7 +176,26 @@ def seller_plan(h: History, month: str, seller: str, sp: StorePlan | None = None
     if f >= p.min_fte and f > 0:
         level = s / f
         return SellerPlan(month, seller, level * sp.coef, "personal", level)
+    share = returning_share(h, month, seller, p)
+    if share is not None:
+        plan = share * sp.plan
+        return SellerPlan(month, seller, plan, "returning", plan / sp.coef if sp.coef else None)  # уровень × коэф. = план
     return SellerPlan(month, seller, sp.newcomer_plan, "newcomer", None)
+
+
+def returning_share(h: History, month: str, seller: str, p: Params = Params()) -> float | None:
+    """Доля продавца в выторге магазина по его последним месяцам (от прошлого назад, пока отработанное не наберёт
+    min_fte, не дальше lookback): Σ продаж / Σ (отработанное × выторг магазина на полный месяц). None — не набралось."""
+    s = f = base = 0.0
+    for k in range(1, p.lookback + 1):
+        m = month_add(month, -k)
+        x, store = h.get(m, seller), h.store_full(m)
+        if not x or store <= 0:
+            continue
+        s, f, base = s + x.sales, f + x.fte, base + x.fte * store
+        if f >= p.min_fte and base > 0:
+            return s / base
+    return None
 
 
 # ----------------------------------------------------------------------------- evaluation

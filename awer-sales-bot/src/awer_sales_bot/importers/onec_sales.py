@@ -124,9 +124,10 @@ def split_store(name: str, cfg: Settings) -> tuple[str, str | None]:
 
 
 def service_seller(name: str, cfg: Settings) -> bool:
-    """Не человек («Одежда сотрудникам Город»): выручка магазина без личного плана (onec.service_sellers)."""
-    n = name.lower()
-    return any(n.startswith(x.strip().lower()) for x in cfg.onec.service_sellers if x.strip())
+    """Не человек («Одежда сотрудникам Город», «Стажер»): выручка магазина без личного плана (onec.service_sellers).
+    Имя целиком: «Стажер Эльмаз» — продавец."""
+    norm = lambda x: " ".join(x.split()).lower().replace("ё", "е")  # noqa: E731
+    return norm(name) in {norm(x) for x in cfg.onec.service_sellers}
 
 
 def _mark_days(c, pairs, source):

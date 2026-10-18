@@ -68,14 +68,16 @@ def test_service_sellers_count_in_store_but_get_no_plan(env):  # noqa: F811
         for d in days:
             f.write(f"\n{d:%d.%m.%Y};12:00;ГОРОД_склад;Д1;Ч{d.day}0;Одежда сотрудникам Город;x;x;1;3000;3000;;0;")
             f.write(f"\n{d:%d.%m.%Y};12:00;МСЛ_склад;Д2;Ч{d.day}1;Одежда сотрудникам;x;x;1;1000;1000;;0;")
+            f.write(f"\n{d:%d.%m.%Y};13:00;МСЛ_склад;Д2;Ч{d.day}2;Стажер;x;x;1;500;500;;0;")  # общий вход
+            f.write(f"\n{d:%d.%m.%Y};14:00;МСЛ_склад;Д2;Ч{d.day}3;Стажер Эльмаз;x;x;1;700;700;;0;")  # человек
     import_file(docs_f, db, cfg)
     rep = import_file(lines_f, db, cfg)
-    assert not any(n.startswith("Одежда") for n in rep.unknown_sellers)  # не «новые продавцы» для владельца
-    sids = [db.seller_id(n, create=False) for n in ("Одежда сотрудникам", "Одежда сотрудникам Город")]
+    sids = [db.seller_id(n, create=False) for n in ("Одежда сотрудникам", "Одежда сотрудникам Город", "Стажер")]
     assert all(db.seller(s)["role"] == "system" for s in sids)
+    assert rep.unknown_sellers == {"Стажер Эльмаз"}  # о ней владельцу скажут: новый продавец
     r = backtest.run(db, cfg, "2026-10")
-    assert {x.name for x in r.rows} == {"Продавец04"}
-    staff = db.one("SELECT SUM(amount) a FROM sales_lines WHERE seller_id IN (?,?)", *sids)["a"]
-    assert staff == 8000 and r.store_fact == pytest.approx(db.one("SELECT SUM(amount) a FROM sales_lines")["a"])
+    assert {x.name for x in r.rows} == {"Продавец04", "Стажер Эльмаз"}
+    staff = db.one("SELECT SUM(amount) a FROM sales_lines WHERE seller_id IN (?,?,?)", *sids)["a"]
+    assert staff == 9000 and r.store_fact == pytest.approx(db.one("SELECT SUM(amount) a FROM sales_lines")["a"])
     assert M.unattributed(db, days[0], days[-1]) == 5000 * 4  # только пустой продавец
     assert not names.suspects(db)

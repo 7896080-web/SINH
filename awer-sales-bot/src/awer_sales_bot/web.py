@@ -24,7 +24,12 @@ from . import crews as crews_mod
 from .config import Settings
 from .db import DB
 from .planning import backtest, service
-from .planning.engine import month_add, rate_for, threshold_amounts
+from .planning.engine import METHOD_NAMES, month_add, rate_for, threshold_amounts
+
+def _how_note(method: str) -> str:
+    """Пометка у имени в «Личных планах»: план не по последним 3 месяцам."""
+    return f' <span class=note>{METHOD_NAMES[method]}</span>' if method in ("returning", "newcomer") else ""
+
 
 def qr_svg(text: str) -> str:
     """QR-код ссылки на бота — SVG прямо в странице (без картинок и интернета)."""
@@ -34,8 +39,6 @@ def qr_svg(text: str) -> str:
     img = qrcode.make(text, image_factory=qrcode.image.svg.SvgPathImage, box_size=10)
     return img.to_string(encoding="unicode")
 
-
-CHECK_HOW = {"personal": "по личной истории", "newcomer": "новичок", "none": "плана нет"}  # backtest.Row.method
 
 CSS = """
 body{font-family:Arial,sans-serif;margin:24px;color:#1f2328;background:#fff}
@@ -139,7 +142,7 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
             th = threshold_amounts(r.plan_final, p, 1)[1] if r.plan_final else None
             perf = st.performance if st else None
             b.append(
-                f'<tr><td>{html.escape(r.name)}</td><td>{"админ" if r.role == "admin" else "продавец"}</td>'
+                f'<tr><td>{html.escape(r.name)}{_how_note(r.method)}</td><td>{"админ" if r.role == "admin" else "продавец"}</td>'
                 f'<td class=n>{_rub(r.level)}</td><td class="n calc">{_rub(r.plan_calc)}</td>'
                 f'<td><input type=text name="p{r.seller_id}" value="{_rub(r.plan_manual)}"></td>'
                 f'<td class="n {"man" if r.plan_manual is not None else ""}"><b>{_rub(r.plan_final)}</b></td>'
@@ -287,7 +290,7 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
                     cells.append(f'<td class="n{" ok" if ok else ""}">{_pct(y.performance) if y else ""}</td>')
                 b.append(f'<tr><td>{html.escape(x.name)}</td>{"".join(cells)}</tr>')
             b.append('</table>')
-        how = CHECK_HOW
+        how = METHOD_NAMES
         for r in res:
             b.append(f'<h2>{r.month}</h2>')
             if not r.rows:
@@ -337,7 +340,7 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
             d.append(["Продавец", "Роль", "Как считали план", "План (полный мес.)", "Рабочих дней", "Отработано (доля)",
                       "План на отработанное", "Факт", "Факт − план", "Выполнение", "Ступеней", "Ставка (полный мес.)"])
             for x in r.rows:
-                d.append([x.name, "старший" if x.role == "admin" else "продавец", CHECK_HOW.get(x.method, x.method),
+                d.append([x.name, "старший" if x.role == "admin" else "продавец", METHOD_NAMES.get(x.method, x.method),
                           x.plan, x.days, x.fte, x.plan_worked, x.sales,
                           x.sales - x.plan_worked if x.plan_worked else None, x.performance, x.steps, x.rate])
             _xlsx_formats(d, {4: RUB, 6: "0.00", 7: RUB, 8: RUB, 9: RUB, 10: "0%", 12: RUB}, 16)

@@ -7,7 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from awer_sales_bot.planning import History, Params, evaluate, month_add, seller_plan, steps_for, store_plan, threshold_amounts
+from awer_sales_bot.planning import (History, Params, evaluate, month_add, month_range, seller_plan, steps_for, store_plan,
+                                     threshold_amounts)
 
 FIX = Path(__file__).parent / "fixtures" / "history_anon.json"
 
@@ -99,3 +100,40 @@ def test_manual_trend_and_plan(hist):
     assert sp.trend == 0.9 and sp.trend_calc == pytest.approx(0.805, abs=0.001)
     assert sp.plan == pytest.approx(6_963_861 * 0.9, abs=1)
     assert seller_plan(hist, "2026-10", "Админ2", manual=1_000_000).plan_full == 1_000_000
+
+
+def _store_with(seller_months: dict[str, tuple[float, float]]) -> History:
+    """Магазин 2024-01…2026-09: «Фон» даёт выторг (декабрь вдвое сильнее), продавец «Вернулась» — свои месяцы."""
+    h = History(roles={"Фон": "seller", "Вернулась": "seller"})
+    for m in month_range("2024-01", "2026-09"):
+        h.add(m, "Фон", 2_000_000 if m.endswith("-12") else 1_000_000, 3.0)
+    for m, (sales, fte) in seller_months.items():
+        h.add(m, "Вернулась", sales, fte)
+    return h
+
+
+def test_returning_after_break_uses_own_months_within_year():
+    # март–июнь работала, июль–август перерыв, сентябрь — полмесяца: за 3 мес < 1 полного месяца
+    h = _store_with({"2026-03": (300_000, 1.0), "2026-06": (240_000, 1.0), "2026-09": (100_000, 0.5)})
+    sp = store_plan(h, "2026-10")
+    x = seller_plan(h, "2026-10", "Вернулась", sp)
+    assert x.method == "returning"
+    # от сентября назад до 1 полного месяца: сентябрь (0,5) + июнь (1,0); март уже не нужен
+    share = (100_000 + 240_000) / (0.5 * 1_100_000 + 1.0 * 1_240_000)
+    assert x.plan_full == pytest.approx(share * sp.plan)
+    assert x.level * sp.coef == pytest.approx(x.plan_full)
+    assert x.plan_full != pytest.approx(sp.newcomer_plan)
+
+
+def test_returning_season_correction_and_year_limit():
+    # работала только в сильном декабре (4 мес. назад): доля — от декабрьского выторга, план апреля не завышен
+    h = _store_with({"2025-12": (400_000, 1.0)})
+    sp = store_plan(h, "2026-04")
+    x = seller_plan(h, "2026-04", "Вернулась", sp)
+    assert x.method == "returning"
+    assert x.plan_full == pytest.approx(400_000 / (2_000_000 + 400_000) * sp.plan)
+    # дальше 12 месяцев не смотрим: та же история через год с лишним — уже новичок
+    h2 = _store_with({"2025-01": (400_000, 1.0)})
+    assert seller_plan(h2, "2026-02", "Вернулась").method == "newcomer"
+    assert seller_plan(h2, "2026-01", "Вернулась").method == "returning"  # ровно 12 мес. назад — ещё считается
+    assert seller_plan(h2, "2026-02", "Вернулась", p=Params(lookback=13)).method == "returning"

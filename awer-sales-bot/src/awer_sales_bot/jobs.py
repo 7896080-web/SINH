@@ -12,6 +12,7 @@ from .db import DB
 from .importers.onec_sales import import_inbox
 from .max_api import MaxAuthError, MaxClient, MaxDenied
 from .planning import service
+from .planning.engine import METHOD_NAMES
 
 log = logging.getLogger(__name__)
 RETURNS_SHARE = 0.08  # доля возвратов, с которой урок недели — про примерку и размер (recommendations, правило 5)
@@ -138,8 +139,8 @@ def daily_run(db: DB, cfg: Settings, sender: Sender, today: date | None = None, 
         month_turn(db, cfg, sender, today)
     for r in service.ensure_plans(db, cfg, day.strftime("%Y-%m")):
         sender.to_owners(day.isoformat(), f"new_plan_{r['seller_id']}",
-                         f"Новый продавец {r['name']}: план {messages.rub(r['plan'])} на полный месяц "
-                         f"({'новичок' if r['method'] == 'newcomer' else r['method']}). "
+                         f"{'Вернулся' if r['method'] == 'returning' else 'Новый'} продавец {r['name']}: план "
+                         f"{messages.rub(r['plan'])} на полный месяц ({METHOD_NAMES.get(r['method'], r['method'])}). "
                          "Изменить — админка → «Настройки месяца» → «План вручную».")
     goals.ensure_week(db, cfg, today)
     for s in ([] if empty else db.sellers()):
