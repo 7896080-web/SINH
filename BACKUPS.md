@@ -57,6 +57,7 @@
 
 ## Осталось сделать
 
+- awer-sales-bot (`awer-sales-bot/`, база `data/awer.db`) ещё не установлен. При установке — снимок базы в `selectel:awer-backups/awer_sales_bot` по образцу Финпомощника, `.env` и `config.yaml` в исключения; добавить строку в таблицы выше.
 - Маркировка: `rclone config create selectel …` с `--config C:\marking\rclone.conf`, затем `MARKING_RCLONE_REMOTE=selectel:awer-backups/marking` в `.env` и перезапуск.
 - Защита от удаления: отдельный бакет с Object Lock или ключ без права удаления, чтобы рабочий ключ не мог стереть все копии.
 - Встроить выгрузку в облако в Репрайсер, Финпомощник и CRM (как в Sync), чтобы её состояние было на «Диагностике», а не только в журнале.
