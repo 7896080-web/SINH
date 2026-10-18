@@ -76,8 +76,11 @@ def main(argv: list[str] | None = None) -> None:
         link = f"{cfg.max.bot_link}?start={code}" if cfg.max.bot_link else ""
         print(f"Код: {code} {link}")
     elif a.cmd == "set-role":
+        sid = db.seller_id(a.name, create=False)  # опечатка в имени не должна создавать нового продавца (аудит Н4)
+        if not sid:
+            raise SystemExit("Продавец не найден — имя как в 1С, список: awer-bot sellers")
         with db.tx() as c:
-            c.execute("UPDATE sellers SET role=? WHERE id=?", (a.role, db.seller_id(a.name)))
+            c.execute("UPDATE sellers SET role=? WHERE id=?", (a.role, sid))
     elif a.cmd == "alias":
         sid = db.seller_id(a.name, create=False)
         if not sid:

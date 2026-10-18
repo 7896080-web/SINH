@@ -3,7 +3,7 @@
 Адрес https://platform-api2.max.ru (с 19.07.2026); токен — заголовок `Authorization: <token>`, без Bearer
 (query `access_token` больше не поддерживается). Сертификат сервера выдан Минцифры (Russian Trusted Root CA) —
 его нет в стандартном наборе Python, поэтому он лежит в certs/ и добавляется к системным и certifi.
-Методы: GET /me, POST /messages?user_id=…, POST /answers?callback_id=…, GET /updates (long polling).
+Методы: GET /me, PATCH /me/commands, POST /messages?user_id=…, POST /answers?callback_id=…, GET /updates.
 
 Повторы: 429 и сетевая ошибка до отправки запроса — всегда; 5xx и обрыв после отправки — только для GET:
 POST /messages не идемпотентен, повтор даст продавцу то же сообщение дважды.
@@ -96,6 +96,11 @@ class MaxClient:
 
     def me(self) -> dict:
         return self._req("GET", "/me")
+
+    def set_commands(self, commands: list[tuple[str, str]]) -> dict:
+        """Меню команд бота (PATCH /me/commands): до 32 команд, имя до 64 символов, описание до 128."""
+        return self._req("PATCH", "/me/commands",
+                         json={"commands": [{"name": n[:64], "description": d[:128]} for n, d in commands[:32]]})
 
     def send(self, text: str, user_id: int | None = None, chat_id: int | None = None, fmt: str = "markdown",
              buttons: list[list[dict]] | None = None) -> dict:

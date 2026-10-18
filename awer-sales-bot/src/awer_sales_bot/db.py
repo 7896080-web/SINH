@@ -4,6 +4,7 @@ from __future__ import annotations
 import calendar
 import secrets
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
@@ -224,6 +225,9 @@ class DB:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(self.path, check_same_thread=False)
+        # одно соединение на несколько потоков (запросы админки идут параллельно): транзакция и запрос —
+        # под замком, иначе commit одного потока фиксирует половину чужой записи (аудит В6)
+        self._lock = threading.RLock()
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.execute("PRAGMA journal_mode=WAL")  # бот и админка работают с базой одновременно
@@ -247,19 +251,21 @@ class DB:
 
     @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:
-        try:
-            yield self.conn
-            self.conn.commit()
-        except Exception:
-            self.conn.rollback()
-            raise
+        with self._lock:
+            try:
+                yield self.conn
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
 
     def q(self, sql: str, *args) -> list[sqlite3.Row]:
-        return self.conn.execute(sql, args).fetchall()
+        with self._lock:
+            return self.conn.execute(sql, args).fetchall()
 
     def one(self, sql: str, *args):
-        r = self.conn.execute(sql, args).fetchone()
-        return r
+        with self._lock:
+            return self.conn.execute(sql, args).fetchone()
 
     # ------------------------------------------------------------------ kv
     def get_kv(self, k: str, default: str | None = None) -> str | None:

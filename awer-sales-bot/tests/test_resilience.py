@@ -212,12 +212,22 @@ def test_upload_bad_file(env, monkeypatch):  # noqa: F811
 # ----------------------------------------------------------------------------- В2: пропущенный запуск
 def test_missed_first_of_month_is_caught_up(env):  # noqa: F811
     cfg, db = env
+    cfg.max.owners = [900]
     service.freeze(db, cfg, "2026-10")
     nov2 = date(2026, 11, 2)
     assert month_due(db, nov2)  # план ноября не зафиксирован, октябрь не закрыт — неважно, что сегодня 2-е
     daily_run(db, cfg, Sender(db, cfg, None, dry_run=True), today=nov2, force=True)
-    assert db.one("SELECT 1 FROM plans WHERE month='2026-11'") and db.one("SELECT 1 FROM results WHERE month='2026-10'")
-    assert not month_due(db, nov2)
+    assert db.one("SELECT 1 FROM plans WHERE month='2026-11'")
+    # за 31.10 выгрузки нет — итоги и ставки по неполным данным не считаем (аудит С2), владелец знает
+    assert not db.one("SELECT 1 FROM results WHERE month='2026-10'") and month_due(db, nov2)
+    assert "31.10" in db.one("SELECT text FROM message_log WHERE kind='month_close_wait'")["text"]
+
+    for store in ("ГОРОД", "МСЛ"):
+        f = write_sales(cfg.onec.inbox / f"s_{store}.csv", [(date(2026, 10, 31), "Продавец04", 5600, 1)])
+        f.write_text(f.read_text(encoding="utf-8").replace("ГОРОД_склад", f"{store}_склад"), encoding="utf-8")
+        os.utime(f, (time.time() - 600,) * 2)
+    daily_run(db, cfg, Sender(db, cfg, None, dry_run=True), today=nov2, force=True)
+    assert db.one("SELECT 1 FROM results WHERE month='2026-10'") and not month_due(db, nov2)
 
 
 def test_daily_done_and_no_duplicates_for_owner(env):  # noqa: F811
@@ -226,7 +236,8 @@ def test_daily_done_and_no_duplicates_for_owner(env):  # noqa: F811
     m = FakeMax()
     s = Sender(db, cfg, m)
     s.GAP = 0
-    write_sales(cfg.onec.inbox / "s.csv", [(date(2026, 10, 17), "Продавец04", 5600, 1)])
+    f = write_sales(cfg.onec.inbox / "s.csv", [(date(2026, 10, 17), "Продавец04", 5600, 1)])
+    os.utime(f, (time.time() - 600,) * 2)
     for _ in range(2):  # догон после расписания — тот же день ещё раз
         daily_run(db, cfg, s, today=date(2026, 10, 18), force=True)
     assert db.get_kv("daily_done") == "2026-10-17"
@@ -248,4 +259,93 @@ def test_onec_error_file_reaches_owner(env):  # noqa: F811
     r = db.one("SELECT text FROM message_log WHERE kind LIKE 'bad_file:error_%'")
     assert "Поле не найдено" in r["text"] and "1С не смогла выгрузить" in r["text"]
     assert part.exists() and not err.exists()
+
+
+def test_empty_day_is_not_sent_to_sellers(env):  # noqa: F811
+    """После 13:00 без единой выгрузки за день продавцам не уходит «продаж нет» — только владельцу (аудит С2)."""
+    cfg, db = env
+    cfg.max.owners = [900]
+    m = FakeMax()
+    s = Sender(db, cfg, m)
+    s.GAP = 0
+    sid = db.seller_id("Продавец04", create=False)
+    with db.tx() as c:
+        c.execute("UPDATE sellers SET max_user_id=501 WHERE id=?", (sid,))
+    service.freeze(db, cfg, "2026-10")
+    daily_run(db, cfg, s, today=date(2026, 10, 18), force=True)
+    assert not [t for uid, t, _ in m.sent if uid == 501]
+    assert db.get_kv("daily_done") is None  # догон повторит, когда выгрузка придёт
+    assert "не отправлена" in db.one("SELECT text FROM message_log WHERE kind='missing_day'")["text"]
+
+
+def test_foreign_warehouse_is_not_revenue(env):  # noqa: F811
+    cfg, db = env
+    cfg.max.owners = [900]
+    f = write_sales(cfg.onec.inbox / "s.csv", [(date(2026, 10, 17), "Продавец04", 5600, 1),
+                                               (date(2026, 10, 17), "Продавец04", 100000, 1)])
+    lines = f.read_text(encoding="utf-8").splitlines()
+    lines[2] = lines[2].replace("ГОРОД_склад", "ЦС Склад")
+    f.write_text("\n".join(lines), encoding="utf-8")
+    os.utime(f, (time.time() - 600,) * 2)
+    daily_run(db, cfg, Sender(db, cfg, None, dry_run=True), today=date(2026, 10, 18), force=True)
+    assert db.one("SELECT SUM(amount) a FROM sales_lines")["a"] == 5600
+    assert db.one("SELECT COUNT(*) n FROM sales_lines WHERE store NOT IN ('Город','МСЛ')")["n"] == 0
+    text = db.one("SELECT text FROM message_log WHERE kind LIKE 'foreign:%'")["text"]
+    assert "ЦС Склад — 100 000" in text and "store_map" in text
+
+
+def test_command_menu():
+    from awer_sales_bot.config import Settings
+    cfg = Settings()
+    assert [n for n, _ in bot.commands(cfg, "plan")] == ["plan", "baza", "help"]  # второго бота нет
+    assert [n for n, _ in bot.commands(cfg, "training")] == ["baza", "help"]
+    c, calls = mock_client(lambda req, n: httpx.Response(200, json={"commands": []}))
+    c.set_commands(bot.commands(cfg, "plan"))
+    assert calls[0].method == "PATCH" and calls[0].url.path == "/me/commands"
+    assert b'"name":"plan"' in calls[0].content.replace(b" ", b"")
+
+
+def test_wrong_codes_are_limited(env):  # noqa: F811
+    cfg, db = env
+    m = FakeMax()
+    sid = db.add_seller("Новикова Мария", "Мария")
+    code = db.new_invite(sid)
+    for i in range(bot.CODE_TRIES):
+        bot.handle(db, cfg, m, {"update_type": "bot_started", "user": {"user_id": 666}, "payload": f"BAD{i:03d}"})
+    assert m.sent[-1][1].startswith("Код не найден")
+    bot.handle(db, cfg, m, {"update_type": "bot_started", "user": {"user_id": 666}, "payload": code})
+    assert m.sent[-1][1] == bot.BLOCKED and db.seller(sid)["max_user_id"] is None  # даже верный код — через час
+    bot.handle(db, cfg, m, {"update_type": "bot_started", "user": {"user_id": 501}, "payload": code})
+    assert db.seller(sid)["max_user_id"] == 501  # другой человек не заблокирован
+
+
+def test_set_role_typo_does_not_create_seller(env, tmp_path):  # noqa: F811
+    from awer_sales_bot import cli
+    cfg, db = env
+    conf = tmp_path / "c.yaml"
+    conf.write_text(f"db_path: {cfg.db_path}\n", encoding="utf-8")
+    before = len(db.sellers(active_only=False))
+    with pytest.raises(SystemExit):
+        cli.main(["-c", str(conf), "set-role", "Продавец 04", "admin"])
+    assert len(db.sellers(active_only=False)) == before
+
+
+def test_db_is_safe_across_threads(env):  # noqa: F811
+    cfg, db = env
+    errors = []
+
+    def work(k):
+        try:
+            for i in range(50):
+                with db.tx() as c:
+                    c.execute("INSERT INTO kv(k,v) VALUES(?,?)", (f"t{k}-{i}", "x"))
+                    db.q("SELECT COUNT(*) FROM kv")
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+    threads = [threading.Thread(target=work, args=(k,)) for k in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors and db.one("SELECT COUNT(*) n FROM kv WHERE k LIKE 't%'")["n"] == 200
 

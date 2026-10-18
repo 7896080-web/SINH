@@ -165,6 +165,10 @@ def test_orp_mode_cards_stock_arrivals(env):
     assert import_file(ar, db, cfg).kind == "arrivals"
     assert M.arrivals_summary(db, days[-1]) == [("Куртка демисезон", 2, 5.0)]
     assert M.broken_sizes(db, days[-1])[0][1] == "Арт Джинсы"
+    assert M.stale_stock(db, days[-1]) == (0, 0.0)  # продаж в базе всего 10 дней — «90 дней без продаж» не знаем
+    with db.tx() as c:  # история продаж длиннее 90 дней: «Старая модель» не продавалась, джинсы и ремень — да
+        c.execute("INSERT INTO sales_lines(day,store,seller_id,item,category,qty,amount,source) "
+                  "VALUES('2026-06-01','Город',?,'Арт Пиджак','Пиджак',1,9000,'old')", (sid,))
     assert M.stale_stock(db, days[-1]) == (1, 3.0)
     text = daily(db, cfg, sid, days[-1])
     assert "Покупка клиента с картой" in text and "Новые поступления" in text

@@ -94,6 +94,12 @@ def daily_run(db: DB, cfg: Settings, sender: Sender, today: date | None = None, 
             sender.to_owners(today.isoformat(), f"bad_file:{rep.file}",
                              f"Файл из 1С «{rep.file}» не прочитан: {rep.error}. Он перенесён в data/archive/bad, "
                              "остальные файлы загружены. Выгрузите этот день из 1С ещё раз.", once=True)
+        if rep.foreign:  # аудит С1: склад не магазина в выгрузке — не в выручку, но владелец знает
+            where = ", ".join(f"{k or 'склад не указан'} — {messages.rub(v)}" for k, v in sorted(rep.foreign.items()))
+            sender.to_owners(today.isoformat(), f"foreign:{rep.file}",
+                             f"В выгрузке 1С есть продажи не магазинов: {where}. Они не засчитаны ни в выручку "
+                             "магазинов, ни продавцам. Если это магазин — добавьте его название в config.yaml → "
+                             "onec.store_map.", once=True)
         if rep.unknown_sellers:
             sender.to_owners(day.isoformat(), "unknown_sellers",
                              "Новые продавцы в выгрузке 1С: " + ", ".join(sorted(rep.unknown_sellers)) +
@@ -119,9 +125,12 @@ def daily_run(db: DB, cfg: Settings, sender: Sender, today: date | None = None, 
     deadline = datetime.combine(today, datetime.strptime(cfg.schedule.deadline_time, "%H:%M").time())
     if missing and not force and datetime.now() < deadline:
         return "waiting"
+    empty = bool(missing) and set(missing) >= set(cfg.stores)  # за день нет ничего ни по одному магазину (аудит С2)
     if missing:
-        sender.to_owners(day.isoformat(), "missing_day", f"Нет выгрузки 1С за {day:%d.%m} по: {', '.join(missing)}. "
-                                                          "Рассылка по имеющимся данным.", once=True)
+        sender.to_owners(day.isoformat(), "missing_day", f"Нет выгрузки 1С за {day:%d.%m} по: {', '.join(missing)}. " +
+                         ("Продавцам рассылка за этот день не отправлена: без данных у всех было бы «продаж нет». "
+                          "Бот отправит её сам, как только выгрузка появится (сегодня)." if empty else
+                          "Рассылка по имеющимся данным."), once=True)
     if month_due(db, today):  # не «сегодня 1-е»: служба могла не работать 1-го числа (аудит В2)
         month_turn(db, cfg, sender, today)
     for r in service.ensure_plans(db, cfg, day.strftime("%Y-%m")):
@@ -130,7 +139,7 @@ def daily_run(db: DB, cfg: Settings, sender: Sender, today: date | None = None, 
                          f"({'новичок' if r['method'] == 'newcomer' else r['method']}). "
                          "Изменить — админка → «Настройки месяца» → «План вручную».")
     goals.ensure_week(db, cfg, today)
-    for s in db.sellers():
+    for s in ([] if empty else db.sellers()):
         if s["max_user_id"] and (db.worked_shifts(s["id"], day.strftime("%Y-%m"), upto=day) or
                                  db.one("SELECT 1 FROM plans WHERE month=? AND seller_id=?", day.strftime("%Y-%m"), s["id"])):
             sender.to_seller(day.isoformat(), "daily", s["id"], messages.daily(db, cfg, s["id"], day))
@@ -140,7 +149,7 @@ def daily_run(db: DB, cfg: Settings, sender: Sender, today: date | None = None, 
     training_run(db, cfg, sender, today)
     arrivals_run(db, cfg, sender, today, day)
     coach.run(db, cfg, sender, today)
-    if not sender.dry:
+    if not sender.dry and not empty:  # пустой день — догон (bot.catch_up) повторит, когда выгрузка придёт
         db.set_kv("daily_done", day.isoformat())  # строка состояния в админке и догон (bot.catch_up)
     return "sent"
 
@@ -202,11 +211,18 @@ def month_due(db: DB, today: date) -> bool:
 def month_turn(db: DB, cfg: Settings, sender: Sender, today: date) -> None:
     """Начало месяца (1-го числа или первый запуск после него): итоги прошлого месяца, фиксация и рассылка
     нового плана. Сообщения за месяц уходят один раз — журнал по ключу месяца."""
-    prev = (today.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
-    cur = today.strftime("%Y-%m")
+    last = today.replace(day=1) - timedelta(days=1)
+    prev, cur = last.strftime("%Y-%m"), today.strftime("%Y-%m")
     if db.one("SELECT 1 FROM plans WHERE month=?", prev):
-        for row in service.close_month(db, cfg, prev):
-            sender.to_seller(cur, "month_result", row["seller_id"], messages.month_result(row))
+        wait = db.day_closed(last, cfg.stores)
+        if wait:  # аудит С2: итоги и ставки — только по полным данным; month_due вернёт сюда завтра
+            sender.to_owners(cur, "month_close_wait",
+                             f"Итоги {prev} пока не подведены: нет выгрузки 1С за {last:%d.%m} по: {', '.join(wait)}. "
+                             "Бот подведёт их сам, когда выгрузка придёт. Если магазин в тот день не работал — "
+                             "админка → «Итоги и ведомость» → «Посчитать итоги».", once=True)
+        else:
+            for row in service.close_month(db, cfg, prev):
+                sender.to_seller(cur, "month_result", row["seller_id"], messages.month_result(row))
     if not db.one("SELECT 1 FROM plans WHERE month=?", cur):
         service.freeze(db, cfg, cur)
     for s in db.sellers():

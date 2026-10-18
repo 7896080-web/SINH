@@ -42,6 +42,7 @@ class ImportReport:
     skipped: int = 0
     unknown_sellers: set[str] = field(default_factory=set)
     error: str = ""  # файл не распознан / ошибка выгрузки из 1С (kind onec_error) — перенесён в archive/bad
+    foreign: dict[str, float] = field(default_factory=dict)  # склад/касса не магазина → сумма (строки не загружены)
 
 
 def _num(v) -> float:
@@ -106,6 +107,13 @@ def store_name(raw, cfg: Settings) -> str:
     return s or cfg.onec.default_store
 
 
+def known_store(raw, cfg: Settings) -> str | None:
+    """Магазин из cfg.stores или None: склад, которого нет в onec.store_map (ЦС Склад, маркетплейсы), не магазин —
+    его продажи не входят ни в выручку магазинов, ни продавцам (аудит С1)."""
+    store = store_name(raw, cfg)
+    return store if store in cfg.stores else None
+
+
 def split_store(name: str, cfg: Settings) -> tuple[str, str | None]:
     """«Букалова Юлия МСЛ» → («Букалова Юлия», «МСЛ»)."""
     name = " ".join(str(name).split())
@@ -126,7 +134,7 @@ def _mark_days(c, pairs, source):
 def _import_lines(path: Path, rows, h, idx, db: DB, cfg: Settings) -> ImportReport:
     excl = {s.strip().lower() for s in cfg.onec.exclude_sellers}
     data: dict[tuple[str, str], list[tuple]] = defaultdict(list)
-    skipped, unknown = 0, set()
+    skipped, unknown, foreign = 0, set(), defaultdict(float)
     for row in rows[h + 1:]:
         if not row or all(c in (None, "") for c in row):
             continue
@@ -142,7 +150,11 @@ def _import_lines(path: Path, rows, h, idx, db: DB, cfg: Settings) -> ImportRepo
             skipped += 1
             continue
         seller, store_from_name = split_store(raw_seller, cfg)
-        store = store_name(get("store") or store_from_name, cfg)
+        store = known_store(get("store") or store_from_name, cfg)
+        if store is None:
+            foreign[" ".join(str(get("store") or store_from_name).split())] += _num(get("amount"))
+            skipped += 1
+            continue
         sid = db.seller_id(seller, create=False)
         if sid is None:
             sid = db.seller_id(seller, create=True)
@@ -171,11 +183,12 @@ def _import_lines(path: Path, rows, h, idx, db: DB, cfg: Settings) -> ImportRepo
                           "discount,manual_discount,card,source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", lines)
             n += len(lines)
         _mark_days(c, {k: len(v) for k, v in data.items()}, path.name)
-    return ImportReport(path.name, "lines", n, sorted(data), skipped, unknown)
+    return ImportReport(path.name, "lines", n, sorted(data), skipped, unknown, foreign=dict(foreign))
 
 
 def _import_docs(path: Path, rows, h, idx, db: DB, cfg: Settings) -> ImportReport:
     data: dict[tuple[str, str, str], list] = {}
+    foreign: dict[str, float] = defaultdict(float)
     for row in rows[h + 1:]:
         if not row or all(c in (None, "") for c in row):
             continue
@@ -184,7 +197,10 @@ def _import_docs(path: Path, rows, h, idx, db: DB, cfg: Settings) -> ImportRepor
         if d is None:
             continue
         kassa = " ".join(str(get("kassa") or "").split())
-        store = store_name(get("store") or kassa, cfg)
+        store = known_store(get("store") or kassa, cfg)
+        if store is None:
+            foreign[kassa or " ".join(str(get("store")).split())] += _num(get("revenue"))
+            continue
         key = (d.isoformat(), store, kassa)
         cur = data.setdefault(key, [str(get("doc") or ""), 0, 0, 0.0])
         cur[1] += int(_num(get("checks")))
@@ -197,7 +213,7 @@ def _import_docs(path: Path, rows, h, idx, db: DB, cfg: Settings) -> ImportRepor
                       "checks=excluded.checks, return_checks=excluded.return_checks, revenue=excluded.revenue, "
                       "source=excluded.source", (day, store, kassa, doc, ch, rch, rev, path.name))
     days = sorted({(d, s) for d, s, _ in data})
-    return ImportReport(path.name, "docs", len(data), days)
+    return ImportReport(path.name, "docs", len(data), days, foreign=dict(foreign))
 
 
 def _import_stock(path: Path, rows, h, idx, db: DB, cfg: Settings, kind: str) -> ImportReport:
@@ -210,7 +226,10 @@ def _import_stock(path: Path, rows, h, idx, db: DB, cfg: Settings, kind: str) ->
         if d is None or not get("item"):
             continue
         qty = _num(get("stock" if kind == "stock" else "arrived"))
-        recs.append((d.isoformat(), store_name(get("store"), cfg), str(get("item")).strip(),
+        store = known_store(get("store"), cfg)
+        if store is None:  # обработка 1С уже отбирает склады магазинов; сюда попадает только чужое
+            continue
+        recs.append((d.isoformat(), store, str(get("item")).strip(),
                      get("category"), str(get("size") or "").strip(), qty, str(get("doc") or ""),
                      str(get("brand") or "").strip() or None, str(get("color") or "").strip() or None))
     pairs = sorted({(r[0], r[1]) for r in recs})

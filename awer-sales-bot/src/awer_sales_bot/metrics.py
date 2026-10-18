@@ -253,11 +253,17 @@ def broken_sizes(db: DB, day: date, min_sold: float = 3, max_sizes: int = 2, lim
 
 
 def stale_stock(db: DB, day: date, days: int = 90) -> tuple[int, float]:
-    """Залежавшийся товар: позиции на остатке без продаж за `days` дней → (моделей, штук)."""
+    """Залежавшийся товар: позиции на остатке без продаж за `days` дней → (моделей, штук).
+
+    Пока продаж в базе меньше `days` дней, «без продаж» не отличить от «бот ещё не видел» — (0, 0) (аудит С3);
+    пришедшее за эти дни не залежалось."""
     d = stock_day(db)
-    if not d:
+    since = (day - timedelta(days=days)).isoformat()
+    first = db.one("SELECT MIN(day) d FROM sales_lines")["d"]
+    if not d or not first or first > since:
         return 0, 0.0
     r = db.one("""SELECT COUNT(DISTINCT item) m, COALESCE(SUM(qty),0) q FROM stock WHERE day=? AND item NOT IN
-                  (SELECT DISTINCT item FROM sales_lines WHERE qty>0 AND day BETWEEN ? AND ?)""",
-               d, (day - timedelta(days=days)).isoformat(), day.isoformat())
+                  (SELECT DISTINCT item FROM sales_lines WHERE qty>0 AND day BETWEEN ? AND ?)
+                  AND item NOT IN (SELECT DISTINCT item FROM arrivals WHERE day BETWEEN ? AND ?)""",
+               d, since, day.isoformat(), since, day.isoformat())
     return r["m"], r["q"]

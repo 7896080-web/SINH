@@ -30,6 +30,22 @@ TRAINING_HELP = ("Здесь уроки, тесты и база знаний: т
                  "/help — помощь")
 
 
+CODE_TRIES = 5  # неверных кодов за час с одного аккаунта MAX, дальше пауза: код всего из 6 знаков (аудит Н2)
+BLOCKED = "Слишком много неверных кодов. Попробуйте через час или возьмите новый код у администратора."
+
+
+def _by_code(db: DB, uid: int, code: str, link) -> tuple[object | None, bool]:
+    """(продавец или None, заблокирован ли) — привязка по коду с ограничением неверных попыток."""
+    since = (datetime.now() - timedelta(hours=1)).isoformat(timespec="seconds")
+    if db.one("SELECT COUNT(*) n FROM message_log WHERE kind='bad_code' AND max_user_id=? AND sent_at>=?",
+              uid, since)["n"] >= CODE_TRIES:
+        return None, True
+    linked = link(code, uid)
+    if not linked:
+        db.log_message(date.today().isoformat(), "bad_code", None, uid, "error", code[:20])
+    return linked, False
+
+
 def _extract(u: dict) -> tuple[str, int | None, str]:
     """(тип, user_id, текст/payload) из апдейта MAX. Сообщения из групп и от ботов — без user_id (не отвечаем)."""
     t = u.get("update_type", "")
@@ -93,8 +109,9 @@ def handle(db: DB, cfg: Settings, client: MaxClient, u: dict) -> None:
     is_owner = uid in cfg.max.owners
     reply = linked = None
     if t == "bot_started" and text:
-        linked = db.link_by_code(text, uid)
-        reply = f"Готово, {linked['first_name']}! {HELP}" if linked else "Код не найден. Возьмите новый у администратора."
+        linked, blocked = _by_code(db, uid, text, db.link_by_code)
+        reply = BLOCKED if blocked else f"Готово, {linked['first_name']}! {HELP}" if linked else \
+            "Код не найден. Возьмите новый у администратора."
     elif t == "bot_started":
         reply = HELP if seller or is_owner else "Здравствуйте! Отправьте код, который выдал администратор."
     elif text.lower() in ("/help", "помощь"):
@@ -107,8 +124,9 @@ def handle(db: DB, cfg: Settings, client: MaxClient, u: dict) -> None:
         reply = messages.daily(db, cfg, seller["id"], date.today() - timedelta(days=1)) if seller else \
             "Сначала отправьте код от администратора."
     elif not seller and len(text) == 6:
-        linked = db.link_by_code(text, uid)
-        reply = f"Готово, {linked['first_name']}! {HELP}" if linked else "Код не найден. Возьмите новый у администратора."
+        linked, blocked = _by_code(db, uid, text, db.link_by_code)
+        reply = BLOCKED if blocked else f"Готово, {linked['first_name']}! {HELP}" if linked else \
+            "Код не найден. Возьмите новый у администратора."
     else:
         reply = HELP
     if reply:
@@ -197,8 +215,8 @@ def handle_training(db: DB, cfg: Settings, client: MaxClient, u: dict) -> None:
         return  # /baza или поиск по базе знаний
     linked = None
     if text and (t == "bot_started" or (not seller and len(text) == 6)):
-        linked = db.link_training(text, uid)
-        reply = f"Готово, {linked['first_name']}! {TRAINING_HELP}" if linked else \
+        linked, blocked = _by_code(db, uid, text, db.link_training)
+        reply = BLOCKED if blocked else f"Готово, {linked['first_name']}! {TRAINING_HELP}" if linked else \
             "Код не найден. Нажмите «Подключить обучение» в боте «План» ещё раз."
     elif t == "bot_started" or not seller:
         reply = TRAINING_HELP if seller else "Сначала подключитесь к боту «План» — он пришлёт кнопку для подключения сюда."
@@ -245,7 +263,17 @@ def _failed(db: DB, client: MaxClient, u: dict, err: Exception) -> None:
             log.exception("не удалось сообщить об ошибке")
 
 
-def connect(db: DB, client: MaxClient, bot: str, stop: threading.Event) -> dict | None:
+def commands(cfg: Settings, bot: str) -> list[tuple[str, str]]:
+    """Меню команд (кнопка «/» в MAX). Команды владельца (/svodka, /id) в меню не показываем — оно общее для всех."""
+    if bot == "training":
+        return [("baza", "База знаний: ткани, утеплители, уход"), ("help", "Что умеет бот")]
+    out = [("plan", "Мой план и продажи на сейчас"), ("help", "Что умеет бот")]
+    if not cfg.training_token:  # второго бота нет — база знаний здесь
+        out.insert(1, ("baza", "База знаний: ткани, утеплители, уход"))
+    return out
+
+
+def connect(db: DB, client: MaxClient, bot: str, stop: threading.Event, cfg: Settings | None = None) -> dict | None:
     """GET /me с повторами: нет связи при старте службы — ждём, а не падаем (аудит В5). None — если остановили."""
     backoff = 5
     while not stop.is_set():
@@ -253,6 +281,11 @@ def connect(db: DB, client: MaxClient, bot: str, stop: threading.Event) -> dict 
             me = client.me()
             health.ok(db, bot)
             log.info("MAX bot %s: %s", health.NAMES[bot], me)
+            if cfg:
+                try:
+                    client.set_commands(commands(cfg, bot))
+                except Exception:  # noqa: BLE001 — без меню бот работает, команды можно набрать вручную
+                    log.warning("MAX bot %s: меню команд не задано", health.NAMES[bot], exc_info=True)
             return me
         except MaxAuthError as e:
             log.error("MAX bot %s: %s", health.NAMES[bot], e)
@@ -298,7 +331,7 @@ def poll_forever(db: DB, cfg: Settings, client: MaxClient, stop: threading.Event
 def run(cfg: Settings, db: DB, stop: threading.Event | None = None) -> None:
     stop = stop or threading.Event()
     client = MaxClient(cfg.max_token, cfg.max.base_url, cfg.max.ca_file)
-    if connect(db, client, "plan", stop) is None:
+    if connect(db, client, "plan", stop, cfg) is None:
         return
     training = MaxClient(cfg.training_token, cfg.max.base_url, cfg.max.ca_file) if cfg.training_token else None
     jdb = DB(cfg.db_path)  # у заданий по расписанию своё соединение — не делят транзакцию с опросом (аудит В6)
@@ -351,7 +384,7 @@ def run(cfg: Settings, db: DB, stop: threading.Event | None = None) -> None:
 
 def _training_loop(cfg: Settings, client: MaxClient, stop: threading.Event) -> None:
     tdb = DB(cfg.db_path)
-    if connect(tdb, client, "training", stop) is not None:
+    if connect(tdb, client, "training", stop, cfg) is not None:
         poll_forever(tdb, cfg, client, stop, handle_training, "max_marker_training", "training")
 
 
