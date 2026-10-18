@@ -39,6 +39,9 @@ def main(argv: list[str] | None = None) -> None:
     dr.add_argument("--force", action="store_true", help="не ждать закрытия дня")
     cl = sub.add_parser("close-month", help="итоги месяца и ставки")
     cl.add_argument("month")
+    bt = sub.add_parser("backtest", help="проверка плана на прошлых месяцах: план и факт по продавцам (ничего не пишет)")
+    bt.add_argument("first", help="первый месяц, YYYY-MM")
+    bt.add_argument("last", nargs="?", help="последний месяц (по умолчанию = первый)")
     sub.add_parser("check-max", help="проверить связь с MAX и токены ботов (ничего не отправляет)")
     sub.add_parser("bot", help="запустить бота (long polling + расписание)")
     sv = sub.add_parser("serve", help="бот + админка в одном процессе (для службы Windows)")
@@ -109,6 +112,17 @@ def main(argv: list[str] | None = None) -> None:
         for r in service.close_month(db, cfg, a.month):
             perf = "—" if r["performance"] is None else f"{r['performance']:.0%}"
             print(f"  {r['name']:<28} {r['sales']:>12,.0f}  {perf:>5}  ставка {r['rate']:,.0f}")
+    elif a.cmd == "backtest":
+        from .planning import backtest
+        for m in backtest.months_between(a.first, a.last or a.first):
+            r = backtest.run(db, cfg, m)
+            plan = (r.store.plan or 0) * r.coverage
+            print(f"{m} ({r.source}): план магазинов {plan:,.0f}, факт {r.store_fact:,.0f}, "
+                  f"выполнили план {r.done} из {len(r.rows)}, ставки по схеме {r.rates:,.0f}".replace(",", " "))
+            for x in r.rows:
+                perf = "—" if x.performance is None else f"{x.performance:.0%}"
+                print(f"  {x.name:<28} план {x.plan or 0:>11,.0f}  отработано {x.fte:4.2f}  факт {x.sales:>11,.0f}  "
+                      f"{perf:>5}  ставка {x.rate:,.0f}".replace(",", " "))
     elif a.cmd == "check-max":
         from .max_api import MaxAuthError, MaxClient
         for name, token in (("«План»", os.environ.get("MAX_BOT_TOKEN")), ("«Обучение»", cfg.training_token)):

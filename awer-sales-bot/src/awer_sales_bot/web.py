@@ -22,7 +22,7 @@ from . import tasks as tasks_mod
 from . import crews as crews_mod
 from .config import Settings
 from .db import DB
-from .planning import service
+from .planning import backtest, service
 from .planning.engine import month_add, rate_for, threshold_amounts
 
 def qr_svg(text: str) -> str:
@@ -77,7 +77,7 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
     def page(title: str, body: str) -> HTMLResponse:
         cur = date.today().strftime("%Y-%m")
         nav = (f'<nav><a href="/month/{cur}">Настройки месяца</a><a href="/sellers">Продавцы</a>'
-               f'<a href="/bot">Бот MAX</a><a href="/crews">Смены</a><a href="/learn">Обучение</a><a href="/tasks">Задания</a><a href="/schedule/{cur}">График работы</a><a href="/month/{cur}/results">Итоги и ведомость</a></nav>')
+               f'<a href="/bot">Бот MAX</a><a href="/crews">Смены</a><a href="/learn">Обучение</a><a href="/tasks">Задания</a><a href="/schedule/{cur}">График работы</a><a href="/month/{cur}/results">Итоги и ведомость</a><a href="/check">Проверка плана</a></nav>')
         return HTMLResponse(f"<!doctype html><html lang=ru><head><meta charset=utf-8><title>{title}</title>"
                             f"<style>{CSS}</style></head><body>{nav}{health.line(db, cfg)}<h1>{title}</h1>{body}</body></html>")
 
@@ -234,6 +234,100 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
             raise HTTPException(422, f"{name}: файл не распознан — {e}") from e
         path.replace(archive_name(archive, name))
         return {"lines": rep.lines, "days": rep.days, "unknown_sellers": sorted(rep.unknown_sellers)}
+
+    # ------------------------------------------------------------------ проверка плана на прошлых месяцах
+    def _check_range(frm: str, to: str) -> list[str]:
+        cur = date.today().strftime("%Y-%m")
+        ok = lambda m: len(m) == 7 and m[4] == "-" and m[:4].isdigit() and m[5:].isdigit() and "01" <= m[5:] <= "12"  # noqa: E731
+        frm = frm.strip() if ok(frm.strip()) else month_add(cur, -2)
+        to = to.strip() if ok(to.strip()) else cur
+        return backtest.months_between(min(frm, to), max(frm, to))
+
+    def _pct(x) -> str:
+        return "—" if x is None else f"{x:.0%}"
+
+    @app.get("/check", dependencies=[Depends(auth)])
+    def check_page(frm: str = "", to: str = ""):
+        months = _check_range(frm, to)
+        res = [backtest.run(db, cfg, m) for m in months]
+        p = res[-1].params
+        b = ['<p>Какой план бот поставил бы каждому продавцу на месяц — по данным <b>до начала</b> месяца, как 1-го '
+             'числа, — и сколько продавец продал на самом деле. Ничего не сохраняется и никому не отправляется.</p>',
+             f'<p class=note>По нынешним правилам: норма {cfg.norm_shifts} рабочих дней, каждые +{p.step:.0%} сверх '
+             f'плана — +{_rub(p.step_bonus)} ₽ к ставке {_rub(p.base_rate)} ₽, максимум {_rub(p.max_rate)} ₽, старшим '
+             f'+{_rub(p.admin_bonus)} ₽. Факт — из 1С, а за месяцы без выгрузки 1С — из ведомостей зарплаты. '
+             'Выполнение считается на отработанное время: (продажи ÷ доля отработанного) ÷ план.</p>',
+             f'<form method=get action="/check">С <input type=text name=frm value="{months[0]}" style="width:80px"> '
+             f'по <input type=text name=to value="{months[-1]}" style="width:80px"> <button class=btn>Показать</button> '
+             f'<a href="/check.xlsx?frm={months[0]}&to={months[-1]}">Скачать в Excel</a></form>',
+             '<h2>Магазины вместе</h2><table><tr><th>Месяц</th><th>Данные</th><th>План магазинов</th><th>Факт</th>'
+             '<th>Факт / план</th><th>Коэф. год к году</th><th>Выполнили план</th><th>Ставки по схеме</th></tr>']
+        for r in res:
+            plan = (r.store.plan or 0) * r.coverage
+            cov = f' <span class=note>({r.coverage:.0%} дней)</span>' if r.coverage < 1 else ""
+            b.append(f'<tr><td>{r.month}</td><td>{r.source}{cov}</td><td class=n>{_rub(plan or None)}</td>'
+                     f'<td class=n>{_rub(r.store_fact or None)}</td>'
+                     f'<td class=n>{_pct(r.store_fact / plan if plan and r.store_fact else None)}</td>'
+                     f'<td class=n>{"—" if r.store.trend is None else f"{r.store.trend:.3f}".replace(".", ",")}</td>'
+                     f'<td class=n>{r.done} из {len(r.rows)}</td><td class=n>{_rub(r.rates or None)}</td></tr>')
+        b.append('</table><p class=note>План магазинов при неполном месяце — пропорционально дням с выгрузкой. '
+                 'Ставки по схеме — сумма ставок продавцов за отработанное время, без процента от продаж.</p>')
+        sids = sorted({x.seller_id: x for r in res for x in r.rows}.values(), key=lambda x: (x.role != "admin", x.name))
+        if sids:
+            b.append('<h2>Выполнение плана по продавцам</h2><table><tr><th>Продавец</th>' +
+                     "".join(f'<th>{r.month}</th>' for r in res) + '</tr>')
+            for x in sids:
+                cells = []
+                for r in res:
+                    y = next((z for z in r.rows if z.seller_id == x.seller_id), None)
+                    ok = y is not None and y.performance is not None and y.performance >= 1
+                    cells.append(f'<td class="n{" ok" if ok else ""}">{_pct(y.performance) if y else ""}</td>')
+                b.append(f'<tr><td>{html.escape(x.name)}</td>{"".join(cells)}</tr>')
+            b.append('</table>')
+        how = {"personal": "по личной истории", "newcomer": "новичок", "none": "плана нет"}
+        for r in res:
+            b.append(f'<h2>{r.month}</h2>')
+            if not r.rows:
+                b.append('<p class=note>Нет данных о продажах за этот месяц — загрузите выгрузку 1С.</p>')
+                continue
+            b.append('<table><tr><th>Продавец</th><th>Как считали план</th><th>План (полный мес.)</th>'
+                     '<th>Отработано</th><th>План на отработанное</th><th>Факт</th><th>Факт − план</th>'
+                     '<th>Выполнение</th><th>Ставка</th></tr>')
+            for x in r.rows:
+                worked = f"{x.days} раб. дн." if x.days is not None else f"{x.fte:.2f} ставки".replace(".", ",")
+                diff = x.sales - x.plan_worked if x.plan_worked else None
+                role = ' <span class=note>старший</span>' if x.role == "admin" else ""
+                b.append(f'<tr><td>{html.escape(x.name)}{role}</td><td>{how.get(x.method, x.method)}</td>'
+                         f'<td class=n>{_rub(x.plan)}</td><td class=n>{worked}</td><td class=n>{_rub(x.plan_worked)}</td>'
+                         f'<td class=n>{_rub(x.sales)}</td>'
+                         f'<td class=n>{"" if diff is None else ("+" if diff > 0 else "") + _rub(diff)}</td>'
+                         f'<td class=n>{_pct(x.performance)}</td><td class=n>{_rub(x.rate)}</td></tr>')
+            b.append('</table>')
+        return page("Проверка плана на прошлых месяцах", "".join(b))
+
+    @app.get("/check.xlsx", dependencies=[Depends(auth)])
+    def check_xlsx(frm: str = "", to: str = ""):
+        months = _check_range(frm, to)
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Магазины"
+        ws.append(["Месяц", "Данные", "Доля дней", "План магазинов", "Факт", "Коэф. год к году", "Выполнили план",
+                   "Продавцов", "Ставки по схеме"])
+        for m in months:
+            r = backtest.run(db, cfg, m)
+            ws.append([m, r.source, r.coverage, (r.store.plan or 0) * r.coverage or None, r.store_fact or None,
+                       r.store.trend, r.done, len(r.rows), r.rates or None])
+            d = wb.create_sheet(m)
+            d.append(["Продавец", "Роль", "Как считали план", "План (полный мес.)", "Рабочих дней", "Отработано (доля)",
+                      "План на отработанное", "Факт", "Факт − план", "Выполнение", "Ступеней", "Ставка (полный мес.)"])
+            for x in r.rows:
+                d.append([x.name, x.role, x.method, x.plan, x.days, x.fte, x.plan_worked, x.sales,
+                          x.sales - x.plan_worked if x.plan_worked else None, x.performance, x.steps, x.rate])
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        return StreamingResponse(buf, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                 headers={"Content-Disposition": f"attachment; filename=check_{months[0]}_{months[-1]}.xlsx"})
 
     # ------------------------------------------------------------------ бот MAX: токены, ссылки, владелец
     def _client(token: str):
