@@ -86,7 +86,8 @@ def rules(db: DB, cfg: Settings, sid: int, st: Status, day: date) -> list[tuple[
 
     # 6. Всё хорошо
     if not out and st.performance and st.performance >= 1:
-        out.append((10, "Отличный темп! Держите его — следующая ступень уже близко."))
+        out.append((10, "Отличный темп! Держите его — следующая ступень уже близко." if st.next_level else
+                        "Отличный темп — вы на максимальной ступени. Держите его до конца месяца."))
     return sorted(out, key=lambda x: -x[0])
 
 

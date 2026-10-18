@@ -110,9 +110,9 @@ def test_owner_praise(env, tmp_path):  # noqa: F811
     assert goals.monday(oct_day(11)).isoformat() == "2026-10-05"
 
 
-def test_store_goal_and_example_config_keeps_no_seller(env, tmp_path):  # noqa: F811
+def test_store_plan_only_for_owner_and_example_config_keeps_no_seller(env, tmp_path):  # noqa: F811
     from awer_sales_bot import config
-    from awer_sales_bot.messages import store_goal
+    from awer_sales_bot.messages import owner_summary, store_goal
     cfg, db = env
     assert store_goal(db, cfg, oct_day(10)) == []  # план не зафиксирован — молчим
     mp = service.freeze(db, cfg, "2026-10")
@@ -121,8 +121,11 @@ def test_store_goal_and_example_config_keeps_no_seller(env, tmp_path):  # noqa: 
     line = store_goal(db, cfg, oct_day(10))[0]
     assert line.startswith("Магазины вместе: 1 121 090 ₽ из 5 605 452 ₽ — 20% плана, прошло 10 из 31 дня")
     assert mp.store.plan == pytest.approx(5_605_452, abs=1)
-    cfg.motivation.store_goal_reward = "общий ужин команды"
-    assert store_goal(db, cfg, oct_day(10))[1] == "Если магазины выполнят план: общий ужин команды"
+    sid = db.seller_id("Продавец04", create=False)
+    seller_text = daily(db, cfg, sid, oct_day(2))
+    assert "Магазины вместе" not in seller_text  # продавцу — только личное
+    assert "**Ваш план на октябрь**" in seller_text and "**Ваши показатели с начала месяца**" in seller_text
+    assert "Магазины вместе: 1 121 090 ₽" in owner_summary(db, cfg, oct_day(10))
 
     ex = config.load(Path(__file__).parents[1] / "config.example.yaml")
     assert "" not in ex.onec.exclude_sellers and ex.motivation.records and ex.training.onboarding_shifts == 10
@@ -372,3 +375,12 @@ def test_owner_praise_button(env, tmp_path, monkeypatch):  # noqa: F811
         assert client.answers[-1][1] == expect
     assert db.one("SELECT text FROM message_log WHERE kind='praise'")["text"].startswith(
         "👏 Владелец отметил ваш результат за 12.10: Личный рекорд: 60 000 ₽")
+
+
+def test_max_step_tip_does_not_promise_next_step(env, tmp_path):  # noqa: F811
+    cfg, db = env
+    service.freeze(db, cfg, "2026-10")
+    sid = db.seller_id("Продавец04", create=False)
+    import_file(write_sales(tmp_path / "s.csv", [(oct_day(i), "Продавец04", 80_000, 8) for i in range(1, 6)]), db, cfg)
+    text = daily(db, cfg, sid, oct_day(5))
+    assert "Максимальная ступень достигнута" in text and "следующая ступень уже близко" not in text
