@@ -2,7 +2,7 @@
 
 Привязка продавца: админка/CLI выдаёт код (или ссылку max.ru/<бот>?start=<код>), продавец
 отправляет код боту → его user_id записывается в sellers.max_user_id.
-Команды продавца: /plan — статус на сейчас, /help. Владелец (max.owners): /svodka.
+Команды продавца: /plan — статус на сейчас, /help. Владелец (max.owners): /svodka. Всем: /id — свой user_id.
 Кнопки (message_callback): ответы на квиз после урока недели, «Похвалить» в сводке владельца — quiz.py.
 """
 from __future__ import annotations
@@ -85,6 +85,8 @@ def handle(db: DB, cfg: Settings, client: MaxClient, u: dict) -> None:
         reply = HELP if seller or is_owner else "Здравствуйте! Отправьте код, который выдал администратор."
     elif text.lower() in ("/help", "помощь"):
         reply = HELP
+    elif text.lower() == "/id":  # владельцу при настройке: user_id для max.owners
+        reply = f"Ваш user_id в MAX: {uid}"
     elif text.lower() in ("/svodka", "сводка") and is_owner:
         reply = messages.owner_summary(db, cfg, date.today() - timedelta(days=1))
     elif text.lower() in ("/plan", "план"):

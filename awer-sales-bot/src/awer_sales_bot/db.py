@@ -19,7 +19,9 @@ CREATE TABLE IF NOT EXISTS sellers (
     active INTEGER NOT NULL DEFAULT 1,
     first_name TEXT,                      -- обращение в сообщениях
     max_user_id INTEGER UNIQUE,           -- кому отправлять в MAX
-    invite_code TEXT UNIQUE
+    invite_code TEXT UNIQUE,
+    hired_at TEXT,                        -- добавлен в админке (YYYY-MM-DD); из 1С — пусто, первая смена по продажам
+    fired_at TEXT                         -- уволен (YYYY-MM-DD): active=0, отвязан от MAX
 );
 CREATE TABLE IF NOT EXISTS seller_aliases (     -- другие написания в 1С / ведомостях
     alias TEXT PRIMARY KEY,
@@ -182,6 +184,15 @@ class DB:
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.execute("PRAGMA journal_mode=WAL")  # бот и админка работают с базой одновременно
         self.conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Новые колонки в базах, созданных раньше (CREATE TABLE IF NOT EXISTS их не добавляет)."""
+        have = {r["name"] for r in self.conn.execute("PRAGMA table_info(sellers)")}
+        for col in ("hired_at", "fired_at"):
+            if col not in have:
+                self.conn.execute(f"ALTER TABLE sellers ADD COLUMN {col} TEXT")
+        self.conn.commit()
 
     @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:
@@ -233,7 +244,34 @@ class DB:
         return self.one("SELECT * FROM sellers WHERE id=?", sid)
 
     def seller_by_user(self, user_id: int) -> sqlite3.Row | None:
-        return self.one("SELECT * FROM sellers WHERE max_user_id=?", user_id)
+        return self.one("SELECT * FROM sellers WHERE max_user_id=? AND active=1", user_id)
+
+    def add_seller(self, name: str, first_name: str | None = None, role: str = "seller") -> int:
+        """Продавец, добавленный в админке до первой выгрузки 1С. ValueError — такое имя уже есть."""
+        name = " ".join(name.split())
+        if not name:
+            raise ValueError("Пустое имя")
+        if self.seller_id(name, create=False):
+            raise ValueError(f"«{name}» уже есть в списке")
+        with self.tx() as c:
+            cur = c.execute("INSERT INTO sellers(name, first_name, role, hired_at) VALUES(?,?,?,?)",
+                            (name, first_name or (name.split()[-1] if len(name.split()) > 1 else name), role,
+                             date.today().isoformat()))
+            return cur.lastrowid
+
+    def fire(self, sid: int, day: date | None = None) -> None:
+        """Увольнение: не участвует в планах и рассылке, отвязан от бота. Продажи и итоги остаются."""
+        with self.tx() as c:
+            c.execute("UPDATE sellers SET active=0, fired_at=?, max_user_id=NULL, invite_code=NULL WHERE id=?",
+                      ((day or date.today()).isoformat(), sid))
+
+    def restore(self, sid: int) -> None:
+        with self.tx() as c:
+            c.execute("UPDATE sellers SET active=1, fired_at=NULL WHERE id=?", (sid,))
+
+    def shift_range(self, sid: int) -> tuple[str | None, str | None]:
+        r = self.one("SELECT MIN(day) a, MAX(day) b FROM sales_lines WHERE seller_id=?", sid)
+        return r["a"], r["b"]
 
     def new_invite(self, sid: int) -> str:
         code = secrets.token_hex(3).upper()
@@ -242,7 +280,7 @@ class DB:
         return code
 
     def link_by_code(self, code: str, user_id: int) -> sqlite3.Row | None:
-        r = self.one("SELECT * FROM sellers WHERE invite_code=?", code.strip().upper())
+        r = self.one("SELECT * FROM sellers WHERE invite_code=? AND active=1", code.strip().upper())
         if not r:
             return None
         with self.tx() as c:

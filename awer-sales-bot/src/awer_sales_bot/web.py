@@ -10,6 +10,7 @@ import io
 import os
 import secrets
 from datetime import date, timedelta
+from urllib.parse import quote
 
 import openpyxl
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
@@ -21,6 +22,15 @@ from .db import DB
 from .planning import service
 from .planning.engine import month_add, rate_for, threshold_amounts
 
+def qr_svg(text: str) -> str:
+    """QR-код ссылки на бота — SVG прямо в странице (без картинок и интернета)."""
+    import qrcode
+    import qrcode.image.svg
+
+    img = qrcode.make(text, image_factory=qrcode.image.svg.SvgPathImage, box_size=10)
+    return img.to_string(encoding="unicode")
+
+
 CSS = """
 body{font-family:Arial,sans-serif;margin:24px;color:#1f2328;background:#fff}
 h1{font-size:20px}h2{font-size:16px;margin-top:28px}
@@ -30,6 +40,7 @@ input[type=text],input[type=number]{width:110px;padding:3px;background:#fffbe6;b
 .calc{color:#57606a}.man{font-weight:bold;color:#9a3412}.ok{background:#e6f4ea}
 .btn{padding:6px 14px;margin:6px 6px 6px 0;cursor:pointer}nav a{margin-right:14px}
 .note{color:#57606a;font-size:12px}
+.qr svg{width:260px;height:260px}.code{font-size:22px;letter-spacing:3px}
 """
 
 
@@ -211,36 +222,153 @@ def create_app(cfg: Settings, db: DB) -> FastAPI:
         path.replace(archive / name)
         return {"lines": rep.lines, "days": rep.days, "unknown_sellers": sorted(rep.unknown_sellers)}
 
-    # ------------------------------------------------------------------ продавцы
+    # ------------------------------------------------------------------ продавцы: подключение и увольнение
+    def _date(d: str | None) -> str:
+        return date.fromisoformat(d).strftime("%d.%m.%Y") if d else "—"
+
+    def _role_select(s) -> str:
+        return (f'<select name="role{s["id"]}"><option value=seller {"selected" if s["role"] == "seller" else ""}>'
+                f'продавец</option><option value=admin {"selected" if s["role"] == "admin" else ""}>'
+                'админ (старший)</option></select>')
+
+    def _fire_btn(s) -> str:
+        msg = (f'Уволить {s["name"]}? Бот перестанет присылать сообщения и отвечать ему. '
+               'Продажи этого месяца останутся в итогах и ведомости.')
+        return (f'<button class=btn name=action value="fire:{s["id"]}" '
+                f'onclick="return confirm({html.escape(repr(msg))})">Уволить</button>')
+
     @app.get("/sellers", dependencies=[Depends(auth)])
-    def sellers():
-        b = ['<form method=post action="/sellers"><table><tr><th>Продавец (как в 1С)</th><th>Обращение</th><th>Роль</th>'
-             '<th>Активен</th><th>MAX</th><th>Код привязки</th></tr>']
-        for s in db.sellers(active_only=False):
-            link = f'{cfg.max.bot_link}?start={s["invite_code"]}' if cfg.max.bot_link and s["invite_code"] else ""
-            b.append(
-                f'<tr><td>{html.escape(s["name"])}</td>'
-                f'<td><input type=text name="fn{s["id"]}" value="{html.escape(s["first_name"] or "")}"></td>'
-                f'<td><select name="role{s["id"]}"><option value=seller {"selected" if s["role"] == "seller" else ""}>продавец</option>'
-                f'<option value=admin {"selected" if s["role"] == "admin" else ""}>админ (старший)</option></select></td>'
-                f'<td><input type=checkbox name="act{s["id"]}" {"checked" if s["active"] else ""}></td>'
-                f'<td>{"✅ " + str(s["max_user_id"]) if s["max_user_id"] else "—"}</td>'
-                f'<td>{s["invite_code"] or ""} {("<br><span class=note>" + link + "</span>") if link else ""}'
-                f' <button class=btn name=invite value="{s["id"]}">новый код</button></td></tr>')
-        b.append('</table><button class=btn>Сохранить</button></form>')
-        return page("Продавцы", "".join(b))
+    def sellers(msg: str = ""):
+        rows = db.sellers(active_only=False)
+        waiting = [s for s in rows if s["active"] and not s["max_user_id"]]
+        working = [s for s in rows if s["active"] and s["max_user_id"]]
+        fired = [s for s in rows if not s["active"]]
+        b = [f'<p class=note>{html.escape(msg)}</p>' if msg else "",
+             '<p class=note>Новые продавцы появляются здесь сами, когда впервые встречаются в выгрузке 1С. '
+             'Можно добавить заранее — тогда первый урок программы новичка придёт сразу после подключения к боту.</p>',
+             '<h2>Добавить продавца</h2><form method=post action="/sellers/add"><table>',
+             '<tr><td>Фамилия Имя — точно как в 1С</td><td><input type=text name=name style="width:260px" required></td></tr>',
+             '<tr><td>Обращение в сообщениях</td><td><input type=text name=first_name style="width:260px" placeholder="по умолчанию — имя из 1С"></td></tr>',
+             '<tr><td>Роль</td><td><select name=role><option value=seller>продавец</option>'
+             '<option value=admin>админ (старший)</option></select></td></tr>',
+             '<tr><td>Если в 1С записан по-другому</td><td><input type=text name=alias style="width:260px"></td></tr>',
+             '</table><button class=btn>Добавить и выдать код подключения</button></form>',
+             '<form method=post action="/sellers">',
+             f'<h2>Ждут подключения к боту ({len(waiting)})</h2>']
+        if waiting:
+            b.append('<table><tr><th>Продавец (как в 1С)</th><th>Обращение</th><th>Роль</th><th>Первая смена</th>'
+                     '<th>Код</th><th></th></tr>')
+            for s in waiting:
+                first, _ = db.shift_range(s["id"])
+                code = (f'<a href="/sellers/{s["id"]}/card">{s["invite_code"]} — карточка с QR</a>' if s["invite_code"]
+                        else f'<button class=btn name=action value="invite:{s["id"]}">Выдать код</button>')
+                b.append(f'<tr><td>{html.escape(s["name"])}</td>'
+                         f'<td><input type=text name="fn{s["id"]}" value="{html.escape(s["first_name"] or "")}"></td>'
+                         f'<td>{_role_select(s)}</td><td class=n>{_date(first or s["hired_at"])}</td>'
+                         f'<td>{code}</td><td>{_fire_btn(s)}</td></tr>')
+            b.append('</table>')
+        else:
+            b.append('<p class=note>Все работающие продавцы подключены.</p>')
+        b.append(f'<h2>Работают ({len(working)})</h2>')
+        if working:
+            b.append('<table><tr><th>Продавец (как в 1С)</th><th>Обращение</th><th>Роль</th><th>Последняя смена</th>'
+                     '<th>MAX</th><th></th></tr>')
+            for s in working:
+                _, last = db.shift_range(s["id"])
+                b.append(f'<tr><td>{html.escape(s["name"])}</td>'
+                         f'<td><input type=text name="fn{s["id"]}" value="{html.escape(s["first_name"] or "")}"></td>'
+                         f'<td>{_role_select(s)}</td><td class=n>{_date(last)}</td>'
+                         f'<td>✅ подключён <button class=btn name=action value="invite:{s["id"]}" '
+                         'title="Если сменил телефон или аккаунт MAX">Новый код</button></td>'
+                         f'<td>{_fire_btn(s)}</td></tr>')
+            b.append('</table>')
+        if waiting or working:
+            b.append('<button class=btn>Сохранить обращение и роли</button>')
+        b.append(f'<h2>Уволены ({len(fired)})</h2>')
+        if fired:
+            b.append('<table><tr><th>Продавец</th><th>Уволен</th><th>Последняя смена</th><th></th></tr>')
+            for s in fired:
+                _, last = db.shift_range(s["id"])
+                b.append(f'<tr><td>{html.escape(s["name"])}</td><td class=n>{_date(s["fired_at"])}</td>'
+                         f'<td class=n>{_date(last)}</td><td><button class=btn name=action '
+                         f'value="restore:{s["id"]}">Вернуть на работу</button></td></tr>')
+            b.append('</table>')
+        b.append('</form><p class=note>Уволенный не получает сообщений, не участвует в планах и целях со следующего '
+                 'дня; его продажи остаются в выторге магазина, а за текущий месяц — в итогах и ведомости.</p>')
+        return page("Продавцы: подключение и увольнение", "".join(b))
 
     @app.post("/sellers", dependencies=[Depends(auth)])
     async def sellers_save(request: Request):
         form = await request.form()
-        if form.get("invite"):
-            db.new_invite(int(form["invite"]))
+        action = str(form.get("action") or "")
+        if ":" in action:
+            what, sid = action.split(":", 1)
+            sid = int(sid)
+            s = db.seller(sid)
+            if not s:
+                raise HTTPException(404)
+            if what == "invite":
+                db.new_invite(sid)
+                return RedirectResponse(f"/sellers/{sid}/card", status_code=303)
+            if what == "fire":
+                db.fire(sid)
+                return RedirectResponse(f"/sellers?msg={quote(s['name'] + ' уволен(а), бот отключён')}", status_code=303)
+            if what == "restore":
+                db.restore(sid)
+                db.new_invite(sid)
+                return RedirectResponse(f"/sellers/{sid}/card", status_code=303)
         with db.tx() as c:
-            for s in db.sellers(active_only=False):
+            for s in db.sellers():
                 sid = s["id"]
-                c.execute("UPDATE sellers SET first_name=?, role=?, active=? WHERE id=?",
-                          (form.get(f"fn{sid}") or s["first_name"], form.get(f"role{sid}", s["role"]),
-                           1 if form.get(f"act{sid}") else 0, sid))
-        return RedirectResponse("/sellers", status_code=303)
+                role = form.get(f"role{sid}", s["role"])
+                c.execute("UPDATE sellers SET first_name=?, role=? WHERE id=?",
+                          (form.get(f"fn{sid}") or s["first_name"], role if role in ("seller", "admin") else s["role"],
+                           sid))
+        return RedirectResponse("/sellers?msg=" + quote("Сохранено"), status_code=303)
+
+    @app.post("/sellers/add", dependencies=[Depends(auth)])
+    def sellers_add(name: str = Form(...), first_name: str = Form(""), role: str = Form("seller"),
+                    alias: str = Form("")):
+        try:
+            sid = db.add_seller(name, first_name.strip() or None, role if role in ("seller", "admin") else "seller")
+        except ValueError as e:
+            return RedirectResponse("/sellers?msg=" + quote(f"Не добавлен: {e}. Если он уволен — «Вернуть на работу»."),
+                                    status_code=303)
+        alias = " ".join(alias.split())
+        if alias and not db.seller_id(alias, create=False):
+            with db.tx() as c:
+                c.execute("INSERT INTO seller_aliases(alias, seller_id) VALUES(?,?)", (alias, sid))
+        db.new_invite(sid)
+        return RedirectResponse(f"/sellers/{sid}/card", status_code=303)
+
+    @app.get("/sellers/{sid}/card", dependencies=[Depends(auth)])
+    def seller_card(sid: int):
+        s = db.seller(sid)
+        if not s:
+            raise HTTPException(404)
+        name = html.escape(s["first_name"] or s["name"])
+        if s["max_user_id"]:
+            body = (f'<p>✅ <b>{html.escape(s["name"])}</b> подключён к боту. Утром после следующей смены придёт первое '
+                    'сообщение.</p><p><a href="/sellers">← к списку продавцов</a></p>')
+            return page(f"Подключение: {html.escape(s['name'])}", body)
+        if not s["active"] or not s["invite_code"]:
+            return RedirectResponse("/sellers", status_code=303)
+        code = s["invite_code"]
+        b = [f'<p>Покажите эту страницу продавцу <b>{name}</b> или распечатайте её.</p>']
+        if cfg.max.bot_link:
+            link = f"{cfg.max.bot_link}?start={code}"
+            b += [f'<div class=qr>{qr_svg(link)}</div>',
+                  '<ol><li>Наведите камеру телефона на QR-код (или откройте ссылку ниже).</li>',
+                  '<li>Откроется бот в MAX — нажмите «Начать».</li>',
+                  f'<li>Бот ответит «Готово, {name}!» — подключение закончено.</li></ol>',
+                  f'<p class=note>Ссылка: {html.escape(link)}</p>',
+                  f'<p>Если QR-код не открывается — найдите бота в MAX и отправьте ему код <b class=code>{code}</b>.</p>']
+        else:
+            b += ['<ol><li>Откройте в MAX бота магазина.</li>',
+                  f'<li>Отправьте ему код <b class=code>{code}</b>.</li>',
+                  f'<li>Бот ответит «Готово, {name}!» — подключение закончено.</li></ol>',
+                  '<p class=note>Чтобы здесь был QR-код, впишите ссылку на бота в config.yaml → max.bot_link.</p>']
+        b.append('<p><a href="">Проверить, подключился ли</a> · <a href="/sellers">← к списку продавцов</a></p>')
+        return page(f"Подключение: {html.escape(s['name'])}", "".join(b))
 
     return app

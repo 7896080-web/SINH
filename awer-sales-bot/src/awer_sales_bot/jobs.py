@@ -75,7 +75,15 @@ def daily_run(db: DB, cfg: Settings, sender: Sender, today: date | None = None, 
         if rep.unknown_sellers:
             sender.to_owners(day.isoformat(), "unknown_sellers",
                              "Новые продавцы в выгрузке 1С: " + ", ".join(sorted(rep.unknown_sellers)) +
-                             ". Проверьте роль и привязку в админке.")
+                             ". Подключите их к боту: админка → «Продавцы» → «Выдать код».")
+    gone = db.q("SELECT s.name, SUM(l.amount) a FROM sales_lines l JOIN sellers s ON s.id=l.seller_id "
+                "WHERE l.day=? AND s.active=0 AND s.role<>'system' AND l.day>s.fired_at GROUP BY s.id", day.isoformat())
+    if gone:  # уволенный продавец в чеках — скорее всего, в 1С выбран не тот продавец
+        sender.to_owners(day.isoformat(), "fired_sales",
+                         f"В выгрузке 1С за {day:%d.%m} продажи уволенных: " +
+                         ", ".join(f"{r['name']} — {messages.rub(r['a'])}" for r in gone) +
+                         ". Проверьте продавца в документах 1С, иначе эти продажи не попадут в план работающего.",
+                         once=True)
     missing = db.day_closed(day, cfg.stores)
     deadline = datetime.combine(today, datetime.strptime(cfg.schedule.deadline_time, "%H:%M").time())
     if missing and not force and datetime.now() < deadline:

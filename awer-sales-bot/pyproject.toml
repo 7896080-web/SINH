@@ -16,6 +16,7 @@ dependencies = [
   "fastapi>=0.110",
   "uvicorn>=0.27",
   "python-multipart>=0.0.9",
+  "qrcode>=7.4",  # QR-код ссылки на бота в карточке подключения продавца (SVG, без Pillow)
 ]
 
 [project.optional-dependencies]
