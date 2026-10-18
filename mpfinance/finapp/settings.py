@@ -20,6 +20,11 @@ CATALOG_LOADED_AT = "onec_catalog_loaded_at"
 CATALOG_ROWS = "onec_catalog_rows"
 COSTS_LOADED_AT = "onec_costs_loaded_at"
 SYNC_CATALOG_AT = "sync_catalog_loaded_at"
+# Вторая площадка копий: путь в облаке (remote:бакет/папка), итог последней
+# выгрузки и время последней УДАЧНОЙ — по ней видно, сколько суток площадки нет.
+BACKUP_REMOTE = "backup_remote"
+BACKUP_REMOTE_RESULT = "backup_remote_result"
+BACKUP_REMOTE_OK_AT = "backup_remote_ok_at"
 
 
 def get(db: Session, key: str, default: str = "") -> str:

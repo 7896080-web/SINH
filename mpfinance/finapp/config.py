@@ -28,3 +28,7 @@ ONEC_TIMEOUT_MINUTES = int(os.environ.get("MPFIN_ONEC_TIMEOUT_MINUTES", "60"))
 SYNC_DB_PATH = os.environ.get("MPFIN_SYNC_DB", r"C:\sync_admin\sync_admin.db")
 
 BACKUP_DIR = _path("MPFIN_BACKUP_DIR", str(BASE_DIR / "backups"))
+# Вторая площадка копий — rclone (тот же, что у Sync Admin) со СВОИМ конфигом:
+# ключ облака лежит только в нём, в базе — лишь путь в облаке.
+RCLONE_EXE = os.environ.get("MPFIN_RCLONE_EXE", r"C:\sync_admin\tools\rclone.exe")
+RCLONE_CONFIG = os.environ.get("MPFIN_RCLONE_CONFIG", str(BASE_DIR / "rclone.conf"))

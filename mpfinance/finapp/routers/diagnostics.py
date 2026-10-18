@@ -1,12 +1,16 @@
 """«Диагностика»: обмен с 1С (версия обработки, справочник, себестоимость),
 база Sync Admin, фоновые задания, журнал действий."""
+import re
+from datetime import datetime
+
 from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.orm import Session
 
 from finapp.finance import fetch
 from finapp.excel_utils import ExcelReadError, read_upload
-from finapp import backup, catalog, config, onec, settings, syncdb
+from finapp import backup, catalog, config, onec, progress, settings, syncdb
+from finapp.timeutils import now_utc
 from finapp.audit import log_action
 from finapp.database import get_db
 from finapp.deps import get_current_user
@@ -43,7 +47,64 @@ def page(request: Request, db: Session = Depends(get_db), user: User = Depends(g
                  "архив обмена": config.ONEC_ARCHIVE_DIR, "копии базы": config.BACKUP_DIR},
         "sync_status": syncdb.status_text(),
         "freshness": fetch.account_freshness(db),
+        "remote": settings.get(db, settings.BACKUP_REMOTE, ""),
+        "remote_result": settings.get(db, settings.BACKUP_REMOTE_RESULT, ""),
+        "remote_ok_at": settings.get(db, settings.BACKUP_REMOTE_OK_AT, ""),
+        "remote_stale": _remote_stale(db),
+        "rclone_config": config.RCLONE_CONFIG,
     })
+
+
+REMOTE_RE = re.compile(r"^[A-Za-z0-9_-]+:[^\s|\"']*$")
+
+
+def _remote_stale(db) -> bool:
+    """Площадка задана, а удачной выгрузки нет дольше `REMOTE_STALE`."""
+    if not (settings.get(db, settings.BACKUP_REMOTE, "") or "").strip():
+        return False
+    ok_at = settings.get(db, settings.BACKUP_REMOTE_OK_AT, "")
+    if not ok_at:
+        return True
+    try:
+        return now_utc() - datetime.fromisoformat(ok_at) > backup.REMOTE_STALE
+    except ValueError:
+        return True
+
+
+@router.post("/diagnostics/backup-remote")
+def backup_remote(request: Request, remote: str = Form(""), db: Session = Depends(get_db),
+                  user: User = Depends(get_current_user)):
+    value = remote.strip().rstrip("/")
+    if value and not REMOTE_RE.match(value):
+        set_flash(request, "Путь в облаке — вида «selectel:awer-backups/mpfinance» (имя remote из "
+                           "rclone.conf, двоеточие, бакет и папка), без пробелов и кавычек.", "warn")
+        return _back()
+    if settings.put(db, settings.BACKUP_REMOTE, value):
+        log_action(db, user.username, "backup_remote", value or "выключено")
+    db.commit()
+    set_flash(request, ("Вторая площадка: " + value + ". Нажмите «Выгрузить копию сейчас», чтобы проверить.")
+              if value else "Вторая площадка выключена: копии только на диске сервера.", "good")
+    return _back()
+
+
+@router.post("/diagnostics/backup-offsite")
+def backup_offsite(request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    source = backup.newest_local()
+    if source is None:
+        err, source = backup.make_backup_ex()
+        if err:
+            set_flash(request, f"Копия не снята: {err}", "warn")
+            return _back()
+    if not (settings.get(db, settings.BACKUP_REMOTE, "") or "").strip():
+        set_flash(request, "Сначала задайте «Путь в облаке».", "warn")
+        return _back()
+    progress.report(None, None, f"выгрузка {source.name} в облако")
+    problem = backup.offsite(db, source)
+    log_action(db, user.username, "backup_offsite", problem or f"ok: {source.name}")
+    db.commit()
+    set_flash(request, problem or f"Копия {source.name} выгружена в облако и найдена там того же размера.",
+              "warn" if problem else "good")
+    return _back()
 
 
 @router.post("/diagnostics/request/{command}")

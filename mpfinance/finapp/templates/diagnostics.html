@@ -118,6 +118,33 @@
     {% else %}<div class="empty-state">Активных кабинетов с автозагрузкой нет.</div>{% endif %}
 </div>
 
+<div class="card" id="offsite">
+    <h2 style="margin-top:0; font-size:15px;">Вторая площадка копий (облако)</h2>
+    <p class="help-text" style="margin-top:0;">Копия базы снимается раз в сутки на диск сервера ({{ last_backup|local('%d.%m.%Y %H:%M') if last_backup else 'ещё не снималась' }}).
+        Отказ диска унёс бы и базу, и копии — поэтому каждая копия выгружается и в облако, а программа проверяет,
+        что она там есть и того же размера. Ключ облака лежит только в <span class="mono">{{ rclone_config }}</span>
+        (создаётся один раз, см. README, раздел «Копии и восстановление»).</p>
+    <form method="post" action="/diagnostics/backup-remote" class="filters" style="border:none; padding:0;">
+        <div class="field">
+            <label for="remote">Путь в облаке</label>
+            <input type="text" id="remote" name="remote" value="{{ remote }}" placeholder="selectel:awer-backups/mpfinance" style="width:320px;">
+        </div>
+        <div class="field"><label>&nbsp;</label><button type="submit" class="btn">Сохранить</button></div>
+    </form>
+    <form method="post" action="/diagnostics/backup-offsite" class="inline-form" style="margin-top:8px;">
+        <button type="submit" class="btn" {% if not remote %}disabled title="Сначала задайте путь в облаке"{% endif %}>Выгрузить копию сейчас</button>
+    </form>
+    <p style="margin-bottom:0;">
+        {% if not remote %}<span class="badge badge--warn">не задана</span> Копии только на диске сервера.
+        {% elif remote_stale %}<span class="badge badge--warn">внимание</span>
+            {% if remote_ok_at %}Последняя удачная выгрузка {{ remote_ok_at|local('%d.%m.%Y %H:%M') }} — давно.{% else %}Удачной выгрузки ещё не было.{% endif %}
+            {% if remote_result and not remote_result.startswith('ok') %}{{ remote_result }}{% endif %}
+        {% else %}<span class="badge badge--good">ок</span> Последняя удачная выгрузка {{ remote_ok_at|local('%d.%m.%Y %H:%M') }}.
+            {% if remote_result and not remote_result.startswith('ok') %}<span class="help-text">Последняя попытка: {{ remote_result }}</span>{% endif %}
+        {% endif %}
+    </p>
+</div>
+
 <div class="card">
     <h2 style="margin-top:0; font-size:15px;">Фоновые задания</h2>
     {% if stale %}<ul class="check-list">{% for s in stale %}<li><span class="badge badge--bad">внимание</span> {{ s }}</li>{% endfor %}</ul>{% endif %}

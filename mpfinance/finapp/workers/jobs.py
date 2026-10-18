@@ -139,9 +139,16 @@ def job_backup() -> None:
             return   # отметку не трогаем: иначе каждый перезапуск сдвигал бы срок
         if _backup_failed_at is not None and now_utc() - _backup_failed_at < BACKUP_RETRY:
             return
-        err = backup.make_backup()
+        err, path = backup.make_backup_ex()
         _backup_failed_at = now_utc() if err else None
-        beat(db, "backup", not err, err)
+        if err:
+            beat(db, "backup", False, err)
+            return
+        # Сбой второй площадки бэкап не роняет (локальная копия снята и
+        # проверена), но и не глотается: текст — в отметку, её показывает
+        # «Диагностика», и туда же смотрит карточка второй площадки.
+        remote_problem = backup.offsite(db, path)
+        beat(db, "backup", True, remote_problem)
     except Exception as e:                       # noqa: BLE001
         # Любой сбой (не только SQLite: переименование, которое держит
         # антивирус) — пауза BACKUP_RETRY. Без неё повтор шёл каждые 30 с и
