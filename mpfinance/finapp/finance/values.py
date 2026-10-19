@@ -90,7 +90,17 @@ UNIFIED_COLUMNS = (
     Column("acceptance", "Приёмка"),
     Column("deduction", "Прочие удержания"),
     Column("compensation", "Компенсации и доплаты"),
+    # Необязательные — детализация площадки (у WB): без них загрузка работает как
+    # раньше, «реализовано» тогда равно выручке.
+    Column("realized", "Реализовано площадкой (база налога)"),
+    Column("list_price", "Цена до скидки продавца"),
+    Column("acquiring", "Эквайринг (в комиссии)"),
+    Column("fee_pct", "кВВ, %"),
+    Column("charge_kind", "Вид начисления"),
+    Column("warehouse", "Склад"),
 )
+# Поля единой формы, которые читаются как деньги, но в `MONEY_FIELDS` не входят.
+DETAIL_MONEY_FIELDS = ("realized", "list_price", "acquiring")
 
 
 def empty_line() -> dict:
@@ -102,6 +112,11 @@ def empty_line() -> dict:
     }
     for field in MONEY_FIELDS:
         line[field] = 0
+    # Детализация площадки, если она её даёт (`SalesReportLine`): «реализовано»
+    # (база налога; None — равно выручке), цена до скидки продавца, эквайринг,
+    # кВВ в сотых долях, вид начисления, склад.
+    line.update(realized=None, list_price=None, acquiring=None, fee_pct_bp=None,
+                charge_kind="", warehouse="")
     return line
 
 

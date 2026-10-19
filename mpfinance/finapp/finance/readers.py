@@ -100,6 +100,22 @@ def _read_member(name: str, data: bytes) -> list[tuple[str, list[list]]]:
     return _read_xlsx(data)
 
 
+def inner_name(file_bytes: bytes) -> str:
+    """Имя единственной таблицы в архиве (WB кладёт номер отчёта в него) или «»."""
+    if not file_bytes or file_bytes[:2] != b"PK":
+        return ""
+    try:
+        with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
+            if _is_xlsx_zip(zf):
+                return ""
+            names = [i.filename for i in zf.infolist() if not i.is_dir()
+                     and not i.filename.startswith("__MACOSX")
+                     and re.search(r"\.(xlsx|csv)$", i.filename, re.IGNORECASE)]
+    except zipfile.BadZipFile:
+        return ""
+    return names[0] if len(names) == 1 else ""
+
+
 def read_sheets(file_bytes: bytes, filename: str = "") -> list[tuple[str, list[list]]]:
     """Все листы файла: [(имя листа, строки)]. .zip распаковывается (берётся
     первый .xlsx/.csv внутри — так WB отдаёт детализацию)."""

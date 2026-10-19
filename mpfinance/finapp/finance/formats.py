@@ -100,6 +100,9 @@ class ParseResult:
     declared_payout: int | None = None
     # Итог продаж из строки «Итого», когда там выручка, а не выплата.
     declared_revenue: int | None = None
+    # Версия разбора (`SalesReport.parser_version`): у детализации WB с ценой
+    # продавца — `WB_DETAIL_VERSION`.
+    detail_version: int = 0
 
 
 def _norm(text: str) -> str:
@@ -152,6 +155,22 @@ WB_ALIASES = {
     # ровно на неё (на бою: 116,66 / 16 / 79 ₽ — копейка в копейку со сводом).
     "payment_schedule": ("Разовое изменение срока перечисления денежных средств",
                          "payment_schedule", "paymentSchedule"),
+    # Цена и комиссия (сверено 19.10.2026 на отчёте №876850339 построчно, ±1 ₽):
+    # «Вайлдберриз реализовал» = цена продавца × (1 − СПП), К перечислению =
+    # цена продавца × (1 − кВВ − эквайринг). СПП — скидка WB покупателю за счёт
+    # своей комиссии, на выплату продавцу не влияет; поэтому экономика — от цены
+    # продавца, а комиссия — это кВВ («Размер кВВ, %») и эквайринг.
+    "retail_price": ("Цена розничная", "retail_price", "retailPrice"),
+    "price_with_disc": ("Цена розничная с учетом согласованной скидки", "retail_price_withdisc_rub",
+                        "retailPriceWithDisc"),
+    "fee_pct": ("Размер кВВ, %", "commission_percent", "commissionPercent"),
+    "acquiring": ("Компенсация платёжных услуг/Комиссия за интеграцию платёжных сервисов",
+                  "Эквайринг/Комиссии за организацию платежей", "acquiring_fee", "acquiringFee"),
+    # Вид начисления: доставка «К клиенту при продаже» / «при отмене» (невыкуп),
+    # «WB Продвижение» в удержаниях, причина штрафа.
+    "bonus_type": ("Виды доставок, штрафов и корректировок ВВ", "Виды логистики, штрафов и корректировок ВВ",
+                   "Обоснование штрафов и доплат", "bonus_type_name", "bonusTypeName"),
+    "warehouse": ("Склад", "office_name", "officeName"),
     "barcode": ("Баркод", "barcode", "sku"),
     "article": ("Артикул поставщика", "Артикул продавца", "sa_name", "vendorCode"),
     "nm_id": ("Код номенклатуры", "nm_id", "nmId"),
@@ -209,6 +228,30 @@ def classify_wb(oper: str, doc_type: str) -> str:
     return v.OTHER
 
 
+_DOC_NUMBER_RE = re.compile(r",?\s*документ\s*№\s*\S+\s*$", re.IGNORECASE)
+_DEDUCTION_PARTS = (("wb_correction", "Корректировка ВВ"),
+                    ("loyalty_fee", "Стоимость участия в программе лояльности"),
+                    ("loyalty_points", "Баллы, удержанные по программе лояльности"),
+                    ("payment_schedule", "Разовое изменение срока перечисления"))
+
+
+def _charge_kind(row: Row) -> str:
+    """Вид начисления строки. Номер документа отрезается («Оказание услуг «WB
+    Продвижение», документ №319971361» → без номера): иначе каждая неделя рекламы
+    стала бы своим видом и итог по видам не сложился бы. Удержание без вида —
+    по колонке, из которой оно пришло, если такая одна."""
+    text = _DOC_NUMBER_RE.sub("", row.text("bonus_type")).strip()
+    if text:
+        return text[:128]
+    parts = [label for name, label in _DEDUCTION_PARTS if row.money(name)]
+    return parts[0] if len(parts) == 1 else ""
+
+
+# Версия разбора детализации WB (`SalesReport.parser_version`): 2 — с ценой
+# продавца, кВВ, эквайрингом и видами начислений.
+WB_DETAIL_VERSION = 2
+
+
 def build_wb(row: Row) -> dict:
     line = v.empty_line()
     oper = row.text("oper")
@@ -223,12 +266,26 @@ def build_wb(row: Row) -> dict:
     line["quantity"] = abs(row.quantity("quantity") or 0)
 
     if line["operation"] in v.GOODS_OPERATIONS:
-        line["revenue"] = sign * row.money("retail_amount")
+        # «Вайлдберриз реализовал» — заплатил покупатель (после СПП). Это
+        # «Продажа» свода WB и база налога (владелец, 19.10.2026).
+        line["realized"] = sign * row.money("retail_amount")
         line["payout"] = for_pay
-        # Всё, что площадка взяла с продажи (вознаграждение, платёжные услуги,
-        # ПВЗ), — разница между реализацией и выплатой за товар. При скидках
-        # WB бывает отрицательной: площадка доплачивает скидку из своей комиссии.
+        # Выручка — по цене продавца: от неё WB считает выплату. Нет цены (старый
+        # файл) или штук (коррекция суммой) — как раньше, «реализовано».
+        price = row.money_or_none("price_with_disc")
+        qty = line["quantity"]
+        line["revenue"] = sign * price * qty if price and qty else line["realized"]
+        # Комиссия — всё, что WB взял с цены продавца: кВВ (в нём и СПП, которую WB
+        # отдал покупателю из своей комиссии) и эквайринг.
         line["commission"] = line["revenue"] - line["payout"]
+        if price and qty:
+            list_price = row.money_or_none("retail_price")
+            line["list_price"] = sign * list_price * qty if list_price else None
+            # Проценты читаются денежным разбором: 46,85 → 4685, то есть сотые доли.
+            line["fee_pct_bp"] = row.money_or_none("fee_pct")
+        acquiring = row.money_or_none("acquiring")
+        line["acquiring"] = sign * acquiring if acquiring is not None else None
+        line["warehouse"] = row.text("warehouse")
     else:
         # Выплата без продажи (компенсация ущерба, оплата брака): документ
         # «Продажа» — платят продавцу, «Возврат» — забирают обратно.
@@ -242,6 +299,8 @@ def build_wb(row: Row) -> dict:
                          + row.money("payment_schedule")
                          + sign * (row.money("loyalty_fee") + row.money("loyalty_points")))
     line["compensation"] += row.money("additional_old")
+
+    line["charge_kind"] = _charge_kind(row)
 
     line["operation_date"] = row.date("sale_date") or row.date("rr_date")
     line["order_date"] = row.date("order_date")
@@ -711,8 +770,14 @@ def build_unified(row: Row) -> dict:
         line["commission"] = -abs(line["commission"])
     if operation in v.GOODS_OPERATIONS and not row.has("commission"):
         line["commission"] = line["revenue"] - line["payout"]
-    for text_field in ("order_id", "srid", "barcode", "article", "platform_sku", "name", "size"):
+    for text_field in ("order_id", "srid", "barcode", "article", "platform_sku", "name", "size",
+                       "charge_kind", "warehouse"):
         line[text_field] = row.text(text_field)
+    for name in v.DETAIL_MONEY_FIELDS:
+        value = row.money_or_none(name)
+        # Возврат — с минусом, как выручка: «реализовано» уменьшает базу налога.
+        line[name] = -abs(value) if value is not None and operation == v.RETURN else value
+    line["fee_pct_bp"] = row.money_or_none("fee_pct")       # 46,85 → 4685, сотые доли
     line["operation_date"] = row.date("operation_date")
     line["order_date"] = row.date("order_date")
     return line
@@ -808,6 +873,8 @@ def parse_sheets(sheets: list[tuple[str, list[list]]], platform: str) -> ParseRe
     _, fmt, sheet_name, rows, header_row, mapping = best
     result.format = fmt
     result.sheet = sheet_name
+    if fmt is WB_FORMAT and "price_with_disc" in mapping:
+        result.detail_version = WB_DETAIL_VERSION
     headers = {name: str(rows[header_row][idx]).strip() for name, idx in mapping.items()}
 
     skipped: dict[str, int] = {}

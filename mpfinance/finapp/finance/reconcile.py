@@ -41,7 +41,9 @@ def _line_tuple(report: SalesReport, line: SalesReportLine):
     return (report.platform, report.account_id, line.operation, line.operation_date, line.uid_1c,
             line.barcode, line.article, line.name, line.size, line.quantity, line.revenue_kop,
             line.commission_kop, line.payout_kop, line.logistics_kop, line.storage_kop,
-            line.penalty_kop, line.acceptance_kop, line.deduction_kop, line.compensation_kop)
+            line.penalty_kop, line.acceptance_kop, line.deduction_kop, line.compensation_kop,
+            line.platform_sku, line.realized_kop, line.list_price_kop, line.acquiring_kop, line.fee_pct_bp,
+            line.charge_kind)
 
 
 def breakdown(db: Session, report: SalesReport) -> tuple[list[OperationRow], Totals]:

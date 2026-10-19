@@ -17,7 +17,7 @@ from finapp.database import get_db
 from finapp.deps import get_current_user
 from finapp.excel_utils import ExcelReadError, build_xlsx_response, read_upload, read_xlsx_rows
 from finapp.finance import charts, fetch, lamoda, repeats, statements, tariffs, values as v
-from finapp.finance.economics import (Filters, Totals, load_lines, platform_summary, trend,
+from finapp.finance.economics import (Filters, Totals, charges_by_kind, load_lines, platform_summary, trend,
                                    unit_economics)
 from finapp.finance.formats import FORMATS
 from finapp.finance.readers import ReportReadError, read_sheets
@@ -186,6 +186,7 @@ def finance_dashboard(
     repeat_groups = repeats.in_period(db, d_from, d_to)
     reports_in_period = db.query(SalesReport).filter(
         SalesReport.period_from <= d_to, SalesReport.period_to >= d_from).count()
+    wb_charges = charges_by_kind(db, Filters(d_from, d_to, "wb")) if "wb" in summary else []
 
     return templates.TemplateResponse(request, "finance_dashboard.html", _ctx(
         request, user, "finance",
@@ -195,6 +196,7 @@ def finance_dashboard(
         tax_modes=TAX_MODES, not_in_1c=not_in_1c, reports_in_period=reports_in_period,
         tax_text=tax_text(settings), tax_effective=effective_rate(settings),
         meter_width=charts.meter_width, stale_fetches=stale_fetches, repeat_groups=repeat_groups,
+        wb_charges=wb_charges,
     ))
 
 
@@ -308,6 +310,9 @@ def reports_upload(
     report = outcome.report
     message = (f"Отчёт загружен: {report.lines_count} строк, период "
                f"{report.period_from:%d.%m.%Y}–{report.period_to:%d.%m.%Y}.")
+    if outcome.enriched:
+        # Отчёт уже был — файл его дополнил; справка и есть главное сообщение.
+        message, outcome.notes = " ".join(outcome.notes), []
     # Предупреждения — раньше справки: сообщение режется по MAX_FLASH_CHARS.
     tail = " ".join(outcome.warnings + outcome.notes)
     set_flash(request, (message + " " + tail).strip(), "warn" if outcome.warnings else "good")
@@ -465,6 +470,13 @@ def report_export(
                 row.append(v.OPERATION_LABELS.get(line.operation, line.operation))
             elif column.field in v.MONEY_FIELDS:
                 row.append(v.kop_to_rub(getattr(line, f"{column.field}_kop")))
+            elif column.field == "realized":
+                row.append(v.kop_to_rub(line.revenue_kop if line.realized_kop is None else line.realized_kop))
+            elif column.field in v.DETAIL_MONEY_FIELDS:
+                value = getattr(line, f"{column.field}_kop")
+                row.append(v.kop_to_rub(value) if value is not None else None)
+            elif column.field == "fee_pct":
+                row.append(line.fee_pct_bp / 100 if line.fee_pct_bp is not None else None)
             else:
                 row.append(getattr(line, column.field))
         row += [line.uid_1c or "", v.kop_to_rub(line.total_kop)]
@@ -541,7 +553,9 @@ def unit_economics_export(
                "Маржинальность от к перечислению, %", "ROI, %",
                "Прибыль на единицу", "Продано без себестоимости, шт", "Нет в 1С",
                "Предмет WB", "Удержано WB с продаж, %", "Комиссия WB FBS сейчас, %",
-               "Комиссия WB FBO сейчас, %", "Комиссия WB FBS до смены, %"]
+               "Комиссия WB FBO сейчас, %", "Комиссия WB FBS до смены, %",
+               "Реализовано площадкой (база налога)", "СПП (скидка площадки покупателю)", "кВВ по отчёту, %",
+               "Эквайринг", "Доставка невыкупа"]
 
     def pct(value):
         return round(value * 100, 2) if value is not None else None
@@ -556,7 +570,9 @@ def unit_economics_export(
                 v.kop_to_rub(t.logistics), v.kop_to_rub(t.storage), v.kop_to_rub(t.other_costs),
                 v.kop_to_rub(t.total_payout), v.kop_to_rub(t.cogs), v.kop_to_rub(t.extra),
                 v.kop_to_rub(t.tax), v.kop_to_rub(t.vat), v.kop_to_rub(t.profit), pct(t.margin), pct(t.roi),
-                v.kop_to_rub(t.profit_per_unit), t.cost_missing_qty, "" if matched else "да"] + wb
+                v.kop_to_rub(t.profit_per_unit), t.cost_missing_qty, "" if matched else "да"] + wb + [
+                v.kop_to_rub(t.realized), v.kop_to_rub(t.spp), pct(t.fee_pct), v.kop_to_rub(t.acquiring),
+                v.kop_to_rub(t.logistics_nonbuyout)]
 
     data = [line(g.title, g.article, g.size, g.color, g.uid_1c,
                  ", ".join(v.PLATFORM_LABELS.get(p, p) for p in sorted(g.platforms)),

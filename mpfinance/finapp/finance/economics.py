@@ -2,13 +2,17 @@
 
 Формула (всё в копейках, по строкам отчётов за период):
 
-    Выручка            = продажи − возвраты (сумма реализации площадки)
+    Выручка            = продажи − возвраты по цене продавца (у WB — «Цена розничная
+                         с учётом согласованной скидки» × кол-во; у остальных —
+                         сумма реализации площадки)
+    Реализовано        = сколько заплатил покупатель (у WB «Вайлдберриз
+                         реализовал» = цена продавца − СПП; у остальных = выручка)
     К перечислению     = выплата за товар − логистика − хранение − штрафы
                          − приёмка − прочие удержания + компенсации
     Себестоимость      = (продано − возвращено) × себестоимость на дату операции
                          (себестоимость 1С в долларах — по курсу ЦБ на ту же дату)
     Доп. расходы       = (продано − возвращено) × расход на единицу (упаковка…)
-    Налог              = ставка × выручка            (УСН «Доходы»)
+    Налог              = ставка × реализовано        (УСН «Доходы»; владелец, 19.10.2026)
                        | ставка × (к перечислению − себестоимость − доп. расходы)
                                                      (УСН «Доходы − расходы»)
     Прибыль            = к перечислению − себестоимость − доп. расходы − налог
@@ -30,6 +34,7 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from finapp.finance import values as v
@@ -84,9 +89,17 @@ class Totals:
     tax: int = 0
     vat: int = 0          # невозвратный НДС (внутри цены продажи)
     extra: int = 0
+    # Детализация площадки (у WB с 19.10.2026; у остальных — нули/равно выручке):
+    realized: int = 0             # «реализовано» — база налога
+    acquiring: int = 0            # эквайринг (внутри комиссии)
+    seller_discount: int = 0      # скидка продавца: «Цена розничная» − цена продавца
+    logistics_nonbuyout: int = 0  # доставка невыкупа: «К клиенту / От клиента при отмене»
+    fee_base: int = 0             # выручка строк, у которых известен кВВ
+    fee_amount: int = 0           # кВВ в рублях по этим строкам
 
     MONEY = ("revenue", "commission", "payout", "logistics", "storage", "penalty", "acceptance",
-             "deduction", "compensation", "cogs", "tax", "vat", "extra")
+             "deduction", "compensation", "cogs", "tax", "vat", "extra", "realized", "acquiring",
+             "seller_discount", "logistics_nonbuyout", "fee_base", "fee_amount")
 
     def add(self, other: "Totals"):
         for name in ("sold_qty", "returned_qty", "cost_missing_qty", "cost_suspicious_qty",
@@ -142,6 +155,16 @@ class Totals:
         return self._ratio(self.platform_costs, self.revenue) if self.revenue > 0 else None
 
     @property
+    def spp(self) -> int:
+        """Скидка площадки покупателю за её счёт (у WB — СПП): цена продавца − реализовано."""
+        return self.revenue - self.realized
+
+    @property
+    def fee_pct(self) -> float | None:
+        """Средний кВВ по отчётам, доля цены продавца (взвешен по выручке)."""
+        return self._ratio(self.fee_amount, self.fee_base) if self.fee_base > 0 else None
+
+    @property
     def profit_per_unit(self) -> int | None:
         return round(self.profit / self.net_qty) if self.net_qty > 0 else None
 
@@ -195,9 +218,11 @@ def apply_tax_and_extra(totals: Totals, settings: FinanceSettings):
     """
     totals.extra = totals.net_qty * settings.extra_cost_kop
     rate = settings.tax_rate / 100
-    totals.vat = _round(Decimal(totals.revenue) * settings.vat_rate / (100 + settings.vat_rate))
+    # База — «реализовано», а не выручка по цене продавца: у WB это «Вайлдберриз
+    # реализовал» (после СПП), «Продажа» свода WB (владелец, 19.10.2026).
+    totals.vat = _round(Decimal(totals.realized) * settings.vat_rate / (100 + settings.vat_rate))
     if settings.tax_mode == "revenue":
-        totals.tax = _round(Decimal(totals.revenue - totals.vat) * rate)
+        totals.tax = _round(Decimal(totals.realized - totals.vat) * rate)
     elif settings.tax_mode == "profit":
         totals.tax = _round(Decimal(totals.total_payout - totals.vat - totals.cogs - totals.extra) * rate)
     else:
@@ -214,9 +239,15 @@ _LINE_COLUMNS = (
     SalesReportLine.payout_kop, SalesReportLine.logistics_kop, SalesReportLine.storage_kop,
     SalesReportLine.penalty_kop, SalesReportLine.acceptance_kop, SalesReportLine.deduction_kop,
     SalesReportLine.compensation_kop,
-    # Последним, за деньгами: `add_line` разбирает первые 19 полей. Артикул
-    # площадки нужен тарифу комиссии WB (`finance/tariffs.py`).
+    # За деньгами: `add_line` разбирает первые 19 полей. Артикул площадки нужен
+    # тарифу комиссии WB (`finance/tariffs.py`).
     SalesReportLine.platform_sku,
+    # Детализация площадки (`add_line`, поля 20–24): «реализовано» — база налога
+    # (у старых строк пусто — равно выручке), цена до скидки продавца, эквайринг,
+    # кВВ, вид начисления.
+    func.coalesce(SalesReportLine.realized_kop, SalesReportLine.revenue_kop),
+    SalesReportLine.list_price_kop, SalesReportLine.acquiring_kop, SalesReportLine.fee_pct_bp,
+    SalesReportLine.charge_kind,
 )
 
 
@@ -299,6 +330,16 @@ SUSPICIOUS_COST_RATIO = 10
 def add_line(totals: Totals, line, cost: int | None):
     (platform, _account, operation, _day, uid, barcode, _art, _name, _size, qty, revenue, commission,
      payout, logistics, storage, penalty, acceptance, deduction, compensation) = line[:19]
+    realized, list_price, acquiring, fee_bp, kind = line[20:25] if len(line) >= 25 else (None,) * 5
+    totals.realized += revenue if realized is None else realized
+    if list_price is not None:
+        totals.seller_discount += list_price - revenue
+    totals.acquiring += acquiring or 0
+    if fee_bp is not None and operation in v.GOODS_OPERATIONS:
+        totals.fee_base += revenue
+        totals.fee_amount += round(revenue * fee_bp / 10000)
+    if logistics and kind and "отмен" in kind.lower():
+        totals.logistics_nonbuyout += logistics
     totals.revenue += revenue
     totals.commission += commission
     totals.payout += payout
@@ -356,7 +397,7 @@ def _allocate(groups: list[Group], unassigned: Totals):
     if not total_weight:
         return False
     for name in ("commission", "payout", "logistics", "storage", "penalty", "acceptance",
-                 "deduction", "compensation", "revenue"):
+                 "deduction", "compensation", "revenue", "realized", "acquiring", "logistics_nonbuyout"):
         amount = getattr(unassigned, name)
         if not amount:
             continue
@@ -422,6 +463,39 @@ def unit_economics(db: Session, filters: Filters, settings: FinanceSettings,
 
     rows.sort(key=lambda g: (g.totals.profit, g.totals.revenue), reverse=True)
     return rows, unassigned, total, bool(allocated)
+
+
+CHARGE_FIELDS = (("logistics", "Доставка"), ("storage", "Хранение"), ("acceptance", "Приёмка и обработка"),
+                 ("deduction", "Удержания"), ("penalty", "Штрафы"))
+
+
+def charges_by_kind(db: Session, filters: Filters) -> list[tuple[str, str, int, int]]:
+    """Расходы площадки по видам: [(статья, вид, строк, сумма)], крупные первыми.
+
+    Вид — «Виды доставок, штрафов и корректировок ВВ» детализации WB: доставка
+    проданного и невыкупа («при отмене» — туда и обратно, продажи нет), реклама
+    «WB Продвижение» в удержаниях, причина штрафа. У строк без вида (отчёт
+    загружен до 19.10.2026 и не дополнен файлом) — как назвала операцию площадка."""
+    L = SalesReportLine
+    query = db.query(L.charge_kind, L.source_operation, func.count(L.id),
+                     *[func.coalesce(func.sum(getattr(L, f"{name}_kop")), 0) for name, _ in CHARGE_FIELDS]) \
+        .join(SalesReport, SalesReport.id == L.report_id) \
+        .filter(L.operation_date >= filters.date_from, L.operation_date <= filters.date_to)
+    if filters.platform:
+        query = query.filter(SalesReport.platform == filters.platform)
+    if filters.account_id:
+        query = query.filter(SalesReport.account_id == filters.account_id)
+    rows: dict[tuple[str, str], list[int]] = {}
+    for kind, source, count, *sums in query.group_by(L.charge_kind, L.source_operation):
+        for (name, label), amount in zip(CHARGE_FIELDS, sums):
+            if amount:
+                key = (label, kind or (f"{source} (вид не указан)" if source else "вид не указан"))
+                row = rows.setdefault(key, [0, 0])
+                row[0] += count
+                row[1] += int(amount)
+    order = [label for _, label in CHARGE_FIELDS]
+    return sorted(((label, kind, n, amount) for (label, kind), (n, amount) in rows.items()),
+                  key=lambda r: (order.index(r[0]), -r[3]))
 
 
 def platform_summary(db: Session, filters: Filters, settings: FinanceSettings,

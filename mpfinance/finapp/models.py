@@ -244,6 +244,10 @@ class SalesReport(Base):
     onec_completed_at = Column(DateTime, nullable=True)
     onec_detail = Column(String(255), nullable=True)     # номера документов или текст ошибки
     onec_lines_sent = Column(Integer, default=0, nullable=False)
+    # Версия разбора детализации: у WB 2 — с ценой продавца, кВВ и видами
+    # начислений (`formats.WB_DETAIL_VERSION`). Отчёт старой версии дополняется
+    # файлом детализации из кабинета, если итоги сошлись (`importer.enrich_report`).
+    parser_version = Column(Integer, default=0, nullable=False, server_default="0")
 
     account = relationship("PlatformAccount")
     lines = relationship("SalesReportLine", back_populates="report",
@@ -289,6 +293,21 @@ class SalesReportLine(Base):
     acceptance_kop = Column(BigInteger, default=0, nullable=False)
     deduction_kop = Column(BigInteger, default=0, nullable=False)
     compensation_kop = Column(BigInteger, default=0, nullable=False)
+    # Детализация WB — то, что объясняет деньги строки (19.10.2026, отчёт №876850339
+    # сверен построчно). У продажи WB выручка `revenue_kop` — по ЦЕНЕ ПРОДАВЦА
+    # («Цена розничная с учётом согласованной скидки» × кол-во): от неё WB считает
+    # выплату, К перечислению = цена × (1 − кВВ − эквайринг). Пусто — площадка
+    # этого не сообщила (другие площадки, старые файлы WB).
+    # «Вайлдберриз реализовал» — сколько заплатил покупатель (цена − СПП, скидка WB
+    # за свой счёт); это «Продажа» свода WB и БАЗА НАЛОГА. Пусто — равна выручке.
+    realized_kop = Column(BigInteger, nullable=True)
+    list_price_kop = Column(BigInteger, nullable=True)      # «Цена розничная» × кол-во — до скидки продавца
+    acquiring_kop = Column(BigInteger, nullable=True)       # эквайринг (входит в комиссию)
+    fee_pct_bp = Column(Integer, nullable=True)             # «Размер кВВ, %» × 100
+    # Вид начисления площадки: у WB «Виды доставок, штрафов и корректировок ВВ»
+    # (К клиенту при продаже / при отмене, WB Продвижение, вид штрафа…).
+    charge_kind = Column(String(128), nullable=True)
+    warehouse = Column(String(128), nullable=True)          # склад продажи («Склад WB» — FBO)
 
     report = relationship("SalesReport", back_populates="lines")
 

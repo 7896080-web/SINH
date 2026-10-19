@@ -196,9 +196,47 @@
         </tbody>
     </table>
     </div>
-    <p class="help-text">Налоги: {{ tax_text }}{% if tax_effective is not none %} — {{ '%.2f'|format(tax_effective)|replace('.', ',') }}% выручки{% endif %}.
+    <p class="help-text">Налоги: {{ tax_text }}{% if tax_effective is not none %} — {{ '%.2f'|format(tax_effective)|replace('.', ',') }}% реализации{% endif %}.
        Настраивается на странице <a href="/finance/costs#settings">«Себестоимость»</a>.</p>
 </div>
+
+{% if wb_charges %}{% set w = summary['wb'] %}
+<div class="card" id="wb-charges">
+    <h2 style="margin-top:0; font-size:15px;">Wildberries: комиссия, доставка и удержания по видам</h2>
+    <p class="help-text" style="margin-top:0;">
+        Выручка WB — по цене продавца ({{ money(w.revenue, true) }}): от неё WB считает выплату.
+        Покупатели заплатили {{ money(w.realized, true) }} — «Вайлдберриз реализовал», с этой суммы налог.
+        {% if w.spp > 0 %}Разница {{ money(w.spp, true) }} ({{ (w.spp / w.revenue) | pct }}) — СПП: скидка WB покупателю
+        из своей комиссии, на выплату продавцу не влияет.{% endif %}
+        {% if w.fee_pct is not none %}Комиссия WB по предметам (кВВ) в среднем {{ w.fee_pct | pct }} цены продавца{% if w.acquiring %},
+        эквайринг {{ money(w.acquiring, true) }}{% endif %}.{% endif %}
+        {% if w.seller_discount > 0 %}Скидка продавца от «Цены розничной» — {{ money(w.seller_discount, true) }}.{% endif %}
+    </p>
+    <div class="table-scroll">
+    <table>
+        <thead><tr><th>Статья</th><th>Вид</th><th class="num">Строк</th><th class="num">Сумма</th><th class="num">Доля статьи</th></tr></thead>
+        <tbody>
+        {% set totals_by = {} %}{% for label, kind, n, amount in wb_charges %}{% set _ = totals_by.update({label: totals_by.get(label, 0) + amount}) %}{% endfor %}
+        {% for label, kind, n, amount in wb_charges %}
+        <tr>
+            <td>{{ label }}</td><td>{{ kind }}</td><td class="num">{{ n }}</td>
+            <td class="num">{{ money(amount, true) }}</td>
+            <td class="num">{{ ((amount / totals_by[label]) if totals_by[label] else none) | pct }}</td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    </div>
+    {% if w.logistics_nonbuyout %}
+    <p class="help-text"><b>Невыкуп:</b> доставка к покупателю и обратно по заказам, которые не выкупили, —
+        {{ money(w.logistics_nonbuyout, true) }}, {{ ((w.logistics_nonbuyout / w.logistics) if w.logistics else none) | pct }} всей доставки.
+        Продажи по ним нет, а доставку WB берёт с продавца.</p>
+    {% endif %}
+    <p class="help-text">Вид берётся из колонки «Виды доставок, штрафов и корректировок ВВ» детализации WB. У отчётов,
+        загруженных до 19.10.2026, вида нет — загрузите их файл детализации из кабинета WB на «Отчётах площадок»:
+        программа сверит итоги с уже загруженным отчётом и дополнит его.</p>
+</div>
+{% endif %}
 
 <div class="two-col">
     <div class="card">

@@ -45,7 +45,7 @@
 
 <p class="help-text">
     Прибыль = к перечислению − себестоимость − доп. расходы ({{ settings.extra_cost_kop | rub }} ₽/шт) − налоги
-    ({{ tax_text }}{% if tax_effective is not none %} — {{ '%.2f'|format(tax_effective)|replace('.', ',') }}% выручки{% endif %}).
+    ({{ tax_text }}{% if tax_effective is not none %} — {{ '%.2f'|format(tax_effective)|replace('.', ',') }}% реализации{% endif %}).
     Себестоимость берётся на дату операции. <a href="/finance/costs#settings">Настройки</a>
 </p>
 
@@ -90,10 +90,11 @@
             <td class="num">{{ money(t.commission, true) }}
                 {% if g.wb_cards or g.wb_revenue %}
                 <div class="help-text">WB удержал {{ g.wb_commission_pct | rate }}</div>
+                {% if t.fee_pct is not none %}<div class="help-text">кВВ по отчёту <b>{{ t.fee_pct | pct }}</b>{% if t.spp > 0 and t.revenue > 0 %}, в нём СПП {{ (t.spp / t.revenue) | pct }}{% endif %}</div>{% endif %}
                 <div class="help-text">{% if g.tariff %}FBS сейчас <b>{{ g.tariff.fbs | rate }}</b>{% if g.tariff.prev_fbs is not none %} (было {{ g.tariff.prev_fbs | rate }}){% endif %}{% elif g.wb_subject %}тарифа по предмету нет{% else %}FBS сейчас: предмет не известен{% endif %}</div>
                 {% if g.wb_subject %}<div class="help-text">{{ g.wb_subject }}</div>{% endif %}
                 {% endif %}</td>
-            <td class="num">{{ money(t.logistics, true) }}</td>
+            <td class="num">{{ money(t.logistics, true) }}{% if t.logistics_nonbuyout %}<div class="help-text">невыкуп {{ money(t.logistics_nonbuyout, true) }}</div>{% endif %}</td>
             <td class="num">{{ money(t.storage, true) }}</td>
             <td class="num">{{ money(t.other_costs, true) }}</td>
             <td class="num">{{ money(t.total_payout, true) }}</td>
@@ -138,10 +139,12 @@
 <p class="help-text">Суммы в таблице округлены до рубля, точные — в выгрузке в Excel.
    «Маржа» — прибыль от суммы к перечислению (не от выручки); где перечислять нечего, её нет.
    «Не привязано к товару» можно разнести по позициям пропорционально выручке — галочкой в фильтре.</p>
-<p class="help-text">WB: «FBS сейчас» — текущая комиссия WB по предмету товара (тарифы WB по API, раз в сутки;
-   «было» — если WB сменил её за последние 30 дней). «WB удержал» — сколько WB фактически взял с продаж за период:
-   туда входят ещё эквайринг, услуги ПВЗ, программа лояльности и продажи со склада WB (там тариф FBO), поэтому
-   числа не обязаны совпадать. Предмет товара берётся из отчётов WB: у позиции, по которой отчёт ещё не
+<p class="help-text">WB: выручка — по цене продавца («Цена розничная с учётом согласованной скидки»), от неё WB
+   считает выплату: к перечислению = цена × (1 − кВВ − эквайринг). Налог — с «Вайлдберриз реализовал» (что заплатил
+   покупатель после СПП). «WB удержал» — комиссия от цены продавца: кВВ и эквайринг. «кВВ по отчёту» — «Размер кВВ, %»
+   из детализации WB; в нём и СПП — скидка, которую WB дал покупателю из своей комиссии. «FBS сейчас» — текущий тариф
+   WB по предмету (по API, раз в сутки; «было» — если WB сменил его за последние 30 дней). «Невыкуп» — доставка к
+   покупателю и обратно по заказам, которые не выкупили. Предмет товара берётся из отчётов WB: у позиции, по которой отчёт ещё не
    загружался после обновления программы, он появится с ближайшим отчётом.</p>
 {% if total.cost_suspicious_qty %}
 <p class="help-text"><span class="badge badge--bad">внимание</span> У {{ total.cost_suspicious_qty }} шт себестоимость больше цены

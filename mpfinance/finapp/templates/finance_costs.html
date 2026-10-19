@@ -147,8 +147,8 @@
                 <input type="text" id="kit_crm_commission" name="FIN_KIT_CRM_COMMISSION" value="{{ raw['FIN_KIT_CRM_COMMISSION'] }}" style="width:80px;">
             </div>
         </div>
-        <p class="help-text" style="margin:6px 0 0;">Сейчас: {{ tax_text }}{% if tax_effective is not none %} — всего {{ '%.2f'|format(tax_effective)|replace('.', ',') }}% выручки{% endif %}.
-            НДС считается внутри цены (из 105 ₽ — 5 ₽), УСН «доходы» — с выручки без НДС.</p>
+        <p class="help-text" style="margin:6px 0 0;">Сейчас: {{ tax_text }}{% if tax_effective is not none %} — всего {{ '%.2f'|format(tax_effective)|replace('.', ',') }}% реализации{% endif %}.
+            НДС считается внутри цены (из 105 ₽ — 5 ₽), УСН «доходы» — с реализации без НДС. Реализация у WB — «Вайлдберриз реализовал» (что заплатил покупатель после скидки WB), а не цена продавца, от которой считается выручка.</p>
         <h3 style="font-size:14px; margin:16px 0 4px;">Склады продаж в 1С (для загрузки отчётов)</h3>
         <p class="help-text" style="margin-top:0;">Точное наименование склада в справочнике «Склады» 1С, с которого списываются
             продажи площадки. Для WB, Ozon и KIT по умолчанию — те же склады, куда приём заказа перемещает товар.

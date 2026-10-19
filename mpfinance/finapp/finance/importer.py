@@ -20,7 +20,7 @@ from finapp import mapping
 from finapp.finance import lamoda, repeats, statements, tariffs, values as v
 from finapp.finance.formats import AWER_CRM_FORMAT, KIT_PAY_FORMAT, ParseResult, apply_commission, parse_sheets
 from finapp.finance.settings import load_settings
-from finapp.finance.readers import ReportReadError, read_sheets
+from finapp.finance.readers import ReportReadError, inner_name, read_sheets
 from finapp.models import OneCUploadStatus, PlatformAccount, SalesReport, SalesReportLine
 
 # Строк в одной пачке IN (...) при сопоставлении баркодов — с запасом под лимит
@@ -38,6 +38,7 @@ class ImportOutcome:
     skipped: bool = False        # такой отчёт уже есть — ничего не записано
     replaced: bool = False       # прежний (ещё не отправленный в 1С) отчёт заменён свежим
     repeat: bool = False         # отказ: эти продажи уже лежат в другом отчёте (`repeats.py`)
+    enriched: bool = False       # уже загруженный отчёт дополнен файлом детализации (`enrich_report`)
     # Еженедельный отчёт Lamoda раскладывается на несколько отчётов (по неделе).
     reports: list[SalesReport] = field(default_factory=list)
     # Не отчёт о продажах, а справочник (партнёрский отчёт Lamoda) — принят, итоги
@@ -63,6 +64,9 @@ def make_onec_key(platform: str, account_id: int | None, report_number: str | No
 
 
 _FILENAME_NUMBER_RE = re.compile(r"№\s*(\d+)")
+# Имя без «№» (браузер или почта заменили его): «…_876850339_72066.zip» — номер
+# отчёта WB из восьми и больше цифр перед «_<код продавца>».
+_FILENAME_WB_NUMBER_RE = re.compile(r"(?<!\d)(\d{8,})_\d+(?:\D|$)")
 
 
 def number_from_filename(filename: str) -> str:
@@ -71,7 +75,7 @@ def number_from_filename(filename: str) -> str:
     отчёта в кабинете. finance-api отдаёт номер отчёта как reportId; если это он
     же (сверить на первом отчёте из API), файл и тот же отчёт из API получат
     один ключ, и второй раз отчёт не загрузится."""
-    match = _FILENAME_NUMBER_RE.search(filename or "")
+    match = _FILENAME_NUMBER_RE.search(filename or "") or _FILENAME_WB_NUMBER_RE.search(filename or "")
     return match.group(1) if match else ""
 
 
@@ -323,7 +327,8 @@ def import_report(db: Session, *, platform: str, file_bytes: bytes, filename: st
             f"В файле несколько номеров отчёта ({', '.join(sorted(parsed.report_numbers)[:5])}) — "
             f"отчёт сохранён по периоду.")
     if not number and not parsed.report_numbers:
-        number = number_from_filename(filename)
+        # WB кладёт номер только в имя файла — и архива, и таблицы внутри него.
+        number = number_from_filename(filename) or number_from_filename(inner_name(file_bytes))
 
     onec_key = make_onec_key(platform, account_id, number, period_from, period_to, parsed.format.code)
     same_key = db.query(SalesReport).filter(SalesReport.onec_key == onec_key).first()
@@ -333,6 +338,12 @@ def import_report(db: Session, *, platform: str, file_bytes: bytes, filename: st
         same_key = db.query(SalesReport).filter(
             SalesReport.onec_key == make_onec_key(platform, account_id, "", period_from, period_to),
             SalesReport.source_format == parsed.format.code).first()
+    if (same_key is not None and platform == "wb" and parsed.detail_version > same_key.parser_version):
+        if account_id is not None and same_key.account_id not in (None, account_id):
+            outcome.errors.append(f"Отчёт №{number} загружен по другому кабинету (#{same_key.id}) — "
+                                  f"выберите тот кабинет или «не указан».")
+            return outcome
+        return enrich_report(db, same_key, parsed, user=user, file_name=filename, sha256=sha256)
     if same_key is not None:
         outcome.errors.append(
             f"Отчёт с тем же {'номером' if number else 'периодом и кабинетом'} уже загружен — "
@@ -431,6 +442,113 @@ def _awer_crm(db: Session, parsed: ParseResult, outcome: ImportOutcome) -> None:
         f"к перечислению {v.format_rub(revenue - commission)} ₽ (ставка — «Себестоимость» → «Настройки»).")
 
 
+def _line_mapping(report_id: int, line: dict, period_to: date) -> dict:
+    """Строка единой формы → поля `SalesReportLine`."""
+    mapping = {
+        "report_id": report_id, "row_no": line.get("row_no"),
+        "operation": line["operation"], "source_operation": line["source_operation"][:128],
+        "operation_date": line["operation_date"] or period_to, "order_date": line["order_date"],
+        "order_id": line["order_id"][:128] or None, "srid": line["srid"][:128] or None,
+        "barcode": line["barcode"][:64] or None, "article": line["article"][:128] or None,
+        "platform_sku": line["platform_sku"][:64] or None, "name": line["name"][:255] or None,
+        "size": line["size"][:64] or None, "quantity": line["quantity"],
+        # «Реализовано» — база налога; у всех, кроме детализации WB, это выручка.
+        "realized_kop": line["revenue"] if line.get("realized") is None else line["realized"],
+        "list_price_kop": line.get("list_price"), "acquiring_kop": line.get("acquiring"),
+        "fee_pct_bp": line.get("fee_pct_bp"),
+        "charge_kind": (line.get("charge_kind") or "")[:128] or None,
+        "warehouse": (line.get("warehouse") or "")[:128] or None,
+    }
+    for name in v.MONEY_FIELDS:
+        mapping[f"{name}_kop"] = line[name]
+    return mapping
+
+
+# Что дополнение отчёта файлом обязано сохранить в точности (`enrich_report`):
+# выплату, все удержания и штуки. Выручка и комиссия меняются — ради этого
+# дополнение и делается.
+_KEPT_FIELDS = ("payout", "logistics", "storage", "penalty", "acceptance", "deduction", "compensation")
+
+
+def _totals_by_goods(lines) -> dict:
+    """(операция, баркод) → [штук, к перечислению] — по продажам и возвратам."""
+    out: dict = {}
+    for op, barcode, qty, payout in lines:
+        if op in v.GOODS_OPERATIONS:
+            row = out.setdefault((op, barcode or ""), [0, 0])
+            row[0] += qty or 0
+            row[1] += payout or 0
+    return out
+
+
+def enrich_report(db: Session, report: SalesReport, parsed: ParseResult, *, user: str,
+                  file_name: str, sha256: str | None) -> ImportOutcome:
+    """Дополнить уже загруженный отчёт WB (по API или старым файлом) файлом
+    детализации из кабинета: цена продавца, кВВ, эквайринг, виды начислений, склад.
+
+    Заново по API не качаем (владелец, 19.10.2026) — берём файл. Строки
+    заменяются ТОЛЬКО если итоги сошлись до копейки: к перечислению и штуки по
+    каждому баркоду продаж и возвратов, все удержания и итог к оплате. Иначе это
+    другой отчёт или другая его версия — не трогаем ничего и называем расхождения.
+    Шапка отчёта (номер, период, статус 1С, ввод оператора) остаётся: в 1С уходят
+    штуки и сумма к перечислению, а они не меняются."""
+    outcome = ImportOutcome()
+    old = db.query(SalesReportLine.operation, SalesReportLine.barcode, SalesReportLine.quantity,
+                   SalesReportLine.payout_kop, *[getattr(SalesReportLine, f"{f}_kop") for f in _KEPT_FIELDS]) \
+        .filter(SalesReportLine.report_id == report.id).all()
+    new = parsed.lines
+    problems = []
+    for i, name in enumerate(_KEPT_FIELDS):
+        was = sum(row[4 + i] or 0 for row in old)
+        now = sum(line[name] for line in new)
+        if was != now:
+            label = dict((c.field, c.header) for c in v.UNIFIED_COLUMNS).get(name, name)
+            problems.append(f"«{label}»: в программе {v.format_rub(was)}, в файле {v.format_rub(now)}")
+    was_goods = _totals_by_goods((r[0], r[1], r[2], r[3]) for r in old)
+    now_goods = _totals_by_goods((l["operation"], l["barcode"], l["quantity"], l["payout"]) for l in new)
+    for key in sorted(set(was_goods) | set(now_goods)):
+        a, b = was_goods.get(key, [0, 0]), now_goods.get(key, [0, 0])
+        if a != b:
+            problems.append(f"{v.OPERATION_LABELS.get(key[0], key[0])} {key[1] or 'без баркода'}: "
+                            f"в программе {a[0]} шт / {v.format_rub(a[1])}, в файле {b[0]} шт / {v.format_rub(b[1])}")
+    if problems:
+        outcome.errors.append(
+            f"Отчёт №{report.report_number} (#{report.id}) уже загружен, а итоги файла с ним не сошлись — "
+            f"ничего не изменено. Расхождения: " + "; ".join(problems[:5])
+            + (f"; и ещё {len(problems) - 5}" if len(problems) > 5 else "") + ".")
+        return outcome
+
+    db.query(SalesReportLine).filter(SalesReportLine.report_id == report.id).delete(synchronize_session=False)
+    db.bulk_insert_mappings(SalesReportLine, [_line_mapping(report.id, line, report.period_to) for line in new])
+    db.flush()
+    report.parser_version = parsed.detail_version
+    report.lines_count = len(new)
+    if sha256 and not report.file_sha256:
+        report.file_sha256 = sha256
+    if report.platform == "wb":
+        tariffs.remember_subjects(db, new)
+    notes: list[str] = []
+    unmatched = resolve_uids(db, report, notes)
+    revenue = sum(l["revenue"] for l in new if l["operation"] in v.GOODS_OPERATIONS)
+    realized = sum(l["realized"] if l["realized"] is not None else l["revenue"]
+                   for l in new if l["operation"] in v.GOODS_OPERATIONS)
+    log_action(db, user, "sales_report_enriched",
+               f"#{report.id} №{report.report_number}: дополнен файлом {file_name[:120]}, строк {len(new)}, "
+               f"выручка по цене продавца {v.format_rub(revenue)}, реализовано {v.format_rub(realized)}")
+    db.commit()
+    db.refresh(report)
+    outcome.report = report
+    outcome.enriched = True
+    outcome.notes.append(
+        f"Отчёт №{report.report_number} уже был загружен — итоги файла сошлись с ним до копейки, и он "
+        f"дополнен из файла: выручка по цене продавца {v.format_rub(revenue)} ₽, «Вайлдберриз реализовал» "
+        f"{v.format_rub(realized)} ₽, кВВ, эквайринг, виды доставок и удержаний.")
+    outcome.warnings.extend(notes)
+    if unmatched:
+        outcome.warnings.append(f"Строк продаж/возвратов без товара 1С: {unmatched}.")
+    return outcome
+
+
 def _store(db: Session, outcome: ImportOutcome, *, platform: str, account_id: int | None,
            parsed: ParseResult, user: str, number: str, period_from: date, period_to: date,
            source: str, file_name: str, file_sha256: str | None, declared_payout: int | None,
@@ -448,24 +566,10 @@ def _store(db: Session, outcome: ImportOutcome, *, platform: str, account_id: in
     db.add(report)
     db.flush()
 
-    outside = 0
-    mappings = []
-    for line in lines:
-        op_date = line["operation_date"] or period_to
-        if not (period_from <= op_date <= period_to):
-            outside += 1
-        mapping = {
-            "report_id": report.id, "row_no": line.get("row_no"),
-            "operation": line["operation"], "source_operation": line["source_operation"][:128],
-            "operation_date": op_date, "order_date": line["order_date"],
-            "order_id": line["order_id"][:128] or None, "srid": line["srid"][:128] or None,
-            "barcode": line["barcode"][:64] or None, "article": line["article"][:128] or None,
-            "platform_sku": line["platform_sku"][:64] or None, "name": line["name"][:255] or None,
-            "size": line["size"][:64] or None, "quantity": line["quantity"],
-        }
-        for name in v.MONEY_FIELDS:
-            mapping[f"{name}_kop"] = line[name]
-        mappings.append(mapping)
+    report.parser_version = parsed.detail_version
+    outside = sum(1 for line in lines
+                  if not (period_from <= (line["operation_date"] or period_to) <= period_to))
+    mappings = [_line_mapping(report.id, line, period_to) for line in lines]
     progress.report(None, None, f"запись строк в базу: {len(mappings)}")
     db.bulk_insert_mappings(SalesReportLine, mappings)
     db.flush()

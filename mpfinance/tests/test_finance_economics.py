@@ -122,7 +122,8 @@ def test_usn_income_with_non_refundable_vat_inside_the_price(db):
     assert t.tax == 11905                        # (250000 − 11905) · 5% = 11904,75
     assert t.profit == 210000 - 100000 - 11905 - 11905
     assert round(effective_rate(settings), 2) == Decimal("9.52")
-    assert tax_text(settings) == "УСН «доходы» 5% от выручки без НДС + НДС 5% внутри цены, невозвратный"
+    assert tax_text(settings) == ("УСН «доходы» 5% от реализации без НДС + НДС 5% внутри цены, невозвратный"
+                                  " (реализация у WB — «Вайлдберриз реализовал»)")
 
 
 def test_unassigned_costs_shown_separately_or_allocated_to_the_kopeck(db):

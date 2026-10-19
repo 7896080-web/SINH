@@ -120,16 +120,21 @@ def tax_text(settings: FinanceSettings) -> str:
         return f"{value.normalize():f}".replace(".", ",") + "%"
     parts = []
     if settings.tax_mode == "revenue":
-        parts.append(f"УСН «доходы» {pct(settings.tax_rate)}" + (" от выручки без НДС" if settings.vat_rate else " от выручки"))
+        parts.append(f"УСН «доходы» {pct(settings.tax_rate)}"
+                     + (" от реализации без НДС" if settings.vat_rate else " от реализации"))
     elif settings.tax_mode == "profit":
         parts.append(f"УСН «доходы − расходы» {pct(settings.tax_rate)} от прибыли до налога")
     if settings.vat_rate:
         parts.append(f"НДС {pct(settings.vat_rate)} внутри цены, невозвратный")
-    return " + ".join(parts) if parts else "налог не учитывается"
+    if not parts:
+        return "налог не учитывается"
+    # Реализация — сколько заплатил покупатель: у WB «Вайлдберриз реализовал»
+    # (после скидки WB), а не цена продавца, от которой считается выручка.
+    return " + ".join(parts) + " (реализация у WB — «Вайлдберриз реализовал»)"
 
 
 def effective_rate(settings: FinanceSettings) -> Decimal | None:
-    """Доля выручки, уходящая в налоги при УСН «доходы» (с НДС внутри цены).
+    """Доля реализации, уходящая в налоги при УСН «доходы» (с НДС внутри цены).
     Для «доходы − расходы» от выручки не считается — None."""
     vat_share = settings.vat_rate / (100 + settings.vat_rate)
     if settings.tax_mode == "revenue":
