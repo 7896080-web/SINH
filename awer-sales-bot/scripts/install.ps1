@@ -368,8 +368,10 @@ foreach ($name in $Admins) {
 $desk = [Environment]::GetFolderPath("CommonDesktopDirectory")
 if ($desk) {
     $url = Join-Path $desk "AWER — админка.url"
-    [System.IO.File]::WriteAllLines($url, @("[InternetShortcut]", "URL=http://127.0.0.1:$Port/"),
-        (New-Object System.Text.UTF8Encoding($false)))
+    $ico = Join-Path $App "scripts\awer.ico"  # значок AWER (scripts/make_icon.py); нет файла — значок браузера
+    $lines = @("[InternetShortcut]", "URL=http://127.0.0.1:$Port/")
+    if (Test-Path $ico) { $lines += @("IconFile=$ico", "IconIndex=0") }
+    [System.IO.File]::WriteAllLines($url, $lines, (New-Object System.Text.UTF8Encoding($false)))
     Note "ярлык на рабочем столе: «AWER — админка»"
 }
 
