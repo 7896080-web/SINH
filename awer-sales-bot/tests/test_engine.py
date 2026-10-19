@@ -64,7 +64,8 @@ def test_backtest_august_admin(hist):
     x = hist.get("2026-08", "Админ2")
     r = evaluate(x.sales, x.fte, plan, "admin")
     assert r.performance == pytest.approx(1.324, abs=0.001)
-    assert r.rate == 53_000  # 25 000 + 3 шага, + 13 000 доплата
+    assert r.rate == 48_000  # 25 000 + 2 шага (115 %, 130 %), + 13 000 доплата
+    assert evaluate(x.sales, x.fte, plan, "admin", Params(step=0.10)).rate == 53_000  # при шаге 10 % было 3 шага
 
 
 def test_backtest_september_no_bonus(hist):
@@ -75,12 +76,13 @@ def test_backtest_september_no_bonus(hist):
     assert r.steps == 0 and r.rate == 38_000
 
 
-def test_steps_edges():
+def test_steps_edges():  # шаг 15 % — решение владельца 19.10.2026
     assert steps_for(0.95) == 0
-    assert steps_for(1.0999) == 0
-    assert steps_for(1.10) == 1  # ровно +10 % — шаг засчитан
-    assert steps_for(1.2) == 2
-    assert steps_for(5.0) == 40  # ставку ограничивает max_rate, не steps_for
+    assert steps_for(1.1499) == 0
+    assert steps_for(1.15) == 1  # ровно +15 % — шаг засчитан
+    assert steps_for(1.30) == 2 and steps_for(1.45) == 3 and steps_for(1.60) == 4
+    assert steps_for(5.0) == 26  # ставку ограничивает max_rate, не steps_for
+    assert steps_for(1.10, Params(step=0.10)) == 1  # шаг меняется в настройках месяца
 
 
 def test_rate_cap_and_stabilizer():
@@ -94,8 +96,8 @@ def test_rate_cap_and_stabilizer():
 def test_thresholds():
     t = threshold_amounts(500_000)
     assert t[0] == (500_000, 25_000)
-    assert t[1][0] == pytest.approx(550_000) and t[1][1] == 30_000
-    assert t[-1][1] == 45_000
+    assert t[1][0] == pytest.approx(575_000) and t[1][1] == 30_000
+    assert t[-1] == (pytest.approx(800_000), 45_000)  # 160 % — максимум
 
 
 def test_manual_trend_and_plan(hist):

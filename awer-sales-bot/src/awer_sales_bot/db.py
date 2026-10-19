@@ -137,7 +137,7 @@ CREATE TABLE IF NOT EXISTS message_log (
 CREATE TABLE IF NOT EXISTS month_settings (     -- ручные настройки месяца (страница «Настройки месяца»)
     month TEXT PRIMARY KEY,
     trend_manual REAL,                    -- ручной коэффициент год к году (NULL = расчётный)
-    step REAL,                            -- шаг перевыполнения, доля (0.10)
+    step REAL,                            -- шаг перевыполнения, доля (0.15)
     step_bonus REAL,                      -- надбавка за шаг, ₽
     base_rate REAL,
     max_rate REAL,

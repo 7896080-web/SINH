@@ -383,8 +383,8 @@ def test_max_step_tip_does_not_promise_next_step(env, tmp_path):  # noqa: F811
     cfg, db = env
     service.freeze(db, cfg, "2026-10")
     sid = db.seller_id("Продавец04", create=False)
-    # 10 смен × 80 000 = 800 000 ₽ = 146 % плана 547 706 ₽ — выше 140 %, это максимальная ступень
-    import_file(write_sales(tmp_path / "s.csv", [(oct_day(i), "Продавец04", 80_000, 8) for i in range(1, 11)]), db, cfg)
+    # 10 рабочих дней × 90 000 = 900 000 ₽ = 164 % плана месяца 547 706 ₽ — выше 160 %, это максимальная ступень
+    import_file(write_sales(tmp_path / "s.csv", [(oct_day(i), "Продавец04", 90_000, 8) for i in range(1, 11)]), db, cfg)
     text = daily(db, cfg, sid, oct_day(10))
     assert "Максимальная ступень достигнута" in text and "следующая ступень уже близко" not in text
 

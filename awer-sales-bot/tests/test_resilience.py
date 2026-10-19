@@ -294,13 +294,16 @@ def test_closed_day_is_not_a_gap(env):  # noqa: F811
     os.utime(f, (time.time() - 600,) * 2)
     import_inbox(db, cfg)
     web = TestClient(create_app(cfg, db))
-    page = web.get("/closed", auth=("admin", "pw")).text
-    assert "Дни без данных из 1С" not in page  # 16.10 — первый день истории, пропусков до него нет
-
     closed = date(2026, 10, 17)
+    assert db.data_gaps(date(2026, 10, 16)) == []  # 16.10 — первый день истории, пропусков до него нет
+    assert db.data_gaps(closed) == [closed.isoformat()]
+    assert f'name=add value="{closed}"' in web.get("/closed", auth=("admin", "pw")).text  # предлагает отметить
+
     assert db.covered_days("2026-10") == 1
     r = web.post("/closed", data={"day": "17.10.2026"}, auth=("admin", "pw"), follow_redirects=False)
     assert r.status_code == 303 and db.store_closed(closed) and db.covered_days("2026-10") == 2
+    page = web.get("/closed", auth=("admin", "pw")).text
+    assert f'name=remove value="{closed}"' in page and f'name=add value="{closed}"' not in page
     assert db.history(cfg.norm_shifts).coverage["2026-10"] == pytest.approx(2 / 31)
     assert not db.day_closed(closed, cfg.stores)  # выгрузку за этот день бот не ждёт
     daily_run(db, cfg, s, today=date(2026, 10, 18), force=True)
