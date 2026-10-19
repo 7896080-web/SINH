@@ -10,26 +10,23 @@
 
 Правила расчёта: [docs/SPEC.md](docs/SPEC.md) · 1С: [docs/1C.md](docs/1C.md) · бот MAX: [docs/MAX.md](docs/MAX.md)
 
-## Установка (Windows, на компьютере с 1С или рядом)
+## Установка
+
+На сервер Windows — одним скриптом, пошагово для владельца: **[docs/УСТАНОВКА.md](docs/УСТАНОВКА.md)**
+(`scripts\install.ps1` — установка и обновление, `scripts\status.ps1` — состояние).
+
+Для разработки:
 
 ```powershell
-# Python 3.11+  (https://www.python.org/downloads/ — галочка «Add to PATH»)
-cd C:\awer-sales-bot
 python -m venv .venv
 .venv\Scripts\activate
 pip install -e .[dev]
 copy config.example.yaml config.yaml
-copy .env.example .env      # вписать ADMIN_PASSWORD, UPLOAD_TOKEN; токены ботов — в админке «Бот MAX»
-pytest -q                   # все тесты должны пройти
-```
-
-## Первый запуск
-
-```powershell
+pytest -q                                   # все тесты должны пройти
 awer-bot init-db
-awer-bot import-history "D:\ЗП" --admins "Эльвина Абдулиннанова" "Букалова Юлия"   # история из ведомостей
+awer-bot import-sales                       # файлы 1С из data\inbox
 awer-bot plan 2026-11                       # посмотреть расчёт плана
-awer-bot web                                # админка http://127.0.0.1:8080 (admin / ADMIN_PASSWORD)
+awer-bot web                                # админка http://127.0.0.1:8080 (admin / ADMIN_PASSWORD из .env)
 ```
 
 В админке: «Настройки месяца» — расчётный и ручной коэффициент год к году, шаг %, надбавка, база,
@@ -48,7 +45,7 @@ awer-bot serve --host 127.0.0.1             # бот + админка (для п
 awer-bot close-month 2026-11                # итоги и ставки → ведомость xlsx в админке
 ```
 
-Служба Windows (автозапуск): `scripts/install-service.ps1`.
+Служба Windows, копии базы, обновление — [docs/УСТАНОВКА.md](docs/УСТАНОВКА.md).
 
 ## Мотивация и обучение
 

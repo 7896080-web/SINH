@@ -29,6 +29,7 @@
 | AWER CRM | сервер, `C:\awer_crm_data` | снимок `kitcrm.db` (SQLite backup + integrity_check); разово 5 копий из `backups\` | `selectel:awer-backups/awer_crm` (+ `/app_backups`) | каждые 6 ч | 7 снимков | 30 дней; `app_backups` без срока | работает с 15.10 |
 | direct (WB, Директ) | сервер, `C:\direct` | zip: снимки `wb_history.db`, `wb_rec.db` + таблицы, откаты, журналы, скрипты | `selectel:awer-backups/direct` | 05:30 | 7 архивов | 30 дней | работает с 16.10 |
 | Маркировка | рабочий ПК, `C:\marking` | `marking.db` | `selectel:awer-backups/marking` | раз в сутки, через 10 мин после запуска | по программе | по программе | **НЕ настроено**: в `.env` ещё `yandex:marking_backups` |
+| awer-sales-bot | сервер, `C:\awer-sales-bot` | снимок `data\awer.db` (`Connection.backup()` + `integrity_check`) → `awer-ГГГГММДД-ЧЧММ.db` | `selectel:awer-backups/awer_sales_bot` | 05:00 | 30 дней | 30 дней | **готово, ждёт установки**: задачу создаёт `scripts\install.ps1` |
 
 Время в именах копий Sync Admin — UTC, у остальных — московское.
 
@@ -42,6 +43,7 @@
 | AWER CRM | задача «AWER CRM cloud backup» (SYSTEM), `C:\awer_crm_data\cloud_backup\cloud_copy.ps1` + `snap.py` | `C:\awer_crm_data\cloud_backup\rclone.conf` | `C:\awer_crm_data\cloud_backup\cloud_copy.log` | `config.json`, `auth.json` |
 | direct | задача «Direct cloud backup» (SYSTEM), `C:\direct_backup\cloud_copy.ps1` + `snap_direct.py` | `C:\direct_backup\rclone.conf` | `C:\direct_backup\cloud_copy.log` | `wb_tokens.txt`, `*token*.txt`, `config.json`, `crm_config.json`, `.env`, `.venv`, `*.old.*` |
 | Маркировка | встроено; `MARKING_RCLONE_REMOTE` в `C:\marking\.env` | `C:\marking\rclone.conf` | «Диагностика» Маркировки | `.env` |
+| awer-sales-bot | задача «AwerSalesBot cloud backup» (SYSTEM), `C:\awer-sales-bot\scripts\cloud_copy.ps1` + `awer-bot backup` | `C:\awer-sales-bot\rclone.conf` (установщик копирует из `C:\FinanceBot\rclone.conf`) | `C:\awer-sales-bot\logs\cloud_copy.log`, `logs\backup.log` | `.env`, `config.yaml`, `rclone.conf` — уходят только `awer-*.db` |
 
 Скрипты задач Windows написаны в ASCII нарочно: Windows PowerShell на сервере
 портит кириллицу в файлах без BOM. Вывод Python в журнал — через
@@ -57,7 +59,7 @@
 
 ## Осталось сделать
 
-- awer-sales-bot (`awer-sales-bot/`, база `data/awer.db`) ещё не установлен. При установке — снимок базы в `selectel:awer-backups/awer_sales_bot` по образцу Финпомощника, `.env` и `config.yaml` в исключения; добавить строку в таблицы выше.
+- awer-sales-bot: скрипт и задача копии готовы (`awer-sales-bot/scripts/cloud_copy.ps1`, `docs/УСТАНОВКА.md`), программа ещё не установлена. После установки проверить первую копию в облаке (`logs\cloud_copy.log`) и поменять состояние в таблице на «работает с …».
 - Маркировка: `rclone config create selectel …` с `--config C:\marking\rclone.conf`, затем `MARKING_RCLONE_REMOTE=selectel:awer-backups/marking` в `.env` и перезапуск.
 - Защита от удаления: отдельный бакет с Object Lock или ключ без права удаления, чтобы рабочий ключ не мог стереть все копии.
 - Встроить выгрузку в облако в Репрайсер, Финпомощник и CRM (как в Sync), чтобы её состояние было на «Диагностике», а не только в журнале.
