@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import calendar
+import random
 from datetime import date, timedelta
 
 from .config import Settings
@@ -94,60 +95,146 @@ def problems(db: DB, cfg: Settings, start: date, end: date) -> list[str]:
 
 
 MAX_RUN = 5  # не больше рабочих дней подряд в предложении графика
+# цена нарушений в предложении графика (чем больше, тем важнее правило)
+W_MISS, W_KEY, W_LONG = 100, 40, 30  # недобор в магазине; старший не на выходных; больше MAX_RUN дней подряд
+W_ON, W_OFF = 3, 2  # отступление от 3/2: рабочих дней подряд не 3, выходных подряд не 2
+W_DAYS, W_WEEKEND, W_SWAP, W_OVER = 1.5, 4, 5, 1  # дни ≠ доле; выходные не поровну; замена; сверх минимума
+STEPS = 15000  # перестановок при подборе (≈ 0,4 с; больше — тот же результат)
 
 
 def suggest(db: DB, cfg: Settings, month: str) -> tuple[dict[int, dict[int, str | None]], list[str]]:
-    """Предложение графика на месяц по правилам владельца (18.10.2026). Ничего не сохраняет — владелец смотрит,
-    правит галочки и сохраняет сам.
+    """Предложение графика на месяц по правилам владельца (18–19.10.2026). Ничего не сохраняет — владелец смотрит,
+    правит и сохраняет сам.
 
-    * Продавец работает в магазине своей смены (по средам смены меняются магазинами).
-    * Сначала минимум: в каждом магазине в будни weekday_min, в сб и вс weekend_min; сильные продавцы — на выходных.
-    * Потом добор до нормы norm_shifts рабочих дней — в дни, где в его магазине меньше всего людей.
-    * Не больше MAX_RUN дней подряд. Продавцы без смены и тестовые карточки не планируются.
-    Возвращает ({seller_id: {число: None}}, [чего не хватило]); None — магазин его смены."""
+    * В каждом магазине в будни weekday_min, в сб и вс weekend_min.
+    * Старшие (и отмеченные «сильный продавец») — в каждую субботу и воскресенье.
+    * У всех по возможности 3/2: три дня работы, два выходных; не больше MAX_RUN дней подряд.
+    * Остальные работают в выходные примерно поровну; рабочих дней у всех примерно поровну.
+    * Состав смен сохраняется: продавец — в магазине своей смены (по средам смены меняются магазинами), замена в
+      другой магазин — только когда без неё не набрать минимум или не уравнять выходные.
+    Заготовка 3/2, затем перебор перестановок (замена дня между продавцами, сдвиг выходного, магазин): остаётся то,
+    что меньше нарушает правила (цены W_*). Перебор с постоянным зерном — для того же месяца тот же результат.
+    Возвращает ({seller_id: {число: магазин замены или None — магазин своей смены}}, [где не хватило людей])."""
     y, m = map(int, month.split("-"))
     days = [date(y, m, k) for k in range(1, calendar.monthrange(y, m)[1] + 1)]
+    n, stores = len(days), cfg.stores
     cs = {c["id"]: c for c in crews(db)}
     people = [s for s in db.sellers() if s["role"] in ("seller", "admin") and s["crew_id"] in cs]
-    target = min(cfg.norm_shifts, len(days))
-    work: dict[int, set[int]] = {s["id"]: set() for s in people}
-    staff: dict[tuple[int, str], int] = {}
-    store = {(s["id"], d.day): crew_store(cs[s["crew_id"]], d, cfg.stores) for s in people for d in days}
+    if not people:
+        return {}, []
+    ids = [s["id"] for s in people]
+    key = {s["id"]: s["role"] == "admin" or bool(s["weekend_key"]) for s in people}
+    own = {sid: [crew_store(cs[s["crew_id"]], d, stores) for d in days] for sid, s in zip(ids, people)}
+    wk = [d.weekday() >= 5 for d in days]
+    need = [minimum(cfg, d) for d in days]
+    target = max(cfg.norm_shifts, sum(need) * len(stores) / len(ids))  # доля каждого
+    plan: dict[int, list[str | None]] = {sid: [None] * n for sid in ids}
 
-    def run_if_added(sid: int, k: int) -> int:
-        left = right = 0
-        while k - left - 1 in work[sid]:
-            left += 1
-        while k + right + 1 in work[sid]:
-            right += 1
-        return left + right + 1
+    # заготовка: старшие — выходные + понедельник и четверг; остальные — 3/2 со сдвигом внутри смены
+    by_crew: dict[int, list[int]] = {}
+    for s in people:
+        by_crew.setdefault(s["crew_id"], []).append(s["id"])
+    for members in by_crew.values():
+        plain = [sid for sid in members if not key[sid]]
+        for i, sid in enumerate(plain):
+            off = i * 5 // max(1, len(plain))
+            for k in range(n):
+                if (k + off) % 5 < 3:
+                    plan[sid][k] = own[sid][k]
+        for sid in members:
+            if key[sid]:
+                for k, d in enumerate(days):
+                    if wk[k] or d.weekday() in (0, 3):
+                        plan[sid][k] = own[sid][k]
 
-    def add(sid: int, k: int) -> None:
-        work[sid].add(k)
-        staff[(k, store[(sid, k)])] = staff.get((k, store[(sid, k)]), 0) + 1
+    def seller_cost(sid: int) -> float:
+        row, c, k = plan[sid], 0.0, 0
+        while k < n:
+            j = k
+            while j < n and (row[j] is None) == (row[k] is None):
+                j += 1
+            length, edge = j - k, k == 0 or j == n
+            if row[k] is not None:
+                c += W_LONG * max(0, length - MAX_RUN) + (0 if edge and length < 3 else W_ON * abs(length - 3))
+            elif not edge:
+                c += W_OFF * abs(length - 2)
+            k = j
+        worked = sum(1 for x in row if x is not None)
+        c += W_DAYS * (worked - target) ** 2
+        c += W_SWAP * sum(1 for k in range(n) if row[k] is not None and row[k] != own[sid][k])
+        if key[sid]:
+            c += W_KEY * sum(1 for k in range(n) if wk[k] and row[k] is None)
+        return c
 
+    def day_cost(k: int) -> float:
+        c = 0.0
+        for st in stores:
+            have = sum(1 for sid in ids if plan[sid][k] == st)
+            c += W_MISS * max(0, need[k] - have) + W_OVER * max(0, have - need[k])
+        return c
+
+    def weekend_cost() -> float:
+        counts = [sum(1 for k in range(n) if wk[k] and plan[sid][k] is not None) for sid in ids if not key[sid]]
+        if not counts:
+            return 0.0
+        mean = sum(counts) / len(counts)
+        return W_WEEKEND * sum((x - mean) ** 2 for x in counts)
+
+    sc = {sid: seller_cost(sid) for sid in ids}
+    dc = [day_cost(k) for k in range(n)]
+    wc = weekend_cost()
+    rng = random.Random(y * 100 + m)
+    for _ in range(STEPS):
+        r = rng.random()
+        k = rng.randrange(n)
+        changed: list[tuple[int, int, str | None]] = []  # (продавец, день, прежнее значение)
+        if r < 0.4:  # день переходит от одного продавца к другому, магазин тот же
+            on = [sid for sid in ids if plan[sid][k] is not None]
+            off = [sid for sid in ids if plan[sid][k] is None]
+            if not on or not off:
+                continue
+            a_, b_ = rng.choice(on), rng.choice(off)
+            changed = [(a_, k, plan[a_][k]), (b_, k, None)]
+            plan[b_][k], plan[a_][k] = plan[a_][k], None
+        elif r < 0.65:  # сдвиг: выходной и рабочий день меняются местами
+            sid = rng.choice(ids)
+            j = k + 1 if k + 1 < n else k - 1
+            if (plan[sid][k] is None) == (plan[sid][j] is None):
+                continue
+            changed = [(sid, k, plan[sid][k]), (sid, j, plan[sid][j])]
+            plan[sid][k], plan[sid][j] = (own[sid][k] if plan[sid][j] else None), (own[sid][j] if plan[sid][k] else None)
+        elif r < 0.85:  # выйти или не выйти
+            sid = rng.choice(ids)
+            changed = [(sid, k, plan[sid][k])]
+            plan[sid][k] = None if plan[sid][k] else own[sid][k]
+        else:  # другой магазин (замена) или обратно в свой
+            sid = rng.choice(ids)
+            if plan[sid][k] is None:
+                continue
+            changed = [(sid, k, plan[sid][k])]
+            plan[sid][k] = rng.choice([st for st in stores if st != plan[sid][k]])
+        who = {c[0] for c in changed}
+        when = {c[1] for c in changed}
+        new_sc = {sid: seller_cost(sid) for sid in who}
+        new_dc = {d: day_cost(d) for d in when}
+        new_wc = weekend_cost()
+        delta = sum(new_sc[x] - sc[x] for x in who) + sum(new_dc[d] - dc[d] for d in when) + new_wc - wc
+        if delta <= 0:
+            sc.update(new_sc)
+            for d, v in new_dc.items():
+                dc[d] = v
+            wc = new_wc
+        else:
+            for sid, d, old in reversed(changed):
+                plan[sid][d] = old
     short = []
-    for d in days:  # 1. минимум в каждом магазине
-        weekend = d.weekday() >= 5
-        for st in cfg.stores:
-            pool = [s for s in people if store[(s["id"], d.day)] == st]
-            need = minimum(cfg, d)
-            pool.sort(key=lambda s: (run_if_added(s["id"], d.day) > MAX_RUN, len(work[s["id"]]) >= target,
-                                     not (weekend and s["weekend_key"]), len(work[s["id"]])))
-            for s in pool[:need]:
-                add(s["id"], d.day)
-            if len(pool) < need:
-                short.append(f"{WD[d.weekday()]} {d:%d.%m}, {st}: в смене {len(pool)} из {need} нужных")
-    for s in people:  # 2. добор до нормы — в дни, где в его магазине меньше людей
-        sid = s["id"]
-        while len(work[sid]) < target:
-            free = [d for d in days if d.day not in work[sid] and run_if_added(sid, d.day) <= MAX_RUN]
-            if not free:
-                break
-            best = min(free, key=lambda d: (staff.get((d.day, store[(sid, d.day)]), 0),
-                                            not (s["weekend_key"] and d.weekday() >= 5), d.day))
-            add(sid, best.day)
-    return {sid: {k: None for k in sorted(ks)} for sid, ks in work.items()}, short
+    for k, d in enumerate(days):
+        for st in stores:
+            have = sum(1 for sid in ids if plan[sid][k] == st)
+            if have < need[k]:
+                short.append(f"{WD[d.weekday()]} {d:%d.%m}, {st}: {have} из {need[k]} — не хватает людей в сменах")
+    return {sid: {k + 1: (None if plan[sid][k] == own[sid][k] else plan[sid][k])
+                  for k in range(n) if plan[sid][k] is not None} for sid in ids}, short
 
 
 def advice(db: DB, cfg: Settings, month: str) -> list[str]:

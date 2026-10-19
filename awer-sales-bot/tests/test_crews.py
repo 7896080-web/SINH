@@ -86,8 +86,9 @@ def test_crews_and_schedule_pages(env):  # noqa: F811
     assert saved[1] == (None if crews.default_store(db, cfg, sid, d1) == "МСЛ" else "МСЛ")  # магазин смены не храним
     assert saved[2] is None  # в обоих магазинах сразу нельзя — остаётся магазин его смены
     sched = web.get(f"/schedule/{month}", auth=AUTH).text
-    assert "<h2>Город</h2>" in sched and "<h2>МСЛ</h2>" in sched and "Смена Эли" in sched
-    assert "Продавец04 <span class=note>С1 · сильный</span>" in sched
+    # вид как в Excel владельца: строки — дни, столбцы — продавцы, в клетке — магазин
+    assert "<th>Дата</th><th>День</th>" in sched and '<th title="Продавец04">' in sched
+    assert "<td class=note>С1 · сильн.</td>" in sched and f'name="s{sid}_1"' in sched
 
 
 def test_owner_warned_about_staffing(env):  # noqa: F811
@@ -101,39 +102,51 @@ def test_owner_warned_about_staffing(env):  # noqa: F811
 
 
 def test_suggest_schedule_follows_rules(env):  # noqa: F811
-    """«Предложить график»: минимум в магазинах, сильные на выходных, норма 18, не больше 5 дней подряд;
-    ничего не сохраняется, пока владелец не нажмёт «Сохранить график»."""
+    """«Предложить график» по правилам владельца (18–19.10.2026): минимум в магазинах, старшие — каждые сб и вс,
+    у всех по возможности 3/2, выходные у остальных поровну, состав смен сохраняется (замен мало); ничего не
+    сохраняется, пока владелец не нажмёт «Сохранить график»."""
     cfg, db = env
     a = ["Продавец04", "Продавец05", "Продавец06", "Админ1"]
-    b = ["Продавец07", "Продавец08", "Админ2", "Продавец09"]
+    b = ["Продавец07", "Админ2", "Продавец09"]  # смены разного размера, как у владельца: 4 и 3
     for n in a + b:
         db.seller_id(n, create=True)
     setup_crews(db, cfg, a, b)
     with db.tx() as c:
-        c.execute("UPDATE sellers SET weekend_key=1 WHERE name IN ('Админ1', 'Админ2')")
+        c.execute("UPDATE sellers SET role='admin' WHERE name IN ('Админ1', 'Админ2')")
     proposal, short = crews.suggest(db, cfg, "2026-11")
     assert short == []
     ids = {db.seller_id(n, create=False) for n in a + b}
+    seniors = {db.seller_id(n, create=False) for n in ("Админ1", "Админ2")}
     assert set(proposal) == ids
+    weekends = [d for d in range(1, 31) if date(2026, 11, d).weekday() >= 5]
+    for sid in seniors:
+        assert all(d in proposal[sid] for d in weekends)  # старшие — в каждую субботу и воскресенье
+    others = [sum(d in proposal[sid] for d in weekends) for sid in ids - seniors]
+    assert max(others) - min(others) <= 1  # выходные поровну
+    sizes = [len(days) for days in proposal.values()]
+    assert max(sizes) - min(sizes) <= 2 and min(sizes) >= 18
+    runs = []
     for sid, days in proposal.items():
         ks = sorted(days)
-        assert 16 <= len(ks) <= 18
-        run = best = 1
+        run = 1
         for x, y in zip(ks, ks[1:]):
-            run = run + 1 if y == x + 1 else 1
-            best = max(best, run)
-        assert best <= crews.MAX_RUN
-    for sid in (db.seller_id("Админ1", create=False), db.seller_id("Админ2", create=False)):
-        weekends = [d for d in range(1, 31) if date(2026, 11, d).weekday() >= 5]
-        assert sum(d in proposal[sid] for d in weekends) >= len(weekends) - 2  # сильные — на выходных
-    db_before = db.schedule_days("2026-11")
-    for d in range(1, 31):  # минимум в каждом магазине — по предложению
+            if y == x + 1:
+                run += 1
+            else:
+                runs.append(run)
+                run = 1
+        runs.append(run)
+    assert max(runs) <= crews.MAX_RUN and runs.count(3) >= len(runs) / 2  # в основном 3/2
+    swaps = sum(1 for days in proposal.values() for v in days.values() if v)
+    assert swaps <= sum(sizes) // 10  # состав смен сохраняется: замен не больше 10 % рабочих дней
+    for d in range(1, 31):  # минимум в каждом магазине
         day = date(2026, 11, d)
         for st in cfg.stores:
-            n = sum(1 for sid, ks in proposal.items() if d in ks and crews.default_store(db, cfg, sid, day) == st)
+            n = sum(1 for sid, ks in proposal.items() if d in ks and (ks[d] or crews.default_store(db, cfg, sid, day)) == st)
             assert n >= crews.minimum(cfg, day), (day, st, n)
+    assert crews.suggest(db, cfg, "2026-11") == (proposal, short)  # тот же месяц — тот же результат
     c = TestClient(create_app(cfg, db))
     r = c.get("/schedule/2026-11?suggest=1", auth=AUTH)
-    assert "Это предложение бота" in r.text and db.schedule_days("2026-11") == db_before == {}
+    assert "Это предложение бота" in r.text and db.schedule_days("2026-11") == {}
     r = c.get("/schedule/2026-11", auth=AUTH)
     assert "Рекомендации по рабочим дням" in r.text and "Предложить график на месяц" in r.text

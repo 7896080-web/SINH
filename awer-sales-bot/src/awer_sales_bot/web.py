@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import html
 import io
+import json
 import os
 import re
 import secrets
@@ -60,6 +61,8 @@ nav a:hover,.links a:hover{background:#e7ecf2}nav a.cur{background:#0969da;borde
 table.grid td,table.grid th{padding:2px 3px;text-align:center}table.grid td.nm{text-align:left;white-space:nowrap}
 table.grid th.we,table.grid td.we{background:#f6f8fa}.off{color:#9a3412;font-weight:bold}
 table.grid td.alien{background:#eceff3}table.grid td.swap{background:#fde68a}table.grid td.sh{font-size:11px;color:#57606a}
+table.sch tr.we td{background:#fff3a0}table.sch td.on{font-weight:bold}table.sch td.swap{background:#fdba74}
+table.sch select{border:0;background:transparent;font-size:12px;width:70px}table.sch td.on select{font-weight:bold}
 .health{font-size:12px;color:#57606a;margin:4px 0 0}.health.bad{color:#9a3412;font-weight:bold}
 """
 
@@ -75,6 +78,7 @@ def _num(s: str | None) -> float | None:
 
 
 MONTH = re.compile(r"\d{4}-(0[1-9]|1[0-2])")
+DAY_NAMES = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
 ROLES = ("seller", "admin", "test")  # test — тестовая карточка: сообщения как у продавца, без ведомости и средних
 ROLE_NAMES = {"seller": "продавец", "admin": "админ", "test": "тестовый"}
 MIN_PLAN = 10_000  # ручной план на полный месяц — не меньше (аудит А1)
@@ -674,65 +678,51 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
             head = ("В сменах не хватает людей — добавьте продавцов в смену («Смены») или замену из другой смены:"
                     if suggest else "Нарушены правила графика:")
             b.append(f'<p class=off>{head}</p><ul>' + "".join(f"<li>{e(x)}</li>" for x in probs) + "</ul>")
-        b.append(f'<form method=post action="/schedule/{month}">')
-        head = "".join(f'<th class="{we(d)}">{d.day}<br>{crews_mod.WD[d.weekday()]}</th>' for d in dates)
-        for si, st in enumerate(cfg.stores):
-            shifts = "".join(
-                f'<td class="sh{we(d)}">' + ", ".join(f"С{cnum[c['id']]}" for c in cs
-                                                      if crews_mod.crew_store(c, d, cfg.stores) == st) + "</td>"
-                for d in dates)
-            b.append(f'<h2>{e(st)}</h2><table class=grid><tr><th>Продавец</th>{head}</tr>'
-                     f'<tr><td class=nm><span class=note>смена</span></td>{shifts}</tr>')
-            for sl in sellers:
+        # Вид — как график владельца в Excel: строки — дни, столбцы — продавцы, в клетке — магазин (пусто — выходной)
+        cols = [sl for sl in sellers if sl["role"] != "test" or saved.get(sl["id"])]
+        stores = cfg.stores
+        b.append(f'<form method=post action="/schedule/{month}"><input type=hidden name=cols '
+                 f'value="{",".join(str(sl["id"]) for sl in cols)}"><table class="grid sch"><tr><th>Дата</th><th>День</th>')
+        for sl in cols:
+            short = sl["first_name"] or sl["name"]
+            b.append(f'<th title="{e(sl["name"])}">{e(short)}</th>')
+        b.append("".join(f"<th>{e(st)}</th>" for st in stores) + "</tr><tr><td></td><td class=note>смена</td>")
+        for sl in cols:
+            crew = f"С{cnum[sl['crew_id']]}" if sl["crew_id"] in cnum else "без смены"
+            b.append(f'<td class=note>{crew}{" · сильн." if sl["weekend_key"] else ""}</td>')
+        b.append(f'<td class=note colspan={len(stores)}>нужно {cfg.staffing.weekday_min} в будни, '
+                 f'{cfg.staffing.weekend_min} в сб и вс</td></tr>')
+        for d in dates:
+            b.append(f'<tr class="{we(d).strip()}"><td class=n>{d:%d.%m}</td><td class=nm>{DAY_NAMES[d.weekday()]}</td>')
+            for sl in cols:
                 sid = sl["id"]
-                cells = []
-                for d in dates:
-                    mine = own[(sid, d.day)] == st
-                    on = where.get((sid, d.day)) == st
-                    cls = ("" if mine else "alien") + we(d) + (" swap" if on and not mine else "")
-                    cells.append(f'<td class="{cls.strip()}"><input type=checkbox name="w{sid}_{d.day}_{si}" '
-                                 f'data-s="{sid}" data-d="{d.day}" data-st="{si}" data-own="{int(mine)}" '
-                                 f'data-we="{int(d.weekday() >= 5)}" {"checked" if on else ""}></td>')
-                crew = f"С{cnum[sl['crew_id']]}" if sl["crew_id"] in cnum else "без смены"
-                b.append(f'<tr><td class=nm>{e(sl["name"])} <span class=note>{crew}'
-                         f'{" · сильный" if sl["weekend_key"] else ""}</span></td>{"".join(cells)}</tr>')
-            cnt = "".join(f'<td id="n{si}_{d.day}" class="{we(d).strip()}" data-need="{crews_mod.minimum(cfg, d)}"></td>'
-                          for d in dates)
-            b.append(f'<tr><td class=nm><b>Продавцов</b> <span class=note>(нужно {cfg.staffing.weekday_min} в будни, '
-                     f'{cfg.staffing.weekend_min} в сб и вс)</span></td>{cnt}</tr></table>')
-        b.append('<h2>Итого по продавцам</h2><table><tr><th>Продавец</th><th>Смена</th><th>Рабочих дней</th>'
-                 + "".join(f"<th>{e(st)}</th>" for st in cfg.stores) + '<th>Заполнить по схеме (с учётом ротации)</th></tr>')
-        for sl in sellers:
-            sid = sl["id"]
-            crew = next((c["name"] for c in cs if c["id"] == sl["crew_id"]), "без смены")
-            fill = (f'<select id="p{sid}"><option value="3,2">3/2</option><option value="2,2">2/2</option>'
-                    f'<option value="5,2">5/2</option></select> с <input type=number id="k{sid}" value=1 min=1 max=7 '
-                    f'style="width:42px">-го <button type=button class=btn onclick="fill({sid})">Заполнить</button>'
-                    f'<button type=button class=btn onclick="weekends({sid})">+ сб и вс</button>'
-                    f'<button type=button class=btn onclick="fill({sid},true)">Очистить</button>')
-            b.append(f'<tr><td>{e(sl["name"])}{" · сильный" if sl["weekend_key"] else ""}</td><td>{e(crew)}</td>'
-                     f'<td id="t{sid}" class=n></td>' + "".join(f'<td id="t{sid}_{si}" class=n></td>'
-                                                              for si in range(len(cfg.stores))) + f'<td>{fill}</td></tr>')
-        b.append(f'</table><button class=btn>Сохранить график</button></form>'
-                 f'<script>const NORM={cfg.norm_shifts},NS={len(cfg.stores)};'
+                cur, mine = where.get((sid, d.day)), own[(sid, d.day)]
+                opts = "".join(f'<option value="{e(st)}"{" selected" if cur == st else ""}>{e(st.upper())}</option>'
+                               for st in stores)
+                cls = "on" if cur else ""
+                if cur and mine and cur != mine:
+                    cls += " swap"  # замена: работает не в магазине своей смены
+                b.append(f'<td class="{cls}"><select name="s{sid}_{d.day}" data-own="{e(mine or "")}">'
+                         f'<option value=""></option>{opts}</select></td>')
+            b.append("".join(f'<td class=n id="n{si}_{d.day}" data-need="{crews_mod.minimum(cfg, d)}"></td>'
+                             for si in range(len(stores))) + "</tr>")
+        b.append('<tr><td colspan=2><b>Рабочих дней</b></td>' +
+                 "".join(f'<td class=n id="t{sl["id"]}"></td>' for sl in cols) + f'<td colspan={len(stores)}></td></tr>')
+        b.append(f'</table><button class=btn>Сохранить график</button>'
+                 '<button type=button class=btn onclick="clearAll()">Очистить месяц</button></form>'
+                 f'<script>const NORM={cfg.norm_shifts},ST={json.dumps(stores, ensure_ascii=False)};'
                  'const Q=s=>[...document.querySelectorAll(s)];'
-                 'function count(){Q("[id^=n]").forEach(c=>{const [si,d]=c.id.slice(1).split("_");'
-                 'const k=Q(`input[data-st="${si}"][data-d="${d}"]`).filter(x=>x.checked).length;'
-                 'c.textContent=k;c.className=(c.className.replace(/ ?off/g,""))+(k<+c.dataset.need?" off":"");});'
-                 'Q("[id^=t]").forEach(c=>{const p=c.id.slice(1).split("_");const sel=p.length>1?'
-                 '`input[data-s="${p[0]}"][data-st="${p[1]}"]`:`input[data-s="${p[0]}"]`;'
-                 'const k=Q(sel).filter(x=>x.checked).length;c.textContent=k;'
-                 'if(p.length===1)c.className="n"+(k===NORM?"":" off");});}'
-                 'function fill(s,clear){const [on,off]=document.getElementById("p"+s).value.split(",").map(Number);'
-                 'const k=+document.getElementById("k"+s).value||1;'
-                 'Q(`input[data-s="${s}"]`).forEach(x=>{const d=+x.dataset.d;'
-                 'x.checked=!clear&&x.dataset.own==="1"&&d>=k&&((d-k)%(on+off))<on;mark(x);});count();}'
-                 'function weekends(s){const busy=new Set(Q(`input[data-s="${s}"]`).filter(x=>x.checked).map(x=>x.dataset.d));'
-                 'Q(`input[data-s="${s}"][data-we="1"][data-own="1"]`).forEach(x=>{if(!busy.has(x.dataset.d)){x.checked=true;mark(x);}});count();}'
-                 'function mark(x){const td=x.parentElement;td.classList.toggle("swap",x.checked&&x.dataset.own!=="1");}'
-                 'document.addEventListener("change",e=>{const x=e.target;if(!x.dataset||!x.dataset.s)return;'
-                 'if(x.checked)Q(`input[data-s="${x.dataset.s}"][data-d="${x.dataset.d}"]`).forEach(y=>{if(y!==x){y.checked=false;mark(y);}});'
-                 'mark(x);count();});count();</script>')
+                 'function count(){'
+                 'Q("[id^=n]").forEach(c=>{const [si,d]=c.id.slice(1).split("_");'
+                 'const k=Q(`select[name$="_${d}"]`).filter(x=>x.value===ST[+si]).length;'
+                 'c.textContent=k;c.classList.toggle("off",k<+c.dataset.need);});'
+                 'Q("[id^=t]").forEach(c=>{const k=Q(`select[name^="s${c.id.slice(1)}_"]`).filter(x=>x.value).length;'
+                 'c.textContent=k;c.classList.toggle("off",k<NORM);});}'
+                 'function mark(x){const td=x.parentElement;td.classList.toggle("on",!!x.value);'
+                 'td.classList.toggle("swap",!!x.value&&!!x.dataset.own&&x.value!==x.dataset.own);}'
+                 'function clearAll(){Q("table.sch select").forEach(x=>{x.value="";mark(x);});count();}'
+                 'document.addEventListener("change",e=>{if(e.target.tagName==="SELECT"&&e.target.name.startsWith("s"))'
+                 '{mark(e.target);count();}});count();</script>')
         return page(f"График работы {month}", "".join(b))
 
     @app.post("/schedule/{month}", dependencies=[Depends(auth)])
@@ -740,10 +730,15 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
         form = await request.form()
         n = service.days_in(month)
         y, mo = map(int, month.split("-"))
+        shown = {int(x) for x in str(form.get("cols") or "").split(",") if x.isdigit()}
         for sl in db.sellers():
+            if shown and sl["id"] not in shown:
+                continue  # столбца на странице не было (тестовая карточка) — его график не трогаем
             days = {}
             for d in range(1, n + 1):
-                picked = [st for si, st in enumerate(cfg.stores) if form.get(f"w{sl['id']}_{d}_{si}")]
+                one = form.get(f"s{sl['id']}_{d}")  # строки — дни, в клетке — магазин
+                picked = [one] if one in cfg.stores else \
+                    [st for si, st in enumerate(cfg.stores) if form.get(f"w{sl['id']}_{d}_{si}")]
                 if picked:  # магазин храним, только если это не магазин его смены (замена)
                     dflt = crews_mod.default_store(db, cfg, sl["id"], date(y, mo, d))
                     st = dflt if dflt in picked else picked[0]
