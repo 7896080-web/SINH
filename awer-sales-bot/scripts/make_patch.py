@@ -103,7 +103,7 @@ powershell -ExecutionPolicy Bypass -File "$stage\scripts\install.ps1"
 
 def changed(base: str) -> tuple[list[str], list[str]]:
     def names(flt: str) -> list[str]:
-        out = subprocess.run(["git", "-c", "core.quotepath=false", "diff", "--name-only", f"--diff-filter={flt}",
+        out = subprocess.run(["git", "-c", "core.quotepath=false", "diff", "--relative", "--name-only", f"--diff-filter={flt}",
                               base, "HEAD", "--", "."], cwd=ROOT, capture_output=True, text=True, check=True).stdout
         return [n for n in out.splitlines() if n.startswith(CODE) or n in CODE]
     return names("ACMR"), names("D")
