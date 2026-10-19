@@ -8,7 +8,7 @@
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 import yaml
@@ -94,7 +94,12 @@ def newcomer_shifts(db: DB, cfg: Settings, sid: int) -> int | None:
     """Сколько смен отработал новичок (0…N) или None, если продавец не новичок."""
     if db.one("SELECT 1 FROM monthly_history WHERE seller_id=?", sid):
         return None
-    n = db.one("SELECT COUNT(DISTINCT day) n FROM sales_lines WHERE seller_id=?", sid)["n"]
+    r = db.one("SELECT MIN(d) a FROM (SELECT MIN(day) d FROM sales_lines WHERE seller_id=? "
+               "UNION ALL SELECT MIN(day) FROM schedule WHERE seller_id=?)", sid, sid)
+    last = db.one("SELECT MAX(day) d FROM imported_days WHERE source<>'closed'")["d"]
+    if not r["a"] or not last or r["a"] > last:
+        return 0
+    n = len(db.worked_days(date.fromisoformat(r["a"]), date.fromisoformat(last), sid).get(sid, ()))
     return n if n <= cfg.training.onboarding_shifts else None
 
 

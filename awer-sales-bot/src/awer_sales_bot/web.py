@@ -8,6 +8,7 @@ from __future__ import annotations
 import html
 import io
 import os
+import re
 import secrets
 from datetime import date, datetime, timedelta
 from urllib.parse import quote
@@ -559,7 +560,23 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
              '<p class=note>Отдельная таблица на каждый магазин. Строка «смена» — какая смена в этом магазине: каждую '
              'среду смены меняются магазинами. Белые клетки — дни, когда смена продавца в этом магазине; серые — '
              'другой магазин: галочка там — выход на замену (выделяется цветом). Один продавец в один день — только '
-             f'в одном магазине. Норма — {cfg.norm_shifts} рабочих дней. Отработанным считается день с продажами в 1С.</p>']
+             f'в одном магазине. Норма — {cfg.norm_shifts} рабочих дней. Рабочие дни считаются по графику (и у старших); '
+             'у кого графика на месяц нет — по дням с продажами в 1С.</p>']
+        pend = db.offschedule_pending()
+        if pend:
+            b.append('<h2>Продажи в дни вне графика — нужен ваш ответ</h2><p class=note>Продавец продал в день, которого нет '
+                     'в его графике. Вышел на замену — «Работал(а)»: день добавится в график и станет рабочим. Не работал '
+                     '(покупатель забрал товар, отложенный в его смену) — «Не работал(а)». Продажа в обоих случаях остаётся '
+                     'у продавца. Пока ответа нет, день не считается рабочим.</p><table><tr><th>День</th><th>Продавец</th>'
+                     '<th>Магазин</th><th>Продажи, ₽</th><th></th></tr>')
+            for x in pend:
+                b.append(f'<tr><td>{date.fromisoformat(x["day"]):%d.%m.%Y}</td><td>{e(x["name"])}</td><td>{e(x["store"])}</td>'
+                         f'<td class=n>{_rub(x["amount"])}</td><td><form method=post action="/offschedule">'
+                         f'<input type=hidden name=day value="{x["day"]}"><input type=hidden name=sid value="{x["seller_id"]}">'
+                         f'<input type=hidden name=back value="{e(month)}">'
+                         '<button class=btn name=worked value=1>Работал(а) — добавить в график</button> '
+                         '<button class=btn name=worked value=0>Не работал(а)</button></form></td></tr>')
+            b.append('</table>')
         if probs:
             b.append('<p class=off>Нарушены правила графика:</p><ul>' + "".join(f"<li>{e(x)}</li>" for x in probs) + "</ul>")
         b.append(f'<form method=post action="/schedule/{month}">')
@@ -638,6 +655,29 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
                     days[d] = None if st == dflt else st
             db.set_schedule(month, sl["id"], days)
         return RedirectResponse(f"/schedule/{month}?msg=" + quote("График сохранён"), status_code=303)
+
+    @app.post("/offschedule", dependencies=[Depends(auth)])
+    async def offschedule(request: Request):
+        """Ответ на продажу в день вне графика. Итоги уже закрытого месяца пересчитываются (рабочих дней стало иначе)."""
+        form = await request.form()
+        try:
+            day = date.fromisoformat(str(form.get("day")))
+            sid = int(str(form.get("sid")))
+        except ValueError:
+            raise HTTPException(400, "Неверный день или продавец")
+        if not db.seller(sid):
+            raise HTTPException(404, "Продавец не найден")
+        worked = form.get("worked") == "1"
+        db.decide_offschedule(day.isoformat(), sid, worked)
+        month = day.strftime("%Y-%m")
+        msg = f"{day:%d.%m} — {'рабочий день, добавлен в график' if worked else 'не рабочий день'}"
+        if db.one("SELECT 1 FROM results WHERE month=?", month):
+            service.close_month(db, cfg, month)
+            msg += f". Итоги {month} пересчитаны — проверьте «Итоги и ведомость»"
+        back = str(form.get("back") or month)
+        if not re.fullmatch(r"\d{4}-\d{2}", back):
+            back = month
+        return RedirectResponse(f"/schedule/{back}?msg=" + quote(msg), status_code=303)
 
     # ------------------------------------------------------------------ дни, когда магазины не работали
     @app.get("/closed", dependencies=[Depends(auth)])

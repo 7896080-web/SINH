@@ -177,6 +177,10 @@ def owner_summary(db: DB, cfg: Settings, day: date) -> str:
     no_seller = M.unattributed(db, start, day, cfg.onec.no_seller_name)
     if no_seller:
         L += ["", f"⚠️ Продажи без продавца с начала месяца: {rub(no_seller)} — ни в чей план не попали."]
+    pend = db.offschedule_pending()
+    if pend:
+        L += ["", f"❓ Продажи в дни вне графика ждут вашего ответа: {len(pend)} — админка → «График работы». "
+                  "Пока ответа нет, эти дни не считаются рабочими."]
     if allm.manual_discount:
         L.append(f"Ручные скидки с начала месяца: {rub(allm.manual_discount)} ({pct(allm.manual_share)} от суммы до скидок)")
     hrs = M.hours(db, start, day)

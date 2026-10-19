@@ -248,7 +248,8 @@ def close_month(db: DB, cfg: Settings, month: str) -> list[dict]:
         for r in db.q("SELECT s.id seller_id, p.plan_full, s.role, s.name FROM sellers s "
                       "LEFT JOIN plans p ON p.seller_id=s.id AND p.month=? "
                       "WHERE s.role<>'system' AND (p.seller_id IS NOT NULL OR s.id IN "
-                      "(SELECT seller_id FROM sales_lines WHERE substr(day,1,7)=?))", month, month):
+                      "(SELECT seller_id FROM sales_lines WHERE substr(day,1,7)=?) OR s.id IN "
+                      "(SELECT seller_id FROM schedule WHERE substr(day,1,7)=?))", month, month, month):
             x = h.get(month, str(r["seller_id"]))
             sales, fte = (x.sales, x.fte) if x else (0.0, 0.0)
             res = evaluate(sales, fte, r["plan_full"], r["role"], p, prev.get(r["seller_id"]))

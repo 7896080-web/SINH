@@ -36,9 +36,10 @@ class Achievement:
 
 
 def shifts(db: DB, sid: int, end: date) -> list[tuple[str, float, float]]:
-    """[(день, продажи, вещей)] по всем сменам продавца до `end` включительно, по возрастанию дня."""
+    """[(день, продажи, вещей)] по дням продаж продавца до `end` включительно, по возрастанию дня.
+    День только с возвратами — не смена продавца (он мог и не работать), в рекорды и серии не входит."""
     rows = db.q("SELECT day, SUM(amount) s, SUM(CASE WHEN qty>0 THEN qty ELSE 0 END) n FROM sales_lines "
-                "WHERE seller_id=? AND day<=? GROUP BY day ORDER BY day", sid, end.isoformat())
+                "WHERE seller_id=? AND day<=? GROUP BY day HAVING MAX(amount)>0 ORDER BY day", sid, end.isoformat())
     return [(r["day"], r["s"], r["n"]) for r in rows]
 
 

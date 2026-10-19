@@ -124,6 +124,13 @@ CREATE TABLE IF NOT EXISTS schedule (           -- график работы: р
     store TEXT,                           -- магазин в этот день; пусто — магазин его смены (crews.py)
     PRIMARY KEY (day, seller_id)
 );
+CREATE TABLE IF NOT EXISTS offschedule (        -- продажа в день вне графика: ответ владельца (решение 19.10.2026)
+    day TEXT NOT NULL,
+    seller_id INTEGER NOT NULL REFERENCES sellers(id),
+    worked INTEGER NOT NULL,              -- 1 — работал(а): день добавлен в график; 0 — не работал(а) (отложенный товар)
+    decided_at TEXT,
+    PRIMARY KEY (day, seller_id)
+);
 CREATE TABLE IF NOT EXISTS crews (              -- смены: состав продавцов одного магазина; по средам меняются магазинами
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
@@ -367,7 +374,7 @@ class DB:
             c.execute("UPDATE sellers SET active=1, fired_at=NULL WHERE id=?", (sid,))
 
     # ------------------------------------------------------------------ имена в 1С: написания и дубли
-    MERGE_KEYED = ("schedule", "plans", "results", "plan_overrides", "weekly_goals", "deliveries", "answers",
+    MERGE_KEYED = ("schedule", "offschedule", "plans", "results", "plan_overrides", "weekly_goals", "deliveries", "answers",
                    "lessons_sent", "quiz_answers")  # есть ключ с seller_id: при совпадении остаётся запись основного
 
     def aliases(self, sid: int) -> list[str]:
@@ -456,7 +463,7 @@ class DB:
     def history(self, norm_shifts: int, until_month: str | None = None) -> History:
         """Помесячная история для движка. Ключ продавца — str(seller_id).
 
-        Месяцы с ежедневными данными из 1С берутся из sales_lines (отработано = смены / норма),
+        Месяцы с ежедневными данными из 1С берутся из sales_lines (отработано = рабочие дни / норма, worked_days),
         остальные — из monthly_history (ведомости ЗП)."""
         h = History(roles={str(k): (v if v in ("admin", "system") else "seller") for k, v in self.roles().items()})
         daily = set(self.daily_months())
@@ -473,19 +480,93 @@ class DB:
             days_in = calendar.monthrange(y, mm)[1]
             n_days = self.covered_days(m)
             h.coverage[m] = min(1.0, n_days / days_in) if n_days else 1.0
-            for r in self.q(
-                "SELECT seller_id, SUM(amount) s, COUNT(DISTINCT day) shifts FROM sales_lines "
-                "WHERE substr(day,1,7)=? GROUP BY seller_id", m):
-                h.add(m, str(r["seller_id"]), r["s"], r["shifts"] / norm_shifts)
+            sales = {r["seller_id"]: r["s"] for r in self.q(
+                "SELECT seller_id, SUM(amount) s FROM sales_lines WHERE substr(day,1,7)=? GROUP BY seller_id", m)}
+            days = self._worked_month(m, f"{m}-31")
+            for sid in sales.keys() | days.keys():
+                h.add(m, str(sid), sales.get(sid, 0.0), len(days.get(sid, ())) / norm_shifts)
         return h
 
+    # ------------------------------------------------------------------ рабочие дни (решение владельца 19.10.2026)
+    def _worked_month(self, month: str, upto: str, sid: int | None = None) -> dict[int, set[str]]:
+        """Рабочие дни месяца до `upto` включительно: {seller_id: {день}}.
+
+        * У продавца есть график на месяц → дни графика (кроме дней, когда были закрыты все магазины), старшим тоже.
+          Продажа в день вне графика сама не засчитывается: владелец отвечает в админке (offschedule_pending) —
+          «работал(а)» добавляет день в график, «не работал(а)» (покупатель забрал отложенное) — нет.
+        * Графика нет (история до бота, продавец не внесён) или день раньше начала графика в этом месяце → дни, когда
+          продавец что-то продал; день только с возвратами — не рабочий."""
+        f, a = ("", []) if sid is None else (" AND seller_id=?", [sid])
+        start = self.one("SELECT MIN(day) d FROM schedule WHERE substr(day,1,7)=?", month)["d"]
+        out: dict[int, set[str]] = {}
+        planned: set[int] = set()
+        if start:
+            closed = {r["day"] for r in self.q("SELECT day FROM imported_days WHERE substr(day,1,7)=? GROUP BY day "
+                                               "HAVING SUM(source<>'closed')=0", month)}
+            for r in self.q(f"SELECT seller_id, day FROM schedule WHERE substr(day,1,7)=? AND day<=?{f}",
+                            month, upto, *a):
+                if r["day"] not in closed:
+                    out.setdefault(r["seller_id"], set()).add(r["day"])
+            planned = {r["seller_id"] for r in self.q(
+                f"SELECT DISTINCT seller_id FROM schedule WHERE substr(day,1,7)=?{f}", month, *a)}
+        for r in self.q(f"SELECT DISTINCT seller_id, day FROM sales_lines WHERE substr(day,1,7)=? AND day<=? "
+                        f"AND amount>0{f}", month, upto, *a):
+            if r["seller_id"] not in planned or r["day"] < start:
+                out.setdefault(r["seller_id"], set()).add(r["day"])
+        return out
+
+    def worked_days(self, start: date, end: date, sid: int | None = None) -> dict[int, set[str]]:
+        """Рабочие дни с `start` по `end` по продавцам (правило — _worked_month)."""
+        out: dict[int, set[str]] = {}
+        m, last = start.strftime("%Y-%m"), end.strftime("%Y-%m")
+        while m <= last:
+            for k, days in self._worked_month(m, end.isoformat(), sid).items():
+                out.setdefault(k, set()).update(d for d in days if d >= start.isoformat())
+            m = month_add(m, 1)
+        return out
+
     def worked_shifts(self, sid: int, month: str, upto: date | None = None) -> int:
-        sql = "SELECT COUNT(DISTINCT day) n FROM sales_lines WHERE seller_id=? AND substr(day,1,7)=?"
-        args: list = [sid, month]
-        if upto:
-            sql += " AND day<=?"
-            args.append(upto.isoformat())
-        return self.one(sql, *args)["n"]
+        return len(self._worked_month(month, upto.isoformat() if upto else f"{month}-31", sid).get(sid, ()))
+
+    def offschedule_pending(self, month: str | None = None) -> list[dict]:
+        """Продажи в дни вне графика, на которые владелец ещё не ответил: [{day, seller_id, name, store, amount}].
+        Только месяцы с графиком и продавцы, внесённые в график этого месяца, с первого дня графика."""
+        f, a = ("", []) if month is None else (" AND substr(l.day,1,7)=?", [month])
+        rows = self.q(f"""
+            SELECT l.day, l.seller_id, s.name, l.store, SUM(l.amount) amount FROM sales_lines l
+            JOIN sellers s ON s.id=l.seller_id
+            WHERE l.amount>0 AND s.role<>'system'{f}
+              AND l.day >= (SELECT MIN(day) FROM schedule WHERE substr(day,1,7)=substr(l.day,1,7))
+              AND EXISTS (SELECT 1 FROM schedule g WHERE g.seller_id=l.seller_id AND substr(g.day,1,7)=substr(l.day,1,7))
+              AND NOT EXISTS (SELECT 1 FROM schedule g WHERE g.day=l.day AND g.seller_id=l.seller_id)
+              AND NOT EXISTS (SELECT 1 FROM offschedule o WHERE o.day=l.day AND o.seller_id=l.seller_id)
+            GROUP BY l.day, l.seller_id, l.store ORDER BY l.day, s.name""", *a)
+        out: dict[tuple, dict] = {}
+        for r in rows:  # продавал в двух магазинах за день — одна строка, магазин — где продал больше
+            k = (r["day"], r["seller_id"])
+            cur = out.get(k)
+            if cur is None:
+                out[k] = dict(day=r["day"], seller_id=r["seller_id"], name=r["name"], store=r["store"],
+                              amount=r["amount"], top=r["amount"])
+            else:
+                cur["amount"] += r["amount"]
+                if r["amount"] > cur["top"]:
+                    cur["store"], cur["top"] = r["store"], r["amount"]
+        return [{k: v for k, v in x.items() if k != "top"} for x in out.values()]
+
+    def decide_offschedule(self, day: str, sid: int, worked: bool) -> None:
+        """Ответ владельца на продажу вне графика. «Работал(а)» — день добавляется в график (магазин — где продал)."""
+        with self.tx() as c:
+            c.execute("INSERT INTO offschedule(day, seller_id, worked, decided_at) VALUES(?,?,?,?) "
+                      "ON CONFLICT(day, seller_id) DO UPDATE SET worked=excluded.worked, decided_at=excluded.decided_at",
+                      (day, sid, int(worked), datetime.now().isoformat(timespec="seconds")))
+            if worked:
+                st = c.execute("SELECT store FROM sales_lines WHERE day=? AND seller_id=? AND amount>0 GROUP BY store "
+                               "ORDER BY SUM(amount) DESC LIMIT 1", (day, sid)).fetchone()
+                c.execute("INSERT INTO schedule(day, seller_id, store) VALUES(?,?,?) ON CONFLICT(day, seller_id) "
+                          "DO NOTHING", (day, sid, st["store"] if st else None))
+            else:
+                c.execute("DELETE FROM schedule WHERE day=? AND seller_id=?", (day, sid))
 
     def scheduled_after(self, sid: int, month: str, day: date) -> int | None:
         """Смен по графику после `day` до конца месяца; None — графика на этот месяц у продавца нет."""

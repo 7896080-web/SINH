@@ -130,14 +130,19 @@ def _seller_sql(where: str, args: list, db: DB) -> SellerMetrics:
 
 
 def seller(db: DB, sid: int, start: date, end: date) -> SellerMetrics:
-    return _seller_sql("seller_id=? AND day BETWEEN ? AND ?", [sid, start.isoformat(), end.isoformat()], db)
+    m = _seller_sql("seller_id=? AND day BETWEEN ? AND ?", [sid, start.isoformat(), end.isoformat()], db)
+    m.shifts = len(db.worked_days(start, end, sid).get(sid, ()))  # рабочие дни — по графику (db._worked_month)
+    return m
 
 
 def team(db: DB, start: date, end: date, exclude_admins: bool = True) -> SellerMetrics:
     """Команда: продавцы (без админов, если exclude_admins), без строк «(без продавца)»."""
     role = "('seller')" if exclude_admins else "('seller','admin')"
     where = f"day BETWEEN ? AND ? AND seller_id IN (SELECT id FROM sellers WHERE role IN {role})"
-    return _seller_sql(where, [start.isoformat(), end.isoformat()], db)
+    m = _seller_sql(where, [start.isoformat(), end.isoformat()], db)
+    ids = {r["id"] for r in db.q(f"SELECT id FROM sellers WHERE role IN {role}")}
+    m.shifts = sum(len(v) for k, v in db.worked_days(start, end).items() if k in ids)
+    return m
 
 
 def unattributed(db: DB, start: date, end: date, name: str = "(без продавца)") -> float:
