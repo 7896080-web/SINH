@@ -44,10 +44,24 @@ def test_profit_formula_with_cogs_and_return(db):
     assert t.total_payout == 210000 - 15000
     assert t.cogs == 90000                         # вернувшаяся штука вернула и себестоимость
     assert t.profit == 195000 - 90000
-    assert round(t.margin, 4) == round(105000 / 250000, 4)
+    assert round(t.margin, 4) == round(105000 / 195000, 4)      # от к перечислению, не от выручки
     assert round(t.roi, 4) == round(105000 / 90000, 4)
     assert t.profit_per_unit == 105000
     assert total.profit == t.profit and unassigned.total_payout == 0
+
+
+def test_margin_needs_something_to_be_paid_out(db):
+    """Маржинальность — от суммы к перечислению. Логистика съела всё перечисление —
+    маржинальности нет (а не «−300 %» от копеечной базы или деление на ноль)."""
+    make_product(db)
+    _cost(db, "u1", 90000)
+    make_report(db, lines=[_sale(),
+                           {"operation": v.LOGISTICS, "uid_1c": "u1", "barcode": "2000000000012",
+                            "article": "A-1", "quantity": 0, "logistics": 210000}])
+    rows, *_ = unit_economics(db, PERIOD, NO_TAX)
+    t = rows[0].totals
+    assert t.revenue > 0 and t.total_payout == 0
+    assert t.margin is None and t.roi is not None
 
 
 def test_cost_is_taken_on_the_operation_date(db):

@@ -58,7 +58,7 @@
     <div class="kpi">
         <div class="kpi__label">Маржинальность</div>
         <div class="kpi__value">{{ total.margin | pct }}</div>
-        <div class="kpi__note">ROI {{ total.roi | pct }}</div>
+        <div class="kpi__note">от суммы к перечислению · ROI {{ total.roi | pct }}</div>
     </div>
     <div class="kpi">
         <div class="kpi__label">Доля возвратов</div>
@@ -119,7 +119,7 @@
             <dt>Выручка</dt><dd>{{ money(t.revenue, true) }}</dd>
             <dt>К перечислению</dt><dd>{{ money(t.total_payout, true) }}</dd>
             <dt>Прибыль</dt><dd>{{ money(t.profit, true) }}</dd>
-            <dt>Маржинальность</dt><dd>{{ t.margin | pct }}</dd>
+            <dt title="Прибыль ÷ к перечислению">Маржинальность</dt><dd>{{ t.margin | pct }}</dd>
             <dt>Продано / возвраты</dt><dd>{{ t.sold_qty }} / {{ t.returned_qty }} шт</dd>
             <dt>Прибыль на единицу</dt><dd>{{ money(t.profit_per_unit, true) }}</dd>
         </dl>
@@ -205,7 +205,7 @@
         <h2 style="margin-top:0; font-size:15px;">Самые прибыльные артикулы</h2>
         {% if top %}
         <table>
-            <thead><tr><th>Артикул</th><th class="num">Шт</th><th class="num">Прибыль</th><th class="num">Маржа</th></tr></thead>
+            <thead><tr><th>Артикул</th><th class="num">Шт</th><th class="num">Прибыль</th><th class="num" title="Прибыль ÷ к перечислению">Маржа</th></tr></thead>
             <tbody>
             {% for g in top %}
             <tr><td>{{ g.article or '—' }}<div class="help-text">{{ g.title }}</div>
@@ -221,7 +221,7 @@
         <h2 style="margin-top:0; font-size:15px;">Убыточные артикулы</h2>
         {% if losers %}
         <table>
-            <thead><tr><th>Артикул</th><th class="num">Шт</th><th class="num">Убыток</th><th class="num">Маржа</th></tr></thead>
+            <thead><tr><th>Артикул</th><th class="num">Шт</th><th class="num">Убыток</th><th class="num" title="Прибыль ÷ к перечислению">Маржа</th></tr></thead>
             <tbody>
             {% for g in losers %}
             <tr><td>{{ g.article or '—' }}<div class="help-text">{{ g.title }}</div>{% if g.totals.cost_suspicious_qty %}<span class="badge badge--bad" title="Себестоимость больше цены продажи в 10 раз и больше — это ошибка данных, в прибыль она не взята. Исправьте на «Себестоимости»">себестоимость под сомнением</span>{% endif %}</td>
