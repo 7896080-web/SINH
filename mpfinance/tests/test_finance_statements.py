@@ -208,6 +208,37 @@ def test_api_list_is_stored_as_summary_without_wiping_file_columns(db):
     assert statement.storage_kop == 0                            # из файла, API его не затёр
 
 
+def test_api_list_gives_every_article_so_a_doubled_expense_is_seen(db):
+    """Список finance-api отдаёт итоги шапки по каждой статье (спецификация
+    `sales-reports/list`): по ним у отчёта из API видно, КАКАЯ статья разошлась,
+    а не только что итог не тот. До 19.10.2026 брались лишь доставка и итог."""
+    header = dict(WB_HEADER, sellerFinanceName="ИП Яворская Т. Н.", forPaySum="2100",
+                  deliveryServiceSum="150.5", paidStorageSum="40", paidAcceptanceSum="10",
+                  deductionSum="300", penaltySum="5", additionalPaymentSum="2",
+                  cashbackAmountSum="3", cashbackCommissionChangeSum="1", paymentSchedule="0",
+                  bankPaymentSum="1588.50")
+    row = statements.parse_api_list([header])[0]
+    assert (row["storage_kop"], row["acceptance_kop"], row["penalty_kop"]) == (4000, 1000, 500)
+    assert row["deduction_kop"] == 30600                         # 300 + 2 + 3 + 1 + 0
+    assert row["legal_entity"] == "ИП Яворская Т. Н."
+    assert row["for_pay_kop"] - row["delivery_kop"] - row["storage_kop"] - row["acceptance_kop"] \
+        - row["deduction_kop"] - row["penalty_kop"] == row["total_kop"]
+    account = make_account(db)
+    statements.store(db, "wb", account.id, [row], "api")
+    db.commit()
+    # Хранение легло дважды: итог разошёлся ровно на него, и статья названа.
+    _wb_report(db, "307401554", [{"operation": v.SALE, "quantity": 1, "payout": 210000},
+                                 {"operation": v.LOGISTICS, "quantity": 0, "logistics": 15050},
+                                 {"operation": v.STORAGE, "quantity": 0, "storage": 4000},
+                                 {"operation": v.STORAGE, "quantity": 0, "storage": 4000},
+                                 {"operation": v.ACCEPTANCE, "quantity": 0, "acceptance": 1000},
+                                 {"operation": v.PENALTY, "quantity": 0, "penalty": 500},
+                                 {"operation": v.DEDUCTION, "quantity": 0, "deduction": 30600}])
+    found = {r.statement.report_number: r for r in statements.compare(db)}["307401554"]
+    assert found.status == "diff" and found.diff == -4000
+    assert found.bucket_diffs() == [("Хранение", 4000, 8000)]
+
+
 # ------------------------------------------------------------ проверка доступа
 
 def _account_with(db, platform, field, value):
