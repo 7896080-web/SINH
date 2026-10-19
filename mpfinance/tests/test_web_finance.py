@@ -50,6 +50,24 @@ def test_upload_redirects_to_report_and_pages_show_it(client, db):
     assert "без себестоимости" in ue
 
 
+def test_unit_economics_keeps_storage_apart_from_deductions(client, db):
+    """19.10.2026: колонка «Хранение и прочее» показала 235 214 ₽ при хранении WB
+    20 038 ₽ — остальное были удержания (реклама). Хранение — своей колонкой."""
+    make_product(db)
+    make_report(db, lines=[
+        {"uid_1c": "u1", "barcode": "2000000000012", "article": "A-1",
+         "revenue": 250000, "payout": 210000, "commission": 40000},
+        {"operation": v.STORAGE, "quantity": 0, "storage": 123400},
+        {"operation": v.DEDUCTION, "quantity": 0, "deduction": 5678900}])
+    period = "date_from=2026-09-01&date_to=2026-09-30"
+    page = client.get(f"/finance/unit-economics?{period}").text
+    assert "Удержания и прочее" in page and "Хранение и прочее" not in page
+    assert "1\u00a0234\u00a0₽" in page and "56\u00a0789\u00a0₽" in page
+    assert '">58\u00a0023\u00a0₽' not in page          # их сумма (не «−58 023» к перечислению)
+    assert "все площадки вместе" in page
+    assert "все площадки вместе" not in client.get(f"/finance/unit-economics?{period}&platform=wb").text
+
+
 def test_bad_upload_shows_reason_and_saves_nothing(client, db):
     response = _upload(client, make_xlsx(["Что-то"], [["1"]]))
     assert response.headers["location"] == "/finance/reports"

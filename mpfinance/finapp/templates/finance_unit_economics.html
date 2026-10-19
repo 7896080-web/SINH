@@ -61,7 +61,8 @@
                 <th class="num">Выручка</th>
                 <th class="num">Комиссия</th>
                 <th class="num">Логистика</th>
-                <th class="num">Хранение и прочее</th>
+                <th class="num">Хранение</th>
+                <th class="num" title="Прочие удержания площадки (у WB это в основном реклама «WB Продвижение»), штрафы и приёмка минус компенсации">Удержания и прочее</th>
                 <th class="num">К перечислению</th>
                 <th class="num">Себестоимость</th>
                 <th class="num">Налоги и доп.</th>
@@ -93,7 +94,8 @@
                 {% if g.wb_subject %}<div class="help-text">{{ g.wb_subject }}</div>{% endif %}
                 {% endif %}</td>
             <td class="num">{{ money(t.logistics, true) }}</td>
-            <td class="num">{{ money(t.storage + t.other_costs, true) }}</td>
+            <td class="num">{{ money(t.storage, true) }}</td>
+            <td class="num">{{ money(t.other_costs, true) }}</td>
             <td class="num">{{ money(t.total_payout, true) }}</td>
             <td class="num">{{ money(t.cogs, true) }}</td>
             <td class="num">{{ money(t.taxes + t.extra, true) }}</td>
@@ -109,7 +111,8 @@
                 <div class="help-text">хранение, удержания без баркода</div></td>
             <td class="num">{{ t.sold_qty or '' }}</td><td class="num">{{ t.returned_qty or '' }}</td>
             <td class="num">{{ money(t.revenue, true) }}</td><td class="num">{{ money(t.commission, true) }}</td>
-            <td class="num">{{ money(t.logistics, true) }}</td><td class="num">{{ money(t.storage + t.other_costs, true) }}</td>
+            <td class="num">{{ money(t.logistics, true) }}</td><td class="num">{{ money(t.storage, true) }}</td>
+            <td class="num">{{ money(t.other_costs, true) }}</td>
             <td class="num">{{ money(t.total_payout, true) }}</td><td class="num">{{ money(t.cogs, true) }}</td>
             <td class="num">{{ money(t.taxes + t.extra, true) }}</td><td class="num">{{ money(t.profit, true) }}</td>
             <td></td><td></td><td></td>
@@ -117,10 +120,12 @@
         {% endif %}
         {% set t = total %}
         <tr class="row--total">
-            <td>Итого</td>
+            <td>Итого{% if not platform %}<div class="help-text">все площадки вместе — прибыль на единицу по ним общая;
+                по одной площадке — фильтр «Площадка»</div>{% endif %}</td>
             <td class="num">{{ t.sold_qty }}</td><td class="num">{{ t.returned_qty }}<div class="help-text">{{ t.return_rate | pct(0) }}</div></td>
             <td class="num">{{ money(t.revenue, true) }}</td><td class="num">{{ money(t.commission, true) }}</td>
-            <td class="num">{{ money(t.logistics, true) }}</td><td class="num">{{ money(t.storage + t.other_costs, true) }}</td>
+            <td class="num">{{ money(t.logistics, true) }}</td><td class="num">{{ money(t.storage, true) }}</td>
+            <td class="num">{{ money(t.other_costs, true) }}</td>
             <td class="num">{{ money(t.total_payout, true) }}</td><td class="num">{{ money(t.cogs, true) }}</td>
             <td class="num">{{ money(t.taxes + t.extra, true) }}</td><td class="num">{{ money(t.profit, true) }}</td>
             <td class="num">{{ t.margin | pct }}</td><td class="num">{{ t.roi | pct(0) }}</td>
