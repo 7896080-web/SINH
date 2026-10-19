@@ -19,6 +19,8 @@ ONEC_EPF_CHECKED_AT = "onec_epf_checked_at"
 CATALOG_LOADED_AT = "onec_catalog_loaded_at"
 CATALOG_ROWS = "onec_catalog_rows"
 COSTS_LOADED_AT = "onec_costs_loaded_at"
+# Проданных без себестоимости сразу после последней выгрузки себестоимости из 1С.
+COSTS_MISSING_AT_LOAD = "onec_costs_missing_at_load"
 SYNC_CATALOG_AT = "sync_catalog_loaded_at"
 # Вторая площадка копий: путь в облаке (remote:бакет/папка), итог последней
 # выгрузки и время последней УДАЧНОЙ — по ней видно, сколько суток площадки нет.

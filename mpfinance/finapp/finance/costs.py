@@ -15,11 +15,34 @@ from __future__ import annotations
 import re
 from decimal import Decimal, InvalidOperation
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from finapp import settings
-from finapp.models import Product, ProductCost
+from finapp.finance import values as v
+from finapp.models import Product, ProductCost, SalesReportLine
 from finapp.timeutils import now_utc, today_local
+
+# Размеры, которых на площадках нет (владелец, 19.10.2026): «U» — карточки 1С не
+# для маркетплейсов. В списках «без себестоимости» и в счётчиках страницы они
+# только мешали искать то, что действительно искажает прибыль.
+OFF_MARKET_SIZES = ("U",)
+
+
+def off_market(size_column):
+    """Условие «размер не с площадок» (без учёта регистра и пробелов)."""
+    return func.upper(func.trim(func.coalesce(size_column, ""))).in_(OFF_MARKET_SIZES)
+
+
+def sold_without_cost(db: Session) -> int:
+    """Сколько проданных на площадках товаров 1С без себестоимости — то, что
+    показывает «без себестоимости» на странице и по чему суточное задание решает,
+    не запросить ли себестоимость из 1С раньше срока."""
+    sold = db.query(SalesReportLine.uid_1c).filter(
+        SalesReportLine.operation == v.SALE, SalesReportLine.uid_1c.isnot(None))
+    return db.query(func.count(Product.uid_1c)).filter(
+        Product.uid_1c.in_(sold), ~off_market(Product.size),
+        ~Product.uid_1c.in_(db.query(ProductCost.uid_1c))).scalar() or 0
 
 _CHUNK = 500
 # Цена — число с точкой (или запятой), без пробелов ВНУТРИ: пробел — признак
@@ -121,6 +144,9 @@ def import_costs(db: Session, costs: dict[str, int]) -> dict:
         stats["updated"] += 1
     db.flush()
     settings.put(db, settings.COSTS_LOADED_AT, now_utc().isoformat(timespec="seconds"))
+    # Сколько проданного осталось без цены ПОСЛЕ выгрузки: этих 1С не знает, и
+    # переспрашивать о них раньше суток незачем (`jobs._costs_newly_missing`).
+    settings.put(db, settings.COSTS_MISSING_AT_LOAD, str(sold_without_cost(db)))
     return stats
 
 

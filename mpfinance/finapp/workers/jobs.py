@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 
 from finapp import backup, catalog, config, exchange, mail, onec, settings
 from finapp.database import SessionLocal
-from finapp.finance import fetch
+from finapp.finance import costs, fetch
 from finapp.models import OnecTask, OnecTaskStatus
 from finapp.timeutils import now_utc
 from finapp.workers.heartbeat import beat
@@ -55,6 +55,26 @@ def job_onec_exchange() -> None:
         beat(db, "onec_exchange", False, f"{type(e).__name__}: {e}")
     finally:
         db.close()
+
+
+# Новый приход продаётся раньше, чем 1С выгрузит его себестоимость (19.10.2026:
+# «36446 b» 3XL INDIGO MEL — пять продаж без себестоимости при выгрузке раз в сутки).
+# Появились проданные товары без цены, которых не было после прошлой выгрузки, —
+# спрашиваем 1С снова, не дожидаясь суток, но не чаще этого.
+COSTS_NEW_MISSING_RETRY = timedelta(hours=3)
+
+
+def _costs_newly_missing(db) -> bool:
+    """Проданных без себестоимости стало больше, чем осталось после прошлой выгрузки.
+    Сравнение именно с остатком после выгрузки: товары, цены которых в 1С нет вовсе,
+    иначе гоняли бы тяжёлую выгрузку каждые три часа без толку."""
+    if not _older_than(settings.get(db, settings.COSTS_LOADED_AT), COSTS_NEW_MISSING_RETRY):
+        return False
+    try:
+        after_load = int(settings.get(db, settings.COSTS_MISSING_AT_LOAD) or 0)
+    except ValueError:
+        after_load = 0
+    return costs.sold_without_cost(db) > after_load
 
 
 def _unanswered_recently(db, command: str) -> bool:
@@ -116,7 +136,9 @@ def job_daily() -> None:
         else:
             for command, stamp in (("BARCODE_DICT", settings.CATALOG_LOADED_AT),
                                    ("EXPORT_COST_PRICES", settings.COSTS_LOADED_AT)):
-                if _older_than(settings.get(db, stamp), DAILY) and not _unanswered_recently(db, command):
+                due = _older_than(settings.get(db, stamp), DAILY) or (
+                    command == "EXPORT_COST_PRICES" and _costs_newly_missing(db))
+                if due and not _unanswered_recently(db, command):
                     onec.enqueue(db, command)
             db.commit()
         exchange.prune_archive(config.ONEC_ARCHIVE_DIR)

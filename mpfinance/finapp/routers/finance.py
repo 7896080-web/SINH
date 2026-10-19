@@ -16,7 +16,7 @@ from finapp.audit import log_action
 from finapp.database import get_db
 from finapp.deps import get_current_user
 from finapp.excel_utils import ExcelReadError, build_xlsx_response, read_upload, read_xlsx_rows
-from finapp.finance import charts, fetch, lamoda, repeats, statements, tariffs, values as v
+from finapp.finance import charts, costs as cost_rules, fetch, lamoda, repeats, statements, tariffs, values as v
 from finapp.finance.economics import (Filters, Totals, charges_by_kind, load_lines, platform_summary, trend,
                                    unit_economics)
 from finapp.finance.formats import FORMATS
@@ -613,7 +613,8 @@ def _costs_query(db: Session, q: str, missing: bool):
     «выгрузить отобранное» выгрузило бы другое. `missing` — ПРОДАННЫЕ без
     себестоимости, самые продаваемые сверху: только они искажают прибыль."""
     sold = _sold_subquery(db)
-    query = db.query(Product, sold.c.sold).outerjoin(sold, sold.c.uid_1c == Product.uid_1c)
+    query = db.query(Product, sold.c.sold).outerjoin(sold, sold.c.uid_1c == Product.uid_1c) \
+        .filter(~cost_rules.off_market(Product.size))         # размера «U» на площадках нет
     if q.strip():
         like = f"%{q.strip()}%"
         query = query.filter(or_(Product.article.ilike(like), Product.name.ilike(like),
@@ -636,16 +637,18 @@ def costs_page(
     products = [p for p, _sold in rows]
     sold_qty = {p.uid_1c: int(n or 0) for p, n in rows}
     costs = _current_costs(db, [p.uid_1c for p in products])
-    with_cost = db.query(func.count(func.distinct(ProductCost.uid_1c))).scalar() or 0
+    on_market = db.query(Product.uid_1c).filter(~cost_rules.off_market(Product.size))
+    with_cost = db.query(func.count(func.distinct(ProductCost.uid_1c))) \
+        .filter(ProductCost.uid_1c.in_(on_market)).scalar() or 0
     sold = _sold_subquery(db)
-    sold_total = db.query(func.count()).select_from(sold).scalar() or 0
-    sold_with_cost = db.query(func.count()).select_from(sold) \
-        .filter(sold.c.uid_1c.in_(db.query(ProductCost.uid_1c))).scalar() or 0
+    sold_total = db.query(func.count()).select_from(sold).filter(sold.c.uid_1c.in_(on_market)).scalar() or 0
+    missing_count = cost_rules.sold_without_cost(db)
+    sold_with_cost = sold_total - missing_count
     rates = RateBook(db)
     return templates.TemplateResponse(request, "finance_costs.html", _ctx(
         request, user, "finance-costs",
         products=products, costs=costs, total=total, limit=COSTS_LIMIT, q=q, missing=missing,
-        with_cost=with_cost, products_total=db.query(Product).count(), sold_qty=sold_qty,
+        with_cost=with_cost, products_total=on_market.count(), sold_qty=sold_qty,
         sold_total=sold_total, sold_with_cost=sold_with_cost,
         raw=raw_settings(db), tax_modes=TAX_MODES, warehouse_keys=WAREHOUSE_KEYS,
         tax_text=tax_text(load_settings(db)), tax_effective=effective_rate(load_settings(db)),

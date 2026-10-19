@@ -7,7 +7,7 @@
         <h1>Себестоимость и настройки расчёта</h1>
         <p>Себестоимость задана у <b>{{ sold_with_cost }} из {{ sold_total }}</b> проданных товаров (тех, что есть в
            отчётах площадок){% if sold_total > sold_with_cost %} — <a href="/finance/costs?missing=true">без себестоимости: {{ sold_total - sold_with_cost }}</a>{% endif %}.
-           <span class="help-text">В справочнике 1С всего {{ products_total }} товаров, себестоимость у {{ with_cost }}; остальные
+           <span class="help-text">В справочнике 1С всего {{ products_total }} товаров (без размера U — их нет на площадках), себестоимость у {{ with_cost }}; остальные
            на площадках не продавались и на расчёт не влияют.</span> ·
            <a href="#settings">Настройки расчёта ↓</a> (налог, склады 1С, курс, продажи KIT и комиссия AWER CRM)</p>
     </div>
