@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import re
 from datetime import date, timedelta
 
 from . import metrics as M
@@ -22,10 +23,17 @@ def in_kit(cfg: Settings, a: str, b: str) -> bool:
                for k, vs in inc.items() for x, y in ((a, b), (b, a)))
 
 
+def same_group(a: str, b: str) -> bool:
+    """«Футболка-O» и «Футболка-V» — одна группа: «возьмите вторую футболку» — не образ (аудит П4)."""
+    first = lambda c: re.split(r"[-\s/]", c.strip().lower())[0]  # noqa: E731
+    return first(a) == first(b)
+
+
 def pairs_from_1c(db: DB, cfg: Settings, day: date) -> dict[str, list[tuple[str, float]]]:
-    """«Что покупают вместе» из 1С за recommendations.lookback_days — без связок, которые идут в комплекте."""
+    """«Что покупают вместе» из 1С за recommendations.lookback_days — без связок, которые идут в комплекте,
+    и без двух вещей одной группы."""
     raw = M.cross_sell(db, day - timedelta(days=cfg.recommendations.lookback_days), day)
-    out = {a: [(b, sh) for b, sh in v if not in_kit(cfg, a, b)] for a, v in raw.items()}
+    out = {a: [(b, sh) for b, sh in v if not in_kit(cfg, a, b) and not same_group(a, b)] for a, v in raw.items()}
     return {a: v for a, v in out.items() if v}
 
 
@@ -42,11 +50,13 @@ def companions(db: DB, cfg: Settings, day: date) -> set[str]:
 
 
 def best_pair(db: DB, cfg: Settings, day: date, stock: dict) -> tuple[str, str] | None:
-    """Самая частая связка категорий, где обе есть на остатке магазина; первой — та, что продаётся чаще."""
+    """Самая частая связка категорий, где обе есть на остатке магазина и одна из них — дополнение из
+    recommendations.add_ons (ремень, рубашка, носки…; аудит П4); первой — та, что продаётся чаще."""
     start = day - timedelta(days=cfg.recommendations.lookback_days)
     pairs = pairs_from_1c(db, cfg, day)
+    add = lambda c: any(c.startswith(x) for x in cfg.recommendations.add_ons)  # noqa: E731
     cands = [(sh, a, b) for a, v in pairs.items() for b, sh in v
-             if sh >= PAIR_MIN and in_stock(stock, a) and in_stock(stock, b)]
+             if sh >= PAIR_MIN and in_stock(stock, a) and in_stock(stock, b) and (add(a) or add(b))]
     if not cands:
         return None
     mix = M.category_mix(db, None, start, day)
@@ -63,10 +73,11 @@ def _d1(x: float) -> str:
 
 
 def _main_store(db: DB, sid: int, start: date, end: date, cfg: Settings | None = None) -> str | None:
-    """Магазин продавца: по графику и смене на день `end`, иначе — где он чаще продавал."""
+    """Магазин продавца СЕГОДНЯ (`end` + 1 — сообщение за `end` читают на следующий день; смены по средам меняются
+    магазинами, аудит П3): по графику и смене, иначе — где он чаще продавал с `start` по `end`."""
     if cfg is not None:
         from .crews import store_on
-        st = store_on(db, cfg, sid, end)
+        st = store_on(db, cfg, sid, end + timedelta(days=1))
         if st:
             return st
     r = db.one("SELECT store, COUNT(*) n FROM sales_lines WHERE seller_id=? AND day BETWEEN ? AND ? "
@@ -123,9 +134,9 @@ def rules(db: DB, cfg: Settings, sid: int, st: Status, day: date) -> list[tuple[
         out.append((70, f"Средняя цена проданной вещи у вас {_rub(me.avg_price)}, у команды {_rub(tm.avg_price)} — "
                         "начинайте показ с моделей среднего и верхнего ценового сегмента."))
 
-    # 4. Скидки выше команды
-    if me.discount_share and tm.discount_share is not None and me.discount_share > max(0.05, tm.discount_share * 1.3):
-        out.append((60, f"Скидки — {me.discount_share:.0%} от суммы продаж (у команды {tm.discount_share:.0%}). "
+    # 4. Ручные скидки выше команды (скидка по карте и акция — не решение продавца, аудит П2)
+    if me.manual_share and tm.manual_share is not None and me.manual_share > max(0.03, tm.manual_share * 1.3):
+        out.append((60, f"Ручные скидки — {me.manual_share:.0%} от суммы до скидок (у команды {tm.manual_share:.0%}). "
                         "Сначала рассказывайте о ценности вещи, скидку — в конце и только когда она решает покупку."))
 
     # 5. Возвраты

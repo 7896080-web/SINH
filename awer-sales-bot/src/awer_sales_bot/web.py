@@ -24,6 +24,7 @@ from . import tasks as tasks_mod
 from . import crews as crews_mod
 from .config import Settings
 from .db import DB
+from .messages import pct  # вниз до целого (аудит П1)
 from .planning import backtest, service
 from .planning.engine import METHOD_NAMES, month_add, rate_for, threshold_amounts
 
@@ -149,7 +150,7 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
                 f'<td class="n {"man" if r.plan_manual is not None else ""}"><b>{_rub(r.plan_final)}</b></td>'
                 f'<td class=n>{_rub(th[0]) + " → " + _rub(rate_for(1, r.role, p)) if th else ""}</td>'
                 f'<td class=n>{_rub(st.sales) if st else ""}</td>'
-                f'<td class="n {"ok" if perf and perf >= 1 + p.step else ""}">{"" if perf is None else f"{perf:.0%}"}</td>'
+                f'<td class="n {"ok" if perf and perf >= 1 + p.step else ""}">{"" if perf is None else pct(perf)}</td>'
                 f'<td class=n>{_rub(st.current_rate) if st else ""}</td></tr>')
         b += ['</table><button class=btn>Сохранить ручные планы</button><span class=note> — после фиксации ручной план '
               'применяется сразу и только к тому, кому вписан (например, новичку); остальным цели не меняются.</span></form>',
@@ -203,7 +204,7 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
              '<table><tr><th>Продавец</th><th>Продажи</th><th>Отработано</th><th>Выполнение</th><th>Шагов</th>'
              '<th>Ставка (полный мес.)</th></tr>']
         for r in rows:
-            perf = "" if r["performance"] is None else format(r["performance"], ".0%")
+            perf = "" if r["performance"] is None else pct(r["performance"])
             b.append(f'<tr><td>{html.escape(r["name"])}</td><td class=n>{_rub(r["sales"])}</td><td class=n>{r["fte"]:.2f}</td>'
                      f'<td class=n>{perf}</td>'
                      f'<td class=n>{r["steps"]}</td><td class=n>{_rub(r["rate"])}</td></tr>')
@@ -267,7 +268,7 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
         return backtest.months_between(min(frm, to), max(frm, to))
 
     def _pct(x) -> str:
-        return "—" if x is None else f"{x:.0%}"
+        return pct(x)
 
     @app.get("/check", dependencies=[Depends(auth)])
     def check_page(frm: str = "", to: str = ""):

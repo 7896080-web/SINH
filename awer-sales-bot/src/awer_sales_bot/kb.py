@@ -78,10 +78,13 @@ def on_callback(db: DB, cfg: Settings, payload: str, sid: int | None) -> tuple[s
 
 
 # ----------------------------------------------------------------------------- карточки новинок
-def arrivals_card(db: DB, cfg: Settings, day: date, limit: int = 10) -> tuple[str, list] | None:
-    """Новинки за день из 1С: модель, бренд, цвет, размеры — и кнопки на статьи о таких вещах."""
+def arrivals_card(db: DB, cfg: Settings, day: date, limit: int = 10,
+                  store: str | None = None) -> tuple[str, list] | None:
+    """Новинки за день из 1С: модель, бренд, цвет, размеры — и кнопки на статьи о таких вещах.
+    store — только поступления этого магазина (продавцу — его магазин сегодня, аудит П3)."""
+    f, a = ("", []) if store is None else (" AND store=?", [store])
     rows = db.q("SELECT item, category, brand, color, GROUP_CONCAT(DISTINCT size) sizes, SUM(qty) q FROM arrivals "
-                "WHERE day=? GROUP BY item, category, brand, color ORDER BY q DESC", day.isoformat())
+                f"WHERE day=?{f} GROUP BY item, category, brand, color ORDER BY q DESC", day.isoformat(), *a)
     if not rows:
         return None
     lines = []

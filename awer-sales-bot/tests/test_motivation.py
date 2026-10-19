@@ -133,7 +133,8 @@ def test_store_plan_only_for_owner_and_example_config_keeps_no_seller(env, tmp_p
     rows = [(oct_day(1), "Продавец04", 1_000_000, 50), (oct_day(2), "", 121_090, 5)]
     import_sales(tmp_path / "s.csv", rows, db, cfg)
     line = store_goal(db, cfg, oct_day(10))[0]
-    assert line.startswith("Магазины вместе: 1 121 090 ₽ из 5 605 452 ₽ — 20% плана, прошло 10 из 31 дня")
+    # 19,99 % — вниз до целого (аудит П1)
+    assert line.startswith("Магазины вместе: 1 121 090 ₽ из 5 605 452 ₽ — 19% плана, прошло 10 из 31 дня")
     assert mp.store.plan == pytest.approx(5_605_452, abs=1)
     sid = db.seller_id("Продавец04", create=False)
     seller_text = daily(db, cfg, sid, oct_day(2))
@@ -295,7 +296,8 @@ def test_onboarding_lessons_one_per_day(env, tmp_path, monkeypatch):  # noqa: F8
     nid = db.seller_id("Новенькая Анна")
     code = db.new_invite(nid)
     bot.handle(db, cfg, client, {"update_type": "bot_started", "user": {"user_id": 777}, "payload": code})
-    assert [t.splitlines()[0] for _, t, _ in client.sent][1] == "📚 **Программа новичка (1 из 2): Знакомство**"
+    assert [t.splitlines()[0] for _, t, _ in client.sent][1:3] == ["**Как читать сообщения бота**",
+                                                                   "📚 **Программа новичка (1 из 2): Знакомство**"]
 
     import_sales(tmp_path / "s.csv", [(oct_day(10), "Новенькая Анна", 30_000, 3)], db, cfg)
     client.sent.clear()
@@ -430,3 +432,15 @@ def test_tips_name_only_categories_in_stock(env, tmp_path):  # noqa: F811
     tips = " ".join(t for _, t in R.rules(db, cfg, sid, st, oct_day(6)))
     assert "«Ремень»" in tips and "Галстук" not in tips
     assert "«Джинсы» + «Ремень»" in tips
+
+
+def test_pairs_skip_same_group_and_need_add_on(env, monkeypatch):  # noqa: F811
+    """Аудит П4: «Футболка-O» + «Футболка-V» — не образ; «собирайте образ» — только с дополнением из add_ons."""
+    from awer_sales_bot import metrics as M
+    from awer_sales_bot import recommendations as R
+    cfg, db = env
+    monkeypatch.setattr(M, "cross_sell", lambda *a, **k: {"Футболка-O": [("Футболка-V", 0.4), ("Ремень", 0.2)],
+                                                          "Брюки": [("Пиджак", 0.3)]})
+    assert R.pairs_from_1c(db, cfg, oct_day(10)) == {"Футболка-O": [("Ремень", 0.2)], "Брюки": [("Пиджак", 0.3)]}
+    stock = {"Футболка-O": (3, 5), "Ремень": (2, 4), "Брюки": (5, 9), "Пиджак": (4, 6)}
+    assert R.best_pair(db, cfg, oct_day(10), stock) in (("Футболка-O", "Ремень"), ("Ремень", "Футболка-O"))

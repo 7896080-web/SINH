@@ -10,6 +10,7 @@ from pathlib import Path
 
 from . import config as config_mod
 from .db import DB
+from .messages import pct
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -138,7 +139,7 @@ def main(argv: list[str] | None = None) -> None:
         print(f"Итоги {a.month} " + ("окончательные" if service.is_final(db, a.month) else
                                      "ПРЕДВАРИТЕЛЬНЫЕ: выгружены не все дни месяца"))
         for r in rows:
-            perf = "—" if r["performance"] is None else f"{r['performance']:.0%}"
+            perf = "—" if r["performance"] is None else pct(r["performance"])
             print(f"  {r['name']:<28} {r['sales']:>12,.0f}  {perf:>5}  ставка {r['rate']:,.0f}")
     elif a.cmd == "backtest":
         from .planning import backtest
@@ -148,7 +149,7 @@ def main(argv: list[str] | None = None) -> None:
             print(f"{m} ({r.source}): план магазинов {plan:,.0f}, факт {r.store_fact:,.0f}, "
                   f"выполнили план {r.done} из {len(r.rows)}, ставки по схеме {r.rates:,.0f}".replace(",", " "))
             for x in r.rows:
-                perf = "—" if x.performance is None else f"{x.performance:.0%}"
+                perf = "—" if x.performance is None else pct(x.performance)
                 print(f"  {x.name:<28} план {x.plan or 0:>11,.0f}  отработано {x.fte:4.2f}  факт {x.sales:>11,.0f}  "
                       f"{perf:>5}  ставка {x.rate:,.0f}".replace(",", " "))
     elif a.cmd == "check-max":
@@ -165,7 +166,10 @@ def main(argv: list[str] | None = None) -> None:
             except Exception as e:  # noqa: BLE001
                 print(f"{name}: нет связи с {cfg.max.base_url} — {e}")
     elif a.cmd == "bot":
-        from .bot import run
+        from .bot import run, single_instance
+        if not single_instance(cfg):
+            raise SystemExit("Бот уже работает (служба AwerSalesBot). Второй экземпляр слал бы сообщения дважды. "
+                             "Перезапуск: Restart-Service AwerSalesBot")
         run(cfg, db)
     elif a.cmd == "serve":
         import uvicorn

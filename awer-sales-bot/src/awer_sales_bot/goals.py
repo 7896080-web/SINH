@@ -19,7 +19,9 @@ METRICS = {
     "upt": ("вещей в чеке", True, "items"),
     "items_per_shift": ("вещей за рабочий день", True, "items"),
     "avg_price": ("средняя цена вещи", True, "avg_price"),
-    "discount_share": ("доля скидок", False, "discount"),
+    "discount_share": ("доля скидок", False, "discount"),  # прежние цели в базе; новые — manual_share
+    # только ручные скидки: скидка по карте и акция — не решение продавца, за них цель не ставим (аудит П2)
+    "manual_share": ("доля ручных скидок", False, "discount"),
 }
 MIN_SHIFTS = 3  # меньше смен за 4 недели — цели нет (новичку — программа новичка)
 
@@ -57,7 +59,7 @@ def fmt(metric: str, v: float | None) -> str:
         return "—"
     if metric == "avg_price":
         return f"{v:,.0f}".replace(",", " ") + " ₽"
-    if metric == "discount_share":
+    if metric in ("discount_share", "manual_share"):
         return f"{v:.0%}"
     return f"{v:.1f}".replace(".", ",")
 
@@ -78,7 +80,7 @@ def choose(db: DB, cfg: Settings, sid: int, week: date) -> Goal | None:
         return None
     items = "upt" if me.has_receipts else "items_per_shift"
     best: tuple[float, str] | None = None
-    for metric in (items, "avg_price", "discount_share"):
+    for metric in (items, "avg_price", "manual_share"):
         mv, tv = value(me, metric), value(tm, metric)
         if mv is None or not tv:
             continue

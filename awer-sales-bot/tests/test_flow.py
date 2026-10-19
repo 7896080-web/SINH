@@ -216,6 +216,9 @@ def test_orp_mode_cards_stock_arrivals(env):
         c.execute("INSERT INTO sales_lines(day,store,seller_id,item,category,qty,amount,source) "
                   "VALUES('2026-06-01','Город',?,'Арт Пиджак','Пиджак',1,9000,'old')", (sid,))
     assert M.stale_stock(db, days[-1]) == (1, 3.0)
+    db.set_schedule("2026-10", sid, {11: "МСЛ"})  # сообщение за 10.10 читают 11.10 — в МСЛ новинок «Города» нет (П3)
+    assert "Новые поступления" not in daily(db, cfg, sid, days[-1])
+    db.set_schedule("2026-10", sid, {11: "Город"})
     text = daily(db, cfg, sid, days[-1])
     assert "Покупка клиента с картой" in text and "Новые поступления" in text
     summ = owner_summary(db, cfg, days[-1])

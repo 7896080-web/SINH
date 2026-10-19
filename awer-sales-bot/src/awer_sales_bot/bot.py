@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 import time
 from datetime import date, datetime, timedelta
@@ -25,6 +26,7 @@ from .max_api import MaxAuthError, MaxClient
 log = logging.getLogger(__name__)
 HELP = ("Я присылаю каждое утро ваш план, сколько осталось до базы и до следующей ступени, средний чек, "
         "вещей в чеке и советы.\n/plan — состояние на сейчас\n/help — помощь")
+CODE = re.compile(r"[0-9A-Fa-f]{6}")  # код подключения — 6 шестнадцатеричных знаков (db.new_invite)
 TRAINING_HELP = ("Здесь уроки, тесты и база знаний: ткани, утеплители, уход за вещами. Раз в неделю — урок "
                  "по вашей цели недели.\n/baza — база знаний; или просто напишите слово, например «кашемир»\n"
                  "/help — помощь")
@@ -35,7 +37,10 @@ BLOCKED = "Слишком много неверных кодов. Попробу
 
 
 def _by_code(db: DB, uid: int, code: str, link) -> tuple[object | None, bool]:
-    """(продавец или None, заблокирован ли) — привязка по коду с ограничением неверных попыток."""
+    """(продавец или None, заблокирован ли) — привязка по коду с ограничением неверных попыток.
+    Попыткой считается только то, что похоже на код: «привет» не съедает попытки (аудит Р8)."""
+    if not CODE.fullmatch(code.strip()):
+        return None, False
     since = (datetime.now() - timedelta(hours=1)).isoformat(timespec="seconds")
     if db.one("SELECT COUNT(*) n FROM message_log WHERE kind='bad_code' AND max_user_id=? AND sent_at>=?",
               uid, since)["n"] >= CODE_TRIES:
@@ -119,14 +124,16 @@ def handle(db: DB, cfg: Settings, client: MaxClient, u: dict) -> None:
     is_owner = uid in cfg.max.owners
     reply = linked = None
     link = lambda code, user: db.link_by_code(code, user, _who(u))  # noqa: E731
-    if t == "bot_started" and text:
+    if t == "bot_started" and text and seller:  # ссылка с кодом открыта ещё раз (или повтор события после сбоя)
+        reply = f"Вы уже подключены, {seller['first_name'] or seller['name']}. /plan — цифры на сейчас, /help — памятка."
+    elif t == "bot_started" and text:
         linked, blocked = _by_code(db, uid, text, link)
-        reply = BLOCKED if blocked else f"Готово, {linked['first_name']}! {HELP}" if linked else \
+        reply = BLOCKED if blocked else f"Готово, {linked['first_name']}! Вы подключены." if linked else \
             "Код не найден. Возьмите новый у администратора."
     elif t == "bot_started":
         reply = HELP if seller or is_owner else "Здравствуйте! Отправьте код, который выдал администратор."
-    elif text.lower() in ("/help", "помощь"):
-        reply = HELP
+    elif text.lower() in ("/help", "помощь", "памятка"):
+        reply = messages.guide(db, cfg, seller["id"], cfg.now().date()) if seller else HELP
     elif text.lower() == "/id":  # владельцу при настройке: user_id для max.owners
         reply = f"Ваш user_id в MAX: {uid}"
     elif text.lower() in ("/svodka", "сводка") and is_owner:
@@ -134,15 +141,21 @@ def handle(db: DB, cfg: Settings, client: MaxClient, u: dict) -> None:
     elif text.lower() in ("/plan", "план"):
         reply = messages.daily(db, cfg, seller["id"], cfg.now().date() - timedelta(days=1)) if seller else \
             "Сначала отправьте код от администратора."
-    elif not seller and len(text) == 6:
+    elif not seller and CODE.fullmatch(text):
         linked, blocked = _by_code(db, uid, text, link)
-        reply = BLOCKED if blocked else f"Готово, {linked['first_name']}! {HELP}" if linked else \
+        reply = BLOCKED if blocked else f"Готово, {linked['first_name']}! Вы подключены." if linked else \
             "Код не найден. Возьмите новый у администратора."
+    elif not seller and not is_owner:
+        reply = "Здравствуйте! Отправьте код из 6 знаков, который выдал администратор."
     else:
         reply = HELP
     if reply:
         client.send(reply, user_id=uid)
     if linked:
+        text = messages.guide(db, cfg, linked["id"], cfg.now().date())  # что значат цифры — сразу, один раз
+        time.sleep(0.6)  # MAX: не больше 2 сообщений в секунду в один диалог
+        client.send(text, user_id=uid)
+        db.log_message(messages.GUIDE_KEY, "guide", linked["id"], uid, "ok", text)
         if cfg.training_token:  # второй бот: кнопка подключения, первый урок новичку придёт уже туда
             offer_training(db, cfg, client, linked["id"], uid)
         else:
@@ -339,7 +352,35 @@ def poll_forever(db: DB, cfg: Settings, client: MaxClient, stop: threading.Event
             backoff = min(backoff * 2, 60)
 
 
+_LOCK = None  # открытый файл-замок этого процесса
+
+
+def single_instance(cfg: Settings) -> bool:
+    """Замок рядом с базой: второй экземпляр бота (служба + `awer-bot bot` вручную) слал бы каждое сообщение
+    дважды (аудит Р4). Замок держится, пока жив процесс; Windows и Linux снимают его сами при выходе."""
+    global _LOCK
+    if _LOCK is not None:
+        return True
+    f = open(f"{cfg.db_path}.bot.lock", "a+")  # noqa: SIM115 — держим открытым всю жизнь процесса
+    try:
+        if os.name == "nt":
+            import msvcrt
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return False
+    _LOCK = f
+    return True
+
+
 def run(cfg: Settings, db: DB, stop: threading.Event | None = None) -> None:
+    if not single_instance(cfg):
+        log.error("бот уже работает в другом процессе (служба AwerSalesBot?) — второй экземпляр не запущен")
+        return
     stop = stop or threading.Event()
     client = MaxClient(cfg.max_token, cfg.max.base_url, cfg.max.ca_file)
     if connect(db, client, "plan", stop, cfg) is None:

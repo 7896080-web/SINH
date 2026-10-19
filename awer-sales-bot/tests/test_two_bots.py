@@ -25,7 +25,8 @@ def test_one_qr_connects_both_bots_and_messages_are_split(env, tmp_path, monkeyp
     sid = db.add_seller("Новикова Мария", "Мария")
     bot.handle(db, cfg, plan, {"update_type": "bot_started", "user": {"user_id": 501}, "payload": db.new_invite(sid)})
     assert plan.sent[0][1].startswith("Готово, Мария!")
-    button = plan.sent[1][2][0][0]
+    assert plan.sent[1][1].startswith("**Как читать сообщения бота**")  # памятка — сразу после подключения
+    button = plan.sent[2][2][0][0]
     assert button["type"] == "link" and button["text"] == "Подключить обучение"
     code = button["url"].split("start=")[1]
     assert not any("Программа новичка" in t for _, t, _ in plan.sent)  # уроки — не в «План»

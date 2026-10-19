@@ -205,16 +205,21 @@ def daily_run(db: DB, cfg: Settings, sender: Sender, today: date | None = None, 
 def arrivals_run(db: DB, cfg: Settings, sender: Sender, today: date, day: date, fails: list[str] | None = None) -> None:
     """Карточка новинок (модель, бренд, цвет, размеры + статьи) — в бот «Обучение» тем, у кого сегодня рабочий день
     (нет графика на месяц — всем)."""
-    card = kb.arrivals_card(db, cfg, day)
-    if not card:
+    if not kb.arrivals_card(db, cfg, day):
         return
     month = today.strftime("%Y-%m")
+    cards: dict[str | None, tuple | None] = {}
     for s in db.sellers():
         if db.scheduled_after(s["id"], month, today - timedelta(days=1)) is not None and \
                 not db.one("SELECT 1 FROM schedule WHERE seller_id=? AND day=?", s["id"], today.isoformat()):
             continue
         try:
-            sender.to_seller(day.isoformat(), "arrivals", s["id"], card[0], card[1])
+            store = crews.store_on(db, cfg, s["id"], today)  # новинки его магазина сегодня (аудит П3)
+            if store not in cards:
+                cards[store] = kb.arrivals_card(db, cfg, day, store=store)
+            card = cards[store]
+            if card:
+                sender.to_seller(day.isoformat(), "arrivals", s["id"], card[0], card[1])
         except Exception:  # noqa: BLE001
             log.exception("arrivals: %s", s["name"])
             if fails is not None:
@@ -313,7 +318,7 @@ def month_turn(db: DB, cfg: Settings, sender: Sender, today: date) -> None:
 
 
 def month_messages(db: DB, cfg: Settings, sender: Sender, today: date, fails: list[str]) -> None:
-    """Итоги прошлого месяца (окончательные, не пробного; первые RESULT_DAYS дней) и план месяца — каждому
+    """Памятка, итоги прошлого месяца (окончательные, не пробного; первые RESULT_DAYS дней) и план месяца — каждому
     подключённому продавцу, у кого их ещё нет в журнале. Прерванная рассылка, сбой MAX и подключившиеся позже
     получат их при следующем запуске (аудит Р1); журнал не даёт отправить дважды."""
     cur = today.strftime("%Y-%m")
@@ -323,9 +328,10 @@ def month_messages(db: DB, cfg: Settings, sender: Sender, today: date, fails: li
         results = {r["seller_id"]: r for r in service.month_results(db, cfg, prev)}
     planned = {r["seller_id"] for r in db.q("SELECT seller_id FROM plans WHERE month=? AND plan_full IS NOT NULL", cur)}
     for s in db.sellers():
-        if not s["max_user_id"] or (s["id"] not in results and s["id"] not in planned):
+        if not s["max_user_id"]:
             continue
-        try:
+        try:  # памятка «как читать сообщения» — один раз каждому (при подключении она уже ушла, журнал не повторит)
+            sender.to_seller(messages.GUIDE_KEY, "guide", s["id"], messages.guide(db, cfg, s["id"], today))
             if s["id"] in results:
                 sender.to_seller(cur, "month_result", s["id"], messages.month_result(results[s["id"]]))
             if s["id"] in planned:

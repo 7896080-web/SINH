@@ -188,7 +188,7 @@ CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);
 CREATE TABLE IF NOT EXISTS weekly_goals (       -- цель недели продавца (понедельник–воскресенье), goals.py
     week TEXT NOT NULL,                   -- понедельник, YYYY-MM-DD
     seller_id INTEGER NOT NULL REFERENCES sellers(id),
-    metric TEXT NOT NULL,                 -- upt | items_per_shift | avg_price | discount_share
+    metric TEXT NOT NULL,                 -- upt | items_per_shift | avg_price | manual_share (прежде discount_share)
     baseline REAL,                        -- у продавца за 4 недели до цели
     team REAL,                            -- у команды за те же 4 недели
     target REAL NOT NULL,

@@ -51,6 +51,11 @@ def test_errors_are_told_apart():
     with pytest.raises(MaxDenied) as e:
         c.send("x", user_id=5)
     assert e.value.code == "chat.denied"
+    # другой 403 (бот заблокирован, нет прав) — сбой, а не «продавец остановил бота» (аудит Р9)
+    c, _ = mock_client(lambda req, n: httpx.Response(403, json={"code": "access.denied", "message": "blocked"}))
+    with pytest.raises(MaxError) as e:
+        c.send("x", user_id=5)
+    assert not isinstance(e.value, MaxDenied)
 
 
 def test_send_is_not_repeated_on_server_error_but_get_is():
@@ -298,7 +303,8 @@ def test_empty_day_is_not_sent_to_sellers(env):  # noqa: F811
     service.freeze(db, cfg, "2026-10")
     daily_run(db, cfg, s, today=date(2026, 10, 18), force=True)
     # утреннего «продаж нет» нет; «план на месяц» досылается подключённому — это не данные дня (аудит Р1)
-    assert [t.split(" (")[0] for uid, t, _ in m.sent if uid == 501] == ["Продавец04, ваш план на октябрь"]
+    assert [t.split("\n")[0].split(" (")[0] for uid, t, _ in m.sent if uid == 501] == [
+        "**Как читать сообщения бота**", "Продавец04, ваш план на октябрь"]
     assert not db.one("SELECT 1 FROM message_log WHERE kind IN ('daily', 'owner_daily')")  # Р6: и сводки нет
     assert db.get_kv("daily_done") is None  # догон повторит, когда выгрузка придёт
     assert "не отправлена" in db.one("SELECT text FROM message_log WHERE kind='missing_day'")["text"]
@@ -456,7 +462,8 @@ def test_month_messages_resent_and_daily_done_only_when_all_sent(env):  # noqa: 
     m.broken.clear()  # связь вернулась — догон дошлёт только тому, кому не ушло
     daily_run(db, cfg, s, today=date(2026, 10, 18), force=True)
     to502 = [t.split("\n")[0] for uid, t, _ in m.sent if uid == 502]
-    assert to502[0].startswith("Продавец05, ваш план на октябрь") and to502[1].startswith("Доброе утро")
+    assert to502[0] == "**Как читать сообщения бота**" and to502[1].startswith("Продавец05, ваш план на октябрь")
+    assert to502[2].startswith("Доброе утро")
     first = [t for uid, t, _ in m.sent if uid == 501]
     assert len(first) == len(set(first))  # 501 ничего не получил второй раз
     assert db.get_kv("daily_done") == "2026-10-17"
@@ -514,3 +521,44 @@ def test_dry_run_does_not_touch_real_database(env, tmp_path, monkeypatch, capsys
     assert "копии базы" in capsys.readouterr().out
     assert f.exists()  # файл 1С не забран
     assert not db.one("SELECT 1 FROM plans WHERE month='2026-11'") and not db.one("SELECT 1 FROM message_log")
+
+
+def test_hello_is_not_a_bad_code_and_guide_goes_once(env, monkeypatch):  # noqa: F811
+    """Аудит Р8: «привет» не съедает попытки кода; повтор ссылки с кодом после подключения — «вы уже подключены».
+    Памятка — при подключении и больше не повторяется утром."""
+    cfg, db = env
+    monkeypatch.setattr(bot.time, "sleep", lambda s: None)
+    m = FakeMax()
+    say = lambda text: bot.handle(db, cfg, m, {"update_type": "message_created",  # noqa: E731
+                                                "message": {"sender": {"user_id": 601}, "body": {"text": text}}})
+    for _ in range(6):
+        say("привет")
+    assert m.sent[-1][1].startswith("Здравствуйте! Отправьте код из 6 знаков")
+    sid = db.seller_id("Продавец04", create=False)
+    code = db.new_invite(sid)
+    say(code)
+    assert m.sent[-2][1].startswith("Готово") and m.sent[-1][1].startswith("**Как читать сообщения бота**")
+    bot.handle(db, cfg, m, {"update_type": "bot_started", "user": {"user_id": 601}, "payload": code})
+    assert m.sent[-1][1].startswith("Вы уже подключены")
+    say("/help")
+    assert m.sent[-1][1].startswith("**Как читать сообщения бота**")
+    service.freeze(db, cfg, "2026-10")
+    s = Sender(db, cfg, m)
+    s.GAP = 0
+    n = len(m.sent)
+    daily_run(db, cfg, s, today=date(2026, 10, 18), force=True)
+    assert not any(t.startswith("**Как читать") for _, t, _ in m.sent[n:])
+
+
+def test_second_bot_instance_is_refused(env, tmp_path):  # noqa: F811
+    """Аудит Р4: замок рядом с базой — второй процесс бота не запускается."""
+    import subprocess
+    import sys
+    cfg, _ = env
+    assert bot.single_instance(cfg)
+    code = ("import sys; from pathlib import Path; from awer_sales_bot.config import Settings; "
+            "from awer_sales_bot import bot; sys.exit(0 if bot.single_instance(Settings(db_path=Path(sys.argv[1]))) else 3)")
+    r = subprocess.run([sys.executable, "-c", code, str(cfg.db_path)], capture_output=True)
+    assert r.returncode == 3, r.stderr
+    bot._LOCK.close()
+    bot._LOCK = None

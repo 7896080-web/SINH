@@ -90,7 +90,7 @@ class MaxClient:
         msg = f"{method} {path}: {r.status_code} {code} {r.text[:300]}".strip()
         if r.status_code == 401:
             return MaxAuthError(msg, 401, code)
-        if r.status_code == 403:
+        if r.status_code == 403 and code == "chat.denied":  # продавец остановил бота; другой 403 — сбой (аудит Р9)
             return MaxDenied(msg, 403, code)
         return MaxError(msg, r.status_code, code)
 

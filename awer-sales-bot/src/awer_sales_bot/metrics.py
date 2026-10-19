@@ -189,7 +189,7 @@ def category_mix(db: DB, sid: int | None, start: date, end: date) -> dict[str, f
     return {r["category"]: r["n"] / tot for r in rows}
 
 
-def cross_sell(db: DB, start: date, end: date, top: int = 3) -> dict[str, list[tuple[str, float]]]:
+def cross_sell(db: DB, start: date, end: date, top: int = 3, min_pair: int = 5) -> dict[str, list[tuple[str, float]]]:
     """Что покупают вместе: «корзина» = чек ККМ, а за дни без чеков — дисконтная карта в документе ОРП."""
     a = [start.isoformat(), end.isoformat()]
     rows = db.q("""SELECT store||'|'||day||'|'||receipt k, category FROM receipt_lines
@@ -214,7 +214,8 @@ def cross_sell(db: DB, start: date, end: date, top: int = 3) -> dict[str, list[t
                     pair[(a, b)] = pair.get((a, b), 0) + 1
     out: dict[str, list[tuple[str, float]]] = {}
     for (a, b), n in pair.items():
-        out.setdefault(a, []).append((b, n / cnt[a]))
+        if n >= min_pair:  # редкая связка (2–3 покупки) — случайность, а не совет (аудит П4)
+            out.setdefault(a, []).append((b, n / cnt[a]))
     return {a: sorted(v, key=lambda x: -x[1])[:top] for a, v in out.items() if cnt.get(a, 0) >= 10}
 
 

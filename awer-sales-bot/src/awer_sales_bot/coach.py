@@ -18,11 +18,11 @@ def strength(me: M.SellerMetrics, tm: M.SellerMetrics) -> str | None:
     """Показатель, в котором продавец сильнее всего обгоняет команду (от 5 %)."""
     items = "upt" if me.has_receipts else "items_per_shift"
     best: tuple[float, str] | None = None
-    for metric in (items, "avg_price", "discount_share", "per_shift"):
+    for metric in (items, "avg_price", "manual_share", "per_shift"):
         mv, tv = getattr(me, metric), getattr(tm, metric)
         if mv is None or not tv:
             continue
-        higher = metric != "discount_share"
+        higher = metric != "manual_share"
         gap = (mv - tv) / tv if higher else (tv - mv) / tv
         if gap > 0.05 and (best is None or gap > best[0]):
             best = (gap, metric)

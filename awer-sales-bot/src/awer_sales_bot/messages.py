@@ -1,6 +1,7 @@
 """Тексты сообщений (MAX, format=markdown). Все суммы — в рублях, округлены."""
 from __future__ import annotations
 
+import math
 from datetime import date, timedelta
 
 from . import achievements, goals
@@ -10,7 +11,7 @@ from .config import Settings
 from .db import DB
 from .planning.engine import threshold_amounts
 from .planning.service import days_in, month_params, status
-from .recommendations import advise, pairs_from_1c
+from .recommendations import _main_store, advise, pairs_from_1c
 
 MONTHS = ["", "январь", "февраль", "март", "апрель", "май", "июнь", "июль", "август", "сентябрь", "октябрь",
           "ноябрь", "декабрь"]
@@ -27,7 +28,8 @@ def d1(x: float | None) -> str:
 
 
 def pct(x: float | None) -> str:
-    return "—" if x is None else f"{x:.0%}"
+    """Процент вниз до целого: 114,95 % — «114 %», не «115 %» — ступени, которой нет (аудит П1)."""
+    return "—" if x is None else f"{math.floor(x * 100 + 1e-6)}%"
 
 
 def daily(db: DB, cfg: Settings, sid: int, day: date) -> str:
@@ -103,7 +105,7 @@ def daily(db: DB, cfg: Settings, sid: int, day: date) -> str:
                      f"вещей {d1(mtd.card_upt)} / {d1(tm.card_upt)}")
         if shop_m.checks:
             L.append(f"Магазины: средний чек {rub(shop_m.avg_check)} · вещей в чеке {d1(shop_m.upt)}")
-    arr = M.arrivals_summary(db, day)
+    arr = M.arrivals_summary(db, day, _main_store(db, sid, day.replace(day=1), day, cfg))  # в его магазин сегодня
     if arr:
         L += ["", "📦 **Новые поступления:** " + ", ".join(f"{c} — {m} мод. ({q:.0f} шт.)" for c, m, q in arr)]
         L += pairing(db, cfg, day, [c for c, _, _ in arr])
@@ -159,6 +161,45 @@ def month_start(db: DB, cfg: Settings, sid: int, month: str) -> str:
     if cfg.trial(month):
         L.append(f"_{MONTHS[int(month[5:])].capitalize()} — пробный месяц: план настоящий, а ставка по новой схеме "
                  f"начисляется с {MONTHS_GEN[int(cfg.first_month[5:])]}._")
+    return "\n".join(L)
+
+
+GUIDE_KEY = "guide-1"  # ключ памятки в журнале: каждому продавцу один раз (новая редакция — новый ключ)
+
+
+def guide(db: DB, cfg: Settings, sid: int, today: date) -> str:
+    """Памятка: что значат цифры в сообщениях бота. При подключении, один раз всем подключённым и по /help."""
+    s = db.seller(sid)
+    month = today.strftime("%Y-%m")
+    p = month_params(db, cfg, month)
+    L = ["**Как читать сообщения бота**", "",
+         "Каждое утро бот присылает итоги вчерашнего дня. Продажи он берёт из «Отчётов о розничных продажах» 1С — "
+         "тех же, по которым считается зарплата. Возврат уменьшает продажи в тот день, когда товар вернули.", "",
+         "**Вчера** — ваши продажи за день, сколько было чеков, средний чек и сколько вещей в среднем в одном чеке.", "",
+         f"**Ваш план на месяц.** Личный план посчитан 1-го числа по вашим продажам за год и до конца месяца не "
+         f"меняется. Полный месяц — {cfg.norm_shifts} рабочих дней; работаете больше или меньше — план растёт или "
+         "уменьшается вместе с рабочими днями.",
+         "• **Рабочих дней 8 из 16** — сколько уже отработано и сколько всего в месяце по графику.",
+         "• **До базы осталось** — сколько продать до конца месяца, чтобы выполнить план; в скобках — сколько это "
+         "в среднем за каждый оставшийся рабочий день.",
+         f"• **До ступени {pct(1 + p.step)}** — сколько до следующей прибавки. Каждые +{pct(p.step)} сверх плана — "
+         f"+{rub(p.step_bonus)} к ставке {rub(p.base_rate)}, ставка — до {rub(p.max_rate)}.",
+         "• **Ваш темп** — ваши средние продажи за рабочий день и какая ставка выйдет, если так продолжать."]
+    if s and s["role"] == "admin":
+        L.append(f"• Доплата старшим {rub(p.admin_bonus)} — сверх ставки, по отработанным дням.")
+    L += ["",
+          "**Ваши показатели (вы / команда)** — ваши цифры с начала месяца рядом со средними по продавцам. Цифр "
+          "коллег бот продавцам не показывает. Ваши цифры видят владелец и старший — для разговора раз в неделю.", "",
+          "🏅 Рекорды, 🎯 цель недели, 📦 новинки и 💡 советы — подсказки, на ставку они не влияют. Ставка зависит "
+          "только от выполнения личного плана.", "",
+          "1-го числа приходит план на новый месяц: какие продажи дают какую ставку. Когда в 1С закрыты все дни "
+          "месяца — итоги: выполнение и ставка.", "",
+          "Работали в день, которого нет в графике (замена), — скажите старшему: день добавят в график, и он "
+          "засчитается."]
+    if cfg.trial(month):
+        L += ["", f"{MONTHS[today.month].capitalize()} — пробный месяц: план настоящий, а ставка по новой схеме "
+                  f"начисляется с {MONTHS_GEN[int(cfg.first_month[5:])]}."]
+    L += ["", "/plan — цифры на сейчас · /help — эта памятка"]
     return "\n".join(L)
 
 
