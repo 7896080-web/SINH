@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 import yaml
@@ -186,15 +187,24 @@ class Settings(BaseModel):
         return os.environ.get("ANTHROPIC_API_KEY") or None
 
 
+def env_value(raw: str) -> str:
+    """Значение из строки .env: в кавычках — как есть, иначе без комментария после « #»
+    («ADMIN_PASSWORD=   # пароль админки» из .env.example — пустое значение, а не текст комментария)."""
+    v = raw.strip()
+    if v[:1] in "\"'" and len(v) > 1 and v[-1] == v[0]:
+        return v[1:-1]
+    return re.split(r"\s#", v, maxsplit=1)[0].strip() if not v.startswith("#") else ""
+
+
 def _load_dotenv(path: Path) -> None:
     if not path.exists():
         return
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in path.read_text(encoding="utf-8-sig").splitlines():  # -sig: .env из Блокнота бывает с BOM
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         k, v = line.split("=", 1)
-        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+        os.environ.setdefault(k.strip(), env_value(v))
 
 
 def load(path: str | Path = "config.yaml") -> Settings:

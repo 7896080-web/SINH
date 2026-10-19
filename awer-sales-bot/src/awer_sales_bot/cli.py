@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-from datetime import date
+from datetime import date, datetime
 
 from . import config as config_mod
 from .db import DB
@@ -47,6 +47,12 @@ def main(argv: list[str] | None = None) -> None:
     sv = sub.add_parser("serve", help="бот + админка в одном процессе (для службы Windows)")
     sv.add_argument("--host", default="127.0.0.1")
     sv.add_argument("--port", type=int, default=8080)
+    bk = sub.add_parser("backup", help="снимок базы с проверкой целостности (задача копирования в облако)")
+    bk.add_argument("--dest", default="backups")
+    bk.add_argument("--keep-days", type=int, default=30)
+    bk.add_argument("--log", help="дописать результат в этот файл (UTF-8)")
+    dc = sub.add_parser("doctor", help="состояние: данные 1С, план месяца, бот MAX, копии базы")
+    dc.add_argument("--backups", default="backups")
     w = sub.add_parser("web", help="админка: настройки месяца, ручные коэффициенты и планы")
     w.add_argument("--host", default="127.0.0.1")
     w.add_argument("--port", type=int, default=8080)
@@ -148,6 +154,28 @@ def main(argv: list[str] | None = None) -> None:
         if not runner.start():  # токена нет — только админка; бот запустится со страницы «Бот MAX»
             logging.warning("MAX_BOT_TOKEN не задан — запущена только админка")
         uvicorn.run(create_app(cfg, db, runner=runner), host=a.host, port=a.port)
+    elif a.cmd == "backup":
+        from pathlib import Path
+
+        from .ops import backup
+        try:
+            out = backup(cfg.db_path, Path(a.dest), a.keep_days)
+            msg = f"ok {out.name} ({out.stat().st_size / 1e6:.1f} МБ)"
+        except Exception as e:  # noqa: BLE001 — задача Windows: причина — в журнал, код возврата — 1
+            msg = f"ОШИБКА {e}"
+        print(msg)
+        if a.log:
+            Path(a.log).parent.mkdir(parents=True, exist_ok=True)
+            with open(a.log, "a", encoding="utf-8") as f:
+                f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}\n")
+        if msg.startswith("ОШИБКА"):
+            raise SystemExit(1)
+    elif a.cmd == "doctor":
+        from pathlib import Path
+
+        from .ops import doctor
+        for good, line in doctor(db, cfg, Path(a.backups)):
+            print(("  ok  " if good else "  !!  ") + line)
     elif a.cmd == "web":
         import uvicorn
 

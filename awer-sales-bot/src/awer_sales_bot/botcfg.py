@@ -56,7 +56,7 @@ def set_token(env_path: Path, bot: str, value: str) -> None:
     if not TOKEN_RE.match(value):
         raise ValueError("токен выглядит неверно — скопируйте его из business.max.ru целиком, без пробелов")
     key = ENV_KEYS[bot]
-    lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+    lines = env_path.read_text(encoding="utf-8-sig").splitlines() if env_path.exists() else []
     out = [ln for ln in lines if ln.split("=", 1)[0].strip() != key] + [f"{key}={value}"]
     env_path.write_text("\n".join(out) + "\n", encoding="utf-8")
     os.environ[key] = value
