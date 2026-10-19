@@ -11,12 +11,12 @@ import os
 import re
 import secrets
 from datetime import date, datetime, timedelta
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import openpyxl
 from openpyxl.styles import Font
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 from . import botcfg, content, health, names
@@ -69,12 +69,29 @@ def _num(s: str | None) -> float | None:
     return float(str(s).replace(" ", "").replace("\xa0", "").replace(",", ".").rstrip("%"))
 
 
+MONTH = re.compile(r"\d{4}-(0[1-9]|1[0-2])")
+MIN_PLAN = 10_000  # ручной план на полный месяц — не меньше (аудит А1)
+
+
 def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
     """runner — поток бота в службе (bot.Runner; None, если админка запущена отдельно: awer-bot web);
     max_client — фабрика клиента MAX по токену (тесты подменяют)."""
-    app = FastAPI(title="AWER — планы продавцов")
+    app = FastAPI(title="AWER — планы продавцов", docs_url=None, redoc_url=None, openapi_url=None)  # аудит А2
     security = HTTPBasic()
     password = os.environ.get("ADMIN_PASSWORD", "")
+
+    @app.middleware("http")
+    async def guard(request: Request, call_next):
+        """Аудит А2: месяц в адресе — только ГГГГ-ММ; POST — только со страниц самой админки (чужая страница в браузере
+        владельца не может подключить владельца бота, сменить токен или план). /api/upload защищён своим токеном."""
+        parts = request.url.path.split("/")
+        if len(parts) > 2 and parts[1] in ("month", "schedule") and not MONTH.fullmatch(parts[2]):
+            return PlainTextResponse("Неверный месяц в адресе: нужен ГГГГ-ММ, например 2026-11", status_code=400)
+        if request.method == "POST" and request.url.path != "/api/upload":
+            src = request.headers.get("origin") or request.headers.get("referer")
+            if src and urlparse(src).netloc != request.headers.get("host"):
+                return PlainTextResponse("Запрос пришёл не со страницы админки — отклонён", status_code=403)
+        return await call_next(request)
 
     def auth(c: HTTPBasicCredentials = Depends(security)):
         if not password:
@@ -86,6 +103,7 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
         cur = date.today().strftime("%Y-%m")
         nav = (f'<nav><a href="/month/{cur}">Настройки месяца</a><a href="/sellers">Продавцы</a>'
                f'<a href="/bot">Бот MAX</a><a href="/crews">Смены</a><a href="/learn">Обучение</a><a href="/tasks">Задания</a><a href="/schedule/{cur}">График работы</a><a href="/month/{cur}/results">Итоги и ведомость</a><a href="/check">Проверка плана</a></nav>')
+        title = html.escape(title)  # в заголовке бывает имя из 1С или часть адреса (аудит А2)
         return HTMLResponse(f"<!doctype html><html lang=ru><head><meta charset=utf-8><title>{title}</title>"
                             f"<style>{CSS}</style></head><body>{nav}{health.line(db, cfg)}<h1>{title}</h1>{body}</body></html>")
 
@@ -95,7 +113,7 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
 
     # ------------------------------------------------------------------ месяц
     @app.get("/month/{month}", dependencies=[Depends(auth)])
-    def month_page(month: str):
+    def month_page(month: str, msg: str = ""):
         mp = service.compute(db, cfg, month)
         p, sp = mp.params, mp.store
         ms = db.one("SELECT * FROM month_settings WHERE month=?", month)
@@ -105,6 +123,7 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
         f = lambda v, d=3: "" if v is None else f"{v:.{d}f}"  # noqa: E731
         prev, nxt = month_add(month, -1), month_add(month, 1)
         b = [f'<p><a href="/month/{prev}">← {prev}</a> · <a href="/month/{nxt}">{nxt} →</a></p>',
+             f'<p class=off>{html.escape(msg)}</p>' if msg else "",
              f'<p class=note>План {"зафиксирован " + mp.frozen_at if mp.frozen_at else "НЕ зафиксирован"}. '
              'Ежедневные сообщения используют зафиксированный план. Жёлтые поля — ручная правка; пусто = расчёт.</p>',
              f'<form method=post action="/month/{month}/settings"><h2>Коэффициенты и ставки месяца</h2><table>',
@@ -161,18 +180,47 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
     @app.post("/month/{month}/settings", dependencies=[Depends(auth)])
     def save_settings(month: str, trend_manual: str = Form(""), step: str = Form(""), step_bonus: str = Form(""),
                       base_rate: str = Form(""), max_rate: str = Form(""), note: str = Form("")):
-        st = _num(step)
-        service.save_month_settings(db, month, trend_manual=_num(trend_manual), step=st / 100 if st else None,
-                                    step_bonus=_num(step_bonus), base_rate=_num(base_rate), max_rate=_num(max_rate),
-                                    note=note or None)
+        try:
+            tm, st, sb, br, mr = map(_num, (trend_manual, step, step_bonus, base_rate, max_rate))
+        except ValueError:
+            return _back(month, "Не сохранено: в числовом поле не число.")
+        # аудит А1: «0,15» в поле шага в процентах — это 0,15 %, и продавец с 104 % получил бы максимум
+        errs = [t for bad, t in (
+            (tm is not None and not 0.3 <= tm <= 3, "коэффициент год к году — от 0,3 до 3 (например 0,95)"),
+            (st is not None and not 1 <= st <= 100, "шаг — в процентах, от 1 до 100 (например 15, а не 0,15)"),
+            (sb is not None and not 0 < sb <= 100_000, "надбавка за шаг — больше 0 и не больше 100 000 ₽"),
+            (br is not None and not 1_000 <= br <= 1_000_000, "базовая ставка — от 1 000 до 1 000 000 ₽"),
+            ((mr if mr is not None else cfg.params.max_rate) < (br if br is not None else cfg.params.base_rate),
+             "максимальная ставка не может быть меньше базовой")) if bad]
+        if errs:
+            return _back(month, "Не сохранено: " + "; ".join(errs) + ".")
+        service.save_month_settings(db, month, trend_manual=tm, step=st / 100 if st else None,
+                                    step_bonus=sb, base_rate=br, max_rate=mr, note=note or None)
         return RedirectResponse(f"/month/{month}", status_code=303)
+
+    def _back(month: str, msg: str) -> RedirectResponse:
+        return RedirectResponse(f"/month/{month}?msg=" + quote(msg), status_code=303)
 
     @app.post("/month/{month}/plans", dependencies=[Depends(auth)])
     async def save_plans(month: str, request: Request):
         form = await request.form()
+        bad = []
         for k, v in form.items():
-            if k.startswith("p") and k[1:].isdigit() and service.save_plan_override(db, month, int(k[1:]), _num(v)):
+            if not (k.startswith("p") and k[1:].isdigit()):
+                continue
+            try:
+                plan = _num(v)
+            except ValueError:
+                plan = -1.0
+            if plan is not None and plan < MIN_PLAN:  # аудит А1: «1e-9» или опечатка дали бы ставку 45 000
+                s_ = db.seller(int(k[1:]))
+                bad.append(s_["name"] if s_ else k)
+                continue
+            if service.save_plan_override(db, month, int(k[1:]), plan):
                 service.apply_override(db, cfg, month, int(k[1:]))  # после фиксации — только этому продавцу
+        if bad:
+            return _back(month, f"Не сохранено для: {', '.join(bad)} — ручной план на полный месяц, от "
+                                f"{_rub(MIN_PLAN)} ₽. Остальные ручные планы сохранены.")
         return RedirectResponse(f"/month/{month}", status_code=303)
 
     @app.post("/month/{month}/freeze", dependencies=[Depends(auth)])

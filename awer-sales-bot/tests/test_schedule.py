@@ -1,15 +1,12 @@
 """График работы и норма 18 рабочих дней: «% плана месяца» к концу месяца совпадает с выполнением для ставки."""
-from datetime import date
-
 import pytest
 from fastapi.testclient import TestClient
 
-from awer_sales_bot.importers.onec_sales import import_file
 from awer_sales_bot.jobs import Sender, daily_run
 from awer_sales_bot.planning import service
 from awer_sales_bot.web import create_app
 from test_flow import env  # noqa: F401
-from test_motivation import import_sales, oct_day, write_sales
+from test_motivation import import_sales, oct_day
 
 AUTH = ("admin", "pw")
 

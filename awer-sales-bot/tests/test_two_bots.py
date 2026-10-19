@@ -4,11 +4,10 @@ from datetime import date, timedelta
 from fastapi.testclient import TestClient
 
 from awer_sales_bot import bot, goals
-from awer_sales_bot.importers.onec_sales import import_file
 from awer_sales_bot.jobs import Sender, training_run
 from awer_sales_bot.web import create_app
 from test_flow import env  # noqa: F401
-from test_motivation import import_sales, LESSONS_YAML, FakeMax, write_sales
+from test_motivation import LESSONS_YAML, FakeMax, import_sales
 
 AUTH = ("admin", "pw")
 

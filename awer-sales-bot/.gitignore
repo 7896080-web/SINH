@@ -11,3 +11,8 @@ __pycache__/
 .venv/
 .pytest_cache/
 *.epf
+# на сервере рядом с программой (scripts/install.ps1): ключ облака, журналы, снимки базы — не в репозиторий
+rclone.conf
+logs/
+backups/
+data/*.bot.lock

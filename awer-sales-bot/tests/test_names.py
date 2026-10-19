@@ -4,10 +4,9 @@ from datetime import date
 from fastapi.testclient import TestClient
 
 from awer_sales_bot import names
-from awer_sales_bot.importers.onec_sales import import_file
 from awer_sales_bot.web import create_app
 from test_flow import env  # noqa: F401
-from test_motivation import import_sales, write_sales
+from test_motivation import import_sales
 
 AUTH = ("admin", "pw")
 

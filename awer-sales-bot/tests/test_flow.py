@@ -249,3 +249,24 @@ def test_money_from_orp_receipts_only_metrics(tmp_path):
     with db.tx() as c:
         c.execute("UPDATE store_days SET revenue=revenue+5000 WHERE store='МСЛ'")
     assert [(x[0], x[1]) for x in reconcile(db, {d.isoformat()})] == [(d.isoformat(), "МСЛ")]
+
+
+def test_admin_rejects_bad_values_foreign_posts_and_bad_month(env, monkeypatch):
+    """Аудит А1, А2: шаг «0,15», нулевая надбавка, план «1e-9», чужой Origin, месяц-скрипт в адресе, /docs."""
+    cfg, db = env
+    monkeypatch.setenv("ADMIN_PASSWORD", "pw")
+    c = TestClient(create_app(cfg, db))
+    a = ("admin", "pw")
+    r = c.post("/month/2026-10/settings", data={"step": "0,15", "step_bonus": "0"}, auth=a)
+    assert "шаг — в процентах" in r.text and "надбавка за шаг" in r.text
+    assert not db.one("SELECT 1 FROM month_settings WHERE month='2026-10'")
+    assert c.post("/month/2026-10/settings", data={"step": "15", "trend_manual": "0,9"}, auth=a).status_code == 200
+    assert service.month_params(db, cfg, "2026-10").step == pytest.approx(0.15)
+    sid = db.seller_id("Продавец04", create=False)
+    r = c.post("/month/2026-10/plans", data={f"p{sid}": "1e-9"}, auth=a)
+    assert "Не сохранено для: Продавец04" in r.text and not db.one("SELECT 1 FROM plan_overrides")
+    r = c.post("/month/2026-10/freeze", auth=a, headers={"Origin": "https://evil.example"})
+    assert r.status_code == 403 and not db.one("SELECT 1 FROM plans")
+    assert c.post("/month/2026-10/freeze", auth=a, headers={"Origin": "http://testserver"}).status_code == 200
+    assert c.get("/month/<script>/results", auth=a).status_code == 400
+    assert c.get("/docs").status_code == 404

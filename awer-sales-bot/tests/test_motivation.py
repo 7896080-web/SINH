@@ -142,7 +142,11 @@ def test_store_plan_only_for_owner_and_example_config_keeps_no_seller(env, tmp_p
     assert "**Ваш план на октябрь**" in seller_text and "**Ваши показатели с начала месяца**" in seller_text
     assert "Магазины вместе: 1 121 090 ₽" in owner_summary(db, cfg, oct_day(10))
 
-    ex = config.load(Path(__file__).parents[1] / "config.example.yaml")
+    # копия примера во временной папке: рядом с настоящим config.example.yaml может лежать боевой .env (аудит У1)
+    (tmp_path / "ex").mkdir()
+    example = tmp_path / "ex" / "config.yaml"
+    example.write_text((Path(__file__).parents[1] / "config.example.yaml").read_text(encoding="utf-8"), encoding="utf-8")
+    ex = config.load(example)
     assert "" not in ex.onec.exclude_sellers and ex.motivation.records and ex.training.onboarding_shifts == 10
 
 

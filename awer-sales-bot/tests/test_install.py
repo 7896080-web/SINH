@@ -1,8 +1,7 @@
 """Установка на сервер: .env из .env.example, снимок базы для копий в облако, сводка состояния (scripts/*.ps1)."""
 import os
 import sqlite3
-import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import pytest
 
@@ -39,11 +38,13 @@ def test_backup_snapshot_and_retention(env, tmp_path):  # noqa: F811
     old = dest / "awer-20260901-0300.db"
     dest.mkdir()
     old.write_bytes(b"x")
-    os.utime(old, (time.time() - 40 * 86400,) * 2)
+    now = datetime.now()  # возраст файлов и «сейчас» — от одной точки, иначе тест сломается со временем (аудит У2)
+    os.utime(old, ((now - timedelta(days=40)).timestamp(),) * 2)
     keep = dest / "awer-20261010-0300.db"
     keep.write_bytes(b"y")
-    out = ops.backup(cfg.db_path, dest, keep_days=30, now=datetime(2026, 10, 19, 3, 40))
-    assert out.name == "awer-20261019-0340.db" and not old.exists() and keep.exists()
+    os.utime(keep, ((now - timedelta(days=9)).timestamp(),) * 2)
+    out = ops.backup(cfg.db_path, dest, keep_days=30, now=now)
+    assert out.name == f"awer-{now:%Y%m%d-%H%M}.db" and not old.exists() and keep.exists()
     con = sqlite3.connect(out)
     assert con.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     assert con.execute("SELECT COUNT(*) FROM monthly_history").fetchone()[0] > 0  # данные на месте
@@ -71,7 +72,7 @@ def test_backup_and_doctor_commands(tmp_path, monkeypatch, capsys):
 
 def test_doctor_after_history(env, tmp_path):  # noqa: F811
     cfg, db = env
-    service.freeze(db, cfg, date.today().strftime("%Y-%m"))
-    lines = ops.doctor(db, cfg, tmp_path, today=date.today())
+    service.freeze(db, cfg, "2026-10")  # дата истории из фикстуры, не сегодняшняя (аудит У2)
+    lines = ops.doctor(db, cfg, tmp_path, today=date(2026, 10, 19))
     assert any(good and text.startswith("план на") for good, text in lines)
     assert (False, f"копий базы в {tmp_path} ещё нет") in lines  # путь C:\... — не делить строку по «:»
