@@ -150,7 +150,8 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
                 f'<td class=n>{_rub(st.sales) if st else ""}</td>'
                 f'<td class="n {"ok" if perf and perf >= 1 + p.step else ""}">{"" if perf is None else f"{perf:.0%}"}</td>'
                 f'<td class=n>{_rub(st.current_rate) if st else ""}</td></tr>')
-        b += ['</table><button class=btn>Сохранить ручные планы</button></form>',
+        b += ['</table><button class=btn>Сохранить ручные планы</button><span class=note> — после фиксации ручной план '
+              'применяется сразу и только к тому, кому вписан (например, новичку); остальным цели не меняются.</span></form>',
               f'<form method=post action="/month/{month}/freeze"><button class=btn>Зафиксировать план месяца</button>'
               '<span class=note> — перезаписывает зафиксированные планы; повторная фиксация в середине месяца меняет цели продавцам.</span></form>']
         return page(f"Настройки месяца {month}", "".join(b))
@@ -168,8 +169,8 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
     async def save_plans(month: str, request: Request):
         form = await request.form()
         for k, v in form.items():
-            if k.startswith("p") and k[1:].isdigit():
-                service.save_plan_override(db, month, int(k[1:]), _num(v))
+            if k.startswith("p") and k[1:].isdigit() and service.save_plan_override(db, month, int(k[1:]), _num(v)):
+                service.apply_override(db, cfg, month, int(k[1:]))  # после фиксации — только этому продавцу
         return RedirectResponse(f"/month/{month}", status_code=303)
 
     @app.post("/month/{month}/freeze", dependencies=[Depends(auth)])

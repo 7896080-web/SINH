@@ -121,6 +121,34 @@ def test_flow(env, tmp_path):
     assert client.get("/month/2026-10", auth=("admin", "wrong")).status_code == 401
 
 
+def test_manual_plan_after_freeze_changes_only_that_seller(env):
+    """Новичок появился после 1-го: владелец вписывает ему «План вручную» — бот берёт его сразу, а зафиксированные
+    цели остальных не трогает (решение владельца 19.10.2026)."""
+    cfg, db = env
+    service.freeze(db, cfg, "2026-10")
+    days = [date(2026, 10, 10) + timedelta(days=i) for i in range(3)]
+    lines_f, docs_f = make_export(cfg.onec.inbox, days, ["Новенькая Вера"])
+    import_file(docs_f, db, cfg)
+    import_file(lines_f, db, cfg)
+    added = service.ensure_plans(db, cfg, "2026-10")
+    new = db.seller_id("Новенькая Вера", create=False)
+    assert [r["method"] for r in added] == ["newcomer"]
+    before = {r["seller_id"]: r["plan_full"] for r in db.q("SELECT * FROM plans WHERE month='2026-10'")}
+
+    web = TestClient(create_app(cfg, db))
+    form = {f"p{sid}": "" for sid in before} | {f"p{new}": "620 000"}  # форма шлёт поля всех продавцов
+    web.post("/month/2026-10/plans", data=form, auth=("admin", "pw"))
+    after = {r["seller_id"]: r["plan_full"] for r in db.q("SELECT * FROM plans WHERE month='2026-10'")}
+    assert service.frozen_plan(db, "2026-10", new) == 620_000
+    assert db.one("SELECT method FROM plans WHERE month='2026-10' AND seller_id=?", new)["method"] == "manual"
+    assert {k: v for k, v in after.items() if k != new} == {k: v for k, v in before.items() if k != new}
+    assert service.status(db, cfg, new, days[-1]).plan_full == 620_000  # сообщения берут его сразу
+
+    web.post("/month/2026-10/plans", data=form | {f"p{new}": ""}, auth=("admin", "pw"))  # сняли — снова расчёт
+    assert service.frozen_plan(db, "2026-10", new) == pytest.approx(before[new])
+    assert not service.apply_override(db, cfg, "2026-11", new)  # ноябрь не зафиксирован — ждёт фиксации
+
+
 def test_upload_csv(env, monkeypatch):
     cfg, db = env
     monkeypatch.setenv("UPLOAD_TOKEN", "tok")

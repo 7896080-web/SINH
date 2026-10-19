@@ -40,7 +40,11 @@ def save_month_settings(db: DB, month: str, **vals) -> None:
             (month, *[data[k] for k in cols], datetime.now().isoformat(timespec="seconds")))
 
 
-def save_plan_override(db: DB, month: str, sid: int, plan: float | None, note: str | None = None) -> None:
+def save_plan_override(db: DB, month: str, sid: int, plan: float | None, note: str | None = None) -> bool:
+    """Ручной план на полный месяц (None — снять). True — значение изменилось."""
+    old = db.one("SELECT plan_manual FROM plan_overrides WHERE month=? AND seller_id=?", month, sid)
+    if (old["plan_manual"] if old else None) == plan:
+        return False
     with db.tx() as c:
         if plan is None:
             c.execute("DELETE FROM plan_overrides WHERE month=? AND seller_id=?", (month, sid))
@@ -49,6 +53,26 @@ def save_plan_override(db: DB, month: str, sid: int, plan: float | None, note: s
                       "ON CONFLICT(month,seller_id) DO UPDATE SET plan_manual=excluded.plan_manual, note=excluded.note, "
                       "updated_at=excluded.updated_at",
                       (month, sid, plan, note, datetime.now().isoformat(timespec="seconds")))
+    return True
+
+
+def apply_override(db: DB, cfg: Settings, month: str, sid: int) -> bool:
+    """План месяца уже зафиксирован, а владелец вписал или снял ручной план (обычно новичку, появившемуся после
+    1-го): меняется строка в plans только этого продавца — остальным цели не пересчитываются. True — изменено."""
+    if not db.one("SELECT 1 FROM plans WHERE month=?", month):
+        return False  # ещё не зафиксирован — ручной план попадёт в фиксацию
+    p = month_params(db, cfg, month)
+    h = db.history(cfg.norm_shifts, until_month=month_add(month, -1))
+    sp = store_plan(h, month, p, trend_override=trend_manual(db, month))
+    man = db.one("SELECT plan_manual FROM plan_overrides WHERE month=? AND seller_id=?", month, sid)
+    calc = seller_plan(h, month, str(sid), sp, p, man["plan_manual"] if man else None)
+    with db.tx() as c:
+        c.execute("INSERT INTO plans(month,seller_id,plan_full,method,level,trend,store_plan,coef,frozen_at) "
+                  "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(month,seller_id) DO UPDATE SET plan_full=excluded.plan_full, "
+                  "method=excluded.method, level=excluded.level, frozen_at=excluded.frozen_at",
+                  (month, sid, calc.plan_full, calc.method, calc.level, sp.trend, sp.plan, sp.coef,
+                   datetime.now().isoformat(timespec="seconds")))
+    return True
 
 
 # ----------------------------------------------------------------------------- plans
