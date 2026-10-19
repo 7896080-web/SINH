@@ -49,7 +49,12 @@ table{border-collapse:collapse;margin:8px 0}td,th{border:1px solid #d0d7de;paddi
 th{background:#eef2f7;text-align:left}td.n{text-align:right;white-space:nowrap}
 input[type=text],input[type=number]{width:110px;padding:3px;background:#fffbe6;border:1px solid #c8b26b}
 .calc{color:#57606a}.man{font-weight:bold;color:#9a3412}.ok{background:#e6f4ea}
-.btn{padding:6px 14px;margin:6px 6px 6px 0;cursor:pointer}nav a{margin-right:14px}
+.btn{padding:6px 14px;margin:6px 6px 6px 0;cursor:pointer}
+nav{display:flex;flex-wrap:wrap;gap:6px;padding-bottom:10px;border-bottom:1px solid #d0d7de}
+nav a,.links a{display:inline-block;padding:6px 12px;border:1px solid #d0d7de;border-radius:6px;background:#f6f8fa;
+color:#1f2328;text-decoration:none;font-size:13px}
+nav a:hover,.links a:hover{background:#e7ecf2}nav a.cur{background:#0969da;border-color:#0969da;color:#fff}
+.links{display:flex;flex-wrap:wrap;gap:6px}.links a.act{background:#dafbe1;border-color:#4ac26b;font-weight:bold}
 .note{color:#57606a;font-size:12px}
 .qr svg{width:260px;height:260px}.code{font-size:22px;letter-spacing:3px}
 table.grid td,table.grid th{padding:2px 3px;text-align:center}table.grid td.nm{text-align:left;white-space:nowrap}
@@ -103,8 +108,12 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
 
     def page(title: str, body: str) -> HTMLResponse:
         cur = date.today().strftime("%Y-%m")
-        nav = (f'<nav><a href="/month/{cur}">Настройки месяца</a><a href="/sellers">Продавцы</a>'
-               f'<a href="/bot">Бот MAX</a><a href="/crews">Смены</a><a href="/learn">Обучение</a><a href="/tasks">Задания</a><a href="/schedule/{cur}">График работы</a><a href="/month/{cur}/results">Итоги и ведомость</a><a href="/check">Проверка плана</a></nav>')
+        items = [(f"/month/{cur}", "Настройки месяца"), ("/sellers", "Продавцы"), ("/bot", "Бот MAX"),
+                 ("/crews", "Смены"), (f"/schedule/{cur}", "График работы"), (f"/month/{cur}/results", "Итоги и ведомость"),
+                 ("/check", "Проверка плана"), ("/learn", "Обучение"), ("/tasks", "Задания")]
+        here = lambda label: title.startswith(label.split()[0]) and not (  # noqa: E731
+            label == "Настройки месяца" and title.startswith("Итоги"))
+        nav = "<nav>" + "".join(f'<a href="{u}"{" class=cur" if here(t) else ""}>{t}</a>' for u, t in items) + "</nav>"
         title = html.escape(title)  # в заголовке бывает имя из 1С или часть адреса (аудит А2)
         return HTMLResponse(f"<!doctype html><html lang=ru><head><meta charset=utf-8><title>{title}</title>"
                             f"<style>{CSS}</style></head><body>{nav}{health.line(db, cfg)}<h1>{title}</h1>{body}</body></html>")
@@ -129,7 +138,7 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
         today = min(date.today() - timedelta(days=1), last)
         f = lambda v, d=3: "" if v is None else f"{v:.{d}f}"  # noqa: E731
         prev, nxt = month_add(month, -1), month_add(month, 1)
-        b = [f'<p><a href="/month/{prev}">← {prev}</a> · <a href="/month/{nxt}">{nxt} →</a></p>',
+        b = [f'<p class=links><a href="/month/{prev}">← {prev}</a><a href="/month/{nxt}">{nxt} →</a></p>',
              f'<p class=off>{html.escape(msg)}</p>' if msg else "",
              f'<p class=note>План {"зафиксирован " + mp.frozen_at if mp.frozen_at else "НЕ зафиксирован"}. '
              'Ежедневные сообщения используют зафиксированный план. Жёлтые поля — ручная правка; пусто = расчёт.</p>',
@@ -609,30 +618,43 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
         return RedirectResponse("/crews?msg=" + quote("Сохранено"), status_code=303)
 
     @app.get("/schedule/{month}", dependencies=[Depends(auth)])
-    def schedule(month: str, msg: str = ""):
-        """График по магазинам: в каждой таблице — кто работает в этом магазине; смены меняются магазинами по средам."""
+    def schedule(month: str, msg: str = "", suggest: int = 0):
+        """График по магазинам: в каждой таблице — кто работает в этом магазине; смены меняются магазинами по средам.
+        suggest=1 — показать предложение графика по правилам (crews.suggest); сохраняет владелец кнопкой."""
         crews_mod.ensure_crews(db, cfg)
         e = html.escape
         y, mo = map(int, month.split("-"))
         n = service.days_in(month)
         dates = [date(y, mo, d) for d in range(1, n + 1)]
         saved = db.schedule_days(month)
+        short: list[str] = []
+        if suggest:
+            proposal, short = crews_mod.suggest(db, cfg, month)
+            saved = {**saved, **proposal}  # продавцы без смены и тестовые — как были
         cs = crews_mod.crews(db)
         cnum = {c["id"]: i for i, c in enumerate(cs, 1)}
         sellers = sorted(db.sellers(), key=lambda s: (cnum.get(s["crew_id"], 99), s["name"]))
         own = {(s["id"], d.day): crews_mod.default_store(db, cfg, s["id"], d) for s in sellers for d in dates}
         where = {(sid, d): (st or own[(sid, d)] or cfg.stores[0]) for sid, ds in saved.items() for d, st in ds.items()}
         we = lambda d: " we" if d.weekday() >= 5 else ""  # noqa: E731
-        probs = crews_mod.problems(db, cfg, dates[0], dates[-1])
-        b = [f'<p><a href="/schedule/{month_add(month, -1)}">← {month_add(month, -1)}</a> · '
-             f'<a href="/schedule/{month_add(month, 1)}">{month_add(month, 1)} →</a> · <a href="/crews">Смены</a> · '
-             '<a href="/closed">Закрытые дни</a></p>',
-             f'<p class=note>{e(msg)}</p>' if msg else "",
-             '<p class=note>Отдельная таблица на каждый магазин. Строка «смена» — какая смена в этом магазине: каждую '
-             'среду смены меняются магазинами. Белые клетки — дни, когда смена продавца в этом магазине; серые — '
-             'другой магазин: галочка там — выход на замену (выделяется цветом). Один продавец в один день — только '
-             f'в одном магазине. Норма — {cfg.norm_shifts} рабочих дней. Рабочие дни считаются по графику (и у старших); '
-             'у кого графика на месяц нет — по дням с продажами в 1С.</p>']
+        # пустой месяц — не список «0 из 3» на каждый день: что делать, скажет рекомендация
+        probs = short if suggest else crews_mod.problems(db, cfg, dates[0], dates[-1]) if saved else []
+        b = [f'<p class=links><a href="/schedule/{month_add(month, -1)}">← {month_add(month, -1)}</a>'
+             f'<a href="/schedule/{month_add(month, 1)}">{month_add(month, 1)} →</a><a href="/crews">Смены</a>'
+             f'<a href="/closed">Закрытые дни</a><a class=act href="/schedule/{month}?suggest=1">Предложить график на '
+             'месяц</a></p>',
+             f'<p class=note>{e(msg)}</p>' if msg else ""]
+        if suggest:
+            b.append('<p class=off>Это предложение бота — ещё не сохранено. Проверьте, поправьте галочки и нажмите '
+                     '«Сохранить график» внизу. Чтобы отказаться, просто уйдите со страницы.</p>')
+        tips = crews_mod.advice(db, cfg, month)
+        if tips and not suggest:
+            b.append('<h2>Рекомендации по рабочим дням</h2><ul>' + "".join(f"<li>{e(t)}</li>" for t in tips) + "</ul>")
+        b.append('<p class=note>Отдельная таблица на каждый магазин. Строка «смена» — какая смена в этом магазине: каждую '
+                 'среду смены меняются магазинами. Белые клетки — дни, когда смена продавца в этом магазине; серые — '
+                 'другой магазин: галочка там — выход на замену (выделяется цветом). Один продавец в один день — только '
+                 f'в одном магазине. Норма — {cfg.norm_shifts} рабочих дней. Рабочие дни считаются по графику (и у '
+                 'старших); у кого графика на месяц нет — по дням с продажами в 1С.</p>')
         pend = db.offschedule_pending()
         if pend:
             b.append('<h2>Продажи в дни вне графика — нужен ваш ответ</h2><p class=note>Продавец продал в день, которого нет '
@@ -649,7 +671,9 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
                          '<button class=btn name=worked value=0>Не работал(а)</button></form></td></tr>')
             b.append('</table>')
         if probs:
-            b.append('<p class=off>Нарушены правила графика:</p><ul>' + "".join(f"<li>{e(x)}</li>" for x in probs) + "</ul>")
+            head = ("В сменах не хватает людей — добавьте продавцов в смену («Смены») или замену из другой смены:"
+                    if suggest else "Нарушены правила графика:")
+            b.append(f'<p class=off>{head}</p><ul>' + "".join(f"<li>{e(x)}</li>" for x in probs) + "</ul>")
         b.append(f'<form method=post action="/schedule/{month}">')
         head = "".join(f'<th class="{we(d)}">{d.day}<br>{crews_mod.WD[d.weekday()]}</th>' for d in dates)
         for si, st in enumerate(cfg.stores):
@@ -791,8 +815,8 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
 
     # ------------------------------------------------------------------ обучение: правка контента
     def _learn_tabs(kind: str) -> str:
-        return "<p>" + " · ".join(f'<b>{t}</b>' if k == kind else f'<a href="/learn?kind={k}">{t}</a>'
-                                  for k, t in content.KINDS.items()) + "</p>"
+        return "<p class=links>" + "".join(f'<a href="/learn?kind={k}"{" class=act" if k == kind else ""}>{t}</a>'
+                                           for k, t in content.KINDS.items()) + "</p>"
 
     @app.get("/learn", dependencies=[Depends(auth)])
     def learn(kind: str = "lesson", msg: str = ""):
@@ -1038,7 +1062,7 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
     def rating_page(month: str = ""):
         month = month or date.today().strftime("%Y-%m")
         pct_ = lambda v: "" if v is None else f"{v:.0%}"  # noqa: E731
-        b = [f'<p><a href="/rating?month={month_add(month, -1)}">← {month_add(month, -1)}</a> · '
+        b = [f'<p class=links><a href="/rating?month={month_add(month, -1)}">← {month_add(month, -1)}</a>'
              f'<a href="/rating?month={month_add(month, 1)}">{month_add(month, 1)} →</a></p>',
              '<p class=note>Информативно, на ставку и ЗП не влияет (решение владельца). Итог — среднее из: тесты '
              '(доля верных), квизы после уроков, задания (выполнено из полученных). Продавцам не показывается.</p>',
@@ -1187,7 +1211,8 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
     def names_link() -> str:
         n = len(names.suspects(db))
         warn = f' <b class=off>— похоже, есть повторы: {n}</b>' if n else ""
-        return f'<p><a href="/sellers/names">Имена в 1С и в боте — сопоставление →</a>{warn}</p>'
+        return f'<p class=links><a href="/sellers/names">Имена в 1С и в боте — сопоставление →</a></p>' + \
+            (f"<p>{warn}</p>" if warn else "")
 
     @app.get("/sellers/names", dependencies=[Depends(auth)])
     def names_page(msg: str = ""):
@@ -1231,7 +1256,7 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
                      f'<td><select name="same{sid}"><option value="">—</option>{opts}</select>'
                      f'<button class=btn name=action value="same:{sid}" onclick="return confirm(\'Объединить '
                      f'двух продавцов в одного?\')">Объединить</button></td></tr>')
-        b.append('</table></form><p><a href="/sellers">← к списку продавцов</a></p>')
+        b.append('</table></form><p class=links><a href="/sellers">← к списку продавцов</a></p>')
         return page("Имена в 1С и в боте", "".join(b))
 
     @app.post("/sellers/names", dependencies=[Depends(auth)])
@@ -1280,7 +1305,7 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
         if not s:
             raise HTTPException(404)
         name = html.escape(s["first_name"] or s["name"])
-        back = '<p><a href="">Проверить, подключился ли</a> · <a href="/sellers">← к списку продавцов</a></p>'
+        back = '<p class=links><a href="">Проверить, подключился ли</a><a href="/sellers">← к списку продавцов</a></p>'
         if s["max_user_id"] and cfg.training_token and not s["training_user_id"] and s["active"]:
             code = s["training_code"] or db.new_training_code(sid)
             b = [f'<p>✅ Бот «План» подключён. Осталось подключить бот «Обучение» — уроки, тесты и база знаний.</p>',
@@ -1294,7 +1319,8 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
         if s["max_user_id"]:
             both = " и к боту «Обучение»" if cfg.training_token else ""
             body = (f'<p>✅ <b>{html.escape(s["name"])}</b> подключён к боту «План»{both}{_max_name(s)}. Утром после '
-                    'следующего рабочего дня придёт первое сообщение.</p><p><a href="/sellers">← к списку продавцов</a></p>')
+                    'следующего рабочего дня придёт первое сообщение.</p><p class=links><a href="/sellers">← к списку '
+                    'продавцов</a></p>')
             return page(f"Подключение: {html.escape(s['name'])}", body)
         if not s["active"] or not s["invite_code"]:
             return RedirectResponse("/sellers", status_code=303)

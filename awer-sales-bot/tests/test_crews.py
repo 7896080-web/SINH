@@ -98,3 +98,42 @@ def test_owner_warned_about_staffing(env):  # noqa: F811
     daily_run(db, cfg, Sender(db, cfg, None, dry_run=True), today=date(2026, 10, 20), force=True)
     text = db.one("SELECT text FROM message_log WHERE kind='staffing'")["text"]
     assert text.startswith("График работы на ближайшие дни:") and "вт 20.10, МСЛ: 0 из 2" in text
+
+
+def test_suggest_schedule_follows_rules(env):  # noqa: F811
+    """«Предложить график»: минимум в магазинах, сильные на выходных, норма 18, не больше 5 дней подряд;
+    ничего не сохраняется, пока владелец не нажмёт «Сохранить график»."""
+    cfg, db = env
+    a = ["Продавец04", "Продавец05", "Продавец06", "Админ1"]
+    b = ["Продавец07", "Продавец08", "Админ2", "Продавец09"]
+    for n in a + b:
+        db.seller_id(n, create=True)
+    setup_crews(db, cfg, a, b)
+    with db.tx() as c:
+        c.execute("UPDATE sellers SET weekend_key=1 WHERE name IN ('Админ1', 'Админ2')")
+    proposal, short = crews.suggest(db, cfg, "2026-11")
+    assert short == []
+    ids = {db.seller_id(n, create=False) for n in a + b}
+    assert set(proposal) == ids
+    for sid, days in proposal.items():
+        ks = sorted(days)
+        assert 16 <= len(ks) <= 18
+        run = best = 1
+        for x, y in zip(ks, ks[1:]):
+            run = run + 1 if y == x + 1 else 1
+            best = max(best, run)
+        assert best <= crews.MAX_RUN
+    for sid in (db.seller_id("Админ1", create=False), db.seller_id("Админ2", create=False)):
+        weekends = [d for d in range(1, 31) if date(2026, 11, d).weekday() >= 5]
+        assert sum(d in proposal[sid] for d in weekends) >= len(weekends) - 2  # сильные — на выходных
+    db_before = db.schedule_days("2026-11")
+    for d in range(1, 31):  # минимум в каждом магазине — по предложению
+        day = date(2026, 11, d)
+        for st in cfg.stores:
+            n = sum(1 for sid, ks in proposal.items() if d in ks and crews.default_store(db, cfg, sid, day) == st)
+            assert n >= crews.minimum(cfg, day), (day, st, n)
+    c = TestClient(create_app(cfg, db))
+    r = c.get("/schedule/2026-11?suggest=1", auth=AUTH)
+    assert "Это предложение бота" in r.text and db.schedule_days("2026-11") == db_before == {}
+    r = c.get("/schedule/2026-11", auth=AUTH)
+    assert "Рекомендации по рабочим дням" in r.text and "Предложить график на месяц" in r.text
