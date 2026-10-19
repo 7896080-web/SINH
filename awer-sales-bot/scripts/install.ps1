@@ -365,14 +365,23 @@ foreach ($name in $Admins) {
 }
 
 # ------------------------------------------------------------------ ярлык админки на рабочем столе (для всех)
+# Обычный ярлык Windows (.lnk) со значком AWER: у интернет-ярлыка (.url) значок на сервере остался браузерным
+# (19.10.2026). explorer.exe открывает адрес в браузере по умолчанию.
 $desk = [Environment]::GetFolderPath("CommonDesktopDirectory")
 if ($desk) {
-    $url = Join-Path $desk "AWER — админка.url"
-    $ico = Join-Path $App "scripts\awer.ico"  # значок AWER (scripts/make_icon.py); нет файла — значок браузера
-    $lines = @("[InternetShortcut]", "URL=http://127.0.0.1:$Port/")
-    if (Test-Path $ico) { $lines += @("IconFile=$ico", "IconIndex=0") }
-    [System.IO.File]::WriteAllLines($url, $lines, (New-Object System.Text.UTF8Encoding($false)))
-    Note "ярлык на рабочем столе: «AWER — админка»"
+    Remove-Item (Join-Path $desk "AWER — админка.url") -ErrorAction SilentlyContinue  # ярлык прежних версий
+    $ico = Join-Path $App "scripts\awer.ico"  # значок AWER (scripts/make_icon.py)
+    try {
+        $lnk = (New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $desk "AWER — админка.lnk"))
+        $lnk.TargetPath = Join-Path $env:WINDIR "explorer.exe"
+        $lnk.Arguments = "http://127.0.0.1:$Port/"
+        if (Test-Path $ico) { $lnk.IconLocation = "$ico,0" }
+        $lnk.Description = "Админка AWER: планы и продажи продавцов"
+        $lnk.Save()
+        Note "ярлык на рабочем столе: «AWER — админка»"
+    } catch {
+        Warn "ярлык на рабочем столе не создан: $($_.Exception.Message)"
+    }
 }
 
 # ------------------------------------------------------------------ копия базы в облако (BACKUPS.md)
