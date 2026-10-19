@@ -9,7 +9,7 @@ from awer_sales_bot.jobs import Sender, daily_run
 from awer_sales_bot.planning import service
 from awer_sales_bot.web import create_app
 from test_flow import env  # noqa: F401
-from test_motivation import oct_day, write_sales
+from test_motivation import import_sales, oct_day, write_sales
 
 AUTH = ("admin", "pw")
 
@@ -23,7 +23,7 @@ def test_status_by_schedule_matches_rate_at_month_end(env, tmp_path):  # noqa: F
     sched = {d for d in range(1, 32) if (d - 1) % 4 < 2}  # 2 через 2 с 1-го: 16 смен
     db.set_schedule("2026-10", sid, sched)
     worked = sorted(sched)[:8]  # к 15.10 отработал 8 смен по графику
-    import_file(write_sales(tmp_path / "s.csv", [(oct_day(d), "Продавец04", 35_000, 3) for d in worked]), db, cfg)
+    import_sales(tmp_path / "s.csv", [(oct_day(d), "Продавец04", 35_000, 3) for d in worked], db, cfg)
 
     st = service.status(db, cfg, sid, oct_day(15))
     assert (st.worked, st.planned_shifts, st.remaining_shifts) == (8, 16, 8)
@@ -31,7 +31,7 @@ def test_status_by_schedule_matches_rate_at_month_end(env, tmp_path):  # noqa: F
 
     # вышел на замену 16-го (не по графику) и отработал все смены по графику до конца месяца
     rest = sorted(d for d in sched if d > 15)
-    import_file(write_sales(tmp_path / "s2.csv", [(oct_day(d), "Продавец04", 35_000, 3) for d in worked + [16] + rest]),
+    import_sales(tmp_path / "s2.csv", [(oct_day(d), "Продавец04", 35_000, 3) for d in worked + [16] + rest],
                 db, cfg)
     end = service.status(db, cfg, sid, oct_day(31))
     assert end.worked == 17 and end.planned_shifts == 17 and end.remaining_shifts == 0
@@ -43,7 +43,7 @@ def test_no_schedule_falls_back_to_norm_and_owner_is_reminded(env, tmp_path):  #
     cfg.max.owners = [1]
     service.freeze(db, cfg, "2026-10")
     sid = db.seller_id("Продавец04", create=False)
-    import_file(write_sales(tmp_path / "s.csv", [(oct_day(d), "Продавец04", 30_000, 3) for d in range(1, 21)]), db, cfg)
+    import_sales(tmp_path / "s.csv", [(oct_day(d), "Продавец04", 30_000, 3) for d in range(1, 21)], db, cfg)
     st = service.status(db, cfg, sid, oct_day(20))
     assert st.planned_shifts == 20 and st.remaining_shifts == 0  # отработал больше нормы — не «20 из 18»
     sender = Sender(db, cfg, None, dry_run=True)

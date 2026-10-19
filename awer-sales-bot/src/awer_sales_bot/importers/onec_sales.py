@@ -1,22 +1,29 @@
 """Импорт выгрузок из 1С — CSV (;) или Excel. Тип файла определяется по заголовкам
 (названия колонок — config.yaml → onec):
 
-1. Строки продаж, sales_*.csv — из чеков ККМ (есть «Чек» и «Время») или из ОРП (без них):
+1. Строки продаж:
        Дата;Время;Склад;Документ;Чек;Продавец;Номенклатура;Номенклатурная группа;Количество;Цена;Сумма;Скидка;
        Ручная скидка %;Дисконтная карта
-   Возврат — отрицательные количество и сумма. Пустой продавец → «(без продавца)».
+   * sales_*.csv из «Отчетов о розничных продажах» (колонка «Чек» пуста) → sales_lines — ИСТИНА для денег: план,
+     выполнение, ставка, выторг магазина (решение владельца 19.10.2026: подарочные сертификаты и возвраты там верны);
+   * receipts_*.csv из чеков ККМ (есть «Чек» и «Время»; так же — старый sales_*.csv, выгруженный из чеков) →
+     receipt_lines — только средний чек, вещей в чеке, часы продаж, покупки по картам, связки товаров.
+   Возврат — отрицательные количество и сумма (уменьшает день возврата). Пустой продавец → «(без продавца)».
 2. Шапки ОРП, orp_docs_*.csv:  Дата;Магазин;Касса;Документ;Чеков;Чеков возврата;Выручка
 3. Остатки, stock_*.csv:       Дата;Склад;Номенклатура;Номенклатурная группа;Характеристика;Остаток
 4. Поступления, arrivals_*.csv: Дата;Склад;Документ;Номенклатура;Номенклатурная группа;Характеристика;Поступило
    [;Бренд;Цвет] — для карточек новинок в боте «Обучение»
 
-Импорт идемпотентен: данные за (день, магазин) из файла полностью заменяются.
-Пары (день, магазин) отмечаются в imported_days — признак «день закрыт» (ОРП проведён).
+Импорт идемпотентен: строки за весь период файла (из имени «…_ГГГГММДД_ГГГГММДД») по обоим магазинам заменяются
+целиком — чек, перенесённый в 1С на другой день, не удваивается (аудит И2). Без периода в имени заменяются только
+пары (день, магазин), которые есть в файле.
+Пары (день, магазин) из строк ОРП отмечаются в imported_days — признак «день закрыт» (ОРП проведён).
 """
 from __future__ import annotations
 
 import csv
 import logging
+import os
 import re
 import shutil
 import time
@@ -36,7 +43,7 @@ log = logging.getLogger(__name__)
 @dataclass
 class ImportReport:
     file: str
-    kind: str  # lines | docs | stock | arrivals
+    kind: str  # lines (ОРП) | receipts (чеки) | docs | stock | arrivals | error | onec_error
     lines: int
     days: list[tuple[str, str]]
     skipped: int = 0
@@ -76,7 +83,10 @@ def _day(v) -> date | None:
 def _rows(path: Path) -> list[list]:
     if path.suffix.lower() in (".xlsx", ".xlsm"):
         wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
-        return [list(r) for r in wb.worksheets[0].iter_rows(values_only=True)]
+        try:
+            return [list(r) for r in wb.worksheets[0].iter_rows(values_only=True)]
+        finally:
+            wb.close()  # на Windows открытый файл не перенести в архив
     raw = path.read_bytes()
     text = ""
     for enc in ("utf-8-sig", "cp1251"):
@@ -130,6 +140,19 @@ def service_seller(name: str, cfg: Settings) -> bool:
     return norm(name) in {norm(x) for x in cfg.onec.service_sellers}
 
 
+_PERIOD = re.compile(r"(20\d{6})_(20\d{6})")
+
+
+def _period(name: str) -> tuple[str, str] | None:
+    """Период выгрузки из имени файла sales_20261017_20261018.csv. Без него (файл по одному магазину, ручной
+    отчёт) строки заменяются только по парам (день, магазин), которые есть в файле."""
+    m = _PERIOD.search(name)
+    if not m:
+        return None
+    a, b = (f"{x[:4]}-{x[4:6]}-{x[6:]}" for x in m.groups())
+    return a, b
+
+
 def _mark_days(c, pairs, source):
     now = datetime.now().isoformat(timespec="seconds")
     for (day, store), n in pairs.items():
@@ -138,7 +161,7 @@ def _mark_days(c, pairs, source):
                   "imported_at=excluded.imported_at", (day, store, source, n, now))
 
 
-def _import_lines(path: Path, rows, h, idx, db: DB, cfg: Settings) -> ImportReport:
+def _import_lines(path: Path, rows, h, idx, db: DB, cfg: Settings, name: str) -> ImportReport:
     excl = {s.strip().lower() for s in cfg.onec.exclude_sellers}
     data: dict[tuple[str, str], list[tuple]] = defaultdict(list)
     skipped, unknown, foreign, service = 0, set(), defaultdict(float), set()
@@ -181,21 +204,36 @@ def _import_lines(path: Path, rows, h, idx, db: DB, cfg: Settings) -> ImportRepo
         card = str(get("card") or "").strip() or None
         data[(d.isoformat(), store)].append(
             (d.isoformat(), store, sid, str(get("doc") or ""), receipt, tm, get("item"), get("category"), qty,
-             amount, disc, min(manual, disc) if disc else manual, card, path.name))
+             amount, disc, min(manual, disc) if disc else manual, card, name))
+    # чеки — только для показателей; деньги — по ОРП. Файл с номерами чеков — это чеки, как бы он ни назывался
+    receipts = name.lower().startswith("receipts") or any(ln[4] for ls in data.values() for ln in ls)
+    table = "receipt_lines" if receipts else "sales_lines"
+    period = _period(name)
     n = 0
     with db.tx() as c:
         c.executemany("UPDATE sellers SET role='system', active=0 WHERE id=? AND role<>'system'",
                       [(sid,) for sid in service])
+        if period:
+            c.execute(f"DELETE FROM {table} WHERE day BETWEEN ? AND ?", period)
         for (day, store), lines in data.items():
-            c.execute("DELETE FROM sales_lines WHERE day=? AND store=?", (day, store))
-            c.executemany("INSERT INTO sales_lines(day,store,seller_id,doc,receipt,time,item,category,qty,amount,"
+            if not period:
+                c.execute(f"DELETE FROM {table} WHERE day=? AND store=?", (day, store))
+            c.executemany(f"INSERT INTO {table}(day,store,seller_id,doc,receipt,time,item,category,qty,amount,"
                           "discount,manual_discount,card,source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", lines)
             n += len(lines)
-        _mark_days(c, {k: len(v) for k, v in data.items()}, path.name)
-    return ImportReport(path.name, "lines", n, sorted(data), skipped, unknown, foreign=dict(foreign))
+        if not receipts:
+            if period:  # день и магазин, которых больше нет в выгрузке ОРП, — снова «нет данных» (не «закрыто»)
+                have = {f"{d}|{st}" for d, st in data}
+                for r in c.execute("SELECT day, store FROM imported_days WHERE day BETWEEN ? AND ? AND source<>'closed'",
+                                   period).fetchall():
+                    if f"{r['day']}|{r['store']}" not in have:
+                        c.execute("DELETE FROM imported_days WHERE day=? AND store=?", (r["day"], r["store"]))
+            _mark_days(c, {k: len(v) for k, v in data.items()}, name)
+    return ImportReport(name, "receipts" if receipts else "lines", n, sorted(data), skipped, unknown,
+                        foreign=dict(foreign))
 
 
-def _import_docs(path: Path, rows, h, idx, db: DB, cfg: Settings) -> ImportReport:
+def _import_docs(path: Path, rows, h, idx, db: DB, cfg: Settings, name: str) -> ImportReport:
     data: dict[tuple[str, str, str], list] = {}
     foreign: dict[str, float] = defaultdict(float)
     for row in rows[h + 1:]:
@@ -220,9 +258,9 @@ def _import_docs(path: Path, rows, h, idx, db: DB, cfg: Settings) -> ImportRepor
             c.execute("INSERT INTO store_days(day,store,kassa,doc,checks,return_checks,revenue,source) "
                       "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(day,store,kassa) DO UPDATE SET doc=excluded.doc, "
                       "checks=excluded.checks, return_checks=excluded.return_checks, revenue=excluded.revenue, "
-                      "source=excluded.source", (day, store, kassa, doc, ch, rch, rev, path.name))
+                      "source=excluded.source", (day, store, kassa, doc, ch, rch, rev, name))
     days = sorted({(d, s) for d, s, _ in data})
-    return ImportReport(path.name, "docs", len(data), days, foreign=dict(foreign))
+    return ImportReport(name, "docs", len(data), days, foreign=dict(foreign))
 
 
 def _brand(value, not_brands: set[str]) -> str | None:
@@ -230,7 +268,7 @@ def _brand(value, not_brands: set[str]) -> str | None:
     return v if v and v.upper() not in not_brands else None
 
 
-def _import_stock(path: Path, rows, h, idx, db: DB, cfg: Settings, kind: str) -> ImportReport:
+def _import_stock(path: Path, rows, h, idx, db: DB, cfg: Settings, kind: str, name: str) -> ImportReport:
     not_brands = {b.strip().upper() for b in cfg.onec.ignore_brands}
     recs = []
     for row in rows[h + 1:]:
@@ -262,27 +300,29 @@ def _import_stock(path: Path, rows, h, idx, db: DB, cfg: Settings, kind: str) ->
         else:
             c.executemany("INSERT INTO arrivals(day,store,item,category,size,qty,doc,brand,color) "
                           "VALUES(?,?,?,?,?,?,?,?,?)", [r for r in recs if r[5] > 0])
-    return ImportReport(path.name, kind, len(recs), pairs)
+    return ImportReport(name, kind, len(recs), pairs)
 
 
-def import_file(path: str | Path, db: DB, cfg: Settings) -> ImportReport:
+def import_file(path: str | Path, db: DB, cfg: Settings, name: str | None = None) -> ImportReport:
+    """name — исходное имя файла (по нему видно чеки и период), если файл забран под другим именем."""
     path = Path(path)
+    name = name or path.name
     rows = _rows(path)
     sc = cfg.onec.stock_columns.model_dump()
     hs = _header(rows, sc, ("store", "item", "stock"))
     if hs:
-        return _import_stock(path, rows, hs[0], hs[1], db, cfg, "stock")
+        return _import_stock(path, rows, hs[0], hs[1], db, cfg, "stock", name)
     ha = _header(rows, sc, ("store", "item", "arrived"))
     if ha:
-        return _import_stock(path, rows, ha[0], ha[1], db, cfg, "arrivals")
+        return _import_stock(path, rows, ha[0], ha[1], db, cfg, "arrivals", name)
     dc = cfg.onec.doc_columns.model_dump()
     hd = _header(rows, dc, ("checks", "revenue"))
     if hd:
-        return _import_docs(path, rows, hd[0], hd[1], db, cfg)
+        return _import_docs(path, rows, hd[0], hd[1], db, cfg, name)
     hl = _header(rows, cfg.onec.columns.model_dump(), ("seller", "amount"))
     if hl:
-        return _import_lines(path, rows, hl[0], hl[1], db, cfg)
-    raise ValueError(f"{path.name}: не найдены заголовки ни строк ОРП («{cfg.onec.columns.seller}», "
+        return _import_lines(path, rows, hl[0], hl[1], db, cfg, name)
+    raise ValueError(f"{name}: не найдены заголовки ни строк ОРП («{cfg.onec.columns.seller}», "
                      f"«{cfg.onec.columns.amount}»), ни шапок («{cfg.onec.doc_columns.checks}», "
                      f"«{cfg.onec.doc_columns.revenue}») — см. docs/1C.md")
 
@@ -295,8 +335,18 @@ def archive_name(archive: Path, name: str) -> Path:
     return archive / f"{datetime.now():%Y%m%d-%H%M%S}_{name}"
 
 
+def _claim(f: Path) -> Path | None:
+    """Забрать файл переименованием: служба и ручной `awer-bot import-sales` не возьмут его оба (аудит И3)."""
+    work = f.with_name(f".work-{os.getpid()}-{f.name}")
+    try:
+        os.replace(f, work)
+    except (FileNotFoundError, PermissionError):  # уже забрали или 1С ещё держит файл — в следующий раз
+        return None
+    return work
+
+
 def import_inbox(db: DB, cfg: Settings) -> list[ImportReport]:
-    """Импортирует все файлы из папки входящих (сначала шапки, потом строки) и переносит в архив.
+    """Импортирует все файлы из папки входящих (шапки ОРП, строки ОРП, чеки, остатки) и переносит в архив.
 
     Файл, который не удалось прочитать, не останавливает остальные (аудит В1): он уходит в archive/bad,
     в отчёте — error, и владелец получает сообщение (jobs.daily_run)."""
@@ -306,16 +356,20 @@ def import_inbox(db: DB, cfg: Settings) -> list[ImportReport]:
     now = time.time()
     files = [f for f in inbox.glob("*") if f.suffix.lower() in (".xlsx", ".xlsm", ".csv")
              and not f.name.startswith(("~$", ".")) and now - f.stat().st_mtime >= FRESH_SECONDS]
-    order = lambda f: (0 if "doc" in f.name.lower() else 2 if f.name.lower().startswith(("stock", "arrival")) else 1, f.name)  # noqa: E731
+    rank = {"orp_docs": 0, "sales": 1, "receipts": 2}
+    order = lambda f: (next((v for k, v in rank.items() if f.name.lower().startswith(k)), 3), f.name)  # noqa: E731
     for f in sorted(files, key=order):
+        work = _claim(f)
+        if work is None:
+            continue
         try:
-            out.append(import_file(f, db, cfg))
-            shutil.move(str(f), archive_name(archive, f.name))
+            out.append(import_file(work, db, cfg, f.name))
+            shutil.move(str(work), archive_name(archive, f.name))
         except Exception as e:  # noqa: BLE001
             log.exception("файл %s не импортирован", f.name)
             bad = archive / "bad"
             bad.mkdir(exist_ok=True)
-            shutil.move(str(f), archive_name(bad, f.name))
+            shutil.move(str(work), archive_name(bad, f.name))
             out.append(ImportReport(f.name, "error", 0, [], error=str(e)[:300]))
     # обработка 1С пишет error_*.txt, если раздел не выгрузился (неверное имя реквизита и т. п.)
     for f in sorted(inbox.glob("error_*.txt")):
@@ -326,3 +380,16 @@ def import_inbox(db: DB, cfg: Settings) -> list[ImportReport]:
         shutil.move(str(f), archive_name(archive / "bad", f.name))
         out.append(ImportReport(f.name, "onec_error", 0, [], error=text[:500] or "без описания"))
     return out
+
+
+def reconcile(db: DB, days: set[str], threshold: float = 1000) -> list[tuple[str, str, float, float]]:
+    """Строки ОРП против шапок ОРП по дням и магазинам: [(день, магазин, строки, шапки)], где разница ≥ threshold.
+    Должны совпадать: расхождение — ошибка выгрузки или склад не магазина в документе (аудит И1)."""
+    if not days:
+        return []
+    marks = ",".join("?" * len(days))
+    rows = db.q(f"""SELECT d.day, d.store, d.rev, COALESCE(l.amt, 0) amt FROM
+                    (SELECT day, store, SUM(revenue) rev FROM store_days WHERE day IN ({marks}) GROUP BY day, store) d
+                    LEFT JOIN (SELECT day, store, SUM(amount) amt FROM sales_lines WHERE day IN ({marks})
+                               GROUP BY day, store) l USING(day, store)""", *sorted(days), *sorted(days))
+    return [(r["day"], r["store"], r["amt"], r["rev"]) for r in rows if abs(r["amt"] - r["rev"]) >= threshold]

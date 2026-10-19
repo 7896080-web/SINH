@@ -9,7 +9,7 @@ from . import achievements, botcfg, coach, crews, goals, health, kb, lessons, me
 from . import metrics as M
 from .config import Settings
 from .db import DB
-from .importers.onec_sales import import_inbox
+from .importers.onec_sales import import_inbox, reconcile
 from .max_api import MaxAuthError, MaxClient, MaxDenied
 from .planning import service
 from .planning.engine import METHOD_NAMES
@@ -86,7 +86,8 @@ def daily_run(db: DB, cfg: Settings, sender: Sender, today: date | None = None, 
     today = today or date.today()
     day = today - timedelta(days=1)
     botcfg.apply(cfg, db)  # владельцы и ссылки со страницы «Бот MAX», если админка — отдельный процесс
-    for rep in import_inbox(db, cfg):
+    reps = import_inbox(db, cfg)
+    for rep in reps:
         log.info("импорт %s: строк %s, дни %s", rep.file, rep.lines, rep.days)
         if rep.kind == "onec_error":  # аудит 1С-1: ошибка обработки 1С видна владельцу, а не только в журнале 1С
             sender.to_owners(today.isoformat(), f"bad_file:{rep.file}",
@@ -108,6 +109,15 @@ def daily_run(db: DB, cfg: Settings, sender: Sender, today: date | None = None, 
                              ". Подключите их к боту: админка → «Продавцы» → «Выдать код». Если это другое "
                              "написание того, кто уже работает, — «Продавцы» → «Имена в 1С» → «Объединить».",
                              once=True)
+    touched = {d for rep in reps if rep.kind in ("lines", "docs") for d, _ in rep.days}
+    diff = reconcile(db, touched)
+    if diff:  # строки ОРП — деньги для плана; итог ОРП — проверка, что выгружено всё
+        sender.to_owners(today.isoformat(), "reconcile",
+                         "Строки «Отчетов о розничных продажах» не сходятся с итогом отчёта: " +
+                         "; ".join(f"{d[8:]}.{d[5:7]} {st} — строки {messages.rub(a)}, итог {messages.rub(r)}"
+                                   for d, st, a, r in diff[:10]) +
+                         ". Продажи продавцам считаются по строкам. Выгрузите эти дни из 1С ещё раз; если не "
+                         "сойдётся — пришлите разработчику.", once=True)
     gone = db.q("SELECT s.name, SUM(l.amount) a FROM sales_lines l JOIN sellers s ON s.id=l.seller_id "
                 "WHERE l.day=? AND s.active=0 AND s.role<>'system' AND l.day>s.fired_at GROUP BY s.id", day.isoformat())
     if gone:  # уволенный продавец в чеках — скорее всего, в 1С выбран не тот продавец

@@ -70,11 +70,24 @@ def main(argv: list[str] | None = None) -> None:
         from .importers.payroll_archive import import_history
         print(import_history(a.folder, db, a.admins))
     elif a.cmd == "import-sales":
-        from .importers.onec_sales import import_file, import_inbox
+        from .importers.onec_sales import import_file, import_inbox, reconcile
         reps = [import_file(a.file, db, cfg)] if a.file else import_inbox(db, cfg)
+        kinds = {"lines": "строки ОРП", "receipts": "чеки", "docs": "шапки ОРП", "stock": "остатки",
+                 "arrivals": "поступления", "error": "ОШИБКА", "onec_error": "ОШИБКА 1С"}
         for r in reps:
-            print(f"{r.file}: строк {r.lines}, дней {len(r.days)}, пропущено {r.skipped}, новые продавцы: "
-                  f"{', '.join(sorted(r.unknown_sellers)) or '—'}")
+            if r.error:
+                print(f"{r.file}: {kinds.get(r.kind, r.kind)} — {r.error}")
+                continue
+            print(f"{r.file}: {kinds.get(r.kind, r.kind)}, строк {r.lines}, дней {len(r.days)}, пропущено "
+                  f"{r.skipped}, новые продавцы: {', '.join(sorted(r.unknown_sellers)) or '—'}")
+            for k, v in sorted(r.foreign.items()):
+                print(f"   не магазин, не загружено: {k or 'склад не указан'} — {v:,.0f} ₽".replace(",", " "))
+        diff = reconcile(db, {d for r in reps if r.kind in ("lines", "docs") for d, _ in r.days})
+        for d, st, amt, rev in diff:
+            print(f"Не сходится {d} {st}: строки ОРП {amt:,.0f}, итог ОРП {rev:,.0f}".replace(",", " "))
+        if any(r.kind == "receipts" for r in reps) and not any(r.kind == "lines" for r in reps):
+            print("Загружены только чеки: продажи для плана берутся из строк ОРП (sales_*.csv). "
+                  "Выгрузите период новой обработкой — она пишет и sales_*, и receipts_*.")
     elif a.cmd == "sellers":
         for r in db.sellers(active_only=False):
             print(f"{r['id']:>3} {r['name']:<28} {r['role']:<7} {'активен' if r['active'] else 'нет':<7} "

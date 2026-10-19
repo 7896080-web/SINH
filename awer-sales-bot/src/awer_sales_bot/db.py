@@ -28,14 +28,15 @@ CREATE TABLE IF NOT EXISTS seller_aliases (     -- другие написани
     alias TEXT PRIMARY KEY,
     seller_id INTEGER NOT NULL REFERENCES sellers(id)
 );
-CREATE TABLE IF NOT EXISTS sales_lines (        -- строки «Отчета о розничных продажах» (ТЧ Товары / Возвращенные)
+CREATE TABLE IF NOT EXISTS sales_lines (        -- строки «Отчета о розничных продажах» (ТЧ Товары / Возвращенные):
+                                               -- ИСТИНА для денег — план, выполнение, ставка, выторг (решение владельца)
     id INTEGER PRIMARY KEY,
     day TEXT NOT NULL,                    -- YYYY-MM-DD
     store TEXT NOT NULL,
     seller_id INTEGER NOT NULL REFERENCES sellers(id),
-    doc TEXT,                             -- номер ОРП или чека
-    receipt TEXT,                         -- номер чека (если выгрузка из чеков; из ОРП — пусто)
-    time TEXT,                            -- время чека HH:MM (если из чеков)
+    doc TEXT,                             -- номер ОРП
+    receipt TEXT,                         -- пусто (чеки — в receipt_lines); колонка осталась от старых выгрузок
+    time TEXT,                            -- пусто, как receipt
     item TEXT,
     category TEXT,
     qty REAL NOT NULL,
@@ -46,6 +47,25 @@ CREATE TABLE IF NOT EXISTS sales_lines (        -- строки «Отчета �
     source TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_sales_card ON sales_lines(card);
+CREATE TABLE IF NOT EXISTS receipt_lines (      -- строки чеков ККМ: только средний чек, вещей в чеке, часы, карты, связки
+    id INTEGER PRIMARY KEY,
+    day TEXT NOT NULL,
+    store TEXT NOT NULL,
+    seller_id INTEGER NOT NULL REFERENCES sellers(id),
+    doc TEXT,
+    receipt TEXT,                         -- касса + номер чека
+    time TEXT,                            -- HH:MM
+    item TEXT,
+    category TEXT,
+    qty REAL NOT NULL,
+    amount REAL NOT NULL,                 -- возврат — отрицательный
+    discount REAL NOT NULL DEFAULT 0,
+    manual_discount REAL NOT NULL DEFAULT 0,
+    card TEXT,
+    source TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_receipt_day ON receipt_lines(day);
+CREATE INDEX IF NOT EXISTS ix_receipt_seller_day ON receipt_lines(seller_id, day);
 CREATE TABLE IF NOT EXISTS stock (              -- остатки на складах магазинов (последний снимок на дату)
     day TEXT NOT NULL,
     store TEXT NOT NULL,
@@ -288,10 +308,10 @@ class DB:
             return r["id"]
         if not create:
             return None
-        with self.tx() as c:
-            cur = c.execute("INSERT INTO sellers(name, first_name) VALUES(?,?)",
-                            (name, name.split()[-1] if len(name.split()) > 1 else name))
-            return cur.lastrowid
+        with self.tx() as c:  # OR IGNORE: служба и ручной импорт могут создать того же продавца одновременно
+            c.execute("INSERT OR IGNORE INTO sellers(name, first_name) VALUES(?,?)",
+                      (name, name.split()[-1] if len(name.split()) > 1 else name))
+            return c.execute("SELECT id FROM sellers WHERE name=?", (name,)).fetchone()["id"]
 
     def sellers(self, active_only: bool = True) -> list[sqlite3.Row]:
         sql = ("SELECT * FROM sellers WHERE role<>'system'" + (" AND active=1" if active_only else "")
@@ -390,7 +410,7 @@ class DB:
             for t in ("monthly_history",) + self.MERGE_KEYED:
                 c.execute(f"UPDATE OR IGNORE {t} SET seller_id=? WHERE seller_id=?", (keep, drop))
                 c.execute(f"DELETE FROM {t} WHERE seller_id=?", (drop,))
-            for t in ("sales_lines", "message_log", "kb_views", "seller_aliases"):
+            for t in ("sales_lines", "receipt_lines", "message_log", "kb_views", "seller_aliases"):
                 c.execute(f"UPDATE {t} SET seller_id=? WHERE seller_id=?", (keep, drop))
             # аккаунт MAX, коды, смена — у основного, если у него нет; уникальные поля сначала снимаем со второго
             take = {k: b[k] for k in ("max_user_id", "max_name", "invite_code", "training_user_id", "training_code",

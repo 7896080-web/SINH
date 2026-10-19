@@ -1,10 +1,10 @@
 """Показатели качества продаж.
 
-Источник строк — чеки ККМ (есть номер чека и время) или «Отчеты о розничных продажах» (номера чека нет).
-  * Есть чеки → по продавцу настоящие: чеков, средний чек, вещей в чеке, доля чеков «одна вещь», часы продаж.
-  * Только ОРП → средний чек и вещей в чеке по МАГАЗИНУ (шапки ОРП); по продавцу — «покупки по картам»:
-    строки одной дисконтной карты в одном документе = одна покупка (честный средний чек хотя бы по части покупок).
-  * Всегда: продажи / вещей за смену, средняя цена вещи, скидки (в т.ч. ручные), возвраты.
+Деньги — всегда из строк «Отчетов о розничных продажах» (sales_lines): продажи, вещей, цена вещи, скидки, возвраты
+(решение владельца 19.10.2026: за истину принимаем отчёт). Чеки ККМ (receipt_lines) — только для показателей:
+  * есть чеки → по продавцу: чеков, средний чек, вещей в чеке, доля чеков «одна вещь», часы продаж, связки;
+  * чеков нет → средний чек и вещей в чеке по МАГАЗИНУ (шапки ОРП); по продавцу — «покупки по картам»:
+    строки одной дисконтной карты в одном документе ОРП = одна покупка.
 """
 from __future__ import annotations
 
@@ -23,9 +23,10 @@ class SellerMetrics:
     discount: float  # скидки, ₽
     manual_discount: float  # из них ручные, ₽
     shifts: int
-    receipts: int  # чеков продажи (0, если данные из ОРП)
+    receipts: int  # чеков продажи (0, если чеков нет)
     receipt_items: float  # штук в этих чеках
     single_item_receipts: int
+    receipt_gross: float  # сумма этих чеков — для среднего чека (деньги для плана — sales, из ОРП)
     card_purchases: int  # покупок с дисконтной картой (карта + документ/чек)
     card_sales: float
     card_items: float
@@ -48,7 +49,7 @@ class SellerMetrics:
 
     @property
     def avg_check(self) -> float | None:
-        return self.gross / self.receipts if self.receipts else None
+        return self.receipt_gross / self.receipts if self.receipts else None
 
     @property
     def upt(self) -> float | None:
@@ -112,18 +113,20 @@ def _seller_sql(where: str, args: list, db: DB) -> SellerMetrics:
         FROM sales_lines WHERE {where}""", *args)
     rc = db.one(f"""
         WITH rc AS (SELECT store, day, receipt, SUM(amount) amt, SUM(CASE WHEN qty>0 THEN qty ELSE 0 END) q
-                    FROM sales_lines WHERE {where} AND receipt IS NOT NULL GROUP BY store, day, receipt)
+                    FROM receipt_lines WHERE {where} AND receipt IS NOT NULL GROUP BY store, day, receipt)
         SELECT COALESCE(SUM(CASE WHEN amt>0 THEN 1 ELSE 0 END),0) n,
                COALESCE(SUM(CASE WHEN amt>0 THEN q ELSE 0 END),0) q,
-               COALESCE(SUM(CASE WHEN amt>0 AND q<=1 THEN 1 ELSE 0 END),0) single FROM rc""", *args)
+               COALESCE(SUM(CASE WHEN amt>0 AND q<=1 THEN 1 ELSE 0 END),0) single,
+               COALESCE(SUM(CASE WHEN amt>0 THEN amt ELSE 0 END),0) gross FROM rc""", *args)
+    # покупки по картам: по чекам, если они есть, иначе строки одной карты в одном документе ОРП
+    src, basket = ("receipt_lines", "receipt") if rc["n"] else ("sales_lines", "doc")
     cd = db.one(f"""
-        WITH cp AS (SELECT store, day, COALESCE(receipt, doc) d, card, SUM(amount) amt,
-                           SUM(CASE WHEN qty>0 THEN qty ELSE 0 END) q
-                    FROM sales_lines WHERE {where} AND card IS NOT NULL AND card<>'' GROUP BY store, day, d, card)
+        WITH cp AS (SELECT store, day, {basket} d, card, SUM(amount) amt, SUM(CASE WHEN qty>0 THEN qty ELSE 0 END) q
+                    FROM {src} WHERE {where} AND card IS NOT NULL AND card<>'' GROUP BY store, day, d, card)
         SELECT COALESCE(SUM(CASE WHEN amt>0 THEN 1 ELSE 0 END),0) n, COALESCE(SUM(CASE WHEN amt>0 THEN amt ELSE 0 END),0) s,
                COALESCE(SUM(CASE WHEN amt>0 THEN q ELSE 0 END),0) q FROM cp""", *args)
     return SellerMetrics(r["sales"], r["items"], r["gross"], r["returns"], r["discount"], r["manual_discount"],
-                         r["shifts"], rc["n"], rc["q"], rc["single"], cd["n"], cd["s"], cd["q"])
+                         r["shifts"], rc["n"], rc["q"], rc["single"], rc["gross"], cd["n"], cd["s"], cd["q"])
 
 
 def seller(db: DB, sid: int, start: date, end: date) -> SellerMetrics:
@@ -150,7 +153,7 @@ def store(db: DB, start: date, end: date) -> StoreMetrics:
     a = [start.isoformat(), end.isoformat()]
     m = _seller_sql("day BETWEEN ? AND ?", a, db)
     if m.receipts:
-        return StoreMetrics(m.gross, m.receipt_items, m.receipts)
+        return StoreMetrics(m.receipt_gross, m.receipt_items, m.receipts)
     r = db.one("SELECT COALESCE(SUM(checks),0) checks, COALESCE(SUM(revenue),0) revenue FROM store_days "
                "WHERE day BETWEEN ? AND ?", *a)
     items = db.one("""SELECT COALESCE(SUM(CASE WHEN qty>0 THEN qty ELSE 0 END),0) n FROM sales_lines
@@ -159,13 +162,13 @@ def store(db: DB, start: date, end: date) -> StoreMetrics:
 
 
 def hours(db: DB, start: date, end: date, sid: int | None = None) -> dict[int, float]:
-    """Продажи по часам (только при выгрузке из чеков): {час: сумма}."""
+    """Продажи по часам (по чекам ККМ — в ОРП времени нет): {час: сумма}."""
     where, args = "time IS NOT NULL AND amount>0 AND day BETWEEN ? AND ?", [start.isoformat(), end.isoformat()]
     if sid is not None:
         where += " AND seller_id=?"
         args.append(sid)
-    rows = db.q(f"SELECT CAST(substr(time,1,2) AS INTEGER) h, SUM(amount) s FROM sales_lines WHERE {where} GROUP BY h",
-                *args)
+    rows = db.q(f"SELECT CAST(substr(time,1,2) AS INTEGER) h, SUM(amount) s FROM receipt_lines WHERE {where} "
+                "GROUP BY h", *args)
     return {r["h"]: r["s"] for r in rows}
 
 
@@ -182,11 +185,17 @@ def category_mix(db: DB, sid: int | None, start: date, end: date) -> dict[str, f
 
 
 def cross_sell(db: DB, start: date, end: date, top: int = 3) -> dict[str, list[tuple[str, float]]]:
-    """Что покупают вместе: «корзина» = чек (если есть), иначе дисконтная карта в документе."""
-    rows = db.q("""SELECT store||'|'||day||'|'||COALESCE(receipt, doc||'|'||card) k, category FROM sales_lines
+    """Что покупают вместе: «корзина» = чек ККМ, а за дни без чеков — дисконтная карта в документе ОРП."""
+    a = [start.isoformat(), end.isoformat()]
+    rows = db.q("""SELECT store||'|'||day||'|'||receipt k, category FROM receipt_lines
                    WHERE qty>0 AND amount>0 AND category IS NOT NULL AND category<>'' AND day BETWEEN ? AND ?
-                     AND (receipt IS NOT NULL OR (card IS NOT NULL AND card<>''))""",
-                start.isoformat(), end.isoformat())
+                     AND receipt IS NOT NULL
+                   UNION ALL
+                   SELECT store||'|'||day||'|'||doc||'|'||card k, category FROM sales_lines
+                   WHERE qty>0 AND amount>0 AND category IS NOT NULL AND category<>'' AND day BETWEEN ? AND ?
+                     AND card IS NOT NULL AND card<>''
+                     AND day||'|'||store NOT IN (SELECT DISTINCT day||'|'||store FROM receipt_lines
+                                                 WHERE day BETWEEN ? AND ?)""", *a, *a, *a)
     baskets: dict[str, set[str]] = {}
     for r in rows:
         baskets.setdefault(r["k"], set()).add(r["category"])

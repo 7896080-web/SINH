@@ -8,7 +8,7 @@ from awer_sales_bot.importers.onec_sales import import_file
 from awer_sales_bot.jobs import Sender, training_run
 from awer_sales_bot.web import create_app
 from test_flow import env  # noqa: F401
-from test_motivation import LESSONS_YAML, FakeMax, write_sales
+from test_motivation import import_sales, LESSONS_YAML, FakeMax, write_sales
 
 AUTH = ("admin", "pw")
 
@@ -47,7 +47,7 @@ def test_one_qr_connects_both_bots_and_messages_are_split(env, tmp_path, monkeyp
     for i in range(10):
         d = date(2026, 9, 22) + timedelta(days=i * 2)
         rows += [(d, "Продавец04", 4_000, 1), (d, "Продавец05", 12_000, 3)]
-    import_file(write_sales(tmp_path / "s.csv", rows), db, cfg)
+    import_sales(tmp_path / "s.csv", rows, db, cfg)
     sender = Sender(db, cfg, plan, training_client=train)
     sender.GAP = 0
     plan.sent.clear()

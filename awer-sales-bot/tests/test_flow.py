@@ -21,10 +21,12 @@ CATS = [("Джинсы", 5600), ("Рубашка Д/р", 3600), ("Ремень",
 
 
 def make_export(folder: Path, days: list[date], sellers: list[str], receipts: bool = True) -> tuple[Path, Path]:
-    """Выгрузки как из обработки 1С: строки продаж (из чеков или из ОРП) и шапки ОРП."""
+    """Выгрузки как из обработки 1С: строки ОРП (деньги), шапки ОРП и — если receipts — строки чеков
+    (receipts_test.csv рядом: средний чек, вещей в чеке, часы)."""
     rnd = random.Random(1)
-    lines = ["Дата;Время;Склад;Документ;Чек;Продавец;Номенклатура;Номенклатурная группа;Количество;Цена;Сумма;"
-             "Скидка;Ручная скидка %;Дисконтная карта"]
+    head = ("Дата;Время;Склад;Документ;Чек;Продавец;Номенклатура;Номенклатурная группа;Количество;Цена;Сумма;"
+            "Скидка;Ручная скидка %;Дисконтная карта")
+    lines, checks_rows = [head], [head]
     docs = ["Дата;Магазин;Касса;Документ;Чеков;Чеков возврата;Выручка"]
     n = 0
     for d in days:
@@ -40,18 +42,29 @@ def make_export(folder: Path, days: list[date], sellers: list[str], receipts: bo
                         cat, price = rnd.choice(CATS)
                         manual = 10 if rnd.random() < 0.15 else 0
                         summa = price * (1 - manual / 100)
-                        rec = f"Ч{n}" if receipts else ""
-                        tm = f"{hh}:15" if receipts else ""
-                        lines.append(f"{d:%d.%m.%Y};{tm};{sklad};{doc};{rec};{s};Арт {cat};{cat};1;{price};{summa:.2f};"
-                                     f";{manual};{card}")
+                        tail = f"{s};Арт {cat};{cat};1;{price};{summa:.2f};;{manual};{card}"
+                        lines.append(f"{d:%d.%m.%Y};;{sklad};{doc};;{tail}")
+                        checks_rows.append(f"{d:%d.%m.%Y};{hh}:15;{sklad};Ч{n};Ч{n};{tail}")
                         rev += summa
             lines.append(f"{d:%d.%m.%Y};;{sklad};{doc};;;Арт x;Джинсы;1;5000;5000;;0;")  # без продавца
             lines.append(f"{d:%d.%m.%Y};;{sklad};{doc};;Wildberries;x;x;1;9999;9999;;0;")  # исключается
-            docs.append(f"{d:%d.%m.%Y};{store};P1 {store}_Касса_Основная;{doc};{checks};0;{rev:.2f}")
+            docs.append(f"{d:%d.%m.%Y};{store};P1 {store}_Касса_Основная;{doc};{checks};0;{rev + 5000:.2f}")
     a, b = folder / "sales_test.csv", folder / "orp_docs_test.csv"
     a.write_text("\n".join(lines), encoding="utf-8")
     b.write_text("\n".join(docs), encoding="utf-8")
+    if receipts:
+        (folder / "receipts_test.csv").write_text("\n".join(checks_rows), encoding="utf-8")
     return a, b
+
+
+def import_export(lines_f: Path, docs_f: Path, db, cfg):
+    """Загрузить выгрузку make_export целиком: шапки, строки ОРП, чеки (если есть)."""
+    import_file(docs_f, db, cfg)
+    rep = import_file(lines_f, db, cfg)
+    rec = lines_f.with_name("receipts_test.csv")
+    if rec.exists():
+        import_file(rec, db, cfg)
+    return rep
 
 
 @pytest.fixture()
@@ -90,6 +103,10 @@ def test_flow(env, tmp_path):
     assert rep.kind == "lines" and rep.skipped == 34 and len(rep.days) == 34  # 34 строки Wildberries
     assert {d[1] for d in rep.days} == {"Город", "МСЛ"}
     assert db.day_closed(date(2026, 10, 17), cfg.stores) == []
+    rep = import_file(lines_f.with_name("receipts_test.csv"), db, cfg)  # чеки — средний чек, вещей в чеке
+    assert rep.kind == "receipts" and not db.one("SELECT 1 FROM sales_lines WHERE receipt IS NOT NULL")
+    from awer_sales_bot.importers.onec_sales import reconcile
+    assert reconcile(db, {d.isoformat() for d in days}) == []  # строки ОРП = шапки ОРП
 
     sid = db.seller_id("Продавец04", create=False)
     st = service.status(db, cfg, sid, date(2026, 10, 17))
@@ -128,8 +145,7 @@ def test_manual_plan_after_freeze_changes_only_that_seller(env):
     service.freeze(db, cfg, "2026-10")
     days = [date(2026, 10, 10) + timedelta(days=i) for i in range(3)]
     lines_f, docs_f = make_export(cfg.onec.inbox, days, ["Новенькая Вера"])
-    import_file(docs_f, db, cfg)
-    import_file(lines_f, db, cfg)
+    import_export(lines_f, docs_f, db, cfg)
     added = service.ensure_plans(db, cfg, "2026-10")
     new = db.seller_id("Новенькая Вера", create=False)
     assert [r["method"] for r in added] == ["newcomer"]
@@ -204,3 +220,29 @@ def test_orp_mode_cards_stock_arrivals(env):
     assert "Покупка клиента с картой" in text and "Новые поступления" in text
     summ = owner_summary(db, cfg, days[-1])
     assert "без продавца" in summ and "Ручные скидки" in summ and "1–2 размера" in summ
+
+
+def test_money_from_orp_receipts_only_metrics(tmp_path):
+    """Решение владельца 19.10.2026: деньги — строки ОРП; чеки — только показатели и день не закрывают."""
+    from awer_sales_bot import metrics
+    from awer_sales_bot.importers.onec_sales import reconcile
+    cfg = Settings(db_path=tmp_path / "t.db")
+    db = DB(cfg.db_path)
+    d = date(2026, 10, 5)
+    lines_f, docs_f = make_export(tmp_path, [d], ["Иванова Анна"])
+    import_file(docs_f, db, cfg)
+    rep = import_file(lines_f.with_name("receipts_test.csv"), db, cfg)
+    assert rep.kind == "receipts"
+    assert db.one("SELECT COUNT(*) n FROM sales_lines")["n"] == 0
+    assert db.one("SELECT COUNT(*) n FROM imported_days")["n"] == 0  # по одним чекам день не закрыт
+    assert import_file(lines_f, db, cfg).kind == "lines"
+    assert db.one("SELECT COUNT(*) n FROM imported_days")["n"] == 2
+    assert reconcile(db, {d.isoformat()}) == []
+    sid = db.seller_id("Иванова Анна", create=False)
+    m = metrics.seller(db, sid, d, d)
+    orp = db.one("SELECT SUM(amount) s FROM sales_lines WHERE seller_id=?", sid)["s"]
+    assert m.sales == pytest.approx(orp) and m.receipts > 0 and m.avg_check
+    # итог ОРП разошёлся со строками (часть строк не выгрузилась) — сверка это видит
+    with db.tx() as c:
+        c.execute("UPDATE store_days SET revenue=revenue+5000 WHERE store='МСЛ'")
+    assert [(x[0], x[1]) for x in reconcile(db, {d.isoformat()})] == [(d.isoformat(), "МСЛ")]

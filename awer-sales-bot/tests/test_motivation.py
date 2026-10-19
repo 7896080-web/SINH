@@ -15,18 +15,32 @@ HEAD = "Дата;Время;Склад;Документ;Чек;Продавец;
 
 
 def write_sales(path: Path, rows: list[tuple]) -> Path:
-    """rows: (день, продавец, сумма, вещей[, категория, чек, скидка]) — одна строка на вещь не нужна, хватит итога."""
-    out = [HEAD]
+    """rows: (день, продавец, сумма, вещей[, категория, чек, скидка]) — одна строка на вещь не нужна, хватит итога.
+    Как обработка 1С: строки ОРП (деньги) в path; если у строк есть чек — ещё receipts_<имя> рядом (средний чек)."""
+    orp, rec = [HEAD], [HEAD]
     for i, r in enumerate(rows):
         d, seller, amount, qty = r[:4]
         cat = r[4] if len(r) > 4 else "Джинсы"
-        rec = r[5] if len(r) > 5 else ""
+        chk = r[5] if len(r) > 5 else ""
         disc = r[6] if len(r) > 6 else 0
         price = (amount + disc) / qty if qty else amount
-        out.append(f"{d:%d.%m.%Y};{'12:00' if rec else ''};ГОРОД_склад;Д{d:%m%d};{rec};{seller};Арт{i};{cat};{qty};"
-                   f"{price:.2f};{amount:.2f};{disc}")
-    path.write_text("\n".join(out), encoding="utf-8")
+        tail = f"{seller};Арт{i};{cat};{qty};{price:.2f};{amount:.2f};{disc}"
+        orp.append(f"{d:%d.%m.%Y};;ГОРОД_склад;Д{d:%m%d};;{tail}")
+        if chk:
+            rec.append(f"{d:%d.%m.%Y};12:00;ГОРОД_склад;{chk};{chk};{tail}")
+    path.write_text("\n".join(orp), encoding="utf-8")
+    if len(rec) > 1:
+        path.with_name("receipts_" + path.name).write_text("\n".join(rec), encoding="utf-8")
     return path
+
+
+def import_sales(path: Path, rows: list[tuple], db, cfg):
+    """write_sales + загрузка строк ОРП и чеков; отчёт — по строкам ОРП."""
+    rep = import_file(write_sales(path, rows), db, cfg)
+    rec = path.with_name("receipts_" + path.name)
+    if rec.exists():
+        import_file(rec, db, cfg)
+    return rep
 
 
 def oct_day(n: int) -> date:
@@ -40,7 +54,7 @@ def test_records_and_streak(env, tmp_path):  # noqa: F811
     rows = [(oct_day(i), "Продавец04", 30_000, 3) for i in range(1, 12)]  # 11 рабочих дней по 30 000
     rows += [(oct_day(12), "Продавец04", 40_000, 4), (oct_day(13), "Продавец04", 45_000, 5),
              (oct_day(14), "Продавец04", 50_000, 6)]
-    import_file(write_sales(tmp_path / "s.csv", rows), db, cfg)
+    import_sales(tmp_path / "s.csv", rows, db, cfg)
     plan = service.frozen_plan(db, "2026-10", sid)  # 547 706 / 18 → дневная норма ≈ 30 428
     got = {a.kind: a for a in achievements.for_day(db, cfg, sid, oct_day(14), plan)}
     assert "Личный рекорд: 50 000 ₽" in got["record_sales"].text and "45 000 ₽" in got["record_sales"].text
@@ -56,7 +70,7 @@ def test_best_shift_of_month_before_enough_history(env, tmp_path):  # noqa: F811
     sid = db.seller_id("Продавец04", create=False)
     rows = [(oct_day(1), "Продавец04", 20_000, 2), (oct_day(2), "Продавец04", 25_000, 2),
             (oct_day(3), "Продавец04", 30_000, 3)]
-    import_file(write_sales(tmp_path / "s.csv", rows), db, cfg)
+    import_sales(tmp_path / "s.csv", rows, db, cfg)
     kinds = [a.kind for a in achievements.for_day(db, cfg, sid, oct_day(3), None)]
     assert kinds == ["best_month"]  # «за всё время» — только после 10 рабочих дней в истории
 
@@ -71,7 +85,7 @@ def test_weekly_goal_set_progress_and_close(env, tmp_path):  # noqa: F811
         rows += [(d, "Продавец04", 4_000, 1), (d, "Продавец05", 12_000, 3)]
     rows += [(date(2026, 10, 19), "Продавец04", 8_000, 2), (date(2026, 10, 20), "Продавец04", 8_000, 2),
              (date(2026, 10, 19), "Продавец05", 12_000, 3)]
-    import_file(write_sales(tmp_path / "s.csv", rows), db, cfg)
+    import_sales(tmp_path / "s.csv", rows, db, cfg)
 
     goals.ensure_week(db, cfg, date(2026, 10, 19))
     goals.ensure_week(db, cfg, date(2026, 10, 19))  # повторный запуск ничего не меняет
@@ -96,7 +110,7 @@ def test_owner_praise(env, tmp_path):  # noqa: F811
     cfg, db = env
     service.freeze(db, cfg, "2026-10")
     rows = [(oct_day(i), "Продавец04", 30_000, 3) for i in range(1, 12)] + [(oct_day(12), "Продавец04", 60_000, 4)]
-    import_file(write_sales(tmp_path / "s.csv", rows), db, cfg)
+    import_sales(tmp_path / "s.csv", rows, db, cfg)
     text = owner_summary(db, cfg, oct_day(12))
     assert "👏 **Кого похвалить:**" in text and "Продавец04 — Личный рекорд: 60 000 ₽" in text
     assert "Кого похвалить" not in owner_summary(db, cfg, oct_day(11))  # обычный рабочий день — без похвалы
@@ -117,7 +131,7 @@ def test_store_plan_only_for_owner_and_example_config_keeps_no_seller(env, tmp_p
     assert store_goal(db, cfg, oct_day(10)) == []  # план не зафиксирован — молчим
     mp = service.freeze(db, cfg, "2026-10")
     rows = [(oct_day(1), "Продавец04", 1_000_000, 50), (oct_day(2), "", 121_090, 5)]
-    import_file(write_sales(tmp_path / "s.csv", rows), db, cfg)
+    import_sales(tmp_path / "s.csv", rows, db, cfg)
     line = store_goal(db, cfg, oct_day(10))[0]
     assert line.startswith("Магазины вместе: 1 121 090 ₽ из 5 605 452 ₽ — 20% плана, прошло 10 из 31 дня")
     assert mp.store.plan == pytest.approx(5_605_452, abs=1)
@@ -180,7 +194,7 @@ def test_weekly_lesson_by_goal_topic(env, tmp_path):  # noqa: F811
     for i in range(10):
         d = date(2026, 9, 22) + timedelta(days=i * 2)
         rows += [(d, "Продавец04", 4_000, 1), (d, "Продавец05", 12_000, 3)]
-    import_file(write_sales(tmp_path / "s.csv", rows), db, cfg)
+    import_sales(tmp_path / "s.csv", rows, db, cfg)
     uid = db.seller(sid)["max_user_id"]
 
     titles = []
@@ -206,7 +220,7 @@ def test_arrivals_pairing(env, tmp_path):  # noqa: F811
         rows.append((d, "Продавец04", 5_000, 1, "Джинсы", f"Ч{i}"))
         if i < 9:
             rows.append((d, "Продавец04", 1_500, 1, "Ремень", f"Ч{i}"))
-    import_file(write_sales(tmp_path / "s.csv", rows), db, cfg)
+    import_sales(tmp_path / "s.csv", rows, db, cfg)
     (tmp_path / "arrivals_1.csv").write_text(
         "Дата;Склад;Документ;Номенклатура;Номенклатурная группа;Характеристика;Поступило\n"
         "10.10.2026;ГОРОД_склад;П1;Джинсы слим;Джинсы;32;6", encoding="utf-8")
@@ -226,7 +240,7 @@ def test_coach_sheet_to_admins_and_owner_once(env, tmp_path):  # noqa: F811
     for i in range(10):
         d = date(2026, 9, 22) + timedelta(days=i * 2)
         rows += [(d, "Продавец04", 4_000, 1), (d, "Продавец05", 12_000, 3)]
-    import_file(write_sales(tmp_path / "s.csv", rows), db, cfg)
+    import_sales(tmp_path / "s.csv", rows, db, cfg)
     monday = date(2026, 10, 19)
     goals.ensure_week(db, cfg, monday)
     training_run(db, cfg, sender, monday)
@@ -251,12 +265,12 @@ def test_newcomer_mid_month_gets_plan_and_payroll_row(env, tmp_path):  # noqa: F
     mp = service.freeze(db, cfg, "2026-10")
     before = {r["seller_id"]: r["plan_full"] for r in db.q("SELECT * FROM plans WHERE month='2026-10'")}
     rows = [(oct_day(10 + i), "Новенькая Анна", 40_000, 4) for i in range(8)]
-    import_file(write_sales(tmp_path / "s.csv", rows), db, cfg)
+    import_sales(tmp_path / "s.csv", rows, db, cfg)
     for n in ("Новенькая Анна", "Ушедший Пётр"):  # второй: продажи есть, а плана не будет (не активен)
         db.seller_id(n)
     with db.tx() as c:
         c.execute("UPDATE sellers SET active=0 WHERE name='Ушедший Пётр'")
-    import_file(write_sales(tmp_path / "s2.csv", [(oct_day(25), "Ушедший Пётр", 10_000, 1)]), db, cfg)
+    import_sales(tmp_path / "s2.csv", [(oct_day(25), "Ушедший Пётр", 10_000, 1)], db, cfg)
 
     daily_run(db, cfg, Sender(db, cfg, None, dry_run=True), today=oct_day(18), force=True)
     nid = db.seller_id("Новенькая Анна", create=False)
@@ -283,7 +297,7 @@ def test_onboarding_lessons_one_per_day(env, tmp_path, monkeypatch):  # noqa: F8
     bot.handle(db, cfg, client, {"update_type": "bot_started", "user": {"user_id": 777}, "payload": code})
     assert [t.splitlines()[0] for _, t, _ in client.sent][1] == "📚 **Программа новичка (1 из 2): Знакомство**"
 
-    import_file(write_sales(tmp_path / "s.csv", [(oct_day(10), "Новенькая Анна", 30_000, 3)]), db, cfg)
+    import_sales(tmp_path / "s.csv", [(oct_day(10), "Новенькая Анна", 30_000, 3)], db, cfg)
     client.sent.clear()
     training_run(db, cfg, sender, oct_day(11))
     training_run(db, cfg, sender, oct_day(11))  # повтор в тот же день — без второго урока
@@ -310,12 +324,12 @@ def test_real_lessons_file_is_valid_and_returns_topic(env, tmp_path):  # noqa: F
     cfg, db, client, sender = linked_env(env, tmp_path)
     cfg.training.lessons_path = Settings().training.lessons_path
     rows = [(oct_day(i), "Продавец04", 10_000, 2) for i in range(1, 9)] + [(oct_day(9), "Продавец04", -3_000, -1)]
-    import_file(write_sales(tmp_path / "s.csv", rows), db, cfg)
+    import_sales(tmp_path / "s.csv", rows, db, cfg)
     uid = db.seller(db.seller_id("Продавец04", create=False))["max_user_id"]
     training_run(db, cfg, sender, date(2026, 10, 12))  # возвраты 3 000 / 80 000 = 3,75 % — урок не про возвраты
     first = [t for u, t, _ in client.sent if u == uid and t.startswith("📚")][-1]
     assert "Примерка, после которой" not in first
-    import_file(write_sales(tmp_path / "s.csv", rows + [(oct_day(10), "Продавец04", -8_000, -2)]), db, cfg)
+    import_sales(tmp_path / "s.csv", rows + [(oct_day(10), "Продавец04", -8_000, -2)], db, cfg)
     training_run(db, cfg, sender, date(2026, 10, 19))  # 11 000 / 80 000 = 13,75 % > 8 %
     assert [t for u, t, _ in client.sent if u == uid and t.startswith("📚")][-1].startswith(
         "📚 **Урок недели: Примерка, после которой")
@@ -330,7 +344,7 @@ def test_quiz_after_lesson_and_answers(env, tmp_path, monkeypatch):  # noqa: F81
     for i in range(10):
         d = date(2026, 9, 22) + timedelta(days=i * 2)
         rows += [(d, "Продавец04", 4_000, 1), (d, "Продавец05", 12_000, 3)]
-    import_file(write_sales(tmp_path / "s.csv", rows), db, cfg)
+    import_sales(tmp_path / "s.csv", rows, db, cfg)
     sid = db.seller_id("Продавец04", create=False)
     uid = db.seller(sid)["max_user_id"]
     goals.ensure_week(db, cfg, date(2026, 10, 19))
@@ -362,7 +376,7 @@ def test_owner_praise_button(env, tmp_path, monkeypatch):  # noqa: F811
     cfg.max.owners = [1]
     service.freeze(db, cfg, "2026-10")
     rows = [(oct_day(i), "Продавец04", 30_000, 3) for i in range(1, 12)] + [(oct_day(12), "Продавец04", 60_000, 4)]
-    import_file(write_sales(tmp_path / "s.csv", rows), db, cfg)
+    import_sales(tmp_path / "s.csv", rows, db, cfg)
     daily_run(db, cfg, sender, today=oct_day(13), force=True)
     owner_msgs = [(t, b) for u, t, b in client.sent if u == 1 and t.startswith("**Сводка")]
     button = owner_msgs[0][1][0][0]
@@ -384,7 +398,7 @@ def test_max_step_tip_does_not_promise_next_step(env, tmp_path):  # noqa: F811
     service.freeze(db, cfg, "2026-10")
     sid = db.seller_id("Продавец04", create=False)
     # 10 рабочих дней × 90 000 = 900 000 ₽ = 164 % плана месяца 547 706 ₽ — выше 160 %, это максимальная ступень
-    import_file(write_sales(tmp_path / "s.csv", [(oct_day(i), "Продавец04", 90_000, 8) for i in range(1, 11)]), db, cfg)
+    import_sales(tmp_path / "s.csv", [(oct_day(i), "Продавец04", 90_000, 8) for i in range(1, 11)], db, cfg)
     text = daily(db, cfg, sid, oct_day(10))
     assert "Максимальная ступень достигнута" in text and "следующая ступень уже близко" not in text
 
@@ -399,7 +413,7 @@ def test_tips_name_only_categories_in_stock(env, tmp_path):  # noqa: F811
         d = oct_day(1 + i % 6)
         rows += [(d, "Продавец05", 5_000, 1, "Джинсы", f"Б{i}"), (d, "Продавец05", 1_500, 1, "Ремень", f"Б{i}"),
                  (d, "Продавец05", 900, 1, "Галстук", f"Б{i}"), (d, "Продавец04", 5_000, 1, "Джинсы", f"А{i}")]
-    import_file(write_sales(tmp_path / "s.csv", rows), db, cfg)
+    import_sales(tmp_path / "s.csv", rows, db, cfg)
     st = service.status(db, cfg, sid, oct_day(6))
 
     tips = " ".join(t for _, t in R.rules(db, cfg, sid, st, oct_day(6)))  # остатков из 1С ещё нет

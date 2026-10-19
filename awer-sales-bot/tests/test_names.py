@@ -7,7 +7,7 @@ from awer_sales_bot import names
 from awer_sales_bot.importers.onec_sales import import_file
 from awer_sales_bot.web import create_app
 from test_flow import env  # noqa: F401
-from test_motivation import write_sales
+from test_motivation import import_sales, write_sales
 
 AUTH = ("admin", "pw")
 
@@ -28,7 +28,7 @@ def test_payroll_and_1c_spellings_merged(env, tmp_path):  # noqa: F811
         c.execute("INSERT INTO monthly_history(month,seller_id,sales,fte) VALUES('2026-08',?,900000,1)", (old,))
         c.execute("INSERT INTO monthly_history(month,seller_id,sales,fte) VALUES('2026-09',?,800000,1)", (old,))
         c.execute("UPDATE sellers SET role='admin' WHERE id=?", (old,))
-    import_file(write_sales(tmp_path / "s.csv", [(date(2026, 10, 17), "Абдулиннанова Эльвина", 50000, 5)]), db, cfg)
+    import_sales(tmp_path / "s.csv", [(date(2026, 10, 17), "Абдулиннанова Эльвина", 50000, 5)], db, cfg)
     new = db.seller_id("Абдулиннанова Эльвина", create=False)
     assert new != old
     with db.tx() as c:  # в 1С-записи уже подключён бот, есть месяц из ведомостей и план новичка
@@ -57,7 +57,7 @@ def test_payroll_and_1c_spellings_merged(env, tmp_path):  # noqa: F811
     assert names.suspects(db) == []
 
     # следующая выгрузка со старым написанием — не новый продавец, а тот же
-    rep = import_file(write_sales(tmp_path / "s2.csv", [(date(2026, 10, 18), "Эльвина Абдулиннанова", 1000, 1)]),
+    rep = import_sales(tmp_path / "s2.csv", [(date(2026, 10, 18), "Эльвина Абдулиннанова", 1000, 1)],
                       db, cfg)
     assert not rep.unknown_sellers
     assert db.one("SELECT COUNT(DISTINCT seller_id) n FROM sales_lines WHERE day>='2026-10-17'")["n"] == 1

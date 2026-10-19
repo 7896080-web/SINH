@@ -9,7 +9,7 @@ from awer_sales_bot.jobs import Sender, daily_run
 from awer_sales_bot.planning import service
 from awer_sales_bot.web import create_app
 from test_flow import env  # noqa: F401
-from test_motivation import FakeMax, oct_day, write_sales
+from test_motivation import import_sales, FakeMax, oct_day, write_sales
 
 AUTH = ("admin", "pw")
 
@@ -42,7 +42,7 @@ def test_add_card_link_fire_restore(env, tmp_path, monkeypatch):  # noqa: F811
     assert "подключён к боту" in web.get(f"/sellers/{sid}/card", auth=AUTH).text
 
     service.freeze(db, cfg, "2026-10")
-    import_file(write_sales(tmp_path / "s.csv", [(oct_day(5), "Новикова М.", 20_000, 2)]), db, cfg)
+    import_sales(tmp_path / "s.csv", [(oct_day(5), "Новикова М.", 20_000, 2)], db, cfg)
     r = web.post("/sellers", data={"action": f"fire:{sid}"}, auth=AUTH)
     assert "уволен(а), бот отключён" in r.text and "Уволены (1)" in r.text
     s = db.seller(sid)
@@ -66,8 +66,8 @@ def test_owner_warned_about_sales_of_fired(env, tmp_path):  # noqa: F811
     cfg.max.owners = [1]
     sid = db.seller_id("Продавец04", create=False)
     db.fire(sid, date(2026, 10, 10))
-    import_file(write_sales(tmp_path / "s.csv", [(oct_day(10), "Продавец04", 5_000, 1),
-                                                 (oct_day(11), "Продавец04", 7_000, 1)]), db, cfg)
+    import_sales(tmp_path / "s.csv", [(oct_day(10), "Продавец04", 5_000, 1),
+                                                 (oct_day(11), "Продавец04", 7_000, 1)], db, cfg)
     sender = Sender(db, cfg, None, dry_run=True)
     daily_run(db, cfg, sender, today=oct_day(11), force=True)  # продажи в день увольнения — его последняя смена
     assert not db.one("SELECT 1 FROM message_log WHERE kind='fired_sales'")

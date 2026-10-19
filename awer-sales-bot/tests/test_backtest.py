@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from awer_sales_bot.importers.onec_sales import import_file
 from awer_sales_bot.planning import backtest
 from awer_sales_bot.web import create_app
-from test_flow import env, make_export  # noqa: F401
+from test_flow import env, import_export, make_export  # noqa: F401
 
 AUTH = ("admin", "pw")
 
@@ -22,8 +22,7 @@ def test_october_plan_matches_reference_and_uses_only_past(env):  # noqa: F811
 
     days = [date(2026, 10, 1) + timedelta(days=i) for i in range(17)]
     lines_f, docs_f = make_export(cfg.onec.inbox, days, ["Продавец04", "Админ2"])
-    import_file(docs_f, db, cfg)
-    import_file(lines_f, db, cfg)
+    import_export(lines_f, docs_f, db, cfg)
     r = backtest.run(db, cfg, "2026-10")
     assert r.store.plan == pytest.approx(before.store.plan)  # продажи октября не меняют план октября
     assert r.source == "1С" and r.coverage == pytest.approx(17 / 31)
@@ -66,10 +65,10 @@ def test_service_sellers_count_in_store_but_get_no_plan(env):  # noqa: F811
     lines_f, docs_f = make_export(cfg.onec.inbox, days, ["Продавец04"])
     with lines_f.open("a", encoding="utf-8") as f:
         for d in days:
-            f.write(f"\n{d:%d.%m.%Y};12:00;ГОРОД_склад;Д1;Ч{d.day}0;Одежда сотрудникам Город;x;x;1;3000;3000;;0;")
-            f.write(f"\n{d:%d.%m.%Y};12:00;МСЛ_склад;Д2;Ч{d.day}1;Одежда сотрудникам;x;x;1;1000;1000;;0;")
-            f.write(f"\n{d:%d.%m.%Y};13:00;МСЛ_склад;Д2;Ч{d.day}2;Стажер;x;x;1;500;500;;0;")  # общий вход
-            f.write(f"\n{d:%d.%m.%Y};14:00;МСЛ_склад;Д2;Ч{d.day}3;Стажер Эльмаз;x;x;1;700;700;;0;")  # человек
+            f.write(f"\n{d:%d.%m.%Y};;ГОРОД_склад;Д1;;Одежда сотрудникам Город;x;x;1;3000;3000;;0;")
+            f.write(f"\n{d:%d.%m.%Y};;МСЛ_склад;Д2;;Одежда сотрудникам;x;x;1;1000;1000;;0;")
+            f.write(f"\n{d:%d.%m.%Y};;МСЛ_склад;Д2;;Стажер;x;x;1;500;500;;0;")  # общий вход
+            f.write(f"\n{d:%d.%m.%Y};;МСЛ_склад;Д2;;Стажер Эльмаз;x;x;1;700;700;;0;")  # человек
     import_file(docs_f, db, cfg)
     rep = import_file(lines_f, db, cfg)
     sids = [db.seller_id(n, create=False) for n in ("Одежда сотрудникам", "Одежда сотрудникам Город", "Стажер")]
