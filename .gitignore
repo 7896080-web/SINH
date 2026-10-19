@@ -2,6 +2,8 @@
 .env
 *.pem
 *.key
+# публичный корневой сертификат Минцифры (не ключ): без него awer-sales-bot не достучится до platform-api2.max.ru
+!awer-sales-bot/src/awer_sales_bot/certs/russian_trusted_root_ca.pem
 
 # Виртуальное окружение
 venv/
