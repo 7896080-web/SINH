@@ -43,8 +43,16 @@ class FakeCloud:
         return subprocess.CompletedProcess(command, code, stdout=out, stderr="")
 
 
+def _fresh_name() -> str:
+    """Имя свежей копии — час назад ОТ МОМЕНТА ПРОГОНА. Зашитое число
+    («mpfinance-20261018-101500.db») протухло само: 19.10.2026 после 10:15 копия
+    стала старше суток, заняла день в счёте уборки, и накат fin21 встал на красном
+    тесте — без единой правки кода. Здесь, в UTC, это случилось бы на три часа позже."""
+    return f"mpfinance-{datetime.now() - timedelta(hours=1):%Y%m%d-%H%M%S}.db"
+
+
 def _copy(tmp_path) -> Path:
-    path = tmp_path / "mpfinance-20261018-101500.db"
+    path = tmp_path / _fresh_name()
     conn = sqlite3.connect(path)
     conn.execute("CREATE TABLE settings (key TEXT, value TEXT)")
     conn.commit()
@@ -61,9 +69,10 @@ def test_upload_is_seen_on_the_other_side_and_cleanup_spares_others(tmp_path, mo
     for name in ours + ["repricer-20261001-030000.db", "ручная копия.db"]:
         (cloud.folder / name).write_bytes(b"old")
     monkeypatch.setattr(backup.subprocess, "run", cloud)
-    assert backup.upload_to_remote(_copy(tmp_path), "selectel:awer-backups/mpfinance") == ""
+    fresh = _copy(tmp_path)
+    assert backup.upload_to_remote(fresh, "selectel:awer-backups/mpfinance") == ""
     names = {f.name for f in cloud.folder.iterdir()}
-    assert "mpfinance-20261018-101500.db" in names                       # свежая доехала
+    assert fresh.name in names                                           # свежая доехала
     assert {"repricer-20261001-030000.db", "ручная копия.db"} <= names    # чужое цело
     # Копия моложе суток в счёт дней не идёт (её отменяют чаще всего): из 16
     # старых дней остаются 14 последних, два самых старых уходят.
