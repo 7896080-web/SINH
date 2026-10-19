@@ -239,6 +239,47 @@ def test_api_list_gives_every_article_so_a_doubled_expense_is_seen(db):
     assert found.bucket_diffs() == [("Хранение", 4000, 8000)]
 
 
+def test_loyalty_compensation_is_inside_for_pay_and_not_added_twice():
+    """19.10.2026 на бою: отчёт №848253942 разошёлся с «Итого к оплате» WB на
+    116,66 ₽ — ровно на «В том числе Компенсация скидки по программе лояльности»
+    свода. WB уже включил её в «К перечислению»."""
+    from finapp.finance.formats import parse_records
+    sale = _wb_line(forPay="2100", retailAmount="2500", cashbackDiscount="116.66")
+    lines = parse_records([sale], "wb").lines
+    assert lines[0]["payout"] == 210000 and lines[0]["compensation"] == 0
+    assert sum(v.line_total(line) for line in lines) == 210000
+
+
+def test_migration_removes_doubled_loyalty_compensation(tmp_path):
+    import sqlite3
+    from tests.test_cost_file import _alembic
+    path = tmp_path / "m.db"
+    url = f"sqlite:///{path}"
+    _alembic(url, "upgrade", "0008")
+    conn = sqlite3.connect(path)
+    for rid, source in ((1, "api"), (2, "file")):
+        conn.execute("INSERT INTO sales_reports (id, platform, period_from, period_to, source_format, source, "
+                     "lines_count, unmatched_lines, onec_key, onec_status, onec_lines_sent) VALUES "
+                     "(?, 'wb', '2026-09-14', '2026-09-20', 'wb_detail', ?, 3, 0, ?, 'none', 0)",
+                     (rid, source, f"SR-wb-{rid}"))
+        for op, comp in (("sale", 11666), ("return", -500), ("compensation", 20000)):
+            conn.execute("INSERT INTO sales_report_lines (report_id, operation, operation_date, quantity, "
+                         "revenue_kop, commission_kop, payout_kop, logistics_kop, storage_kop, penalty_kop, "
+                         "acceptance_kop, deduction_kop, compensation_kop) VALUES "
+                         "(?, ?, '2026-09-15', 1, 0, 0, 0, 0, 0, 0, 0, 0, ?)", (rid, op, comp))
+    conn.commit()
+    conn.close()
+    _alembic(url, "upgrade", "head")
+    conn = sqlite3.connect(path)
+    left = sorted(conn.execute("SELECT report_id, operation, compensation_kop FROM sales_report_lines").fetchall())
+    logged = conn.execute("SELECT details FROM audit_log WHERE action = 'wb_loyalty_comp_cleanup'").fetchone()
+    conn.close()
+    # Из API — у продаж и возвратов обнулена; компенсация без продажи и файл — как были.
+    assert left == [(1, "compensation", 20000), (1, "return", 0), (1, "sale", 0),
+                    (2, "compensation", 20000), (2, "return", -500), (2, "sale", 11666)]
+    assert logged and "строк 2" in logged[0]
+
+
 # ------------------------------------------------------------ проверка доступа
 
 def _account_with(db, platform, field, value):

@@ -220,7 +220,9 @@ def test_wb_loyalty_columns():
     result = _parse(make_xlsx(headers, [sale, ret]), "wb")
     assert result.lines[0]["deduction"] == 5000          # (30 + 20) по продаже
     assert result.lines[1]["deduction"] == -5000         # по возврату — со знаком минус
-    assert result.lines[0]["compensation"] == 1000
+    # Компенсация лояльности уже внутри «К перечислению» — второй раз её не прибавляем.
+    assert result.lines[0]["compensation"] == 0
+    assert result.lines[0]["payout"] == 210000
 
 
 def test_wb_compensation_without_sale_is_income_signed_by_document():

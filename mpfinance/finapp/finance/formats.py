@@ -145,8 +145,11 @@ WB_ALIASES = {
                     "cashbackCommissionChange"),
     "loyalty_points": ("Сумма, удержанная за начисленные баллы программы лояльности",
                        "cashback_amount", "cashbackAmount"),
-    "loyalty_comp": ("Компенсация скидки по программе лояльности", "cashback_discount",
-                     "cashbackDiscount"),
+    # «Компенсация скидки по программе лояльности» (`cashbackDiscount`) НЕ
+    # читается: WB уже включил её в «К перечислению» той же строки — в своде она
+    # «в том числе» продажи, и формула «Итого к оплате» её отдельно не прибавляет.
+    # До 19.10.2026 она прибавлялась к компенсациям, и итог отчёта расходился с WB
+    # ровно на неё (на бою: 116,66 / 16 / 79 ₽ — копейка в копейку со сводом).
     "payment_schedule": ("Разовое изменение срока перечисления денежных средств",
                          "payment_schedule", "paymentSchedule"),
     "barcode": ("Баркод", "barcode", "sku"),
@@ -238,7 +241,7 @@ def build_wb(row: Row) -> dict:
     line["deduction"] = (row.money("deduction") + row.money("wb_correction")
                          + row.money("payment_schedule")
                          + sign * (row.money("loyalty_fee") + row.money("loyalty_points")))
-    line["compensation"] += row.money("loyalty_comp") + row.money("additional_old")
+    line["compensation"] += row.money("additional_old")
 
     line["operation_date"] = row.date("sale_date") or row.date("rr_date")
     line["order_date"] = row.date("order_date")
