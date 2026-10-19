@@ -99,6 +99,8 @@ def praise(db: DB, cfg: Settings, day: date) -> list[tuple[int, str, list[str]]]
             week_done[g.seller_id] = f"цель недели «{g.name} {g.fmt(g.target)}» выполнена"
     out = []
     for s in db.sellers():
+        if s["role"] == "test":
+            continue
         why = [a.text for a in for_day(db, cfg, s["id"], day, frozen_plan(db, day.strftime("%Y-%m"), s["id"]))
                if a.notable]
         if s["id"] in week_done:

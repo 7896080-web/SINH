@@ -366,7 +366,14 @@ class DB:
         name = " ".join(name.split())
         if not name:
             raise ValueError("Пустое имя")
-        if self.seller_id(name, create=False):
+        sid = self.seller_id(name, create=False)
+        if sid and role == "test" and self.seller(sid)["role"] == "system":
+            # служебная запись 1С («Татьяна») становится тестовой карточкой: продажи остаются в выручке магазина
+            with self.tx() as c:
+                c.execute("UPDATE sellers SET role='test', active=1, fired_at=NULL, first_name=COALESCE(?, first_name) "
+                          "WHERE id=?", (first_name, sid))
+            return sid
+        if sid:
             raise ValueError(f"«{name}» уже есть в списке")
         with self.tx() as c:
             cur = c.execute("INSERT INTO sellers(name, first_name, role, hired_at) VALUES(?,?,?,?)",
@@ -477,7 +484,10 @@ class DB:
 
         Месяцы с ежедневными данными из 1С берутся из sales_lines (отработано = рабочие дни / норма, worked_days),
         остальные — из monthly_history (ведомости ЗП)."""
-        h = History(roles={str(k): (v if v in ("admin", "system") else "seller") for k, v in self.roles().items()})
+        # тестовая карточка (роль test) в расчёте — как служебная запись: её продажи в выручке магазина, но не в
+        # плане новичка и не в средних по продавцам
+        h = History(roles={str(k): ("system" if v == "test" else v if v in ("admin", "system") else "seller")
+                           for k, v in self.roles().items()})
         daily = set(self.daily_months())
         for r in self.q("SELECT month, seller_id, sales, fte FROM monthly_history"):
             if r["month"] not in daily:
@@ -547,7 +557,7 @@ class DB:
         rows = self.q(f"""
             SELECT l.day, l.seller_id, s.name, l.store, SUM(l.amount) amount FROM sales_lines l
             JOIN sellers s ON s.id=l.seller_id
-            WHERE l.amount>0 AND s.role<>'system'{f}
+            WHERE l.amount>0 AND s.role NOT IN ('system', 'test'){f}
               AND l.day >= (SELECT MIN(day) FROM schedule WHERE substr(day,1,7)=substr(l.day,1,7))
               AND EXISTS (SELECT 1 FROM schedule g WHERE g.seller_id=l.seller_id AND substr(g.day,1,7)=substr(l.day,1,7))
               AND NOT EXISTS (SELECT 1 FROM schedule g WHERE g.day=l.day AND g.seller_id=l.seller_id)

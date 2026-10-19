@@ -61,7 +61,7 @@ def staffing(db: DB, cfg: Settings, start: date, end: date) -> dict[tuple[str, s
     """{(день, магазин): [имена]} по графику работы."""
     out: dict[tuple[str, str], list[str]] = {}
     for r in db.q("SELECT g.day, g.store, g.seller_id, s.name FROM schedule g JOIN sellers s ON s.id=g.seller_id "
-                  "WHERE g.day BETWEEN ? AND ? AND s.active=1", start.isoformat(), end.isoformat()):
+                  "WHERE g.day BETWEEN ? AND ? AND s.active=1 AND s.role<>'test'", start.isoformat(), end.isoformat()):
         store = r["store"] or default_store(db, cfg, r["seller_id"], date.fromisoformat(r["day"]))
         if store:
             out.setdefault((r["day"], store), []).append(r["name"])

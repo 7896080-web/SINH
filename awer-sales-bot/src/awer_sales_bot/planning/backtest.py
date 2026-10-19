@@ -68,7 +68,7 @@ def run(db: DB, cfg: Settings, month: str) -> Month:
                 min(1.0, n_days / days_in) if daily else 1.0)
     for sid, x in fact.items():
         s = db.seller(int(sid))
-        if not s or s["role"] == "system" or (x.sales <= 0 and x.fte <= 0):
+        if not s or s["role"] in ("system", "test") or (x.sales <= 0 and x.fte <= 0):
             continue
         calc = seller_plan(before, month, sid, sp, p)
         res = evaluate(x.sales, x.fte, calc.plan_full, h.role(sid), p)

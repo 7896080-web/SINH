@@ -211,7 +211,7 @@ def _import_lines(path: Path, rows, h, idx, db: DB, cfg: Settings, name: str) ->
     period = _period(name)
     n = 0
     with db.tx() as c:
-        c.executemany("UPDATE sellers SET role='system', active=0 WHERE id=? AND role<>'system'",
+        c.executemany("UPDATE sellers SET role='system', active=0 WHERE id=? AND role NOT IN ('system', 'test')",
                       [(sid,) for sid in service])
         if period:
             c.execute(f"DELETE FROM {table} WHERE day BETWEEN ? AND ?", period)

@@ -70,6 +70,8 @@ def _num(s: str | None) -> float | None:
 
 
 MONTH = re.compile(r"\d{4}-(0[1-9]|1[0-2])")
+ROLES = ("seller", "admin", "test")  # test — тестовая карточка: сообщения как у продавца, без ведомости и средних
+ROLE_NAMES = {"seller": "продавец", "admin": "админ", "test": "тестовый"}
 MIN_PLAN = 10_000  # ручной план на полный месяц — не меньше (аудит А1)
 
 
@@ -168,7 +170,7 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
             th = threshold_amounts(r.plan_final, p, 1)[1] if r.plan_final else None
             perf = st.performance if st else None
             b.append(
-                f'<tr><td>{html.escape(r.name)}{_how_note(r.method)}</td><td>{"админ" if r.role == "admin" else "продавец"}</td>'
+                f'<tr><td>{html.escape(r.name)}{_how_note(r.method)}</td><td>{ROLE_NAMES.get(r.role, "продавец")}</td>'
                 f'<td class=n>{_rub(r.level)}</td><td class="n calc">{_rub(r.plan_calc)}</td>'
                 f'<td><input type=text name="p{r.seller_id}" value="{_rub(r.plan_manual)}"></td>'
                 f'<td class="n {"man" if r.plan_manual is not None else ""}"><b>{_rub(r.plan_final)}</b></td>'
@@ -1054,7 +1056,8 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
 
     def _role_select(s) -> str:
         return (f'<select name="role{s["id"]}"><option value=seller {"selected" if s["role"] == "seller" else ""}>'
-                f'продавец</option><option value=admin {"selected" if s["role"] == "admin" else ""}>'
+                f'продавец</option><option value=test {"selected" if s["role"] == "test" else ""}>тестовый</option>'
+                f'<option value=admin {"selected" if s["role"] == "admin" else ""}>'
                 'админ (старший)</option></select>')
 
     def _max_name(s) -> str:
@@ -1088,7 +1091,8 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
              '<tr><td>Фамилия Имя — точно как в 1С</td><td><input type=text name=name style="width:260px" required></td></tr>',
              '<tr><td>Обращение в сообщениях</td><td><input type=text name=first_name style="width:260px" placeholder="по умолчанию — имя из 1С"></td></tr>',
              '<tr><td>Роль</td><td><select name=role><option value=seller>продавец</option>'
-             '<option value=admin>админ (старший)</option></select></td></tr>',
+             '<option value=admin>админ (старший)</option><option value=test>тестовый — проверить бота: сообщения '
+             'как у продавца, в ведомость и средние по команде не входит</option></select></td></tr>',
              '<tr><td>Если в 1С записан по-другому</td><td><input type=text name=alias style="width:260px"></td></tr>',
              '</table><button class=btn>Добавить и выдать код подключения</button></form>',
              '<form method=post action="/sellers">',
@@ -1160,7 +1164,7 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
                 sid = s["id"]
                 role = form.get(f"role{sid}", s["role"])
                 c.execute("UPDATE sellers SET first_name=?, role=? WHERE id=?",
-                          (form.get(f"fn{sid}") or s["first_name"], role if role in ("seller", "admin") else s["role"],
+                          (form.get(f"fn{sid}") or s["first_name"], role if role in ROLES else s["role"],
                            sid))
         return RedirectResponse("/sellers?msg=" + quote("Сохранено"), status_code=303)
 
@@ -1168,7 +1172,7 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
     def sellers_add(name: str = Form(...), first_name: str = Form(""), role: str = Form("seller"),
                     alias: str = Form("")):
         try:
-            sid = db.add_seller(name, first_name.strip() or None, role if role in ("seller", "admin") else "seller")
+            sid = db.add_seller(name, first_name.strip() or None, role if role in ROLES else "seller")
         except ValueError as e:
             return RedirectResponse("/sellers?msg=" + quote(f"Не добавлен: {e}. Если он уволен — «Вернуть на работу»."),
                                     status_code=303)

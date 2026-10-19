@@ -364,6 +364,15 @@ foreach ($name in $Admins) {
     if ((Invoke-Bot @("set-role", $name, "admin")) -eq 0) { Note "старший: $name" } else { Warn "не нашёл продавца «$name» — роль поставьте в админке «Продавцы»" }
 }
 
+# ------------------------------------------------------------------ ярлык админки на рабочем столе (для всех)
+$desk = [Environment]::GetFolderPath("CommonDesktopDirectory")
+if ($desk) {
+    $url = Join-Path $desk "AWER — админка.url"
+    [System.IO.File]::WriteAllLines($url, @("[InternetShortcut]", "URL=http://127.0.0.1:$Port/"),
+        (New-Object System.Text.UTF8Encoding($false)))
+    Note "ярлык на рабочем столе: «AWER — админка»"
+}
+
 # ------------------------------------------------------------------ копия базы в облако (BACKUPS.md)
 Say "Задача «$BackupTask» (каждый день в 05:00)"
 $rclone = Join-Path $App "rclone.conf"

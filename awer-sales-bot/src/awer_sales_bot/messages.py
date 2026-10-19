@@ -215,7 +215,7 @@ def owner_summary(db: DB, cfg: Settings, day: date) -> str:
         if not st.sales:
             continue
         m = M.seller(db, s["id"], day.replace(day=1), day)
-        rows.append((s["name"], st, m))
+        rows.append((s["name"] + (" (тест)" if s["role"] == "test" else ""), st, m))
     tot = M.store(db, day.replace(day=1), day)
     allm = M.team(db, day.replace(day=1), day, exclude_admins=False)
     L = [f"**Сводка на {day:%d.%m.%Y}**",

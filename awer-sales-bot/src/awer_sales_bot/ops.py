@@ -63,7 +63,7 @@ def doctor(db: DB, cfg: Settings, backups: Path | None = None, today: date | Non
     pend = db.offschedule_pending()
     if pend:
         out.append((False, f"продажи в дни вне графика ждут ответа: {len(pend)} — «График работы»"))
-    sellers = db.q("SELECT role, max_user_id FROM sellers WHERE active=1 AND role<>'system'")
+    sellers = db.q("SELECT role, max_user_id FROM sellers WHERE active=1 AND role NOT IN ('system', 'test')")
     admins = sum(1 for s in sellers if s["role"] == "admin")
     linked = sum(1 for s in sellers if s["max_user_id"])
     out.append((bool(sellers) and admins > 0,
