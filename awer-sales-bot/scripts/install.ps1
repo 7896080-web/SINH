@@ -18,6 +18,11 @@ param(
 )
 
 $ErrorActionPreference = "Continue"   # ошибки внешних команд проверяем сами по $LASTEXITCODE
+# вывод Python (сводка, загрузка 1С) — в UTF-8: иначе «→» роняет сводку, а кириллица — кракозябры (аудит У5)
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
+$PortGiven = $PSBoundParameters.ContainsKey("Port")
 $App = $App.TrimEnd("\")
 # powershell -File передаёт -Admins "А","Б" одной строкой «А,Б» — делим сами
 $Admins = @($Admins | ForEach-Object { $_ -split "," } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
@@ -34,8 +39,10 @@ function Note($text) { Write-Host "    $text" }
 function Warn($text) { Write-Host "    ! $text" -ForegroundColor Yellow }
 function Fail($text) {
     Write-Host "`nОшибка: $text" -ForegroundColor Red
-    if ($script:Stopped) {
-        Write-Host "Служба $Service остановлена. Исправьте причину и запустите установку снова." -ForegroundColor Yellow
+    if ($script:Stopped -and $Nssm) {  # служба не остаётся остановленной (аудит У6): код ещё прежний
+        & $Nssm start $Service | Out-Null
+        if (Test-Web) { Write-Host "Служба $Service снова работает, как до установки." -ForegroundColor Yellow }
+        else { Write-Host "Служба $Service не запустилась — пришлите этот вывод и logs\service.err.log разработчику." -ForegroundColor Yellow }
     }
     exit 1
 }
@@ -125,25 +132,28 @@ function Install-Deps {
 }
 
 function Restore-OldCode($why) {
-    if (-not $script:OldCode) { Fail $why }
+    if (-not $script:OldCode) { Fail "$why (прежней копии кода нет: установка запущена из самой $App)" }
     Warn "$why — возвращаю прежнюю версию из $($script:OldCode)"
     $err = Copy-Code $script:OldCode $App
     if ($err) { Fail "$why; вернуть прежний код не удалось: $err" }
     Install-Deps | Out-Null
     & $Nssm start $Service | Out-Null
-    Fail "$why. Прежняя версия возвращена и запущена; пришлите этот вывод разработчику."
+    $script:Stopped = $false
+    if (Test-Web) {
+        Write-Host "`nОшибка: $why. Прежняя версия возвращена и работает; пришлите этот вывод разработчику." -ForegroundColor Red
+    } else {
+        Write-Host "`nОшибка: $why. Прежняя версия возвращена, но служба не отвечает — пришлите этот вывод и logs\service.err.log разработчику." -ForegroundColor Red
+    }
+    exit 1
 }
 
 function Test-Web {
-    # Админка жива, если отвечает: 401 (просит пароль) — тоже ответ.
+    # Отвечает именно наша программа: /ping без пароля возвращает «awer-sales-bot» (чужая на этом порту — нет; аудит У3).
     for ($i = 0; $i -lt 30; $i++) {
         try {
-            $r = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/" -UseBasicParsing -TimeoutSec 5 -MaximumRedirection 0
-            return $true
-        } catch {
-            $resp = $_.Exception.Response
-            if ($resp -and ([int]$resp.StatusCode -in 302, 303, 307, 401)) { return $true }
-        }
+            $r = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/ping" -UseBasicParsing -TimeoutSec 5
+            if ("$($r.Content)".Trim() -eq "awer-sales-bot") { return $true }
+        } catch { }
         Start-Sleep -Seconds 2
     }
     return $false
@@ -175,6 +185,13 @@ if (-not $Nssm) {
 Note "NSSM: $Nssm"
 
 $svc = Get-Service -Name $Service -ErrorAction SilentlyContinue
+if ($svc -and -not $PortGiven) {  # обновление без -Port — порт прежний, а не 8080 (аудит У3)
+    $params = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\$Service\Parameters" -ErrorAction SilentlyContinue).AppParameters
+    if ("$params" -match '--port\s+(\d+)') { $Port = [int]$Matches[1]; Note "порт службы — как был: $Port" }
+}
+foreach ($name in $Admins) {
+    if ($name -match '[\\/:]') { Fail "«$name» похоже на путь, а не на имя. Старших — одной строкой через запятую: -Admins `"Эльвина Абдулиннанова,Букалова Юлия`"" }
+}
 $busy = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
 if ($busy -and -not ($svc -and $svc.Status -eq "Running")) {
     $who = (Get-Process -Id $busy[0].OwningProcess -ErrorAction SilentlyContinue).Path
@@ -188,6 +205,10 @@ $stamp = Get-Date -Format "yyyyMMdd-HHmm"
 foreach ($dir in "data\inbox", "data\archive", "logs", "backups") {
     New-Item -ItemType Directory -Force -Path (Join-Path $App $dir) | Out-Null
 }
+# служба работает от имени системы: менять её код и данные могут только система и администраторы, остальные
+# пользователи сервера — только читать (аудит У7; иначе права наследуются от C:\ и обычный пользователь может
+# подложить код службе)
+& icacls $App /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-32-545:(OI)(CI)RX" /C /Q 2>&1 | Out-Null
 if ($Update) {
     Say "Обновление: останавливаю службу и делаю снимок базы"
     if ($svc) {
@@ -271,6 +292,7 @@ if (-not (Test-Path $envPath)) {
     # без BOM: так .env читают и бот, и Блокнот
     [System.IO.File]::WriteAllLines($envPath, $lines, (New-Object System.Text.UTF8Encoding($false)))
     Note ".env создан"
+    Write-Host "    Пароль админки: $AdminPassword (запишите; ещё раз — в конце установки)" -ForegroundColor Green
 } else { Note ".env уже есть — не трогаю (пароль и токены прежние)" }
 Lock-Secret $envPath
 
@@ -287,17 +309,9 @@ if (-not $SkipTests) {
     }
 }
 
-# ------------------------------------------------------------------ база и история 1С
-Say "База и данные 1С"
+# ------------------------------------------------------------------ база
+Say "База"
 if ((Invoke-Bot @("init-db")) -ne 0) { if ($Update) { Restore-OldCode "база не открылась" } else { Fail "база не создана" } }
-$waiting = @(Get-ChildItem (Join-Path $App "data\inbox") -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike ".*" })
-if ($waiting.Count -gt 0) {
-    Note "в data\inbox $($waiting.Count) файл(ов) из 1С — загружаю (история может грузиться несколько минут)"
-    if ((Invoke-Bot @("import-sales")) -ne 0) { Warn "загрузка из data\inbox завершилась с ошибкой — см. выше" }
-}
-foreach ($name in $Admins) {
-    if ((Invoke-Bot @("set-role", $name, "admin")) -eq 0) { Note "старший: $name" } else { Warn "не нашёл продавца «$name» — роль поставьте в админке «Продавцы»" }
-}
 
 # ------------------------------------------------------------------ служба
 Say "Служба $Service (NSSM)"
@@ -329,6 +343,19 @@ if (-not (Test-Web)) {
     Fail "служба не отвечает на http://127.0.0.1:$Port — последние строки журнала выше"
 }
 Note "служба работает: http://127.0.0.1:$Port"
+
+# ------------------------------------------------------------------ история 1С — после проверки службы (аудит У10:
+# откат кода не должен оставлять в базе данные, загруженные новой версией); при обновлении файлы забирает служба
+if (-not $Update) {
+    $waiting = @(Get-ChildItem (Join-Path $App "data\inbox") -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike ".*" })
+    if ($waiting.Count -gt 0) {
+        Say "Данные 1С: в data\inbox $($waiting.Count) файл(ов) — загружаю (история за два года — несколько минут)"
+        if ((Invoke-Bot @("import-sales")) -ne 0) { Warn "загрузка из data\inbox завершилась с ошибкой — см. выше" }
+    }
+}
+foreach ($name in $Admins) {
+    if ((Invoke-Bot @("set-role", $name, "admin")) -eq 0) { Note "старший: $name" } else { Warn "не нашёл продавца «$name» — роль поставьте в админке «Продавцы»" }
+}
 
 # ------------------------------------------------------------------ копия базы в облако (BACKUPS.md)
 Say "Задача «$BackupTask» (каждый день в 05:00)"

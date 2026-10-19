@@ -3,15 +3,16 @@
 # вошла на сервере (как у Sync Admin: толстому клиенту 1С нужна интерактивная сессия, в «фоне» без входа он
 # не работает):
 #   .\scripts\install-1c-task.ps1 -Base "localhost\<имя базы>"
-# Вход в 1С — по аутентификации Windows (/WA+): в Конфигураторе у пользователя 1С «Бот» включите
-# «Аутентификация операционной системы» и укажите эту учётную запись Windows. Тогда пароль нигде не хранится.
-# Если так нельзя — -OneCUser "Бот": скрипт спросит пароль 1С, и он будет виден в свойствах задачи (как у Sync Admin).
+# Вход в 1С — по имени и паролю пользователя 1С «Бот», как у Sync Admin (/N /P): скрипт спросит пароль, он будет
+# виден в свойствах задачи. Аутентификация Windows (-WindowsAuth, /WA+) связала бы учётную запись Windows людей с
+# «Ботом»: кто откроет 1С под ней, войдёт как «Бот» (аудит У4) — только если для бота заведена отдельная учётная запись.
 param(
     [Parameter(Mandatory = $true)][string]$Base,
     [string]$OneC = "C:\Program Files\1cv8\8.3.9.2233\bin\1cv8.exe",
     [string]$Time = "07:30",          # раньше утренней рассылки бота (schedule.daily_send_time, 09:30) и открытия магазинов
     [string]$Retry = "08:30",         # повтор: если в 07:30 не хватило лицензии 1С; выгрузка дня просто заменится
-    [string]$OneCUser = "",
+    [string]$OneCUser = "Бот",
+    [switch]$WindowsAuth,
     [string]$Name = "AwerSalesBot-1C"
 )
 $root = Split-Path -Parent $PSScriptRoot
@@ -20,7 +21,7 @@ if (!(Test-Path $OneC)) { throw "Не найден $OneC — укажите пу
 if (!(Test-Path $epf)) { throw "Не найден $epf — сначала соберите обработку (docs/1C.md, «Сборка в Конфигураторе»)" }
 
 $auth = "/WA+"
-if ($OneCUser) {
+if (-not $WindowsAuth) {
     $sec = Read-Host -AsSecureString "Пароль пользователя 1С «$OneCUser»"
     $plain = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec))
     $auth = "/WA- /N`"$OneCUser`" /P`"$plain`""

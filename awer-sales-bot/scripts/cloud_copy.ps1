@@ -25,8 +25,11 @@ if ($LASTEXITCODE -ne 0) { L "snapshot FAILED (exit $LASTEXITCODE), see logs\bac
 $last = Get-ChildItem $Backups -Filter "awer-*.db" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 L "snapshot ok: $($last.Name) $([math]::Round($last.Length / 1MB, 1)) MB"
 
-if (-not (Test-Path $Conf)) { L "no $Conf - cloud copy skipped (local copies only)"; exit 0 }
-if (-not (Test-Path $Rclone)) { L "no $Rclone - cloud copy skipped"; exit 0 }
+# exit 2 = snapshot ok, but NO cloud copy: the task result is not 0, status.ps1 shows it (audit, section 4)
+if (-not (Test-Path $Conf)) { L "WARNING no $Conf - cloud copy skipped (local copies only)"; exit 2 }
+if (-not (Test-Path $Rclone)) { L "WARNING no $Rclone - cloud copy skipped (local copies only)"; exit 2 }
+# rclone.conf copied by hand inherits open folder rights: only SYSTEM and Administrators (audit U9)
+& icacls $Conf /inheritance:r /grant:r "*S-1-5-18:F" "*S-1-5-32-544:F" /C /Q 2>&1 | Out-Null
 
 # .env, config.yaml and rclone.conf never leave the server: only awer-*.db snapshots are copied
 & $Rclone copy $Backups $Remote --config $Conf --include "awer-*.db" --log-file $Log --log-level NOTICE

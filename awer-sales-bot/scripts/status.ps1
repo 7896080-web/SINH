@@ -4,6 +4,13 @@
 param([string]$App = "C:\awer-sales-bot", [string]$Service = "AwerSalesBot", [int]$Lines = 20)
 
 $App = $App.TrimEnd("\")
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+$env:PYTHONUTF8 = "1"
+$identity = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+if (-not $identity.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Host "Запустите PowerShell от имени администратора: без этого не видно .env, задач и журналов." -ForegroundColor Red
+    exit 1
+}
 $py = Join-Path $App ".venv\Scripts\python.exe"
 $svc = Get-Service -Name $Service -ErrorAction SilentlyContinue
 if (-not $svc) {
@@ -19,6 +26,9 @@ foreach ($name in "AwerSalesBot cloud backup", "AwerSalesBot-1C") {
     $info = $task | Get-ScheduledTaskInfo
     Write-Host ("Задача «{0}»: {1}, последний запуск {2}, код 0x{3:X8}, следующий {4}" -f `
         $name, $task.State, $info.LastRunTime, $info.LastTaskResult, $info.NextRunTime)
+    if ($name -like "*cloud*" -and $info.LastTaskResult -eq 2) {
+        Write-Host "    копия базы — только на сервере: нет rclone.conf (docs\УСТАНОВКА.md, «Копии базы»)" -ForegroundColor Yellow
+    }
 }
 $drive = (Get-Item $App).PSDrive
 $freeGb = [math]::Round($drive.Free / 1GB, 1)

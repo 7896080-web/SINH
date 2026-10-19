@@ -107,6 +107,11 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
         return HTMLResponse(f"<!doctype html><html lang=ru><head><meta charset=utf-8><title>{title}</title>"
                             f"<style>{CSS}</style></head><body>{nav}{health.line(db, cfg)}<h1>{title}</h1>{body}</body></html>")
 
+    @app.get("/ping")
+    def ping():
+        """Без пароля: установщик проверяет, что на порту отвечает именно эта программа (аудит У3)."""
+        return PlainTextResponse("awer-sales-bot")
+
     @app.get("/", dependencies=[Depends(auth)])
     def root():
         return RedirectResponse(f"/month/{date.today():%Y-%m}")

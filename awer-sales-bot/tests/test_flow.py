@@ -270,3 +270,4 @@ def test_admin_rejects_bad_values_foreign_posts_and_bad_month(env, monkeypatch):
     assert c.post("/month/2026-10/freeze", auth=a, headers={"Origin": "http://testserver"}).status_code == 200
     assert c.get("/month/<script>/results", auth=a).status_code == 400
     assert c.get("/docs").status_code == 404
+    assert c.get("/ping").text == "awer-sales-bot"  # установщик узнаёт свою программу на порту (У3)

@@ -4,7 +4,7 @@
 // (События → ПриОткрытии) — сам по имени процедуры он не подключается.
 //
 // Автозапуск (задачу Планировщика создаёт scripts\install-1c-task.ps1; нужна интерактивная сессия Windows):
-//   "C:\Program Files\1cv8\8.3.9.2233\bin\1cv8.exe" ENTERPRISE /S"<сервер>\<база>" /WA+
+//   "C:\Program Files\1cv8\8.3.9.2233\bin\1cv8.exe" ENTERPRISE /S"<сервер>\<база>" /N"Бот" /P"…"
 //      /Execute"C:\awer-sales-bot\onec\ВыгрузкаПродажДляБота.epf" /CAUTO /DisableStartupDialogs /DisableStartupMessages
 // /CAUTO — выгрузить вчера и позавчера и закрыть 1С; /CCHECK — отчёт «Проверка базы» и закрыть 1С.
 // Параметр латиницей и без кавычек, как /CEXCHANGE у Sync Admin. Ошибка — в журнал регистрации и файлом
