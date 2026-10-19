@@ -69,16 +69,18 @@ print("STAGED", stage)
 
 PS_HEADER = r'''# ===== awer-sales-bot, обновление {tag} =====
 # PowerShell ОТ ИМЕНИ АДМИНИСТРАТОРА на сервере. Вставлять по очереди: БЛОК 1 … БЛОК {n}, потом БЛОК APPLY.
-# После каждого блока сверить напечатанный SHA256 с ожидаемым (got = expect).
-function Hx($s) {{
+# Блок — от строки «# ---- БЛОК …» до следующей такой строки. После каждого блока строки got и expect совпадают.
+'''
+
+HX = r'''function Hx($s) {
     $h = [System.Security.Cryptography.SHA256]::Create()
-    ($h.ComputeHash([Text.Encoding]::ASCII.GetBytes($s)) | ForEach-Object {{ $_.ToString("x2") }}) -join ""
-}}
+    ($h.ComputeHash([Text.Encoding]::ASCII.GetBytes($s)) | ForEach-Object { $_.ToString("x2") }) -join ""
+}
 '''
 
 PS_PART = r'''
 # ---- БЛОК {i} из {n} ----
-$u{i} = @'
+{hx}$u{i} = @'
 {body}
 '@
 $u{i} = $u{i} -replace "\s",""
@@ -144,7 +146,7 @@ def build(base: str, tag: str, parts: int, width: int) -> tuple[str, dict]:
     out = [PS_HEADER.format(tag=tag, n=len(pieces))]
     for i, p in enumerate(pieces, 1):
         body = "\n".join(p[j:j + width] for j in range(0, len(p), width))
-        out.append(PS_PART.format(i=i, n=len(pieces), body=body, sha=sha(p)))
+        out.append(PS_PART.format(i=i, n=len(pieces), body=body, sha=sha(p), hx=HX if i == 1 else ""))
     checks = "\n".join(f'if ((Hx $u{i}) -eq "{sha(p)}") {{ "u{i} OK" }} else {{ "u{i} НЕ ТОТ — вставьте блок {i} заново"; '
                        f'return }}' for i, p in enumerate(pieces, 1))
     concat = " + ".join(f"$u{i}" for i in range(1, len(pieces) + 1))
