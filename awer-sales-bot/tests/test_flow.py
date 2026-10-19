@@ -248,7 +248,50 @@ def test_money_from_orp_receipts_only_metrics(tmp_path):
     # итог ОРП разошёлся со строками (часть строк не выгрузилась) — сверка это видит
     with db.tx() as c:
         c.execute("UPDATE store_days SET revenue=revenue+5000 WHERE store='МСЛ'")
-    assert [(x[0], x[1]) for x in reconcile(db, {d.isoformat()})] == [(d.isoformat(), "МСЛ")]
+    assert [(x.day, x.store) for x in reconcile(db, {d.isoformat()})] == [(d.isoformat(), "МСЛ")]
+
+
+def test_gift_certificate_as_in_report_total(tmp_path):
+    """Решение владельца 19.10.2026: продажа сертификата — тому, кто продал; оплата сертификатом — у продавца вещей
+    только доплата (Сумма − Сертификат), строки сходятся с итогом ОРП. Чеки — размер покупки вместе с сертификатом."""
+    from awer_sales_bot.importers.onec_sales import reconcile
+    cfg = Settings(db_path=tmp_path / "t.db")
+    db = DB(cfg.db_path)
+    head = ("Дата;Время;Склад;Документ;Чек;Продавец;Номенклатура;Номенклатурная группа;Количество;Цена;Сумма;"
+            "Скидка;Ручная скидка %;Дисконтная карта;Сертификат")
+    (tmp_path / "orp_docs_20261003_20261004.csv").write_text(
+        "Дата;Магазин;Касса;Документ;Чеков;Чеков возврата;Выручка;Оплата сертификатами\n"
+        "03.10.2026;МСЛ;Р МСЛ_Касса;MSL1;1;0;5000;0\n"
+        "04.10.2026;МСЛ;Р МСЛ_Касса;MSL2;1;0;2700;5000\n", encoding="utf-8")
+    (tmp_path / "sales_20261003_20261004.csv").write_text("\n".join([
+        head,
+        "03.10.2026;;МСЛ_Склад;MSL1;;Иванова Анна МСЛ;ПОДАРОК СЕРТИФИКАТ 5000;Сертификат;1;5000;5000;0;0;;0",
+        "04.10.2026;;МСЛ_Склад;MSL2;;Петрова Ольга МСЛ;Арт Джинсы;Джинсы;1;8000;7200;800;0;;5000",
+        "04.10.2026;;МСЛ_Склад;MSL2;;Петрова Ольга МСЛ;Арт Ремень;Ремень;1;500;500;0;0;;0"]), encoding="utf-8")
+    (tmp_path / "receipts_20261004_20261004.csv").write_text("\n".join([
+        head,
+        "04.10.2026;12:10;МСЛ_Склад;Ч1;Ч1;Петрова Ольга МСЛ;Арт Джинсы;Джинсы;1;8000;7200;800;0;;5000",
+        "04.10.2026;12:10;МСЛ_Склад;Ч1;Ч1;Петрова Ольга МСЛ;Арт Ремень;Ремень;1;500;500;0;0;;0"]), encoding="utf-8")
+    for f in ("orp_docs_20261003_20261004.csv", "sales_20261003_20261004.csv", "receipts_20261004_20261004.csv"):
+        import_file(tmp_path / f, db, cfg)
+    money = {r["name"]: r["s"] for r in db.q("SELECT s.name, SUM(l.amount) s FROM sales_lines l "
+                                              "JOIN sellers s ON s.id=l.seller_id GROUP BY s.name")}
+    assert money == {"Иванова Анна": 5000, "Петрова Ольга": 2700}  # сертификат — продавшей, у Ольги доплата
+    jeans = db.one("SELECT amount, cert, discount FROM sales_lines WHERE item='Арт Джинсы'")
+    assert (jeans["amount"], jeans["cert"], jeans["discount"]) == (2200, 5000, 800)  # скидка — не сертификат
+    assert reconcile(db, {"2026-10-03", "2026-10-04"}) == []
+    assert db.one("SELECT certs FROM store_days WHERE day='2026-10-04'")["certs"] == 5000
+    assert db.one("SELECT SUM(amount) s FROM receipt_lines")["s"] == 7700  # чек — размер покупки
+
+    # 1С не указала сертификат в строках (старая обработка) — сверка видит и подсказывает причину
+    (tmp_path / "sales_20261004_20261004.csv").write_text("\n".join([
+        head.rsplit(";", 1)[0],
+        "04.10.2026;;МСЛ_Склад;MSL2;;Петрова Ольга МСЛ;Арт Джинсы;Джинсы;1;8000;7200;800;0;",
+        "04.10.2026;;МСЛ_Склад;MSL2;;Петрова Ольга МСЛ;Арт Ремень;Ремень;1;500;500;0;0;"]), encoding="utf-8")
+    import_file(tmp_path / "sales_20261004_20261004.csv", db, cfg)
+    [m] = reconcile(db, {"2026-10-04"})
+    assert (m.lines, m.total, m.certs_lost) == (7700, 2700, True)
+    assert "не разнесена по продавцам" in m.text(str)
 
 
 def test_admin_rejects_bad_values_foreign_posts_and_bad_month(env, monkeypatch):

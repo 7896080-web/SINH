@@ -3,13 +3,14 @@
 
 1. Строки продаж:
        Дата;Время;Склад;Документ;Чек;Продавец;Номенклатура;Номенклатурная группа;Количество;Цена;Сумма;Скидка;
-       Ручная скидка %;Дисконтная карта
+       Ручная скидка %;Дисконтная карта[;Сертификат]
    * sales_*.csv из «Отчетов о розничных продажах» (колонка «Чек» пуста) → sales_lines — ИСТИНА для денег: план,
-     выполнение, ставка, выторг магазина (решение владельца 19.10.2026: подарочные сертификаты и возвраты там верны);
+     выполнение, ставка, выторг магазина (решение владельца 19.10.2026). В деньги идёт «Сумма» минус «Сертификат» —
+     часть, оплаченная подарочным сертификатом: его продажа уже засчитана тому, кто продал (SPEC «Откуда деньги»);
    * receipts_*.csv из чеков ККМ (есть «Чек» и «Время»; так же — старый sales_*.csv, выгруженный из чеков) →
      receipt_lines — только средний чек, вещей в чеке, часы продаж, покупки по картам, связки товаров.
    Возврат — отрицательные количество и сумма (уменьшает день возврата). Пустой продавец → «(без продавца)».
-2. Шапки ОРП, orp_docs_*.csv:  Дата;Магазин;Касса;Документ;Чеков;Чеков возврата;Выручка
+2. Шапки ОРП, orp_docs_*.csv:  Дата;Магазин;Касса;Документ;Чеков;Чеков возврата;Выручка[;Оплата сертификатами]
 3. Остатки, stock_*.csv:       Дата;Склад;Номенклатура;Номенклатурная группа;Характеристика;Остаток
 4. Поступления, arrivals_*.csv: Дата;Склад;Документ;Номенклатура;Номенклатурная группа;Характеристика;Поступило
    [;Бренд;Цвет] — для карточек новинок в боте «Обучение»
@@ -193,7 +194,7 @@ def _import_lines(path: Path, rows, h, idx, db: DB, cfg: Settings, name: str) ->
                 unknown.add(seller)
         if is_service:
             service.add(sid)
-        qty, amount = _num(get("qty")), _num(get("amount"))
+        qty, amount, cert = _num(get("qty")), _num(get("amount")), _num(get("cert"))
         disc = abs(_num(get("discount")))
         if not disc and "price" in idx and amount > 0:
             disc = max(0.0, _num(get("price")) * qty - amount)
@@ -204,10 +205,12 @@ def _import_lines(path: Path, rows, h, idx, db: DB, cfg: Settings, name: str) ->
         card = str(get("card") or "").strip() or None
         data[(d.isoformat(), store)].append(
             (d.isoformat(), store, sid, str(get("doc") or ""), receipt, tm, get("item"), get("category"), qty,
-             amount, disc, min(manual, disc) if disc else manual, card, name))
+             amount, disc, min(manual, disc) if disc else manual, card, name, cert))
     # чеки — только для показателей; деньги — по ОРП. Файл с номерами чеков — это чеки, как бы он ни назывался
     receipts = name.lower().startswith("receipts") or any(ln[4] for ls in data.values() for ln in ls)
     table = "receipt_lines" if receipts else "sales_lines"
+    if not receipts:  # деньги продавцу — без оплаты сертификатом; в чеках сумма остаётся размером покупки
+        data = {k: [ln[:9] + (ln[9] - ln[14],) + ln[10:] for ln in ls] for k, ls in data.items()}
     period = _period(name)
     n = 0
     with db.tx() as c:
@@ -219,7 +222,7 @@ def _import_lines(path: Path, rows, h, idx, db: DB, cfg: Settings, name: str) ->
             if not period:
                 c.execute(f"DELETE FROM {table} WHERE day=? AND store=?", (day, store))
             c.executemany(f"INSERT INTO {table}(day,store,seller_id,doc,receipt,time,item,category,qty,amount,"
-                          "discount,manual_discount,card,source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", lines)
+                          "discount,manual_discount,card,source,cert) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", lines)
             n += len(lines)
         if not receipts:
             if period:  # день и магазин, которых больше нет в выгрузке ОРП, — снова «нет данных» (не «закрыто»)
@@ -249,16 +252,17 @@ def _import_docs(path: Path, rows, h, idx, db: DB, cfg: Settings, name: str) -> 
             foreign[kassa or " ".join(str(get("store")).split())] += _num(get("revenue"))
             continue
         key = (d.isoformat(), store, kassa)
-        cur = data.setdefault(key, [str(get("doc") or ""), 0, 0, 0.0])
+        cur = data.setdefault(key, [str(get("doc") or ""), 0, 0, 0.0, 0.0])
         cur[1] += int(_num(get("checks")))
         cur[2] += int(_num(get("return_checks")))
         cur[3] += _num(get("revenue"))
+        cur[4] += _num(get("certs"))
     with db.tx() as c:
-        for (day, store, kassa), (doc, ch, rch, rev) in data.items():
-            c.execute("INSERT INTO store_days(day,store,kassa,doc,checks,return_checks,revenue,source) "
-                      "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(day,store,kassa) DO UPDATE SET doc=excluded.doc, "
+        for (day, store, kassa), (doc, ch, rch, rev, certs) in data.items():
+            c.execute("INSERT INTO store_days(day,store,kassa,doc,checks,return_checks,revenue,source,certs) "
+                      "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(day,store,kassa) DO UPDATE SET doc=excluded.doc, "
                       "checks=excluded.checks, return_checks=excluded.return_checks, revenue=excluded.revenue, "
-                      "source=excluded.source", (day, store, kassa, doc, ch, rch, rev, name))
+                      "source=excluded.source, certs=excluded.certs", (day, store, kassa, doc, ch, rch, rev, name, certs))
     days = sorted({(d, s) for d, s, _ in data})
     return ImportReport(name, "docs", len(data), days, foreign=dict(foreign))
 
@@ -382,14 +386,36 @@ def import_inbox(db: DB, cfg: Settings) -> list[ImportReport]:
     return out
 
 
-def reconcile(db: DB, days: set[str], threshold: float = 1000) -> list[tuple[str, str, float, float]]:
-    """Строки ОРП против шапок ОРП по дням и магазинам: [(день, магазин, строки, шапки)], где разница ≥ threshold.
-    Должны совпадать: расхождение — ошибка выгрузки или склад не магазина в документе (аудит И1)."""
+@dataclass
+class Mismatch:
+    day: str
+    store: str
+    lines: float  # строки ОРП (без оплаты сертификатом)
+    total: float  # итог ОРП («Выручка» шапки)
+    certs: float  # оплата сертификатами по шапке
+    cert_lines: float  # оплата сертификатами, указанная в строках
+
+    @property
+    def certs_lost(self) -> bool:
+        """Разница — оплата сертификатами, которую 1С не указала в строках («СкидкаСертификатами» пуста)."""
+        return self.certs > 0 and abs(self.lines - self.total - (self.certs - self.cert_lines)) < 1
+
+    def text(self, rub) -> str:
+        tail = " — оплата сертификатами не разнесена по продавцам" if self.certs_lost else ""
+        return f"строки ОРП {rub(self.lines)}, итог ОРП {rub(self.total)}{tail}"
+
+
+def reconcile(db: DB, days: set[str], threshold: float = 1000) -> list[Mismatch]:
+    """Строки ОРП (без оплаты сертификатом) против итога ОРП по дням и магазинам, где разница ≥ threshold.
+    Должны совпадать: расхождение — ошибка выгрузки, склад не магазина в документе (аудит И1) или сертификат,
+    не указанный в строках (Mismatch.certs_lost)."""
     if not days:
         return []
     marks = ",".join("?" * len(days))
-    rows = db.q(f"""SELECT d.day, d.store, d.rev, COALESCE(l.amt, 0) amt FROM
-                    (SELECT day, store, SUM(revenue) rev FROM store_days WHERE day IN ({marks}) GROUP BY day, store) d
-                    LEFT JOIN (SELECT day, store, SUM(amount) amt FROM sales_lines WHERE day IN ({marks})
+    rows = db.q(f"""SELECT d.day, d.store, d.rev, d.certs, COALESCE(l.amt, 0) amt, COALESCE(l.cert, 0) cert FROM
+                    (SELECT day, store, SUM(revenue) rev, SUM(certs) certs FROM store_days WHERE day IN ({marks})
+                     GROUP BY day, store) d
+                    LEFT JOIN (SELECT day, store, SUM(amount) amt, SUM(cert) cert FROM sales_lines WHERE day IN ({marks})
                                GROUP BY day, store) l USING(day, store)""", *sorted(days), *sorted(days))
-    return [(r["day"], r["store"], r["amt"], r["rev"]) for r in rows if abs(r["amt"] - r["rev"]) >= threshold]
+    return [Mismatch(r["day"], r["store"], r["amt"], r["rev"], r["certs"], r["cert"]) for r in rows
+            if abs(r["amt"] - r["rev"]) >= threshold]

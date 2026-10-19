@@ -30,6 +30,7 @@ class Columns(BaseModel):
     manual_pct: str = "Ручная скидка %"
     receipt: str = "Чек"  # есть только при выгрузке из чеков
     time: str = "Время"
+    cert: str = "Сертификат"  # часть суммы, оплаченная подарочным сертификатом (СкидкаСертификатами) — не продавцу
 
 
 class StockColumns(BaseModel):
@@ -57,6 +58,7 @@ class DocColumns(BaseModel):
     checks: str = "Чеков"
     return_checks: str = "Чеков возврата"
     revenue: str = "Выручка"
+    certs: str = "Оплата сертификатами"  # ОплатаПодарочнымиСертификатами: в «Выручку» не входит — для сверки
 
 
 class OneC(BaseModel):

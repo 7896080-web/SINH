@@ -115,8 +115,7 @@ def daily_run(db: DB, cfg: Settings, sender: Sender, today: date | None = None, 
     if diff:  # строки ОРП — деньги для плана; итог ОРП — проверка, что выгружено всё
         sender.to_owners(today.isoformat(), "reconcile",
                          "Строки «Отчетов о розничных продажах» не сходятся с итогом отчёта: " +
-                         "; ".join(f"{d[8:]}.{d[5:7]} {st} — строки {messages.rub(a)}, итог {messages.rub(r)}"
-                                   for d, st, a, r in diff[:10]) +
+                         "; ".join(f"{m.day[8:]}.{m.day[5:7]} {m.store} — {m.text(messages.rub)}" for m in diff[:10]) +
                          ". Продажи продавцам считаются по строкам. Выгрузите эти дни из 1С ещё раз; если не "
                          "сойдётся — пришлите разработчику.", once=True)
     gone = db.q("SELECT s.name, SUM(l.amount) a FROM sales_lines l JOIN sellers s ON s.id=l.seller_id "

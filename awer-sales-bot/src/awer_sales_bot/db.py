@@ -40,11 +40,12 @@ CREATE TABLE IF NOT EXISTS sales_lines (        -- строки «Отчета �
     item TEXT,
     category TEXT,
     qty REAL NOT NULL,
-    amount REAL NOT NULL,                 -- со скидкой; возврат — отрицательный
+    amount REAL NOT NULL,                 -- со скидкой, без оплаты сертификатом (cert); возврат — отрицательный
     discount REAL NOT NULL DEFAULT 0,     -- сумма скидки по строке (цена × кол-во − сумма)
     manual_discount REAL NOT NULL DEFAULT 0, -- из неё ручная скидка, ₽
     card TEXT,                            -- дисконтная карта (пусто — без карты)
-    source TEXT
+    source TEXT,
+    cert REAL NOT NULL DEFAULT 0          -- оплачено подарочным сертификатом (уже вычтено из amount; SPEC «Откуда деньги»)
 );
 CREATE INDEX IF NOT EXISTS ix_sales_card ON sales_lines(card);
 CREATE TABLE IF NOT EXISTS receipt_lines (      -- строки чеков ККМ: только средний чек, вещей в чеке, часы, карты, связки
@@ -58,11 +59,12 @@ CREATE TABLE IF NOT EXISTS receipt_lines (      -- строки чеков КК�
     item TEXT,
     category TEXT,
     qty REAL NOT NULL,
-    amount REAL NOT NULL,                 -- возврат — отрицательный
+    amount REAL NOT NULL,                 -- возврат — отрицательный; вместе с оплатой сертификатом (размер покупки)
     discount REAL NOT NULL DEFAULT 0,
     manual_discount REAL NOT NULL DEFAULT 0,
     card TEXT,
-    source TEXT
+    source TEXT,
+    cert REAL NOT NULL DEFAULT 0          -- из amount оплачено подарочным сертификатом
 );
 CREATE INDEX IF NOT EXISTS ix_receipt_day ON receipt_lines(day);
 CREATE INDEX IF NOT EXISTS ix_receipt_seller_day ON receipt_lines(seller_id, day);
@@ -92,8 +94,9 @@ CREATE TABLE IF NOT EXISTS store_days (         -- шапка ОРП: чеков
     doc TEXT,
     checks INTEGER NOT NULL DEFAULT 0,
     return_checks INTEGER NOT NULL DEFAULT 0,
-    revenue REAL NOT NULL DEFAULT 0,
+    revenue REAL NOT NULL DEFAULT 0,      -- СуммаДокумента: без оплаты сертификатами
     source TEXT,
+    certs REAL NOT NULL DEFAULT 0,        -- ОплатаПодарочнымиСертификатами (сверка)
     PRIMARY KEY (day, store, kassa)
 );
 CREATE INDEX IF NOT EXISTS ix_sales_day ON sales_lines(day);
@@ -275,7 +278,10 @@ class DB:
                            ("training_code", "TEXT"),  # код подключения к боту «Обучение»
                            ("max_name", "TEXT")],  # имя из профиля MAX при подключении — сверить, тот ли человек
                "schedule": [("store", "TEXT")],
-               "plans": [("role", "TEXT")]}  # роль на день фиксации: повышение потом не меняет прошлый месяц (Д3)
+               "plans": [("role", "TEXT")],
+               "sales_lines": [("cert", "REAL NOT NULL DEFAULT 0")],  # подарочные сертификаты (19.10.2026)
+               "receipt_lines": [("cert", "REAL NOT NULL DEFAULT 0")],
+               "store_days": [("certs", "REAL NOT NULL DEFAULT 0")]}  # роль на день фиксации: повышение потом не меняет прошлый месяц (Д3)
         for table, cols in new.items():
             have = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
             for col, typ in cols:

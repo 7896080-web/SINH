@@ -86,8 +86,8 @@ def main(argv: list[str] | None = None) -> None:
             for k, v in sorted(r.foreign.items()):
                 print(f"   не магазин, не загружено: {k or 'склад не указан'} — {v:,.0f} ₽".replace(",", " "))
         diff = reconcile(db, {d for r in reps if r.kind in ("lines", "docs") for d, _ in r.days})
-        for d, st, amt, rev in diff:
-            print(f"Не сходится {d} {st}: строки ОРП {amt:,.0f}, итог ОРП {rev:,.0f}".replace(",", " "))
+        for m in diff:
+            print(f"Не сходится {m.day} {m.store}: " + m.text(lambda v: f"{v:,.0f}".replace(",", " ")))
         if any(r.kind == "receipts" for r in reps) and not any(r.kind == "lines" for r in reps):
             print("Загружены только чеки: продажи для плана берутся из строк ОРП (sales_*.csv). "
                   "Выгрузите период новой обработкой — она пишет и sales_*, и receipts_*.")
