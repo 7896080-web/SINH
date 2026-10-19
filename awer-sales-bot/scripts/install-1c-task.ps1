@@ -8,7 +8,7 @@
 # «Ботом»: кто откроет 1С под ней, войдёт как «Бот» (аудит У4) — только если для бота заведена отдельная учётная запись.
 param(
     [Parameter(Mandatory = $true)][string]$Base,
-    [string]$OneC = "C:\Program Files\1cv8\8.3.9.2233\bin\1cv8.exe",
+    [string]$OneC = "",               # пусто — 8.3.9.2233, та же версия, что у Sync Admin (обычно в Program Files (x86))
     [string]$Time = "07:30",          # раньше утренней рассылки бота (schedule.daily_send_time, 09:30) и открытия магазинов
     [string]$Retry = "08:30",         # повтор: если в 07:30 не хватило лицензии 1С; выгрузка дня просто заменится
     [string]$OneCUser = "Бот",
@@ -17,7 +17,12 @@ param(
 )
 $root = Split-Path -Parent $PSScriptRoot
 $epf = Join-Path $root "onec\ВыгрузкаПродажДляБота.epf"
-if (!(Test-Path $OneC)) { throw "Не найден $OneC — укажите путь к 1cv8.exe параметром -OneC" }
+if (-not $OneC) {
+    $OneC = @("C:\Program Files (x86)\1cv8\8.3.9.2233\bin\1cv8.exe", "C:\Program Files\1cv8\8.3.9.2233\bin\1cv8.exe") |
+        Where-Object { Test-Path $_ } | Select-Object -First 1
+}
+if (-not $OneC -or !(Test-Path $OneC)) { throw "Не найден 1cv8.exe 8.3.9.2233 — укажите путь параметром -OneC" }
+Write-Host "1С: $OneC"
 if (!(Test-Path $epf)) { throw "Не найден $epf — сначала соберите обработку (docs/1C.md, «Сборка в Конфигураторе»)" }
 
 $auth = "/WA+"
@@ -38,6 +43,8 @@ $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minu
     -MultipleInstances IgnoreNew
 # «Выполнять только для вошедшего пользователя» — интерактивная сессия, пароль Windows не нужен
 $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive
+# задача работает без повышения прав: этой учётной записи — запись во входящие бота (остальная папка закрыта)
+& icacls (Join-Path $root "data\inbox") /grant "$env:USERDOMAIN\$($env:USERNAME):(OI)(CI)M" /C /Q 2>&1 | Out-Null
 Register-ScheduledTask -TaskName $Name -Action $action -Trigger $triggers -Settings $settings -Principal $principal `
     -Description "Выгрузка продаж, остатков и поступлений для awer-sales-bot" -Force | Out-Null
 Write-Host "Задача $Name создана: каждый день в $Time и $Retry, в сессии $env:USERNAME (на сервере он должен быть вошедшим)."

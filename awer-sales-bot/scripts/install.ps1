@@ -209,6 +209,13 @@ foreach ($dir in "data\inbox", "data\archive", "logs", "backups") {
 # пользователи сервера — только читать (аудит У7; иначе права наследуются от C:\ и обычный пользователь может
 # подложить код службе)
 & icacls $App /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-32-545:(OI)(CI)RX" /C /Q 2>&1 | Out-Null
+# 1С и Конфигуратор работают без повышения прав (UAC): тому, кто ставит программу (под ним же работает выгрузка 1С),
+# — запись во входящие (файлы 1С) и в onec\ (сохранить собранную обработку). Код службы по-прежнему закрыт.
+$me = "$env:USERDOMAIN\$env:USERNAME"
+New-Item -ItemType Directory -Force -Path (Join-Path $App "onec") | Out-Null
+foreach ($dir in "data\inbox", "onec") {
+    & icacls (Join-Path $App $dir) /grant "${me}:(OI)(CI)M" /C /Q 2>&1 | Out-Null
+}
 if ($Update) {
     Say "Обновление: останавливаю службу и делаю снимок базы"
     if ($svc) {
