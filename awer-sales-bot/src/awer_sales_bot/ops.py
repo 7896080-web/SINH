@@ -9,6 +9,7 @@ import os
 import sqlite3
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from . import health
 from .config import Settings
@@ -49,10 +50,14 @@ def doctor(db: DB, cfg: Settings, backups: Path | None = None, today: date | Non
     """[(в порядке ли, строка)] — то, что владельцу или разработчику нужно увидеть первым."""
     today = today or cfg.now().date()
     out: list[tuple[bool, str]] = []
-    shift = abs((cfg.now() - datetime.now()).total_seconds()) > 120  # аудит Р5: часы Windows в другом поясе
-    out.append((not shift, f"часы сервера и пояс магазинов ({cfg.timezone}) совпадают" if not shift else
-                f"часы сервера ({datetime.now():%H:%M}) не в поясе магазинов {cfg.timezone} ({cfg.now():%H:%M}): "
-                "бот считает время по поясу магазинов, но лучше поставить в Windows пояс «Москва»"))
+    # аудит Р5: бот считает время по поясу магазинов, а не по часам Windows (на сервере они могут стоять в другом
+    # поясе — их не трогаем: по ним работают 1С и другие программы). Плохо, только если базы поясов нет.
+    try:
+        ZoneInfo(cfg.timezone)
+        out.append((True, f"время бота — {cfg.timezone}: {cfg.now():%H:%M} (часы сервера {datetime.now():%H:%M})"))
+    except Exception:  # noqa: BLE001
+        out.append((False, f"нет базы часовых поясов для {cfg.timezone} — бот берёт время с часов сервера; "
+                           "переустановите зависимости (scripts\\install.ps1)"))
     if cfg.first_month:
         out.append((True, f"первый расчётный месяц — {cfg.first_month}: итоги со ставкой — начиная с него"))
     pend = db.offschedule_pending()
