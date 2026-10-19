@@ -14,7 +14,8 @@ from finapp.crypto import mask_value
 from finapp.database import get_db
 from finapp.deps import get_current_user, posted_form
 from finapp.flash import pop_flash, set_flash
-from finapp.models import PLATFORMS, MailMessage, PlatformAccount, User
+from finapp.models import (PLATFORMS, ApiCredential, KitVariant, MailMessage, PlatformAccount,
+                           PlatformStatement, ReportFetch, SalesReport, User)
 from finapp.security import verify_password
 from finapp.templating import templates
 
@@ -37,6 +38,7 @@ def page(request: Request, db: Session = Depends(get_db), user: User = Depends(g
         bad = acc.unreadable_fields(db, a)
         rows.append({
             "account": a,
+            "data": _data_on(db, a.id),
             "fields": [(f, label, acc.UNREADABLE if f in bad else mask_value(creds.get(f, "")))
                        for f, label in acc.CREDENTIAL_FIELDS[a.platform]],
             "sync_choices": [s for s in sync_accounts if s.platform == a.platform],
@@ -52,12 +54,31 @@ def page(request: Request, db: Session = Depends(get_db), user: User = Depends(g
     })
 
 
+def _data_on(db: Session, account_id: int) -> tuple[int, int]:
+    """(отчётов, сводов) на кабинете — то, что удаление кабинета унесло бы."""
+    return (db.query(SalesReport).filter(SalesReport.account_id == account_id).count(),
+            db.query(PlatformStatement).filter(PlatformStatement.account_id == account_id).count())
+
+
+def _twin(db: Session, platform: str, name: str, except_id: int | None = None) -> PlatformAccount | None:
+    """Кабинет той же площадки с тем же названием. Два одинаковых — это беда, а не
+    вкус: 19.10.2026 второй «Яндекс» у KIT остановил автозагрузку продаж из AWER CRM
+    (`fetch.crm_account` не угадывает кабинет из двух), и продаж KIT за октябрь не стало."""
+    for other in db.query(PlatformAccount).filter(PlatformAccount.platform == platform):
+        if other.id != except_id and other.name.strip().casefold() == name.strip().casefold():
+            return other
+    return None
+
+
 @router.post("/api-keys/new")
 def create(request: Request, platform: str = Form(""), name: str = Form(""),
            db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     name = name.strip()[:128]
     if platform not in PLATFORMS or not name:
         set_flash(request, "Выберите площадку и введите название кабинета.", "warn")
+        return _back()
+    if _twin(db, platform, name) is not None:
+        set_flash(request, f"Кабинет «{name}» у {PLATFORMS[platform]} уже есть — второй не заведён.", "warn")
         return _back()
     account = PlatformAccount(platform=platform, name=name)
     db.add(account)
@@ -76,6 +97,10 @@ def save(account_id: int, request: Request, form=Depends(posted_form), db: Sessi
         set_flash(request, "Кабинет не найден.", "warn")
         return _back()
     name = str(form.get("name") or "").strip()[:128]
+    if name and _twin(db, account.platform, name, except_id=account.id) is not None:
+        set_flash(request, f"Кабинет «{name}» у {PLATFORMS[account.platform]} уже есть — ничего не сохранено, "
+                           "выберите другое название.", "warn")
+        return _back()
     if name:
         account.name = name
     account.is_active = form.get("is_active") == "1"
@@ -157,4 +182,31 @@ def mail_check(request: Request, db: Session = Depends(get_db), user: User = Dep
     else:
         set_flash(request, f"Почта проверена: новых писем {stats['messages']}, загружено {stats['imported']}, "
                            f"с ошибкой {stats['failed']}.", "good" if not stats["failed"] else "warn")
+    return _back()
+
+
+@router.post("/api-keys/{account_id}/delete")
+def delete(account_id: int, request: Request, db: Session = Depends(get_db),
+           user: User = Depends(get_current_user)):
+    """Удалить ПУСТОЙ кабинет — заведённый по ошибке или лишний двойник. Кабинет
+    с отчётами или сводами не удаляется: отчёты остались бы без кабинета, а их
+    суммы — без хозяина; такой кабинет выключают."""
+    account = db.get(PlatformAccount, account_id)
+    if account is None:
+        set_flash(request, "Кабинет не найден.", "warn")
+        return _back()
+    reports, statements = _data_on(db, account.id)
+    if reports or statements:
+        set_flash(request, f"Кабинет «{account.name}» не удалён: на нём отчётов {reports}, сводов {statements}. "
+                           "Удаляется только пустой кабинет — этот можно выключить.", "warn")
+        return _back()
+    name, platform = account.name, account.platform
+    for model in (ApiCredential, KitVariant, ReportFetch):
+        db.query(model).filter(model.account_id == account.id).delete(synchronize_session=False)
+    if settings.get(db, mail.ACCOUNT) == str(account.id):
+        settings.put(db, mail.ACCOUNT, "")
+    db.delete(account)
+    log_action(db, user.username, "account_deleted", f"{name} ({platform}), №{account_id}")
+    db.commit()
+    set_flash(request, f"Кабинет «{name}» удалён.", "good")
     return _back()

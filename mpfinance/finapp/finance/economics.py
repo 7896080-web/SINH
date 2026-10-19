@@ -46,6 +46,9 @@ class Filters:
     date_to: date
     platform: str | None = None
     account_id: int | None = None
+    # Только отчёты без кабинета (у Lamoda с почты кабинета нет): вместе с
+    # `platform` — пункт «Lamoda · отчёты без кабинета» в выборе кабинета.
+    no_account: bool = False
 
 
 @dataclass
@@ -225,6 +228,8 @@ def load_lines(db: Session, filters: Filters) -> list:
         query = query.filter(SalesReport.platform == filters.platform)
     if filters.account_id:
         query = query.filter(SalesReport.account_id == filters.account_id)
+    elif filters.no_account:
+        query = query.filter(SalesReport.account_id.is_(None))
     return query.all()
 
 

@@ -93,6 +93,44 @@ def _accounts(db: Session) -> list[PlatformAccount]:
     return db.query(PlatformAccount).order_by(PlatformAccount.platform, PlatformAccount.name).all()
 
 
+def _account_labels(accounts: list[PlatformAccount]) -> dict[int, str]:
+    """«Площадка · название» для выбора кабинета. Два кабинета с одним названием
+    различаются номером (19.10.2026 в списке стояло «Яндекс KIT · Яндекс» дважды, и
+    выбрать нужный было нечем), выключенный помечен."""
+    names = {}
+    for a in accounts:
+        names[(a.platform, a.name)] = names.get((a.platform, a.name), 0) + 1
+    labels = {}
+    for a in accounts:
+        label = f"{v.PLATFORM_LABELS.get(a.platform, a.platform)} · {a.name}"
+        if names[(a.platform, a.name)] > 1:
+            label += f" (№{a.id})"
+        if not a.is_active:
+            label += " — выключен"
+        labels[a.id] = label
+    return labels
+
+
+NO_ACCOUNT_PREFIX = "none:"
+
+
+def _cabinet_choices(db: Session) -> list[tuple[str, str]]:
+    """Пункты «Кабинет»: кабинеты и, для площадок, у которых есть отчёты без
+    кабинета, — «отчёты без кабинета». Отчёты Lamoda с почты кабинета не имеют, и
+    без этого пункта Lamoda в списке не было вовсе."""
+    accounts = _accounts(db)
+    labels = _account_labels(accounts)
+    orphans = {p for (p,) in db.query(SalesReport.platform).filter(SalesReport.account_id.is_(None)).distinct()}
+    order = list(v.REPORT_PLATFORMS) + sorted(({a.platform for a in accounts} | orphans) - set(v.REPORT_PLATFORMS))
+    choices = []
+    for platform in order:
+        choices += [(str(a.id), labels[a.id]) for a in accounts if a.platform == platform]
+        if platform in orphans:
+            choices.append((NO_ACCOUNT_PREFIX + platform,
+                            f"{v.PLATFORM_LABELS.get(platform, platform)} · отчёты без кабинета"))
+    return choices
+
+
 def _int_or_none(text: str) -> int | None:
     text = (text or "").strip()
     return int(text) if text.isdigit() else None
@@ -192,7 +230,8 @@ def reports_page(
     fin_settings = load_settings(db)
     return templates.TemplateResponse(request, "finance_reports.html", _ctx(
         request, user, "finance-reports",
-        reports=reports, totals=totals, accounts=accounts, platform=platform,
+        reports=reports, totals=totals, accounts=accounts, account_labels=_account_labels(accounts),
+        platform=platform,
         platforms=v.REPORT_PLATFORMS, onec_labels=ONEC_LABELS, formats=FORMATS,
         api_accounts=[a for a in accounts if a.platform in ("wb", "kit")],
         fetches=db.query(ReportFetch).order_by(ReportFetch.id.desc()).limit(FETCH_LOG_LIMIT).all(),
@@ -443,10 +482,21 @@ GROUPS = {"article": "по артикулу", "sku": "по SKU (размер-ц�
 
 
 def _ue_params(preset, date_from, date_to, platform, account_id, group_by):
+    """Период, фильтры и выбранный пункт «Кабинет» (номер кабинета или
+    «none:<площадка>» — отчёты площадки без кабинета; площадку он задаёт сам)."""
     d_from, d_to, preset = _period(preset, date_from, date_to)
     platform = platform if platform in v.REPORT_PLATFORMS else ""
     group_by = group_by if group_by in GROUPS else "article"
-    return d_from, d_to, preset, platform, _int_or_none(account_id), group_by
+    cabinet = (account_id or "").strip()
+    orphan = cabinet[len(NO_ACCOUNT_PREFIX):] if cabinet.startswith(NO_ACCOUNT_PREFIX) else ""
+    if orphan in v.REPORT_PLATFORMS:
+        filters = Filters(d_from, d_to, orphan, None, no_account=True)
+        platform = orphan
+    else:
+        account = _int_or_none(cabinet)
+        cabinet = str(account) if account else ""
+        filters = Filters(d_from, d_to, platform or None, account)
+    return d_from, d_to, preset, platform, cabinet, group_by, filters
 
 
 @router.get("/finance/unit-economics", response_class=HTMLResponse)
@@ -456,17 +506,16 @@ def unit_economics_page(
     allocate: bool = Query(False),
     db: Session = Depends(get_db), user: User = Depends(get_current_user),
 ):
-    d_from, d_to, preset, platform, account, group_by = _ue_params(
+    d_from, d_to, preset, platform, cabinet, group_by, filters = _ue_params(
         preset, date_from, date_to, platform, account_id, group_by)
     settings = load_settings(db)
-    rows, unassigned, total, allocated = unit_economics(
-        db, Filters(d_from, d_to, platform or None, account), settings, group_by, allocate)
+    rows, unassigned, total, allocated = unit_economics(db, filters, settings, group_by, allocate)
     tariffs.annotate(db, rows)
     return templates.TemplateResponse(request, "finance_unit_economics.html", _ctx(
         request, user, "finance-ue",
         rows=rows, unassigned=unassigned, total=total, allocated=allocated, allocate=allocate,
         d_from=d_from, d_to=d_to, preset=preset, presets=PRESETS, platform=platform,
-        account_id=account, accounts=_accounts(db), group_by=group_by, groups=GROUPS,
+        cabinet=cabinet, cabinets=_cabinet_choices(db), group_by=group_by, groups=GROUPS,
         platforms=v.REPORT_PLATFORMS, settings=settings, tax_modes=TAX_MODES, tax_text=tax_text(settings),
         tax_effective=effective_rate(settings),
     ))
@@ -479,11 +528,10 @@ def unit_economics_export(
     allocate: bool = Query(False),
     db: Session = Depends(get_db), user: User = Depends(get_current_user),
 ):
-    d_from, d_to, preset, platform, account, group_by = _ue_params(
+    d_from, d_to, preset, platform, cabinet, group_by, filters = _ue_params(
         preset, date_from, date_to, platform, account_id, group_by)
     settings = load_settings(db)
-    rows, unassigned, total, _ = unit_economics(
-        db, Filters(d_from, d_to, platform or None, account), settings, group_by, allocate)
+    rows, unassigned, total, _ = unit_economics(db, filters, settings, group_by, allocate)
     tariffs.annotate(db, rows)
 
     headers = ["Артикул", "Наименование", "Размер", "Цвет", "ID_1С", "Площадки", "Продано, шт",

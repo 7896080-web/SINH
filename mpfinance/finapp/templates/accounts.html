@@ -65,6 +65,13 @@
         <p class="help-text" style="margin:4px 0 0;">Проверка — один запрос к {{ 'WB finance-api (список отчётов за две недели)' if a.platform == 'wb' else 'KIT (первая страница заказов)' }}.</p>
         {% endif %}
     </form>
+    <p class="help-text" style="margin:8px 0 0;">Кабинет №{{ a.id }} · отчётов {{ row.data[0] }}{% if row.data[1] %}, сводов {{ row.data[1] }}{% endif %}</p>
+    {% if not row.data[0] and not row.data[1] %}
+    <form method="post" action="/api-keys/{{ a.id }}/delete" style="margin-top:6px;"
+          onsubmit='return confirm({{ ("Удалить кабинет «" ~ a.name ~ "» (№" ~ a.id ~ ")? Отчётов на нём нет; ключи и журнал его загрузок удалятся вместе с ним.") | tojson }});'>
+        <button type="submit" class="btn">Удалить пустой кабинет</button>
+    </form>
+    {% endif %}
 </div>
 {% endfor %}
 

@@ -3,7 +3,7 @@
 {% block title %}Юнит-экономика{% endblock %}
 {% block content %}
 
-{% set query = '&platform=' ~ platform ~ '&group_by=' ~ group_by ~ ('&account_id=' ~ account_id if account_id else '') ~ ('&allocate=true' if allocate else '') %}
+{% set query = '&platform=' ~ platform ~ '&group_by=' ~ group_by ~ ('&account_id=' ~ cabinet if cabinet else '') ~ ('&allocate=true' if allocate else '') %}
 
 <div class="page-header">
     <div>
@@ -27,7 +27,7 @@
         <label for="account_id">Кабинет</label>
         <select id="account_id" name="account_id">
             <option value="">Все</option>
-            {% for a in accounts %}<option value="{{ a.id }}" {% if account_id == a.id %}selected{% endif %}>{{ platform_labels[a.platform] }} · {{ a.name }}</option>{% endfor %}
+            {% for value, label in cabinets %}<option value="{{ value }}" {% if cabinet == value %}selected{% endif %}>{{ label }}</option>{% endfor %}
         </select>
     </div>
     <div class="field">

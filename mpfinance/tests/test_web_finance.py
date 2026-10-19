@@ -68,6 +68,37 @@ def test_unit_economics_keeps_storage_apart_from_deductions(client, db):
     assert "все площадки вместе" not in client.get(f"/finance/unit-economics?{period}&platform=wb").text
 
 
+def test_cabinet_list_tells_twins_apart_and_offers_reports_without_cabinet(client, db):
+    """19.10.2026: «Яндекс KIT · Яндекс» стоял в списке дважды, а Lamoda (её отчёты
+    с почты — без кабинета) не было вовсе."""
+    from tests.finance_factories import make_account
+    make_product(db)
+    first = make_account(db, platform="kit", name="Яндекс")
+    second = make_account(db, platform="kit", name="Яндекс")
+    second.is_active = False
+    wb = make_account(db, name="Яворская")
+    db.commit()
+    sale = {"uid_1c": "u1", "barcode": "2000000000012", "article": "A-1", "revenue": 250000, "payout": 200000}
+    make_report(db, platform="lamoda", lines=[dict(sale, revenue=700000)])
+    make_report(db, platform="wb", account_id=wb.id, lines=[sale])
+    period = "date_from=2026-09-01&date_to=2026-09-30"
+    page = client.get(f"/finance/unit-economics?{period}").text
+    assert f"Яндекс KIT · Яндекс (№{first.id})</option>" in page
+    assert f"Яндекс KIT · Яндекс (№{second.id}) — выключен</option>" in page
+    assert ">Wildberries · Яворская</option>" in page                    # единственный — без номера
+    assert 'value="none:lamoda"' in page and "Lamoda · отчёты без кабинета" in page
+    assert 'value="none:wb"' not in page                                  # у WB все отчёты с кабинетом
+
+    lamoda = client.get(f"/finance/unit-economics?{period}&account_id=none:lamoda").text
+    assert 'value="none:lamoda" selected' in lamoda
+    assert "7\u00a0000\u00a0₽" in lamoda and "2\u00a0500\u00a0₽" not in lamoda
+    raw = client.get(f"/finance/unit-economics/export?{period}&account_id=none:lamoda").content
+    rows = list(load_workbook(io.BytesIO(raw), read_only=True).active.iter_rows(values_only=True))
+    head = list(rows[0])
+    assert [r[head.index("Выручка")] for r in rows[1:] if r[0] == "A-1"] == [7000]
+    assert client.get(f"/finance/unit-economics?{period}&account_id=none:bogus").status_code == 200
+
+
 def test_bad_upload_shows_reason_and_saves_nothing(client, db):
     response = _upload(client, make_xlsx(["Что-то"], [["1"]]))
     assert response.headers["location"] == "/finance/reports"
