@@ -448,3 +448,18 @@ def test_pairs_skip_same_group_and_need_add_on(env, monkeypatch):  # noqa: F811
     assert R.pairs_from_1c(db, cfg, oct_day(10)) == {"Футболка-O": [("Ремень", 0.2)], "Брюки": [("Пиджак", 0.3)]}
     stock = {"Футболка-O": (3, 5), "Ремень": (2, 4), "Брюки": (5, 9), "Пиджак": (4, 6)}
     assert R.best_pair(db, cfg, oct_day(10), stock) in (("Футболка-O", "Ремень"), ("Ремень", "Футболка-O"))
+
+
+def test_tiny_manual_discounts_are_not_a_weekly_goal(env, monkeypatch):  # noqa: F811
+    """Доли процента ручных скидок — не цель недели и не «0 %» в тексте (проверка рассылки 19.10.2026)."""
+    from awer_sales_bot import goals
+    from awer_sales_bot.metrics import SellerMetrics
+    cfg, db = env
+
+    def m(manual):  # продажи 100 000, скидок 2 000, из них ручных — manual; остальное у всех одинаково
+        return SellerMetrics(100_000, 40, 100_000, 0, 2_000, manual, 10, 20, 40, 5, 25_000, 0, 0, 0)
+    monkeypatch.setattr(goals.M, "seller", lambda *a: m(400))   # 0,4 %
+    monkeypatch.setattr(goals.M, "team", lambda *a: m(200))     # 0,2 %
+    g = goals.choose(db, cfg, db.seller_id("Продавец04", create=False), oct_day(19))
+    assert g is None or g.metric != "manual_share"
+    assert goals.fmt("manual_share", 0.004) == "0,4%"

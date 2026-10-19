@@ -22,6 +22,8 @@ def strength(me: M.SellerMetrics, tm: M.SellerMetrics) -> str | None:
         mv, tv = getattr(me, metric), getattr(tm, metric)
         if mv is None or not tv:
             continue
+        if metric == "manual_share" and tv - mv < goals.MANUAL_GAP:
+            continue  # «сильная сторона» в долях процента скидок — не сильная сторона
         higher = metric != "manual_share"
         gap = (mv - tv) / tv if higher else (tv - mv) / tv
         if gap > 0.05 and (best is None or gap > best[0]):

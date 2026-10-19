@@ -24,6 +24,7 @@ METRICS = {
     "manual_share": ("доля ручных скидок", False, "discount"),
 }
 MIN_SHIFTS = 3  # меньше смен за 4 недели — цели нет (новичку — программа новичка)
+MANUAL_MIN, MANUAL_GAP = 0.01, 0.005  # цель по ручным скидкам — от 1 % и выше команды хотя бы на 0,5 п.
 
 
 @dataclass
@@ -59,8 +60,8 @@ def fmt(metric: str, v: float | None) -> str:
         return "—"
     if metric == "avg_price":
         return f"{v:,.0f}".replace(",", " ") + " ₽"
-    if metric in ("discount_share", "manual_share"):
-        return f"{v:.0%}"
+    if metric in ("discount_share", "manual_share"):  # доли скидок малы: 0,4 %, а не «0 %»
+        return f"{v * 100:.1f}".replace(".", ",") + "%"
     return f"{v:.1f}".replace(".", ",")
 
 
@@ -84,6 +85,8 @@ def choose(db: DB, cfg: Settings, sid: int, week: date) -> Goal | None:
         mv, tv = value(me, metric), value(tm, metric)
         if mv is None or not tv:
             continue
+        if metric == "manual_share" and (mv < MANUAL_MIN or mv - tv < MANUAL_GAP):
+            continue  # доли процента — не повод для цели недели
         gap = (tv - mv) / tv if METRICS[metric][1] else (mv - tv) / tv
         if gap > 0.05 and (best is None or gap > best[0]):
             best = (gap, metric)

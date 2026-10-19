@@ -240,7 +240,8 @@ def owner_summary(db: DB, cfg: Settings, day: date) -> str:
         L += ["", f"❓ Продажи в дни вне графика ждут вашего ответа: {len(pend)} — админка → «График работы». "
                   "Пока ответа нет, эти дни не считаются рабочими."]
     if allm.manual_discount:
-        L.append(f"Ручные скидки с начала месяца: {rub(allm.manual_discount)} ({pct(allm.manual_share)} от суммы до скидок)")
+        L.append(f"Ручные скидки с начала месяца: {rub(allm.manual_discount)} "
+                 f"({allm.manual_share * 100:.1f}% от суммы до скидок)".replace(".", ","))
     hrs = M.hours(db, start, day)
     if hrs:
         best = sorted(hrs.items(), key=lambda x: -x[1])[:3]
