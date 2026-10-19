@@ -130,9 +130,9 @@ def handle(db: DB, cfg: Settings, client: MaxClient, u: dict) -> None:
     elif text.lower() == "/id":  # владельцу при настройке: user_id для max.owners
         reply = f"Ваш user_id в MAX: {uid}"
     elif text.lower() in ("/svodka", "сводка") and is_owner:
-        reply = messages.owner_summary(db, cfg, date.today() - timedelta(days=1))
+        reply = messages.owner_summary(db, cfg, cfg.now().date() - timedelta(days=1))
     elif text.lower() in ("/plan", "план"):
-        reply = messages.daily(db, cfg, seller["id"], date.today() - timedelta(days=1)) if seller else \
+        reply = messages.daily(db, cfg, seller["id"], cfg.now().date() - timedelta(days=1)) if seller else \
             "Сначала отправьте код от администратора."
     elif not seller and len(text) == 6:
         linked, blocked = _by_code(db, uid, text, link)
@@ -357,12 +357,12 @@ def run(cfg: Settings, db: DB, stop: threading.Event | None = None) -> None:
             return  # рассылка уже идёт (догон и расписание совпали)
         try:
             # повторяем, пока день не закрыт (нет выгрузок по всем магазинам) или не наступил дедлайн
-            if jobs.daily_run(jdb, cfg, sender) == "waiting":
-                sched.add_job(daily, "date", run_date=datetime.now() + timedelta(minutes=cfg.schedule.retry_minutes),
+            if jobs.daily_run(jdb, cfg, sender) == "waiting":  # время планировщика — пояс магазинов (cfg.now)
+                sched.add_job(daily, "date", run_date=cfg.now() + timedelta(minutes=cfg.schedule.retry_minutes),
                               id="daily_retry", replace_existing=True)
         except Exception as e:  # noqa: BLE001
             log.exception("daily failed")
-            sender.to_owners(date.today().isoformat(), "daily_failed",
+            sender.to_owners(cfg.now().date().isoformat(), "daily_failed",
                              f"Утренняя рассылка не прошла: {e}. Бот повторяет каждые 15 минут; "
                              "подробности — data/service.log.", once=True)
         finally:
@@ -370,14 +370,15 @@ def run(cfg: Settings, db: DB, stop: threading.Event | None = None) -> None:
 
     def catch_up():
         """Аудит В2: служба не работала во время рассылки (перезагрузка, сбой) или рассылка упала — догоняем
-        рассылку за вчера. Признак — kv daily_done, а не время запуска."""
-        due = datetime.now().strftime("%H:%M") >= cfg.schedule.daily_send_time
-        if due and jdb.get_kv("daily_done") != (date.today() - timedelta(days=1)).isoformat() \
+        рассылку за вчера. Признак — kv daily_done, а не время запуска. После quiet_after не шлём (аудит Р7)."""
+        now = cfg.now()
+        due = cfg.schedule.daily_send_time <= now.strftime("%H:%M") < cfg.schedule.quiet_after
+        if due and jdb.get_kv("daily_done") != (now.date() - timedelta(days=1)).isoformat() \
                 and not sched.get_job("daily_retry"):
             daily()
 
     sched.add_job(daily, "cron", hour=hh, minute=mm, id="daily")
-    sched.add_job(catch_up, "interval", minutes=15, id="catch_up", next_run_time=datetime.now() + timedelta(seconds=30))
+    sched.add_job(catch_up, "interval", minutes=15, id="catch_up", next_run_time=cfg.now() + timedelta(seconds=30))
     # тесты, опросы, чек-листы — каждые 15 минут проверяем, у каких рассылок сейчас тестовые часы
     sched.add_job(lambda: tasks.run_due(jdb, cfg, sender), "cron", minute="*/15", id="tasks")
     sched.start()

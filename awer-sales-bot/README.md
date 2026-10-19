@@ -40,7 +40,7 @@ awer-bot web                                # админка http://127.0.0.1:80
 
 ```powershell
 awer-bot import-sales                       # забрать файлы из data/inbox вручную
-awer-bot daily --dry-run --force            # показать сообщения без отправки
+awer-bot daily --dry-run --force            # показать сообщения без отправки (на копии базы, файлы 1С не трогает)
 awer-bot serve --host 127.0.0.1             # бот + админка (для постоянной работы)
 awer-bot close-month 2026-11                # итоги и ставки → ведомость xlsx в админке
 ```

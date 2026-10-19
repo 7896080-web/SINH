@@ -184,7 +184,22 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
     def results(month: str):
         rows = db.q("SELECT r.*, s.name, s.role FROM results r JOIN sellers s ON s.id=r.seller_id WHERE month=? "
                     "ORDER BY s.role DESC, s.name", month)
-        b = [f'<form method=post action="/month/{month}/close"><button class=btn>Посчитать итоги {month}</button></form>',
+        miss = sorted({d for d, _ in db.month_missing(month, cfg.stores, upto=date.today() - timedelta(days=1))})
+        mc = db.one("SELECT * FROM month_close WHERE month=?", month)
+        state = ("Итоги ещё не подведены." if not rows else
+                 f"Итоги окончательные (все дни выгружены), посчитаны {mc['closed_at'][:16].replace('T', ' ')}."
+                 if mc and mc["final"] else
+                 "Итоги ПРЕДВАРИТЕЛЬНЫЕ: месяц не закончился или выгружены не все дни. Бот пересчитает их сам, когда "
+                 "придут все дни месяца, и только тогда разошлёт продавцам.")
+        if cfg.trial(month):
+            state += f" {month} — пробный месяц (первый расчётный — {cfg.first_month}): бот итоги не подводит и не рассылает."
+        if miss:
+            state += f" Нет выгрузки 1С за: {', '.join(d[8:] + '.' + d[5:7] for d in miss[:12])}" + \
+                     (" …" if len(miss) > 12 else "") + " (если магазины не работали — «График работы» → «Закрытые дни»)."
+        b = [f'<p class=note>{html.escape(state)}</p>',
+             f'<form method=post action="/month/{month}/close"><button class=btn>Посчитать итоги {month}</button>'
+             '<span class=note> — для просмотра: продавцам кнопка ничего не отправляет; пока выгружены не все дни, '
+             'итоги предварительные.</span></form>',
              '<table><tr><th>Продавец</th><th>Продажи</th><th>Отработано</th><th>Выполнение</th><th>Шагов</th>'
              '<th>Ставка (полный мес.)</th></tr>']
         for r in rows:
@@ -197,7 +212,7 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
 
     @app.post("/month/{month}/close", dependencies=[Depends(auth)])
     def close(month: str):
-        service.close_month(db, cfg, month)
+        service.close_month(db, cfg, month)  # окончательные — только при всех выгруженных днях (аудит Д2)
         return RedirectResponse(f"/month/{month}/results", status_code=303)
 
     @app.get("/month/{month}/payroll.xlsx", dependencies=[Depends(auth)])
@@ -671,8 +686,7 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
         db.decide_offschedule(day.isoformat(), sid, worked)
         month = day.strftime("%Y-%m")
         msg = f"{day:%d.%m} — {'рабочий день, добавлен в график' if worked else 'не рабочий день'}"
-        if db.one("SELECT 1 FROM results WHERE month=?", month):
-            service.close_month(db, cfg, month)
+        if service.refresh_results(db, cfg, month):
             msg += f". Итоги {month} пересчитаны — проверьте «Итоги и ведомость»"
         back = str(form.get("back") or month)
         if not re.fullmatch(r"\d{4}-\d{2}", back):
@@ -1195,6 +1209,9 @@ def create_app(cfg: Settings, db: DB, runner=None, max_client=None) -> FastAPI:
                     if both:
                         msg += f" В месяцах {', '.join(both)} история была у обоих — взята большая сумма."
                     msg += " Если план этого месяца уже зафиксирован — проверьте его в «Настройки месяца»."
+                    redone = service.refresh_results(db, cfg)  # итоги прошлых месяцев — по объединённым продажам (Д3)
+                    if redone:
+                        msg += f" Итоги {', '.join(redone)} пересчитаны — проверьте «Итоги и ведомость»."
         except ValueError as e:
             msg = f"Не сделано: {e}"
         return RedirectResponse(f"/sellers/names?msg={quote(msg)}", status_code=303)

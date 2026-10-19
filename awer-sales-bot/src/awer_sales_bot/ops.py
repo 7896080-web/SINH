@@ -47,8 +47,17 @@ def backup(db_path: Path, dest: Path, keep_days: int = 30, now: datetime | None 
 
 def doctor(db: DB, cfg: Settings, backups: Path | None = None, today: date | None = None) -> list[tuple[bool, str]]:
     """[(в порядке ли, строка)] — то, что владельцу или разработчику нужно увидеть первым."""
-    today = today or date.today()
+    today = today or cfg.now().date()
     out: list[tuple[bool, str]] = []
+    shift = abs((cfg.now() - datetime.now()).total_seconds()) > 120  # аудит Р5: часы Windows в другом поясе
+    out.append((not shift, f"часы сервера и пояс магазинов ({cfg.timezone}) совпадают" if not shift else
+                f"часы сервера ({datetime.now():%H:%M}) не в поясе магазинов {cfg.timezone} ({cfg.now():%H:%M}): "
+                "бот считает время по поясу магазинов, но лучше поставить в Windows пояс «Москва»"))
+    if cfg.first_month:
+        out.append((True, f"первый расчётный месяц — {cfg.first_month}: итоги со ставкой — начиная с него"))
+    pend = db.offschedule_pending()
+    if pend:
+        out.append((False, f"продажи в дни вне графика ждут ответа: {len(pend)} — «График работы»"))
     sellers = db.q("SELECT role, max_user_id FROM sellers WHERE active=1 AND role<>'system'")
     admins = sum(1 for s in sellers if s["role"] == "admin")
     linked = sum(1 for s in sellers if s["max_user_id"])

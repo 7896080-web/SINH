@@ -214,20 +214,44 @@ def test_missed_first_of_month_is_caught_up(env):  # noqa: F811
     cfg, db = env
     cfg.max.owners = [900]
     service.freeze(db, cfg, "2026-10")
-    nov2 = date(2026, 11, 2)
-    assert month_due(db, nov2)  # план ноября не зафиксирован, октябрь не закрыт — неважно, что сегодня 2-е
-    daily_run(db, cfg, Sender(db, cfg, None, dry_run=True), today=nov2, force=True)
-    assert db.one("SELECT 1 FROM plans WHERE month='2026-11'")
-    # за 31.10 выгрузки нет — итоги и ставки по неполным данным не считаем (аудит С2), владелец знает
-    assert not db.one("SELECT 1 FROM results WHERE month='2026-10'") and month_due(db, nov2)
-    assert "31.10" in db.one("SELECT text FROM message_log WHERE kind='month_close_wait'")["text"]
 
-    for store in ("ГОРОД", "МСЛ"):
-        f = write_sales(cfg.onec.inbox / f"s_{store}.csv", [(date(2026, 10, 31), "Продавец04", 5600, 1)])
-        f.write_text(f.read_text(encoding="utf-8").replace("ГОРОД_склад", f"{store}_склад"), encoding="utf-8")
-        os.utime(f, (time.time() - 600,) * 2)
+    def october(days, name):  # выгрузка ОРП по обоим магазинам — как файлы обработки 1С
+        for store in ("ГОРОД", "МСЛ"):
+            f = write_sales(cfg.onec.inbox / f"{name}_{store}.csv",
+                            [(date(2026, 10, d), "Продавец04", 5600, 1) for d in days])
+            f.write_text(f.read_text(encoding="utf-8").replace("ГОРОД_склад", f"{store}_склад"), encoding="utf-8")
+            os.utime(f, (time.time() - 600,) * 2)
+
+    october(range(1, 31), "s")
+    nov2 = date(2026, 11, 2)
+    assert month_due(db, cfg, nov2)  # план ноября не зафиксирован, октябрь не закрыт — неважно, что сегодня 2-е
     daily_run(db, cfg, Sender(db, cfg, None, dry_run=True), today=nov2, force=True)
-    assert db.one("SELECT 1 FROM results WHERE month='2026-10'") and not month_due(db, nov2)
+    # за 31.10 выгрузки нет — итоги и ставки по неполным данным не считаем (аудит С2, Д5), план ноября ждёт (Д4)
+    assert not db.one("SELECT 1 FROM results WHERE month='2026-10'") and month_due(db, cfg, nov2)
+    assert not db.one("SELECT 1 FROM plans WHERE month='2026-11'")
+    assert "31.10" in db.one("SELECT text FROM message_log WHERE kind='month_close_wait'")["text"]
+    assert "31.10" in db.one("SELECT text FROM message_log WHERE kind='plan_wait'")["text"]
+
+    october([31], "s31")
+    daily_run(db, cfg, Sender(db, cfg, None, dry_run=True), today=nov2, force=True)
+    assert db.one("SELECT 1 FROM results WHERE month='2026-10'") and service.is_final(db, "2026-10")
+    assert db.one("SELECT 1 FROM plans WHERE month='2026-11'") and not month_due(db, cfg, nov2)
+
+
+def test_plan_frozen_on_third_and_trial_month_not_closed(env):  # noqa: F811
+    """Выгрузки за последний день так и нет — план фиксируется 3-го. Пробный месяц (до first_month) не
+    закрывается: итогов со ставкой за него нет (решение владельца 19.10.2026)."""
+    cfg, db = env
+    cfg.max.owners = [900]
+    cfg.first_month = "2026-11"
+    service.freeze(db, cfg, "2026-10")
+    write = write_sales(cfg.onec.inbox / "s.csv", [(date(2026, 10, 30), "Продавец04", 5600, 1)])
+    os.utime(write, (time.time() - 600,) * 2)
+    daily_run(db, cfg, Sender(db, cfg, None, dry_run=True), today=date(2026, 11, 3), force=True)
+    assert db.one("SELECT 1 FROM plans WHERE month='2026-11'")
+    assert not db.one("SELECT 1 FROM results WHERE month='2026-10'")
+    assert not db.one("SELECT 1 FROM message_log WHERE kind IN ('month_close_wait', 'month_result')")
+    assert not month_due(db, cfg, date(2026, 11, 3))
 
 
 def test_daily_done_and_no_duplicates_for_owner(env):  # noqa: F811
@@ -273,7 +297,9 @@ def test_empty_day_is_not_sent_to_sellers(env):  # noqa: F811
         c.execute("UPDATE sellers SET max_user_id=501 WHERE id=?", (sid,))
     service.freeze(db, cfg, "2026-10")
     daily_run(db, cfg, s, today=date(2026, 10, 18), force=True)
-    assert not [t for uid, t, _ in m.sent if uid == 501]
+    # утреннего «продаж нет» нет; «план на месяц» досылается подключённому — это не данные дня (аудит Р1)
+    assert [t.split(" (")[0] for uid, t, _ in m.sent if uid == 501] == ["Продавец04, ваш план на октябрь"]
+    assert not db.one("SELECT 1 FROM message_log WHERE kind IN ('daily', 'owner_daily')")  # Р6: и сводки нет
     assert db.get_kv("daily_done") is None  # догон повторит, когда выгрузка придёт
     assert "не отправлена" in db.one("SELECT text FROM message_log WHERE kind='missing_day'")["text"]
 
@@ -393,3 +419,98 @@ def test_db_is_safe_across_threads(env):  # noqa: F811
         t.join()
     assert not errors and db.one("SELECT COUNT(*) n FROM kv WHERE k LIKE 't%'")["n"] == 200
 
+
+
+# ----------------------------------------------------------------------------- Р1, Р2, Р3, Д2, Д3
+class FlakyMax(FakeMax):
+    """MAX, который отвечает ошибкой нужному получателю, пока broken."""
+    def __init__(self, broken: set[int]):
+        super().__init__()
+        self.broken = broken
+
+    def send(self, text, user_id=None, buttons=None, **kw):
+        if user_id in self.broken:
+            raise MaxError("502 Bad Gateway")
+        return super().send(text, user_id, buttons)
+
+
+def _link(db, names_uids):
+    with db.tx() as c:
+        for name, uid in names_uids:
+            c.execute("UPDATE sellers SET max_user_id=? WHERE id=?", (uid, db.seller_id(name, create=False)))
+
+
+def test_month_messages_resent_and_daily_done_only_when_all_sent(env):  # noqa: F811
+    cfg, db = env
+    _link(db, [("Продавец04", 501), ("Продавец05", 502)])
+    service.freeze(db, cfg, "2026-10")
+    f = write_sales(cfg.onec.inbox / "s.csv", [(date(2026, 10, 17), n, 5600, 1) for n in ("Продавец04", "Продавец05")])
+    os.utime(f, (time.time() - 600,) * 2)
+    m = FlakyMax({502})
+    s = Sender(db, cfg, m)
+    s.GAP = 0
+    daily_run(db, cfg, s, today=date(2026, 10, 18), force=True)
+    assert db.get_kv("daily_done") is None and db.get_kv("daily_sent") == "2026-10-17|1|2"
+    ok, text = health.daily_state(db, cfg, now=datetime(2026, 10, 18, 11, 0))
+    assert not ok and "ушло 1 из 2" in text
+    m.broken.clear()  # связь вернулась — догон дошлёт только тому, кому не ушло
+    daily_run(db, cfg, s, today=date(2026, 10, 18), force=True)
+    to502 = [t.split("\n")[0] for uid, t, _ in m.sent if uid == 502]
+    assert to502[0].startswith("Продавец05, ваш план на октябрь") and to502[1].startswith("Доброе утро")
+    first = [t for uid, t, _ in m.sent if uid == 501]
+    assert len(first) == len(set(first))  # 501 ничего не получил второй раз
+    assert db.get_kv("daily_done") == "2026-10-17"
+
+
+def test_error_in_one_seller_does_not_stop_others(env, monkeypatch):  # noqa: F811
+    from awer_sales_bot import messages
+    cfg, db = env
+    cfg.max.owners = [900]
+    _link(db, [("Продавец04", 501), ("Продавец05", 502)])
+    service.freeze(db, cfg, "2026-10")
+    f = write_sales(cfg.onec.inbox / "s.csv", [(date(2026, 10, 17), n, 5600, 1) for n in ("Продавец04", "Продавец05")])
+    os.utime(f, (time.time() - 600,) * 2)
+    bad = db.seller_id("Продавец04", create=False)
+    real = messages.daily
+
+    def daily(db_, cfg_, sid, day):
+        if sid == bad:
+            raise ZeroDivisionError("битые данные")
+        return real(db_, cfg_, sid, day)
+    monkeypatch.setattr(messages, "daily", daily)
+    m = FakeMax()
+    s = Sender(db, cfg, m)
+    s.GAP = 0
+    daily_run(db, cfg, s, today=date(2026, 10, 18), force=True)
+    assert any(uid == 502 and t.startswith("Доброе утро") for uid, t, _ in m.sent)
+    assert "Продавец04 — утреннее сообщение" in db.one("SELECT text FROM message_log WHERE kind='send_fail'")["text"]
+    assert db.get_kv("daily_done") == "2026-10-17"  # ошибка в данных — не повод повторять каждые 15 минут
+
+
+def test_role_on_freeze_day_and_preliminary_results(env):  # noqa: F811
+    """Повышение до старшего после фиксации не добавляет доплату за этот месяц (Д3); итоги по кнопке до конца
+    месяца — предварительные, бот их потом пересчитает (Д2)."""
+    cfg, db = env
+    service.freeze(db, cfg, "2026-10")
+    sid = db.seller_id("Продавец04", create=False)
+    with db.tx() as c:
+        c.execute("UPDATE sellers SET role='admin' WHERE id=?", (sid,))
+    rows = {r["seller_id"]: r for r in service.close_month(db, cfg, "2026-10")}
+    assert rows[sid]["role"] == "seller" and rows[sid]["rate"] < cfg.params.base_rate + cfg.params.admin_bonus
+    assert not service.is_final(db, "2026-10")
+    assert month_due(db, cfg, date(2026, 11, 1))  # предварительные итоги не отключают закрытие месяца
+
+
+def test_dry_run_does_not_touch_real_database(env, tmp_path, monkeypatch, capsys):  # noqa: F811
+    from awer_sales_bot import cli
+    cfg, db = env
+    service.freeze(db, cfg, "2026-10")
+    f = write_sales(cfg.onec.inbox / "s.csv", [(date(2026, 10, 31), "Продавец04", 5600, 1)])
+    os.utime(f, (time.time() - 600,) * 2)
+    conf = tmp_path / "config.yaml"
+    conf.write_text(f"db_path: {cfg.db_path.as_posix()}\nonec:\n  inbox: {cfg.onec.inbox.as_posix()}\n"
+                    f"  archive: {cfg.onec.archive.as_posix()}\n", encoding="utf-8")
+    cli.main(["-c", str(conf), "daily", "--dry-run", "--force", "--today", "2026-11-05"])
+    assert "копии базы" in capsys.readouterr().out
+    assert f.exists()  # файл 1С не забран
+    assert not db.one("SELECT 1 FROM plans WHERE month='2026-11'") and not db.one("SELECT 1 FROM message_log")

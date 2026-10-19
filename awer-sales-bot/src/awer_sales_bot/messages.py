@@ -53,7 +53,18 @@ def daily(db: DB, cfg: Settings, sid: int, day: date) -> str:
         L.append("**Вчера:** продаж нет (выходной?)")
     L += [f"🏅 {a.text}" for a in achievements.for_day(db, cfg, sid, day, st.plan_full)]
     L.append("")
-    if st.plan_month:
+    month = day.strftime("%Y-%m")
+    trial = cfg.trial(month)
+    if st.plan_month and day.day == days_in(month):  # последний день: итог месяца, а не «до базы» (аудит Д6)
+        L += [f"**{MONTHS[day.month].capitalize()} закончился**, рабочих дней {st.worked}:",
+              f"Продано {rub(st.sales)} — {pct(st.sales / st.plan_month)} плана месяца ({rub(st.plan_month)})"]
+        if trial:
+            L.append(f"{MONTHS[day.month].capitalize()} был пробным: ставка по новой схеме — с "
+                     f"{MONTHS_GEN[int(cfg.first_month[5:])]}.")
+        else:
+            L.append(f"Ставка по схеме: {rub(st.current_rate)} за полный месяц. Итоги месяца бот пришлёт, когда "
+                     "в 1С будут закрыты все дни.")
+    elif st.plan_month:
         L += [f"**Ваш план на {MONTHS[day.month]}**, рабочих дней {st.worked} из {st.planned_shifts}:",
               f"Продано {rub(st.sales)} — {pct(st.sales / st.plan_month)} плана месяца",
               f"Базовый план: {rub(st.plan_month)}"]
@@ -70,6 +81,9 @@ def daily(db: DB, cfg: Settings, sid: int, day: date) -> str:
         if st.pace_per_shift:
             L.append(f"Ваш темп: {rub(st.pace_per_shift)} за рабочий день → выполнение {pct(st.performance)}, "
                      f"ставка по итогам месяца при таком темпе {rub(st.projected_rate)}")
+        if trial:
+            L.append(f"_{MONTHS[day.month].capitalize()} — пробный месяц: ставка по новой схеме начисляется с "
+                     f"{MONTHS_GEN[int(cfg.first_month[5:])]}._")
     else:
         L.append("План на месяц ещё не рассчитан — уточните у администратора.")
     gl = goals.lines(db, sid, day)
@@ -142,6 +156,9 @@ def month_start(db: DB, cfg: Settings, sid: int, month: str) -> str:
         add = f" + {rub(p.admin_bonus)} админ." if admin else ""
         L.append(f"{lvl}% — {rub(amount * k)} → ставка {rub(rate)}{add}")
     L += ["", f"Каждые +{p.step:.0%} сверх плана = +{rub(p.step_bonus)} к ставке. Удачного месяца!"]
+    if cfg.trial(month):
+        L.append(f"_{MONTHS[int(month[5:])].capitalize()} — пробный месяц: план настоящий, а ставка по новой схеме "
+                 f"начисляется с {MONTHS_GEN[int(cfg.first_month[5:])]}._")
     return "\n".join(L)
 
 

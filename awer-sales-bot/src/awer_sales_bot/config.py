@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import os
 import re
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import yaml
 from pydantic import BaseModel, Field, PrivateAttr, field_validator
@@ -86,6 +88,7 @@ class Schedule(BaseModel):
     daily_send_time: str = "09:30"  # HH:MM, отправка за вчерашний день
     retry_minutes: int = 30  # повтор, если день ещё не закрыт (нет выгрузки)
     deadline_time: str = "13:00"  # после — предупреждение владельцу, отправка без пропавшего магазина
+    quiet_after: str = "21:00"  # догон не шлёт продавцам «Доброе утро» позже этого времени (аудит Р7)
 
 
 class MaxCfg(BaseModel):
@@ -153,6 +156,9 @@ class Settings(BaseModel):
     timezone: str = "Europe/Moscow"
     stores: list[str] = ["Город", "МСЛ"]  # день закрыт, когда есть выгрузка по всем
     norm_shifts: int = 18  # смен в полном месяце (решение владельца 18.10.2026); график — админка «График смен»
+    # первый расчётный месяц «ГГГГ-ММ» (решение владельца 19.10.2026: "2026-11"): итоги со ставкой за более ранние
+    # месяцы бот сам не подводит и не рассылает, план такого месяца — пробный; пусто — все месяцы расчётные
+    first_month: str = ""
     params: Params = Params()
     onec: OneC = OneC()
     schedule: Schedule = Schedule()
@@ -164,6 +170,17 @@ class Settings(BaseModel):
     training: Training = Training()
 
     _env_path: Path = PrivateAttr(default_factory=lambda: Path(".env"))
+
+    def now(self) -> datetime:
+        """Время магазинов (`timezone`) без пояса — часы Windows могут стоять в другом поясе (аудит Р5)."""
+        try:
+            return datetime.now(ZoneInfo(self.timezone)).replace(tzinfo=None)
+        except Exception:  # noqa: BLE001 — нет базы поясов (tzdata) — время системы
+            return datetime.now()
+
+    def trial(self, month: str) -> bool:
+        """Месяц до первого расчётного: план есть, итогов со ставкой нет."""
+        return bool(self.first_month) and month < self.first_month
 
     @property
     def env_path(self) -> Path:

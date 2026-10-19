@@ -51,13 +51,18 @@ def bot_state(db: DB, bot: str, now: datetime | None = None) -> tuple[bool, str]
 
 
 def daily_state(db: DB, cfg: Settings, now: datetime | None = None) -> tuple[bool, str]:
-    now = now or datetime.now()
+    now = now or cfg.now()
     yesterday, hm = now.date() - timedelta(days=1), now.strftime("%H:%M")
     done = db.get_kv("daily_done")
     last = f" (последняя — за {date.fromisoformat(done):%d.%m})" if done else ""
+    d, _, nums = (db.get_kv("daily_sent") or "").partition("|")
+    sent, _, total = nums.partition("|")
+    count = f": ушло {sent} из {total}" if d == yesterday.isoformat() and total else ""
     if done == yesterday.isoformat():
-        sent = db.one("SELECT MAX(sent_at) t FROM message_log WHERE kind='daily' AND status='ok'")
-        return True, f"утренняя рассылка за {yesterday:%d.%m} прошла" + (f" в {_t(sent['t'])}" if sent["t"] else "")
+        at = db.one("SELECT MAX(sent_at) t FROM message_log WHERE kind='daily' AND status='ok'")
+        return True, f"утренняя рассылка за {yesterday:%d.%m} прошла" + (f" в {_t(at['t'])}" if at["t"] else "") + count
+    if count:  # аудит Р2: часть не ушла (сбой связи) — догон дошлёт, но владелец видит, что не всё
+        return False, f"утренняя рассылка за {yesterday:%d.%m}{count}, бот досылает остальным"
     if hm < cfg.schedule.daily_send_time:
         return True, f"утренняя рассылка — в {cfg.schedule.daily_send_time}{last}"
     if hm < cfg.schedule.deadline_time:

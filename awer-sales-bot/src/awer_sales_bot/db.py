@@ -156,6 +156,11 @@ CREATE TABLE IF NOT EXISTS results (            -- итоги месяца (дл
     closed_at TEXT,
     PRIMARY KEY (month, seller_id)
 );
+CREATE TABLE IF NOT EXISTS month_close (        -- итоги месяца: окончательные (все дни × магазины выгружены) или нет
+    month TEXT PRIMARY KEY,
+    final INTEGER NOT NULL DEFAULT 0,
+    closed_at TEXT
+);
 CREATE TABLE IF NOT EXISTS message_log (
     id INTEGER PRIMARY KEY,
     sent_at TEXT, day TEXT, kind TEXT, seller_id INTEGER, max_user_id INTEGER,
@@ -269,13 +274,20 @@ class DB:
                            ("training_user_id", "INTEGER"),  # user_id в боте «Обучение»
                            ("training_code", "TEXT"),  # код подключения к боту «Обучение»
                            ("max_name", "TEXT")],  # имя из профиля MAX при подключении — сверить, тот ли человек
-               "schedule": [("store", "TEXT")]}
+               "schedule": [("store", "TEXT")],
+               "plans": [("role", "TEXT")]}  # роль на день фиксации: повышение потом не меняет прошлый месяц (Д3)
         for table, cols in new.items():
             have = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
             for col, typ in cols:
                 if col not in have:
                     self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
         self.conn.commit()
+
+    def copy_to(self, path: Path) -> "DB":
+        """Копия базы (sqlite backup — согласованная и при работающей службе) — для проверки без записи."""
+        with self._lock, sqlite3.connect(path) as dst:
+            self.conn.backup(dst)
+        return DB(path)
 
     @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:
@@ -630,6 +642,19 @@ class DB:
     def covered_days(self, month: str) -> int:
         """Дней месяца с выгрузкой 1С или отметкой «закрыто» — доля месяца в данных."""
         return self.one("SELECT COUNT(DISTINCT day) n FROM imported_days WHERE substr(day,1,7)=?", month)["n"]
+
+    def month_missing(self, month: str, stores: list[str], upto: date | None = None) -> list[tuple[str, str]]:
+        """[(день, магазин)] месяца (до `upto` включительно), по которым нет ни выгрузки, ни отметки «закрыто» (Д5)."""
+        y, m = map(int, month.split("-"))
+        last = date(y, m, calendar.monthrange(y, m)[1])
+        last = min(last, upto) if upto else last
+        have = {(r["day"], r["store"]) for r in self.q("SELECT day, store FROM imported_days WHERE substr(day,1,7)=?",
+                                                       month)}
+        out, d = [], date(y, m, 1)
+        while d <= last:
+            out += [(d.isoformat(), st) for st in stores if (d.isoformat(), st) not in have]
+            d += timedelta(days=1)
+        return out
 
     def day_closed(self, day: date, stores: list[str]) -> list[str]:
         """Список магазинов, по которым ещё нет выгрузки за день (пусто = день закрыт)."""

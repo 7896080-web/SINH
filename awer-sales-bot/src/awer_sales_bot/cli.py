@@ -4,7 +4,9 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import tempfile
 from datetime import date, datetime
+from pathlib import Path
 
 from . import config as config_mod
 from .db import DB
@@ -124,11 +126,18 @@ def main(argv: list[str] | None = None) -> None:
         from .jobs import Sender, daily_run
         from .max_api import MaxClient
         client = None if a.dry_run else MaxClient(cfg.max_token, cfg.max.base_url, cfg.max.ca_file)
-        today = date.fromisoformat(a.today) if a.today else date.today()
-        print(daily_run(db, cfg, Sender(db, cfg, client, dry_run=a.dry_run), today, force=a.force))
+        today = date.fromisoformat(a.today) if a.today else cfg.now().date()
+        if a.dry_run:  # аудит Р1: проверка не подводит итоги, не фиксирует план и не забирает файлы 1С в настоящей базе
+            db = db.copy_to(Path(tempfile.mkdtemp(prefix="awer-dry-")) / "dry.db")
+            print("Проверка на копии базы: в настоящую базу ничего не пишется, файлы 1С из inbox не загружаются.\n")
+        print(daily_run(db, cfg, Sender(db, cfg, client, dry_run=a.dry_run), today, force=a.force,
+                        import_files=not a.dry_run))
     elif a.cmd == "close-month":
         from .planning import service
-        for r in service.close_month(db, cfg, a.month):
+        rows = service.close_month(db, cfg, a.month)
+        print(f"Итоги {a.month} " + ("окончательные" if service.is_final(db, a.month) else
+                                     "ПРЕДВАРИТЕЛЬНЫЕ: выгружены не все дни месяца"))
+        for r in rows:
             perf = "—" if r["performance"] is None else f"{r['performance']:.0%}"
             print(f"  {r['name']:<28} {r['sales']:>12,.0f}  {perf:>5}  ставка {r['rate']:,.0f}")
     elif a.cmd == "backtest":
@@ -168,7 +177,6 @@ def main(argv: list[str] | None = None) -> None:
             logging.warning("MAX_BOT_TOKEN не задан — запущена только админка")
         uvicorn.run(create_app(cfg, db, runner=runner), host=a.host, port=a.port)
     elif a.cmd == "backup":
-        from pathlib import Path
 
         from .ops import backup
         try:
@@ -184,7 +192,6 @@ def main(argv: list[str] | None = None) -> None:
         if msg.startswith("ОШИБКА"):
             raise SystemExit(1)
     elif a.cmd == "doctor":
-        from pathlib import Path
 
         from .ops import doctor
         for good, line in doctor(db, cfg, Path(a.backups)):

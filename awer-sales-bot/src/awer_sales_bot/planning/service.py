@@ -67,11 +67,12 @@ def apply_override(db: DB, cfg: Settings, month: str, sid: int) -> bool:
     man = db.one("SELECT plan_manual FROM plan_overrides WHERE month=? AND seller_id=?", month, sid)
     calc = seller_plan(h, month, str(sid), sp, p, man["plan_manual"] if man else None)
     with db.tx() as c:
-        c.execute("INSERT INTO plans(month,seller_id,plan_full,method,level,trend,store_plan,coef,frozen_at) "
-                  "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(month,seller_id) DO UPDATE SET plan_full=excluded.plan_full, "
+        c.execute("INSERT INTO plans(month,seller_id,plan_full,method,level,trend,store_plan,coef,frozen_at,role) "
+                  "VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(month,seller_id) DO UPDATE SET plan_full=excluded.plan_full, "
                   "method=excluded.method, level=excluded.level, frozen_at=excluded.frozen_at",
                   (month, sid, calc.plan_full, calc.method, calc.level, sp.trend, sp.plan, sp.coef,
-                   datetime.now().isoformat(timespec="seconds")))
+                   datetime.now().isoformat(timespec="seconds"), db.seller(sid)["role"]))
+    refresh_results(db, cfg, month)  # месяц уже закрыт — итоги по новому плану (аудит Д3)
     return True
 
 
@@ -133,11 +134,12 @@ def freeze(db: DB, cfg: Settings, month: str) -> MonthPlan:
     with db.tx() as c:
         c.execute("DELETE FROM plans WHERE month=?", (month,))
         for r in mp.rows:
-            c.execute("INSERT INTO plans(month,seller_id,plan_full,method,level,trend,store_plan,coef,frozen_at) "
-                      "VALUES(?,?,?,?,?,?,?,?,?)",
+            c.execute("INSERT INTO plans(month,seller_id,plan_full,method,level,trend,store_plan,coef,frozen_at,role) "
+                      "VALUES(?,?,?,?,?,?,?,?,?,?)",
                       (month, r.seller_id, r.plan_final, r.method, r.level, mp.store.trend, mp.store.plan,
-                       mp.store.coef, now))
+                       mp.store.coef, now, r.role))
     mp.frozen_at = now
+    refresh_results(db, cfg, month)
     return mp
 
 
@@ -146,7 +148,7 @@ def ensure_plans(db: DB, cfg: Settings, month: str) -> list[dict]:
     (обычно новичка) одной строкой, не трогая остальных. Возвращает добавленные строки."""
     if not db.one("SELECT 1 FROM plans WHERE month=?", month):
         return []
-    missing = db.q("SELECT DISTINCT s.id, s.name FROM sales_lines l JOIN sellers s ON s.id=l.seller_id "
+    missing = db.q("SELECT DISTINCT s.id, s.name, s.role FROM sales_lines l JOIN sellers s ON s.id=l.seller_id "
                    "WHERE substr(l.day,1,7)=? AND s.active=1 AND s.role<>'system' "
                    "AND s.id NOT IN (SELECT seller_id FROM plans WHERE month=?)", month, month)
     if not missing:
@@ -160,9 +162,10 @@ def ensure_plans(db: DB, cfg: Settings, month: str) -> list[dict]:
     with db.tx() as c:
         for r in missing:
             calc = seller_plan(h, month, str(r["id"]), sp, p, manual.get(r["id"]))
-            c.execute("INSERT INTO plans(month,seller_id,plan_full,method,level,trend,store_plan,coef,frozen_at) "
-                      "VALUES(?,?,?,?,?,?,?,?,?)",
-                      (month, r["id"], calc.plan_full, calc.method, calc.level, sp.trend, sp.plan, sp.coef, now))
+            c.execute("INSERT INTO plans(month,seller_id,plan_full,method,level,trend,store_plan,coef,frozen_at,role) "
+                      "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                      (month, r["id"], calc.plan_full, calc.method, calc.level, sp.trend, sp.plan, sp.coef, now,
+                       r["role"]))
             out.append(dict(seller_id=r["id"], name=r["name"], plan=calc.plan_full, method=calc.method))
     return out
 
@@ -206,8 +209,10 @@ def status(db: DB, cfg: Settings, sid: int, day: date) -> Status:
         plan = row.plan_final if row else None
     worked = db.worked_shifts(sid, month, upto=day)
     ahead = db.scheduled_after(sid, month, day)
-    # отработанные + смены по графику впереди: к концу месяца «% плана месяца» = выполнению для ставки
-    planned = worked + ahead if ahead is not None else max(cfg.norm_shifts, worked)
+    # отработанные + дни по графику впереди: к концу месяца «% плана месяца» = выполнению для ставки.
+    # Без графика — норма, но не больше, чем позволяют оставшиеся дни календаря (аудит Д6)
+    left = days_in(month) - day.day
+    planned = worked + ahead if ahead is not None else max(worked, min(cfg.norm_shifts, worked + left))
     sales = db.one("SELECT COALESCE(SUM(amount),0) s FROM sales_lines WHERE seller_id=? AND substr(day,1,7)=? AND day<=?",
                    sid, month, day.isoformat())["s"]
     remaining = max(0, planned - worked)
@@ -236,7 +241,13 @@ def status(db: DB, cfg: Settings, sid: int, day: date) -> Status:
 
 
 # ----------------------------------------------------------------------------- month close
-def close_month(db: DB, cfg: Settings, month: str) -> list[dict]:
+def close_month(db: DB, cfg: Settings, month: str, final: bool | None = None) -> list[dict]:
+    """Итоги месяца → results. final — данные полные (все дни × магазины выгружены или отмечены «закрыто»);
+    None — определить самому. Предварительные итоги бот пересчитает сам, когда данные станут полными (аудит Д2).
+    Роль — на день фиксации плана (повышение 1-го числа не добавляет доплату за прошлый месяц, Д3). Строки месяца,
+    которых нет в новом наборе (объединённый дубль, служебная запись), удаляются."""
+    if final is None:
+        final = not db.month_missing(month, cfg.stores)
     p = month_params(db, cfg, month)
     h = db.history(cfg.norm_shifts, until_month=month)
     prev = {r["seller_id"]: r["steps"] for r in db.q("SELECT seller_id, steps FROM results WHERE month=?",
@@ -244,8 +255,8 @@ def close_month(db: DB, cfg: Settings, month: str) -> list[dict]:
     out = []
     now = datetime.now().isoformat(timespec="seconds")
     with db.tx() as c:
-        # все из плана + все, у кого есть продажи (SPEC п. 10): без плана — базовая ставка, но в ведомости
-        for r in db.q("SELECT s.id seller_id, p.plan_full, s.role, s.name FROM sellers s "
+        # все из плана + все, у кого есть продажи или график (SPEC п. 10): без плана — базовая ставка, но в ведомости
+        for r in db.q("SELECT s.id seller_id, p.plan_full, COALESCE(p.role, s.role) role, s.name FROM sellers s "
                       "LEFT JOIN plans p ON p.seller_id=s.id AND p.month=? "
                       "WHERE s.role<>'system' AND (p.seller_id IS NOT NULL OR s.id IN "
                       "(SELECT seller_id FROM sales_lines WHERE substr(day,1,7)=?) OR s.id IN "
@@ -261,7 +272,40 @@ def close_month(db: DB, cfg: Settings, month: str) -> list[dict]:
             out.append(dict(seller_id=r["seller_id"], name=r["name"], role=r["role"], sales=sales, fte=fte,
                             plan=r["plan_full"], performance=res.performance, steps=res.steps, rate=res.rate,
                             percent_pay=sales * p.sales_percent))
+        keep = [r["seller_id"] for r in out]
+        c.execute(f"DELETE FROM results WHERE month=? AND seller_id NOT IN ({','.join('?' * len(keep)) or 'NULL'})",
+                  (month, *keep))
+        c.execute("INSERT INTO month_close(month, final, closed_at) VALUES(?,?,?) ON CONFLICT(month) DO UPDATE SET "
+                  "final=excluded.final, closed_at=excluded.closed_at", (month, int(final), now))
     return out
+
+
+def is_final(db: DB, month: str) -> bool:
+    r = db.one("SELECT final FROM month_close WHERE month=?", month)
+    return bool(r and r["final"])
+
+
+def month_results(db: DB, cfg: Settings, month: str) -> list[dict]:
+    """Сохранённые итоги месяца в том же виде, что возвращает close_month (для сообщений и ведомости)."""
+    p = month_params(db, cfg, month)
+    return [dict(seller_id=r["seller_id"], name=r["name"], role=r["role"], sales=r["sales"], fte=r["fte"],
+                 plan=r["plan_full"], performance=r["performance"], steps=r["steps"], rate=r["rate"],
+                 percent_pay=r["sales"] * p.sales_percent)
+            for r in db.q("SELECT r.*, s.name, COALESCE(p.role, s.role) role, p.plan_full FROM results r "
+                          "JOIN sellers s ON s.id=r.seller_id LEFT JOIN plans p ON p.month=r.month AND "
+                          "p.seller_id=r.seller_id WHERE r.month=?", month)]
+
+
+def refresh_results(db: DB, cfg: Settings, month: str | None = None) -> list[str]:
+    """Пересчитать уже подведённые итоги после правки (ручной план, фиксация, объединение продавцов, ответ о дне
+    вне графика) — аудит Д3. month=None — все месяцы с итогами. Возвращает пересчитанные месяцы."""
+    months = [month] if month else [r["month"] for r in db.q("SELECT DISTINCT month FROM results ORDER BY month")]
+    done = []
+    for m in months:
+        if db.one("SELECT 1 FROM results WHERE month=?", m):
+            close_month(db, cfg, m, final=is_final(db, m) or not db.month_missing(m, cfg.stores))
+            done.append(m)
+    return done
 
 
 def days_in(month: str) -> int:
