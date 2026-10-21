@@ -432,17 +432,19 @@ def own_limit(rule, pay):
     return bool(lim) and (pay != "cpc" or lim < WB_MIN_CPC_LIMIT)
 
 
-def hold_edit(cid, name, on):
+def hold_edit(cid, name, on, who="на странице «Бюджеты»"):
     """Стоп-лист wb_hold.txt: выключить — дописать номер с пометкой, включить — убрать строку. Прежний файл — в копию."""
     try:
         text = B.HOLD_FILE.read_text(encoding="utf-8-sig")
     except OSError:
         text = "# Стоп-лист: номера кампаний WB (по одному в строке), которые скрипты не запускают и не пополняют.\n"
     BACKUPS.mkdir(exist_ok=True)
-    (BACKUPS / f"hold_{dt.datetime.now():%Y%m%d_%H%M%S}.txt").write_text(text, encoding="utf-8")
+    bk = BACKUPS / f"hold_{dt.datetime.now():%Y%m%d_%H%M%S}.txt"
+    if not bk.exists():                  # несколько правок за одну секунду — в копии самый ранний вид файла
+        bk.write_text(text, encoding="utf-8")
     lines = [ln for ln in text.splitlines() if ln.split("#")[0].strip() != str(cid)]
     if not on:
-        lines.append(f"{cid}   # «{name}» — выключена на странице «Бюджеты» {dt.datetime.now():%d.%m.%Y %H:%M}")
+        lines.append(f"{cid}   # «{name}» — выключена {who} {dt.datetime.now():%d.%m.%Y %H:%M}")
     tmp = B.HOLD_FILE.with_suffix(".tmp")
     tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
     os.replace(tmp, B.HOLD_FILE)
@@ -462,43 +464,50 @@ def toggle(cab, cid, on):
     rules = rules_now()
     if not managed(rules, cab, cid, camps, B.load_state())[0]:
         return False, f"кампания {cid} не под управлением автопилота — включайте и выключайте её в кабинете WB"
-    st = a.get("settings") or {}
-    name = st.get("name") or str(cid)
     if not B.lock_acquire("wb_web.py (вкл/выкл)", wait_min=2):
         return False, "сейчас работает автопилот или проверка — попробуйте через пару минут"
     try:
-        state = B.load_state()           # под блокировкой — свежее состояние
-        if not on:
-            hold_edit(cid, name, on=False)
-            for k in ("limit_paused", "pace_paused", "start_pending"):
-                (state.get(k) or {}).pop(str(cid), None)
-            B.save_state(state)
-            if a.get("_status") != 9:
-                return True, f"«{name}» выключена: уже стояла на паузе, теперь в стоп-листе — скрипты её не запустят и не пополнят."
-            B.pace(token, "start", 1.1)
-            try:
-                B.call("GET", B.ADV + "/adv/v0/pause", token, params={"id": cid}, what="Пауза кампании")
-            except B.ApiError as e:
-                return False, (f"«{name}» в стоп-листе, но пауза не встала: {e}. Поставьте её на паузу в кабинете WB — "
-                               "скрипты её больше не запустят и не пополнят.")
-            return True, f"«{name}» выключена: на паузе и в стоп-листе — скрипты её не запустят и не пополнят."
-        hold_edit(cid, name, on=True)
-        if a.get("_status") == 9:
-            return True, f"«{name}» включена (она и так работала)."
-        if own_limit(rule_of(rules, cab, cid, camps), st.get("payment_type")):
-            state.setdefault("pace_paused", {})[str(cid)] = {
-                "date": (dt.date.today() - dt.timedelta(days=1)).isoformat(), "at": "включена на странице «Бюджеты»",
-                "spent": None, "limit": None}
-            B.save_state(state)
-            return True, (f"«{name}» включена: её запустит частая проверка лимита в ближайшие 5 минут, по графику расхода "
-                          "(если сегодня лимит уже потрачен — завтра утром; ночью — после 7:00).")
-        n = len(B.out)
-        if B.start_campaign(token, {"advert_id": cid, "name": name, "amount": 0}, state):
-            return True, f"«{name}» включена и запущена."
-        why = " ".join(x.strip() for x in B.out[n:]) or "WB не запустил кампанию"
-        return False, f"«{name}» убрана из стоп-листа, но не запустилась: {why}"
+        return switch(token, camps, rules, cab, cid, on)
     finally:
         B.lock_release()
+
+
+def switch(token, camps, rules, cab, cid, on, who="на странице «Бюджеты»"):
+    """Вкл/выкл кампании под уже взятой блокировкой (переключатель страницы и wb_decide.py) — как описано в toggle.
+    who — кто выключил/включил: пометка в стоп-листе и в состоянии автопилота."""
+    a = camps[cid]
+    st = a.get("settings") or {}
+    name = st.get("name") or str(cid)
+    state = B.load_state()           # под блокировкой — свежее состояние
+    if not on:
+        hold_edit(cid, name, on=False, who=who)
+        for k in ("limit_paused", "pace_paused", "start_pending"):
+            (state.get(k) or {}).pop(str(cid), None)
+        B.save_state(state)
+        if a.get("_status") != 9:
+            return True, f"«{name}» выключена: уже стояла на паузе, теперь в стоп-листе — скрипты её не запустят и не пополнят."
+        B.pace(token, "start", 1.1)
+        try:
+            B.call("GET", B.ADV + "/adv/v0/pause", token, params={"id": cid}, what="Пауза кампании")
+        except B.ApiError as e:
+            return False, (f"«{name}» в стоп-листе, но пауза не встала: {e}. Поставьте её на паузу в кабинете WB — "
+                           "скрипты её больше не запустят и не пополнят.")
+        return True, f"«{name}» выключена: на паузе и в стоп-листе — скрипты её не запустят и не пополнят."
+    hold_edit(cid, name, on=True, who=who)
+    if a.get("_status") == 9:
+        return True, f"«{name}» включена (она и так работала)."
+    if own_limit(rule_of(rules, cab, cid, camps), st.get("payment_type")):
+        state.setdefault("pace_paused", {})[str(cid)] = {
+            "date": (dt.date.today() - dt.timedelta(days=1)).isoformat(), "at": f"включена {who}",
+            "spent": None, "limit": None}
+        B.save_state(state)
+        return True, (f"«{name}» включена: её запустит частая проверка лимита в ближайшие 5 минут, по графику расхода "
+                      "(если сегодня лимит уже потрачен — завтра утром; ночью — после 7:00).")
+    n = len(B.out)
+    if B.start_campaign(token, {"advert_id": cid, "name": name, "amount": 0}, state):
+        return True, f"«{name}» включена и запущена."
+    why = " ".join(x.strip() for x in B.out[n:]) or "WB не запустил кампанию"
+    return False, f"«{name}» убрана из стоп-листа, но не запустилась: {why}"
 
 
 def write_log(lines):

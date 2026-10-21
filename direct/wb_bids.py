@@ -576,7 +576,8 @@ def trimmed_items(state, cab):
     for i in (state.get("trimmed") or {}).values():
         if i.get("cabinet") == cab:
             res[(i["advert_id"], i["nm_id"])] = i
-    return res
+    gone = state.get("no_return") or {}      # убраны из рекламы насовсем (wb_decide.py) — не возвращать при любом остатке
+    return {k: v for k, v in res.items() if pk(*k) not in gone}
 
 
 def load_buyout(cab, token, nm_ids, vendor):
