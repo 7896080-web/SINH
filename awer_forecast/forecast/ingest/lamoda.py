@@ -22,7 +22,7 @@ from forecast.integrations.lamoda.statuses import (
     KNOWN_ITEM_STATUSES, KNOWN_SHIPMENT_STATUSES, RETURN_STATUSES, SALE_STATUSES,
     SHIPMENT_ARRIVED_STATUSES, SHIPMENT_FINAL_STATUSES, normalize_status,
 )
-from forecast.timeutil import msk_date
+from forecast.timeutil import msk_date, to_naive_utc
 
 logger = logging.getLogger(__name__)
 MAX_LISTED = 200
@@ -111,11 +111,12 @@ def ingest_fbo_shipments(conn: Connection, client: LamodaClient, resolver: SkuRe
         rows = [{
             "shipment_id": shipment_id, "product_size_id": psid, "qty": planned_qty, "qty_accepted": accepted,
             "created_date": msk_date(created) if created else today,
+            "created_at": to_naive_utc(created) if created else None,
             "expected_arrival_date": date.fromisoformat(planned[:10]) if planned else None,
             "status": status, "warehouse_code": shipment.get("warehouseCode"),
         } for psid, (planned_qty, accepted) in per_size.items()]
         upsert(conn, t_fbo_shipments, rows, keys=["shipment_id", "product_size_id"],
-               update=["qty", "qty_accepted", "expected_arrival_date", "status", "warehouse_code"])
+               update=["qty", "qty_accepted", "expected_arrival_date", "status", "warehouse_code", "created_at"])
     return report
 
 

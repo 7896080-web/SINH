@@ -153,6 +153,7 @@ def test_fbo_shipments_in_transit_and_arrival(engine):
         rows = {r.product_size_id: r for r in conn.execute(select(t_fbo_shipments))}
     assert report["in_transit"] == 1 and rows[m].qty == 5 and rows[l_].qty == 2   # второй — по EAN из пула
     assert rows[m].expected_arrival_date == date(2026, 10, 25) and rows[m].created_date == date(2026, 10, 18)
+    assert rows[m].created_at == datetime(2026, 10, 18, 9, 0)          # точный момент создания, UTC
     fake.shipments[0]["status"] = "RECEIVED"
     with engine.begin() as conn:
         report = ingest_fbo_shipments(conn, client, SkuResolver.load(conn), date(2026, 10, 26))
@@ -208,6 +209,9 @@ def test_stock_1c_snapshot_sums_sizes_and_zero_fills(engine, tmp_path):
         snapshot = conn.execute(select(t_stock_1c.c.snapshot_date).distinct()).scalar()
     assert rows == {m: 5, l_: -2, x: 0}
     assert snapshot == date(2026, 10, 21) and report["unmatched"] == 1 and report["negative"] == 1
+    with engine.connect() as conn:
+        taken = conn.execute(select(t_stock_1c.c.taken_at).distinct()).scalar()
+    assert taken == datetime(2026, 10, 21, 4, 30)          # имя файла 07:30 по Москве → UTC
 
 
 def test_sales_file_parsing_and_period_replace(engine, tmp_path):

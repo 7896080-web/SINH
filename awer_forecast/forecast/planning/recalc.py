@@ -26,7 +26,7 @@ from forecast.db.schema import (
     t_shipment_recommendations, t_stock_1c, t_stock_fbo, t_suppliers,
 )
 from forecast.ingest.lamoda import rebuild_sales_daily, remap_unmapped_order_items
-from forecast.integrations.lamoda.statuses import KNOWN_SHIPMENT_STATUSES, SHIPMENT_FINAL_STATUSES
+from forecast.integrations.lamoda.statuses import SHIPMENT_FINAL_STATUSES
 from forecast.planning import smoothing
 from forecast.planning.policy import Policy, order_up_to
 from forecast.planning.series import DemandSeries, channel_series, lamoda_series, store_lamoda_timeseries
@@ -106,28 +106,42 @@ def latest_snapshot(conn: Connection, table, as_of: date) -> tuple[dict[int, int
     return {psid: int(qty or 0) for psid, qty in rows}, last
 
 
-def fbo_in_transit(conn: Connection, as_of: date,
-                   on_cs_statuses: frozenset[str]) -> tuple[dict[int, int], dict[int, int]]:
+def still_in_cs_snapshot(created_at: datetime | None, created_date: date | None,
+                         snapshot_date: date | None, taken_at: datetime | None) -> bool:
+    """Сидит ли товар поставки ещё в срезе остатка ЦС.
+
+    Отгрузку на FBO в 1С списывают с ЦС в момент создания поставки в Lamoda (ответ владельца,
+    21.10.2026). Значит, поставка, созданная ДО выгрузки среза, в нём уже вычтена, а созданная
+    ПОСЛЕ — ещё нет: её товар виден и в поставке, и в остатке ЦС. Без точного времени (строки
+    до миграции 0003, срез без метки) — по дате: созданную в день среза или позже считаем ещё
+    в остатке; ошибка тогда в безопасную сторону — не предложить отгрузить лишнего."""
+    if snapshot_date is None:
+        return False
+    if created_at is not None and taken_at is not None:
+        return created_at > taken_at
+    return created_date is not None and created_date >= snapshot_date
+
+
+def fbo_in_transit(conn: Connection, as_of: date, cs_snapshot_date: date | None,
+                   cs_taken_at: datetime | None) -> tuple[dict[int, int], dict[int, int]]:
     """«В пути на FBO»: незавершённые поставки, план минус уже принятое Lamoda.
 
-    Второй словарь — часть «в пути», которая ещё числится в остатке ЦС из 1С: отгрузку
-    списывают в 1С после создания поставки в Lamoda, поэтому пока поставка не доехала до
-    склада Lamoda, её товар виден и в поставке, и на ЦС. Незнакомый статус считаем
-    «ещё на ЦС» — так не предложим отгрузить товар, который уже обещан Lamoda."""
+    Второй словарь — часть «в пути», которая ещё сидит в используемом срезе остатка ЦС
+    (поставку создали после выгрузки остатка, см. still_in_cs_snapshot)."""
     out: dict[int, int] = defaultdict(int)
-    on_cs: dict[int, int] = defaultdict(int)
+    in_cs: dict[int, int] = defaultdict(int)
     rows = conn.execute(select(t_fbo_shipments.c.product_size_id, t_fbo_shipments.c.qty,
-                               t_fbo_shipments.c.qty_accepted, t_fbo_shipments.c.status)
+                               t_fbo_shipments.c.qty_accepted, t_fbo_shipments.c.status,
+                               t_fbo_shipments.c.created_date, t_fbo_shipments.c.created_at)
                         .where(t_fbo_shipments.c.created_date >= as_of - timedelta(days=IN_TRANSIT_MAX_AGE_DAYS)))
-    for psid, qty, accepted, status in rows:
-        status = (status or "").upper()
-        if status in SHIPMENT_FINAL_STATUSES:
+    for psid, qty, accepted, status, created_date, created_at in rows:
+        if (status or "").upper() in SHIPMENT_FINAL_STATUSES:
             continue
         remaining = max(0, int(qty or 0) - int(accepted or 0))
         out[psid] += remaining
-        if status in on_cs_statuses or status not in KNOWN_SHIPMENT_STATUSES:
-            on_cs[psid] += remaining
-    return dict(out), dict(on_cs)
+        if still_in_cs_snapshot(created_at, created_date, cs_snapshot_date, cs_taken_at):
+            in_cs[psid] += remaining
+    return dict(out), dict(in_cs)
 
 
 def assembled_not_in_lamoda(conn: Connection, as_of: date) -> dict[int, int]:
@@ -235,7 +249,10 @@ def recalc(conn: Connection, settings: PlanningSettings, as_of: date, batch_id: 
     catalog = load_catalog(conn)
     stock_cs, stock_cs_date = latest_snapshot(conn, t_stock_1c, as_of)
     stock_fbo, stock_fbo_date = latest_snapshot(conn, t_stock_fbo, as_of)
-    in_transit, transit_on_cs = fbo_in_transit(conn, as_of, settings.fbo_statuses_on_cs)
+    cs_taken_at = (conn.execute(select(func.max(t_stock_1c.c.taken_at))
+                                .where(t_stock_1c.c.snapshot_date == stock_cs_date)).scalar()
+                   if stock_cs_date else None)
+    in_transit, transit_on_cs = fbo_in_transit(conn, as_of, stock_cs_date, cs_taken_at)
     assembled = assembled_not_in_lamoda(conn, as_of)
     on_order = purchase_on_order(conn, as_of, settings.purchase_on_order_grace_days)
     lead_fbo, lead_fbo_note = fbo_lead_days(conn, settings.fbo_lead_days_default, computed_at)
@@ -318,7 +335,7 @@ def _shipment_batch(conn, settings, catalog, forecasts, stock_cs, stock_fbo, in_
         prior = confirmed.get(psid)
         if cs <= 0 and prior is None:
             continue
-        # уже обещано Lamoda, но ещё в остатке ЦС: собрано у нас + поставки Lamoda, не списанные в 1С
+        # уже обещано Lamoda, но ещё в остатке ЦС: собрано у нас + поставки, созданные после выгрузки остатка
         committed = packed + transit_on_cs.get(psid, 0)
         available = max(0, cs - settings.cs_reserve_qty - committed)
         qty = min(policy.need, available)
@@ -336,7 +353,7 @@ def _shipment_batch(conn, settings, catalog, forecasts, stock_cs, stock_fbo, in_
         elif policy.need > available:
             notes.append(f"На ЦС {cs}" + (f", резерв ЦС {settings.cs_reserve_qty}" if settings.cs_reserve_qty else "")
                          + (f", уже собрано в поставку {packed}" if packed else "")
-                         + (f", в поставках Lamoda, ещё не списанных в 1С, {transit_on_cs[psid]}"
+                         + (f", в поставках Lamoda, созданных после выгрузки остатка 1С, {transit_on_cs[psid]}"
                             if transit_on_cs.get(psid) else "")
                          + f" → к отгрузке {qty}.")
         row = {"product_size_id": psid, "stock_1c_qty_snapshot": cs, "stock_fbo_qty_snapshot": on_fbo,
@@ -381,7 +398,7 @@ def _purchase_batch(conn, settings, catalog, forecasts, stock_cs, stock_fbo, in_
             supplier_note = f"{supplier_lead} (поставщик не указан — срок по умолчанию)"
         lead_days = supplier_lead + settings.review_interval_days
         cs, fbo, ordered = max(stock_cs.get(psid, 0), 0), max(stock_fbo.get(psid, 0), 0), on_order.get(psid, 0)
-        # товар поставки, ещё не списанный в 1С, уже сидит в остатке ЦС — второй раз «в пути» не считаем
+        # поставка создана после выгрузки остатка 1С: её товар ещё в этом остатке — второй раз «в пути» не считаем
         still_on_cs = min(transit_on_cs.get(psid, 0), in_transit.get(psid, 0))
         transit = in_transit.get(psid, 0) - still_on_cs
         policy = order_up_to(d, sigma, lead_days, z, cs + fbo + transit + ordered)
@@ -393,8 +410,8 @@ def _purchase_batch(conn, settings, catalog, forecasts, stock_cs, stock_fbo, in_
                  describe_policy(policy, f"{supplier_note} + {settings.review_interval_days} (пересмотр)") + ".",
                  f"Есть {fmt(policy.position, 0)} (ЦС {cs} + FBO {fbo} + в пути на FBO {transit}"
                  + (f" + заказано {ordered}" if ordered else "") + f") → к закупке {policy.need}."
-                 + (f" Ещё {still_on_cs} шт. в поставках Lamoda не списаны с ЦС в 1С — учтены в остатке ЦС."
-                    if still_on_cs else "")]
+                 + (f" Ещё {still_on_cs} шт. — в поставках Lamoda, созданных после выгрузки остатка 1С: "
+                    f"они пока в остатке ЦС, второй раз не считаем." if still_on_cs else "")]
         status = "pending"
         if not info.available_to_reorder:
             status = "no_reorder"

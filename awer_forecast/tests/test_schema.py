@@ -15,11 +15,12 @@ from conftest import alembic_config
 
 SCHEMA_SQL = Path(__file__).resolve().parent.parent / "docs" / "schema.sql"
 
-# Что Фаза 1 добавила к schema.sql (миграция 0002) — любое другое отличие = ошибка.
+# Что Фаза 1 добавила к schema.sql (миграции 0002–0003) — любое другое отличие = ошибка.
 PHASE1_NEW_TABLES = {"job_runs", "channel_sales_daily"}
 PHASE1_NEW_COLUMNS = {
     "order_items": {"lamoda_sku", "external_sku"},
-    "fbo_shipments": {"qty_accepted", "warehouse_code"},
+    "fbo_shipments": {"qty_accepted", "warehouse_code", "created_at"},   # created_at — миграция 0003
+    "stock_1c": {"taken_at"},                                               # миграция 0003
     "shipment_recommendations": {"batch_id", "confirmed_by", "confirmed_at", "assembly_id"},
     "purchase_recommendations": {"batch_id", "stock_1c_qty_snapshot", "stock_fbo_qty_snapshot",
                                  "in_transit_qty_snapshot", "on_order_qty_snapshot", "daily_demand",

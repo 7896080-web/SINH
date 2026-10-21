@@ -12,7 +12,7 @@ PostgreSQL (прод, как в ТЗ), и на SQLite (тесты, локаль�
 - `INT[]` → `IntArray` (массив на PostgreSQL, JSON-список на SQLite).
 
 Отличия от `schema.sql`, которые понадобились в Фазе 1, приезжают отдельной
-миграцией 0002 и помечены здесь комментарием «Фаза 1»: строковый `order_items.lamoda_item_id`
+миграциями 0002–0003 и помечены здесь комментарием «Фаза 1» / «Миграция 0003»: строковый `order_items.lamoda_item_id`
 и SKU позиции, принятое количество поставки FBO, служебные поля рекомендаций, новые
 таблицы `job_runs` и `channel_sales_daily` (раздел «Расширения Фазы 1» в конце файла).
 
@@ -181,6 +181,10 @@ t_stock_1c = Table(
     Column('product_size_id', Integer, primary_key=True),
     Column('snapshot_date', Date, primary_key=True),
     Column('qty', Integer, nullable=False),
+    # Миграция 0003: момент выгрузки остатка из 1С (UTC). Отгрузку на FBO в 1С списывают при
+    # создании поставки в Lamoda — сравнение с этим моментом показывает, сидит ли товар
+    # поставки ещё в этом срезе остатка ЦС.
+    Column('taken_at', DateTime),
     ForeignKeyConstraint(['product_size_id'], ['product_sizes.product_size_id'], name='stock_1c_product_size_id_fkey'),
     PrimaryKeyConstraint('product_size_id', 'snapshot_date', name='stock_1c_pkey')
 )
@@ -212,6 +216,8 @@ t_fbo_shipments = Table(
     # и склад поставки (BYKOVO / SOFINO).
     Column('qty_accepted', Integer),
     Column('warehouse_code', Text),
+    # Миграция 0003: точный момент создания поставки в Lamoda (`createdAt`, UTC) — см. stock_1c.taken_at.
+    Column('created_at', DateTime),
     ForeignKeyConstraint(['product_size_id'], ['product_sizes.product_size_id'], name='fbo_shipments_product_size_id_fkey'),
     PrimaryKeyConstraint('shipment_id', 'product_size_id', name='fbo_shipments_pkey')
 )

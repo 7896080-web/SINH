@@ -14,6 +14,7 @@ from forecast.db.schema import t_channel_sales_daily, t_product_sizes, t_stock_1
 from forecast.integrations.onec.files import (
     parse_sales, parse_stock_rows, read_text, sales_file_period, stock_file_time,
 )
+from forecast.timeutil import MSK, to_naive_utc
 
 MAX_LISTED = 200
 
@@ -47,9 +48,10 @@ def ingest_stock_file(conn: Connection, path: Path, resolver: SkuResolver) -> di
             report["negative"] += 1
         per_size[next(iter(psids))] += row["quantity"]
     all_sizes = [r[0] for r in conn.execute(select(t_product_sizes.c.product_size_id))]
-    values = [{"product_size_id": psid, "snapshot_date": snapshot_date, "qty": per_size.get(psid, 0)}
-              for psid in all_sizes]
-    upsert(conn, t_stock_1c, values, keys=["product_size_id", "snapshot_date"], update=["qty"])
+    taken_at_utc = to_naive_utc(taken_at.replace(tzinfo=MSK))      # имя файла — время сервера 1С (Москва)
+    values = [{"product_size_id": psid, "snapshot_date": snapshot_date, "qty": per_size.get(psid, 0),
+               "taken_at": taken_at_utc} for psid in all_sizes]
+    upsert(conn, t_stock_1c, values, keys=["product_size_id", "snapshot_date"], update=["qty", "taken_at"])
     report["sizes_in_stock"] = sum(1 for v in per_size.values() if v > 0)
     return report
 
