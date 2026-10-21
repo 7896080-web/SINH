@@ -26,7 +26,7 @@ from forecast.db.schema import (
     t_shipment_recommendations, t_stock_1c, t_stock_fbo, t_suppliers,
 )
 from forecast.ingest.lamoda import rebuild_sales_daily, remap_unmapped_order_items
-from forecast.integrations.lamoda.statuses import SHIPMENT_FINAL_STATUSES
+from forecast.integrations.lamoda.statuses import KNOWN_SHIPMENT_STATUSES, SHIPMENT_FINAL_STATUSES
 from forecast.planning import smoothing
 from forecast.planning.policy import Policy, order_up_to
 from forecast.planning.series import DemandSeries, channel_series, lamoda_series, store_lamoda_timeseries
@@ -106,17 +106,28 @@ def latest_snapshot(conn: Connection, table, as_of: date) -> tuple[dict[int, int
     return {psid: int(qty or 0) for psid, qty in rows}, last
 
 
-def fbo_in_transit(conn: Connection, as_of: date) -> dict[int, int]:
-    """«В пути на FBO»: незавершённые поставки, план минус уже принятое Lamoda."""
+def fbo_in_transit(conn: Connection, as_of: date,
+                   on_cs_statuses: frozenset[str]) -> tuple[dict[int, int], dict[int, int]]:
+    """«В пути на FBO»: незавершённые поставки, план минус уже принятое Lamoda.
+
+    Второй словарь — часть «в пути», которая ещё числится в остатке ЦС из 1С: отгрузку
+    списывают в 1С после создания поставки в Lamoda, поэтому пока поставка не доехала до
+    склада Lamoda, её товар виден и в поставке, и на ЦС. Незнакомый статус считаем
+    «ещё на ЦС» — так не предложим отгрузить товар, который уже обещан Lamoda."""
     out: dict[int, int] = defaultdict(int)
+    on_cs: dict[int, int] = defaultdict(int)
     rows = conn.execute(select(t_fbo_shipments.c.product_size_id, t_fbo_shipments.c.qty,
                                t_fbo_shipments.c.qty_accepted, t_fbo_shipments.c.status)
                         .where(t_fbo_shipments.c.created_date >= as_of - timedelta(days=IN_TRANSIT_MAX_AGE_DAYS)))
     for psid, qty, accepted, status in rows:
-        if (status or "").upper() in SHIPMENT_FINAL_STATUSES:
+        status = (status or "").upper()
+        if status in SHIPMENT_FINAL_STATUSES:
             continue
-        out[psid] += max(0, int(qty or 0) - int(accepted or 0))
-    return dict(out)
+        remaining = max(0, int(qty or 0) - int(accepted or 0))
+        out[psid] += remaining
+        if status in on_cs_statuses or status not in KNOWN_SHIPMENT_STATUSES:
+            on_cs[psid] += remaining
+    return dict(out), dict(on_cs)
 
 
 def assembled_not_in_lamoda(conn: Connection, as_of: date) -> dict[int, int]:
@@ -224,7 +235,7 @@ def recalc(conn: Connection, settings: PlanningSettings, as_of: date, batch_id: 
     catalog = load_catalog(conn)
     stock_cs, stock_cs_date = latest_snapshot(conn, t_stock_1c, as_of)
     stock_fbo, stock_fbo_date = latest_snapshot(conn, t_stock_fbo, as_of)
-    in_transit = fbo_in_transit(conn, as_of)
+    in_transit, transit_on_cs = fbo_in_transit(conn, as_of, settings.fbo_statuses_on_cs)
     assembled = assembled_not_in_lamoda(conn, as_of)
     on_order = purchase_on_order(conn, as_of, settings.purchase_on_order_grace_days)
     lead_fbo, lead_fbo_note = fbo_lead_days(conn, settings.fbo_lead_days_default, computed_at)
@@ -272,14 +283,15 @@ def recalc(conn: Connection, settings: PlanningSettings, as_of: date, batch_id: 
     report["forecasts"] = len(forecast_rows)
 
     report["shipment"] = _shipment_batch(conn, settings, catalog, forecasts, stock_cs, stock_fbo, in_transit,
-                                         assembled, lead_fbo, lead_fbo_note, batch_id, computed_at, as_of)
+                                         transit_on_cs, assembled, lead_fbo, lead_fbo_note, batch_id,
+                                         computed_at, as_of)
     report["purchase"] = _purchase_batch(conn, settings, catalog, forecasts, stock_cs, stock_fbo, in_transit,
-                                         on_order, batch_id, as_of)
+                                         transit_on_cs, on_order, batch_id, as_of)
     return report
 
 
-def _shipment_batch(conn, settings, catalog, forecasts, stock_cs, stock_fbo, in_transit, assembled, lead_fbo,
-                    lead_fbo_note, batch_id, computed_at, as_of) -> dict:
+def _shipment_batch(conn, settings, catalog, forecasts, stock_cs, stock_fbo, in_transit, transit_on_cs, assembled,
+                    lead_fbo, lead_fbo_note, batch_id, computed_at, as_of) -> dict:
     """Страница 1: поставка с ЦС на FBO Lamoda. Только Lamoda-спрос (FBO есть только у неё)."""
     confirmed = {r.product_size_id: r for r in conn.execute(
         select(t_shipment_recommendations).where(t_shipment_recommendations.c.status == "confirmed"))}
@@ -306,7 +318,9 @@ def _shipment_batch(conn, settings, catalog, forecasts, stock_cs, stock_fbo, in_
         prior = confirmed.get(psid)
         if cs <= 0 and prior is None:
             continue
-        available = max(0, cs - settings.cs_reserve_qty - packed)
+        # уже обещано Lamoda, но ещё в остатке ЦС: собрано у нас + поставки Lamoda, не списанные в 1С
+        committed = packed + transit_on_cs.get(psid, 0)
+        available = max(0, cs - settings.cs_reserve_qty - committed)
         qty = min(policy.need, available)
         transit_note = f"в пути {transit}" + (f", из них собрано у нас и ещё не создано в Lamoda {packed}"
                                               if packed else "")
@@ -321,7 +335,10 @@ def _shipment_batch(conn, settings, catalog, forecasts, stock_cs, stock_fbo, in_
             notes.append("Капсульная коллекция: в регулярный цикл пополнения не входит.")
         elif policy.need > available:
             notes.append(f"На ЦС {cs}" + (f", резерв ЦС {settings.cs_reserve_qty}" if settings.cs_reserve_qty else "")
-                         + (f", уже собрано в поставку {packed}" if packed else "") + f" → к отгрузке {qty}.")
+                         + (f", уже собрано в поставку {packed}" if packed else "")
+                         + (f", в поставках Lamoda, ещё не списанных в 1С, {transit_on_cs[psid]}"
+                            if transit_on_cs.get(psid) else "")
+                         + f" → к отгрузке {qty}.")
         row = {"product_size_id": psid, "stock_1c_qty_snapshot": cs, "stock_fbo_qty_snapshot": on_fbo,
                "qty_to_ship": qty, "confidence_pct": None, "confidence_explanation": " ".join(notes),
                "status": "pending", "batch_id": batch_id, "created_at": computed_at, "target_ship_date": None}
@@ -341,7 +358,7 @@ def _shipment_batch(conn, settings, catalog, forecasts, stock_cs, stock_fbo, in_
             "reorder_points": len(reorder_rows), "lead_days": lead_days}
 
 
-def _purchase_batch(conn, settings, catalog, forecasts, stock_cs, stock_fbo, in_transit, on_order,
+def _purchase_batch(conn, settings, catalog, forecasts, stock_cs, stock_fbo, in_transit, transit_on_cs, on_order,
                     batch_id, as_of) -> dict:
     """Страница 2: закупка у поставщика по СУММАРНОМУ спросу всех каналов, тянущих с ЦС."""
     z = settings.service_level_z
@@ -363,16 +380,21 @@ def _purchase_batch(conn, settings, catalog, forecasts, stock_cs, stock_fbo, in_
             supplier_lead = settings.supplier_lead_days_default
             supplier_note = f"{supplier_lead} (поставщик не указан — срок по умолчанию)"
         lead_days = supplier_lead + settings.review_interval_days
-        cs, fbo, transit, ordered = (max(stock_cs.get(psid, 0), 0), max(stock_fbo.get(psid, 0), 0),
-                                     in_transit.get(psid, 0), on_order.get(psid, 0))
+        cs, fbo, ordered = max(stock_cs.get(psid, 0), 0), max(stock_fbo.get(psid, 0), 0), on_order.get(psid, 0)
+        # товар поставки, ещё не списанный в 1С, уже сидит в остатке ЦС — второй раз «в пути» не считаем
+        still_on_cs = min(transit_on_cs.get(psid, 0), in_transit.get(psid, 0))
+        transit = in_transit.get(psid, 0) - still_on_cs
         policy = order_up_to(d, sigma, lead_days, z, cs + fbo + transit + ordered)
         if policy.need <= 0:
             continue
-        channels = " + ".join(f"{channel_name(c)} {fmt(fc.fit.level)}" for c, fc in sorted(by_channel.items()))
+        channels = " + ".join(f"{channel_name(c)} {fmt(fc.fit.level)}" for c, fc in sorted(by_channel.items())
+                              if fc.fit.level >= 0.005)
         notes = [f"Спрос всех каналов {fmt(d)} шт/день ({channels}).",
                  describe_policy(policy, f"{supplier_note} + {settings.review_interval_days} (пересмотр)") + ".",
                  f"Есть {fmt(policy.position, 0)} (ЦС {cs} + FBO {fbo} + в пути на FBO {transit}"
-                 + (f" + заказано {ordered}" if ordered else "") + f") → к закупке {policy.need}."]
+                 + (f" + заказано {ordered}" if ordered else "") + f") → к закупке {policy.need}."
+                 + (f" Ещё {still_on_cs} шт. в поставках Lamoda не списаны с ЦС в 1С — учтены в остатке ЦС."
+                    if still_on_cs else "")]
         status = "pending"
         if not info.available_to_reorder:
             status = "no_reorder"

@@ -1,5 +1,6 @@
 """Расчёт: цензурирование, сглаживание, страховой запас, рекомендации двух страниц."""
 import math
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
@@ -156,17 +157,55 @@ def test_fbo_recommendation_tops_up_to_reorder_point(engine):
     assert report["shipment"]["to_ship"] == 1
 
 
+def _shipment(conn, psid, shipment_id, status, qty, accepted=0, days_ago=2):
+    conn.execute(t_fbo_shipments.insert().values(shipment_id=shipment_id, product_size_id=psid, qty=qty,
+                                                 qty_accepted=accepted, created_date=AS_OF - timedelta(days=days_ago),
+                                                 status=status))
+
+
 def test_fbo_recommendation_capped_by_central_stock_and_counts_in_transit(engine):
     with engine.begin() as conn:
         psid = _world(conn, cs=5, fbo=1)
-        conn.execute(t_fbo_shipments.insert().values(shipment_id="SH1", product_size_id=psid, qty=4, qty_accepted=1,
-                                                     created_date=AS_OF - timedelta(days=2), status="CONFIRMED"))
-        conn.execute(t_fbo_shipments.insert().values(shipment_id="SH0", product_size_id=psid, qty=50,
-                                                     created_date=AS_OF - timedelta(days=9), status="CLOSED"))
+        _shipment(conn, psid, "SH1", "UNLOADING", qty=4, accepted=1)     # уже на складе Lamoda, с ЦС списано
+        _shipment(conn, psid, "SH0", "CLOSED", qty=50, days_ago=9)
         run(conn)
         rec = latest(conn, t_shipment_recommendations, status="pending")[0]
     # нужно 14 − (1 + 3 в пути) = 10, но на ЦС только 5
     assert float(rec.qty_to_ship) == 5 and "в пути 3" in rec.confidence_explanation
+
+
+def test_shipment_not_yet_written_off_in_1c_is_not_available_on_central_stock(engine):
+    """Отгрузку на FBO в 1С списывают после создания поставки в Lamoda: пока поставка не доехала,
+    её товар ещё в остатке ЦС — предлагать его к отгрузке второй раз нельзя."""
+    with engine.begin() as conn:
+        psid = _world(conn, cs=5, fbo=1)
+        _shipment(conn, psid, "SH1", "CONFIRMED", qty=3)
+        run(conn)
+        rec = latest(conn, t_shipment_recommendations, status="pending")[0]
+    # нужно 14 − (1 + 3) = 10; на ЦС 5, из них 3 уже в поставке Lamoda → доступно 2
+    assert float(rec.qty_to_ship) == 2
+    assert "ещё не списанных в 1С, 3" in rec.confidence_explanation
+
+
+def test_on_cs_statuses_are_configurable(engine):
+    with engine.begin() as conn:
+        psid = _world(conn, cs=5, fbo=1)
+        _shipment(conn, psid, "SH1", "CONFIRMED", qty=3)
+        recalc(conn, replace(SETTINGS, fbo_statuses_on_cs=frozenset({"DRAFT"})), AS_OF, 1, datetime(2026, 10, 21, 7))
+        rec = latest(conn, t_shipment_recommendations, status="pending")[0]
+    assert float(rec.qty_to_ship) == 5      # CONFIRMED объявлен «уже списано с ЦС»
+
+
+def test_purchase_does_not_count_unwritten_shipment_twice(engine):
+    with engine.begin() as conn:
+        psid = _world(conn, cs=6, fbo=0)
+        _shipment(conn, psid, "SH1", "READY_FOR_SHIPMENT", qty=4)      # эти 4 ещё внутри остатка ЦС 6
+        _shipment(conn, psid, "SH2", "UNLOADED", qty=2)                # эти 2 уже списаны с ЦС
+        run(conn)
+        rec = latest(conn, t_purchase_recommendations, status="pending")[0]
+    assert float(rec.in_transit_qty_snapshot) == 2
+    assert float(rec.qty_to_purchase) == math.ceil(float(rec.reorder_point_qty)) - (6 + 0 + 2)
+    assert "Ещё 4 шт. в поставках Lamoda не списаны с ЦС" in rec.explanation
 
 
 def test_sizes_without_central_stock_are_not_on_fbo_page(engine):

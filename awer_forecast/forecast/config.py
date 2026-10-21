@@ -10,6 +10,8 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from forecast.integrations.lamoda.statuses import SHIPMENT_ON_CS_STATUSES
+
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 
 
@@ -58,6 +60,8 @@ class PlanningSettings:
     smoothing_alpha: float | None = None   # None — подбирается по истории
     cs_reserve_qty: int = 0                # сколько штук каждого размера не отгружать с ЦС на FBO
     purchase_on_order_grace_days: int = 14 # заказанное у поставщика считаем «в пути» до срока готовности + N дней
+    # статусы поставки Lamoda, в которых её товар ещё не списан с ЦС в 1С (см. statuses.py)
+    fbo_statuses_on_cs: frozenset[str] = SHIPMENT_ON_CS_STATUSES
 
 
 @dataclass(frozen=True)
@@ -85,6 +89,7 @@ class Settings:
 def get_settings() -> Settings:
     load_dotenv(PROJECT_DIR / ".env")
     alpha = _str("PLAN_SMOOTHING_ALPHA")
+    on_cs = _str("PLAN_FBO_STATUSES_ON_CS")
     planning = PlanningSettings(
         service_level_z=_float("PLAN_SERVICE_LEVEL_Z", 1.65),
         review_interval_days=_int("PLAN_REVIEW_INTERVAL_DAYS", 7),
@@ -97,6 +102,8 @@ def get_settings() -> Settings:
         smoothing_alpha=float(alpha.replace(",", ".")) if alpha else None,
         cs_reserve_qty=_int("PLAN_CS_RESERVE_QTY", 0),
         purchase_on_order_grace_days=_int("PLAN_PURCHASE_GRACE_DAYS", 14),
+        fbo_statuses_on_cs=(frozenset(s.strip().upper() for s in on_cs.split(",") if s.strip())
+                            if on_cs else SHIPMENT_ON_CS_STATUSES),
     )
     exchange_dirs = tuple(
         Path(p.strip()) for p in _str("ONEC_EXCHANGE_DIRS", r"C:\sync\results;C:\sync\archive").split(";")

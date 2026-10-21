@@ -200,6 +200,11 @@ def _write_1c_files(sizes: list[DemoSize], base: Path, today: date, rng: random.
             sold = sum(1 for _ in range(4) if rng.random() < s.retail_rate / 4)
             if sold:
                 rows.append(f"{day:%Y%m%d}|{s.barcode_1c}|{sold}|{sold * s.model.price:.2f}|retail_1")
+            # WB и Ozon — тоже из 1С (решение владельца), примерно половина розничного темпа
+            for channel in ("wb", "ozon"):
+                sold = sum(1 for _ in range(4) if rng.random() < s.retail_rate / 8)
+                if sold:
+                    rows.append(f"{day:%Y%m%d}|{s.barcode_1c}|{sold}|{sold * s.model.price:.2f}|{channel}")
     sales_path = sales_dir / f"sales_{start:%Y%m%d}_{today - timedelta(days=1):%Y%m%d}_{today:%Y%m%d}080000.txt"
     sales_path.write_text("\n".join(rows) + "\n", encoding="utf-8")
     return stock_path, sales_path
