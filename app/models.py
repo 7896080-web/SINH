@@ -307,7 +307,12 @@ class FtpTaskStatus(str, enum.Enum):
 
 
 class FtpTask(Base):
-    """Одна строка внутри файла task_*.txt для старой базы 1С."""
+    """Одна строка внутри файла task_*.txt для старой базы 1С.
+
+    Таблицу ЧИТАЕТ AWER Forecast (awer_forecast/forecast/integrations/syncadmin.py): спрос
+    WB/Ozon/сайта для планирования закупок — из CREATE_/CANCEL_MOVEMENT без is_test.
+    Переименование колонок command/barcode/quantity/order_id/account_id/movement_date/
+    created_at/is_test — только вместе с правкой там."""
     __tablename__ = "ftp_tasks"
 
     id = Column(Integer, primary_key=True)

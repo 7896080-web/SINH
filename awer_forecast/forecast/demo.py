@@ -1,6 +1,6 @@
 """Демо на тестовых данных: весь ежедневный цикл на выдуманном ассортименте AWER.
 
-Что настоящее: БД (миграции), импорт Excel-карты, клиент Lamoda v2 и приём данных,
+Что настоящее: БД (миграции), импорт Excel-карты, клиент Lamoda v2 и приём данных, чтение базы Sync Admin,
 разбор файлов 1С, расчёт и страницы. Что выдумано: ассортимент, продажи за 120 дней,
 остатки и ответы Lamoda (имитация поверх httpx.MockTransport, без сети), файлы 1С.
 
@@ -200,14 +200,44 @@ def _write_1c_files(sizes: list[DemoSize], base: Path, today: date, rng: random.
             sold = sum(1 for _ in range(4) if rng.random() < s.retail_rate / 4)
             if sold:
                 rows.append(f"{day:%Y%m%d}|{s.barcode_1c}|{sold}|{sold * s.model.price:.2f}|retail_1")
-            # WB и Ozon — тоже из 1С (решение владельца), примерно половина розничного темпа
-            for channel in ("wb", "ozon"):
-                sold = sum(1 for _ in range(4) if rng.random() < s.retail_rate / 8)
-                if sold:
-                    rows.append(f"{day:%Y%m%d}|{s.barcode_1c}|{sold}|{sold * s.model.price:.2f}|{channel}")
     sales_path = sales_dir / f"sales_{start:%Y%m%d}_{today - timedelta(days=1):%Y%m%d}_{today:%Y%m%d}080000.txt"
     sales_path.write_text("\n".join(rows) + "\n", encoding="utf-8")
     return stock_path, sales_path
+
+
+def _write_sync_admin_db(sizes: list[DemoSize], path: Path, today: date, rng: random.Random) -> None:
+    """Имитация базы Sync Admin: заказы WB/Ozon/сайта — задания перемещений в 1С (ftp_tasks).
+    Только колонки, которые читает forecast/integrations/syncadmin.py, с теми же именами."""
+    import sqlite3
+    path.unlink(missing_ok=True)
+    con = sqlite3.connect(path)
+    con.executescript("""
+        CREATE TABLE platform_accounts (id INTEGER PRIMARY KEY, platform VARCHAR(4) NOT NULL, name VARCHAR(128));
+        CREATE TABLE ftp_tasks (id INTEGER PRIMARY KEY, command VARCHAR(32) NOT NULL, barcode VARCHAR(64),
+            quantity INTEGER, order_id VARCHAR(128) NOT NULL, account_id INTEGER NOT NULL, movement_date DATE,
+            status VARCHAR(7), created_at DATETIME, is_test BOOLEAN NOT NULL);
+        INSERT INTO platform_accounts VALUES (1, 'wb', 'WB'), (2, 'ozon', 'Ozon'), (3, 'kit', 'Сайт');
+    """)
+    rows, n = [], 0
+    start = today - timedelta(days=90)
+    for d in range(90):
+        day = start + timedelta(days=d)
+        for s in sizes:
+            for account_id, share in ((1, 0.5), (2, 0.35), (3, 0.15)):   # доля от розничного темпа
+                if rng.random() < s.retail_rate * share:
+                    n += 1
+                    created = datetime.combine(day, time(rng.randint(6, 19), 0))   # UTC, как в Sync Admin
+                    rows.append(("CREATE_MOVEMENT", s.barcode_1c, 1, f"D{n}", account_id, None, "done",
+                                 created.isoformat(sep=" "), 0))
+                    if rng.random() < 0.08:                                       # отмена до подтверждения
+                        rows.append(("CANCEL_MOVEMENT", s.barcode_1c, 1, f"D{n}", account_id, None, "done",
+                                     (created + timedelta(hours=5)).isoformat(sep=" "), 0))
+    rows.append(("CREATE_MOVEMENT", sizes[0].barcode_1c, 50, "TEST1", 1, None, "done",
+                 datetime.combine(today - timedelta(days=1), time(9)).isoformat(sep=" "), 1))  # симуляция — не спрос
+    con.executemany("INSERT INTO ftp_tasks (command, barcode, quantity, order_id, account_id, movement_date, "
+                    "status, created_at, is_test) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+    con.commit()
+    con.close()
 
 
 def build_demo(base: Path, *, quiet: bool = False) -> Settings:
@@ -231,6 +261,7 @@ def build_demo(base: Path, *, quiet: bool = False) -> Settings:
         report = import_catalog(conn, card)
     fake, fbo_history = _simulate(sizes, today, rng)
     _write_1c_files(sizes, base, today, rng)
+    _write_sync_admin_db(sizes, base / "sync_admin.db", today, rng)
 
     from forecast.security import hash_password
     settings = Settings(
@@ -238,7 +269,7 @@ def build_demo(base: Path, *, quiet: bool = False) -> Settings:
         lamoda_base_url="https://public-api-seller.lamoda.ru/api", lamoda_client_id="id", lamoda_client_secret="secret",
         lamoda_seller_id="100500", lamoda_country="RU", orders_backfill_days=180, orders_overlap_hours=6,
         onec_exchange_dirs=(base / "sync" / "results", base / "sync" / "archive"), onec_sales_dir=base / "sales",
-        planning=PlanningSettings(),
+        planning=PlanningSettings(), sync_admin_database=str(base / "sync_admin.db"),
     )
     # история ежедневных снимков FBO (в жизни — результат ежедневного опроса)
     with engine.begin() as conn:

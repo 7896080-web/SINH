@@ -52,6 +52,7 @@
   · история {{ planning.history_days }} дн. · мин. история {{ planning.min_history_days }} дн.
   · порог выброса {{ planning.outlier_sigma|num }}σ · резерв на ЦС {{ planning.cs_reserve_qty }} шт.
   <div class="muted">Меняются в .env (PLAN_…), применяются со следующего пересчёта.
-  Каталоги 1С: {{ exchange_dirs|join('; ') }}; продажи: {{ sales_dir or 'не задан' }}.</div>
+  Каталоги 1С: {{ exchange_dirs|join('; ') }}; продажи магазинов: {{ sales_dir or 'не задан' }};
+  база Sync Admin (WB/Ozon/сайт): {{ sync_admin or 'не задана' }}.</div>
 </div>
 {% endblock %}

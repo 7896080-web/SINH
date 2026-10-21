@@ -8,9 +8,9 @@
 Продажи — ПРЕДЛОЖЕННЫЙ формат (у 1С такой выгрузки пока нет, см. README «Вопросы по 1С»):
     sales_ГГГГММДД_ГГГГММДД_ГГГГММДДЧЧММСС.txt — период «с … по …» и метка выгрузки,
     строка: дата(ГГГГММДД)|баркод|количество|сумма_руб|канал
-количество < 0 — возврат; канал — retail_1, retail_2 (магазины), wb, ozon, own_site (сайт).
-Спрос WB/Ozon/сайта берётся из 1С (решение владельца), Lamoda — только из API: строки канала
-lamoda отклоняются, иначе спрос задвоится.
+количество < 0 — возврат; канал — код магазина (retail_1, retail_2). Строки каналов lamoda, wb,
+ozon, own_site отклоняются: Lamoda берётся из её API, WB/Ozon/сайт — из журнала перемещений
+Sync Admin в 1С (forecast/integrations/syncadmin.py), иначе спрос задвоится.
 """
 from __future__ import annotations
 
@@ -25,6 +25,8 @@ SALES_FILE_RE = re.compile(r"^sales_(\d{8})_(\d{8})_(\d{14})\.txt$", re.IGNORECA
 STOCK_EXPORT_FIELDS = 7
 SALES_FIELDS = 5
 CHANNEL_RE = re.compile(r"^[a-z0-9_]{1,32}$")
+# Каналы со своим источником: строки с ними в файле продаж задвоили бы спрос.
+NOT_FROM_FILES = frozenset({"lamoda", "wb", "ozon", "own_site"})
 
 
 def read_text(path: Path) -> str:
@@ -124,8 +126,13 @@ def parse_sales(content: str) -> SalesParseResult:
             result.errors.append(f"строка {number}: {exc}")
             continue
         channel = channel.lower()
-        if not barcode or not CHANNEL_RE.match(channel) or channel == "lamoda":
+        if not barcode or not CHANNEL_RE.match(channel):
             result.errors.append(f"строка {number}: пустой баркод или неверный канал «{channel}»")
+            continue
+        if channel in NOT_FROM_FILES:
+            result.errors.append(f"строка {number}: канал «{channel}» в файл продаж не принимается — "
+                                 + ("Lamoda берётся из её API" if channel == "lamoda"
+                                    else "WB/Ozon/сайт берутся из журнала перемещений Sync Admin"))
             continue
         result.rows.append({"sale_date": day, "barcode": barcode, "qty": qty, "revenue": amount,
                             "channel": channel})

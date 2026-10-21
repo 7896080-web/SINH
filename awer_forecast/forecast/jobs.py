@@ -24,8 +24,10 @@ from forecast.config import Settings
 from forecast.db.schema import t_job_runs
 from forecast.ingest.lamoda import ingest_fbo_shipments, ingest_fbo_stocks, ingest_orders
 from forecast.ingest.onec import ingest_sales_files, ingest_stock_file
+from forecast.ingest.syncadmin import store_marketplace_demand
 from forecast.integrations.lamoda.client import LamodaClient, parse_datetime
 from forecast.integrations.onec.files import find_newest_stock_file, find_sales_files
+from forecast.integrations.syncadmin import open_sync_admin, read_marketplace_demand
 from forecast.planning.recalc import recalc
 from forecast.timeutil import as_aware_utc, to_naive_utc, today_msk, utcnow
 
@@ -38,13 +40,14 @@ JOB_TITLES = {
     "lamoda_shipments": "Поставки на FBO (в пути)",
     "lamoda_orders": "Заказы Lamoda",
     "onec_stock": "Остаток ЦС из 1С",
-    "onec_sales": "Продажи из 1С",
+    "onec_sales": "Продажи магазинов из 1С",
+    "syncadmin_orders": "Заказы WB/Ozon/сайта (перемещения Sync Admin в 1С)",
     "recalc": "Пересчёт рекомендаций",
     "catalog_import": "Импорт карты мэппинга",
     "fbo_assembly": "Сборка поставки на FBO",
 }
 DAILY_STEPS = ("lamoda_catalog", "lamoda_stocks", "lamoda_shipments", "lamoda_orders", "onec_stock",
-               "onec_sales", "recalc")
+               "onec_sales", "syncadmin_orders", "recalc")
 LAMODA_JOBS = {"lamoda_catalog", "lamoda_stocks", "lamoda_shipments", "lamoda_orders"}
 
 
@@ -170,6 +173,26 @@ def _onec_sales(engine, settings, client, run_id):
     return f"файлов {len(report['files'])}, строк {report['rows']}, ошибок {len(report['errors'])}", report, None
 
 
+def _syncadmin_orders(engine, settings, client, run_id):
+    since_day = today_msk() - timedelta(days=settings.planning.history_days)
+    source = open_sync_admin(settings.sync_admin_database)
+    try:
+        demand = read_marketplace_demand(source, since_day)
+    finally:
+        source.dispose()
+    with engine.begin() as conn:
+        rows = store_marketplace_demand(conn, demand, since_day)
+    by_channel: dict[str, int] = {}
+    for (channel, _barcode, _day), qty in demand.totals.items():
+        by_channel[channel] = by_channel.get(channel, 0) + qty
+    report = {"since": since_day.isoformat(), "orders": demand.orders, "cancelled": demand.cancelled,
+              "partially_returned": demand.partially_returned, "rows": rows, "units_by_channel": by_channel,
+              "skipped": demand.skipped}
+    units = ", ".join(f"{c} {q}" for c, q in sorted(by_channel.items())) or "нет"
+    return (f"заказов {demand.orders} с {since_day:%d.%m.%Y}, отменено целиком {demand.cancelled}, "
+            f"штук по каналам: {units}"), report, None
+
+
 def _recalc(engine, settings, client, run_id):
     with engine.begin() as conn:
         report = recalc(conn, settings.planning, today_msk(), run_id, utcnow())
@@ -180,7 +203,8 @@ def _recalc(engine, settings, client, run_id):
 
 STEPS: dict[str, Callable] = {
     "lamoda_catalog": _lamoda_catalog, "lamoda_stocks": _lamoda_stocks, "lamoda_shipments": _lamoda_shipments,
-    "lamoda_orders": _lamoda_orders, "onec_stock": _onec_stock, "onec_sales": _onec_sales, "recalc": _recalc,
+    "lamoda_orders": _lamoda_orders, "onec_stock": _onec_stock, "onec_sales": _onec_sales,
+    "syncadmin_orders": _syncadmin_orders, "recalc": _recalc,
 }
 
 
@@ -207,6 +231,9 @@ def run_daily(engine: Engine, settings: Settings, *, started_by: str = "schedule
     for job in DAILY_STEPS:
         if job in LAMODA_JOBS and not settings.lamoda_configured:
             results.append(JobResult(0, job, "skipped", "ключи Lamoda не заданы"))
+            continue
+        if job == "syncadmin_orders" and not settings.sync_admin_database:
+            results.append(JobResult(0, job, "skipped", "SYNC_ADMIN_DATABASE не задан"))
             continue
         try:
             results.append(run_step(engine, settings, job, started_by=started_by, http=http, sleep=sleep))

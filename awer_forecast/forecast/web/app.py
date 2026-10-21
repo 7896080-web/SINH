@@ -123,7 +123,8 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
             assemblies = q.recent_assemblies(conn)
         return render(request, "dashboard.html", runs=runs, stats=stats, assemblies=assemblies,
                       steps=DAILY_STEPS, planning=settings.planning, lamoda_ok=settings.lamoda_configured,
-                      exchange_dirs=settings.onec_exchange_dirs, sales_dir=settings.onec_sales_dir)
+                      exchange_dirs=settings.onec_exchange_dirs, sales_dir=settings.onec_sales_dir,
+                      sync_admin=settings.sync_admin_database)
 
     @app.post("/jobs/{job}")
     def run_job_now(request: Request, job: str, background: BackgroundTasks):

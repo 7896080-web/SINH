@@ -76,6 +76,8 @@ class Settings:
     onec_exchange_dirs: tuple[Path, ...]
     onec_sales_dir: Path | None
     planning: PlanningSettings = field(default_factory=PlanningSettings)
+    # база Sync Admin (путь к sync_admin.db или URL) — журнал перемещений WB/Ozon/сайта в 1С
+    sync_admin_database: str = ""
 
     @property
     def lamoda_configured(self) -> bool:
@@ -118,4 +120,5 @@ def get_settings() -> Settings:
         onec_exchange_dirs=exchange_dirs,
         onec_sales_dir=Path(sales_dir) if sales_dir else None,
         planning=planning,
+        sync_admin_database=_str("SYNC_ADMIN_DATABASE"),
     )

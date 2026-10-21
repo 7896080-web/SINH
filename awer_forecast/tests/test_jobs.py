@@ -11,15 +11,17 @@ from forecast.integrations.lamoda.client import format_datetime, parse_datetime
 from forecast.jobs import JobAlreadyRunning, run_daily, run_step, start_job
 from forecast.timeutil import today_msk, utcnow
 from factories import FakeLamoda, add_size, item, order
+from test_syncadmin import add_task, make_sync_admin_db
 
 NO_SLEEP = lambda seconds: None  # noqa: E731 — повторы без реальных пауз
 
 
-def settings_for(db_url, exchange_dir, seller="777") -> Settings:
+def settings_for(db_url, exchange_dir, seller="777", sync_admin="") -> Settings:
     return Settings(database_url=db_url, session_secret="x", login="m", password_hash="", lamoda_base_url="http://l",
                     lamoda_client_id="id", lamoda_client_secret="secret", lamoda_seller_id=seller,
                     lamoda_country="RU", orders_backfill_days=30, orders_overlap_hours=6,
-                    onec_exchange_dirs=(exchange_dir,), onec_sales_dir=None, planning=PlanningSettings())
+                    onec_exchange_dirs=(exchange_dir,), onec_sales_dir=None, planning=PlanningSettings(),
+                    sync_admin_database=sync_admin)
 
 
 @pytest.fixture
@@ -37,13 +39,15 @@ def setup(engine, db_url, tmp_path):
         fake.orders.append(order(f"O{i}", moment, [item(f"I{i}", "MPAW1INM", "DELIVERED")]))
     fake.stocks = [{"sku": "MPAW1INM", "warehouseCode": "BYKOVO", "quantity": 1}]
     fake.nomenclatures = [{"sku": "MPAW1INM", "parentSku": "MPAW1", "externalSku": "x", "barcode": "4600000000011"}]
-    return settings_for(db_url, exchange), fake
+    sync_admin = make_sync_admin_db(tmp_path / "sync_admin.db")
+    add_task(sync_admin, "CREATE_MOVEMENT", "W1", 1, created_at=utcnow() - timedelta(days=2))
+    return settings_for(db_url, exchange, sync_admin=str(sync_admin)), fake
 
 
 def test_daily_cycle_end_to_end_and_idempotent(engine, setup):
     settings, fake = setup
     results = run_daily(engine, settings, http=fake.client(), sleep=NO_SLEEP)
-    assert [r.status for r in results] == ["ok"] * 7, [(r.job, r.message) for r in results]
+    assert [r.status for r in results] == ["ok"] * 8, [(r.job, r.message) for r in results]
     with engine.connect() as conn:
         assert conn.execute(select(func.count()).select_from(t_order_items)).scalar() == 20
         assert conn.execute(select(t_stock_1c.c.qty)).scalar() == 9
