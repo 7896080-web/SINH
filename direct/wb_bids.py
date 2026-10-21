@@ -523,6 +523,8 @@ CAPS_CAB = {}     # {"кампания:артикул": кабинет} — чт
 FAILED_CABS = set()   # кабинеты, планирование которых в этом запуске упало с ошибкой
 LOCK_FILE = HERE / "wb_bids.running"   # общая блокировка: пока применяет автопилот или страж, второй не стартует
 LOCK_MAX_AGE_MIN = 65                  # блокировка старше (задача в планировщике снимается через 1 ч) — процесс упал
+LOCK_DEAD_MIN = 3                      # …а если процесса, взявшего её, уже нет — снять через столько минут (21.10 оборванная
+                                       # проверка лимита оставила блокировку, и час кампании за показы шли без контроля)
 PAUSED_MONEY_BELOW = 100               # кампания на паузе с бюджетом меньше этого, ₽ — «кончились деньги»: пополнить
                                        # и запустить можно; больше — паузу поставили вы, не трогать
 _lock_id = None
@@ -735,10 +737,10 @@ def pid_alive(pid):
     try:
         if os.name == "nt":
             import ctypes
-            k32 = ctypes.windll.kernel32
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
             h = k32.OpenProcess(0x1000, False, int(pid))      # PROCESS_QUERY_LIMITED_INFORMATION
             if not h:
-                return False
+                return ctypes.get_last_error() == 5           # «отказано в доступе» — процесс есть (чужой, SYSTEM)
             code = ctypes.c_ulong()
             ok = k32.GetExitCodeProcess(h, ctypes.byref(code))
             k32.CloseHandle(h)
@@ -778,10 +780,13 @@ def lock_acquire(owner, wait_min=0):
                 continue                                   # файл только что удалили — пробуем снова
             at, who, _, pid = info
             old = dt.datetime.now() - at
+            # процесса, взявшего блокировку, уже нет (оборвался, его сняли по времени) — снимаем через LOCK_DEAD_MIN мин;
             # старая блокировка живого процесса (ноутбук спал посреди проверки) — не отбираем; совсем старую (номер
             # процесса мог достаться другой программе) — снимаем всё равно
-            if old > dt.timedelta(minutes=LOCK_MAX_AGE_MIN) and (not pid_alive(pid) or old > dt.timedelta(minutes=3 * LOCK_MAX_AGE_MIN)):
-                log(f"! Блокировка от {who} ({at:%d.%m %H:%M}) старше {LOCK_MAX_AGE_MIN} мин — процесс, видимо, упал; снимаю.")
+            dead = old > dt.timedelta(minutes=LOCK_DEAD_MIN) and not pid_alive(pid)
+            if dead or old > dt.timedelta(minutes=3 * LOCK_MAX_AGE_MIN):
+                log(f"! Блокировка от {who} ({at:%d.%m %H:%M}) — " + ("процесса, который её взял, уже нет" if dead else
+                    f"старше {3 * LOCK_MAX_AGE_MIN} мин") + "; снимаю.")
                 try:
                     LOCK_FILE.unlink()
                 except OSError:

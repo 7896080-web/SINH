@@ -13,6 +13,8 @@
 
 Запуск:  python wb_cpm_stop.py               — пробный прогон: таблица и план, ничего не меняет
          python wb_cpm_stop.py --apply       — остановить (с CHECK_DATE; резервная копия в wb_bids_backups)
+         python wb_cpm_stop.py --also 40955797 [--apply]  — остановить и эти кампании за показы, хотя заказы у них есть
+                                               (номера через запятую; решение пользователя — заказ слишком дорогой)
          python wb_cpm_stop.py --rollback    — вернуть последнюю остановку: убрать из стоп-листа, вернуть кампании под
                                                управление (запускает их частая проверка лимита по графику расхода)
 Откат возвращает только последний --apply и применяется сразу, без пробного прогона.
@@ -32,6 +34,7 @@ CHECK_DATE = dt.date(2026, 10, 20)     # раньше этого дня --apply 
 JUDGE_SPEND = 1000                     # меньше потратила (₽) — судить рано, не трогаю
 MIN_ORDERS = 1                         # меньше стольких заказов с рекламы — остановить («показы без заказов»)
 LOG_FILE = B.HERE / "wb_cpm_stop_log.txt"
+ALSO = set()                           # --also: остановить и эти (номера), даже если заказы есть
 # -------------------------------------------
 log = B.log
 
@@ -81,6 +84,11 @@ def plan_cabinet(cab, token, d2):
         status = camps[cid].get("_status")
         if B.on_hold(cid):
             why = "уже в стоп-листе — не трогаю"
+        elif cid in ALSO:
+            why = (f"заказов {s['orders']:.0f}, но указана в --also — ОСТАНОВИТЬ" if s["orders"] else
+                   "указана в --also — ОСТАНОВИТЬ")
+            stop.append({"cabinet": cab, "advert_id": cid, "name": name, "status_before": status,
+                         "spent": round(s["sum"], 2), "orders": s["orders"]})
         elif s["sum"] < JUDGE_SPEND:
             why = f"потратила меньше {JUDGE_SPEND} ₽ — судить рано, оставляю"
         elif s["orders"] < MIN_ORDERS:
@@ -109,7 +117,8 @@ def hold_add(items):
         text += "\n"
     for i in items:
         text += (f"{i['advert_id']}   # «{i['name']}» — {dt.date.today():%d.%m.%Y} wb_cpm_stop.py: "
-                 f"{B.fm_rub(i['spent'])} ₽ с {FROM:%d.%m} без заказов\n")
+                 f"{B.fm_rub(i['spent'])} ₽ с {FROM:%d.%m}, "
+                 + (f"заказов {i['orders']:.0f} (--also)" if i.get("orders") else "без заказов") + "\n")
     B.HOLD_FILE.write_text(text, encoding="utf-8")
 
 
@@ -190,6 +199,11 @@ def main():
             write_log()
         return
     do = "--apply" in sys.argv
+    if "--also" in sys.argv:
+        i = sys.argv.index("--also")
+        ALSO.update(int(x) for x in (sys.argv[i + 1] if i + 1 < len(sys.argv) else "").split(",") if x.strip().isdigit())
+        if not ALSO:
+            sys.exit("--also — номера кампаний через запятую, например --also 40955797")
     d2 = dt.date.today() - dt.timedelta(days=1)
     log(f"{dt.datetime.now():%d.%m.%Y %H:%M} — проверка кампаний за показы ({'ПРИМЕНЕНИЕ' if do else 'пробный прогон'}); "
         f"заказы с {FROM:%d.%m} по {d2:%d.%m} ({(d2 - FROM).days + 1} дн.)")
@@ -208,7 +222,7 @@ def main():
         log("\nОстанавливать нечего.")
     elif not do:
         log(f"\nПлан: остановить {len(stop)}: " + ", ".join(f"«{i['name']}»" for i in stop)
-            + ". Применить: python wb_cpm_stop.py --apply")
+            + ". Применить: python wb_cpm_stop.py --apply" + (f" --also {','.join(map(str, sorted(ALSO)))}" if ALSO else ""))
     else:
         if not B.lock_acquire("wb_cpm_stop.py", wait_min=5):
             log("Сейчас работает автопилот или проверка больше 5 мин — ничего не сделано, запустите позже.")
