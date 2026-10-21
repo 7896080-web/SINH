@@ -1,0 +1,3 @@
+# база и файлы демо (python -m forecast demo)
+demo/
+forecast.db*

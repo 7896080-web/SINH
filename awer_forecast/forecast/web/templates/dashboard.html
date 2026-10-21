@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Главная</h1>
+<p class="sub">Состояние данных и ежедневного цикла. Цикл запускается Планировщиком Windows
+  (<code>python -m forecast daily</code>); здесь можно запустить шаг вручную.</p>
+
+<div class="grid">
+  <div class="card stat"><span class="muted">Размеров в справочнике</span><b>{{ stats.sizes }}</b>
+    <span class="muted">с Lamoda SKU: {{ stats.sizes_with_lamoda }}, баркодов {{ stats.barcodes }}</span></div>
+  <div class="card stat"><span class="muted">Остаток ЦС (1С) на</span><b>{{ stats.stock_1c_date|dt }}</b></div>
+  <div class="card stat"><span class="muted">Остаток FBO на</span><b>{{ stats.stock_fbo_date|dt }}</b></div>
+  <div class="card stat"><span class="muted">Позиций заказов без сопоставления</span><b>{{ stats.unmapped_items }}</b>
+    <a href="/catalog">разобрать в справочнике</a></div>
+</div>
+
+{% if not lamoda_ok %}<div class="flash error">Ключи Lamoda не заданы (LAMODA_CLIENT_ID / LAMODA_CLIENT_SECRET / LAMODA_SELLER_ID в .env) — шаги Lamoda пропускаются.</div>{% endif %}
+
+<h2>Задания</h2>
+<form method="post">
+<div class="table-wrap"><table>
+  <thead><tr><th>Шаг</th><th>Последний запуск</th><th>Итог</th><th>Сводка</th><th></th></tr></thead>
+  <tbody>
+  {% for job in steps %}{% set run = runs[job] %}
+    <tr>
+      <td>{{ JOB_TITLES[job] }}</td>
+      <td>{{ run.started_at|dt if run else '—' }}{% if run and run.started_by %}<div class="muted">{{ run.started_by }}</div>{% endif %}</td>
+      <td>{% if run %}<span class="badge {{ run.status }}">{{ {'ok':'готово','error':'ошибка','running':'идёт'}.get(run.status, run.status) }}</span>{% else %}—{% endif %}</td>
+      <td style="max-width:640px">{{ run.message if run and run.message else '' }}</td>
+      <td><button class="secondary small" type="submit" formaction="/jobs/{{ job }}">запустить</button></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table></div>
+<div class="toolbar"><button type="submit" formaction="/jobs/daily">Запустить весь цикл</button></div>
+</form>
+
+<h2>Последние собранные поставки</h2>
+{% if assemblies %}
+<div class="table-wrap"><table>
+  <thead><tr><th>№</th><th>Когда</th><th>Кто</th><th>Состав</th><th></th></tr></thead>
+  <tbody>{% for a in assemblies %}
+    <tr><td>{{ a.run_id }}</td><td>{{ a.started_at|dt }}</td><td>{{ a.started_by }}</td><td>{{ a.message }}</td>
+      <td><a href="/fbo/assembly/{{ a.run_id }}.xlsx">Excel</a></td></tr>
+  {% endfor %}</tbody>
+</table></div>
+{% else %}<p class="muted">Пока не было.</p>{% endif %}
+
+<h2>Параметры расчёта</h2>
+<div class="card">
+  z (уровень сервиса) = {{ planning.service_level_z|num }} · интервал пересмотра {{ planning.review_interval_days }} дн.
+  · срок поставки на FBO по умолчанию {{ planning.fbo_lead_days_default }} дн. · срок поставщика по умолчанию {{ planning.supplier_lead_days_default }} дн.
+  · история {{ planning.history_days }} дн. · мин. история {{ planning.min_history_days }} дн.
+  · порог выброса {{ planning.outlier_sigma|num }}σ · резерв на ЦС {{ planning.cs_reserve_qty }} шт.
+  <div class="muted">Меняются в .env (PLAN_…), применяются со следующего пересчёта.
+  Каталоги 1С: {{ exchange_dirs|join('; ') }}; продажи: {{ sales_dir or 'не задан' }}.</div>
+</div>
+{% endblock %}

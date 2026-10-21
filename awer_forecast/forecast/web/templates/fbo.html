@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}Поставка на FBO — AWER Forecast{% endblock %}
+{% block content %}
+<h1>Рекомендации по поставке с ЦС на FBO Lamoda</h1>
+<p class="sub">
+  {% if info %}Пересчёт №{{ info.run_id }} от {{ info.started_at|dt }} · остаток ЦС на {{ info.stock_1c_date|dt }}
+  · остаток FBO на {{ info.stock_fbo_date|dt }}{% else %}Пересчёта ещё не было — запустите его на главной.{% endif %}
+  · только размеры с остатком на ЦС
+</p>
+
+{% if assembled %}
+<div class="card">Поставка №{{ assembled }} собрана.
+  <a class="btn" href="/fbo/assembly/{{ assembled }}.xlsx">Скачать Excel поставки</a></div>
+{% endif %}
+
+<form method="get" action="/fbo" class="toolbar">
+  <input type="text" name="query" value="{{ query }}" placeholder="Артикул или цвет">
+  <label><input type="checkbox" name="all" value="1" {{ 'checked' if show_all }} onchange="this.form.submit()">
+    показать и строки без рекомендации</label>
+  <button class="secondary" type="submit">Найти</button>
+  <span class="spacer"></span>
+  <a class="btn secondary" href="/fbo/export.xlsx?all=1{% if query %}&query={{ query|urlencode }}{% endif %}">Выгрузить страницу в Excel</a>
+</form>
+
+<form method="post" action="/fbo/save">
+  <input type="hidden" name="all" value="{{ 1 if show_all else 0 }}">
+  <input type="hidden" name="query" value="{{ query }}">
+  <div class="toolbar">
+    <button type="submit">Сохранить подтверждённое</button>
+    <button type="submit" formaction="/fbo/assemble"
+            onclick="return confirm('Собрать поставку из строк с заполненным «Подтверждено к поставке»? Сейчас таких строк: {{ confirmed_count }} ({{ confirmed_units }} шт.), плюс то, что вы вписали, но ещё не сохранили.')">
+      Собрать поставку</button>
+    <span class="muted">Подтверждено: {{ confirmed_count }} строк, {{ confirmed_units }} шт. В поставку попадут только заполненные строки.</span>
+  </div>
+  <div class="table-wrap">
+  <table>
+    <thead><tr>
+      <th>Артикул</th><th>Цвет</th><th>Размер</th><th class="n">Остаток ЦС</th><th class="n">Остаток FBO</th>
+      <th class="n">Рекомендация к отгрузке</th><th class="n">Достоверность, %</th><th>Пояснение</th>
+      <th class="n">Подтверждено к поставке</th>
+    </tr></thead>
+    <tbody>
+    {% for r in rows %}
+      <tr class="{{ 'over' if r.over_stock }} {{ 'done' if r.status == 'sent_to_edo' }}">
+        <td class="nowrap">{{ r.article }}<div class="muted" style="font-size:12px">{{ r.lamoda_sku }}</div></td>
+        <td>{{ r.color }}</td><td>{{ r.size }}</td>
+        <td class="n">{{ r.stock_cs }}</td><td class="n">{{ r.stock_fbo }}</td>
+        <td class="n"><b>{{ r.qty_to_ship }}</b></td>
+        <td class="n">{% if r.confidence_pct is none %}<span class="muted" title="Степень достоверности появится в Фазе 4 (раздел 5.8 ТЗ)">—</span>{% else %}{{ r.confidence_pct|num(0) }}{% endif %}</td>
+        <td><details><summary>расчёт</summary><p>{{ r.explanation }}</p></details></td>
+        <td class="n">
+          {% if r.status == 'sent_to_edo' %}
+            {{ r.confirmed_qty }} <span class="badge ok">в поставке №{{ r.assembly_id }}</span>
+          {% else %}
+            <input class="qty" type="text" inputmode="numeric" name="c_{{ r.recommendation_id }}"
+                   value="{{ r.confirmed_qty if r.confirmed_qty is not none else '' }}"
+                   title="{% if r.confirmed_by %}подтвердил {{ r.confirmed_by }}{% endif %}">
+            {% if r.over_stock %}<div class="badge error">больше остатка ЦС</div>{% endif %}
+          {% endif %}
+        </td>
+      </tr>
+    {% else %}
+      <tr><td colspan="9" class="muted">Нет строк{% if not show_all %} с рекомендацией — отметьте «показать и строки без рекомендации»{% endif %}.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</form>
+<p class="muted">«Подтверждено к поставке» по умолчанию пустое: решение остаётся за менеджером. Строка с заполненным полем
+  получает статус «подтверждено» и попадает в «Собрать поставку»; файл сборки — в том же формате, что выгрузка страницы.</p>
+{% endblock %}

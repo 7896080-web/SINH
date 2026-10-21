@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}AWER Forecast{% endblock %}</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#1d2430; --muted:#6b7380; --line:#e3e6eb; --accent:#1f5fa8;
+          --ok:#2e7d4f; --warn:#b26a00; --err:#b3261e; --hl:#fff8e1; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.45 -apple-system, "Segoe UI", Roboto, Arial, sans-serif; }
+  header { background:#16263a; color:#fff; padding:0 20px; display:flex; align-items:center; gap:24px; flex-wrap:wrap; }
+  header .brand { font-weight:600; padding:12px 0; }
+  header nav a { color:#c9d6e6; text-decoration:none; padding:14px 10px; display:inline-block; }
+  header nav a.active, header nav a:hover { color:#fff; box-shadow:inset 0 -3px 0 #6fa8ff; }
+  header form { margin-left:auto; }
+  main { padding:20px; max-width:1500px; margin:0 auto; }
+  h1 { font-size:20px; margin:0 0 4px; } h2 { font-size:16px; margin:24px 0 8px; }
+  .sub { color:var(--muted); margin:0 0 14px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px 16px; margin-bottom:14px; }
+  .flash { padding:10px 14px; border-radius:6px; margin-bottom:14px; }
+  .flash.ok { background:#e7f4ec; color:var(--ok); } .flash.error { background:#fdecea; color:var(--err); }
+  table { width:100%; border-collapse:collapse; background:var(--card); }
+  th, td { padding:6px 8px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }
+  th { background:#eef2f6; font-weight:600; font-size:13px; position:sticky; top:0; z-index:1; }
+  td.n, th.n { text-align:right; white-space:nowrap; } .nowrap { white-space:nowrap; }
+  tr.over td { background:#fdecea; } tr.done td { color:var(--muted); }
+  .table-wrap { overflow-x:auto; border:1px solid var(--line); border-radius:8px; }
+  input[type=text], input[type=number], input[type=password], input[type=file] { padding:5px 7px; border:1px solid #c5cbd3; border-radius:5px; font:inherit; }
+  input.qty { width:80px; text-align:right; }
+  button, .btn { background:var(--accent); color:#fff; border:0; border-radius:5px; padding:7px 13px; font:inherit; cursor:pointer; text-decoration:none; display:inline-block; }
+  button.secondary, .btn.secondary { background:#e5eaf0; color:var(--ink); }
+  button.small { padding:3px 9px; font-size:12px; }
+  .toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin:10px 0; }
+  .toolbar .spacer { flex:1; }
+  details summary { cursor:pointer; color:var(--accent); }
+  details p { margin:6px 0 0; max-width:560px; color:#333; }
+  .badge { display:inline-block; padding:1px 7px; border-radius:10px; font-size:12px; background:#e5eaf0; color:var(--ink); }
+  .badge.ok { background:#e7f4ec; color:var(--ok); } .badge.error { background:#fdecea; color:var(--err); }
+  .badge.running { background:#e8f0fb; color:var(--accent); } .badge.warn { background:#fff3e0; color:var(--warn); }
+  .muted { color:var(--muted); }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:12px; }
+  .stat b { font-size:20px; display:block; }
+</style>
+</head>
+<body>
+{% if user %}
+<header>
+  <span class="brand">AWER Forecast</span>
+  <nav>
+    {% set path = request.url.path %}
+    <a href="/" class="{{ 'active' if path == '/' }}">Главная</a>
+    <a href="/fbo" class="{{ 'active' if path.startswith('/fbo') }}">Поставка на FBO</a>
+    <a href="/purchase" class="{{ 'active' if path.startswith('/purchase') }}">Закупка у поставщика</a>
+    <a href="/catalog" class="{{ 'active' if path.startswith('/catalog') }}">Справочник</a>
+  </nav>
+  <form method="post" action="/logout"><button class="secondary small" type="submit">Выйти ({{ user }})</button></form>
+</header>
+{% endif %}
+<main>
+  {% if flash %}<div class="flash {{ flash.kind }}">{{ flash.text }}</div>{% endif %}
+  {% block content %}{% endblock %}
+</main>
+</body>
+</html>

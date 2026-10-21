@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% block title %}Справочник — AWER Forecast{% endblock %}
+{% block content %}
+<h1>Справочник</h1>
+<p class="sub">Моделей {{ stats.models }}, размеров {{ stats.sizes }} (с Lamoda SKU {{ stats.sizes_with_lamoda }}),
+  баркодов в пуле {{ stats.barcodes }}, поставщиков {{ stats.suppliers }}.</p>
+
+<div class="card">
+  <h2 style="margin-top:0">Импорт Excel-карты мэппинга</h2>
+  <p class="muted">Обязательные колонки: <b>Артикул</b>, <b>Размер</b>, <b>Баркод</b> (или Штрихкод / EAN / GTIN; несколько
+    баркодов в ячейке — через запятую). Необязательные: Цвет, Seller SKU, Lamoda SKU (размерный), Категория, Сезон,
+    Поставщик, Срок производства, Срок доставки, MOQ, Доступен к заказу (да/нет), Статус. Заголовки ищутся в первых строках
+    листа. Колонку баркодов держите текстовой — Excel срезает ведущие нули у чисел. Повторный импорт ничего не задваивает;
+    баркод, уже привязанный к другому размеру, не переносится, а показывается как конфликт.</p>
+  <form method="post" action="/catalog/import" enctype="multipart/form-data" class="toolbar">
+    <input type="file" name="file" accept=".xlsx" required>
+    <button type="submit">Загрузить</button>
+  </form>
+  {% set imp = runs['catalog_import'] %}
+  {% if imp %}
+  <p>Последний импорт {{ imp.started_at|dt }}: <span class="badge {{ imp.status }}">{{ imp.status }}</span> {{ imp.message }}</p>
+  {% if imp.details and (imp.details.conflicts or imp.details.errors) %}
+  <details><summary>Конфликты и ошибки ({{ (imp.details.conflicts or [])|length }} / {{ (imp.details.errors or [])|length }})</summary>
+    <ul>{% for c in (imp.details.conflicts or [])[:200] %}<li>{{ c }}</li>{% endfor %}
+        {% for e in (imp.details.errors or [])[:200] %}<li>{{ e }}</li>{% endfor %}</ul>
+  </details>
+  {% endif %}{% endif %}
+</div>
+
+<h2>Поставщики</h2>
+<p class="muted">Срок производства + срок доставки = срок закупки в расчёте; MOQ — минимальная партия (проверяется по модели).</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Поставщик</th><th class="n">Производство, дн</th><th class="n">Доставка, дн</th><th class="n">MOQ</th><th></th></tr></thead>
+  <tbody>
+  {% for s in suppliers %}{% set f = 'sup' ~ s.supplier_id %}
+    <tr>
+      <td>{{ s.name }}</td>
+      <td class="n"><input form="{{ f }}" class="qty" type="text" name="production_days" value="{{ s.production_days }}"></td>
+      <td class="n"><input form="{{ f }}" class="qty" type="text" name="delivery_days" value="{{ s.delivery_days }}"></td>
+      <td class="n"><input form="{{ f }}" class="qty" type="text" name="moq" value="{{ s.moq }}"></td>
+      <td><button form="{{ f }}" class="secondary small" type="submit">сохранить</button></td>
+    </tr>
+  {% else %}<tr><td colspan="5" class="muted">Поставщики заводятся из колонки «Поставщик» карты мэппинга.</td></tr>{% endfor %}
+  </tbody>
+</table></div>
+{% for s in suppliers %}<form id="sup{{ s.supplier_id }}" method="post" action="/suppliers/{{ s.supplier_id }}"></form>{% endfor %}
+
+<h2>Не сопоставлено</h2>
+{% set lc = runs['lamoda_catalog'] %}{% set ls = runs['lamoda_stocks'] %}{% set oc = runs['onec_stock'] %}
+<div class="grid">
+  <div class="card"><b>Каталог Lamoda</b> — {{ lc.message if lc else 'не запускался' }}
+    {% if lc and lc.details and lc.details.unmatched %}<details><summary>товары Lamoda без пары в справочнике</summary>
+      <ul>{% for u in lc.details.unmatched[:100] %}<li>{{ u.sku }} · {{ u.externalSku }} · {{ u.barcode }} · {{ u.name }} {{ u.size }}</li>{% endfor %}</ul></details>{% endif %}
+  </div>
+  <div class="card"><b>Остатки FBO</b> — {{ ls.message if ls else 'не запускались' }}
+    {% if ls and ls.details and ls.details.unmatched %}<details><summary>SKU FBO без пары</summary>
+      <ul>{% for u in ls.details.unmatched[:100] %}<li>{{ u.sku }} · {{ u.externalSku }} · {{ u.quantity }} шт</li>{% endfor %}</ul></details>{% endif %}
+  </div>
+  <div class="card"><b>Остаток ЦС</b> — {{ oc.message if oc else 'не загружался' }}
+    {% if oc and oc.details %}<div class="muted">строк 1С без пары в справочнике: {{ oc.details.unmatched }}
+      (это нормально: в 1С весь ассортимент магазина, в справочнике — только AWER)</div>{% endif %}
+  </div>
+</div>
+{% if unmapped %}
+<h2>Позиции заказов Lamoda без сопоставления</h2>
+<p class="muted">Добавьте эти SKU в карту мэппинга (колонка Lamoda SKU или Seller SKU) — при следующем пересчёте заказы привяжутся сами.</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Lamoda SKU</th><th>SKU продавца</th><th class="n">Позиций</th></tr></thead>
+  <tbody>{% for u in unmapped %}<tr><td>{{ u.lamoda_sku or '—' }}</td><td>{{ u.external_sku or '—' }}</td><td class="n">{{ u.n }}</td></tr>{% endfor %}</tbody>
+</table></div>
+{% endif %}
+{% endblock %}

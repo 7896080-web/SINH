@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}Закупка у поставщика — AWER Forecast{% endblock %}
+{% macro table(rows, editable, kind) %}
+<div class="table-wrap">
+<table>
+  <thead><tr>
+    <th>Артикул</th><th>Цвет</th><th>Размер</th><th>Поставщик</th><th class="n">ЦС</th><th class="n">FBO</th>
+    <th class="n">В пути на FBO</th><th class="n">Заказано ранее</th><th class="n">Спрос в день</th>
+    <th class="n">Точка заказа</th><th class="n">К закупке</th><th>Срок готовности</th><th>Пояснение</th>
+    {% if kind != 'no_reorder' %}<th class="n">Заказано, шт</th>{% endif %}
+  </tr></thead>
+  <tbody>
+  {% for r in rows %}
+    <tr>
+      <td class="nowrap">{{ r.article }}</td><td>{{ r.color }}</td><td>{{ r.size }}</td><td>{{ r.supplier }}</td>
+      <td class="n">{{ r.stock_cs }}</td><td class="n">{{ r.stock_fbo }}</td><td class="n">{{ r.in_transit }}</td>
+      <td class="n">{{ r.on_order }}</td><td class="n">{{ r.daily_demand|num }}</td><td class="n">{{ r.reorder_point|num(1) }}</td>
+      <td class="n"><b>{{ r.qty }}</b></td><td class="nowrap">{{ r.ready_by|dt }}</td>
+      <td><details><summary>расчёт</summary><p>{{ r.explanation }}</p></details></td>
+      {% if kind == 'pending' %}
+        <td class="n"><input class="qty" type="text" inputmode="numeric" name="o_{{ r.recommendation_id }}" value=""></td>
+      {% elif kind == 'ordered' %}
+        <td class="n">{{ r.ordered_qty }} <span class="muted">({{ r.ordered_by }})</span>
+          <button class="secondary small" type="submit" formaction="/purchase/{{ r.recommendation_id }}/received">получено</button></td>
+      {% endif %}
+    </tr>
+  {% else %}
+    <tr><td colspan="14" class="muted">Нет строк.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endmacro %}
+{% block content %}
+<h1>Рекомендации по закупке у поставщика</h1>
+<p class="sub">
+  {% if info %}Пересчёт №{{ info.run_id }} от {{ info.started_at|dt }} · остаток ЦС на {{ info.stock_1c_date|dt }}
+  · остаток FBO на {{ info.stock_fbo_date|dt }}{% else %}Пересчёта ещё не было.{% endif %}
+  · спрос — сумма всех каналов, которые тянут с ЦС
+</p>
+<form method="get" action="/purchase" class="toolbar">
+  <input type="text" name="query" value="{{ query }}" placeholder="Артикул или цвет">
+  <button class="secondary" type="submit">Найти</button>
+  <span class="spacer"></span>
+  <a class="btn secondary" href="/purchase/export.xlsx">Выгрузить в Excel</a>
+</form>
+
+<form method="post" action="/purchase/save">
+  <h2>К закупке — {{ rows|length }} SKU, {{ total_units }} шт.</h2>
+  <div class="toolbar"><button type="submit">Отметить заказанным</button>
+    <span class="muted">Заказанное считается «в пути» до срока готовности (+ запас из настроек) — повторно не предлагается.</span></div>
+  {{ table(rows, true, 'pending') }}
+</form>
+
+{% if no_reorder %}
+<h2>Без пополнения — идут на исчерпание остатка ({{ no_reorder|length }})</h2>
+<p class="muted">Пополнение по расчёту нужно, но модель отмечена как недоступная к заказу у поставщика.</p>
+{{ table(no_reorder, false, 'no_reorder') }}
+{% endif %}
+
+<form method="post" action="/purchase/save">
+  <h2>Уже заказано у поставщика ({{ ordered|length }})</h2>
+  {{ table(ordered, false, 'ordered') }}
+</form>
+{% endblock %}

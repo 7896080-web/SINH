@@ -29,6 +29,7 @@
 | AWER CRM | сервер, `C:\awer_crm_data` | снимок `kitcrm.db` (SQLite backup + integrity_check); разово 5 копий из `backups\` | `selectel:awer-backups/awer_crm` (+ `/app_backups`) | каждые 6 ч | 7 снимков | 30 дней; `app_backups` без срока | работает с 15.10 |
 | direct (WB, Директ) | сервер, `C:\direct` | zip: снимки `wb_history.db`, `wb_rec.db` + таблицы, откаты, журналы, скрипты | `selectel:awer-backups/direct` | 05:30 | 7 архивов | 30 дней | работает с 16.10 |
 | Маркировка | рабочий ПК, `C:\marking` | `marking.db` | `selectel:awer-backups/marking` | раз в сутки, через 10 мин после запуска | по программе | по программе | **НЕ настроено**: в `.env` ещё `yandex:marking_backups` |
+| AWER Forecast (планирование поставок) | ещё не развёрнута; в репозитории `awer_forecast/` | база `forecast.db` (SQLite) или PostgreSQL `forecast` | `selectel:awer-backups/awer_forecast` | раз в сутки, после ежедневного цикла | — | 30 дней | **НЕ настроено**: настроить при установке на сервер |
 
 Время в именах копий Sync Admin — UTC, у остальных — московское.
 
@@ -58,6 +59,7 @@
 ## Осталось сделать
 
 - Маркировка: `rclone config create selectel …` с `--config C:\marking\rclone.conf`, затем `MARKING_RCLONE_REMOTE=selectel:awer-backups/marking` в `.env` и перезапуск.
+- AWER Forecast: при установке на сервер — задача выгрузки снимка базы (SQLite — `Connection.backup()` + `PRAGMA integrity_check`, PostgreSQL — `pg_dump`) в `selectel:awer-backups/awer_forecast`; `.env` (ключи Lamoda, хеш пароля) в облако не класть.
 - Защита от удаления: отдельный бакет с Object Lock или ключ без права удаления, чтобы рабочий ключ не мог стереть все копии.
 - Встроить выгрузку в облако в Репрайсер, Финпомощник и CRM (как в Sync), чтобы её состояние было на «Диагностике», а не только в журнале.
 - Раз в месяц: скачать одну копию из облака и открыть её.
