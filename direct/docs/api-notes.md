@@ -66,6 +66,7 @@
   `get-bids`, `stats` — snake_case (`advert_id`, `nm_id`, `norm_query(ies)`). `get-bids` → `bids[]` с `bid` (₽) и
   `bid_kopecks` — только ручная ставка за показы. Отчёт по кластерам — `wb_clusters.py` (только чтение).
 - Дневной лимит — только для оплаты за клики: `PUT /api/advert/v0/daily-limits`, суммы в копейках.
+- **`PATCH /adv/v0/auction/nms` → 400 «daily limit validation failed»** (21.10.2026): WB не меняет товары кампании, пока её дневной лимит ниже `requiredLimit` (минимум при нынешних ставках; в GET daily-limits — `valid: false`). Обход в `wb_bids.nms_with_limit_room`: на секунды поднять лимит до `requiredLimit`, изменить товары, вернуть лимит.
 - Создание кампании: `POST /adv/v2/seacat/save-ad` (до 50 товаров), ставки при создании — минимальные.
   Пополнение бюджета: `POST /adv/v1/budget/deposit?id=` (`type`: 0 счёт, 1 баланс, 3 бонусы). **Минимум 1 000 ₽** за раз
   (ответ 400 «minimum deposit amount is 1000», проверено 14.10.2026).

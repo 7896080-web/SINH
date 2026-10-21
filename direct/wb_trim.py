@@ -109,6 +109,24 @@ def plan_cabinet(cab, token, limit):
 
 
 def patch_nms(token, advert_id, add=(), delete=()):
+    """Изменить товары кампании. WB отказывает («daily limit validation failed»), пока дневной лимит кампании ниже его
+    минимума при нынешних ставках, — тогда, как автопилот, лимит на время правки поднимается до минимума WB."""
+    try:
+        return _patch_nms(token, advert_id, add, delete)
+    except ApiError as e:
+        if "daily limit validation failed" not in str(e):
+            raise
+        import wb_bids as B
+        try:
+            r = B.nms_with_limit_room(token, advert_id, lambda: _patch_nms(token, advert_id, add, delete))
+        except B.ApiError as e2:
+            raise ApiError(str(e2), e2.status) from e2
+        if r is None:
+            raise
+        return r
+
+
+def _patch_nms(token, advert_id, add=(), delete=()):
     pace(token, "auction_nms", 1.1)
     body = {"nms": [{"advert_id": advert_id, "nms": {"add": list(add), "delete": list(delete)}}]}
     data = call("PATCH", ADV + "/adv/v0/auction/nms", token, body=body, what="Товары кампании") or {}

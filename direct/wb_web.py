@@ -51,6 +51,7 @@ import wb_dashboard as DASH
 IDLE_MIN = 30                      # без запросов столько минут — сервер закрывается
 PORT = 8765                        # постоянный порт: браузер помнит тему, период и кабинет дашборда; занят — любой свободный
 FIELDS = ("daily_limit", "topup_day_cap", "topup_week_cap")      # то же, что правит wb_budget.py (B.BUDGET_KEYS)
+WB_MIN_CPC_LIMIT = 1000        # меньше дневной лимит кампании за клики WB не ставит — меньший держит пауза (wb_guard.py --limits)
 MAX_VALUE = 300000                 # ₽ — больше в одно поле не принимаю (защита от лишнего нуля)
 EXPERIMENT = {"Ребрик": "2026-10-27", "Караман": "2026-10-27"}   # предупреждать: деньги влияют на сравнение
 # -------------------------------------------
@@ -157,7 +158,7 @@ def flags(state, cid):
     if B.pace_paused(state, cid):
         out.append("пауза по графику расхода")
     if B.on_hold(cid):
-        out.append("в стоп-листе wb_hold.txt")
+        out.append("выключена — в стоп-листе wb_hold.txt")
     return out
 
 
@@ -166,6 +167,8 @@ def managed(rules, cab, cid, camps, state):
     (номер или название) — в любом статусе; по общему «*» — только работающая или стоящая на паузе программы (лимит,
     график расхода). Остальное на паузе автопилот не трогает (кроме паузы из-за пустого бюджета — тогда пополнит)."""
     r = rules.get(cab) or {}
+    if B.on_hold(cid) and rule_of(rules, cab, cid, camps) is not None:
+        return True, ""                  # выключена переключателем (стоп-лист) — под управлением, чтобы её можно было включить
     today = dt.date.today().isoformat()
     for k, v in r.items():
         if k == "*" or k.startswith("_") or (v.get("until") and today > v["until"]):
@@ -244,7 +247,8 @@ def collect():
                 continue
             base = rule_of(B.RULES_BASE, cab, cid, camps) or {}
             p = recs.get(str(cid)) or {}
-            row.update({"cur": {k: r.get(k) for k in FIELDS}, "base": {k: base.get(k) for k in FIELDS},
+            row.update({"on": not B.on_hold(cid), "own_limit": own_limit(r, st.get("payment_type")),
+                        "cur": {k: r.get(k) for k in FIELDS}, "base": {k: base.get(k) for k in FIELDS},
                         "topup": bool(r.get("topup_below")), "topped": B.topped_week(state, cid),
                         "manual": (manual.get(str(cid)) or {}).get("date"),
                         "raised": (raised.get(str(cid)) or {}).get("date"),
@@ -419,6 +423,82 @@ def undo_last():
     os.replace(tmp, OVERRIDES)
     files[-1].rename(files[-1].with_suffix(".rolled_back"))
     return files[-1].name
+
+
+def own_limit(rule, pay):
+    """Дневной лимит кампании держит частая проверка лимита паузой (за показы — всегда, за клики — если лимит в правилах
+    ниже минимума WB): включённую такую кампанию запускает она, по графику расхода, а не страница сразу."""
+    lim = (rule or {}).get("daily_limit")
+    return bool(lim) and (pay != "cpc" or lim < WB_MIN_CPC_LIMIT)
+
+
+def hold_edit(cid, name, on):
+    """Стоп-лист wb_hold.txt: выключить — дописать номер с пометкой, включить — убрать строку. Прежний файл — в копию."""
+    try:
+        text = B.HOLD_FILE.read_text(encoding="utf-8-sig")
+    except OSError:
+        text = "# Стоп-лист: номера кампаний WB (по одному в строке), которые скрипты не запускают и не пополняют.\n"
+    BACKUPS.mkdir(exist_ok=True)
+    (BACKUPS / f"hold_{dt.datetime.now():%Y%m%d_%H%M%S}.txt").write_text(text, encoding="utf-8")
+    lines = [ln for ln in text.splitlines() if ln.split("#")[0].strip() != str(cid)]
+    if not on:
+        lines.append(f"{cid}   # «{name}» — выключена на странице «Бюджеты» {dt.datetime.now():%d.%m.%Y %H:%M}")
+    tmp = B.HOLD_FILE.with_suffix(".tmp")
+    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.replace(tmp, B.HOLD_FILE)
+
+
+def toggle(cab, cid, on):
+    """Переключатель «вкл/выкл» кампании под управлением. Выкл — стоп-лист и пауза: автопилот и проверки её не запускают
+    и не пополняют (деньги в бюджете остаются). Вкл — убрать из стоп-листа и запустить; кампанию со своим дневным лимитом
+    запускает частая проверка лимита по графику расхода (≈5 мин; ночью — после 7:00). Возвращает (удалось?, текст)."""
+    token = B.load_tokens().get(cab)
+    if not token:
+        return False, f"нет токена кабинета «{cab}»"
+    camps = B.get_campaigns(token)
+    a = camps.get(cid)
+    if not a:
+        return False, f"кампании {cid} нет среди работающих, на паузе и готовых к запуску"
+    rules = rules_now()
+    if not managed(rules, cab, cid, camps, B.load_state())[0]:
+        return False, f"кампания {cid} не под управлением автопилота — включайте и выключайте её в кабинете WB"
+    st = a.get("settings") or {}
+    name = st.get("name") or str(cid)
+    if not B.lock_acquire("wb_web.py (вкл/выкл)", wait_min=2):
+        return False, "сейчас работает автопилот или проверка — попробуйте через пару минут"
+    try:
+        state = B.load_state()           # под блокировкой — свежее состояние
+        if not on:
+            hold_edit(cid, name, on=False)
+            for k in ("limit_paused", "pace_paused", "start_pending"):
+                (state.get(k) or {}).pop(str(cid), None)
+            B.save_state(state)
+            if a.get("_status") != 9:
+                return True, f"«{name}» выключена: уже стояла на паузе, теперь в стоп-листе — скрипты её не запустят и не пополнят."
+            B.pace(token, "start", 1.1)
+            try:
+                B.call("GET", B.ADV + "/adv/v0/pause", token, params={"id": cid}, what="Пауза кампании")
+            except B.ApiError as e:
+                return False, (f"«{name}» в стоп-листе, но пауза не встала: {e}. Поставьте её на паузу в кабинете WB — "
+                               "скрипты её больше не запустят и не пополнят.")
+            return True, f"«{name}» выключена: на паузе и в стоп-листе — скрипты её не запустят и не пополнят."
+        hold_edit(cid, name, on=True)
+        if a.get("_status") == 9:
+            return True, f"«{name}» включена (она и так работала)."
+        if own_limit(rule_of(rules, cab, cid, camps), st.get("payment_type")):
+            state.setdefault("pace_paused", {})[str(cid)] = {
+                "date": (dt.date.today() - dt.timedelta(days=1)).isoformat(), "at": "включена на странице «Бюджеты»",
+                "spent": None, "limit": None}
+            B.save_state(state)
+            return True, (f"«{name}» включена: её запустит частая проверка лимита в ближайшие 5 минут, по графику расхода "
+                          "(если сегодня лимит уже потрачен — завтра утром; ночью — после 7:00).")
+        n = len(B.out)
+        if B.start_campaign(token, {"advert_id": cid, "name": name, "amount": 0}, state):
+            return True, f"«{name}» включена и запущена."
+        why = " ".join(x.strip() for x in B.out[n:]) or "WB не запустил кампанию"
+        return False, f"«{name}» убрана из стоп-листа, но не запустилась: {why}"
+    finally:
+        B.lock_release()
 
 
 def write_log(lines):
@@ -609,6 +689,21 @@ class Handler(BaseHTTPRequestHandler):
             APP.data = None
             self._send(200, {"saved": len(norm), "backup": name})
             return
+        if path == "/toggle":
+            try:
+                cab, cid, on = str(body.get("cab") or ""), int(body.get("id")), bool(body.get("on"))
+            except (TypeError, ValueError):
+                self._send(200, {"ok": False, "text": "неверный запрос"})
+                return
+            with _write_lock:
+                try:
+                    ok, text = toggle(cab, cid, on)
+                except B.ApiError as e:
+                    ok, text = False, f"WB не ответил: {e}"
+            write_log([("ВКЛЮЧЕНИЕ" if on else "ВЫКЛЮЧЕНИЕ") + f" {cab} {cid}: " + ("" if ok else "НЕ ВЫШЛО — ") + text])
+            APP.data = None
+            self._send(200, {"ok": ok, "text": text})
+            return
         if path == "/undo":
             with _write_lock:
                 name = undo_last()
@@ -715,6 +810,13 @@ input[type=search]{font:inherit;color:var(--ink);background:var(--surface);borde
 th,td{padding:8px 10px;border-bottom:1px solid var(--grid);vertical-align:top;text-align:left}
 th{font-size:12px;color:var(--ink2);font-weight:600;background:var(--surface)}th.num,td.num{text-align:right;white-space:nowrap}
 td{font-variant-numeric:tabular-nums}th.wk,td.wk{background:var(--s1-wash)}
+.cidrow{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.tg{display:inline-flex;align-items:center;gap:6px;cursor:pointer;font-size:12px;color:var(--ink2);user-select:none;position:relative}
+.tg input{position:absolute;opacity:0;width:1px;height:1px;margin:0}
+.tg i{position:relative;width:34px;height:20px;border-radius:999px;background:var(--grid);transition:background .2s;flex:0 0 auto}
+.tg i::after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:var(--surface);box-shadow:0 1px 2px rgba(0,0,0,.3);transition:left .2s}
+.tg input:checked+i{background:var(--s1)}.tg input:checked+i::after{left:16px}
+.tg input:focus-visible+i{outline:2px solid var(--s1);outline-offset:2px}.tg input:disabled+i{opacity:.5}
 .cid{font-weight:600}.name{color:var(--ink2);font-size:12px}.badges{margin-top:4px;display:flex;gap:4px;flex-wrap:wrap}
 .arts{display:flex;flex-wrap:wrap;gap:4px;max-width:440px}.art{font-size:12px;padding:1px 6px;border:1px solid var(--ring);border-radius:6px;white-space:nowrap}
 .art b{font-weight:600}.art span{color:var(--muted)}
@@ -791,7 +893,9 @@ function render(){const el=document.getElementById("cabs");el.innerHTML="";
    `<button class="b sm" data-takeall="${esc(c.cab)}">Взять все рекомендации кабинета</button></div>`;
   h+=`<div class="scroll"><table><thead><tr><th>Кампания</th><th>Артикулы в кампании</th><th class="num">Дневной лимит, ₽</th><th class="num">Пополнений в сутки, ₽</th><th class="num wk">Недельный потолок, ₽</th><th>Рекомендуется</th><th class="num">Пополнено за 7 дн.</th></tr></thead><tbody>`;
   c.camps.forEach(r=>{const hay=(r.id+" "+r.name+" "+r.nms.map(x=>x.vendor+" "+x.nm+" "+x.title).join(" ")).toLowerCase();
-   h+=`<tr data-hay="${esc(hay)}" data-act="${r.active?1:0}"><td><div class="cid">${r.id}</div><div class="name">${esc(r.name)}</div><div class="badges">${badges(r)}</div></td>`+
+   const tg=`<label class="tg" title="${r.on?"Выключить: пауза и стоп-лист — скрипты не запустят и не пополнят":"Включить: убрать из стоп-листа и запустить"}">`+
+    `<input type="checkbox" data-tg="${esc(c.cab)}|${r.id}"${r.on?" checked":""} aria-label="${r.on?"Выключить":"Включить"} кампанию ${r.id}"><i></i><span>${r.on?"вкл":"выкл"}</span></label>`;
+   h+=`<tr data-hay="${esc(hay)}" data-act="${r.active?1:0}"><td><div class="cidrow"><span class="cid">${r.id}</span>${tg}</div><div class="name">${esc(r.name)}</div><div class="badges">${badges(r)}</div></td>`+
    `<td>${arts(r.nms)}</td><td class="num">${inp(c.cab,r.id,"daily_limit",r.cur.daily_limit,r.base.daily_limit,false)}</td>`+
    `<td class="num">${inp(c.cab,r.id,"topup_day_cap",r.cur.topup_day_cap,r.base.topup_day_cap,!r.topup)}</td>`+
    `<td class="num wk">${inp(c.cab,r.id,"topup_week_cap",r.cur.topup_week_cap,r.base.topup_week_cap,!r.topup)}</td>`+
@@ -802,6 +906,7 @@ function render(){const el=document.getElementById("cabs");el.innerHTML="";
   s.innerHTML=h;el.appendChild(s)});
  document.querySelectorAll("input.v").forEach(i=>i.addEventListener("input",onEdit));
  document.querySelectorAll("[data-take]").forEach(b=>b.onclick=()=>{const [c,i]=b.dataset.take.split("|");take(c,i)});
+ document.querySelectorAll("[data-tg]").forEach(cb=>cb.onclick=e=>{e.preventDefault();toggleCamp(cb)});
  document.querySelectorAll("[data-takeall]").forEach(b=>b.onclick=()=>{const c=DATA.cabinets.find(x=>x.cab===b.dataset.takeall);c.camps.forEach(r=>{if(r.rec&&r.active)take(c.cab,r.id)})});
  filter()}
 function changes(){return [...document.querySelectorAll("input.v")].filter(i=>i.value.trim()!==i.dataset.orig).map(i=>({cab:i.dataset.cab,id:i.dataset.id,field:i.dataset.f,value:i.value.trim()}))}
@@ -819,7 +924,16 @@ function box(cls,title,items){return items&&items.length?`<div class="box ${cls}
 // ---------- шкала прогресса: каждое действие идёт через busy(); долгие — с этапами с сервера (/progress) ----------
 const $id=id=>document.getElementById(id);let STACK=[],LOCKS=0,PT=null,RECALC_ON=false;
 const fmtSec=s=>s<60?s+" с":Math.floor(s/60)+" мин "+(s%60)+" с";
-function syncButtons(){const n=changes().length,lk=LOCKS>0;$id("chk").disabled=lk||!n;$id("reset").disabled=lk||!n;
+function toggleCamp(cb){const [cab,id]=cb.dataset.tg.split("|"),c=DATA.cabinets.find(x=>x.cab===cab),r=c&&c.camps.find(x=>String(x.id)===id);
+ if(!r||LOCKS>0)return;
+ if(changes().length){alert("Сначала сохраните или сбросьте правки лимитов: после переключения таблица загрузится заново.");return}
+ const on=!r.on,msg=on?`Включить «${r.name}» (${r.id})?\n\nУберу её из стоп-листа и запущу`+(r.own_limit?
+   ". Запустит частая проверка лимита в ближайшие 5 минут, по графику расхода (если дневной лимит уже потрачен — завтра утром; ночью — после 7:00).":".")
+  :`Выключить «${r.name}» (${r.id})?\n\nКампания встанет на паузу и попадёт в стоп-лист: автопилот и проверки не будут её запускать и пополнять. Деньги в её бюджете останутся. Включить обратно — этим же переключателем.`;
+ if(!confirm(msg))return;
+ busy(on?"Включаю кампанию…":"Выключаю кампанию…",true,async()=>{const res=await api("/toggle",{cab,id:+id,on});await load();
+  $id("plan").innerHTML=`<div class="box ${res.ok?"o":"e"}">${esc(res.text||res.error||"нет ответа")}</div>`;$id("plan").scrollIntoView({behavior:"smooth"})})}
+function syncButtons(){const n=changes().length,lk=LOCKS>0;document.querySelectorAll("[data-tg]").forEach(x=>x.disabled=lk);$id("chk").disabled=lk||!n;$id("reset").disabled=lk||!n;
  $id("save").disabled=lk||!lastDigest;$id("undo").disabled=lk;const r=$id("recalc");if(r)r.disabled=lk||RECALC_ON}
 function showProg(pct,text){const p=$id("prog");p.classList.add("on");p.classList.toggle("ind",pct==null);
  p.querySelector(".fill").style.width=pct==null?"":Math.max(3,Math.round(pct*100))+"%";p.querySelector(".pt").textContent=text;

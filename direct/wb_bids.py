@@ -1882,7 +1882,7 @@ def plan_cabinet(cab, token, rules, state):
                 log(f"    Убрать из кампании (в наличии меньше {r['min_stock']} шт): "
                     + ", ".join(f"{nm} ({stock_label(stock.get(nm))})" for nm in low))
                 for nm in low:
-                    plan["trim"].append({"cabinet": cab, "advert_id": cid, "nm_id": nm, "bid_type": a.get("bid_type"),
+                    plan["trim"].append({"cabinet": cab, "advert_id": cid, "nm_id": nm, "bid_type": a.get("bid_type"), "pay": pay,
                                          "bids_kopecks": bk.get(nm, {}), "stock": available(stock.get(nm))})
                 nms = [nm for nm in nms if nm not in low]
         # ---- убранные раньше из-за малого остатка: вернуть, когда в наличии снова return_stock ----
@@ -3098,19 +3098,91 @@ def patch_nms(token, advert_id, add=(), delete=()):
     return res
 
 
+LIMIT_INVALID = "daily limit validation failed"
+
+
+def nms_with_limit_room(token, aid, fn):
+    """WB не меняет товары кампании, пока её дневной лимит ниже рекомендуемого минимума при нынешних ставках — ответ 400
+    «daily limit validation failed» (найдено 21.10.2026: из-за этого автопилот не мог убрать ни одного товара с малым
+    остатком). В daily-limits это valid=false и requiredLimit. Поднять лимит до requiredLimit (вверх до 100 ₽), сделать fn,
+    сразу вернуть прежний лимит — окно в секунды. None — дело не в лимите (fn не вызывалась)."""
+    lim = get_limits(token, [aid]).get(aid) or {}
+    old, need = int(num(lim.get("dailyLimit"))), int(num(lim.get("requiredLimit")))
+    if not lim.get("enabled") or not need or need <= old:
+        log(f"    лимит кампании {aid}: {rub(old)} ₽, минимум WB {rub(need)} ₽ — отказ не из-за лимита")
+        return None
+    room = -(-need // 10000) * 10000
+    carry = bool(lim.get("carryOverEnabled"))
+
+    def put(v):
+        pace(token, "limits", 12.5)
+        call("PUT", ADV + "/api/advert/v0/daily-limits", token, what="Дневной лимит",
+             body={"advertIds": [aid], "enabled": True, "dailyLimit": int(v), "carryOverEnabled": carry})
+    log(f"    WB не меняет товары, пока дневной лимит ({rub(old)} ₽) ниже его минимума для нынешних ставок "
+        f"({rub(need)} ₽) — на минуту ставлю {rub(room)} ₽")
+    put(room)
+    try:
+        return fn()
+    finally:
+        for attempt in range(3):
+            try:
+                put(old)
+                log(f"    лимит кампании {aid} возвращён: {rub(old)} ₽")
+                break
+            except ApiError as e:
+                if attempt == 2:
+                    log(f"  ✗✗ Лимит кампании {aid} НЕ возвращён ({e}): сейчас {rub(room)} ₽ вместо {rub(old)} ₽ — поставьте "
+                        "его в кабинете WB (следующий запуск автопилота поставит лимит по правилам сам).")
+
+
+def min_bid_instead(token, aid, its):
+    """Товар убрать не вышло — минимальная ставка WB, чтобы он почти не тратил (правило «меньше 15 шт — без рекламы»)."""
+    ok = 0
+    for pl in sorted({"combined" if i.get("bid_type") == "unified" else "search" for i in its}):
+        part = [i for i in its if ("combined" if i.get("bid_type") == "unified" else "search") == pl]
+        mins = get_min_bids(token, aid, [i["nm_id"] for i in part], part[0].get("pay") or "cpc", pl)
+        bids = [{"nm_id": i["nm_id"], "bid_kopecks": mins[i["nm_id"]], "placement": pl} for i in part if mins.get(i["nm_id"])]
+        if not bids:
+            continue
+        pace(token, "patch", 0.3)
+        try:
+            call("PATCH", ADV + "/api/advert/v1/bids", token, body={"bids": [{"advert_id": aid, "nm_bids": bids}]},
+                 what="Ставки товаров")
+            ok += len(bids)
+            log(f"    {aid}: убрать не вышло — минимальная ставка: "
+                + ", ".join(f"{b['nm_id']} {rub(b['bid_kopecks'])} ₽" for b in bids))
+        except ApiError as e:
+            log(f"  ✗ {e}")
+    return ok
+
+
 def apply_trim(token, items, reverse=False):
-    """Убрать товары из кампаний; при откате — вернуть и поставить прежние ставки (WB ставит минимальную)."""
+    """Убрать товары из кампаний; при откате — вернуть и поставить прежние ставки (WB ставит минимальную).
+    Возвращает [(кампания, артикул)] — что WB действительно убрал (вернул)."""
     by = defaultdict(list)
     for i in items:
         by[i["advert_id"]].append(i)
-    ok = 0
+    done = []
     for aid, its in by.items():
+        kw = {"add": [i["nm_id"] for i in its]} if reverse else {"delete": [i["nm_id"] for i in its]}
         try:
-            r = patch_nms(token, aid, **({"add": [i["nm_id"] for i in its]} if reverse else {"delete": [i["nm_id"] for i in its]}))
-            ok += len(r["added"] if reverse else r["deleted"])
+            r = patch_nms(token, aid, **kw)
         except ApiError as e:
-            log(f"  ✗ {e}")
-            continue
+            r = None
+            if LIMIT_INVALID in str(e):
+                try:
+                    r = nms_with_limit_room(token, aid, lambda: patch_nms(token, aid, **kw))
+                except ApiError as e2:
+                    e = e2
+            if r is None:
+                log(f"  ✗ {e}")
+                if not reverse:
+                    min_bid_instead(token, aid, its)
+                continue
+        got = set(r["added"] if reverse else r["deleted"])
+        done += [(aid, i["nm_id"]) for i in its if i["nm_id"] in got]
+        if not reverse and len(got) < len(its):
+            min_bid_instead(token, aid, [i for i in its if i["nm_id"] not in got])
         if reverse:
             bids = []
             for i in its:
@@ -3128,7 +3200,7 @@ def apply_trim(token, items, reverse=False):
                          what="Ставки товаров")
                 except ApiError as e:
                     log(f"  ✗ {e}")
-    return ok
+    return done
 
 
 def run_apply(cabs, plan, key, state, reverse=False):
@@ -3148,18 +3220,23 @@ def run_apply(cabs, plan, key, state, reverse=False):
                 if n_dep:
                     res.append(f"пополнено бюджетов {n_ok}/{n_dep}")
         if sel.get("trim"):
-            res.append(f"{'возвращено' if reverse else 'убрано'} товаров {apply_trim(tok, sel['trim'], reverse)}/{len(sel['trim'])}")
+            done = set(apply_trim(tok, sel["trim"], reverse))
+            res.append(f"{'возвращено' if reverse else 'убрано'} товаров {len(done)}/{len(sel['trim'])}")
             tr = state.setdefault("trimmed", {})
             for i in sel["trim"]:
+                if (i["advert_id"], i["nm_id"]) not in done:
+                    continue                    # WB не убрал (не вернул) — в состоянии как было
                 if reverse:
                     tr.pop(pk(i["advert_id"], i["nm_id"]), None)
                 else:
                     tr[pk(i["advert_id"], i["nm_id"])] = {**i, "date": dt.date.today().isoformat()}
         if sel.get("untrim"):
-            res.append(f"{'снова убрано' if reverse else 'возвращено в кампании'} товаров "
-                       f"{apply_trim(tok, sel['untrim'], not reverse)}/{len(sel['untrim'])}")
+            done = set(apply_trim(tok, sel["untrim"], not reverse))
+            res.append(f"{'снова убрано' if reverse else 'возвращено в кампании'} товаров {len(done)}/{len(sel['untrim'])}")
             tr = state.setdefault("trimmed", {})
             for i in sel["untrim"]:
+                if (i["advert_id"], i["nm_id"]) not in done:
+                    continue
                 if reverse:
                     tr[pk(i["advert_id"], i["nm_id"])] = {**i, "date": dt.date.today().isoformat()}
                 else:
