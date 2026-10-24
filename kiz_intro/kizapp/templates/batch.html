@@ -87,6 +87,11 @@
   <p class="muted">«Нанесён» ЧЗ ставит сам после заказа — время нестабильно; жмите «Проверить статусы», пока коды не станут «нанесён».
     ТН ВЭД и разрешительный документ — из карточки Нацкаталога. Страница обновляет себя раз в минуту, пока коды не в обороте.</p>
   <div id="log"></div>
+  {% if delete_refusal %}<p class="muted">Удалить партию нельзя: {{ delete_refusal }}.</p>
+  {% else %}<form method="post" action="/batch/{{ batch.id }}/delete" style="margin-top:12px"
+      onsubmit="return confirm('Удалить партию #{{ batch.id }} ({{ org.name }}) — {{ s.total }} кодов? Коды в ЧЗ это не затрагивает: файл можно будет загрузить заново под нужным ИП.')">
+    <button class="danger">Удалить партию</button>
+    <span class="muted">— если загружена по ошибке (не тот ИП, не тот файл)</span></form>{% endif %}
 </div>
 
 {% if docs %}

@@ -422,6 +422,49 @@ def release_unknown(db: Session, doc: Doc) -> None:
     _release(db, doc)
 
 
+# --- Удаление партии ------------------------------------------------------------------------
+
+# Документ, который мог дойти до ЧЗ или уже принят: партию с ним не удаляем.
+# «new» не отправлялся, «error» и «CHECKED_NOT_OK» — ЧЗ его не принял.
+DOC_REACHED_CHZ = ("sending", "unknown", "sent", "CHECKED_OK")
+
+
+def delete_refusal(db: Session, batch: Batch) -> str:
+    """Почему партию нельзя удалить; пусто — можно.
+
+    Удаление — только для партии, загруженной по ошибке (не тот ИП, не тот
+    файл): коды из неё ни разу не ушли в ЧЗ документом. Иначе исчезла бы
+    единственная запись о том, что ИП ввёл коды в оборот, и по ним не собрать
+    ни файл кодов, ни CSV для УПД. Статусы кодов — сведения ЧЗ, у нас удаление
+    их не меняет; запрещаем по «в обороте», чтобы не потерять запись о вводе.
+    """
+    db.flush()
+    sent = db.query(Doc).filter(Doc.batch_id == batch.id, Doc.status.in_(DOC_REACHED_CHZ)).count()
+    if sent:
+        return f"по партии есть документ ввода, отправленный в ЧЗ ({sent})"
+    introduced = db.query(Code).filter(Code.batch_id == batch.id, Code.status == "INTRODUCED").count()
+    if introduced:
+        return f"коды партии в обороте ({introduced})"
+    return ""
+
+
+def delete_batch(db: Session, batch: Batch) -> int:
+    """Удалить партию с кодами и неотправленными документами. Возвращает число кодов.
+
+    Сами коды в ЧЗ не трогаются — удаляется только наша запись, и тот же файл
+    можно загрузить снова под нужным ИП."""
+    why = delete_refusal(db, batch)
+    if why:
+        raise KizError(f"партию #{batch.id} удалить нельзя: {why}")
+    o = org_of(db, batch)
+    n = db.query(Code).filter(Code.batch_id == batch.id).delete(synchronize_session=False)
+    db.query(Doc).filter(Doc.batch_id == batch.id).delete(synchronize_session=False)
+    log(db, "delete", f"партия #{batch.id} ({o.name}): {batch.title}, кодов {n} — удалена")
+    db.delete(batch)
+    db.flush()
+    return n
+
+
 # --- Выдача --------------------------------------------------------------------------------
 
 def txt(db: Session, batch: Batch) -> bytes:

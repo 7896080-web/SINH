@@ -41,13 +41,16 @@
   <h2>Партии</h2>
   {% if batches %}
   <table>
-    <tr><th>#</th><th>ИП</th><th>Файл</th><th class="num">Кодов</th><th>Статусы</th><th>Итог</th><th>Загружено</th></tr>
-    {% for b, oname, s in batches %}
+    <tr><th>#</th><th>ИП</th><th>Файл</th><th class="num">Кодов</th><th>Статусы</th><th>Итог</th><th>Загружено</th><th></th></tr>
+    {% for b, oname, s, refusal in batches %}
     <tr><td><a href="/batch/{{ b.id }}">{{ b.id }}</a></td><td>{{ oname }}</td><td><a href="/batch/{{ b.id }}">{{ b.title }}</a></td>
       <td class="num">{{ s.total }}</td>
       <td>{% for st, n in s.statuses.most_common() %}{{ status_ru.get(st, st) }} {{ n }}{{ ', ' if not loop.last }}{% endfor %}</td>
       <td class="{{ 'ok' if s.done else 'warn' }}">{{ 'в обороте ✔' if s.done else 'в обороте ' ~ s.introduced ~ ' из ' ~ s.total }}</td>
-      <td>{{ b.created_at|local_time }}</td></tr>
+      <td>{{ b.created_at|local_time }}</td>
+      <td>{% if not refusal %}<form method="post" action="/batch/{{ b.id }}/delete"
+          onsubmit="return confirm('Удалить партию #{{ b.id }} ({{ oname }}) — {{ s.total }} кодов? Коды в ЧЗ это не затрагивает: файл можно будет загрузить заново под нужным ИП.')">
+          <button class="danger">Удалить</button></form>{% endif %}</td></tr>
     {% endfor %}
   </table>
   {% else %}<p class="muted">Партий пока нет.</p>{% endif %}

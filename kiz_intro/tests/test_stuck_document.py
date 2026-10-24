@@ -68,3 +68,67 @@ def test_release_refused_with_stale_statuses_or_introduced_codes(db, chz_fake):
     c.status, c.status_at = "INTRODUCED", now_utc()
     with pytest.raises(S.KizError, match="уже в обороте"):
         S.release_unknown(db, d)
+
+
+# --- Удаление партии, загруженной по ошибке (24.10.2026: коды другого ИП) -------------------
+
+def _loaded(db, n=3, status=""):
+    from kizapp.models import Org
+    o = db.query(Org).first() or org(db)
+    b = Batch(org_id=o.id, title="джинсы.pdf")
+    db.add(b)
+    db.flush()
+    for i in range(n):
+        db.add(Code(batch_id=b.id, cis=f"01{GTIN}21{i:013d}", full_enc=encrypt("x"), gtin=GTIN,
+                    status=status))
+    db.commit()
+    return b
+
+
+def test_batch_loaded_by_mistake_is_deleted_with_its_codes(db):
+    b = _loaded(db)
+    d = Doc(batch_id=b.id, document="x", codes_count=3, status="CHECKED_NOT_OK")   # ЧЗ не принял
+    db.add(d)
+    db.commit()
+    assert S.delete_refusal(db, b) == ""
+    assert S.delete_batch(db, b) == 3
+    db.commit()
+    assert db.query(Batch).count() == 0 and db.query(Code).count() == 0 and db.query(Doc).count() == 0
+
+
+def test_codes_can_be_loaded_again_after_deletion(db):
+    """Удаление и есть способ перенести коды к нужному ИП: cis уникален."""
+    b = _loaded(db)
+    S.delete_batch(db, b)
+    db.commit()
+    again = _loaded(db)                    # те же коды — повторная загрузка не упирается в уникальность
+    assert db.query(Code).filter(Code.batch_id == again.id).count() == 3
+
+
+@pytest.mark.parametrize("status", ["sending", "unknown", "sent", "CHECKED_OK"])
+def test_batch_with_a_document_that_reached_chz_is_not_deleted(db, status):
+    b = _loaded(db)
+    db.add(Doc(batch_id=b.id, document="x", codes_count=3, status=status))
+    db.commit()
+    assert "документ ввода" in S.delete_refusal(db, b)
+    with pytest.raises(S.KizError, match="удалить нельзя"):
+        S.delete_batch(db, b)
+    assert db.query(Code).count() == 3
+
+
+def test_batch_with_introduced_codes_is_not_deleted(db):
+    b = _loaded(db, status="INTRODUCED")
+    assert "в обороте" in S.delete_refusal(db, b)
+
+
+def test_delete_button_and_refusal_on_pages(client, db):
+    b = _loaded(db)
+    assert f'action="/batch/{b.id}/delete"' in client.get("/").text
+    r = client.post(f"/batch/{b.id}/delete")
+    assert r.status_code == 200 and "удалена, кодов 3" in r.text
+    db.expire_all()
+    b2 = _loaded(db, status="INTRODUCED")
+    page = client.get("/").text
+    assert f'action="/batch/{b2.id}/delete"' not in page
+    r = client.post(f"/batch/{b2.id}/delete")
+    assert "удалить нельзя" in r.text and db.query(Code).count() == 3

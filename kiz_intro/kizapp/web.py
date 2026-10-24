@@ -70,7 +70,8 @@ def index(request: Request, db: Session = Depends(get_db)):
     names = {o.id: o.name for o in orgs}
     return _render(request, "index.html", orgs=[(o, S.token(o) is not None,
                                                 db.query(Card).filter(Card.org_id == o.id).count()) for o in orgs],
-                   batches=[(b, names.get(b.org_id, "?"), S.summary(db, b)) for b in batches],
+                   batches=[(b, names.get(b.org_id, "?"), S.summary(db, b), S.delete_refusal(db, b))
+                            for b in batches],
                    status_ru=S.STATUS_RU, label_templates=L.templates(db),
                    placeholders=L.PLACEHOLDERS,
                    journal=db.query(Journal).order_by(Journal.id.desc()).limit(15).all())
@@ -221,7 +222,23 @@ def batch_page(batch_id: int, request: Request, db: Session = Depends(get_db)):
     return _render(request, "batch.html", org=o, batch=b, s=S.summary(db, b), token_ok=S.token(o) is not None,
                    label_templates=tpls, upd_lines=S.upd_lines(db, b), upd_vat=S.UPD_VAT,
                    docs=db.query(Doc).filter(Doc.batch_id == b.id).order_by(Doc.id.desc()).all(),
+                   delete_refusal=S.delete_refusal(db, b),
                    status_ru=S.STATUS_RU, doc_ru=S.DOC_RU, cert_ru=S.CERT_RU)
+
+
+@app.post("/batch/{batch_id}/delete")
+def batch_delete(batch_id: int, db: Session = Depends(get_db)):
+    b = db.get(Batch, batch_id)
+    if b is None:
+        return _go("/")
+    title = b.title
+    try:
+        n = S.delete_batch(db, b)
+    except S.KizError as e:
+        db.rollback()
+        return _go(f"/batch/{batch_id}", str(e), "error")
+    db.commit()
+    return _go("/", f"Партия #{batch_id} ({title}) удалена, кодов {n}. Файл можно загрузить заново под нужным ИП.")
 
 
 @app.post("/batch/{batch_id}/refresh")
