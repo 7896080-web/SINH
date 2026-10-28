@@ -878,6 +878,25 @@ def attrs_by_sku(db: Session, supply: Supply) -> tuple[dict[str, dict], list[str
     return out, problems
 
 
+def _nk_reason(db: Session, sku: str) -> str:
+    """Почему карточка НК не дала данных документа — в текст отказа.
+
+    28.10.2026: «нет ТН ВЭД, номер документа…» по 50 артикулам, и по тексту не
+    понять, что делать — ждать карточку, заводить её в Нацкаталоге или вписать
+    данные руками. Ответ — состояние карточки."""
+    pair = db.query(GtinPair).filter(GtinPair.supplier_sku == sku).first()
+    if pair is None:
+        return " (нет GTIN в справочнике)"
+    card = db.get(NkCard, pair.gtin)
+    if card is None or card.status == "pending":
+        return " (карточка НК ещё не загружена — нужен вход в ЧЗ, программа запросит её сама)"
+    if card.status == "not_found":
+        return " (карточки в Нацкаталоге нет)"
+    if card.status != "ok":
+        return f" (карточка НК не загрузилась: {card.error or card.status})"
+    return " (в карточке НК этих данных нет)"
+
+
 def ready_codes(db: Session, supply: Supply) -> list[MarkCode]:
     """Нанесённые коды, не лежащие в документе, который ещё идёт, принят или
     с неизвестным исходом (статус кода «в обороте» догонит документ)."""
@@ -920,7 +939,7 @@ def prepare_introduce(db: Session, supply: Supply, username: str) -> IntroduceDo
                                   ("cert_date", "дата документа"), ("cert_type", "тип документа"))
                    if not a.get(k)]
         if missing:
-            problems.append(f"{sku}: нет {', '.join(missing)}")
+            problems.append(f"{sku}: нет {', '.join(missing)}{_nk_reason(db, sku)}")
     if problems:
         raise CodesError("документ не собран — " + "; ".join(problems[:5])
                          + (f" и ещё {len(problems) - 5}" if len(problems) > 5 else ""))

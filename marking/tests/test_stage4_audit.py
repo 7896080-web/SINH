@@ -284,3 +284,26 @@ def test_introduction_is_own_production_by_the_ip_itself(db, supply, fake):
     inn = supply.organization.inn
     assert body["production_type"] == "OWN_PRODUCTION"
     assert body["producer_inn"] == body["owner_inn"] == body["participant_inn"] == inn
+
+
+@pytest.mark.parametrize("card, reason", [
+    (None, "ещё не загружена"),
+    ("not_found", "карточки в Нацкаталоге нет"),
+    ("error", "не загрузилась"),
+    ("ok", "в карточке НК этих данных нет"),
+])
+def test_missing_document_data_names_the_state_of_the_nk_card(db, supply, fake, card, reason):
+    """28.10.2026: «нет ТН ВЭД, номер документа…» по 50 артикулам — без причины
+    непонятно, ждать ли карточку или вписывать данные руками."""
+    from markapp.models import NkCard
+    _, state = fake
+    _applied(db, supply, state)
+    supply.rows[0].extras = [""]                     # ТН ВЭД из файла не берём
+    for g in (GTIN_A, GTIN_B):
+        if card:
+            db.merge(NkCard(gtin=g, status=card, error="HTTP 500" if card == "error" else ""))
+    C.save_defaults(supply, "", "", "", "", "2026-09-30")
+    db.flush()
+    with pytest.raises(C.CodesError) as e:
+        C.prepare_introduce(db, supply, "op")
+    assert "нет" in str(e.value) and reason in str(e.value)
