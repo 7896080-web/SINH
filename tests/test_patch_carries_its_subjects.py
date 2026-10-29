@@ -59,28 +59,44 @@ def test_the_script_a_test_runs_goes_with_it(tmp_path):
     assert "scripts/probe_accounts.py" in carried, (
         "тест уехал без предмета — на сервере он упадёт с «can't open file», "
         "и узнается это только в накате, после копии базы")
-    assert "scripts/probe_accounts.py" in printed, (
-        "дотянутый файл обязан быть НАЗВАН: молча увезённый файл однажды "
-        "окажется не тем, что человек собирался поставить")
+    # Строкой, а не «имя где-то в выводе»: оно есть и в итоговом
+    # `print(info)`, то есть такая проверка переживала бы вынутую печать.
+    assert "дотянут предмет теста: scripts/probe_accounts.py" in printed, printed
 
 
 def test_it_pulls_the_subject_but_not_the_whole_repository(tmp_path):
     """Обратная проверка, без которой первая молчала бы и на «везём всё».
 
-    Сканер кодировки берёт каталоги ГЛОБОМ и ни одного скрипта по имени не
-    называет: дотягивать ему нечего. Пройди эта проверка с «везём всё подряд», и
-    патч раздувался бы до репозитория, а сверка sha перестала бы что-либо значить.
-    """
-    carried, _ = _build(tmp_path, "tests/test_subprocess_encoding.py")
+    Тест, который не называет ни одного `.py` и ничего локального не
+    импортирует, дотягивать нечего — таков сканер кодировки, берущий каталоги
+    ГЛОБОМ. Пройди эта проверка с «везём всё подряд», и патч раздувался бы до
+    репозитория, а сверка sha перестала бы что-либо значить.
 
-    assert carried == {"tests/test_subprocess_encoding.py"}, carried
+    Корень СВОЙ, а не настоящий репозиторий, и это не опрятность: на настоящем
+    в патч попадают ещё и ИЗМЕНЁННЫЕ файлы релиза (генератор дотягивает их
+    намеренно, см. ниже), то есть точное равенство множеств зависело бы от
+    того, что я правлю рядом, — проверка краснела бы от чужой работы.
+    """
+    root = tmp_path / "root"
+    (root / "tests").mkdir(parents=True)
+    (root / "tests" / "test_scanner.py").write_text(
+        'import os\nfrom pathlib import Path\nGLOB = "scripts/*.py"\n',
+        encoding="utf-8")
+
+    carried, _ = _build(tmp_path, "tests/test_scanner.py", root=root)
+
+    assert carried == {"tests/test_scanner.py"}, carried
 
 
 def test_a_patch_without_tests_is_left_alone(tmp_path):
     """Патч из одних боевых файлов не трогаем вовсе: предмета искать не у кого."""
-    carried, printed = _build(tmp_path, "app/backup.py")
+    root = tmp_path / "root"
+    (root / "app").mkdir(parents=True)
+    (root / "app" / "thing.py").write_text("x = 1\n", encoding="utf-8")
 
-    assert carried == {"app/backup.py"}
+    carried, printed = _build(tmp_path, "app/thing.py", root=root)
+
+    assert carried == {"app/thing.py"}, carried
     assert "дотянут" not in printed
 
 
@@ -153,7 +169,7 @@ def test_a_helper_reached_only_by_import_goes_too(tmp_path):
     assert "scripts/deep_helper.py" in carried, carried
     # Транзитивно и через скрипты: helper импортирует своего helper'а.
     assert "scripts/third.py" in carried, carried
-    assert "scripts/helper.py" in printed, "дотянутый файл обязан быть НАЗВАН"
+    assert "дотянут предмет теста: scripts/helper.py" in printed, printed
 
 
 def test_a_test_helper_module_goes_too(tmp_path):
@@ -226,3 +242,148 @@ def test_a_default_path_inside_a_script_is_not_followed(tmp_path):
     carried, _ = _build(tmp_path, "tests/test_tool.py", root=root)
 
     assert carried == {"tests/test_tool.py", "scripts/tool.py"}, carried
+
+
+# ---------------------------------------------------------------------------
+# Патч не должен САМ создавать расхождения в описи
+# ---------------------------------------------------------------------------
+
+def _repo(root: Path, files: dict) -> None:
+    """Синтетический репозиторий: файлы разложены и закоммичены.
+
+    Нужен именно репозиторий: опись собирается из `git ls-files`, а
+    «изменённые файлы релиза» — из `git diff HEAD`, и на корне без git обе
+    отвечают пустотой, то есть проверка сторожила бы пустоту.
+    """
+    for rel, text in files.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+               GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+    for args in (["init", "-q"], ["add", "-A"], ["commit", "-qm", "base"]):
+        subprocess.run(["git", "-C", str(root), *args], check=True,
+                       capture_output=True, env=env)
+
+
+def _inventory(tmp_path, *files, root) -> tuple[set[str], set[str], str]:
+    """(что увезёт патч, что перечислит опись, что напечатал генератор)."""
+    out = tmp_path / "inv_deploy.ps1"
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    done = subprocess.run(
+        [sys.executable, str(GEN), "--tag", "probe", "--parts", "1",
+         "--root", str(root), "--out", str(out), *files],
+        cwd=str(ROOT), capture_output=True, encoding="utf-8",
+        errors="replace", env=env)
+    assert done.returncode == 0, done.stdout + done.stderr
+    text = out.read_text(encoding="utf-8-sig")
+    blocks = re.findall(r"@'\n(.*?)\n'@", text, re.S)
+    b64 = "".join("".join(b.split()) for b in blocks)
+    apply_src = zlib.decompress(base64.b64decode(b64)).decode("utf-8")
+    shipped = re.search(r"^FILES = (\[.*?\])\nDELETE", apply_src, re.S | re.M)
+    listed = re.search(r"^INVENTORY = (\[.*?\])\nRELEASE_DIRS", apply_src, re.S | re.M)
+    assert shipped and listed, "в apply-скрипте не нашлись список файлов и опись"
+    return ({rel for rel, _s, _d in ast.literal_eval(shipped.group(1))},
+            {rel for rel, _s in ast.literal_eval(listed.group(1))},
+            done.stdout)
+
+
+def test_a_file_the_patch_ships_is_part_of_the_release(tmp_path):
+    """Что патч ВЕЗЁТ, то в описи и состоит — иначе он сам плодит «лишние».
+
+    29.10 на pm170: новая миграция собиралась в патч ДО коммита, `git ls-files`
+    про неё не знал, в опись она не попала — а на диске сервера появилась, и
+    накат назвал её ЛИШНЕЙ. Так на каждом накате, пока её не подберёт опись
+    следующего патча. Цена не в одной строке: лишние разбирают руками, и
+    настоящий осадок прежних патчей утонул бы в наших же свежих файлах.
+    """
+    root = tmp_path / "root"
+    _repo(root, {"app/old.py": "x = 1\n"})
+    (root / "alembic" / "versions").mkdir(parents=True)
+    (root / "alembic" / "versions" / "new_migration.py").write_text(
+        "x = 1\n", encoding="utf-8")
+
+    shipped, listed, _ = _inventory(
+        tmp_path, "alembic/versions/new_migration.py", root=root)
+
+    assert "alembic/versions/new_migration.py" in shipped
+    assert "alembic/versions/new_migration.py" in listed, (
+        "привезённый файл не попал в опись — накат назовёт его лишним")
+    # И прежнее на месте: опись по-прежнему про ВЕСЬ релиз, а не про патч.
+    assert "app/old.py" in listed, listed
+
+
+def test_a_file_outside_the_release_stays_outside_the_inventory(tmp_path):
+    """Обратная проверка: `1c/` передают явно, и в опись он идти НЕ должен.
+
+    Без неё «что везём, то и в описи» прошло бы как «везём — значит релиз», и
+    каталог, который накат намеренно не возит, начал бы требоваться от сервера
+    на каждом накате.
+    """
+    root = tmp_path / "root"
+    _repo(root, {"app/old.py": "x = 1\n", "1c/module.txt": "a\n"})
+
+    shipped, listed, _ = _inventory(tmp_path, "1c/module.txt", root=root)
+
+    assert "1c/module.txt" in shipped
+    assert "1c/module.txt" not in listed, listed
+
+
+def test_an_empty_inventory_stays_empty(tmp_path):
+    """Нет git — опись ПУСТАЯ, сколько бы файлов патч ни вёз.
+
+    Пустая опись на сервере значит «ответа нет» и проверку пропускает, а опись
+    из одних привезённых объявила бы лишними ВСЕ остальные триста с лишним
+    файлов релиза — то есть тревогу на исправной установке, после которой её
+    не читают больше никогда.
+    """
+    root = tmp_path / "root"
+    (root / "app").mkdir(parents=True)
+    (root / "app" / "thing.py").write_text("x = 1\n", encoding="utf-8")
+
+    shipped, listed, printed = _inventory(tmp_path, "app/thing.py", root=root)
+
+    assert shipped == {"app/thing.py"}
+    assert listed == set(), listed
+    assert "ОПИСЬ НЕ СОБРАНА" in printed
+
+
+def test_a_changed_release_file_goes_with_the_patch(tmp_path):
+    """Изменённый файл релиза дотягивается — иначе накат краснеет сам от себя.
+
+    29.10 на pm170 `CLAUDE.md` исключили из списка руками (документация, не
+    боевой код), и накат ответил «разошлись с релизом: 1» на полностью
+    исправной установке: опись считает sha по ДИСКУ, а на сервере лежит
+    прежнее содержимое, и само это не сойдётся никогда. Дотягиваем, как
+    дотягиваем предмет теста, и НАЗЫВАЕМ вслух.
+    """
+    root = tmp_path / "root"
+    _repo(root, {"app/one.py": "x = 1\n", "CLAUDE.md": "правила\n"})
+    (root / "CLAUDE.md").write_text("правила и ещё строка\n", encoding="utf-8")
+
+    shipped, _listed, printed = _inventory(tmp_path, "app/one.py", root=root)
+
+    assert "CLAUDE.md" in shipped, (
+        "изменённый файл релиза не уехал — опись объявит его разошедшимся")
+    # Ищем САМУ СТРОКУ, а не имя в выводе: имя попадает ещё и в итоговый
+    # `print(info)` (там же лежит `stale_in_release`), и проверка «имя где-то
+    # есть» была зелёной с вынутой печатью — поймано мутацией.
+    assert "дотянут изменённый файл релиза: CLAUDE.md" in printed, printed
+
+
+def test_a_changed_file_outside_the_release_stays_home(tmp_path):
+    """Обратная проверка, и она тут важнее прямой.
+
+    `README.md`, аудиты, `1c/` накат не возит НАМЕРЕННО, и в описи их нет —
+    значит разойтись они не могут, а дотянув их, патч увозил бы на боевой
+    сервер то, что там не нужно, причём на каждой правке документации.
+    """
+    root = tmp_path / "root"
+    _repo(root, {"app/one.py": "x = 1\n", "README.md": "текст\n",
+                 "1c/module.txt": "a\n"})
+    (root / "README.md").write_text("другой текст\n", encoding="utf-8")
+    (root / "1c" / "module.txt").write_text("b\n", encoding="utf-8")
+
+    shipped, _listed, _ = _inventory(tmp_path, "app/one.py", root=root)
+
+    assert shipped == {"app/one.py"}, shipped

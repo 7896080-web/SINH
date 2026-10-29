@@ -100,7 +100,28 @@ def in_release(rel: str) -> bool:
     return rel.startswith(RELEASE_DIRS) or rel in RELEASE_ROOT_FILES
 
 
-def inventory_of(root: str) -> list[tuple[str, str]]:
+def dirty_release_files(root: str) -> list[str]:
+    """Файлы РЕЛИЗА, чьё содержимое на диске разошлось с последним коммитом.
+
+    Спрашиваем ровно про отслеживаемые и ровно про изменённые: новые файлы в
+    обход не идут намеренно — среди неотслеживаемого лежит временная копия
+    модуля, которую заводит тест (`scripts/_probe_invariant_broken.py`), и
+    дотяни мы её, патч увёз бы на боевой сервер чужой опыт.
+    """
+    import subprocess
+
+    try:
+        out = subprocess.run(["git", "-C", root, "diff", "--name-only", "-z", "HEAD"],
+                             check=True, capture_output=True)
+    except (OSError, subprocess.CalledProcessError):
+        # Нет git, корень не репозиторий, нет ни одного коммита — патч всё
+        # равно собираем: доставка файлов важнее диагностики.
+        return []
+    return sorted(p for p in out.stdout.decode("utf-8").split("\0")
+                  if p and in_release(p))
+
+
+def inventory_of(root: str, shipped: list[str] | None = None) -> list[tuple[str, str]]:
     """Опись релиза: путь и sha256 КАЖДОГО файла, который обязан лежать на
     сервере, — независимо от того, везёт ли его этот патч.
 
@@ -109,11 +130,30 @@ def inventory_of(root: str) -> list[tuple[str, str]]:
     сверяет то, что В патче, а не то, чего в нём нет. 15.10 так и вышло —
     `scripts/probe_accounts.py` не привозил ни один патч, и десять тестов
     упали на бою через тридцать три минуты после начала наката.
+
+    **Что патч ВЕЗЁТ, то в релизе и состоит** — `shipped`, и это не
+    придирка. 29.10 на pm170 опись назвала «лишними» два файла, и один из них
+    был новой миграцией `9aa66dd8218b`: патч собирался ДО коммита, `git
+    ls-files` про неё ещё не знал, в опись она не попала — а на диске сервера
+    появилась. То есть патч своими руками создал «лишний» файл, и так на
+    каждом накате, пока его не унесёт следующая опись. Цена не в одной строке:
+    лишние разбирают РУКАМИ, и осадок прежних патчей (`pm132_deploy.ps1`)
+    тонул бы в наших же свежих файлах. Шлём не из релиза (`1c/` передают
+    явно) — в опись не идёт: туда он и не обязан.
+
+    Пустой список отслеживаемого оставляет опись ПУСТОЙ, сколько бы файлов
+    патч ни вёз. Пустая опись на сервере значит «ответа нет» и проверку
+    пропускает, а опись из одних привезённых объявила бы лишними ВСЕ
+    остальные триста с лишним файлов — то есть тревогу на исправной
+    установке, после которой её не читают больше никогда.
     """
+    tracked = tracked_files(root)
+    if not tracked:
+        return []
+    rels = {rel for rel in tracked if in_release(rel)}
+    rels.update(rel for rel in (shipped or []) if in_release(rel))
     found = []
-    for rel in tracked_files(root):
-        if not in_release(rel):
-            continue
+    for rel in sorted(rels):
         with open(os.path.join(root, rel), "rb") as f:
             found.append((rel, hashlib.sha256(f.read()).hexdigest()))
     return sorted(found)
@@ -538,12 +578,24 @@ def build(root: str, files: list[str], tag: str, parts: int, width: int,
           delete: list[str] | None = None) -> tuple[str, dict]:
     pulled = subjects_of(root, files)
     files = list(files) + pulled
+    # Изменённый файл релиза, которого патч НЕ везёт, опись объявит
+    # «разошедшимся с релизом» — и будет права: опись считает sha по ДИСКУ, а
+    # на сервере лежит прежнее содержимое, и само это не сойдётся никогда.
+    # 29.10 на pm170 так и вышло с `CLAUDE.md`: его исключили из списка руками
+    # (документация, не боевой код), и накат ответил «разошлись с релизом: 1»
+    # на полностью исправной установке. Поэтому ДОТЯГИВАЕМ, как дотягиваем
+    # предмет теста, и по той же причине: отказ пришлось бы обходить руками на
+    # каждом патче, а дотянутый файл при совпадении sha на сервере даже не
+    # пишется. Молча нельзя — патч однажды увёз бы не то, что человек собирался
+    # поставить, поэтому генератор это печатает.
+    stale = [rel for rel in dirty_release_files(root) if rel not in files]
+    files = files + stale
     entries = []
     for rel in files:
         with open(os.path.join(root, rel), "rb") as f:
             data = f.read()
         entries.append((rel, hashlib.sha256(data).hexdigest(), base64.b64encode(data).decode("ascii")))
-    inventory = inventory_of(root)
+    inventory = inventory_of(root, files)
     apply_src = APPLY_TEMPLATE.format(
         tag=tag, files=entries, delete=list(delete or []),
         inventory=inventory, release_dirs=RELEASE_DIRS).encode("utf-8")
@@ -569,7 +621,7 @@ def build(root: str, files: list[str], tag: str, parts: int, width: int,
     info = {"files": len(entries), "deleted": len(delete or []),
             "raw_bytes": len(apply_src), "b64_len": len(b64),
             "parts": len(pieces), "full_sha": full_sha, "pulled_in": pulled,
-            "inventory": len(inventory)}
+            "stale_in_release": stale, "inventory": len(inventory)}
     return "".join(out), info
 
 
@@ -597,6 +649,10 @@ def main() -> int:
         f.write(text)
     for rel in info["pulled_in"]:
         print(f"+ дотянут предмет теста: {rel}")
+    for rel in info["stale_in_release"]:
+        # Не везти его значило бы выпустить патч, который сам создаёт
+        # «разошлись с релизом» на исправной установке.
+        print(f"+ дотянут изменённый файл релиза: {rel}")
     if not info["inventory"]:
         # Молча патч без описи выпускать нельзя: на сервере она отвечает на
         # вопрос «а всё ли на месте», и её отсутствие — это минус один ответ,
