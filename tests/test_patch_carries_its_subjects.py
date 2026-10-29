@@ -20,13 +20,27 @@ import ast
 import base64
 import os
 import re
+import shutil
 import subprocess
 import sys
 import zlib
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 GEN = ROOT / "scripts" / "gen_whole_file_patch.py"
+
+# Проверки, которым нужен СВОЙ репозиторий, на боевом сервере не работают: git
+# там не установлен вовсе (первый абзац CLAUDE.md), и `subprocess.run(["git",
+# …])` отвечает `FileNotFoundError`. 29.10 на pm171 этим встал накат — уже
+# после копии базы и перед перезапуском служб, то есть ровно как pm147, pm148 и
+# pm167. Здесь они зелёные, значит починить по месту нельзя; маркер обязателен,
+# и требует его сканер `tests/test_repository_only_marks.py`.
+repository_only = pytest.mark.skipif(
+    shutil.which("git") is None,
+    reason="проверке нужен свой git-репозиторий, а на боевом сервере git не "
+           "установлен — опись там и так собирается пустой")
 
 
 def _build(tmp_path, *files, root=ROOT) -> tuple[set[str], str]:
@@ -288,6 +302,7 @@ def _inventory(tmp_path, *files, root) -> tuple[set[str], set[str], str]:
             done.stdout)
 
 
+@repository_only
 def test_a_file_the_patch_ships_is_part_of_the_release(tmp_path):
     """Что патч ВЕЗЁТ, то в описи и состоит — иначе он сам плодит «лишние».
 
@@ -313,6 +328,7 @@ def test_a_file_the_patch_ships_is_part_of_the_release(tmp_path):
     assert "app/old.py" in listed, listed
 
 
+@repository_only
 def test_a_file_outside_the_release_stays_outside_the_inventory(tmp_path):
     """Обратная проверка: `1c/` передают явно, и в опись он идти НЕ должен.
 
@@ -348,6 +364,7 @@ def test_an_empty_inventory_stays_empty(tmp_path):
     assert "ОПИСЬ НЕ СОБРАНА" in printed
 
 
+@repository_only
 def test_a_changed_release_file_goes_with_the_patch(tmp_path):
     """Изменённый файл релиза дотягивается — иначе накат краснеет сам от себя.
 
@@ -371,6 +388,7 @@ def test_a_changed_release_file_goes_with_the_patch(tmp_path):
     assert "дотянут изменённый файл релиза: CLAUDE.md" in printed, printed
 
 
+@repository_only
 def test_a_changed_file_outside_the_release_stays_home(tmp_path):
     """Обратная проверка, и она тут важнее прямой.
 

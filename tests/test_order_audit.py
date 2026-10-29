@@ -737,3 +737,106 @@ def test_returning_the_tick_closes_the_row_by_itself(db):
 
     assert db.query(SyncAnomaly).filter(
         SyncAnomaly.status == AnomalyStatus.new).count() == 0
+
+
+# ---------------------------------------------------------------------------
+# Пару без галочки на ОБЩЕЙ карточке нельзя описывать теми же словами
+# ---------------------------------------------------------------------------
+
+def _shared_card(db, account, *, fed_uid="u-fed", fed_stock=40,
+                 fed_enabled=True, fed_broadcast=True):
+    """Соседа по ячейке: тот же `external_id`, свой баркод, своя настройка.
+
+    `u1` (пара без галочки) уже заведён `_product(..., enabled=False)`, и его
+    баркод тоже кладётся в каталог кабинета — иначе ячейки не будет вовсе и
+    соседей искать негде.
+    """
+    from app.models import PlatformCatalogItem
+
+    db.add(Product(uid_1c=fed_uid, article="2503", name="Свитшот", size="M",
+                   color="SIYAH", stock_on_hand=fed_stock,
+                   broadcast_enabled=fed_broadcast,
+                   recalc_account_ids=str(account.id)))
+    db.add(Barcode(barcode="BC-FED", uid_1c=fed_uid))
+    db.add(SyncSetting(uid_1c=fed_uid, account_id=account.id,
+                       enabled=fed_enabled))
+    for code in ("BC-1", "BC-FED"):
+        db.add(PlatformCatalogItem(account_id=account.id, external_id="111:222",
+                                   barcode=code, article="WB", name="Карточка"))
+    db.commit()
+
+
+def test_a_card_we_keep_feeding_is_its_own_finding(db):
+    """Карточку кормим МЫ — значит число не устаревшее, и срок у него иной.
+
+    29.10 на бою: `2503 SIYAH` и `2403 SIYAH` ведут на одну карточку. Остаток
+    на 2503, он отмечен и транслируется; баркод привязан к 2403, галочки нет,
+    остаток нулевой. Заказ списывается с 2403 — тот в МИНУС, — а у 2503 не
+    убавляется вовсе, и мы отправляем его полное число снова и снова.
+    Прежний текст обещал «пока устаревшее число на карточке не кончится», а
+    кончиться ему нечем: оно НАШЕ и подновляется нами.
+    """
+    from app.report import (CRITICAL, CHECKS, FULL_LISTS,
+                            _check_unmanaged_fed_pairs,
+                            _check_unmanaged_pairs,
+                            _rows_unmanaged_fed_pairs)
+
+    account = make_account(db)
+    _product(db, stock=0, account=account, enabled=False)
+    _shared_card(db, account)
+
+    audit_account(db, FeedClient([_order()]), account, _pending)
+    # Заказ списался с пары БЕЗ галочки — её остаток ушёл в минус.
+    assert db.query(Product).filter(Product.uid_1c == "u1").first().stock_on_hand == -1
+    # А у кормильца не убавилось вовсе: его-то число и уедет на карточку.
+    assert db.query(Product).filter(Product.uid_1c == "u-fed").first().stock_on_hand == 40
+
+    assert _check_unmanaged_fed_pairs in CHECKS
+    finding = _check_unmanaged_fed_pairs(db)
+    assert finding is not None
+    assert finding.level == CRITICAL
+    # И НЕ попадает в находку про одинокую пару: два списка про одну сущность
+    # разошлись бы, и человек разбирал бы строку дважды по разным советам.
+    assert _check_unmanaged_pairs(db) is None
+    assert "unmanaged_fed_pairs" in FULL_LISTS
+    rows = _rows_unmanaged_fed_pairs(db)
+    assert len(rows) == finding.count
+    # Кормилец НАЗВАН: без имени второй товар 1С пришлось бы искать глазами.
+    assert any("2503" in str(cell) for cell in rows[0]), rows[0]
+
+
+def test_a_lone_pair_keeps_the_old_wording(db):
+    """Обратная проверка: пара одна в ячейке — находка прежняя.
+
+    Без неё «всё в новую находку» прошло бы как исправное, и про настоящий
+    остаток прежних времён (он убывает и кончится) сказали бы «кормим мы».
+    """
+    from app.report import _check_unmanaged_fed_pairs, _check_unmanaged_pairs
+
+    account = make_account(db)
+    _product(db, stock=0, account=account, enabled=False)
+
+    audit_account(db, FeedClient([_order()]), account, _pending)
+
+    assert _check_unmanaged_pairs(db) is not None
+    assert _check_unmanaged_fed_pairs(db) is None
+
+
+def test_a_neighbour_without_the_tick_does_not_feed_the_card(db):
+    """И сосед по ячейке БЕЗ галочки кормильцем не считается.
+
+    Его вклад в ячейку ноль по тому же правилу, что и у самой пары, — значит
+    число на карточке опять ничем не поддерживается, и это прежний случай.
+    Спроси находка только «есть ли сосед», она кричала бы «кормим мы» там, где
+    не кормит никто.
+    """
+    from app.report import _check_unmanaged_fed_pairs, _check_unmanaged_pairs
+
+    account = make_account(db)
+    _product(db, stock=0, account=account, enabled=False)
+    _shared_card(db, account, fed_enabled=False)
+
+    audit_account(db, FeedClient([_order()]), account, _pending)
+
+    assert _check_unmanaged_pairs(db) is not None
+    assert _check_unmanaged_fed_pairs(db) is None

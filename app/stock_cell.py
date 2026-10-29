@@ -162,3 +162,41 @@ def shared_cells(db: Session, uids: list[str],
             if others:
                 out[(uid, acc)] = others
     return out
+
+
+def managed_neighbours(db: Session, pairs: list[tuple[str, int]]
+                       ) -> dict[tuple[str, int], list[str]]:
+    """Пары, у которых сосед по ячейке НЕ заблокирован выключателем.
+
+    Вопрос узкий и нужен ровно в одном месте — у находки про пару без галочки
+    (`report._check_unmanaged_pairs`), — но ответ меняет и следствие, и
+    лекарство, поэтому живёт он здесь, рядом с самой ячейкой.
+
+    Пара без галочки сама наружу не отправляет ничего, и если в ячейке она
+    одна, число на карточке — остаток прежних времён: его никто не обновляет,
+    он убывает с каждой продажей площадки и однажды кончится. А вот если рядом
+    по той же карточке стоит УПРАВЛЯЕМЫЙ товар, число на карточке — НАШЕ, мы
+    его сами и подновляем при каждом его событии. Тогда продажи не кончатся
+    сами никогда: заказ списывается с пары без галочки (баркод ведёт туда), её
+    остаток уходит в минус, а у соседа не убавляется вовсе — и мы продолжаем
+    отправлять его полное число.
+
+    Спрашивается это ПРИ ЧТЕНИИ, а не при записи аномалии: галочку соседу могли
+    поставить или снять после, и находка обязана описывать нынешнее положение.
+    Тот же приём, что у `report._only_live_pairs`.
+    """
+    if not pairs:
+        return {}
+    uids = sorted({uid for uid, _ in pairs})
+    accounts = sorted({acc for _, acc in pairs})
+    neighbours = shared_cells(db, uids, accounts)
+    out: dict[tuple[str, int], list[str]] = {}
+    for pair in pairs:
+        others = neighbours.get(pair)
+        if not others:
+            continue
+        _uid, account_id = pair
+        live = [u for u in others if not blocked_by_switch(db, u, account_id)]
+        if live:
+            out[pair] = live
+    return out

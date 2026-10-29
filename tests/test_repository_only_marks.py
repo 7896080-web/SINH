@@ -99,6 +99,39 @@ def _runs_a_script_without_a_path(func: ast.FunctionDef) -> bool:
 GIT_BACKED_HELPERS = {"tracked_files", "inventory_of"}
 
 
+def _runs_git_directly(func: ast.FunctionDef) -> bool:
+    """Функция зовёт `git` ПОДПРОЦЕССОМ — значит без git она не работает.
+
+    29.10 на pm171 этим встал накат живого сервера: четыре новых теста
+    поднимали синтетический репозиторий (`git init`, `add`, `commit`), чтобы
+    проверить опись на своём корне, — а git на бою не установлен вовсе, и
+    `subprocess.run` отвечает `FileNotFoundError: [WinError 2]`. Накат
+    остановился перед перезапуском служб, уже после копии базы, то есть ровно
+    тем же способом, что pm147, pm148 и pm167.
+    Четвёртый случай подряд на «проверка была уже, а применена не ко всему»:
+    сканер спрашивал про `tracked_files`/`inventory_of`, то есть про НАШИХ
+    помощников, и прямой вызов самой программы не видел. Механизмов, которым
+    нужен репозиторий, теперь ТРИ, и этот — последний из возможных: мимо него
+    до git не добраться.
+
+    Признак — литерал `"git"` первым элементом списка в `subprocess.run([...])`.
+    Именно литерал: требовать маркер по слову «git» где угодно значило бы
+    ругаться на `uid_1c`-подобную ерунду и на докстроки, а проверка,
+    ругающаяся на исправное, кончается тем, что её отключают.
+    """
+    for node in ast.walk(func):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "run" and node.args):
+            continue
+        first = node.args[0]
+        if not isinstance(first, ast.List) or not first.elts:
+            continue
+        head = first.elts[0]
+        if isinstance(head, ast.Constant) and head.value == "git":
+            return True
+    return False
+
+
 def _asks_git_what_is_in_the_repository(func: ast.FunctionDef) -> bool:
     for node in ast.walk(func):
         if isinstance(node, ast.Attribute) and node.attr in GIT_BACKED_HELPERS:
@@ -156,7 +189,8 @@ def _functions_needing_the_repository(tree: ast.AST) -> set[str]:
     needing = _functions_touching_1c(tree)
     needing |= {n.name for n in ast.walk(tree)
                 if isinstance(n, ast.FunctionDef)
-                and _asks_git_what_is_in_the_repository(n)}
+                and (_asks_git_what_is_in_the_repository(n)
+                     or _runs_git_directly(n))}
 
     changed = True
     while changed:
@@ -208,6 +242,25 @@ def test_the_scanner_sees_the_tests_it_is_written_for():
     # А эти дают путь явно и на сервере как раз работают — гасить их нельзя.
     assert "test_a_missing_file_is_refused_plainly" not in touching
     assert "test_the_epf_itself_is_refused_with_the_way_out" not in touching
+
+
+def test_the_scanner_sees_a_test_that_runs_git_itself():
+    """Третий механизм: `git` подпроцессом — pm171.
+
+    Проверяем по ТОМУ ЖЕ файлу, на котором встал накат, и обе половины:
+    тест, поднимающий синтетический репозиторий, сканер видит ЧЕРЕЗ помощника
+    (`_repo` зовёт git, тест зовёт `_repo`), а соседний, которому репозиторий
+    не нужен, — нет. Без второй половины «требуем маркер у всех» прошло бы как
+    исправное, и на сервере погасли бы проверки, которые там работают.
+    """
+    tree = ast.parse((TESTS / "test_patch_carries_its_subjects.py").read_text(
+        encoding="utf-8"))
+    needing = _functions_needing_the_repository(tree)
+
+    assert "test_a_changed_release_file_goes_with_the_patch" in needing
+    assert "test_a_file_the_patch_ships_is_part_of_the_release" in needing
+    # А этот собирает патч на корне БЕЗ git и на сервере как раз работает.
+    assert "test_an_empty_inventory_stays_empty" not in needing
 
     assert _functions_touching_1c(
         ast.parse((TESTS / "test_1c_protocol.py").read_text(encoding="utf-8"))

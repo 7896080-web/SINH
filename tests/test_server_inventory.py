@@ -18,6 +18,7 @@
 случится на сервере. Проверять генератор по исходнику мало: предмет правки —
 то, что окажется на диске у человека.
 """
+import ast
 import base64
 import os
 import re
@@ -65,8 +66,16 @@ def _child_env() -> dict:
     return env
 
 
-def _apply_source(tmp_path, root=ROOT, files=("CLAUDE.md",)) -> str:
-    """Собрать патч настоящим генератором и достать из него apply-скрипт."""
+def _apply_source(tmp_path, root=ROOT,
+                  files=("CLAUDE.md", "app/models.py")) -> str:
+    """Собрать патч настоящим генератором и достать из него apply-скрипт.
+
+    В нагрузке НАМЕРЕННО есть файл из `app/`: `_uncarried` ниже выбирает жертву
+    среди файлов релиза, и его отбор «кроме привезённых» обязан быть несущим.
+    Вези патч одну `CLAUDE.md`, под `app/` не было бы ни одного привезённого
+    файла, отбор не влиял бы ни на что — и мутация, снимающая его, прошла бы
+    молча (поймано ровно так).
+    """
     out = tmp_path / "probe_deploy.ps1"
     done = subprocess.run(
         [sys.executable, str(GEN), "--tag", "probe", "--parts", "1",
@@ -80,6 +89,33 @@ def _apply_source(tmp_path, root=ROOT, files=("CLAUDE.md",)) -> str:
     blocks = re.findall(r"@'\r?\n(.*?)\r?\n'@", text, re.S)
     b64 = "".join("".join(b.split()) for b in blocks)
     return zlib.decompress(base64.b64decode(b64)).decode("utf-8")
+
+
+def _uncarried(tmp_path, prefix: str = "app/") -> str:
+    """Файл релиза, которого ЭТОТ патч не везёт, — выбирается, а не зашивается.
+
+    Литерал тут не живёт, и это оплаченный урок. Проверки ниже про файл релиза,
+    оставшийся на сервере БЕЗ правки патчем, и до pm171 годился любой: патч
+    везёт то, что ему назвали. С pm171 он дотягивает ещё и ИЗМЕНЁННЫЕ файлы
+    релиза — значит зашитый `app/report.py` попадал в патч в тот день, когда его
+    правят, и две проверки описи краснели от чужой работы рядом. Третий случай
+    одной и той же хрупкости (две соседние pm171 перенёс на свой корень), и
+    лечится он тем же: спрашиваем у САМОГО патча, чего он не везёт.
+    """
+    src = _apply_source(tmp_path)
+    carried = {rel for rel, _sha, _data in ast.literal_eval(
+        re.search(r"^FILES = (\[.*?\])\nDELETE", src, re.S | re.M).group(1))}
+    listed = [rel for rel, _sha in ast.literal_eval(
+        re.search(r"^INVENTORY = (\[.*?\])\nRELEASE_DIRS", src, re.S | re.M).group(1))]
+    # Привезённые идут ПЕРВЫМИ в порядке перебора: сними кто-нибудь условие
+    # «кроме привезённых», и жертвой станет файл, который патч перепишет, —
+    # обе проверки ниже тут же покраснеют. Поставь привезённые в конец, и
+    # снятое условие не изменило бы ничего.
+    order = sorted(listed, key=lambda rel: (rel not in carried, rel))
+    free = [rel for rel in order
+            if rel.startswith(prefix) and rel not in carried]
+    assert free, "в релизе не осталось файла, которого патч не везёт"
+    return free[0]
 
 
 def _server(tmp_path) -> Path:
@@ -98,10 +134,11 @@ def _server(tmp_path) -> Path:
     return server
 
 
-def _run_apply(tmp_path, server: Path, root=ROOT) -> str:
+def _run_apply(tmp_path, server: Path, root=ROOT, files=None) -> str:
     script = tmp_path / "apply.py"
+    kw = {} if files is None else {"files": files}
     script.write_text(
-        _apply_source(tmp_path, root).replace('ROOT = r"C:\\sync_admin"',
+        _apply_source(tmp_path, root, **kw).replace('ROOT = r"C:\\sync_admin"',
                                               "ROOT = r" + repr(str(server))),
         encoding="utf-8")
     done = subprocess.run([sys.executable, str(script)], capture_output=True,
@@ -119,8 +156,9 @@ def test_the_inventory_names_what_is_missing_changed_and_extra(tmp_path):
     видит дальше собственной нагрузки. Именно этот файл 15.10 и пропал.
     """
     server = _server(tmp_path)
+    changed = _uncarried(tmp_path)
     os.remove(server / "scripts" / "probe_accounts.py")
-    (server / "app" / "report.py").write_text("правил руками\n", encoding="utf-8")
+    (server / changed).write_text("правил руками\n", encoding="utf-8")
     (server / "tests" / "test_stale_from_pm99.py").write_text("x = 1\n")
 
     out = _run_apply(tmp_path, server)
@@ -128,7 +166,7 @@ def test_the_inventory_names_what_is_missing_changed_and_extra(tmp_path):
 
     for where in (out, written):
         assert "scripts/probe_accounts.py" in where, where[-800:]
-        assert "app/report.py" in where, where[-800:]
+        assert changed in where, where[-800:]
         assert "tests/test_stale_from_pm99.py" in where, where[-800:]
     assert "нет на диске: 1" in written
     assert "разошлись с релизом: 1" in written
@@ -243,7 +281,9 @@ def test_a_patch_without_an_inventory_builds_and_says_so(tmp_path):
     shutil.copy2(ROOT / "CLAUDE.md", fake / "CLAUDE.md")
 
     server = _server(tmp_path)
-    out = _run_apply(tmp_path, server, root=fake)
+    # Корень синтетический, и в нём лежит одна `CLAUDE.md`: умолчание
+    # `_apply_source` возит ещё и `app/models.py`, которого там нет.
+    out = _run_apply(tmp_path, server, root=fake, files=("CLAUDE.md",))
 
     assert "ОПИСЬ НЕ СОБРАНА" in _apply_source.last_stdout, (
         "патч без описи обязан сказать это вслух при сборке")
@@ -367,7 +407,8 @@ def test_permission_is_asked_only_about_what_the_patch_will_write(tmp_path):
     скрипту нет дела.
     """
     server = _server(tmp_path)
-    foreign = server / "app" / "report.py"
+    victim = _uncarried(tmp_path)
+    foreign = server / victim
     foreign.unlink()
     foreign.mkdir()
 
@@ -376,4 +417,4 @@ def test_permission_is_asked_only_about_what_the_patch_will_write(tmp_path):
     assert "skip CLAUDE.md" in out, out
     assert "ОТКАЗ" not in out, out
     # А опись про этот каталог сказать ОБЯЗАНА: файла релиза на диске нет.
-    assert "app/report.py" in out, out
+    assert victim in out, out
