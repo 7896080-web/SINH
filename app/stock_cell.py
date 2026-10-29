@@ -200,3 +200,73 @@ def managed_neighbours(db: Session, pairs: list[tuple[str, int]]
         if live:
             out[pair] = live
     return out
+
+
+def payer_for(db: Session, uid_1c: str, account_id: int,
+              quantity: int) -> tuple[str, str | None]:
+    """Кто ФАКТИЧЕСКИ платит за этот заказ: товар баркода или сосед по ячейке.
+
+    Возвращает (кто списывается, кого баркод назвал — если подменили, иначе
+    None).
+
+    29.10 на бою: `2503 SIYAH` и `2403 SIYAH` ведут на одну карточку. Остаток
+    лежит на 2503, баркод карточки привязан к 2403, у 2403 ноль. Каждый заказ
+    списывался с 2403 — тот уходил в МИНУС, — а у 2503 не убавлялось вовсе, и
+    рассылка отправляла его полное число снова и снова: оверселл, который сам
+    не кончится никогда. Физически же со склада уехала единица 2503, и списать
+    её надо с 2503.
+
+    Правило одно, и обычный путь им НЕ ЗАДЕВАЕТСЯ: товар баркода покрывает
+    заказ — он и платит, ни запроса соседей, ни подмены. Подмена включается
+    ровно там, где иначе ушли бы в минус.
+
+    Сосед выбирается по ОСТАТКУ, а не по галочкам: вопрос «чья единица уехала
+    со склада» к трансляции отношения не имеет, и ограничь мы выбор
+    отмеченными парами, подмена не сработала бы ровно в том случае, ради
+    которого написана (у 2403 галочки и нет). Берём того, у кого остаток
+    больше, при равенстве — первого по uid: подмена обязана быть
+    воспроизводимой, иначе один и тот же заказ списывался бы то с одного, то с
+    другого.
+
+    Никто не покрывает — НЕ ПОДМЕНЯЕМ: пусть уходит в минус, как и раньше.
+    Минус тогда честно значит «отгрузили больше, чем числилось», и у него есть
+    читатель (`report._check_negative_stock`). Выдумать плательщика там, где
+    его нет, значило бы списать с товара, которого тоже нет.
+
+    **Цена ошибки несимметрична, и поэтому подмена уместна даже если ячейка
+    образовалась ОШИБКОЙ мэппинга** (два разных товара на одной карточке).
+    Без подмены: минус у одного, завышенный остаток у второго, карточка продаёт
+    его полное число — оверселл, и сам он не исправится. С подменой: списали у
+    соседа единицу, которая, может, и не уезжала, — недопродажа, и её поправит
+    ближайшая сверка с 1С, потому что она применяет снимок 1С как есть. Из двух
+    ошибок выбираем ту, что дешевле и самолечится.
+    """
+    product = db.query(Product).filter(Product.uid_1c == uid_1c).first()
+    if product is not None and (product.stock_on_hand or 0) >= quantity:
+        return uid_1c, None
+
+    codes = [bc for (bc,) in db.query(Barcode.barcode).filter(
+        Barcode.uid_1c == uid_1c).all() if bc]
+    if not codes:
+        return uid_1c, None
+    cells = {ext for (ext,) in db.query(PlatformCatalogItem.external_id).filter(
+        PlatformCatalogItem.account_id == account_id,
+        PlatformCatalogItem.barcode.in_(codes),
+    ).all() if ext}
+    if not cells:
+        return uid_1c, None
+
+    neighbours: set[str] = set()
+    for cell in cells:
+        neighbours.update(members(db, account_id, cell, uid_1c))
+    neighbours.discard(uid_1c)
+    if not neighbours:
+        return uid_1c, None
+
+    able = [p for p in db.query(Product).filter(
+        Product.uid_1c.in_(sorted(neighbours))).all()
+        if (p.stock_on_hand or 0) >= quantity]
+    if not able:
+        return uid_1c, None
+    able.sort(key=lambda p: (-(p.stock_on_hand or 0), p.uid_1c))
+    return able[0].uid_1c, uid_1c

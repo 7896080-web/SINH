@@ -783,13 +783,17 @@ def test_a_card_we_keep_feeding_is_its_own_finding(db):
 
     account = make_account(db)
     _product(db, stock=0, account=account, enabled=False)
-    _shared_card(db, account)
+    # Кормилец НЕ ПОКРЫВАЕТ заказ, и только поэтому случай ещё жив: покрой он
+    # его, подмена плательщика (`stock_cell.payer_for`) списала бы с него, и
+    # находки не было бы вовсе — ровно это и есть починка 29.10. Остаётся
+    # узкий остаток: у кормильца остаток есть, но меньше заказа.
+    _shared_card(db, account, fed_stock=0)
 
     audit_account(db, FeedClient([_order()]), account, _pending)
-    # Заказ списался с пары БЕЗ галочки — её остаток ушёл в минус.
+    # Подменить некем — списалось с пары БЕЗ галочки, её остаток ушёл в минус.
     assert db.query(Product).filter(Product.uid_1c == "u1").first().stock_on_hand == -1
-    # А у кормильца не убавилось вовсе: его-то число и уедет на карточку.
-    assert db.query(Product).filter(Product.uid_1c == "u-fed").first().stock_on_hand == 40
+    # А у кормильца не убавилось: его-то число и уедет на карточку.
+    assert db.query(Product).filter(Product.uid_1c == "u-fed").first().stock_on_hand == 0
 
     assert _check_unmanaged_fed_pairs in CHECKS
     finding = _check_unmanaged_fed_pairs(db)

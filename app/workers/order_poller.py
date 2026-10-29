@@ -8,6 +8,7 @@ from app.models import (
     Product, SyncSetting, SyncAnomaly, AnomalyReason, ProcessedOrder,
     OrderProcessStatus, DispatchQueueItem, FtpTask, Barcode, PlatformAccount,
 )
+from app.stock_cell import payer_for
 from app.transmit import covered_accounts, coverage_is_tracked
 from app.workers.matching import resolve_barcode
 from app.workers.platform_clients.base import PlatformClient, PlatformOrder
@@ -152,7 +153,8 @@ def process_new_order(db: Session, order: PlatformOrder, account: PlatformAccoun
     оператору, что именно произошло на каждом шаге."""
 
     result = {"status": None, "uid_1c": None, "new_stock": None, "dispatched_to": [], "ftp_task_id": None,
-              "detail": "", "anomaly_created": False, "pair_enabled": None}
+              "detail": "", "anomaly_created": False, "pair_enabled": None,
+              "misrouted_from": None}
 
     existing = db.query(ProcessedOrder).filter(
         ProcessedOrder.account_id == account.id, ProcessedOrder.order_id == order.order_id,
@@ -174,6 +176,27 @@ def process_new_order(db: Session, order: PlatformOrder, account: PlatformAccoun
         result["status"] = "unmatched"
         result["detail"] = "Баркод сопоставлен, но товар с таким ID_1С не найден."
         return result
+
+    # ПОДМЕНА ПЛАТЕЛЬЩИКА. У товара баркода остатка может не быть вовсе, а у
+    # соседа по той же карточке площадки — быть: физически со склада уехала
+    # его единица, значит списывать надо с него. 29.10 на бою без этого было
+    # так: заказы по карточке `2503`/`2403` списывались с 2403 (его назвал
+    # баркод), тот уходил в минус, у 2503 не убавлялось вовсе — и рассылка
+    # отправляла его полное число снова и снова. Оверселл, который сам не
+    # кончится. Правило и все его оговорки — в `stock_cell.payer_for`; обычный
+    # путь (товар покрывает заказ) не задевается вовсе.
+    #
+    # Стоит это ДО гейта намеренно: гейт спрашивает про пару, а пара теперь
+    # плательщикова. Иначе живой опрос по-прежнему отвергал бы заказ по
+    # неотмеченному 2403 и не списывал бы ничего — то есть ровно тот пропуск,
+    # ради которого подмена и сделана.
+    if not is_test:
+        payer, displaced = payer_for(db, uid_1c, account.id, order.quantity)
+        if displaced is not None:
+            paying = db.query(Product).filter(Product.uid_1c == payer).first()
+            if paying is not None:
+                uid_1c, product = payer, paying
+                result["misrouted_from"] = displaced
 
     # Товар назван ДО гейта намеренно: вызывающему нужно знать, о какой паре
     # речь, — суточная сверка заказов заводит по ней аномалию «галочки нет, а
@@ -245,6 +268,32 @@ def process_new_order(db: Session, order: PlatformOrder, account: PlatformAccoun
         ))
         result["anomaly_created"] = True
         result["detail"] += " Синхронизация для этого кабинета выключена — зафиксирована аномалия."
+
+    if result["misrouted_from"]:
+        # Подмена МОЛЧАТЬ не имеет права. Арифметику она поправила — остаток
+        # списался с того, у кого он есть, и на карточку уедет верное число, —
+        # но неверным осталось САМОЕ ГЛАВНОЕ: баркод привязан не к тому товару
+        # 1С. Промолчи мы, человек никогда не узнал бы, что продажи по этой
+        # карточке разносятся догадкой, а не мэппингом, и подмена из починки
+        # превратилась бы в сокрытие причины.
+        #
+        # Аномалией, а не только строкой в логе: лог читают, когда уже что-то
+        # случилось, а у аномалии есть своя страница, срок хранения и читатель
+        # в отчёте (`report._check_misrouted_orders`).
+        db.add(SyncAnomaly(
+            uid_1c=result["misrouted_from"], account_id=account.id,
+            reason=AnomalyReason.order_misrouted,
+            order_id=order.order_id, is_test=is_test,
+        ))
+        result["anomaly_created"] = True
+        result["detail"] += (
+            f" Баркод ведёт на {result['misrouted_from']}, но остатка там нет — "
+            f"заказ списан с {uid_1c} (та же карточка площадки). "
+            f"Поправьте сопоставление: баркод обязан вести на товар, где лежит остаток.")
+        logger.warning(
+            "заказ %s по кабинету «%s»: баркод ведёт на %s (остатка нет), "
+            "списан с %s по той же карточке — поправьте сопоставление",
+            order.order_id, account.name, result["misrouted_from"], uid_1c)
 
     db.add(ProcessedOrder(
         account_id=account.id, order_id=order.order_id, uid_1c=uid_1c,
