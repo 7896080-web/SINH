@@ -93,7 +93,7 @@ def feed(tmp_path):
     return url, path
 
 
-def _run(url, *args, encoding="utf-8"):
+def _run(url, *args, encoding="utf-8", orders=None):
     """Запустить скрипт и прочитать вывод ТЕМ ЖЕ, чем попросили писать.
 
     Кодировка задаётся с ОБЕИХ сторон и всегда: у перенаправленного вывода
@@ -102,8 +102,14 @@ def _run(url, *args, encoding="utf-8"):
     наших же русских строк, причём только на сервере, в накате.
     """
     stub = Path(url.replace("sqlite:///", "")).parent / "sitecustomize_stub.py"
-    stub.write_text(STUB.replace("{ON}", ON).replace("{OFF}", OFF)
-                    .replace("{ORPHAN}", ORPHAN), encoding="utf-8")
+    body = STUB.replace("{ON}", ON).replace("{OFF}", OFF).replace("{ORPHAN}", ORPHAN)
+    if orders is not None:
+        # Подмена ленты идёт ЧЕРЕЗ ЭТОТ ЖЕ путь, а не вторым `subprocess.run`:
+        # второй запуск однажды разошёлся бы кодировкой с читателем, и тест
+        # падал бы мозаикой на боевом Windows. Ровно это и поймал сканер
+        # `tests/test_subprocess_encoding.py`.
+        body = body.replace("        return [", "        return [\n" + orders + "\n")
+    stub.write_text(body, encoding="utf-8")
     env = dict(os.environ)
     env["DATABASE_URL"] = url
     env["SESSION_SECRET"] = "x" * 32
@@ -193,42 +199,26 @@ def test_zero_is_not_the_same_as_fine(feed):
     assert "НЕ значит" in out, out
 
 
-def test_the_ceiling_is_named_when_the_first_run_would_not_fit(feed, tmp_path):
-    """Больше потолка — скрипт говорит, за сколько суток это сойдётся.
+def test_the_ceiling_is_named_when_the_first_run_would_not_fit(feed):
+    """Больше потолка — скрипт говорит, что уедет за прогон, а что в следующие.
 
     Иначе человек увидит «уедет 300» при потолке 50 и решит, что всё поедет
-    разом.
+    разом. А решает он по этому числу, стоит ли вообще запускать сверку на
+    бою — то есть ответ, выглядящий ответом, тут дороже всего.
     """
-    url, path = feed
     from app.workers.order_audit import MAX_PER_ACCOUNT
 
-    big = "\n".join(
+    url, _path = feed
+    extra = "\n".join(
         f'            PlatformOrder(order_id="O-{i}", barcode="{ON}", '
         f'quantity=1, raw_status="new", order_date=day),'
         for i in range(MAX_PER_ACCOUNT + 3))
-    stub = Path(path).parent / "sitecustomize_stub.py"
-    out = _run(url)          # создаст заглушку
-    stub.write_text(
-        stub.read_text(encoding="utf-8").replace(
-            f'            PlatformOrder(order_id="O-on", barcode="{ON}", quantity=2,\n'
-            f'                          raw_status="new", order_date=day),', big),
-        encoding="utf-8")
-    env = dict(os.environ)
-    env.update({"DATABASE_URL": url, "SESSION_SECRET": "x" * 32,
-                "SECRETS_ENCRYPTION_KEY": Fernet.generate_key().decode(),
-                "PYTHONIOENCODING": "utf-8"})
-    done = subprocess.run(
-        [sys.executable, "-c",
-         f"exec(open({str(stub)!r}, encoding='utf-8').read());"
-         f"exec(compile(open({str(SCRIPT)!r}, encoding='utf-8').read(),"
-         f" {str(SCRIPT)!r}, 'exec'), {{'__name__': '__main__',"
-         f" '__file__': {str(SCRIPT)!r}}})"],
-        capture_output=True, encoding="utf-8", errors="replace",
-        env=env, cwd=str(ROOT))
-    out = done.stdout + done.stderr
+
+    out = _run(url, orders=extra)
 
     assert "больше потолка" in out, out
     assert f"уедет {MAX_PER_ACCOUNT}" in out, out
+    assert "в следующие сутки" in out, out
 
 
 def test_it_survives_the_production_console(feed):
