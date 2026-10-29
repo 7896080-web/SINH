@@ -318,6 +318,23 @@ class ClaudeRecognizer:
                 messages=[{"role": "user", "content": content}],
             ) as stream:
                 return stream.get_final_message()
+        except anthropic.AuthenticationError:
+            # 401: ключ неверный, отозван или его организация отключена — повтор не поможет.
+            log.error("Claude API: ключ не принят (401)")
+            raise RecognitionError(
+                "ключ Claude API не принят (отозван или неверный) — впишите действующий "
+                "ключ на странице настроек") from None
+        except anthropic.PermissionDeniedError:
+            log.error("Claude API: нет доступа (403)")
+            raise RecognitionError("у ключа Claude API нет доступа к модели — проверьте ключ "
+                                   "и организацию на platform.claude.com") from None
+        except anthropic.BadRequestError as exc:
+            if "credit balance" in str(exc).lower():
+                log.error("Claude API: закончились деньги на балансе")
+                raise RecognitionError("на счёте Claude API закончились деньги — пополните "
+                                       "баланс на platform.claude.com (Billing)") from None
+            log.exception("Claude API error")
+            raise RecognitionError("ошибка сервиса распознавания (400)") from None
         except anthropic.RateLimitError:
             raise RecognitionError("сервис распознавания перегружен, пришлите ещё раз через минуту") from None
         except anthropic.APIStatusError as exc:
