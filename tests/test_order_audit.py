@@ -204,15 +204,15 @@ def test_the_status_question_goes_to_the_client(db):
     assert stats["missed"] == 1, stats
 
 
-def test_a_pair_without_the_cabinet_tick_is_not_processed(db):
-    """САМОЕ важное ограничение: только по отмеченным парам.
+def test_the_disabled_branch_is_only_a_sentinel(db):
+    """Ветка «пропущено по галочке» осталась СТОРОЖЕМ, и она обязана молчать.
 
-    Пока идёт переход, часть каталога транслирует ещё старая система, и
-    продажи по неподключённым у нас карточкам идут мимо нас В ПОРЯДКЕ ВЕЩЕЙ:
-    остаток по ним мы не рассылали и не списывали. Проведи сверка их — создала
-    бы в 1С перемещения на весь тридцатидневный поток ЧУЖИХ продаж, разом и
-    без присмотра. Расчёт ставит `respect_enabled=False` по обратной причине:
-    там товар выбрал человек и нажал кнопку.
+    До 29.10 это было главным ограничением сверки: только по отмеченным
+    парам, иначе она создала бы в 1С перемещения на весь поток чужих продаж.
+    Факты поменялись — вторая система выключена, чужих продаж нет, — и
+    `respect_enabled` стало `False`. Ветку не убрали: вернись аргумент
+    чьей-нибудь правкой, счётчик показал бы это ЧИСЛОМ, а не молчанием.
+    Поэтому проверяем, что сейчас он нулевой, а заказ проведён.
     """
     account = make_account(db)
     _product(db, stock=10, account=account, enabled=False)
@@ -220,9 +220,9 @@ def test_a_pair_without_the_cabinet_tick_is_not_processed(db):
 
     stats = audit_account(db, client, account, _pending)
 
-    assert stats["disabled"] == 1 and stats["missed"] == 0, stats
-    assert db.query(Product).filter(Product.uid_1c == "u1").first().stock_on_hand == 10
-    assert db.query(FtpTask).count() == 0
+    assert stats["disabled"] == 0 and stats["missed"] == 1, stats
+    assert db.query(Product).filter(Product.uid_1c == "u1").first().stock_on_hand == 9
+    assert db.query(FtpTask).count() == 1
 
 
 def test_a_barcode_we_cannot_match_does_not_count_as_a_loss(db):
@@ -559,3 +559,181 @@ def test_the_first_run_does_not_wait_for_a_whole_day():
                                        ORDER_AUDIT_INTERVAL_HOURS)
 
     assert ORDER_AUDIT_FIRST_RUN_DELAY < timedelta(hours=ORDER_AUDIT_INTERVAL_HOURS)
+
+
+# ---------------------------------------------------------------------------
+# Галочки нет — заказ всё равно проводим, а пару НАЗЫВАЕМ
+# ---------------------------------------------------------------------------
+
+def test_an_unmanaged_pair_is_processed_and_named(db):
+    """Галочки нет — заказ ПРОВОДИМ, и это изменилось 29.10 вместе с фактами.
+
+    Пока жила вторая система, провести такую продажу значило бы списать то,
+    что уже списал кто-то другой. Второй системы нет с конца сентября 2026:
+    число на неподключённой карточке не обновляет НИКТО, товар при продаже
+    уезжает со склада ЦС, а в 1С это не отражается — учёт завышается
+    накопительно, по штуке на каждую продажу.
+
+    Но провести — половина дела. Карточка продаст ещё, пока её устаревшее
+    число не кончится, и решить это может только человек, поэтому по паре
+    заводится строка. Проверяем ОБЕ половины: без первой остаток остался бы
+    завышенным, без второй о карточке не узнал бы никто.
+    """
+    from app.models import AnomalyReason, AnomalyStatus, SyncAnomaly
+
+    account = make_account(db)
+    _product(db, stock=10, account=account, enabled=False)
+    client = FeedClient([_order(qty=2)])
+
+    stats = audit_account(db, client, account, _pending)
+
+    assert stats["missed"] == 1 and stats["unmanaged"] == 1, stats
+    assert stats["disabled"] == 0, "галочку сверка больше не спрашивает"
+    # Половина первая: учёт поправлен — остаток списан, документ в 1С заведён.
+    assert db.query(Product).filter(Product.uid_1c == "u1").first().stock_on_hand == 8
+    assert db.query(FtpTask).count() == 1
+    processed = db.query(ProcessedOrder).one()
+    assert processed.found_by == FOUND_BY_AUDIT
+    # Половина вторая: про карточку сказано.
+    row = db.query(SyncAnomaly).filter(
+        SyncAnomaly.reason == AnomalyReason.order_on_unmanaged).first()
+    assert row is not None
+    assert row.order_id == "O-1" and row.account_id == account.id
+    assert row.uid_1c == "u1"
+    assert row.status == AnomalyStatus.new and row.is_test is False
+
+
+def test_a_managed_pair_is_processed_without_an_anomaly(db):
+    """Обратная проверка: по ОТМЕЧЕННОЙ паре строка не заводится.
+
+    Без неё «заводим аномалию всегда» прошло бы как исправное, и «Аномалии»
+    получили бы строку на каждый догнанный заказ — то есть сигнал про
+    неуправляемую карточку утонул бы в обычной работе сверки.
+    """
+    from app.models import SyncAnomaly
+
+    account = make_account(db)
+    _product(db, stock=10, account=account, enabled=True)
+
+    stats = audit_account(db, FeedClient([_order(qty=2)]), account, _pending)
+
+    assert stats["missed"] == 1 and stats["unmanaged"] == 0, stats
+    assert db.query(SyncAnomaly).count() == 0
+    assert db.query(Product).filter(Product.uid_1c == "u1").first().stock_on_hand == 8
+
+
+def test_the_pair_is_reported_before_the_gate(db):
+    """`process_new_order` сообщает пару САМ, а сверка её не переспрашивает.
+
+    Спроси сверка `resolve_barcode` второй раз, незнакомый баркод получил бы
+    второй счёт попыток в конфликте сопоставления — число перестало бы
+    означать, сколько продаж по нему пропало. Проверяем следствием: отдаём
+    решение о паре и uid прямо из `process_new_order`.
+    """
+    from app.workers.order_poller import process_new_order
+
+    account = make_account(db)
+    _product(db, stock=10, account=account, enabled=False)
+    order = PlatformOrder(order_id="O-9", barcode="BC-1", quantity=1,
+                          raw_status="new", order_date=date.today())
+
+    result = process_new_order(db, order, account, _pending(account.platform),
+                               is_test=False, order_date=date.today(),
+                               respect_enabled=False,
+                               found_by=FOUND_BY_AUDIT)
+    db.commit()
+
+    assert result["status"] == "processed"
+    assert result["uid_1c"] == "u1"
+    assert result["pair_enabled"] is False
+
+
+def test_the_same_order_does_not_pile_up_day_after_day(db):
+    """Сверка ходит по одному окну каждые сутки — строка обязана быть одна.
+
+    Без этого один заказ дал бы тридцать аномалий, и число перестало бы
+    означать масштаб: находка показывала бы «тридцать продаж» там, где продажа
+    одна.
+
+    Держится это `ProcessedOrder`, а НЕ проверкой внутри `_note_unmanaged`:
+    заказ стал известен, `plan_account` второй раз его не отдаёт, а попади он
+    всё равно — `process_new_order` ответит `already_processed`. Поэтому тест
+    проверяет ЦЕПОЧКУ: второй прогон не проводит заказа (`missed == 0`), и
+    строка остаётся одна. Мутация сторожа внутри `_note_unmanaged` этот тест не
+    роняет, и это не пробел теста, а свойство сторожа — сказано у него в
+    докстроке.
+    """
+    from app.models import SyncAnomaly
+
+    account = make_account(db)
+    _product(db, stock=10, account=account, enabled=False)
+    client = FeedClient([_order()])
+
+    first = audit_account(db, client, account, _pending)
+    assert first["unmanaged"] == 1, first
+    for _ in range(2):
+        again = audit_account(db, client, account, _pending)
+        assert again["missed"] == 0, "заказ проведён дважды"
+        assert again["unmanaged"] == 0, again
+
+    assert db.query(SyncAnomaly).count() == 1
+    # И остаток списан РОВНО один раз: именно это и покупается тем, что хозяин
+    # правила один. Сойдись счёт по аномалиям, а по остатку нет — вред был бы
+    # ровно тот, от которого сверка и заведена.
+    assert db.query(Product).filter(Product.uid_1c == "u1").first().stock_on_hand == 9
+
+
+def test_the_finding_is_critical_and_leads_to_its_list(db):
+    """КРИТИЧНО — и это не разбавление критичного.
+
+    У «потерянных заказов» сверка всё провела, осталась одна причина, и она
+    сойдётся сама — поэтому там ВНИМАНИЕ. Здесь продажи идут ПРЯМО СЕЙЧАС по
+    числу, которое никто не обновляет, то есть состояние
+    самоподдерживающееся, и само оно не кончится, пока число не иссякнет.
+    """
+    from app.report import (CRITICAL, FULL_LISTS, WARNING, CHECKS,
+                            _check_unmanaged_pairs, _rows_unmanaged_pairs)
+
+    account = make_account(db)
+    _product(db, stock=10, account=account, enabled=False)
+    audit_account(db, FeedClient([_order(), _order(order_id="O-2")]),
+                  account, _pending)
+
+    assert _check_unmanaged_pairs in CHECKS
+    finding = _check_unmanaged_pairs(db)
+    assert finding is not None
+    assert finding.level == CRITICAL and finding.level != WARNING
+    assert finding.count == 2
+    # Пар одна, продаж две: по одной строке не видно, сколько раз повторилось.
+    assert "1 (продаж: 2)" in finding.title, finding.title
+    assert finding.link == "/report/rows/unmanaged_pairs"
+    assert "unmanaged_pairs" in FULL_LISTS
+    # И находка со списком считают ОДНО И ТО ЖЕ.
+    assert len(_rows_unmanaged_pairs(db)) == finding.count
+
+
+def test_returning_the_tick_closes_the_row_by_itself(db):
+    """Поставили галочку — пара под управлением, строка закрывается сама.
+
+    Второй выход (снять карточку с продажи в кабинете площадки) по колонкам не
+    спросить вовсе: нашего отзыва по такой паре не бывает — ноль мы отправляем
+    только туда, куда отправляли непустой остаток. Выдумывать признак,
+    которого нет, значило бы гасить строку на догадке, поэтому этот выход
+    закрывает человек руками.
+    """
+    from app.anomalies import close_fixed_anomalies
+    from app.models import AnomalyStatus, SyncAnomaly, SyncSetting as S
+
+    account = make_account(db)
+    _product(db, stock=10, account=account, enabled=False)
+    audit_account(db, FeedClient([_order()]), account, _pending)
+    assert db.query(SyncAnomaly).filter(
+        SyncAnomaly.status == AnomalyStatus.new).count() == 1
+
+    db.query(S).filter(S.uid_1c == "u1", S.account_id == account.id).first().enabled = True
+    db.commit()
+    close_fixed_anomalies(db)
+    db.commit()
+
+    assert db.query(SyncAnomaly).filter(
+        SyncAnomaly.status == AnomalyStatus.new).count() == 0

@@ -828,7 +828,8 @@ def job_order_audit():
         stats = audit_all(db, build_client, accounts,
                           lambda platform: PENDING_WAREHOUSE_NAME.get(platform, "Ожидает"))
 
-        if stats["missed"] or stats["failed"] or stats["errors"] or stats["left"]:
+        if (stats["missed"] or stats["unmanaged"] or stats["failed"]
+                or stats["errors"] or stats["left"]):
             # WARNING: живой опрос потерял заказы. Сами они теперь проведены,
             # но причина осталась, и завтра он потеряет следующие.
             logger.warning("сверка заказов: %s", stats)
@@ -851,6 +852,13 @@ def job_order_audit():
         if stats["missed"]:
             trouble.append(f"живой опрос потерял заказов: {stats['missed']} — "
                            f"проведены сверкой")
+        if stats["unmanaged"]:
+            # Своя строка, а не часть «потерянных»: проведением дело не
+            # кончается — карточка продаёт дальше, и число на ней не обновляет
+            # никто. Читателя ДВА, как и у потерь: страница «Аномалии» (там сами
+            # строки) и находка `report._check_unmanaged_pairs`.
+            trouble.append(f"продаж по парам без галочки: {stats['unmanaged']} — "
+                           f"карточку никто не обновляет, разбор на «Аномалиях»")
         if stats["left"]:
             # Молчаливая обрезка читалась бы как «всё догнали».
             trouble.append(f"не уместилось в прогон (потолок {MAX_PER_ACCOUNT} "

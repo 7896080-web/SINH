@@ -78,6 +78,21 @@ def close_fixed_anomalies(db: Session) -> int:
          ).exists()),
         (AnomalyReason.missing_barcode,
          SyncAnomaly.uid_1c.in_(db.query(Barcode.uid_1c).scalar_subquery())),
+        # Неуправляемую пару лечит ровно то же, что и невключённую: галочку
+        # поставили, значит пара под управлением, остаток туда поедет, число на
+        # карточке начнёт обновляться само, и заказы по ней проводит уже живой
+        # опрос. Второй выход — снять карточку с продажи В КАБИНЕТЕ площадки, и
+        # его по колонкам не спросить вовсе (нашего отзыва по такой паре не
+        # бывает: ноль мы отправляем только туда, куда отправляли непустой
+        # остаток), поэтому его закрывает человек руками на самой странице.
+        # Выдумывать признак, которого нет, значило бы гасить строку на
+        # догадке — а строка эта про продажи, идущие прямо сейчас.
+        (AnomalyReason.order_on_unmanaged,
+         db.query(SyncSetting).filter(
+             SyncSetting.uid_1c == SyncAnomaly.uid_1c,
+             SyncSetting.account_id == SyncAnomaly.account_id,
+             SyncSetting.enabled.is_(True),
+         ).exists()),
     )
 
     closed = 0

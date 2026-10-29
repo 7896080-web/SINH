@@ -152,7 +152,7 @@ def process_new_order(db: Session, order: PlatformOrder, account: PlatformAccoun
     оператору, что именно произошло на каждом шаге."""
 
     result = {"status": None, "uid_1c": None, "new_stock": None, "dispatched_to": [], "ftp_task_id": None,
-              "detail": "", "anomaly_created": False}
+              "detail": "", "anomaly_created": False, "pair_enabled": None}
 
     existing = db.query(ProcessedOrder).filter(
         ProcessedOrder.account_id == account.id, ProcessedOrder.order_id == order.order_id,
@@ -175,10 +175,22 @@ def process_new_order(db: Session, order: PlatformOrder, account: PlatformAccoun
         result["detail"] = "Баркод сопоставлен, но товар с таким ID_1С не найден."
         return result
 
+    # Товар назван ДО гейта намеренно: вызывающему нужно знать, о какой паре
+    # речь, — суточная сверка заказов заводит по ней аномалию «галочки нет, а
+    # карточка продаёт». Без этого она узнавала бы пару только из баркода, то
+    # есть повторяла бы у себя разрешение баркода, а `resolve_barcode` ПИШЕТ
+    # (конфликт сопоставления и счётчик попыток) — второй вызов удвоил бы счёт.
+    result["uid_1c"] = uid_1c
+
     setting = db.query(SyncSetting).filter(
         SyncSetting.uid_1c == uid_1c, SyncSetting.account_id == account.id,
     ).first()
     enabled = bool(setting and setting.enabled)
+    # Отмечена ли пара — наверх. Нужно тому, кто проводит заказ НЕ СПРАШИВАЯ
+    # галочку (`respect_enabled=False`): суточной сверке и расчёту. Провести
+    # мало, про такую карточку надо ещё и сказать — она продаёт по числу,
+    # которое мы ей не посылали и которое никто не обновляет.
+    result["pair_enabled"] = enabled
 
     # Отбор по включённым товарам (SyncSetting.enabled): живой поллер
     # (respect_enabled=True) трогает ТОЛЬКО включённые SKU — выключенный товар
@@ -221,7 +233,6 @@ def process_new_order(db: Session, order: PlatformOrder, account: PlatformAccoun
         if product.transmit_override is not None:
             product.transmit_override = product.transmit_override - order.quantity
         new_stock = product.stock_on_hand
-    result["uid_1c"] = uid_1c
     result["new_stock"] = new_stock
 
     # Синтетический тест по выключенному товару — оставляем аномалию-предупреждение
