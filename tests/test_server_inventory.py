@@ -65,12 +65,12 @@ def _child_env() -> dict:
     return env
 
 
-def _apply_source(tmp_path, root=ROOT) -> str:
+def _apply_source(tmp_path, root=ROOT, files=("CLAUDE.md",)) -> str:
     """Собрать патч настоящим генератором и достать из него apply-скрипт."""
     out = tmp_path / "probe_deploy.ps1"
     done = subprocess.run(
         [sys.executable, str(GEN), "--tag", "probe", "--parts", "1",
-         "--root", str(root), "--out", str(out), "CLAUDE.md"],
+         "--root", str(root), "--out", str(out), *files],
         cwd=str(ROOT), capture_output=True, encoding="utf-8",
         errors="replace", env=_child_env())
     assert done.returncode == 0, done.stdout + done.stderr
@@ -271,3 +271,109 @@ def test_reading_the_inventory_can_never_abort_the_update():
 
     assert head.rstrip().endswith("try {"), "чтение описи не обёрнуто в try"
     assert "} catch {" in tail, "у try нет catch — накат оборвётся"
+
+
+@repository_only
+def test_machine_caches_are_never_called_extra(tmp_path):
+    """Опись, кричащая на исправном накате, перестаёт читаться.
+
+    29.10 на pm168 первый же боевой прогон дал семь «лишних», и шесть из них —
+    `tests/.pytest_cache`: его заводит pytest, он появляется заново после
+    каждого прогона, и назвать его лишним значит выдавать семь строк тревоги
+    на полностью исправной установке. Седьмой — `deploy/pm132_deploy.ps1`, и
+    он лишний ПО-НАСТОЯЩЕМУ (осадок прежнего патча), поэтому назван остаться
+    должен: в этом вся работа описи.
+
+    Отсекаем по правилу, а не списком имён, поэтому проверяем и `.ruff_cache`,
+    которого сегодня нет: список про него не узнал бы, а правило знает.
+    """
+    server = _server(tmp_path)
+    for folder, name in (("tests/.pytest_cache", "lastfailed"),
+                         ("tests/.pytest_cache/v/cache", "nodeids"),
+                         ("app/.ruff_cache", "0.1.2")):
+        d = server / folder
+        d.mkdir(parents=True, exist_ok=True)
+        (d / name).write_text("{}", encoding="utf-8")
+    (server / "deploy" / "pm132_deploy.ps1").write_text("старый патч\n",
+                                                        encoding="utf-8")
+
+    out = _run_apply(tmp_path, server)
+    written = (server / "deploy" / "INVENTORY.txt").read_text(encoding="utf-8-sig")
+
+    for where in (out, written):
+        assert "pytest_cache" not in where, where[-800:]
+        assert "ruff_cache" not in where, where[-800:]
+        assert "deploy/pm132_deploy.ps1" in where, where[-800:]
+    assert "лишние, в релизе их нет: 1" in written, written[:600]
+
+
+@repository_only
+def test_a_file_we_cannot_write_stops_the_patch_before_it_writes_anything(tmp_path):
+    """Права проверяются ДО первой записи, иначе патч умирает на середине.
+
+    29.10 на pm167 ровно это и вышло: три файла остались от прежнего запуска с
+    правами администратора, патч пошёл из обычной сессии и упал
+    `PermissionError` посреди работы — часть файлов новая, часть старая. Сверка
+    sha при этом честно отработала: она про СОДЕРЖИМОЕ, а не про права.
+
+    **Отказ вызываем КАТАЛОГОМ на месте файла, а не снятым правом записи, и
+    это не придирка к механизму.** Тесты здесь идут под root, а root обходит
+    биты прав на Linux: `chmod 0400` плюс открытие на запись у него проходит,
+    то есть проверка была бы зелёной при ЛЮБОМ поведении скрипта. Каталог же
+    нельзя открыть на запись никому, и до `why_not_writable` доходит ровно тот
+    же отказ. Предмет проверки — не вид исключения, а ПОРЯДОК: назвать
+    виновного, не тронуть никого, выйти с ошибкой.
+    """
+    server = _server(tmp_path)
+    victim = server / "app" / "report.py"
+    other = server / "app" / "models.py"
+    other.write_text("и этот тоже\n", encoding="utf-8")
+    before_other = other.read_bytes()
+    victim.unlink()
+    victim.mkdir()
+
+    script = tmp_path / "apply_denied.py"
+    script.write_text(
+        _apply_source(tmp_path, files=("app/report.py", "app/models.py"))
+        .replace('ROOT = r"C:\\sync_admin"', "ROOT = r" + repr(str(server))),
+        encoding="utf-8")
+    done = subprocess.run([sys.executable, str(script)], capture_output=True,
+                          encoding="utf-8", errors="replace", env=_child_env())
+
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert "ОТКАЗ" in done.stdout, done.stdout
+    assert "app/report.py" in done.stdout, done.stdout
+    assert "от имени администратора" in done.stdout, done.stdout
+    assert "DONE" not in done.stdout, "патч отчитался об успехе при отказе"
+    # И главное: СОСЕДА он не тронул.
+    assert other.read_bytes() == before_other, (
+        "патч начал писать до того, как спросил про права")
+    assert not (server / "deploy" / "INSTALLED_TAG").exists(), (
+        "версия отмечена при неприменённом патче")
+
+
+@repository_only
+def test_permission_is_asked_only_about_what_the_patch_will_write(tmp_path):
+    """Обратная проверка, без которой первая превращается в отказ на ровном месте.
+
+    Спрашивать надо про файлы ЭТОГО патча, и только про те, которые он
+    действительно перепишет. Спроси скрипт про весь релиз — и патч отказывал
+    бы из-за чужого файла, к которому не имеет никакого отношения, а такую
+    проверку отключают первой же.
+
+    Собираем ровно это: патч везёт один файл, который на диске уже совпадает
+    (значит писать нечего вовсе), а по соседству лежит каталог на месте
+    релизного файла — непреодолимое препятствие для записи, до которого
+    скрипту нет дела.
+    """
+    server = _server(tmp_path)
+    foreign = server / "app" / "report.py"
+    foreign.unlink()
+    foreign.mkdir()
+
+    out = _run_apply(tmp_path, server)
+
+    assert "skip CLAUDE.md" in out, out
+    assert "ОТКАЗ" not in out, out
+    # А опись про этот каталог сказать ОБЯЗАНА: файла релиза на диске нет.
+    assert "app/report.py" in out, out

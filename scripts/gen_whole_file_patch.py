@@ -130,22 +130,105 @@ RELEASE_DIRS = {release_dirs!r}
 def sha(b):
     return hashlib.sha256(b).hexdigest()
 
-written = 0
+
+def why_not_writable(path):
+    """Почему в этот файл не получится записать. Пусто — получится.
+
+    Проверяем ПОПЫТКОЙ, а не `os.access(path, os.W_OK)`: на Windows тот
+    смотрит только атрибут «только чтение» и про ACL не знает ВОВСЕ — файл,
+    принадлежащий `BUILTIN\\Administrators`, он объявит записываемым, а запись
+    из обычной сессии упадёт `PermissionError`.
+
+    29.10 на pm167 так и вышло: три файла остались от прежнего запуска с
+    правами администратора, патч пошёл из обычной сессии и умер на середине —
+    часть файлов новая, часть старая, то есть ровно то состояние, которого
+    сверка sha до первой записи и должна была не допустить. Сверка при этом
+    честно отработала: она про СОДЕРЖИМОЕ, а не про права.
+
+    `r+b` открывает на запись, ничего не усекая. Каталог проверяем пробным
+    файлом — он создаётся и сразу удаляется; сам каталог при этом может
+    появиться, и это безвредно: не откажи мы, его создала бы запись ниже.
+    """
+    if os.path.exists(path):
+        try:
+            with io.open(path, "r+b"):
+                return ""
+        except Exception as e:
+            return type(e).__name__ + ": " + str(e)
+    folder = os.path.dirname(path)
+    try:
+        os.makedirs(folder, exist_ok=True)
+        probe = os.path.join(folder, ".perm_probe_" + TAG)
+        with io.open(probe, "wb") as f:
+            f.write(b"x")
+        os.remove(probe)
+        return ""
+    except Exception as e:
+        return type(e).__name__ + ": " + str(e)
+
+
+# План: что именно будем писать. Считаем ЗАРАНЕЕ, чтобы спросить про права до
+# первой записи, — и спрашиваем только про те файлы, которые писать СОБИРАЕМСЯ.
+# Совпавший по sha файл не трогаем вовсе, значит и права на него не нужны:
+# требуй мы их на всё подряд, патч из одних неизменившихся файлов отказывал бы
+# из-за чужого файла, к которому не имеет отношения.
+plan = []
 for rel, expect, b64 in FILES:
     data = base64.b64decode(b64)
     assert sha(data) == expect, "payload corrupted: " + rel
     path = os.path.join(ROOT, rel.replace("/", os.sep))
     if os.path.exists(path):
-        with io.open(path, "rb") as f:
-            cur = f.read()
-        if sha(cur) == expect:
+        # ПРОЧИТАТЬ существующий файл тоже может не получиться — на его месте
+        # каталог, или чтение закрыто правами. Падать здесь трассировкой
+        # нельзя: она читается как поломка патча, человек отложит накат и
+        # пойдёт искать причину в генераторе, тогда как причина на диске и
+        # названа ниже своим именем. Не прочитали — значит сравнить не с чем,
+        # значит считаем, что писать надо, и про права спросит проверка.
+        try:
+            with io.open(path, "rb") as f:
+                cur = f.read()
+        except Exception:
+            cur = None
+        if cur is not None and sha(cur) == expect:
             print("skip", rel)
             continue
-        shutil.copy2(path, path + ".bak_" + TAG)
-        status = "ok"
+        plan.append((rel, path, data, expect, "ok", cur))
+    else:
+        plan.append((rel, path, data, expect, "new", None))
+
+denied = []
+for rel, path, _data, _expect, _status, _cur in plan:
+    reason = why_not_writable(path)
+    if reason:
+        denied.append((rel, reason))
+if denied:
+    print("")
+    print("ОТКАЗ: в эти файлы записать нельзя, НИ ОДИН файл не тронут:")
+    for rel, reason in denied:
+        print("  " + rel + " -- " + reason)
+    print("")
+    print("Чаще всего это владелец файла: прежний запуск шёл с правами")
+    print("администратора, и обычная сессия перезаписать уже не может.")
+    print("Запустите патч из PowerShell «от имени администратора».")
+    raise SystemExit(2)
+
+written = 0
+for rel, path, data, expect, status, cur in plan:
+    if status == "ok":
+        # Бэкап пишем ИЗ УЖЕ ПРОЧИТАННЫХ байт, а не `shutil.copy2`: файл мог
+        # не читаться вовсе (на его месте каталог, чтение закрыто правами), и
+        # повторное чтение упало бы ПОСРЕДИ записи — то есть ровно тем
+        # полуприменённым патчем, от которого и заведена проверка выше. Нечего
+        # сохранять — говорим это вслух: прежнего содержимого не будет, и
+        # узнать об этом лучше сейчас, чем в день откатa.
+        if cur is None:
+            print("ВНИМАНИЕ: прежнее содержимое", rel, "прочитать не удалось —"
+                  " копия .bak_" + TAG + " не снята")
+        else:
+            with io.open(path + ".bak_" + TAG, "wb") as f:
+                f.write(cur)
     else:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        status = "new"
     with io.open(path, "wb") as f:
         f.write(data)
     with io.open(path, "rb") as f:
@@ -238,7 +321,18 @@ try:
     for d in RELEASE_DIRS:
         top = os.path.join(ROOT, d.replace("/", os.sep))
         for dirpath, dirnames, filenames in os.walk(top):
-            dirnames[:] = [x for x in dirnames if x != "__pycache__"]
+            # Машинные кэши в релиз не входят и входить не могут: их заводят
+            # pytest и сам Python, они появляются заново после каждого прогона.
+            # Назови их опись лишними — она кричала бы СЕМЬЮ строками на каждом
+            # исправном накате (29.10 на pm168 ровно так и вышло:
+            # `tests/.pytest_cache` шесть файлов), а проверка, ругающаяся на
+            # исправное, кончается тем, что её перестают читать. Отсекаем по
+            # ПРАВИЛУ (имя с точки плюс `__pycache__`), а не списком имён:
+            # завтра появится `.ruff_cache`, и список про него не узнает.
+            # Заодно `os.walk` не полезет внутрь `.pytest_cache`, куда на бою
+            # обычной учётной записи вход закрыт.
+            dirnames[:] = [x for x in dirnames
+                           if x != "__pycache__" and not x.startswith(".")]
             for name in filenames:
                 rel = os.path.relpath(os.path.join(dirpath, name), ROOT)
                 rel = rel.replace(os.sep, "/")
@@ -355,34 +449,89 @@ def subjects_of(root: str, files: list[str]) -> list[str]:
     # генератора), а у того свой предмет. Один уровень оставил бы ровно ту же
     # дыру на шаг глубже, а шагов тут считанные единицы — множество файлов
     # конечно, и каждый проход либо что-то добавляет, либо заканчивает обход.
+    #
+    # В обход идут и `scripts/`, а не только тесты: предмет теста сам бывает
+    # чужим читателем. `tests/test_probe_pool.py` запускает
+    # `scripts/probe_pool.py`, а тот ИМПОРТИРУЕТ `probe_movements` — поиск
+    # строк один на все probe-скрипты, — и этот второй файл приходилось
+    # дописывать в патч руками. Литералы при этом смотрим ТОЛЬКО в тестах:
+    # у скрипта строка с путём — это его умолчание (у `check_1c_module.py` оно
+    # ведёт в `1c/`, который накат не везёт намеренно), и тянуть по ней значило
+    # бы увезти на сервер то, чего там быть не должно.
     queue = [f.replace("\\", "/") for f in files]
     while queue:
         rel = queue.pop()
-        if not rel.startswith("tests/") or not rel.endswith(".py"):
+        if not rel.endswith(".py"):
+            continue
+        is_test = rel.startswith("tests/")
+        if not is_test and not rel.startswith("scripts/"):
             continue
         try:
             tree = ast.parse(open(os.path.join(root, rel), encoding="utf-8").read())
         except (OSError, SyntaxError):
             continue
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
-                continue
-            name = node.value.replace("\\", "/")
-            # Наружу корня не выходим: литерал в тесте — чужая строка, а патч
-            # пишет на боевой сервер по этим же путям. `os.path.join` с
-            # абсолютным путём корень ПОДМЕНЯЕТ, то есть один такой литерал
-            # увёз бы на сервер файл откуда угодно с диска.
-            if (not name.endswith(".py") or os.path.isabs(name)
-                    or name.startswith("/") or ".." in name.split("/")):
-                continue
-            for candidate in (name, "scripts/" + name):
+
+        def take(candidates):
+            """Первый существующий кандидат — в патч и в обход."""
+            for candidate in candidates:
                 if candidate in known or candidate in found:
-                    continue
+                    return
                 if os.path.isfile(os.path.join(root, candidate)):
                     found.add(candidate)
                     queue.append(candidate)
-                    break
+                    return
+
+        for node in ast.walk(tree):
+            if is_test and isinstance(node, ast.Constant) and isinstance(node.value, str):
+                name = node.value.replace("\\", "/")
+                # Наружу корня не выходим: литерал в тесте — чужая строка, а
+                # патч пишет на боевой сервер по этим же путям.
+                # `os.path.join` с абсолютным путём корень ПОДМЕНЯЕТ, то есть
+                # один такой литерал увёз бы на сервер файл откуда угодно с
+                # диска.
+                if (name.endswith(".py") and not os.path.isabs(name)
+                        and not name.startswith("/")
+                        and ".." not in name.split("/")):
+                    take((name, "scripts/" + name))
+            for module in _imported_modules(node):
+                take(_module_candidates(module))
     return sorted(found)
+
+
+def _imported_modules(node) -> list[str]:
+    """Имена модулей, которые импортирует ЭТА инструкция.
+
+    Относительные импорты (`from . import x`) пропускаем: в `tests/` и
+    `scripts/` их нет, а разбирать уровни ради несуществующего случая значит
+    завести код, который никто никогда не проверит.
+    """
+    import ast
+
+    if isinstance(node, ast.Import):
+        return [a.name for a in node.names]
+    if isinstance(node, ast.ImportFrom) and not node.level and node.module:
+        return [node.module]
+    return []
+
+
+def _module_candidates(module: str) -> tuple[str, ...]:
+    """Файлы релиза, которыми может оказаться этот модуль.
+
+    `app.*` НЕ тянем намеренно, и это не экономия на спичках. Боевой код едет
+    в патчах постоянно: модуль, которого на сервере нет, — это новый модуль, а
+    новый модуль по построению попадает в `git diff` и в патч. Зато тест,
+    импортирующий `app.models`, тянул бы за собой сотни килобайт в КАЖДЫЙ
+    патч, который этот тест правит, — а нагрузка и так под мегабайт. Про
+    боевой файл, который однажды не доехал, отвечает ОПИСЬ, и это её работа.
+    Настоящая же дыра — помощники: `scripts/probe_movements.py` и
+    `tests/factories.py` обычной работой не возятся вовсе.
+    """
+    parts = module.split(".")
+    if parts[0] in ("tests", "scripts"):
+        return ("/".join(parts) + ".py",)
+    if len(parts) == 1:
+        return ("scripts/" + parts[0] + ".py", "tests/" + parts[0] + ".py")
+    return ()
 
 
 def build(root: str, files: list[str], tag: str, parts: int, width: int,

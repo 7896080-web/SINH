@@ -251,3 +251,59 @@ def test_it_survives_the_production_console(feed):
     # работает — она печатается, но «İ» в ней заменена.
     assert "O-on" in out, "списка заказов нет — чужой символ до вывода не дошёл"
     assert "NDGO MELANJ" in out.replace("?", ""), out
+
+
+def test_the_skipped_orders_are_named_too(feed):
+    """«Пропустит 12» без имён отвечает не на тот вопрос.
+
+    На бою 29.10 к проведению не вышло ни одного заказа, а отобранных было
+    двенадцать — и посмотреть, ЧТО это за товары, было нечем. А среди них
+    может лежать позиция, которую вот-вот включают: включат — и заказ уже
+    выпал из тридцатисуточного окна сверки. Причина у двух корзин разная и
+    разбирают их по-разному, поэтому и названа она у каждой своя.
+    """
+    url, _path = feed
+    out = _run(url, "--orders")
+
+    assert "(пропуск: пара не отмечена) O-off" in out, out
+    assert "(пропуск: баркод не сопоставлен) O-orphan" in out, out
+    # И товар назван по имени, а не одним баркодом: по баркоду строку не узнать.
+    assert "4052 b" in out, out
+    # У несопоставленного товара в номенклатуре нет вовсе — и это сказано.
+    assert "товара в номенклатуре нет" in out, out
+    # Отменённый в список не идёт: его сверка не отбирала вовсе.
+    assert "O-dead" not in out, out
+
+
+def test_the_totals_point_at_the_key_that_shows_them(feed):
+    """Список есть, а про ключ никто не сказал — значит списка для человека нет.
+
+    Ровно то правило, по которому страница, к которой ведёт один элемент на
+    другой странице, считается отсутствующей.
+    """
+    url, _path = feed
+    assert "--orders" in _run(url), "итоги не говорят, чем посмотреть пропущенных"
+
+
+def test_nothing_to_skip_means_no_advice(feed):
+    """А когда пропускать нечего — молчим: лишняя подсказка учит не читать вывод.
+
+    Состояние собираем честное: про пропускаемые заказы мы УЖЕ знаем, значит
+    отбор их не возьмёт, а единственный оставшийся уедет в 1С.
+    """
+    url, path = feed
+    engine = create_engine(f"sqlite:///{path}")
+    session = sessionmaker(bind=engine, autoflush=False)()
+    for order_id in ("O-off", "O-orphan"):
+        session.add(ProcessedOrder(account_id=1, order_id=order_id, uid_1c=None,
+                                   quantity=1,
+                                   status=OrderProcessStatus.processed))
+    session.commit()
+    session.close()
+    engine.dispose()
+
+    out = _run(url)
+
+    assert "УЕДЕТ В 1С перемещениями:      1" in out, out
+    assert "пары не отмечены):  0" in out, out
+    assert "--orders" not in out, out

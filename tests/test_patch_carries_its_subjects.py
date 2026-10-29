@@ -120,3 +120,109 @@ def test_the_subject_of_a_subject_goes_too(tmp_path):
     assert "scripts/deep_probe.py" in carried, (
         "предмет предмета не дотянулся — обход не транзитивен")
     assert not [c for c in carried if ".." in c or c.startswith("/")], carried
+
+
+def test_a_helper_reached_only_by_import_goes_too(tmp_path):
+    """Предмет бывает назван ИМПОРТОМ, а не строкой — и это живой случай.
+
+    `tests/test_probe_pool.py` запускает `scripts/probe_pool.py` (его имя там
+    литералом, он дотягивается), а сам `probe_pool.py` ИМПОРТИРУЕТ
+    `probe_movements` — поиск строк один на все probe-скрипты, намеренно. Этот
+    второй файл не называет никто, его приходилось дописывать в патч руками, а
+    забудь человек — на сервере скрипт упал бы `ModuleNotFoundError` в тот
+    день, когда его открывают, то есть когда уже беда.
+
+    Корень СВОЙ: на настоящем репозитории `probe_movements` дотягивался бы и по
+    другим путям, и мутация «импорты не смотрим» проверку не уронила бы.
+    """
+    root = tmp_path / "root"
+    (root / "tests").mkdir(parents=True)
+    (root / "scripts").mkdir()
+    (root / "tests" / "test_tool.py").write_text(
+        'SCRIPT = "scripts/tool.py"\n', encoding="utf-8")
+    (root / "scripts" / "tool.py").write_text(
+        "import helper\nfrom deep_helper import thing\n", encoding="utf-8")
+    (root / "scripts" / "helper.py").write_text("x = 1\n", encoding="utf-8")
+    (root / "scripts" / "deep_helper.py").write_text(
+        "import third\n", encoding="utf-8")
+    (root / "scripts" / "third.py").write_text("x = 1\n", encoding="utf-8")
+
+    carried, printed = _build(tmp_path, "tests/test_tool.py", root=root)
+
+    assert "scripts/helper.py" in carried, carried
+    assert "scripts/deep_helper.py" in carried, carried
+    # Транзитивно и через скрипты: helper импортирует своего helper'а.
+    assert "scripts/third.py" in carried, carried
+    assert "scripts/helper.py" in printed, "дотянутый файл обязан быть НАЗВАН"
+
+
+def test_a_test_helper_module_goes_too(tmp_path):
+    """`from tests.factories import …` — тот же случай с другой стороны.
+
+    Помощник тестов обычной работой не возится: его правят раз в полгода, а
+    тесты, которые его импортируют, правят постоянно. На сервере его может не
+    быть вовсе, и тогда падает не один тест, а каждый, кто его зовёт.
+    """
+    root = tmp_path / "root"
+    (root / "tests").mkdir(parents=True)
+    (root / "tests" / "test_uses.py").write_text(
+        "from tests.helpers import make\nimport sidecar\n", encoding="utf-8")
+    (root / "tests" / "helpers.py").write_text("def make(): pass\n", encoding="utf-8")
+    (root / "tests" / "sidecar.py").write_text("x = 1\n", encoding="utf-8")
+
+    carried, _ = _build(tmp_path, "tests/test_uses.py", root=root)
+
+    assert "tests/helpers.py" in carried, carried
+    # Голое имя ищется и в tests/, а не только в scripts/.
+    assert "tests/sidecar.py" in carried, carried
+
+
+def test_the_import_scan_does_not_drag_in_the_world(tmp_path):
+    """Обратная проверка, и она тут важнее первой.
+
+    Стандартная библиотека, чужие пакеты и боевой код дотягиваться НЕ должны.
+    Про `app/*` это решение, а не упущение: боевой код едет в патчах
+    постоянно — модуль, которого на сервере нет, это новый модуль, а новый
+    модуль по построению попадает в `git diff`. Зато тест, импортирующий
+    `app.models`, тянул бы сотни килобайт в КАЖДЫЙ патч, который его правит, а
+    нагрузка и так под мегабайт. Про боевой файл, однажды не доехавший,
+    отвечает ОПИСЬ — это её работа.
+    """
+    root = tmp_path / "root"
+    (root / "tests").mkdir(parents=True)
+    (root / "app" / "workers").mkdir(parents=True)
+    (root / "tests" / "test_plain.py").write_text(
+        "import os\nimport sys\nimport pytest\n"
+        "from app.workers.order_audit import audit_all\n"
+        "from sqlalchemy.orm import Session\n", encoding="utf-8")
+    (root / "app" / "workers" / "order_audit.py").write_text("x = 1\n",
+                                                             encoding="utf-8")
+
+    carried, printed = _build(tmp_path, "tests/test_plain.py", root=root)
+
+    assert carried == {"tests/test_plain.py"}, carried
+    assert "дотянут" not in printed, printed
+
+
+def test_a_default_path_inside_a_script_is_not_followed(tmp_path):
+    """Литералы смотрим ТОЛЬКО в тестах, и это не мелочь.
+
+    У скрипта строка с путём — это его УМОЛЧАНИЕ, и у `check_1c_module.py` оно
+    ведёт в `1c/`, который накат не везёт намеренно: его копия на диске сервера
+    на работу не влияет, а разошедшийся sha развалил бы накат целиком. Пойди
+    обход по литералам внутри скриптов, патч увёз бы туда ровно то, чего там
+    быть не должно.
+    """
+    root = tmp_path / "root"
+    (root / "tests").mkdir(parents=True)
+    (root / "scripts").mkdir()
+    (root / "1c").mkdir()
+    (root / "tests" / "test_tool.py").write_text(
+        'SCRIPT = "scripts/tool.py"\n', encoding="utf-8")
+    (root / "scripts" / "tool.py").write_text(
+        'LIVE = "1c/module.py"\n', encoding="utf-8")
+    (root / "1c" / "module.py").write_text("x = 1\n", encoding="utf-8")
+
+    carried, _ = _build(tmp_path, "tests/test_tool.py", root=root)
+
+    assert carried == {"tests/test_tool.py", "scripts/tool.py"}, carried
