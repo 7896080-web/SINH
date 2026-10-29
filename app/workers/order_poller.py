@@ -135,7 +135,8 @@ def open_test_out(db: Session, uid_1c: str) -> int:
 
 
 def process_new_order(db: Session, order: PlatformOrder, account: PlatformAccount, warehouse_pending: str,
-                       is_test: bool = False, order_date=None, respect_enabled: bool = True) -> dict:
+                       is_test: bool = False, order_date=None, respect_enabled: bool = True,
+                       found_by: str | None = None) -> dict:
     """Обрабатывает ОДИН заказ — сердце приёма заказов (раздел 4/5
     спецификации). Используется и живым опросом (poll_new_orders, заказ из
     реального API), и страницей тестирования (testing.py, синтетический
@@ -237,6 +238,11 @@ def process_new_order(db: Session, order: PlatformOrder, account: PlatformAccoun
     db.add(ProcessedOrder(
         account_id=account.id, order_id=order.order_id, uid_1c=uid_1c,
         quantity=order.quantity, status=OrderProcessStatus.processed,
+        # `None` — живой опрос: он и есть штатный путь, и отдельного имени ему
+        # не нужно. Имя ставят те, кто ДОГОНЯЕТ прошлое, потому что про них и
+        # спрашивают: расчёт — по просьбе человека, сверка — потому что опрос
+        # заказ потерял.
+        found_by=found_by,
     ))
 
     result["dispatched_to"] = _enqueue_dispatch_to_others(

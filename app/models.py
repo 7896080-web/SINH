@@ -551,6 +551,17 @@ class ProcessedOrder(Base):
     status = Column(Enum(OrderProcessStatus), default=OrderProcessStatus.processed, nullable=False)
     processed_at = Column(DateTime, default=now_utc)
     cancelled_at = Column(DateTime, nullable=True)
+    # ОТКУДА мы узнали про этот заказ: `None` — живой опрос (и все строки,
+    # заведённые до появления колонки), `recalc` — расчёт по кнопке,
+    # `audit` — суточная сверка заказов с площадкой.
+    #
+    # Это не бухгалтерия ради бухгалтерии: `audit` означает, что живой опрос
+    # заказ ПОТЕРЯЛ, то есть остаток был завышен ровно на него, пока сверка не
+    # пришла. Вопрос «сколько заказов в сутки теряем» без этой колонки ответа
+    # не имеет вовсе — а именно он решает, искать ли причину. Живёт на самой
+    # строке заказа, потому что это свойство заказа, а не отдельное событие:
+    # аномалии чистятся через 90 суток, а здесь нужна длинная картина.
+    found_by = Column(String(16), nullable=True, index=True)
 
     account = relationship("PlatformAccount")
 

@@ -1,4 +1,4 @@
-"""Тест, читающий `1c/`, обязан быть помечен `@repository_only`.
+"""Тест, которому нужен РЕПОЗИТОРИЙ, обязан быть помечен `@repository_only`.
 
 Это уже случилось ДВАЖДЫ, и оба раза одинаково: блоки наката каталог `1c/`
 намеренно не везут (его копия на диске сервера на работу не влияет, а
@@ -23,6 +23,17 @@
 каталогу не обращается вовсе — помечать их значило бы пропускать на сервере
 проверки, которые там как раз работают. Обращение считается транзитивно:
 тест зовёт помощника, помощник читает `LIVE`.
+
+**29.10 выяснилось, что механизмов ДВА, и правило было применено к одному.**
+Опись релиза (`gen_whole_file_patch.inventory_of`) берёт список файлов из
+`git ls-files`, а git на боевом сервере не установлен вовсе: `tracked_files`
+там отдаёт пустой список НАМЕРЕННО (иначе патч перестал бы собираться), и
+тест, который строит «сервер» ПО ОПИСИ, проверяет на сервере пустоту и падает
+ВСЕГДА. На pm167 так встали шесть тестов `test_server_inventory.py` — накат
+остановился перед перезапуском служб, уже после копии базы и миграций, то есть
+ровно тем же способом, что pm147 и pm148. Третий случай подряд на «проверка
+была уже, а применена не ко всему», поэтому правило расширено здесь, а не
+правкой по месту: сканер требует маркер и у тех, кто добирается до описи.
 """
 import ast
 from pathlib import Path
@@ -79,6 +90,24 @@ def _runs_a_script_without_a_path(func: ast.FunctionDef) -> bool:
     return False
 
 
+# Помощники генератора патча, которые спрашивают git. Признак — ИМЯ, а не
+# модуль-алиас: `gen.inventory_of`, `inventory_of`, `patch.tracked_files` —
+# всё это один и тот же вопрос «что в репозитории», и на сервере ответ на него
+# пуст. Перечислены поимённо: требовать маркер по слову «git» где угодно
+# значило бы ругаться на исправное, а проверка, ругающаяся на исправное,
+# кончается тем, что её отключают.
+GIT_BACKED_HELPERS = {"tracked_files", "inventory_of"}
+
+
+def _asks_git_what_is_in_the_repository(func: ast.FunctionDef) -> bool:
+    for node in ast.walk(func):
+        if isinstance(node, ast.Attribute) and node.attr in GIT_BACKED_HELPERS:
+            return True
+        if isinstance(node, ast.Name) and node.id in GIT_BACKED_HELPERS:
+            return True
+    return False
+
+
 def _functions_touching_1c(tree: ast.AST) -> set[str]:
     """Функции файла, которые доберутся до `1c/` — сами или через помощника."""
     marked = _paths_into_1c(tree)
@@ -112,11 +141,38 @@ def _is_marked(func: ast.FunctionDef) -> bool:
     return False
 
 
+def _functions_needing_the_repository(tree: ast.AST) -> set[str]:
+    """Функции файла, которым нужен репозиторий: каталог `1c/` ЛИБО опись.
+
+    Замыкание считается по ОБЪЕДИНЕНИЮ, а не по каждому механизму отдельно:
+    тест может звать помощника, который читает опись, ровно так же, как
+    помощника, который читает модуль 1С, — и разбей мы это на два прохода,
+    смешанная цепочка (`тест -> помощник описи -> ...`) провалилась бы между
+    ними.
+    """
+    funcs = {n.name: _referenced_names(n) for n in ast.walk(tree)
+             if isinstance(n, ast.FunctionDef)}
+
+    needing = _functions_touching_1c(tree)
+    needing |= {n.name for n in ast.walk(tree)
+                if isinstance(n, ast.FunctionDef)
+                and _asks_git_what_is_in_the_repository(n)}
+
+    changed = True
+    while changed:
+        changed = False
+        for name, used in funcs.items():
+            if name not in needing and used & needing:
+                needing.add(name)
+                changed = True
+    return needing
+
+
 def _unmarked_tests_reading_1c() -> list[str]:
     found = []
     for path in sorted(TESTS.glob("test_*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
-        touching = _functions_touching_1c(tree)
+        touching = _functions_needing_the_repository(tree)
         for node in ast.walk(tree):
             if (isinstance(node, ast.FunctionDef)
                     and node.name.startswith("test_")
@@ -126,12 +182,13 @@ def _unmarked_tests_reading_1c() -> list[str]:
     return found
 
 
-def test_every_test_that_reads_the_1c_directory_is_repository_only():
+def test_every_test_that_needs_the_repository_is_repository_only():
     unmarked = _unmarked_tests_reading_1c()
 
     assert unmarked == [], (
-        "эти тесты читают 1c/ без @repository_only и на боевом сервере упадут "
-        "ВСЕГДА, остановив накат перед перезапуском служб: " + ", ".join(unmarked))
+        "эти тесты читают 1c/ или опись релиза без @repository_only и на боевом "
+        "сервере упадут ВСЕГДА, остановив накат перед перезапуском служб: "
+        + ", ".join(unmarked))
 
 
 def test_the_scanner_sees_the_tests_it_is_written_for():
@@ -155,3 +212,29 @@ def test_the_scanner_sees_the_tests_it_is_written_for():
     assert _functions_touching_1c(
         ast.parse((TESTS / "test_1c_protocol.py").read_text(encoding="utf-8"))
     ) == set(), "файл говорит про 1c только в докстроке — каталога он не читает"
+
+
+def test_the_scanner_sees_the_second_mechanism_too():
+    """Опись: сканер обязан РАЗЛИЧАТЬ и здесь, иначе он сузился до пустоты.
+
+    В `test_server_inventory.py` живут оба сорта: одни добираются до описи
+    (сами или через `_server`, который строит «сервер» по ней) — на сервере
+    они падают всегда; другие читают ИСХОДНИК `update_windows.ps1`, и там они
+    как раз работают. Пометь мы файл целиком — погасили бы вторых, а это
+    единственная проверка, что у описи есть читатель и что он под `try`.
+    """
+    tree = ast.parse((TESTS / "test_server_inventory.py").read_text(encoding="utf-8"))
+    needing = _functions_needing_the_repository(tree)
+
+    # Зовёт `gen.inventory_of` напрямую.
+    assert "test_the_inventory_covers_the_tools_and_skips_what_we_never_ship" in needing
+    # Зовёт `gen.tracked_files` напрямую.
+    assert "test_every_file_in_the_root_is_a_decision" in needing
+    # А эти — транзитивно, через `_server`: своего обращения к описи у них нет.
+    assert "_server" in needing
+    assert "test_a_disk_that_matches_the_release_says_so" in needing
+    assert "test_the_inventory_names_what_is_missing_changed_and_extra" in needing
+
+    # Эти два читают исходник скрипта наката — репозиторий им не нужен.
+    assert "test_the_inventory_has_a_reader_in_the_update_script" not in needing
+    assert "test_reading_the_inventory_can_never_abort_the_update" not in needing

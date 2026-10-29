@@ -294,7 +294,8 @@ def catch_up_product(db: Session, product: Product, build_client, pending_wareho
         try:
             result = process_new_order(
                 db, order, account, pending_warehouse(account.platform),
-                is_test=False, order_date=o.order_date, respect_enabled=False)
+                is_test=False, order_date=o.order_date, respect_enabled=False,
+                found_by="recalc")
             if result["status"] == "processed":
                 stats["applied"] += 1
             elif result["status"] == "already_processed":

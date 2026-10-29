@@ -283,6 +283,11 @@ class KitClient(PlatformClient):
         cache[variant_id] = barcode or ""
         return barcode or None
 
+    def is_cancelled_status(self, raw_status: str) -> bool:
+        # Тем же набором, которым узнаёт отмену `get_cancelled_orders` ниже:
+        # два счёта одного и того же обязаны совпадать по построению.
+        return (raw_status or "") in CANCELLED_STATUSES
+
     def get_cancelled_orders(self, order_ids: list[str]) -> list[PlatformOrder]:
         # Учитываем ТОЛЬКО НАШУ (продавцовскую) отмену до отгрузки. В разобранном
         # API Kit объект заказа не отдаёт инициатора отмены, поэтому отличить нашу

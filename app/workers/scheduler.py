@@ -13,6 +13,7 @@ from app.backup import last_backup, make_backup, second_site_configured
 from app.retention import apply_retention, backlog_note
 from app.report import CRITICAL, collect_findings, summary_line
 from app.workers.verify_stock import verify_all
+from app.workers.order_audit import audit_all, MAX_PER_ACCOUNT
 from app.models import Platform, PlatformAccount, WorkerHeartbeat
 from app.routers.health import MIRROR_OK_MARKER, SCHEDULER_START_MARKER
 from app.workers.credentials import CredentialsMissing
@@ -788,6 +789,88 @@ def job_verify_stock():
         db.close()
 
 
+# Суточная сверка ЗАКАЗОВ с площадками — см. `app/workers/order_audit.py`.
+# Живой опрос читает очередь неподтверждённых, и заказ, вышедший из неё, он не
+# видит больше никогда; до 29.10 ленту целиком поднимал только «Расчёт» по
+# кнопке, то есть пропуски находились, когда человек дойдёт. Часовая сверка с
+# 1С такой пропуск МАСКИРУЕТ: документа нет ни у нас, ни в 1С, и обе стороны
+# согласованно врут на одну величину.
+ORDER_AUDIT_INTERVAL_HOURS = 24
+# Первый прогон через четверть часа после старта, а не через сутки: задания на
+# `interval` отсчитывают первый запуск от момента добавления, а воркер
+# перезапускается чаще раза в сутки — ровно так суточная выгрузка каталога не
+# запускалась НИ РАЗУ (см. `job_catalog_poll`). Четверть часа, а не минуты:
+# сверка идёт в ленты всех кабинетов за тридцать суток, и затевать это сразу
+# после рестарта, пока приём заказов и сверка остатков наперегонки нагоняют
+# свои первые циклы, незачем.
+ORDER_AUDIT_FIRST_RUN_DELAY = timedelta(minutes=15)
+
+
+def job_order_audit():
+    from app.recalc import active_job
+
+    db = SessionLocal()
+    try:
+        # Расчёт по кнопке делает по своим товарам ровно то же и из той же
+        # ленты. Идемпотентность по `ProcessedOrder` защищает от второго
+        # перемещения, но не от гонки за запись в SQLite: оба пути коммитят на
+        # заказ, и `database is locked` достался бы тому, кого человек ждёт на
+        # странице. Сверка суточная — она дождётся следующих суток.
+        job = active_job(db)
+        if job is not None:
+            logger.info("сверка заказов: идёт расчёт #%s — пропуск до следующих суток",
+                        job.id)
+            _heartbeat(db, "order_audit", True,
+                       f"пропущена: идёт расчёт #{job.id}")
+            return
+
+        accounts = _active_accounts(db)
+        stats = audit_all(db, build_client, accounts,
+                          lambda platform: PENDING_WAREHOUSE_NAME.get(platform, "Ожидает"))
+
+        if stats["missed"] or stats["failed"] or stats["errors"] or stats["left"]:
+            # WARNING: живой опрос потерял заказы. Сами они теперь проведены,
+            # но причина осталась, и завтра он потеряет следующие.
+            logger.warning("сверка заказов: %s", stats)
+        else:
+            logger.info("сверка заказов: %s", stats)
+
+        # Оговорка УСПЕШНОЙ отметки — тот же приём, что у
+        # `reconciliation_applied`: `/health` про живость, а расхождение
+        # разбирает отчёт. Читателя тут ДВА, и это не дублирование. Про сами
+        # потери говорит находка `report._check_missed_orders`, и считает она
+        # СТРОКИ (`ProcessedOrder.found_by`), а не это поле: строки живут, а
+        # оговорку затрёт следующий прогон, и находка умела бы говорить только
+        # про последние сутки. А всё остальное — упёрлись в потолок, не
+        # провелось, кабинет не ответил, лента оборвалась — читает
+        # «Диагностика», показывая отметку «с оговоркой» с текстом. Второй
+        # находки про то же нет НАМЕРЕННО: причина у всех этих строк одна
+        # (сверка не догнала), сходится это за несколько суток само, и находка
+        # о том же приучила бы пролистывать обе.
+        trouble = []
+        if stats["missed"]:
+            trouble.append(f"живой опрос потерял заказов: {stats['missed']} — "
+                           f"проведены сверкой")
+        if stats["left"]:
+            # Молчаливая обрезка читалась бы как «всё догнали».
+            trouble.append(f"не уместилось в прогон (потолок {MAX_PER_ACCOUNT} "
+                           f"на кабинет): {stats['left']}")
+        if stats["failed"]:
+            trouble.append(f"не проведено из-за ошибок: {stats['failed']}")
+        if stats["errors"]:
+            trouble.append(f"сверка не прошла по кабинетам: {stats['errors']}")
+        if stats["problems"]:
+            trouble.append("; ".join(stats["problems"])[:400])
+        _heartbeat(db, "order_audit", True, "; ".join(trouble))
+        db.commit()
+    except Exception as e:
+        logger.exception("order_audit failed")
+        db.rollback()
+        _heartbeat(db, "order_audit", False, str(e))
+    finally:
+        db.close()
+
+
 # Отчёт о расхождениях — раз в час. Ничего не чинит и не отправляет наружу,
 # только читает и пишет ОДНУ строку в лог. Смысл именно в строке: каждый
 # серьёзный дефект сентября был виден в данных за часы до того, как его нашли, —
@@ -1169,6 +1252,9 @@ def build_scheduler() -> BlockingScheduler:
         reconcile_account_jobs(sched, db)
     finally:
         db.close()
+    sched.add_job(job_order_audit, "interval", hours=ORDER_AUDIT_INTERVAL_HOURS,
+                  id="order_audit", max_instances=1,
+                  next_run_time=start + ORDER_AUDIT_FIRST_RUN_DELAY)
     sched.add_job(job_backup, "interval", hours=BACKUP_INTERVAL_HOURS, id="backup",
                   max_instances=1, next_run_time=start + BACKUP_FIRST_RUN_DELAY)
     sched.add_job(job_watchdog, "interval", minutes=WATCHDOG_INTERVAL_MINUTES,

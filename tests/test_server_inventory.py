@@ -35,6 +35,28 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import gen_whole_file_patch as gen  # noqa: E402
 
+# Признак «описи есть из чего собраться» — не каталог `.git`, а СОБРАЛАСЬ ЛИ
+# она. Это тот же класс, что `1c/` (см. tests/test_repository_only_marks.py),
+# только механизм другой и потому не пойманный прежним правилом: список файлов
+# релиза берётся из `git ls-files`, а на боевом сервере git не установлен
+# вовсе. `tracked_files` там возвращает пустой список НАМЕРЕННО — иначе патч
+# перестал бы собираться, то есть новая диагностика отняла бы главное, —
+# значит `inventory_of` пуст, «сервер» из описи не создаёт ни одного файла, и
+# всё, что на нём стоит, падает ВСЕГДА. Здесь при этом зелено, то есть
+# починить по месту нельзя: 29.10 на pm167 так встали пять тестов, накат
+# остановился ПЕРЕД перезапуском служб, уже после копии базы и миграций.
+#
+# Спрашиваем ИМЕННО результат, а не наличие `.git`: каталог может лежать и там,
+# где `git` не запускается (нет бинаря, чужой владелец, `safe.directory`), и
+# тогда признак соврал бы в самую дорогую сторону — тесты пошли бы по пустой
+# описи.
+INVENTORY_BUILDS = bool(gen.tracked_files(str(ROOT)))
+repository_only = pytest.mark.skipif(
+    not INVENTORY_BUILDS,
+    reason="опись собирается из `git ls-files`: на боевом сервере git не "
+           "установлен, и список файлов релиза там пуст по построению",
+)
+
 
 def _child_env() -> dict:
     """Кодировка с ОБЕИХ сторон — см. tests/test_subprocess_encoding.py."""
@@ -89,6 +111,7 @@ def _run_apply(tmp_path, server: Path, root=ROOT) -> str:
     return done.stdout
 
 
+@repository_only
 def test_the_inventory_names_what_is_missing_changed_and_extra(tmp_path):
     """Три вопроса, три ответа — и все три по именам, а не числом.
 
@@ -112,6 +135,7 @@ def test_the_inventory_names_what_is_missing_changed_and_extra(tmp_path):
     assert "лишние, в релизе их нет: 1" in written
 
 
+@repository_only
 def test_a_disk_that_matches_the_release_says_so(tmp_path):
     """Обратная проверка, без которой первая молчала бы и на «ругаемся всегда».
 
@@ -135,6 +159,7 @@ def test_a_disk_that_matches_the_release_says_so(tmp_path):
     assert "лишние, в релизе их нет: 0" in written, written[:600]
 
 
+@repository_only
 def test_a_broken_inventory_never_kills_the_patch(tmp_path):
     """Опись — диагностика, и ронять ею накат нельзя.
 
@@ -152,6 +177,7 @@ def test_a_broken_inventory_never_kills_the_patch(tmp_path):
     assert "DONE" in out
 
 
+@repository_only
 def test_every_file_in_the_root_is_a_decision(tmp_path):
     """Новый файл в корне не попадёт в релиз МОЛЧА.
 
@@ -167,6 +193,7 @@ def test_every_file_in_the_root_is_a_decision(tmp_path):
         "(NOT_SHIPPED_ROOT). Не решено: " + repr(sorted(tracked ^ decided)))
 
 
+@repository_only
 def test_the_inventory_covers_the_tools_and_skips_what_we_never_ship():
     """Состав описи: скрипты разбора внутри, `1c/` снаружи.
 
@@ -197,6 +224,7 @@ def test_the_inventory_has_a_reader_in_the_update_script():
     assert "нет на диске" in text, "счётчики опознаются поимённо"
 
 
+@repository_only
 def test_a_patch_without_an_inventory_builds_and_says_so(tmp_path):
     """Опись не имеет права отнять у патча возможность привезти файлы.
 

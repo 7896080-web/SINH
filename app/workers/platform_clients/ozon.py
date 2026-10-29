@@ -230,6 +230,11 @@ class OzonClient(PlatformClient):
             self.last_truncated = True
         return result
 
+    def is_cancelled_status(self, raw_status: str) -> bool:
+        # Тем же набором, которым узнаёт отмену `get_cancelled_orders` ниже:
+        # два счёта одного и того же обязаны совпадать по построению.
+        return (raw_status or "") in CANCELLED_STATUSES
+
     def get_cancelled_orders(self, order_ids: list[str]) -> list[PlatformOrder]:
         if not order_ids:
             return []
