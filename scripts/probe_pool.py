@@ -46,7 +46,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.database import SessionLocal                              # noqa: E402
 from app.models import (Barcode, PlatformAccount,                   # noqa: E402
                         PlatformCatalogItem, Product, SyncSetting)
-from app.stock_cell import cell_of, members, shares                 # noqa: E402
+from app.stock_cell import cell_of, cell_quantity, members, shares  # noqa: E402
 from app.workers.dispatch import _resolve_push_target               # noqa: E402
 from probe_movements import _find_rows, _size_key                   # noqa: E402
 
@@ -145,7 +145,8 @@ def _say_cabinet(db, product, account, verdicts: dict) -> None:
     # Правило 1: кого рассылка считает жильцами ячейки и сколько даст каждый.
     cell_uids = members(db, account.id, cell, product.uid_1c)
     parts = shares(db, account.id, cell_uids)
-    total = sum(q for _, q in parts)
+    total = cell_quantity(parts)
+    raw_total = sum(q for _, q in parts)
     if len(cell_uids) > 1:
         verdicts["shared"] += 1
         print(f"    ЖИЛЬЦОВ {len(cell_uids)} — на карточку уедет СУММА {total}:")
@@ -155,11 +156,23 @@ def _say_cabinet(db, product, account, verdicts: dict) -> None:
         owner = db.query(Product).filter(Product.uid_1c == uid).first()
         stock = (owner.stock_on_hand or 0) if owner else 0
         note = ""
-        if qty == 0 and stock > 0:
+        if qty < 0:
+            # Минус в слагаемом — это продажи, которые со склада уехали, а в
+            # учёте не отражены. Он ВЫЧИТАЕТСЯ из суммы намеренно, и промолчи
+            # скрипт, человек читал бы «уедет 33» при остатке соседа 40 и не
+            # понял бы, откуда взялось число.
+            note = "   <- МИНУС, вычитается: отгрузили больше, чем числилось"
+            verdicts["negative_member"] += 1
+        elif qty == 0 and stock > 0:
             note = "   <- вклад НОЛЬ при остатке " + str(stock) + \
                    ": выключатель (трансляция или галочка кабинета)"
             verdicts["muted_neighbour"] += 1
         print(f"      {_label(owner):28} {qty:>4}{note}")
+    if raw_total != total:
+        # Обрезка по итогу. Молчи о ней скрипт, и «уедет 0» при жильце с
+        # остатком 40 выглядело бы поломкой расчёта, а не минусом соседа.
+        print(f"    сумма слагаемых {raw_total} — это минус, наружу уедет ноль")
+        verdicts["clamped"] += 1
 
     # Правило 2: однозначен ли пул для догадки `catalog_sync`.
     if len(uids) > 1:
@@ -219,6 +232,8 @@ def main() -> int:
         print(f"  карточек с несколькими жильцами: {verdicts['shared']}")
         print(f"  неоднозначных пулов:             {verdicts['ambiguous']}")
         print(f"  соседей с нулевым вкладом:       {verdicts['muted_neighbour']}")
+        print(f"  слагаемых в минусе:              {verdicts['negative_member']}")
+        print(f"  ячеек, обрезанных до нуля:       {verdicts['clamped']}")
         print(f"  пар без карточки в каталоге:     {verdicts['no_card']}")
         print(f"  строк без баркодов вовсе:        {verdicts['no_barcode']}")
         print("")

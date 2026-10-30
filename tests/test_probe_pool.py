@@ -111,6 +111,16 @@ def _switch_off(path, uid):
     engine.dispose()
 
 
+def _set_stock(path, uid, value):
+    engine = create_engine(f"sqlite:///{path}")
+    session = sessionmaker(bind=engine, autoflush=False)()
+    product = session.query(Product).filter(Product.uid_1c == uid).first()
+    product.stock_on_hand = value
+    session.commit()
+    session.close()
+    engine.dispose()
+
+
 # ------------------------------------------------------- правило ячейки
 
 def test_the_neighbour_on_the_card_is_named_with_the_sum(shared_card):
@@ -144,6 +154,41 @@ def test_a_muted_neighbour_is_called_out_not_silently_dropped(shared_card):
     assert "вклад НОЛЬ при остатке 18" in out, out
     assert "выключател" in out, "причина нулевого вклада не названа"
     assert "СУММА 16" in out, "сумма обязана быть без вклада соседа"
+
+
+def test_a_negative_member_is_named_as_subtracted(shared_card):
+    """Минус соседа ВЫЧИТАЕТСЯ из суммы — и об этом надо сказать.
+
+    Случай 29.10 по `2503`/`2403`: остаток на одном жильце, минус на другом,
+    и физически на складе лежит разница. Промолчи скрипт, человек читал бы
+    «уедет 9» при остатке жильца 16 и не понял бы, откуда взялось число, —
+    ответ выглядел бы ответом.
+    """
+    url, path = shared_card
+    _set_stock(path, "u-b", -7)
+
+    out = _run(url, OUR)
+
+    assert "СУММА 9" in out, "минус соседа не вычтен:\n" + out
+    assert "МИНУС, вычитается" in out, out
+    assert "слагаемых в минусе:              1" in out, out
+
+
+def test_a_cell_clamped_to_zero_says_so(shared_card):
+    """Сумма ушла в минус — наружу уедет ноль, и это не поломка расчёта.
+
+    «Уедет 0» при жильце с остатком 2 читается как отказ отправки: человек
+    пойдёт искать выключатель, которого нет.
+    """
+    url, path = shared_card
+    _set_stock(path, "u-a", 2)
+    _set_stock(path, "u-b", -7)
+
+    out = _run(url, OUR)
+
+    assert "СУММА 0" in out, out
+    assert "сумма слагаемых -5" in out, out
+    assert "ячеек, обрезанных до нуля:       1" in out, out
 
 
 def test_a_single_tenant_row_says_so_plainly(shared_card):

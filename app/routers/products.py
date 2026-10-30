@@ -27,7 +27,7 @@ from app.audit import log_action
 from app.timeutils import now_utc, today_local
 from app.excel_utils import (build_xlsx_response, read_xlsx_rows, read_upload, parse_bool_ru,
                              ExcelReadError, YES_NO)
-from app.stock_cell import shared_cells, shares
+from app.stock_cell import cell_quantity, shared_cells, shares
 from app.transmit import (explain, sku_quantity, enqueue_full_resend, enqueue_withdrawal,
                           should_withdraw, ever_transmitted,
                           offset_from_base, recompute_offset, sku_mode, MODE_AUTO,
@@ -150,8 +150,8 @@ def _shared_cards(db: Session, products: list[Product],
         labels.setdefault(p.uid_1c, p.article or p.uid_1c)
     totals: dict[tuple[str, int], int] = {}
     for (uid, account_id), others in shared.items():
-        totals[(uid, account_id)] = sum(
-            q for _, q in shares(db, account_id, sorted({uid, *others})))
+        totals[(uid, account_id)] = cell_quantity(
+            shares(db, account_id, sorted({uid, *others})))
     return shared, labels, totals
 
 

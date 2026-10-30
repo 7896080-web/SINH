@@ -9,10 +9,17 @@
 Физически же со склада ЦС уехала единица 2503. Значит списывать надо с 2503, и
 это не «подогнать цифру», а назвать правильного плательщика.
 
-Проверки тут про СЛЕДСТВИЕ: у кого убавилось, у кого нет, что уехало в 1С и
-сказали ли мы про саму причину. Обратные проверки важнее прямых: обычный путь
-(товар покрывает свой заказ) обязан остаться байт в байт, иначе подмена начнёт
-перекладывать продажи между здоровыми строками.
+Карточку при этом делят ДВЕ ПАРТИИ ОДНОЙ МОДЕЛИ, и сопоставление верное:
+партии идут с пересекающимися размерами (4033 M–3XL и 4052 3XL–6XL делят 3XL;
+2403 и пришедшая за ней 2503 — один и тот же товар), баркоды привязаны по
+цветоразмеру и пулу. Значит подмена плательщика — не обход поломки мэппинга, а
+штатный разбор, и аномалии по ней НЕТ: см.
+`test_the_swap_says_what_it_did_and_leaves_no_anomaly`.
+
+Проверки тут про СЛЕДСТВИЕ: у кого убавилось, у кого нет и что уехало в 1С.
+Обратные проверки важнее прямых: обычный путь (товар покрывает свой заказ)
+обязан остаться байт в байт, иначе подмена начнёт перекладывать продажи между
+здоровыми строками.
 """
 from datetime import date
 
@@ -95,12 +102,18 @@ def test_the_1c_document_names_the_payer(db):
     assert task.barcode == "BC-2503", task.barcode
 
 
-def test_the_swap_is_named_out_loud(db):
-    """Подмена починила арифметику, но НЕ причину — и обязана сказать про неё.
+def test_the_swap_says_what_it_did_and_leaves_no_anomaly(db):
+    """Подмена — ШТАТНЫЙ случай: аномалии нет, а след есть.
 
-    Неверным осталось сопоставление: баркод привязан не к тому товару 1С.
-    Промолчи подмена, человек никогда не узнал бы, что продажи по этой карточке
-    разносятся догадкой, — и починка превратилась бы в сокрытие.
+    Один день (pm173) она заводила аномалию с советом «поправьте
+    сопоставление», и совет был невыполним: два артикула 1С на одной карточке
+    — это партии одной модели с пересекающимися размерами (4033 M–3XL и 4052
+    3XL–6XL делят 3XL; 2403 и 2503 — один товар), баркоды сопоставлены ВЕРНО
+    по цветоразмеру и пулу. Править нечего, а строка на каждую такую продажу —
+    поток на штатной работе, после которого страницу аномалий не открывают.
+
+    Совсем молчать тоже нельзя: вопрос «почему убавился остаток ДРУГОГО
+    артикула» задают, и ответ обязан быть в журнале приёма заказа.
     """
     account = make_account(db)
     _item(db, account, "2403", "BC-2403", 0, enabled=False)
@@ -108,12 +121,12 @@ def test_the_swap_is_named_out_loud(db):
 
     result = _take(db, account, _order())
 
-    row = db.query(SyncAnomaly).filter(
-        SyncAnomaly.reason == AnomalyReason.order_misrouted).one()
-    # Строка на ТОМ, кого назвал баркод: разбирать идут его сопоставление.
-    assert row.uid_1c == "2403" and row.order_id == "O-1"
-    assert result["anomaly_created"] is True
-    assert "сопоставление" in result["detail"], result["detail"]
+    assert db.query(SyncAnomaly).count() == 0, "аномалии на штатном случае нет"
+    assert result["anomaly_created"] is False
+    assert "2403" in result["detail"] and "2503" in result["detail"]
+    assert "другая партия" in result["detail"], result["detail"]
+    assert "сопоставлен" not in result["detail"], \
+        "совет править мэппинг невыполним: править нечего"
 
 
 def test_an_item_that_can_cover_pays_itself(db):
@@ -244,40 +257,22 @@ def test_a_simulation_never_swaps(db):
     assert _stock(db, "2503") == 40 and _stock(db, "2403") == 0
 
 
-def test_the_finding_reads_the_anomaly(db):
-    """У подмены обязан быть ЧИТАТЕЛЬ: иначе это запись без читателя.
+def test_the_report_stays_silent_about_the_swap(db):
+    """Отчёт про подмену молчит — и это РЕШЕНИЕ, а не упущение.
 
-    ВНИМАНИЕ, а не КРИТИЧНО: подмена оверселл уже остановила, деньги прямо
-    сейчас не теряются. Но молчать нельзя — пока сопоставление не поправлено,
-    каждая продажа по карточке разносится догадкой.
+    Проверяется по следствию: собираем отчёт целиком на том самом состоянии,
+    которое 29.10 разбирали руками, и требуем, чтобы ни одна находка про него
+    не говорила. Верни кто-нибудь находку «баркод ведёт не на тот товар» — на
+    штатной расстановке двух партий она закричит, и тест упадёт.
     """
-    from app.report import (CHECKS, FULL_LISTS, WARNING, CRITICAL,
-                            _check_misrouted_orders, _rows_misrouted_orders)
+    from app.report import collect_findings
 
     account = make_account(db)
     _item(db, account, "2403", "BC-2403", 0, enabled=False)
     _item(db, account, "2503", "BC-2503", 40)
-    _take(db, account, _order())
+    result = _take(db, account, _order())
 
-    assert _check_misrouted_orders in CHECKS
-    finding = _check_misrouted_orders(db)
-    assert finding is not None
-    assert finding.level == WARNING and finding.level != CRITICAL
-    assert finding.link == "/report/rows/misrouted_orders"
-    assert "misrouted_orders" in FULL_LISTS
-    rows = _rows_misrouted_orders(db)
-    assert len(rows) == finding.count
-    # Строка про ТОТ товар, чьё сопоставление и правят.
-    assert any("2403" in str(cell) for cell in rows[0]), rows[0]
-
-
-def test_the_finding_is_silent_without_a_swap(db):
-    """И молчит на исправном: находка, срабатывающая на норме, учит не читать."""
-    from app.report import _check_misrouted_orders
-
-    account = make_account(db)
-    _item(db, account, "2403", "BC-2403", 5)
-    _item(db, account, "2503", "BC-2503", 40)
-    _take(db, account, _order())
-
-    assert _check_misrouted_orders(db) is None
+    assert result["misrouted_from"] == "2403", "подмена обязана была сработать"
+    keys = {f.key for f in collect_findings(db)}
+    assert "misrouted_orders" not in keys, keys
+    assert "unmanaged_fed_pairs" not in keys, keys

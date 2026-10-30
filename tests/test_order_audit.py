@@ -766,47 +766,38 @@ def _shared_card(db, account, *, fed_uid="u-fed", fed_stock=40,
     db.commit()
 
 
-def test_a_card_we_keep_feeding_is_its_own_finding(db):
-    """Карточку кормим МЫ — значит число не устаревшее, и срок у него иной.
+def test_a_card_shared_with_another_batch_is_not_a_finding(db):
+    """Два артикула 1С на одной карточке — ШТАТНАЯ расстановка, не поломка.
 
-    29.10 на бою: `2503 SIYAH` и `2403 SIYAH` ведут на одну карточку. Остаток
-    на 2503, он отмечен и транслируется; баркод привязан к 2403, галочки нет,
-    остаток нулевой. Заказ списывается с 2403 — тот в МИНУС, — а у 2503 не
-    убавляется вовсе, и мы отправляем его полное число снова и снова.
-    Прежний текст обещал «пока устаревшее число на карточке не кончится», а
-    кончиться ему нечем: оно НАШЕ и подновляется нами.
+    Партии одной модели идут с пересекающимися размерами: 4033 M–3XL и 4052
+    3XL–6XL делят 3XL, а 2403 и пришедшая за ней 2503 — один и тот же товар.
+    Баркоды сопоставлены верно по цветоразмеру и пулу, править нечего.
+
+    Один день (pm173) у этого случая была своя КРИТИЧНАЯ находка: она обещала
+    самоподдерживающийся оверселл — мол, заказ списывается с распроданной
+    партии, а полное число живой мы отправляем снова и снова. С обрезкой по
+    ИТОГУ суммы (`stock_cell.cell_quantity`) обещание стало неправдой: минус
+    распроданной партии вычитается, и наружу уходит настоящее число. Находка,
+    кричащая на штатной работе, кончается тем, что отчёт пролистывают целиком.
     """
-    from app.report import (CRITICAL, CHECKS, FULL_LISTS,
-                            _check_unmanaged_fed_pairs,
-                            _check_unmanaged_pairs,
-                            _rows_unmanaged_fed_pairs)
+    from app.report import _check_unmanaged_pairs
+    from app.stock_cell import cell_quantity, members, shares
 
     account = make_account(db)
     _product(db, stock=0, account=account, enabled=False)
-    # Кормилец НЕ ПОКРЫВАЕТ заказ, и только поэтому случай ещё жив: покрой он
-    # его, подмена плательщика (`stock_cell.payer_for`) списала бы с него, и
-    # находки не было бы вовсе — ровно это и есть починка 29.10. Остаётся
-    # узкий остаток: у кормильца остаток есть, но меньше заказа.
+    # Живая партия заказ НЕ покрывает (остаток 0), поэтому подмена плательщика
+    # не срабатывает и минус достаётся распроданной паре — самый неудобный из
+    # случаев, и именно на нём находка кричала.
     _shared_card(db, account, fed_stock=0)
 
     audit_account(db, FeedClient([_order()]), account, _pending)
-    # Подменить некем — списалось с пары БЕЗ галочки, её остаток ушёл в минус.
     assert db.query(Product).filter(Product.uid_1c == "u1").first().stock_on_hand == -1
-    # А у кормильца не убавилось: его-то число и уедет на карточку.
-    assert db.query(Product).filter(Product.uid_1c == "u-fed").first().stock_on_hand == 0
 
-    assert _check_unmanaged_fed_pairs in CHECKS
-    finding = _check_unmanaged_fed_pairs(db)
-    assert finding is not None
-    assert finding.level == CRITICAL
-    # И НЕ попадает в находку про одинокую пару: два списка про одну сущность
-    # разошлись бы, и человек разбирал бы строку дважды по разным советам.
-    assert _check_unmanaged_pairs(db) is None
-    assert "unmanaged_fed_pairs" in FULL_LISTS
-    rows = _rows_unmanaged_fed_pairs(db)
-    assert len(rows) == finding.count
-    # Кормилец НАЗВАН: без имени второй товар 1С пришлось бы искать глазами.
-    assert any("2503" in str(cell) for cell in rows[0]), rows[0]
+    assert _check_unmanaged_pairs(db) is None, "находки на штатном случае быть не должно"
+    # И молчание не на пустом месте: минус вычтен, наружу уедет верное число.
+    uids = members(db, account.id, "111:222", "u1")
+    assert cell_quantity(shares(db, account.id, uids)) == 0
+    assert sum(q for _, q in shares(db, account.id, uids)) == -1
 
 
 def test_a_lone_pair_keeps_the_old_wording(db):
@@ -815,7 +806,7 @@ def test_a_lone_pair_keeps_the_old_wording(db):
     Без неё «всё в новую находку» прошло бы как исправное, и про настоящий
     остаток прежних времён (он убывает и кончится) сказали бы «кормим мы».
     """
-    from app.report import _check_unmanaged_fed_pairs, _check_unmanaged_pairs
+    from app.report import _check_unmanaged_pairs
 
     account = make_account(db)
     _product(db, stock=0, account=account, enabled=False)
@@ -823,18 +814,18 @@ def test_a_lone_pair_keeps_the_old_wording(db):
     audit_account(db, FeedClient([_order()]), account, _pending)
 
     assert _check_unmanaged_pairs(db) is not None
-    assert _check_unmanaged_fed_pairs(db) is None
 
 
 def test_a_neighbour_without_the_tick_does_not_feed_the_card(db):
     """И сосед по ячейке БЕЗ галочки кормильцем не считается.
 
     Его вклад в ячейку ноль по тому же правилу, что и у самой пары, — значит
-    число на карточке опять ничем не поддерживается, и это прежний случай.
-    Спроси находка только «есть ли сосед», она кричала бы «кормим мы» там, где
-    не кормит никто.
+    число на карточке опять ничем не поддерживается, и это прежний случай:
+    остаток прежних времён, который убывает с каждой продажей и кончится.
+    Спроси `managed_neighbours` только «есть ли сосед», находка замолчала бы
+    там, где карточку не кормит НИКТО, — то есть ровно на настоящей беде.
     """
-    from app.report import _check_unmanaged_fed_pairs, _check_unmanaged_pairs
+    from app.report import _check_unmanaged_pairs
 
     account = make_account(db)
     _product(db, stock=0, account=account, enabled=False)
@@ -843,4 +834,3 @@ def test_a_neighbour_without_the_tick_does_not_feed_the_card(db):
     audit_account(db, FeedClient([_order()]), account, _pending)
 
     assert _check_unmanaged_pairs(db) is not None
-    assert _check_unmanaged_fed_pairs(db) is None

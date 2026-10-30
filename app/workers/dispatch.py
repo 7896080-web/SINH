@@ -6,7 +6,7 @@ from app.timeutils import now_utc
 from sqlalchemy.orm import Session
 
 from app.transmit import quantity_for_account, ever_transmitted, blocked_by_switch
-from app.stock_cell import cell_of, explain_sum, members, shares
+from app.stock_cell import cell_of, cell_quantity, explain_sum, members, shares
 from app.models import (
     AuditLog, DispatchQueueItem, DispatchStatus, SyncSetting, PlatformAccount, Barcode,
     PlatformCatalogItem, Product,
@@ -261,7 +261,10 @@ def _dispatch_one_account(db: Session, client: PlatformClient, account: Platform
         cell_uids = members(db, account.id, cell, uid_1c) if external_id else [uid_1c]
         if len(cell_uids) > 1:
             parts = shares(db, account.id, cell_uids, {uid_1c: item.quantity})
-            quantity = sum(q for _, q in parts)
+            # Обрезка по итогу, а не по слагаемому: минус соседа — это продажи,
+            # которые со склада уже уехали, и выбросив его, мы отправили бы на
+            # карточку больше, чем лежит. Хозяин обрезки один — `cell_quantity`.
+            quantity = cell_quantity(parts)
         else:
             parts = []
             quantity = _quantity_to_send(db, uid_1c, account.id, item.quantity)
