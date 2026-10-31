@@ -356,6 +356,14 @@ def catalog_now(
         db.commit()
         done = (f"«{account.name}»: загружено {stats['fetched']} карточек, "
                 f"новых конфликтов {stats['new_conflicts']}.")
+        # См. тот же случай в `mapping.mapping_load_catalog`: уборка протухших
+        # строк — это удаление, а её отказ — причина, по которой каталог после
+        # нажатия остался прежним. Молчать нельзя ни о том, ни о другом.
+        if stats.get("stale_removed"):
+            done += (f" Убрано карточек, пропавших из выгрузки: "
+                     f"{stats['stale_removed']}.")
+        if stats.get("stale_skipped") and not stats.get("truncated"):
+            done += f" {stats['stale_skipped'].capitalize()}."
         if stats.get("truncated"):
             # См. тот же случай в `mapping.mapping_load_catalog`: зелёное
             # «загружено N» на обрезанной выгрузке оставляет человека в
@@ -363,6 +371,8 @@ def catalog_now(
             # остаток уйдёт не тем ключом или не уйдёт вовсе.
             set_flash(request, done + " ВЫГРУЗКА ОБОРВАНА защитным пределом "
                                       "страниц — снимок неполон.", "warn")
+        elif stats.get("stale_skipped"):
+            set_flash(request, done, "warn")
         else:
             set_flash(request, done, "good")
     except CredentialsMissing as e:

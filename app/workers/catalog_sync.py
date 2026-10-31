@@ -7,6 +7,27 @@ from app.timeutils import now_utc
 # имеет право перебить (`reconciliation.import_barcode_dict`).
 POOL_GUESS_SOURCE = "pool_match"
 
+# Доля прежних строк каталога, которую выгрузка обязана ПОДТВЕРДИТЬ, чтобы мы
+# поверили её пропускам и убрали остальное. Тот же предохранитель, что у
+# обнуления распроданного по снимку 1С, и по той же причине: цена ошибки здесь
+# несимметрична. Не убрали лишнего — ячейка осталась двужильной, сумма уедет
+# завышенной, но увидеть это можно находкой и починить следующей выгрузкой.
+# Убрали лишнее — у живой пары исчез КЛЮЧ ОТПРАВКИ: рассылка закроет её
+# терминально как «нет карточки», и вернуть ключ сможет только следующая полная
+# выгрузка, а до неё сутки. Поэтому отказываемся при любом сомнении.
+STALE_COVERAGE_FLOOR = 0.5
+
+# Порциями: `IN (...)` упирается в предел параметров SQLite (999 у сборок до
+# 3.32, чего на машине разработки не увидеть), а протухших строк после починки
+# кабинета бывают тысячи — ровно тот случай, ради которого уборка и написана.
+STALE_DELETE_CHUNK = 500
+
+# Метки оговорок УСПЕШНОЙ отметки задания. Живут у ПИСАТЕЛЯ: повтори их читатель
+# у себя, достаточно было бы поправить формулировку здесь, чтобы находка
+# замолчала навсегда, не сказав об этом ни слова.
+TRUNCATED_MARK = "выгрузка каталога оборвана пределом страниц"
+STALE_SKIP_MARK = "уборка каталога пропущена"
+
 import logging
 
 from sqlalchemy.orm import Session
@@ -39,7 +60,7 @@ def load_platform_catalog(db: Session, client: PlatformClient, account: Platform
     stats = {"fetched": len(items), "already_mapped": 0, "pool_matched": 0,
              "recalc_dropped": 0,
              "new_conflicts": 0, "known_conflicts": 0, "no_barcode": 0,
-             "revived": 0,
+             "revived": 0, "stale_removed": 0, "stale_skipped": "",
              "truncated": truncated}
 
     # Ключ строки каталога — БАРКОД (у WB один external_id/nmID охватывает
@@ -51,6 +72,11 @@ def load_platform_catalog(db: Session, client: PlatformClient, account: Platform
         for r in db.query(PlatformCatalogItem).filter(PlatformCatalogItem.account_id == account.id).all()
         if r.barcode
     }
+    # Что лежало в каталоге ДО этого прохода — снимок берём здесь, потому что
+    # ниже в `existing` доложатся строки, заведённые этой же выгрузкой, и
+    # разница «было минус пришло» перестала бы быть разницей.
+    known_before = set(existing)
+    seen_barcodes = {it.barcode for it in items if it.barcode}
 
     # Пул баркодов размер-цвета: external_id (у WB nmID:chrtID) — это РОВНО один
     # размер-цвет SKU. Собираем баркоды каждого пула ИЗ ЭТОЙ выгрузки и сопоставляем
@@ -156,10 +182,79 @@ def load_platform_catalog(db: Session, client: PlatformClient, account: Platform
             conflict.last_seen = now_utc()
             stats["known_conflicts"] += 1
 
+    stats["stale_removed"], stats["stale_skipped"] = prune_stale_rows(
+        db, account, known_before, seen_barcodes, truncated)
+
     db.commit()
 
     stats["revived"] = revive_after_catalog(db, client, account)
     return stats
+
+
+def prune_stale_rows(db: Session, account: PlatformAccount,
+                     known_before: set[str], seen_barcodes: set[str],
+                     truncated: bool) -> tuple[int, str]:
+    """Убрать строки каталога кабинета, баркодов которых в выгрузке БОЛЬШЕ НЕТ.
+
+    Возвращает (сколько убрано, оговорка про отказ или пустую строку).
+
+    Зачем. Загрузка каталога была ТОЛЬКО апсертом: строка, пропавшая из выгрузки
+    площадки, не удалялась нигде и никогда. То есть любая правка карточки в
+    кабинете до нас не доезжала вовсе — убрали чужой баркод из карточки, а у нас
+    он по-прежнему ведёт на неё. Цена у этого двойная и обе половины молчаливые.
+    `external_id` протухшей строки остаётся КЛЮЧОМ ОТПРАВКИ для её товара
+    (`dispatch.push_identifier`), то есть остаток поедет на карточку, которая
+    этого баркода уже не знает. И ячейка остаётся двужильной: сумма по ней
+    складывает двух жильцов, из которых один там давно не живёт, — то самое,
+    что показывает находка «жильцы одной ячейки с разным цветоразмером», и
+    починить это починкой кабинета было НЕЛЬЗЯ.
+
+    Удаляем ОТСУТСТВИЕ, а не «старое по времени»: признак «баркода нет в
+    выгрузке» прямой и проверяемый, а `fetched_at < начала прогона` — это
+    побочное следствие чужой строки кода, и перенеси её кто-нибудь, уборка молча
+    снесла бы живой каталог.
+
+    Отказываемся при любом сомнении, и вот при каком именно.
+    """
+    # Убирать нечего — и молчим об этом. Свежий кабинет, каталог которого ещё
+    # ни разу не грузили, выглядит отсюда точно так же, как кабинет с пустой
+    # выгрузкой; сказать по нему «уборка пропущена» значило бы ругаться на
+    # исправную установку при КАЖДОЙ загрузке, а проверка, которая кричит на
+    # исправном, кончается тем, что её перестают читать.
+    if not known_before:
+        return 0, ""
+    # Выдачу оборвал наш собственный предел страниц. Пропуск тут не значит
+    # «карточки нет» — он значит «мы не дочитали», и уборка по такому снимку
+    # унесла бы ключи отправки у всего хвоста каталога разом.
+    if truncated:
+        return 0, f"{STALE_SKIP_MARK}: {TRUNCATED_MARK}"
+    # Пустая выгрузка — это отказ площадки, прикинувшийся успехом (сменился
+    # формат ответа, кончились права, пустая страница вместо ошибки). Поверь мы
+    # ей, кабинет остался бы вообще без каталога, то есть без ключей отправки.
+    if not seen_barcodes:
+        return 0, f"{STALE_SKIP_MARK}: выгрузка пуста"
+    stale = sorted(known_before - seen_barcodes)
+    if not stale:
+        return 0, ""
+    # Выгрузка подтвердила меньше половины того, что мы знали. Отдельная
+    # карточка исчезает поштучно; исчезнувшая половина каталога — это не правка
+    # в кабинете, а беда на стороне площадки или у нас. Тот же порог и та же
+    # мысль, что у «снимок 1С покрыл меньше половины прежних ненулевых».
+    covered = len(known_before) - len(stale)
+    if covered < STALE_COVERAGE_FLOOR * len(known_before):
+        reason = (f"{STALE_SKIP_MARK}: выгрузка подтвердила {covered} прежних "
+                  f"карточек из {len(known_before)} — меньше половины")
+        logger.warning("каталог «%s»: %s", account.name, reason)
+        return 0, reason
+
+    for start in range(0, len(stale), STALE_DELETE_CHUNK):
+        db.query(PlatformCatalogItem).filter(
+            PlatformCatalogItem.account_id == account.id,
+            PlatformCatalogItem.barcode.in_(stale[start:start + STALE_DELETE_CHUNK]),
+        ).delete(synchronize_session=False)
+    logger.info("каталог «%s»: убрано пропавших из выгрузки карточек: %d",
+                account.name, len(stale))
+    return len(stale), ""
 
 
 def revive_after_catalog(db: Session, client: PlatformClient,

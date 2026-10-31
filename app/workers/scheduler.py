@@ -22,7 +22,7 @@ from app.workers.circuit_breaker import (record_success, record_failure,
                                           survives_a_retry)
 from app.workers.order_poller import poll_new_orders, poll_cancellations, poll_confirmations
 from app.workers.dispatch import run_dispatch_cycle
-from app.workers.catalog_sync import load_platform_catalog
+from app.workers.catalog_sync import TRUNCATED_MARK, load_platform_catalog
 from app.workers.catalog_poller import poll_catalog
 from app.workers.ftp_channel import (
     LocalExchange, build_task_batch, apply_result_batch, collect_stock_delta,
@@ -646,11 +646,19 @@ def job_catalog_poll(account_id: int):
                 "%s (%s): выгрузка каталога ОБОРВАНА защитным пределом страниц — "
                 "снимок неполон, по не попавшим в него карточкам остаток может "
                 "уйти не тем ключом или не уйти вовсе", worker_name, account.name)
-            _heartbeat(db, worker_name, True,
-                       error="выгрузка каталога оборвана пределом страниц — "
-                             "снимок неполон")
+            # Уборка протухших строк при обрыве тоже отказала, и причина у
+            # отказа ТА ЖЕ самая. Вторая оговорка о том же приучила бы
+            # пролистывать обе, поэтому `elif`, а не второй `append`.
+            remark = f"{TRUNCATED_MARK} — снимок неполон"
+        elif load_stats.get("stale_skipped"):
+            # Отказ уборки — сторона БЕЗОПАСНАЯ (ничего не удалили) и проходит
+            # сам со следующей полной выгрузкой, поэтому отдельной находки
+            # отчёта у него нет намеренно: читатель — строка «с оговоркой» на
+            # «Диагностике». Красным тут была бы не беда, а осторожность.
+            remark = load_stats["stale_skipped"]
         else:
-            _heartbeat(db, worker_name, True)
+            remark = ""
+        _heartbeat(db, worker_name, True, error=remark)
     except CredentialsMissing as e:
         _heartbeat(db, worker_name, False, str(e))
     except Exception as e:

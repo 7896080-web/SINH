@@ -1790,10 +1790,17 @@ def _check_truncated_catalog(db: Session) -> Finding | None:
     «Диагностика» рисует по кабинету только `poll_orders_account_*` и пять общих
     имён, а `/health` при `last_success=True` текст не отдаёт.
     """
+    from app.workers.catalog_sync import TRUNCATED_MARK
+    # Оговорок у этой отметки теперь может быть не одна: рядом живёт отказ
+    # уборки протухших строк. Берём ТОЛЬКО свою часть — возьми находка поле
+    # целиком, она объявила бы «каталог выгружен не полностью» про кабинет, у
+    # которого выгрузка как раз полная, а уборка отказала по другой причине.
+    # Метка — подстрока прежнего текста, поэтому отметки, написанные до этой
+    # правки, находка видит по-прежнему.
     rows = [r for r in db.query(WorkerHeartbeat).filter(
         WorkerHeartbeat.worker_name.like("catalog_poll_account_%"),
         WorkerHeartbeat.last_success.is_(True),
-    ).all() if r.last_error]
+    ).all() if r.last_error and TRUNCATED_MARK in r.last_error]
     if not rows:
         return None
     return Finding(
@@ -1804,7 +1811,10 @@ def _check_truncated_catalog(db: Session) -> Finding | None:
                     "тем ключом или не уйдёт вовсе — и выглядеть это будет как "
                     "«нет карточки», а не как обрыв выгрузки.",
         count=len(rows), link="/diagnostics#workers",
-        details=[f"{r.worker_name}: {(r.last_error or '')[:200]}" for r in rows[:10]],
+        details=[f"{r.worker_name}: "
+                 + next((part.strip() for part in (r.last_error or "").split(";")
+                         if TRUNCATED_MARK in part), "")[:200]
+                 for r in rows[:10]],
     )
 
 

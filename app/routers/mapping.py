@@ -392,6 +392,16 @@ def mapping_load_catalog(
     )
     if stats.get("no_barcode"):
         message += f" Без баркода на площадке: {stats['no_barcode']}."
+    # Уборка протухших строк — это УДАЛЕНИЕ, пусть и выверенное: человек имеет
+    # право знать, сколько строк каталога исчезло после его нажатия. И отказ
+    # уборки говорится вслух по той же причине, по какой говорится обрыв:
+    # нажимают кнопку ровно затем, чтобы каталог стал верным, и зелёное
+    # «загружено N» оставляет уверенность, что стал.
+    if stats.get("stale_removed"):
+        message += (f" Убрано карточек, пропавших из выгрузки: "
+                    f"{stats['stale_removed']}.")
+    if stats.get("stale_skipped") and not stats.get("truncated"):
+        message += f" {stats['stale_skipped'].capitalize()}."
 
     log_action(db, user.username, "catalog_loaded", f"{account.name}: {stats}")
     db.commit()
@@ -404,6 +414,10 @@ def mapping_load_catalog(
                     "неполон, часть карточек осталась со старыми данными. "
                     "Повторите загрузку; если повторяется, каталог кабинета "
                     "больше нашего предела.")
+        set_flash(request, message, "warn")
+    elif stats.get("stale_skipped"):
+        # Отказ уборки зелёным не красим: каталог после нажатия остался с
+        # прежними строками, а человек нажимал кнопку затем, чтобы он перестал.
         set_flash(request, message, "warn")
     else:
         set_flash(request, message, "good")
