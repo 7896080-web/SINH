@@ -1,21 +1,24 @@
 # -*- coding: utf-8 -*-
 """
 Применить решения пользователя по рекламе WB одним запуском: выключить кампании, вернуть лимиты к правилам, убрать
-модели из рекламы. Вписано решение 21.10.2026 по сравнению трёх кабинетов (wb_compare.py) — «да, все пункты»:
-  1. выключить Ребрик «2101 показы» 40955628 (4 046 ₽ → 1 заказ), Караман «пуховики показы» 40955797 (16 131 ₽ → 2),
-     Караман 40769361 (джемпер ZJYM269002, за клики: 1 409 ₽ без заказов) — как переключатель «выкл» на странице
-     «Бюджеты»: пауза и стоп-лист wb_hold.txt (автопилот и проверки не запускают и не пополняют; деньги в бюджете
-     кампании остаются);
-  2. вернуть к правилам (снять ручные правки страницы «Бюджеты» от 16.10): Яворская «пух нов» 39661508 — лимит
-     1 000 ₽; Караман 40769334 — 300 ₽; недельный бюджет Карамана — 16 200 ₽;
-  3. убрать модель 2718 (C26-2818C, все цвета) из рекламы во всех кабинетах: ≈8 200 ₽ за 14 дней без единого заказа.
-     Кампанию целиком не опустошает (если все её товары — эта модель, только предупреждает). Автопилот эти товары больше
-     не возвращает, даже когда остаток пополнится (state["no_return"] в wb_bids_state.json).
+модели из рекламы. Вписано решение 01.11.2026 (итоги эксперимента 14–27.10 и «лестница» пуховиков):
+  1. только «за клики»: кампании за показы выключить во всех кабинетах;
+  2. работают только: у Яворской — «27643 клик» 31049161, «36446 клик» 31048671 и кампании курток (куртки, пуховики —
+     больше половины товаров кампании); у Ребрика — кампании курток; у Карамана — ничего (куртки Карамана — самые
+     дорогие, по «лестнице» без рекламы). Остальное (джемперы, лонгсливы, рубашки… в работе, на паузе и «готовые к
+     запуску») — выключить, как переключатель «выкл» на странице «Бюджеты»: работающие — на паузу, все — в стоп-лист
+     wb_hold.txt (автопилот и проверки не запускают и не пополняют; деньги в бюджете кампании остаются);
+  3. модель 2718 (C26-2818C) убрать из оставшихся кампаний («пух нов» 39661508, Ребрик 40769287 — 21.10 WB не дал);
+     кампанию целиком не опустошает; автопилот эти товары больше не возвращает (state["no_return"]).
+  «Лестница» (места 1–2 у «пух нов», 3–10 у Ребрика 40769287) — в правилах wb_bids.py, не здесь.
+Решение 21.10.2026 (выключить 40955628, 40955797, 40769361; лимиты к правилам; убрать 2718) применено 21.10 18:33 —
+см. docs/changelog.md.
 
 Запуск:  python wb_decide.py              — пробный прогон: план, ничего не меняет
          python wb_decide.py --apply      — применить (резервная копия — wb_bids_backups\\decide_*.json)
          python wb_decide.py --rollback   — вернуть по последней копии: товары с прежними ставками, поправки лимитов,
-                                            включить кампании (сразу, без пробного прогона)
+                                            кампании — как были (работавшие включить, стоявшие на паузе — только убрать
+                                            из стоп-листа); сразу, без пробного прогона
 Откат возвращает только последний --apply; из поправок лимитов — только те, что менял этот скрипт.
 Нужны категории токена: «Продвижение», «Аналитика». Журнал — wb_decide_log.txt.
 """
@@ -33,12 +36,17 @@ import wb_web as W
 from wb_compare import model_of
 
 # ---------------- РЕШЕНИЕ (что делать) ----------------
-DECISION = "решение 21.10.2026 по сравнению кабинетов"
-STOP = {"Ребрик": [40955628], "Караман": [40955797, 40769361]}           # выключить: пауза + стоп-лист
-TO_RULES = {"Яворская": [39661508], "Караман": [40769334, "_week_budget"]}   # лимиты/потолки — как в правилах
-REMOVE_MODELS = {"2718"}                    # убрать из рекламы во всех кабинетах (номер модели — как в wb_compare.py)
+DECISION = "решение 01.11.2026: только за клики, джемперы — 27643 и 36446 Яворской, куртки — «лестница»"
+KEEP_ONLY = True               # выключить всё, что не подходит под ONLY_CPC / KEEP_IDS / KEEP_JACKETS (False — только STOP)
+ONLY_CPC = True                # кампании за показы — выключить все
+KEEP_IDS = {31049161, 31048671}                 # «27643 клик», «36446 клик» (Яворская)
+KEEP_JACKETS = {"Яворская", "Ребрик"}           # где остаются кампании курток (Караман — без курток, «лестница»)
+STOP = {}                      # выключить дополнительно: {кабинет: [номера]}
+TO_RULES = {}                  # лимиты/потолки — как в правилах: {кабинет: [номера или "_week_budget"]}
+REMOVE_MODELS = {"2718"}       # убрать из рекламы во всех кабинетах (номер модели — как в wb_compare.py)
 # ---------------- НАСТРОЙКИ ----------------
 TRIM_STATUSES = (9, 11)                     # из каких кампаний убирать: работающие и на паузе (пауза может кончиться)
+JACKET_SUBJECTS = {"Куртки", "Пуховики", "Парки", "Ветровки", "Бомберы", "Анораки"}   # предметы WB «курток»
 LOG_FILE = B.HERE / "wb_decide_log.txt"
 WHO = "скриптом wb_decide.py"               # пометка в стоп-листе
 # -------------------------------------------
@@ -49,34 +57,72 @@ def name_of(a, cid):
     return (a.get("settings") or {}).get("name") or str(cid)
 
 
-def plan_stop(camps_by):
+def subjects(a, info):
+    """{предмет: товаров} кампании — из настроек кампании, нет там — из воронки."""
+    out = defaultdict(int)
+    for st in a.get("nm_settings") or []:
+        sub = (st.get("subject") or {}).get("name") or (info.get(st.get("nm_id")) or {}).get("subject")
+        out[sub or "?"] += 1
+    return out
+
+
+def verdict(cab, cid, a, info):
+    """(оставить?, почему) по правилу решения."""
+    if ONLY_CPC and (a.get("settings") or {}).get("payment_type") != "cpc":
+        return False, "за показы"
+    if cid in KEEP_IDS:
+        return True, "в списке оставляемых"
+    sub = subjects(a, info)
+    known = sum(n for k, n in sub.items() if k != "?")
+    jackets = sum(n for k, n in sub.items() if k in JACKET_SUBJECTS)
+    if known and jackets * 2 >= known:
+        return (True, "куртки") if cab in KEEP_JACKETS else (False, "куртки — в этом кабинете без курток («лестница»)")
+    return False, "не куртки" if known else "товаров нет"
+
+
+def plan_stop(camps_by, info_by):
     out = []
-    log("\n1. ВЫКЛЮЧИТЬ КАМПАНИИ (пауза + стоп-лист wb_hold.txt; деньги в бюджете кампании остаются)")
-    for cab, ids in STOP.items():
-        camps = camps_by.get(cab)
-        for cid in ids:
-            if camps is None:
-                log(f"  ✗ {cab} {cid}: кабинет не загрузился — пропускаю")
-                continue
-            a = camps.get(cid)
-            if not a:
-                log(f"  — {cab} {cid}: нет среди работающих и стоящих на паузе (завершена?) — делать нечего")
-                continue
+    log("\n1. КАМПАНИИ: что остаётся и что выключить (пауза + стоп-лист wb_hold.txt; деньги в бюджете кампании "
+        "остаются)")
+    extra = {(cab, cid) for cab, ids in STOP.items() for cid in ids}
+    for cab, camps in camps_by.items():
+        if camps is None:
+            log(f"  ✗ {cab}: кабинет не загрузился — пропускаю")
+            continue
+        log(f"  {cab}:")
+        keep, held = [], 0
+        for cid, a in sorted(camps.items(), key=lambda x: ({9: 0, 11: 1, 4: 2}.get(x[1].get("_status"), 3), x[0])):
             nm, st = name_of(a, cid), a.get("_status")
             pay = W.PAY.get((a.get("settings") or {}).get("payment_type"), "?")
             if B.on_hold(cid):
-                log(f"  — {cab} «{nm}» {cid} ({pay}): уже в стоп-листе — не трогаю")
+                held += 1
                 continue
-            log(f"  ⏹ {cab} «{nm}» {cid} ({pay}, {W.STATUS.get(st, st)}): "
-                + ("поставить на паузу и в стоп-лист" if st == 9 else "уже на паузе — вписать в стоп-лист"))
+            ok, why = verdict(cab, cid, a, info_by.get(cab) or {}) if KEEP_ONLY else (True, "")
+            if (cab, cid) in extra:
+                ok, why = False, "указана в STOP"
+            sub = ", ".join(f"{k} {n}" for k, n in sorted(subjects(a, info_by.get(cab) or {}).items(),
+                                                           key=lambda p: -p[1])[:3])
+            line = f"«{C.cut(nm, 30)}» {cid} ({pay}, {W.STATUS.get(st, st)}; {sub or 'без товаров'})"
+            if ok:
+                keep.append(f"    ✓ оставить: {line} — {why}")
+                continue
+            log(f"    ⏹ {line} — {why}: " + ("на паузу и в стоп-лист" if st == 9 else "в стоп-лист"))
             out.append({"cabinet": cab, "advert_id": cid, "name": nm, "status_before": st})
+        for x in keep:
+            log(x)
+        if not keep:
+            log("    ✓ оставить: ничего")
+        if held:
+            log(f"    (уже в стоп-листе: {held})")
     if not out:
         log("  Выключать нечего.")
     return out
 
 
 def plan_limits(data):
-    """Правки «как в правилах» для страницы «Бюджеты»: (нормализованные правки, снимок прежних поправок)."""
+    """Правки «как в правилах» для страницы «Бюджеты»: (нормализованные правки, строки плана, снимок прежних поправок)."""
+    if not TO_RULES:
+        return [], [], {"items": {}, "manual": {}, "raised": {}}
     log("\n2. ЛИМИТЫ И ПОТОЛКИ — КАК В ПРАВИЛАХ (снять ручные поправки)")
     by_cab = {c["cab"]: c for c in data["cabinets"]}
     changes, errors = [], []
@@ -120,14 +166,13 @@ def plan_limits(data):
     return norm, lines, old
 
 
-def plan_trim(cab, token, camps, skip, state):
+def plan_trim(cab, camps, skip, state, info):
     """Товары моделей REMOVE_MODELS: (убрать из кампаний, пары «кампания:товар», которые автопилот не должен вернуть)."""
     pool = {cid: a for cid, a in camps.items() if a.get("_status") in TRIM_STATUSES and cid not in skip
             and not B.on_hold(cid)}
     earlier = B.trimmed_items(state, cab)                    # убранные раньше из-за малого остатка
     nms = sorted({s.get("nm_id") for a in pool.values() for s in a.get("nm_settings") or [] if s.get("nm_id")}
                  | {k[1] for k in earlier})
-    info = C.funnel(token, C.YESTERDAY, C.YESTERDAY, nms) if nms else {}
     vendor = {nm: (info.get(nm) or {}).get("vendor") for nm in nms}
     hit = {nm for nm, v in vendor.items() if model_of(v) in REMOVE_MODELS}
     items = []
@@ -268,10 +313,17 @@ def rollback(cabs):
         os.replace(tmp, W.OVERRIDES)
         W.write_log([f"ОТКАТ ({WHO}), резервная копия {bk.name}"] + [f"возвращено: {x}" for x in lim.get("lines") or []])
         log(f"  ↩ Поправки лимитов — как до {files[-1].name} (копия нынешних — wb_budget_backups\\{bk.name})")
-    # 1. кампании — включить (как переключатель «вкл»)
+    # 1. кампании — как были: работавшие включить (как переключатель «вкл»), стоявшие на паузе — только из стоп-листа
     rules = W.rules_now()
     for i in plan.get("stop") or []:
         if i.get("done") is False or i["cabinet"] not in cabs:
+            continue
+        if i.get("status_before") != 9:
+            try:
+                W.hold_edit(i["advert_id"], i["name"], on=True, who=WHO)
+                log(f"  ↩ «{i['name']}»: убрана из стоп-листа (до выключения не работала — не запускаю)")
+            except OSError as e:
+                log(f"  ✗ «{i['name']}»: {e}")
             continue
         try:
             camps = B.get_campaigns(cabs[i["cabinet"]])
@@ -311,28 +363,39 @@ def main():
     if do and not B.lock_acquire("wb_decide.py", wait_min=25):
         sys.exit("Сейчас работает автопилот или проверка больше 25 мин — ничего не сделано, запустите позже.")
     try:
-        data = W.collect()                   # как страница «Бюджеты»: кампании, правила, поправки
-        camps_by = {}
+        data = W.collect() if TO_RULES else None     # как страница «Бюджеты»: кампании, правила, поправки
+        state = B.load_state()
+        camps_by, info_by = {}, {}
         for cab, token in cabs.items():
             try:
                 camps_by[cab] = B.get_campaigns(token)
             except B.ApiError as e:
                 log(f"  ✗ {cab}: список кампаний не загрузился — {e}")
-        stop = plan_stop(camps_by)
+                continue
+            nms = sorted({st.get("nm_id") for a in camps_by[cab].values() for st in a.get("nm_settings") or []
+                          if st.get("nm_id")} | {k[1] for k in B.trimmed_items(state, cab)})
+            try:                             # артикулы продавца и предметы товаров: весь кабинет за раз, недостающие — отдельно
+                info_by[cab] = C.funnel(token, C.YESTERDAY, C.YESTERDAY) if nms else {}
+                miss = [nm for nm in nms if nm not in info_by[cab]]
+                if miss:
+                    info_by[cab].update(C.funnel(token, C.YESTERDAY, C.YESTERDAY, miss))
+            except C.ApiError as e:
+                log(f"  ! {cab}: артикулы продавца не загрузились — {e}; предметы — из настроек кампаний, модель "
+                    f"{', '.join(sorted(REMOVE_MODELS))} в этом кабинете не убираю")
+        stop = plan_stop(camps_by, info_by)
         norm, lines, old = plan_limits(data)
-        log(f"\n3. УБРАТЬ ИЗ РЕКЛАМЫ МОДЕЛЬ {', '.join(sorted(REMOVE_MODELS))} (все цвета, все кабинеты)")
-        state = B.load_state()
+        if REMOVE_MODELS:
+            log(f"\n{3 if TO_RULES else 2}. УБРАТЬ ИЗ РЕКЛАМЫ МОДЕЛЬ {', '.join(sorted(REMOVE_MODELS))} (все цвета, все кабинеты, кроме "
+                "выключаемых кампаний)")
         skip = {i["advert_id"] for i in stop}
         trim, earlier = [], []
         for cab, camps in camps_by.items():
-            try:
-                t, e = plan_trim(cab, cabs[cab], camps, skip, state)
-            except C.ApiError as e:
-                log(f"  ✗ {cab}: артикулы продавца не загрузились — {e}; модель в этом кабинете не убираю")
+            if cab not in info_by or not REMOVE_MODELS:
                 continue
+            t, e = plan_trim(cab, camps, skip, state, info_by[cab])
             trim += t
             earlier += e
-        if not trim:
+        if REMOVE_MODELS and not trim:
             log("  Убирать нечего.")
         plan = {"decision": DECISION, "at": dt.datetime.now().isoformat(timespec="seconds"), "stop": stop,
                 "limits": {"norm": norm, "lines": lines, "old": old}, "trim": trim, "no_return_earlier": earlier}

@@ -115,13 +115,15 @@ RULES = {
         # «Куртка общ» включена пользователем 12.10.2026 с пустым бюджетом: общие правила "*", после пополнения — запустить.
         "36114933": {"start_after_topup": True},   # «Куртка общ от 25.04.2026», за клики
         # ── Новинки (запуск, решение 12.10.2026): цель — места 1–2, допустимый заказ вдвое выше обычного,
-        #    запросы не минусуем, пока набираются продажи и отзывы. С 03.11 — общие правила "*".
+        #    запросы не минусуем, пока набираются продажи и отзывы. С 03.11 — общие правила "*" (кроме «пух нов» — до 30.11).
         "39661494": {"target": "1-2", "max_cost_per_order": 1200, "auto_minus": False,
                      "until": "2026-11-02"},   # ZJYM269002, за клики
         "39829896": {"target": "1-2", "max_cost_per_order": 1200, "auto_minus": False,
                      "until": "2026-11-02"},   # 256250 («Кампания от 29.08.2026»), за клики
+        # «пух нов» — верхняя ступень «лестницы» пуховиков (решение 01.11.2026): Яворская — места 1–2, Ребрик 40769287 —
+        #    места 3–10, Караман — без рекламы курток; кабинеты стоят на разных местах выдачи и не перебивают друг друга.
         "39661508": {"target": "1-2", "max_cost_per_order": 2000, "auto_minus": False,
-                     "until": "2026-11-02"},   # «пух нов 22.08.2026» — новинки-куртки, за клики; 2 000 ₽ за заказ (решение 12.10.2026)
+                     "until": "2026-11-30"},   # «пух нов 22.08.2026» — новинки-куртки, за клики; 2 000 ₽ за заказ (решение 12.10.2026)
 
         # ── Этап 1. Те же товары в рекомендациях, оплата за показы. Создать:
         #    python wb_create.py --name "27643 рекомендации показы" --pay cpm --where recommendations --from "27643 клик"
@@ -3106,7 +3108,8 @@ def nms_with_limit_room(token, aid, fn):
     """WB не меняет товары кампании, пока её дневной лимит ниже рекомендуемого минимума при нынешних ставках — ответ 400
     «daily limit validation failed» (найдено 21.10.2026: из-за этого автопилот не мог убрать ни одного товара с малым
     остатком). В daily-limits это valid=false и requiredLimit. Поднять лимит до requiredLimit (вверх до 100 ₽), сделать fn,
-    сразу вернуть прежний лимит — окно в секунды. None — дело не в лимите (fn не вызывалась)."""
+    сразу вернуть прежний лимит — окно в секунды; бюджет кампании меньше такого лимита — лимит на те же секунды выключить.
+    None — дело не в лимите (fn не вызывалась)."""
     lim = get_limits(token, [aid]).get(aid) or {}
     old, need = int(num(lim.get("dailyLimit"))), int(num(lim.get("requiredLimit")))
     if not lim.get("enabled") or not need or need <= old:
@@ -3115,13 +3118,25 @@ def nms_with_limit_room(token, aid, fn):
     room = -(-need // 10000) * 10000
     carry = bool(lim.get("carryOverEnabled"))
 
-    def put(v):
+    def put(v, on=True):
+        body = {"advertIds": [aid], "enabled": on}
+        if on:
+            body.update(dailyLimit=int(v), carryOverEnabled=carry)
         pace(token, "limits", 12.5)
-        call("PUT", ADV + "/api/advert/v0/daily-limits", token, what="Дневной лимит",
-             body={"advertIds": [aid], "enabled": True, "dailyLimit": int(v), "carryOverEnabled": carry})
+        call("PUT", ADV + "/api/advert/v0/daily-limits", token, what="Дневной лимит", body=body)
     log(f"    WB не меняет товары, пока дневной лимит ({rub(old)} ₽) ниже его минимума для нынешних ставок "
         f"({rub(need)} ₽) — на минуту ставлю {rub(room)} ₽")
-    put(room)
+    now = f"{rub(room)} ₽"
+    try:
+        put(room)
+    except ApiError as e:
+        # лимит выше бюджета кампании WB не ставит (01.11.2026: минимум ≈15 000 ₽ при бюджете в пару тысяч) — тогда
+        # лимит выключается на те же секунды: проверка лимита у WB действует, только когда он включён
+        if "insufficient campaign budget" not in str(e):
+            raise
+        log(f"    в бюджете кампании меньше {rub(room)} ₽ — вместо этого выключаю дневной лимит на минуту")
+        put(None, on=False)
+        now = "выключен"
     try:
         return fn()
     finally:
@@ -3132,7 +3147,7 @@ def nms_with_limit_room(token, aid, fn):
                 break
             except ApiError as e:
                 if attempt == 2:
-                    log(f"  ✗✗ Лимит кампании {aid} НЕ возвращён ({e}): сейчас {rub(room)} ₽ вместо {rub(old)} ₽ — поставьте "
+                    log(f"  ✗✗ Лимит кампании {aid} НЕ возвращён ({e}): сейчас {now} вместо {rub(old)} ₽ — поставьте "
                         "его в кабинете WB (следующий запуск автопилота поставит лимит по правилам сам).")
 
 
