@@ -31,10 +31,11 @@ CELL = "177:4242"
 
 
 def _item(db, account, uid, barcode, *, size="3XL", color="SIYAH", stock=10,
-          cell=CELL, enabled=True, broadcast=True, threshold=0, article=None):
+          cell=CELL, enabled=True, broadcast=True, threshold=0, article=None,
+          offset=None):
     db.add(Product(uid_1c=uid, article=article or uid, name="Куртка",
                    size=size, color=color, stock_on_hand=stock,
-                   broadcast_enabled=broadcast,
+                   broadcast_enabled=broadcast, broadcast_offset=offset,
                    recalc_account_ids=str(account.id)))
     db.add(Barcode(barcode=barcode, uid_1c=uid))
     db.add(SyncSetting(uid_1c=uid, account_id=account.id, enabled=enabled,
@@ -118,17 +119,82 @@ def test_a_cell_we_never_send_to_is_silent(db):
     assert _check_mixed_cells(db) is None
 
 
-def test_one_live_tenant_is_enough(db):
-    """А достаточно ОДНОГО живого: его число и уедет на карточку.
+def test_one_contributor_is_not_a_mix(db):
+    """ОДНОГО живого жильца НЕ достаточно — и это разворот прежнего правила.
 
-    Спроси отбор «все ли живые», находка молчала бы ровно в том случае, что
-    разбирали 29.10: у одной партии галочки нет, у второй есть.
+    29.10 здесь стояло обратное («достаточно одного живого»), и 01.11 первый
+    боевой список это опроверг: 29 строк, и ни по одной наружу не уходило
+    ничего неверного. Вклад один — сумма равна ему же, значит на карточку
+    уходит число ОДНОГО товара и складывать нечего: расхождения нет ПО
+    ПОСТРОЕНИЮ. Начнёт складывать — находка закричит в тот же час.
     """
     account = _account(db)
     _item(db, account, "u-a", "2000000000011", size="3XL", enabled=True)
     _item(db, account, "u-b", "2000000000022", size="M", enabled=False)
 
-    assert _check_mixed_cells(db) is not None
+    assert _check_mixed_cells(db) is None
+
+
+def test_a_second_tenant_without_stock_is_not_a_mix(db):
+    """Тот самый боевой случай: обе галочки на месте, а остаток у одного.
+
+    Во ВСЕХ 29 строках первого списка ненулевой остаток был ровно у одного
+    жильца. Находка по ним горела КРИТИЧНЫМ, обещая оверселл, которого не
+    было ни в одной.
+    """
+    account = _account(db)
+    _item(db, account, "u-a", "2000000000011", size="3XL", stock=7)
+    _item(db, account, "u-b", "2000000000022", size="M", stock=0)
+
+    assert _check_mixed_cells(db) is None
+
+
+def test_a_negative_neighbour_is_not_a_mix(db):
+    """Минусовое слагаемое сумму УМЕНЬШАЕТ, значит оверселла не даёт.
+
+    Считай отбор просто «ненулевые вклады», находка горела бы на строке
+    «остатки −7, 10» — а разбирать там нечего: минус есть мера продаж,
+    уехавших мимо учёта, и `cell_quantity` на неё сумму и уменьшит.
+    """
+    account = _account(db)
+    _item(db, account, "u-a", "2000000000011", size="3XL", stock=10)
+    _item(db, account, "u-b", "2000000000022", size="M", stock=-7)
+
+    assert _check_mixed_cells(db) is None
+
+
+def test_a_tenant_under_the_cabinet_threshold_is_not_a_mix(db):
+    """Порог кабинета выше остатка — вклад ноль, складывать нечего.
+
+    Вклад спрашиваем у `shares`, то есть у той же функции, которой считает
+    рассылка: повтори отбор «остаток не ноль» у себя, он назвал бы смешением
+    то, чего на карточке не будет.
+    """
+    account = _account(db)
+    _item(db, account, "u-a", "2000000000011", size="3XL", stock=10)
+    _item(db, account, "u-b", "2000000000022", size="M", stock=18, threshold=50)
+
+    assert _check_mixed_cells(db) is None
+
+
+def test_unticking_the_extra_tenant_silences_the_finding(db):
+    """У находки обязан быть РАЗБОР, и вот он.
+
+    Прежнее условие снятой галочкой не гасилось вовсе: пока жив второй жилец,
+    строка оставалась в списке, и человек, сделавший ровно то, что просит
+    подсказка, продолжал видеть её — вернее способа приучить не читать отчёт
+    нет.
+    """
+    account = _account(db)
+    _item(db, account, "u-a", "2000000000011", size="3XL", stock=10)
+    _item(db, account, "u-b", "2000000000022", size="M", stock=18)
+    assert _check_mixed_cells(db) is not None, "обе половины отдают — находка"
+
+    db.query(SyncSetting).filter(SyncSetting.uid_1c == "u-b").update(
+        {"enabled": False})
+    db.commit()
+
+    assert _check_mixed_cells(db) is None
 
 
 def test_a_lone_tenant_is_not_a_cell(db):
@@ -166,15 +232,15 @@ def test_the_whole_size_range_in_one_wb_cell_is_found(db):
 def test_the_row_names_the_number_that_goes_out(db):
     """В строке стоит ровно то число, которое отправит рассылка.
 
-    Порог кабинета у второго жильца выше его остатка, значит его вклад — ноль,
-    и «уходит» обязано быть 10, а не 28. Повтори список сложение сам, он
-    обещал бы число, которого на площадке не будет.
+    У второго жильца порог трансляции 8 при остатке 18, значит его вклад 10, и
+    «уходит» обязано быть 20, а не 28. Повтори список сложение сам (`sum` по
+    колонке «Остатки»), он обещал бы число, которого на площадке не будет.
     """
     account = _account(db)
     _item(db, account, "u-a", "2000000000011", size="3XL", stock=10,
           article="4033")
     _item(db, account, "u-b", "2000000000022", size="M", stock=18,
-          threshold=50, article="4052")
+          offset=8, article="4052")
 
     rows = _rows_mixed_cells(db)
 
@@ -184,7 +250,7 @@ def test_the_row_names_the_number_that_goes_out(db):
     assert articles == "4033, 4052"
     assert sizes == "3XL, M"
     assert stocks == "10, 18"
-    assert goes == "10", "вклад жильца под порогом кабинета — ноль"
+    assert goes == "20", "сумма вкладов, а не сумма остатков (28)"
 
 
 def test_the_finding_and_the_list_see_the_same_rows(db):
