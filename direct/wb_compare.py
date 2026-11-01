@@ -63,6 +63,9 @@ def period():
             d1 = d2 - dt.timedelta(days=int(arg("--days") or DAYS) - 1)
     except ValueError:
         sys.exit("--from / --to — дата в виде ГГГГ-ММ-ДД, --days — число дней")
+    if arg("--from") and not arg("--to") and d1 > d2:
+        sys.exit(f"С {d1:%d.%m} данных ещё нет: отчёт считает по вчерашний день ({d2:%d.%m}). Запустите не раньше "
+                 f"{d1 + dt.timedelta(days=1):%d.%m}, а для вывода лучше через неделю — {d1 + dt.timedelta(days=7):%d.%m}.")
     if not d1 <= d2 <= TODAY:
         sys.exit("Период: --from не позже --to, --to не позже сегодняшнего дня")
     return d1, d2
