@@ -251,7 +251,11 @@ function Invoke-{Tag} {{
     Get-ChildItem -LiteralPath (Join-Path $Root "code_backups") -Directory | Sort-Object Name | Select-Object -SkipLast 10 | Remove-Item -Recurse -Force
     Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
     Ok "Патч {tag} поставлен: версия {version}, расписание включено"
-    Write-Host "Страница «Реклама WB» была открыта — закройте вкладку и откройте ярлык заново." -ForegroundColor Cyan
+    # страница «Реклама WB» держит прежний код в памяти, пока открыта, — закрыть её, ярлык поднимет новую
+    $web = @(Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'" |
+        Where-Object {{ $_.CommandLine -match 'wb_web\.py' }})
+    foreach ($p in $web) {{ if ($p.ProcessId) {{ Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }} }}
+    if ($web.Count) {{ Write-Host "Страница «Реклама WB» работала на прежнем коде — закрыл её. Откройте ярлык заново." -ForegroundColor Cyan }}
 }}
 try {{ Invoke-{Tag} }} catch {{ Write-Host "[X] $($_.Exception.Message)" -ForegroundColor Red }}
 '''

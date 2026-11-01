@@ -496,13 +496,22 @@ def switch(token, camps, rules, cab, cid, on, who="на странице «Бю�
     hold_edit(cid, name, on=True, who=who)
     if a.get("_status") == 9:
         return True, f"«{name}» включена (она и так работала)."
-    if own_limit(rule_of(rules, cab, cid, camps), st.get("payment_type")):
+    rule, pay = rule_of(rules, cab, cid, camps), st.get("payment_type")
+    watched = own_limit(rule, pay)
+    if watched and pay == "cpc":                 # клики: частая проверка ведёт её, только если лимит WB включён и выше своего
+        try:
+            watched = B.own_limit_watched(rule, pay, B.get_limits(token, [cid]).get(cid))
+        except B.ApiError:
+            watched = False
+    if watched:
         state.setdefault("pace_paused", {})[str(cid)] = {
             "date": (dt.date.today() - dt.timedelta(days=1)).isoformat(), "at": f"включена {who}",
             "spent": None, "limit": None}
         B.save_state(state)
         return True, (f"«{name}» включена: её запустит частая проверка лимита в ближайшие 5 минут, по графику расхода "
                       "(если сегодня лимит уже потрачен — завтра утром; ночью — после 7:00).")
+    for k in ("pace_paused", "limit_paused"):     # запускаю сразу — прежняя отметка «на паузе по графику» больше не наша
+        (state.get(k) or {}).pop(str(cid), None)
     n = len(B.out)
     if B.start_campaign(token, {"advert_id": cid, "name": name, "amount": 0}, state):
         return True, f"«{name}» включена и запущена."

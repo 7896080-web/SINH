@@ -2315,12 +2315,26 @@ def plan_cabinet(cab, token, rules, state):
             note_broken_topups(state, cid, name)
             bud = buds_all.get(cid)
             short = max(limit_need - (bud or 0), 0)       # сколько не хватает бюджета, чтобы WB принял новый лимит
+            # отметка «пауза по графику / по лимиту» у кампании, которую частая проверка лимита не ведёт: её никто не снимет
+            # и кампания так и стояла бы — отметку снять, кампанию запустить (если деньги есть) или пополнить и запустить
+            stuck = (pay == "cpc" and lims_all is not None and not on_hold(cid)
+                     and bool(pace_paused(state, cid) or limit_paused(state, cid))
+                     and not own_limit_watched(r, pay, lims_all.get(cid)))
+            if stuck:
+                for k in ("pace_paused", "limit_paused"):
+                    (state.get(k) or {}).pop(str(cid), None)
+                log("    Отметка «пауза по графику / по лимиту», но частая проверка лимита эту кампанию не ведёт (лимит WB "
+                    "выключен или не выше своего) — отметку снимаю.")
             if bud is None:
                 log("    ! Бюджет кампании не получен — пополнение пропускаю.")
             elif on_hold(cid) and a.get("_status") != 9:
                 log(f"    В стоп-листе {HOLD_FILE.name} — не пополняю и не запускаю.")
                 for k in ("limit_paused", "pace_paused"):
                     (state.get(k) or {}).pop(str(cid), None)
+            elif stuck and a.get("_status") == 11 and bud >= PAUSED_MONEY_BELOW:
+                log(f"    На паузе с нашей отметкой, в бюджете {fm_rub(bud)} ₽ — запустить.")
+                plan["topup"].append({"cabinet": cab, "advert_id": cid, "name": name, "amount": 0,
+                                      "source": r["topup_source"], "budget_before": bud, "start": True})
             elif a.get("_status") == 11 and limit_paused(state, cid) == dt.date.today().isoformat():
                 log("    На паузе по дневному лимиту до утра — не пополняю и не запускаю.")
             elif a.get("_status") == 11 and pace_paused(state, cid) and bud >= r["topup_below"]:
@@ -2876,6 +2890,17 @@ def note_spend(state, cid, spent, active):
                                                            "m": pace_m_now(state, cid), "h": pace_hour(now),
                                                            "at": now.isoformat(timespec="minutes")}
     seen[str(cid)] = {"at": now.isoformat(timespec="minutes"), "spent": spent, "active": bool(active)}
+
+
+def own_limit_watched(r, pay, lim):
+    """Свою паузу «по лимиту / по графику» снимает частая проверка лимита (wb_guard.py --limits): у кампании за показы со
+    своим дневным лимитом — всегда, у кампании за клики — только при своём лимите ниже включённого лимита WB (01.11.2026:
+    Караман 40769350 включили без лимита WB — её никто не запустил)."""
+    if not (r or {}).get("daily_limit"):
+        return False
+    if pay != "cpc":
+        return True
+    return bool(lim and lim.get("enabled") and r["daily_limit"] * 100 < num(lim.get("dailyLimit")))
 
 
 def pace_paused(state, cid):
