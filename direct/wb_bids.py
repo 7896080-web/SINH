@@ -3102,6 +3102,7 @@ def patch_nms(token, advert_id, add=(), delete=()):
 
 
 LIMIT_INVALID = "daily limit validation failed"
+LIMIT_FLOOR = 100000     # копейки: меньше 1 000 ₽ WB дневной лимит кампании за клики не ставит (minDailyLimit)
 
 
 def nms_with_limit_room(token, aid, fn):
@@ -3146,6 +3147,23 @@ def nms_with_limit_room(token, aid, fn):
                 log(f"    лимит кампании {aid} возвращён: {rub(old)} ₽")
                 break
             except ApiError as e:
+                if "insufficient campaign budget" in str(e):
+                    # прежний лимит больше нынешнего бюджета: WB его не ставит (01.11.2026, Ребрик 40769287) — поставить,
+                    # сколько бюджет позволяет; прежний вернёт автопилот, пополнив бюджет под лимит
+                    bud = get_budgets(token, [aid]).get(aid)        # ₽
+                    cap = int(bud // 100) * 100 * 100 if bud else 0   # копейки, вниз до 100 ₽
+                    if bud is not None and cap < LIMIT_FLOOR:
+                        log(f"    лимит кампании {aid} пока выключен: в её бюджете {fm_rub(bud)} ₽ — меньше минимального "
+                            f"лимита WB, больше она не потратит; лимит {rub(old)} ₽ поставит автопилот, пополнив бюджет.")
+                        break
+                    if bud is not None:
+                        try:
+                            put(cap)
+                            log(f"    лимит кампании {aid}: {rub(cap)} ₽ вместо {rub(old)} ₽ — в бюджете только "
+                                f"{fm_rub(bud)} ₽; прежний поставит автопилот, пополнив бюджет.")
+                            break
+                        except ApiError as e2:
+                            e = e2
                 if attempt == 2:
                     log(f"  ✗✗ Лимит кампании {aid} НЕ возвращён ({e}): сейчас {now} вместо {rub(old)} ₽ — поставьте "
                         "его в кабинете WB (следующий запуск автопилота поставит лимит по правилам сам).")
