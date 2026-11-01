@@ -66,6 +66,9 @@
   `get-bids`, `stats` — snake_case (`advert_id`, `nm_id`, `norm_query(ies)`). `get-bids` → `bids[]` с `bid` (₽) и
   `bid_kopecks` — только ручная ставка за показы. Отчёт по кластерам — `wb_clusters.py` (только чтение).
 - Дневной лимит — только для оплаты за клики: `PUT /api/advert/v0/daily-limits`, суммы в копейках.
+- **`PATCH /adv/v0/auction/nms` → 400 «nomenclatures from different category»** (01.11.2026): в одной кампании — товары
+  только одного предмета. Одна и та же модель в разных кабинетах может быть разным предметом (у Карамана 2651 —
+  «Пуховики», у Ребрика — «Куртки»). Запрос с ошибкой не меняет ничего (ни добавление, ни удаление).
 - **`PATCH /adv/v0/auction/nms` → 400 «daily limit validation failed»** (21.10.2026): WB не меняет товары кампании, пока её дневной лимит ниже `requiredLimit` (минимум при нынешних ставках; в GET daily-limits — `valid: false`). Обход в `wb_bids.nms_with_limit_room`: на секунды поднять лимит до `requiredLimit`, изменить товары, вернуть лимит.
   **01.11.2026:** поднять лимит выше бюджета кампании WB не даёт — PUT daily-limits → 400 «insufficient campaign budget»
   (у «пух нов» `requiredLimit` ≈15 000 ₽ при бюджете в пару тысяч). Тогда лимит на секунды выключается (`enabled:

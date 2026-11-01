@@ -11,7 +11,8 @@
   3. модель 2718 (C26-2818C) убрать из оставшихся кампаний («пух нов» 39661508, Ребрик 40769287 — 21.10 WB не дал);
      кампанию целиком не опустошает; автопилот эти товары больше не возвращает (state["no_return"]).
   4. (решение 01.11, второе) в кампаниях курток «лестницы» — Яворская «пух нов» 39661508, Ребрик 40769287, Караман
-     40769334 — ровно 27 цветов из списка пользователя (2617, 2633, 2717, 2651, 2718), по одному разу: недостающие
+     40769334 (куртки) + 40769350 (пуховики; WB не держит в кампании товары разных предметов, её же — включить) —
+     ровно 27 цветов из списка пользователя (2617, 2633, 2717, 2651, 2718), по одному разу: недостающие
      добавить (если в наличии не меньше min_stock), лишние (TC26 у Карамана и т. п.) и повторы — убрать; эти же
      карточки — убрать из других работающих кампаний кабинета; 2718 — вернуть в рекламу (снять state["no_return"]).
   «Лестница» (места 1–2 у «пух нов», 3–10 у Ребрика 40769287, 11–34 у Карамана 40769334) — в правилах wb_bids.py.
@@ -43,8 +44,8 @@ from wb_compare import model_of
 DECISION = "решение 01.11.2026: только за клики, 27643 и 36446 Яворской, куртки — «лестница» из 27 цветов"
 KEEP_ONLY = True               # выключить всё, что не подходит под ONLY_CPC / KEEP_IDS / KEEP_JACKETS (False — только STOP)
 ONLY_CPC = True                # кампании за показы — выключить все
-KEEP_IDS = {31049161, 31048671, 40769334}      # «27643 клик», «36446 клик» (Яворская); Караман 40769334 — куртки,
-                                                # третья ступень «лестницы» (места 11–34, решение 01.11.2026)
+KEEP_IDS = {31049161, 31048671, 40769334, 40769350}   # «27643 клик», «36446 клик» (Яворская); Караман 40769334 —
+                                                # куртки, 40769350 — пуховики: третья ступень «лестницы» (места 11–34)
 KEEP_JACKETS = {"Яворская", "Ребрик"}           # где остаются кампании курток (Караман — без курток, «лестница»)
 STOP = {}                      # выключить дополнительно: {кабинет: [номера]}
 TO_RULES = {}                  # лимиты/потолки — как в правилах: {кабинет: [номера или "_week_budget"]}
@@ -53,7 +54,9 @@ RETURN_MODELS = {"2718"}       # вернуть в рекламу: снять з
 # Кампании курток «лестницы» и ровно какие карточки в них (решение пользователя 01.11.2026: «в рекламе должны быть эти
 # модели без дублирования» — в каждом кабинете все 27 цветов, по одному разу; лишние убрать, недостающие добавить, если
 # в наличии не меньше min_stock; в других работающих кампаниях кабинета этих карточек быть не должно)
-LADDER = {"Яворская": 39661508, "Ребрик": 40769287, "Караман": 40769334}
+LADDER = {"Яворская": [39661508], "Ребрик": [40769287],
+          "Караман": [40769334, 40769350]}   # у Карамана 2617/2633 — «куртки», 2651/2717/2718 — «пуховики»: две кампании
+START = {"Караман": [40769350]}           # включить (как переключатель «вкл»): пуховики Карамана — та же ступень, 11–34
 LADDER_SET = (
     [f"2617 C24-2317CQ Авер Куртка {c}" for c in ("BLACK", "BRICK RED", "BROWN", "INK BLUE", "NAVY", "OLIVE", "SAND BEIGE")]
     + [f"2633 C24-2233L Авер Куртка {c}" for c in ("BLACK", "GREY", "KHAKI", "OLIVE")]
@@ -250,34 +253,50 @@ def avail(nf):
     return (nf.get("stock_wb") or 0) + ((nf.get("stock_mp") or 0) if B.COUNT_FBS_STOCK else 0)
 
 
+def subject_of(nm, info, sets=None):
+    """Предмет товара (строчными): из воронки, нет там — из настроек кампании."""
+    sub = (info.get(nm) or {}).get("subject") or ((sets or {}).get(nm, {}).get("subject") or {}).get("name")
+    return (sub or "").strip().lower() or None
+
+
 def plan_ladder(cab, camps, info, skip):
-    """Кампанию «лестницы» кабинета — ровно к LADDER_SET; эти карточки — из других работающих кампаний кабинета.
+    """Кампании «лестницы» кабинета — ровно к LADDER_SET, каждый цвет один раз; товар — в кампанию своего предмета
+    (WB держит в кампании товары одного предмета: «nomenclatures from different category», 01.11.2026 — у Карамана
+    2617/2633 — «куртки», 2651/2717/2718 — «пуховики»); эти карточки — убрать из других работающих кампаний кабинета.
     [{кабинет, кампания, add: [артикулы WB], delete: [{nm_id, bids_kopecks}]}]."""
-    cid = LADDER.get(cab)
-    if not cid:
-        return []
-    a = camps.get(cid)
-    if not a:
-        log(f"  ✗ {cab}: кампании {cid} нет среди работающих и стоящих на паузе — не трогаю")
+    cids = [c for c in LADDER.get(cab) or [] if c in camps]
+    for c in LADDER.get(cab) or []:
+        if c not in camps:
+            log(f"  ✗ {cab}: кампании {c} нет среди работающих и стоящих на паузе — не трогаю")
+    if not cids:
         return []
     want = {norm_vc(v): v for v in LADDER_SET}
     vc_of = {nm: norm_vc((nf or {}).get("vendor")) for nm, nf in info.items()}
-    sets = {st["nm_id"]: st for st in a.get("nm_settings") or [] if st.get("nm_id")}
-    have, extra, unknown = defaultdict(list), [], []
-    for nm in sets:
-        vc = vc_of.get(nm)
-        if not vc:
-            unknown.append(nm)                       # артикул продавца неизвестен — не трогаю
-        elif vc in want:
-            have[vc].append(nm)
-        else:
-            extra.append(nm)
-    dup = []
-    for vc, nms in have.items():                     # один цвет дважды — оставить карточку с большим остатком
-        if len(nms) > 1:
-            nms.sort(key=lambda n: -(avail(info.get(n)) or 0))
-            dup += nms[1:]
-    add, notes = [], []
+    sets = {c: {st["nm_id"]: st for st in camps[c].get("nm_settings") or [] if st.get("nm_id")} for c in cids}
+    subj = {}                                        # предмет кампании — по большинству её товаров
+    for c in cids:
+        cnt = defaultdict(int)
+        for nm in sets[c]:
+            if subject_of(nm, info, sets[c]):
+                cnt[subject_of(nm, info, sets[c])] += 1
+        subj[c] = max(cnt, key=cnt.get) if cnt else None
+    have, extra, unknown = defaultdict(list), defaultdict(list), defaultdict(list)
+    for c in cids:
+        for nm in sets[c]:
+            vc = vc_of.get(nm)
+            if not vc:
+                unknown[c].append(nm)                # артикул продавца неизвестен — не трогаю
+            elif vc in want:
+                have[vc].append((c, nm))
+            else:
+                extra[c].append(nm)
+    dup = defaultdict(list)
+    for vc, pairs in have.items():                   # один цвет дважды — оставить карточку с большим остатком
+        if len(pairs) > 1:
+            pairs.sort(key=lambda p: -(avail(info.get(p[1])) or 0))
+            for c, nm in pairs[1:]:
+                dup[c].append(nm)
+    add, notes = defaultdict(list), []
     for vc, label in want.items():
         if have.get(vc):
             continue
@@ -290,45 +309,76 @@ def plan_ladder(cab, camps, info, skip):
         if q is not None and q < MIN_STOCK:
             notes.append(f"{label} ({nm}) — в наличии {q:.0f} шт, меньше {MIN_STOCK}")
             continue
-        add.append(nm)
-    delete = extra + dup
-    after = len(have) + len(add)
+        sub = subject_of(nm, info)
+        target = [c for c in cids if subj[c] == sub] or ([cids[0]] if len(cids) == 1 and not subj[cids[0]] else [])
+        if not target:
+            notes.append(f"{label} ({nm}) — предмет «{sub or '?'}», а кампании «лестницы» с таким предметом в кабинете "
+                         f"нет (WB не берёт в кампанию товары другого предмета)")
+            continue
+        add[target[0]].append(nm)
     vend = lambda nm: C.cut((info.get(nm) or {}).get("vendor") or nm, 40)
-    log(f"  ▶ {cab} «{name_of(a, cid)}» {cid}: сейчас цветов из списка {len(have)} из {len(want)}"
-        + (f", лишних {len(extra)}" if extra else "") + (f", повторов {len(dup)}" if dup else "")
-        + f" → станет {after} из {len(want)}")
-    if add:
-        log(f"      добавить {len(add)}: " + "; ".join(f"{nm} {vend(nm)}" for nm in add))
-    if extra:
-        log(f"      убрать не из списка {len(extra)}: " + "; ".join(f"{nm} {vend(nm)}" for nm in extra))
-    if dup:
-        log(f"      убрать повторы {len(dup)}: " + "; ".join(f"{nm} {vend(nm)}" for nm in dup))
+    total = len(have) + sum(len(v) for v in add.values())
+    log(f"  {cab}: цветов из списка сейчас {len(have)} из {len(want)} → станет {total} из {len(want)}")
+    ops = []
+    for c in cids:
+        a = camps[c]
+        log(f"  ▶ «{name_of(a, c)}» {c} ({subj[c] or 'предмет неизвестен'}, {W.STATUS.get(a.get('_status'), a.get('_status'))}"
+            f"; товаров {len(sets[c])})")
+        if add[c]:
+            log(f"      добавить {len(add[c])}: " + "; ".join(f"{nm} {vend(nm)}" for nm in add[c]))
+        if extra[c]:
+            log(f"      убрать не из списка {len(extra[c])}: " + "; ".join(f"{nm} {vend(nm)}" for nm in extra[c]))
+        if dup[c]:
+            log(f"      убрать повторы {len(dup[c])}: " + "; ".join(f"{nm} {vend(nm)}" for nm in dup[c]))
+        if unknown[c]:
+            log(f"      артикул продавца не узнал у {len(unknown[c])} тов. — не трогаю: {', '.join(map(str, unknown[c][:6]))}")
+        delete = extra[c] + dup[c]
+        if len(delete) == len(sets[c]) and not add[c] and delete:
+            log("      ! убрать пришлось бы все её товары — кампанию не опустошаю")
+            continue
+        if add[c] or delete:
+            ops.append({"cabinet": cab, "advert_id": c, "campaign": name_of(a, c), "bid_type": a.get("bid_type"),
+                        "add": add[c], "delete": [{"nm_id": nm, "bids_kopecks": sets[c][nm].get("bids_kopecks") or {}}
+                                                  for nm in delete]})
+        if not (add[c] or delete):
+            log("      менять нечего")
     for x in notes:
         log(f"      не добавляю: {x}")
-    if unknown:
-        log(f"      артикул продавца не узнал у {len(unknown)} тов. — не трогаю: {', '.join(map(str, unknown[:6]))}")
-    ops = []
-    if add or delete:
-        ops.append({"cabinet": cab, "advert_id": cid, "campaign": name_of(a, cid), "bid_type": a.get("bid_type"),
-                    "add": add, "delete": [{"nm_id": nm, "bids_kopecks": sets[nm].get("bids_kopecks") or {}}
-                                           for nm in delete]})
     for ocid, oa in sorted(camps.items()):           # те же карточки в других работающих кампаниях кабинета
-        if ocid == cid or oa.get("_status") != 9 or B.on_hold(ocid) or ocid in skip:
+        if ocid in cids or oa.get("_status") != 9 or B.on_hold(ocid) or ocid in skip:
             continue
         osets = oa.get("nm_settings") or []
         rm = [st for st in osets if vc_of.get(st.get("nm_id")) in want]
         if not rm:
             continue
         if len(rm) == len(osets):
-            log(f"  ! {cab} «{name_of(oa, ocid)}» {ocid}: все её товары ({len(rm)}) — из списка «лестницы»; кампанию не "
+            log(f"  ! «{name_of(oa, ocid)}» {ocid}: все её товары ({len(rm)}) — из списка «лестницы»; кампанию не "
                 "опустошаю — выключите её, если она не нужна")
             continue
-        log(f"  ▶ {cab} «{name_of(oa, ocid)}» {ocid}: убрать повторы карточек «лестницы» {len(rm)}: "
+        log(f"  ▶ «{name_of(oa, ocid)}» {ocid}: убрать повторы карточек «лестницы» {len(rm)}: "
             + "; ".join(f"{st['nm_id']} {vend(st['nm_id'])}" for st in rm))
         ops.append({"cabinet": cab, "advert_id": ocid, "campaign": name_of(oa, ocid), "bid_type": oa.get("bid_type"),
                     "add": [], "delete": [{"nm_id": st["nm_id"], "bids_kopecks": st.get("bids_kopecks") or {}}
                                           for st in rm]})
     return ops
+
+
+def plan_start(camps_by):
+    """START: включить кампании (как переключатель «вкл»): [{кабинет, кампания, статус до}]."""
+    out = []
+    for cab, ids in START.items():
+        for cid in ids:
+            a = (camps_by.get(cab) or {}).get(cid)
+            if not a:
+                log(f"  ✗ {cab} {cid}: кампании нет среди работающих и стоящих на паузе — включить не могу")
+                continue
+            if a.get("_status") == 9 and not B.on_hold(cid):
+                continue
+            log(f"  ▶ {cab} «{name_of(a, cid)}» {cid}: включить (сейчас — {W.STATUS.get(a.get('_status'), a.get('_status'))}"
+                + (", в стоп-листе" if B.on_hold(cid) else "") + ")")
+            out.append({"cabinet": cab, "advert_id": cid, "name": name_of(a, cid), "status_before": a.get("_status"),
+                        "held_before": B.on_hold(cid)})
+    return out
 
 
 def write_backup(path, plan):
@@ -390,6 +440,16 @@ def apply(cabs, camps_by, data, plan):
         ok = len(r["added"]) == len(op["add"]) and len(r["deleted"]) == len(op["delete"])
         log(f"  ⇄ «{op['campaign']}» {op['advert_id']}: добавлено {len(r['added'])} из {len(op['add'])}, убрано "
             f"{len(r['deleted'])} из {len(op['delete'])}" + ("" if ok else " — часть WB не принял, проверьте в кабинете"))
+    rules_ = W.rules_now()
+    for i in plan.get("start") or []:               # включить — после того как товары на месте
+        try:
+            camps = B.get_campaigns(cabs[i["cabinet"]])
+            ok, text = W.switch(cabs[i["cabinet"]], camps, rules_, i["cabinet"], i["advert_id"], True, who=WHO)
+            i["done"] = ok
+            log(f"  {'▶' if ok else '✗'} {text}")
+        except (B.ApiError, OSError, KeyError) as e:
+            i["done"] = False
+            log(f"  ✗ «{i['name']}»: не включена — {e}")
     state = B.load_state()
     nr = state.setdefault("no_return", {})
     for k in plan.get("no_return_removed") or {}:
@@ -425,6 +485,23 @@ def rollback(cabs):
                 f"{T.restore_bids(cabs[cab], back)}")
         except C.ApiError as e:
             log(f"  ✗ «{items[0]['campaign']}»: {e}")
+    for i in plan.get("start") or []:              # включённые — как были: на паузу (и в стоп-лист, если были там)
+        if i.get("done") is False or i["cabinet"] not in cabs:
+            continue
+        st = B.load_state()
+        for k in ("pace_paused", "limit_paused", "start_pending"):
+            (st.get(k) or {}).pop(str(i["advert_id"]), None)
+        B.save_state(st)
+        if i.get("held_before"):
+            W.hold_edit(i["advert_id"], i["name"], on=False, who=f"{WHO} (откат)")
+        try:
+            camps = B.get_campaigns(cabs[i["cabinet"]])
+            if (camps.get(i["advert_id"]) or {}).get("_status") == 9:
+                B.pace(cabs[i["cabinet"]], "start", 1.1)
+                B.call("GET", B.ADV + "/adv/v0/pause", cabs[i["cabinet"]], params={"id": i["advert_id"]}, what="Пауза кампании")
+            log(f"  ↩ «{i['name']}»: снова на паузе" + (" и в стоп-листе" if i.get("held_before") else ""))
+        except B.ApiError as e:
+            log(f"  ✗ «{i['name']}»: на паузу не встала — {e}; поставьте её на паузу в кабинете WB")
     for op in plan.get("ladder") or []:            # «лестница»: добавленные — убрать, убранные — вернуть со ставками
         added, deleted = op.get("added"), op.get("deleted")
         if added is None:                              # сбой посреди --apply — откатываю всё, что было в плане
@@ -567,6 +644,12 @@ def main():
                     ladder += plan_ladder(cab, camps, info_by[cab], skip)
                 elif cab in LADDER:
                     log(f"  ✗ {cab}: артикулы продавца не загрузились — кампанию «лестницы» не трогаю")
+        start = []
+        if START:
+            log("\n  Включить:")
+            start = plan_start(camps_by)
+            if not start:
+                log("  — включать нечего")
         if RETURN_MODELS:
             ret = {nm for inf in info_by.values() for nm, nf in inf.items() if model_of((nf or {}).get("vendor")) in RETURN_MODELS}
             back = {k: v for k, v in (state.get("no_return") or {}).items() if int(k.split(":")[1]) in ret}
@@ -575,12 +658,12 @@ def main():
                     f"(после уборки из-за малого остатка), записей: {len(back)}")
         plan = {"decision": DECISION, "at": dt.datetime.now().isoformat(timespec="seconds"), "stop": stop,
                 "limits": {"norm": norm, "lines": lines, "old": old}, "trim": trim, "no_return_earlier": earlier,
-                "ladder": ladder, "no_return_removed": back}
+                "ladder": ladder, "no_return_removed": back, "start": start}
         n_add, n_del = sum(len(o["add"]) for o in ladder), sum(len(o["delete"]) for o in ladder)
-        n = len(stop) + len(norm) + len(trim) + len(earlier) + n_add + n_del + len(back)
+        n = len(stop) + len(norm) + len(trim) + len(earlier) + n_add + n_del + len(back) + len(start)
         log(f"\nИтого: выключить {len(stop)} камп.; правок лимитов {len(norm)}; убрать {len(trim)} тов. из "
             f"{len({(i['cabinet'], i['advert_id']) for i in trim})} камп.; «лестница» — добавить {n_add}, убрать {n_del}"
-            + (f"; снять запрет на возврат — {len(back)}" if back else ""))
+            + (f"; снять запрет на возврат — {len(back)}" if back else "") + (f"; включить {len(start)} камп." if start else ""))
         if not n:
             log("Делать нечего.")
         elif not do:
