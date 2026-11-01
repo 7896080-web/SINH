@@ -46,7 +46,8 @@ TO_RULES = {}                  # лимиты/потолки — как в пр�
 REMOVE_MODELS = {"2718"}       # убрать из рекламы во всех кабинетах (номер модели — как в wb_compare.py)
 # ---------------- НАСТРОЙКИ ----------------
 TRIM_STATUSES = (9, 11)                     # из каких кампаний убирать: работающие и на паузе (пауза может кончиться)
-JACKET_SUBJECTS = {"Куртки", "Пуховики", "Парки", "Ветровки", "Бомберы", "Анораки"}   # предметы WB «курток»
+JACKET_SUBJECTS = {"куртки", "пуховики", "парки", "ветровки", "бомберы", "анораки"}   # предметы WB «курток» (без учёта
+                                            # регистра: в настройках кампаний WB пишет их со строчной, в воронке — с прописной)
 LOG_FILE = B.HERE / "wb_decide_log.txt"
 WHO = "скриптом wb_decide.py"               # пометка в стоп-листе
 # -------------------------------------------
@@ -74,13 +75,23 @@ def verdict(cab, cid, a, info):
         return True, "в списке оставляемых"
     sub = subjects(a, info)
     known = sum(n for k, n in sub.items() if k != "?")
-    jackets = sum(n for k, n in sub.items() if k in JACKET_SUBJECTS)
+    jackets = sum(n for k, n in sub.items() if k.lower() in JACKET_SUBJECTS)
     if known and jackets * 2 >= known:
         return (True, "куртки") if cab in KEEP_JACKETS else (False, "куртки — в этом кабинете без курток («лестница»)")
     return False, "не куртки" if known else "товаров нет"
 
 
-def plan_stop(camps_by, info_by):
+def ours(cab, cid, camps, state):
+    """Может ли кампанию на паузе запустить автопилот или проверка: своё правило, «наша» (state["managed"]), пауза
+    по лимиту или графику расхода, отложенный запуск. Остальные стоящие на паузе скрипты не трогают — их не выключаю."""
+    r = B.RULES.get(cab) or {}
+    if any(cid in B.find(camps, k) for k in r if k != "*" and not str(k).startswith("_")):
+        return True
+    return (str(cid) in (state.get("managed") or {}) or bool(B.limit_paused(state, cid)) or bool(B.pace_paused(state, cid))
+            or str(cid) in (state.get("start_pending") or {}))
+
+
+def plan_stop(camps_by, info_by, state):
     out = []
     log("\n1. КАМПАНИИ: что остаётся и что выключить (пауза + стоп-лист wb_hold.txt; деньги в бюджете кампании "
         "остаются)")
@@ -90,7 +101,7 @@ def plan_stop(camps_by, info_by):
             log(f"  ✗ {cab}: кабинет не загрузился — пропускаю")
             continue
         log(f"  {cab}:")
-        keep, held = [], 0
+        keep, held, kept_idle, idle = [], 0, 0, 0
         for cid, a in sorted(camps.items(), key=lambda x: ({9: 0, 11: 1, 4: 2}.get(x[1].get("_status"), 3), x[0])):
             nm, st = name_of(a, cid), a.get("_status")
             pay = W.PAY.get((a.get("settings") or {}).get("payment_type"), "?")
@@ -104,16 +115,25 @@ def plan_stop(camps_by, info_by):
                                                            key=lambda p: -p[1])[:3])
             line = f"«{C.cut(nm, 30)}» {cid} ({pay}, {W.STATUS.get(st, st)}; {sub or 'без товаров'})"
             if ok:
-                keep.append(f"    ✓ оставить: {line} — {why}")
+                if st == 9:
+                    keep.append(f"    ✓ оставить: {line} — {why}")
+                else:
+                    kept_idle += 1
+                continue
+            if st != 9 and not ours(cab, cid, camps, state) and (cab, cid) not in extra:
+                idle += 1                    # стоит и так, скрипты её не запускают — стоп-лист не засоряю
                 continue
             log(f"    ⏹ {line} — {why}: " + ("на паузу и в стоп-лист" if st == 9 else "в стоп-лист"))
             out.append({"cabinet": cab, "advert_id": cid, "name": nm, "status_before": st})
         for x in keep:
             log(x)
         if not keep:
-            log("    ✓ оставить: ничего")
-        if held:
-            log(f"    (уже в стоп-листе: {held})")
+            log("    ✓ оставить работающими: ничего")
+        notes = [f"уже в стоп-листе — {held}" if held else "",
+                 f"подходят под решение, но стоят на паузе (не запускаю) — {kept_idle}" if kept_idle else "",
+                 f"не подходят, но стоят на паузе и скрипты их не запускают (не трогаю) — {idle}" if idle else ""]
+        if any(notes):
+            log("    (" + "; ".join(x for x in notes if x) + ")")
     if not out:
         log("  Выключать нечего.")
     return out
@@ -382,7 +402,7 @@ def main():
             except C.ApiError as e:
                 log(f"  ! {cab}: артикулы продавца не загрузились — {e}; предметы — из настроек кампаний, модель "
                     f"{', '.join(sorted(REMOVE_MODELS))} в этом кабинете не убираю")
-        stop = plan_stop(camps_by, info_by)
+        stop = plan_stop(camps_by, info_by, state)
         norm, lines, old = plan_limits(data)
         if REMOVE_MODELS:
             log(f"\n{3 if TO_RULES else 2}. УБРАТЬ ИЗ РЕКЛАМЫ МОДЕЛЬ {', '.join(sorted(REMOVE_MODELS))} (все цвета, все кабинеты, кроме "
